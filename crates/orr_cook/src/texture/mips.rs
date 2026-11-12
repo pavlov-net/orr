@@ -802,11 +802,7 @@ mod tests {
     /// constant keeps what a clamp makes of the texels inside.
     #[test]
     fn a_border_filters_in_black_and_a_constant_filters_as_a_clamp() {
-        let white = || Img {
-            w: 16,
-            h: 16,
-            px: vec![[1.0; 4]; 256],
-        };
+        let white = || Img::of(16, 16, vec![[1.0; 4]; 256]);
         let mip = |wrap: Wrap| {
             let spec = MipSpec {
                 wrap: [wrap, Wrap::Repeat],

@@ -502,7 +502,6 @@ fn one_channel_files_fill_as_their_importer_says() {
     let (_, m) = materialx(&d, "two.png", "color3", base);
     assert_eq!(m.base_color, [gray, 64.0 / 255.0, 0.0]);
 
-    let srgb = |v: f32| orr_color::srgb_decode(f64::from(v)) as f32;
     let (_, m, _) = usd(
         &d,
         "flat.png",
@@ -514,7 +513,7 @@ fn one_channel_files_fill_as_their_importer_says() {
 
     let json = r#"{"pbrMetallicRoughness":{"baseColorTexture":{"index":0}}}"#;
     let (_, m) = gltf(&d, json, gray_png(8, 8, |_, _| 128));
-    assert_eq!(m.base_color, [srgb(gray); 3]);
+    assert_eq!(m.base_color, [orr_color::srgb8_decode(128); 3]);
 }
 
 /// USD Preview Surface `UsdUVTexture`: "If a single-channel texture is fed into a UsdUVTexture,

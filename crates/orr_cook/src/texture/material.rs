@@ -73,7 +73,7 @@ use orr_pack::tiles::{TextureTiles, Tile};
 use orr_pack::{AssetId, Class, Hash32};
 use serde::Deserialize;
 
-use super::color::{BELOW_ZERO, Decode, FileColor, ImageColor, Read, clipped, multiply};
+use super::color::{BELOW_ZERO, Codes, Decode, FileColor, ImageColor, Read, clipped, multiply};
 use super::load::{self, Blocks, Component, Gray, Source, Swizzle};
 use super::mips::{MipSpec, Toksvig, normalize, normalized, settled};
 use super::neural::{self, NeuralJob, NeuralSettings};
@@ -196,13 +196,8 @@ impl TexRef {
     }
 
     /// The normal in texel `t`, with [`Packer::normal_source`]'s remap, of an image laid out as
-    /// `source` says.
-    fn normal(&self, source: NormalSource, t: [f32; 4]) -> [f32; 3] {
-        self.normal_of(source, t, |v| source.decode.value(v))
-    }
-
-    /// [`Self::normal`], with `value` reading each stored component.
-    fn normal_of(&self, source: NormalSource, t: [f32; 4], value: impl Fn(f32) -> f32) -> [f32; 3] {
+    /// `source` says, `value` reading each stored component as `source.decode` does.
+    fn normal(&self, source: NormalSource, t: [f32; 4], value: impl Fn(f32) -> f32) -> [f32; 3] {
         let value = |c: usize| value(t[c]);
         let [x, y] = [self.read(0, value(0)), self.read(1, value(source.y))];
         let z = if source.rg {
@@ -489,11 +484,7 @@ impl ImageFile {
     /// The image's only layer.
     fn decoded(&self) -> Result<Img, String> {
         match self.data {
-            ImageData::Solid(texel) => Ok(Img {
-                w: 1,
-                h: 1,
-                px: vec![texel],
-            }),
+            ImageData::Solid(texel) => Ok(Img::of(1, 1, vec![texel])),
             _ => decode(&self.bytes().map_err(|e| e.to_string())?),
         }
     }
@@ -507,6 +498,8 @@ pub(crate) struct ImageFacts {
     color: FileColor,
     /// Per channel, the value every texel lies within 1/255 of, if there is one.
     constant: [Option<f32>; 4],
+    /// What its texels are codes of, if they are.
+    codes: Option<Codes>,
     /// Per channel, the lowest and highest value of mip 0, or of every mip the file stores of a
     /// color that can read below 0. Only a float image or one read with all of its range is sure
     /// to have all of it: reading blocks stops once every channel varies.
@@ -546,6 +539,7 @@ impl ImageFacts {
             h: 1,
             color: FileColor::default(),
             constant: texel.map(Some),
+            codes: None,
             range: texel.map(|v| (v, v)),
             minus_infinity: false,
             hash: Hash32::of(bytemuck::cast_slice(&texel)),
@@ -572,6 +566,7 @@ impl ImageFacts {
             h: tiles.clone().map(|t| t.h).max().unwrap_or(1),
             color: FileColor::default(),
             constant: [None; 4],
+            codes: None,
             range: [(0.0, 0.0); 4],
             minus_infinity: any(|t| t.minus_infinity),
             hash: Hash32::of(&tiles.clone().flat_map(|t| t.hash.0).collect::<Vec<u8>>()),
@@ -789,6 +784,7 @@ fn facts_of(
             h: s.h,
             color: s.color,
             constant: constant(s.range),
+            codes: load::block_codes(s.vk_format),
             range: s.range,
             minus_infinity: false,
             hash,
@@ -834,6 +830,10 @@ fn facts_of(
         h,
         color: src.color,
         constant: constant(range),
+        codes: match &src.blocks {
+            Some(b) => load::block_codes(b.vk_format),
+            None => src.layers[0].codes,
+        },
         range,
         minus_infinity,
         hash,
@@ -1204,7 +1204,11 @@ impl<'a> Packer<'a> {
     /// Stored value `v` of channel `c` of `r`, as [`Self::read`] numbers it, as an input that
     /// isn't a color reads it. Alpha is no color, whichever channel of the file holds it.
     fn number(&self, r: &TexRef, c: usize, v: f32) -> f32 {
-        if c == 3 { v } else { self.decode(r).value(v) }
+        if c == 3 {
+            v
+        } else {
+            self.decode(r).values(self.image(r.image).codes).value(v)
+        }
     }
 
     /// [`TexRef::source`] of channel `c`, as [`Self::read`] has it, through `read`.
@@ -1444,6 +1448,7 @@ impl<'a> Packer<'a> {
     /// Whether any texel of `img` still clips once color input `r` has read and converted it.
     fn texels_clip(&self, r: &TexRef, img: &Img) -> bool {
         let (read, _, gamut) = self.color_read(r);
+        let read = read.on(img);
         let channels = [0, 1, 2].map(|c| self.read(r, c));
         img.px.par_iter().any(|t| {
             let reach = read.reach(*t);
@@ -2172,6 +2177,7 @@ impl<'a> Packer<'a> {
         if held && (alpha.is_some() || !read.straight) {
             let [x, y, z] = [0, 1, 2].map(|c| self.stored_constant(r, c).expect("constant"));
             let t = [x, y, z, alpha.unwrap_or(1.0)];
+            let read = read.values(self.image(r.image).codes);
             let mut texel: [f32; 3] = std::array::from_fn(|c| r.read(c, read.value(t, c)));
             if let Some(m) = &gamut {
                 texel = multiply(m, texel);
@@ -2794,17 +2800,14 @@ impl TextureJob {
             .as_ref()
             .map(|(channel, r, scale, source)| {
                 let n = &sources[&r.image];
+                let decoder = source.decode.on(n);
                 let px = n.px.iter().map(|t| {
-                    let [x, y, z] = r.normal(*source, *t);
+                    let [x, y, z] = r.normal(*source, *t, |v| decoder.value(v));
                     [x * scale[0], y * scale[1], z, 1.0]
                 });
                 Toksvig {
                     channel: *channel,
-                    normals: Img {
-                        w: n.w,
-                        h: n.h,
-                        px: px.collect(),
-                    },
+                    normals: Img::of(n.w, n.h, px.collect()),
                 }
             });
         Ok((img, self.plan(toksvig)))
@@ -2864,7 +2867,6 @@ impl TextureJob {
         let mut img = Img::new(w, h);
         // One ICC transform gives all three channels of a texel.
         let mut profiled: HashMap<usize, Vec<[f32; 4]>> = HashMap::new();
-        let as_stored = Read::of(Decode::STORED);
         for (c, ch) in self.pack.channels.iter().enumerate() {
             match &ch.texels {
                 &Texels::Constant(v) => simd::update(&mut img.px, |t| t[c] = v),
@@ -2880,15 +2882,16 @@ impl TextureJob {
                     } else {
                         (0.0, 1.0)
                     };
-                    let texels = &decoded[&image].px;
+                    let texels = &decoded[&image];
                     if source.decode == Decode::STORED {
                         // What `source.decode` reads of a stored value: the value itself.
-                        simd::zip(&mut img.px, texels, |t, s| {
-                            t[c] = a + b * r.normal_of(source, *s, |v| v)[2];
+                        simd::zip(&mut img.px, &texels.px, |t, s| {
+                            t[c] = a + b * r.normal(source, *s, |v| v)[2];
                         });
                     } else {
-                        simd::zip(&mut img.px, texels, |t, s| {
-                            t[c] = a + b * r.normal(source, *s)[2];
+                        let decoder = source.decode.on(texels);
+                        simd::zip(&mut img.px, &texels.px, |t, s| {
+                            t[c] = a + b * r.normal(source, *s, |v| decoder.value(v))[2];
                         });
                     }
                 }
@@ -2899,23 +2902,24 @@ impl TextureJob {
                     a,
                     b,
                 } => {
-                    let source = &decoded[image].px;
-                    let (texels, read) = if read.icc.is_some() {
-                        let texels = profiled
-                            .entry(*image)
-                            .or_insert_with(|| simd::mapped(source, |s| read.color(*s, None)));
-                        (&*texels, &as_stored)
-                    } else {
-                        (source, read)
+                    let source = &decoded[image];
+                    // Texels that read as they stand: an ICC transform's, or stored ones.
+                    let read_as_stored = match &read.icc {
+                        Some(_) => Some(&*profiled.entry(*image).or_insert_with(|| {
+                            let on = read.on(source);
+                            simd::mapped(&source.px, |s| on.color(*s, None))
+                        })),
+                        None if read.is(Decode::STORED) => Some(&source.px),
+                        None => None,
                     };
-                    if read.is(Decode::STORED) {
-                        // What `read.value` gives of a stored value: the value itself.
+                    if let Some(texels) = read_as_stored {
                         simd::zip(&mut img.px, texels, |t, s| {
                             t[c] = stored(s[*channel], *a, *b, limit);
                         });
                     } else {
-                        simd::zip(&mut img.px, texels, |t, s| {
-                            t[c] = stored(read.value(*s, *channel), *a, *b, limit);
+                        let on = read.on(source);
+                        simd::zip(&mut img.px, &source.px, |t, s| {
+                            t[c] = stored(on.value(*s, *channel), *a, *b, limit);
                         });
                     }
                 }

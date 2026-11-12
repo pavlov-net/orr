@@ -21,9 +21,11 @@ use std::sync::{Arc, LazyLock};
 use moxcms::{ColorProfile, DataColorSpace, Layout, ToneReprCurve, TransformOptions};
 use orr_color::{
     Chromaticity, Primaries, RgbPrimaries, hlg_decode, pq_decode, rec709_to_rec2020, srgb_decode,
+    srgb8_decode,
 };
 use orr_math::{DMat3, DVec3};
 
+use super::Img;
 use super::mips::settled;
 
 /// A stored signal to linear light.
@@ -314,6 +316,86 @@ impl Decode {
     pub(crate) fn value(self, stored: f32) -> f32 {
         self.transfer.decode(self.signal(stored))
     }
+
+    /// The value of `code` of an image that stores `codes`: [`srgb8_decode`] for 8-bit sRGB,
+    /// which knows the code and not just the f32 nearest it, and [`Self::value`] of its stored
+    /// value for the rest.
+    fn code(self, codes: Codes, code: u32) -> f32 {
+        match (self, codes) {
+            (Self::SRGB, Codes::EIGHT) => srgb8_decode(code as u8),
+            _ => self.value(codes.value(code)),
+        }
+    }
+
+    /// This decode of the values of an image that stores `codes`: a value that is a code reads
+    /// as [`Self::code`] of it.
+    pub(crate) fn values(self, codes: Option<Codes>) -> Decoder {
+        self.reading(codes, 0)
+    }
+
+    /// [`Self::values`] of the texels of `img`, from a table of every code where it has more
+    /// texels than codes.
+    pub(crate) fn on(self, img: &Img) -> Decoder {
+        self.reading(img.codes, img.px.len())
+    }
+
+    fn reading(self, codes: Option<Codes>, texels: usize) -> Decoder {
+        let codes = codes.filter(|_| self.transfer != Transfer::Linear);
+        let table = codes
+            .filter(|c| texels > c.max() as usize)
+            .map(|c| (0..=c.max()).map(|k| self.code(c, k)).collect());
+        Decoder {
+            decode: self,
+            codes,
+            table,
+        }
+    }
+}
+
+/// Values an image stores as unsigned integer codes of this many bits: the f32 nearest
+/// `code / (2^bits - 1)`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Codes(u8);
+
+impl Codes {
+    pub(crate) const EIGHT: Self = Self(8);
+    pub(crate) const SIXTEEN: Self = Self(16);
+
+    fn max(self) -> u32 {
+        (1 << self.0) - 1
+    }
+
+    /// The stored value of `code`.
+    pub(crate) fn value(self, code: u32) -> f32 {
+        code as f32 / self.max() as f32
+    }
+
+    /// The code whose stored value `v` is, if it is one. A code's value times the largest code
+    /// lies far within a half of the code.
+    fn of(self, v: f32) -> Option<u32> {
+        let code = (v * self.max() as f32 + 0.5) as u32;
+        (code <= self.max() && self.value(code) == v).then_some(code)
+    }
+}
+
+/// A [`Decode`] of the values of one image.
+pub(crate) struct Decoder {
+    decode: Decode,
+    codes: Option<Codes>,
+    /// [`Decode::code`] of every code.
+    table: Option<Vec<f32>>,
+}
+
+impl Decoder {
+    pub(crate) fn value(&self, stored: f32) -> f32 {
+        let Some((codes, code)) = self.codes.and_then(|c| Some((c, c.of(stored)?))) else {
+            return self.decode.value(stored);
+        };
+        match &self.table {
+            Some(t) => t[code as usize],
+            None => self.decode.code(codes, code),
+        }
+    }
 }
 
 /// How a texel's channels read.
@@ -335,28 +417,28 @@ impl Read {
         }
     }
 
+    /// This read of the texels of `img`. An ICC transform reads signals, which no code's value
+    /// stands in for.
+    pub(crate) fn on(&self, img: &Img) -> Reader<'_> {
+        let decode = match self.icc {
+            Some(_) => self.decode.values(None),
+            None => self.decode.on(img),
+        };
+        Reader { read: self, decode }
+    }
+
+    /// This read of values of an image that stores `codes`, as [`Decode::values`] reads each.
+    pub(crate) fn values(&self, codes: Option<Codes>) -> Reader<'_> {
+        let codes = codes.filter(|_| self.icc.is_none());
+        Reader {
+            read: self,
+            decode: self.decode.values(codes),
+        }
+    }
+
     /// Whether this is `decode` alone, so that blocks stored under `decode` hold what it reads.
     pub(crate) fn is(&self, decode: Decode) -> bool {
         self.decode == decode && self.icc.is_none() && !self.straight
-    }
-
-    /// The color of stored texel `t`, through `gamut`, with its alpha.
-    pub(crate) fn color(&self, t: [f32; 4], gamut: Option<&DMat3>) -> [f32; 4] {
-        let rgb = match &self.icc {
-            Some(icc) => icc.linear([0, 1, 2].map(|c| self.decode.signal(t[c]))),
-            None => [0, 1, 2].map(|c| self.decode.value(t[c])),
-        };
-        let rgb = rgb.map(|v| self.unmultiplied(v, t[3]));
-        let [r, g, b] = gamut.map_or(rgb, |m| multiply(m, rgb));
-        [r, g, b, t[3]]
-    }
-
-    /// Channel `c` of stored texel `t`, as a channel of color.
-    pub(crate) fn value(&self, t: [f32; 4], c: usize) -> f32 {
-        if self.icc.is_some() && c < 3 {
-            return self.color(t, None)[c];
-        }
-        self.unmultiplied(self.decode.value(t[c]), t[3])
     }
 
     /// Stored value `v` as one channel reads it, as far as its sign goes: an ICC transform reads
@@ -378,15 +460,42 @@ impl Read {
             (None, None) => false,
         }
     }
+}
+
+/// A [`Read`] of the texels of one image.
+pub(crate) struct Reader<'a> {
+    read: &'a Read,
+    decode: Decoder,
+}
+
+impl Reader<'_> {
+    /// The color of stored texel `t`, through `gamut`, with its alpha.
+    pub(crate) fn color(&self, t: [f32; 4], gamut: Option<&DMat3>) -> [f32; 4] {
+        let rgb = match &self.read.icc {
+            Some(icc) => icc.linear([0, 1, 2].map(|c| self.read.decode.signal(t[c]))),
+            None => [0, 1, 2].map(|c| self.decode.value(t[c])),
+        };
+        let rgb = rgb.map(|v| self.unmultiplied(v, t[3]));
+        let [r, g, b] = gamut.map_or(rgb, |m| multiply(m, rgb));
+        [r, g, b, t[3]]
+    }
+
+    /// Channel `c` of stored texel `t`, as a channel of color.
+    pub(crate) fn value(&self, t: [f32; 4], c: usize) -> f32 {
+        if self.read.icc.is_some() && c < 3 {
+            return self.color(t, None)[c];
+        }
+        self.unmultiplied(self.decode.value(t[c]), t[3])
+    }
 
     /// The channels of stored texel `t` as [`Self::value`] reads them, but where the color is, not
     /// where a transform's clamp leaves it: a texel below 0 no transform takes reads as its lowest
     /// signal.
     pub(crate) fn reach(&self, t: [f32; 4]) -> [f32; 4] {
-        let Some(icc) = &self.icc else {
+        let Some(icc) = &self.read.icc else {
             return [0, 1, 2, 3].map(|c| self.value(t, c));
         };
-        let signal = [0, 1, 2].map(|c| self.decode.signal(t[c]));
+        let signal = [0, 1, 2].map(|c| self.read.decode.signal(t[c]));
         let lowest = signal.into_iter().fold(0.0, f32::min);
         let rgb = if lowest < BELOW_ZERO {
             [lowest; 3]
@@ -408,7 +517,7 @@ impl Read {
     /// nothing: it stays as stored.
     fn unmultiplied(&self, v: f32, alpha: f32) -> f32 {
         let straight = v / alpha;
-        if self.straight && alpha > 0.0 && straight.is_finite() {
+        if self.read.straight && alpha > 0.0 && straight.is_finite() {
             straight
         } else {
             v

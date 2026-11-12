@@ -136,11 +136,7 @@ impl Texel {
                 Self::Rgba8 => [color(b[0]), color(b[1]), color(b[2]), unorm8(b[3])],
             })
             .collect();
-        Img {
-            w: size,
-            h: size,
-            px,
-        }
+        Img::of(size, size, px)
     }
 }
 

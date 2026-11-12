@@ -22,7 +22,7 @@ use orr_pack::texture::{
 use orr_pack::{ArchiveWriter, AssetId, BcLayout, BlobIn, Class, Filter, Hash32, Span};
 use serde::Deserialize;
 
-use color::{BELOW_ZERO, Decode, ImageColor, Read};
+use color::{BELOW_ZERO, Codes, Decode, ImageColor, Read, Reader};
 use ctt::Quality;
 pub(crate) use encode::{Encoding, encode as encode_chains};
 pub(crate) use env::working_set as environment_working_set;
@@ -206,20 +206,29 @@ impl Wrap {
     }
 }
 
-/// Linear float RGBA texels, row-major.
+/// Linear float RGBA texels, row-major, or a file's values as stored.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Img {
     pub(crate) w: u32,
     pub(crate) h: u32,
     pub(crate) px: Vec<[f32; 4]>,
+    /// Every value is a code of these, as a file stores it. Writing other values in place drops
+    /// it.
+    codes: Option<Codes>,
 }
 
 impl Img {
     fn new(w: u32, h: u32) -> Self {
+        Self::of(w, h, vec![[0.0; 4]; w as usize * h as usize])
+    }
+
+    /// Texels `px`, which state no codes.
+    pub(crate) fn of(w: u32, h: u32, px: Vec<[f32; 4]>) -> Self {
         Self {
             w,
             h,
-            px: vec![[0.0; 4]; w as usize * h as usize],
+            px,
+            codes: None,
         }
     }
 
@@ -645,7 +654,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
     let measures = negatives || (color && read.reaches_past(gamut));
     let clipped = AtomicBool::new(false);
     // The conversion says whether a color clips, and the first that does settles it.
-    let measure = |read: &Read, p: [f32; 4]| {
+    let measure = |read: &Reader, p: [f32; 4]| {
         if measures && !clipped.load(Ordering::Relaxed) && read.clips(p, gamut) {
             clipped.store(true, Ordering::Relaxed);
         }
@@ -664,9 +673,13 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
             straight: false,
             ..read
         };
-        for p in src.layers.iter_mut().flat_map(|l| &mut l.px) {
-            measure(&read, *p);
-            *p = read.color(*p, gamut);
+        for l in &mut src.layers {
+            let read = read.on(l);
+            simd::update(&mut l.px, |p| {
+                measure(&read, *p);
+                *p = read.color(*p, gamut);
+            });
+            l.codes = None;
         }
         return env::cook(src, s, primaries, light_threshold, max_lights, quality)
             .map(|b| b.with_clips(&clipped));
@@ -709,9 +722,9 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         z: 2,
         decode: Decode::STORED,
     };
-    let linear = |p: &mut [f32; 4]| {
+    let linear = |read: &Reader, p: &mut [f32; 4]| {
         if color {
-            measure(&read, *p);
+            measure(read, *p);
             *p = read.color(*p, gamut);
         }
         if normal {
@@ -774,9 +787,15 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
             ));
         }
         if !remakes {
-            let mut chains = source_chains(b, s.max_size, |mut p| {
-                linear(&mut p);
-                if normal { mips::normalized(p) } else { p }
+            let mut chains = source_chains(b, s.max_size, |img| {
+                let read = read.on(img);
+                simd::update(&mut img.px, |p| {
+                    linear(&read, p);
+                    if normal {
+                        *p = mips::normalized(*p);
+                    }
+                });
+                img.codes = None;
             })?;
             if plan.mips.height {
                 load::decode_layers(&mut src)?;
@@ -792,19 +811,21 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         .layers
         .into_iter()
         .map(|mut l| {
-            l.px.iter_mut().for_each(linear);
+            let read = read.on(&l);
+            simd::update(&mut l.px, |p| linear(&read, p));
+            l.codes = None;
             l
         })
         .collect();
     build(layers, &plan).map(|b| b.with_clips(&clipped))
 }
 
-/// Every layer's mips of `b` as stored, without those over `max_size`, decoded and passed
-/// texel by texel through `f`.
+/// Every layer's mips of `b` as stored, without those over `max_size`, each decoded and passed
+/// through `f`.
 fn source_chains(
     b: &Blocks,
     max_size: Option<u32>,
-    f: impl Fn([f32; 4]) -> [f32; 4] + Sync,
+    f: impl Fn(&mut Img),
 ) -> Result<Vec<Vec<Img>>, String> {
     let skip = skipped_mips(b.w, b.h, max_size) as usize;
     b.levels
@@ -815,7 +836,9 @@ fn source_chains(
                 .skip(skip)
                 .map(|(m, bytes)| {
                     let [w, h] = mip_size(b.w, b.h, m as u32);
-                    load::decode_blocks_with(b.vk_format, w, h, bytes, &f)
+                    let mut img = decode_blocks(b.vk_format, w, h, bytes)?;
+                    f(&mut img);
+                    Ok(img)
                 })
                 .collect()
         })

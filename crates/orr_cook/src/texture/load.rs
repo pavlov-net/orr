@@ -24,7 +24,7 @@ use image::codecs::hdr::HdrDecoder;
 use image::codecs::webp::WebPDecoder;
 use orr_pack::texture::{FormatInfo, full_mip_count, mip_size, vk};
 
-use super::color::{self, FileColor, Gamut, ImageColor, Transfer};
+use super::color::{self, Codes, FileColor, Gamut, ImageColor, Transfer};
 use super::material::Layer;
 use super::{Img, Wrap};
 
@@ -862,12 +862,19 @@ fn container(image: ctt::Image, bytes: &[u8]) -> Result<Source, String> {
     let ctt::PipelineOutput::Raw(img) = out else {
         return Err("ctt returned a container for raw output".into());
     };
+    let codes = match stored.channel_kind() {
+        _ if is_snorm(stored) => None,
+        Some(ctt::ChannelKind::U8) => Some(Codes::EIGHT),
+        Some(ctt::ChannelKind::U16) => Some(Codes::SIXTEEN),
+        _ => None,
+    };
     let layers = img
         .surfaces
         .iter()
         .map(|l| {
             let s = &l[0];
             let mut out = Img::new(s.width, s.height);
+            out.codes = codes;
             for (y, row) in out.px.chunks_exact_mut(s.width as usize).enumerate() {
                 let src = &s.data[y * s.stride as usize..][..s.width as usize * 16];
                 for (p, b) in row
@@ -980,17 +987,15 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
             }
         }
     }
-    let rgba = img.to_rgba32f();
-    let (w, h) = rgba.dimensions();
-    let px = rgba
-        .into_raw()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|p| [p[0] * scale[0], p[1] * scale[1], p[2] * scale[2], p[3]])
-        .collect();
+    let (w, h) = (img.width(), img.height());
+    let (codes, mut px) = widened(&img);
+    if scale != [1.0; 3] {
+        for p in &mut px {
+            *p = [p[0] * scale[0], p[1] * scale[1], p[2] * scale[2], p[3]];
+        }
+    }
     Ok(Source {
-        layers: vec![Img { w, h, px }],
+        layers: vec![Img { w, h, px, codes }],
         cube: false,
         color,
         blocks: None,
@@ -1000,6 +1005,36 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
         negatives: hdr && !radiance,
         gray,
     })
+}
+
+/// The texels of `img` as RGBA floats, gray spread over RGB and absent alpha 1. Integers widen as
+/// [`Codes`], which they state.
+fn widened(img: &image::DynamicImage) -> (Option<Codes>, Vec<[f32; 4]>) {
+    fn texels<T: Copy + Into<u32>>(
+        codes: Codes,
+        samples: &[T],
+        channels: usize,
+    ) -> (Option<Codes>, Vec<[f32; 4]>) {
+        let texel = |c: &[T]| {
+            let v = |i: usize| codes.value(c[i].into());
+            match c.len() {
+                1 => [v(0), v(0), v(0), 1.0],
+                2 => [v(0), v(0), v(0), v(1)],
+                3 => [v(0), v(1), v(2), 1.0],
+                _ => [v(0), v(1), v(2), v(3)],
+            }
+        };
+        (
+            Some(codes),
+            samples.chunks_exact(channels).map(texel).collect(),
+        )
+    }
+    let channels = usize::from(img.color().channel_count());
+    match (img.as_flat_samples_u8(), img.as_flat_samples_u16()) {
+        (Some(s), _) => texels(Codes::EIGHT, s.samples, channels),
+        (_, Some(s)) => texels(Codes::SIXTEEN, s.samples, channels),
+        _ => (None, img.to_rgba32f().as_chunks::<4>().0.to_vec()),
+    }
 }
 
 /// States what a PNG's chunks say on `color`, the chunk of lowest priority number in PNG §4.3
@@ -1154,20 +1189,16 @@ pub(super) fn is_animated(bytes: &[u8]) -> bool {
 /// Decodes one layer's BCn mip to float texels (unorm values in 0..1, snorm values in -1..1,
 /// BC6H as floats).
 pub(crate) fn decode_blocks(vk_format: u32, w: u32, h: u32, data: &[u8]) -> Result<Img, String> {
-    decode_blocks_with(vk_format, w, h, data, |t| t)
+    let mut out = Img::new(w, h);
+    decode_rows(vk_format, w, h, data, &mut out.px, |t| t)?;
+    out.codes = block_codes(vk_format);
+    Ok(out)
 }
 
-/// [`decode_blocks`] with each texel passed through `f`.
-pub(super) fn decode_blocks_with(
-    vk_format: u32,
-    w: u32,
-    h: u32,
-    data: &[u8],
-    f: impl Fn([f32; 4]) -> [f32; 4] + Sync,
-) -> Result<Img, String> {
-    let mut out = Img::new(w, h);
-    decode_rows(vk_format, w, h, data, &mut out.px, f)?;
-    Ok(out)
+/// The codes blocks of `vk_format` decode to: BC7 interpolates to 8 bits, and the others in
+/// real numbers.
+pub(super) fn block_codes(vk_format: u32) -> Option<Codes> {
+    matches!(vk_format, vk::BC7_UNORM | vk::BC7_SRGB).then_some(Codes::EIGHT)
 }
 
 /// Channel `c` of one layer's BCn mip, decoded as [`decode_blocks`] decodes it.
@@ -1384,6 +1415,155 @@ mod tests {
                 }
                 // The alpha chunk is lossless.
                 assert_eq!(got[3].round(), f32::from(want[3]), "({x}, {y})");
+            }
+        }
+    }
+
+    /// A PNG of `w` x `h` `texels` with `chunks` ahead of its image data.
+    fn png(
+        color: png::ColorType,
+        depth: png::BitDepth,
+        [w, h]: [u32; 2],
+        texels: &[u8],
+        chunks: &[(&[u8; 4], &[u8])],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut info = png::Info::with_size(w, h);
+        (info.color_type, info.bit_depth) = (color, depth);
+        let mut writer = png::Encoder::with_info(&mut out, info)
+            .unwrap()
+            .write_header()
+            .unwrap();
+        for (name, data) in chunks {
+            writer
+                .write_chunk(png::chunk::ChunkType(**name), data)
+                .unwrap();
+        }
+        writer.write_image_data(texels).unwrap();
+        writer.finish().unwrap();
+        out
+    }
+
+    /// An uncompressed 256 x 1 KTX2 of `texels` in R8G8B8A8_SRGB, premultiplied if it says so.
+    fn srgb_ktx2(texels: &[u8], premultiplied: bool) -> Vec<u8> {
+        let image = ctt::ImageRef {
+            surfaces: vec![vec![ctt::SurfaceRef {
+                data: texels,
+                width: 256,
+                height: 1,
+                depth: 1,
+                stride: 256 * 4,
+                slice_stride: 0,
+            }]],
+            kind: TextureKind::Texture2D,
+            desc: ctt::FormatDesc {
+                format: ctt::Format::R8G8B8A8_SRGB,
+                color_space: ColorSpace::Srgb,
+                alpha: ctt::AlphaMode::Straight,
+            },
+        };
+        let settings = ctt::ConvertSettings {
+            container: ctt::Container::ktx2(),
+            ..Default::default()
+        };
+        let ctt::PipelineOutput::Encoded(mut bytes) = ctt::convert(image, settings).unwrap() else {
+            panic!("container output");
+        };
+        // KTX 2.0 §3.10: bit 0 of the DFD's flags states premultiplied alpha.
+        let dfd = u32::from_le_bytes(bytes[48..52].try_into().unwrap()) as usize;
+        bytes[dfd + 15] = u8::from(premultiplied);
+        bytes
+    }
+
+    /// 8-bit sRGB codes read as the f32 nearest their exact value, through each loader and gray,
+    /// and premultiplied ones before their alpha divides them. The f32 nearest a code over 255
+    /// read through the curve misses it for some codes, which this tells apart.
+    #[test]
+    fn eight_bit_srgb_codes_read_exactly() {
+        let exact = |k: usize| orr_color::srgb8_decode(k as u8);
+        let near = |k: usize| orr_color::srgb_decode(f64::from(k as f32 / 255.0)) as f32;
+        assert!((0..256).any(|k| near(k).to_bits() != exact(k).to_bits()));
+
+        let rgb: Vec<u8> = (0..=255).flat_map(|k| [k, k, k]).collect();
+        let gray: Vec<u8> = (0..=255).collect();
+        let rgba: Vec<u8> = (0..=255).flat_map(|k| [k, k, k, 255]).collect();
+        let half: Vec<u8> = (0..=255).flat_map(|k| [k, k, k, 128]).collect();
+        let (eight, rgb8) = (png::BitDepth::Eight, png::ColorType::Rgb);
+        let files = [
+            (png(rgb8, eight, [256, 1], &rgb, &[]), 1.0),
+            (
+                png(
+                    png::ColorType::Grayscale,
+                    eight,
+                    [256, 1],
+                    &gray,
+                    &[(b"sRGB", &[0])],
+                ),
+                1.0,
+            ),
+            (srgb_ktx2(&rgba, false), 1.0),
+            (srgb_ktx2(&half, true), 128.0 / 255.0),
+        ];
+        for (i, (file, alpha)) in files.iter().enumerate() {
+            let src = decode(file).unwrap();
+            let (read, ..) = ImageColor::File.color(&src.color, None, |_| false);
+            let img = &src.layers[0];
+            let (texels, values) = (read.on(img), read.values(img.codes));
+            for (k, t) in img.px.iter().enumerate() {
+                let want = (exact(k) / alpha).to_bits();
+                for c in 0..3 {
+                    assert_eq!(texels.value(*t, c).to_bits(), want, "file {i} code {k}");
+                    assert_eq!(values.value(*t, c).to_bits(), want, "file {i} code {k}");
+                }
+            }
+        }
+    }
+
+    /// Every curve but 8-bit sRGB reads a code as it reads the value that stores it, bit for bit,
+    /// through a table or without: a gamma chunk, narrow-range PQ, HLG, and 16-bit gray sRGB.
+    #[test]
+    fn other_curves_read_codes_as_their_values() {
+        let codes: Vec<u8> = (0..=255).flat_map(|k| [k, 255 - k, k / 2]).collect();
+        let wide: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_be_bytes).collect();
+        let gamma = (0.45455f64 * 100_000.0).round() as u32;
+        let (rgb8, eight) = (png::ColorType::Rgb, png::BitDepth::Eight);
+        let files = [
+            png(
+                rgb8,
+                eight,
+                [256, 1],
+                &codes,
+                &[(b"gAMA", &gamma.to_be_bytes())],
+            ),
+            png(rgb8, eight, [256, 1], &codes, &[(b"cICP", &[9, 16, 0, 0])]),
+            png(rgb8, eight, [256, 1], &codes, &[(b"cICP", &[9, 18, 0, 1])]),
+            png(
+                png::ColorType::Grayscale,
+                png::BitDepth::Sixteen,
+                [256, 256],
+                &wide,
+                &[(b"sRGB", &[0])],
+            ),
+        ];
+        for (i, file) in files.iter().enumerate() {
+            let src = decode(file).unwrap();
+            let (read, ..) = ImageColor::File.color(&src.color, None, |_| false);
+            assert_ne!(read.decode.transfer, Transfer::Linear, "file {i}");
+            let img = &src.layers[0];
+            let (texels, values) = (read.on(img), read.values(None));
+            let one = Img {
+                w: 1,
+                h: 1,
+                px: img.px[..1].to_vec(),
+                codes: img.codes,
+            };
+            let untabled = read.on(&one);
+            for t in &img.px {
+                for c in 0..3 {
+                    let want = values.value(*t, c).to_bits();
+                    assert_eq!(texels.value(*t, c).to_bits(), want, "file {i} {t:?}");
+                    assert_eq!(untabled.value(*t, c).to_bits(), want, "file {i} {t:?}");
+                }
             }
         }
     }
