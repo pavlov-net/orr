@@ -58,7 +58,7 @@ use crate::transparency::TransparencyPass;
 use crate::traverse::{CutInputs, CutPipelines, CutSizes, CutStats, Cuts, PageFeedback};
 use crate::upload::{Record, scatter};
 use crate::view::{RasterView, ViewDesc, ViewHistory, ViewHistoryId, view_constants};
-use crate::work::DetailTarget;
+use crate::work::{DetailTarget, Floors};
 use crate::world::{WorldPos, needs_rebase, origin_for};
 mod probe;
 
@@ -1948,7 +1948,15 @@ impl<'a> Frame<'a> {
                     entries: core.mounts.mesh_pages.entries(),
                     requests: core.budgets.traversal_requests,
                 };
-                cpu.cuts = Some(Cuts::new(device, sizes, core.fif)?);
+                // Lists of nothing where the device lacks the memory: `fit` says so and tries
+                // again.
+                let cuts = match Cuts::new(device, sizes, core.fif, floors) {
+                    Err(e) if e.is_out_of_memory() => {
+                        Cuts::new(device, sizes, core.fif, Floors::default())?
+                    }
+                    cuts => cuts?,
+                };
+                cpu.cuts = Some(cuts);
             }
             let cuts = cpu.cuts.as_mut().expect("made above");
             cuts.follow_models(device, core.mounts.models.capacity())?;
@@ -2700,11 +2708,20 @@ impl<'a> Frame<'a> {
         };
         let mut short = None;
         if history.lists.is_none() {
-            let none = ListSizes {
-                visible_clusters: 0,
-                work: 0,
+            // Lists of nothing where the device lacks the memory, until it has it.
+            let made = match ViewLists::new(device, want) {
+                Err(e) if e.is_out_of_memory() => {
+                    history.lists_retry = self.id + response_period(core.fif);
+                    short = Some(e);
+                    let none = ListSizes {
+                        visible_clusters: 0,
+                        work: 0,
+                    };
+                    ViewLists::new(device, none)?
+                }
+                made => made?,
             };
-            history.lists = Some(ViewLists::new(device, none)?);
+            history.lists = Some(made);
         }
         let lists = history.lists.as_mut().expect("lists made above");
         if lists.sizes() != want && self.id >= history.lists_retry {

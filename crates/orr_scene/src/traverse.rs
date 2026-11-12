@@ -628,9 +628,8 @@ pub(crate) struct CutInputs {
 }
 
 impl Cuts {
-    /// The cut tables of a scene, their work lists holding nothing until [`Self::fit`] gives
-    /// them their floors.
-    pub(crate) fn new(device: &Device, sizes: CutSizes, fif: u32) -> Result<Self> {
+    /// The cut tables of a scene, their work lists at `floors`.
+    pub(crate) fn new(device: &Device, sizes: CutSizes, fif: u32, floors: Floors) -> Result<Self> {
         let dl = MemoryKind::DeviceLocal;
         let mut blocks = Vec::new();
         let mut block = |bytes: u64, name: &str| -> Result<GpuPtr<u8>> {
@@ -640,12 +639,27 @@ impl Cuts {
             Ok(gpu)
         };
         let slot_cut = slot_cuts(device, sizes.slots)?;
-        let floors = Floors::default();
-        let lists = Lists::new(device, 0, 0)?;
+        let held = |limit: u32, floor: u32| {
+            let mut c = Capacity::new(limit);
+            c.floor(floor);
+            c.set(c.wanted());
+            c
+        };
+        let queue = held(u32::MAX, floors.queue);
+        let candidates = held(u32::MAX, floors.candidates);
+        let lists = Lists::new(device, queue.held(), candidates.held())?;
         let traced = device.caps().cluster.max_partitions > 0;
-        let rt = RtTables::new(device, RtSizes::of(&floors), traced)?;
-        // The table of equal cuts holds an entry at least.
+        let clas = held(RT_CLAS_LIMIT, floors.rt_clas);
+        let jobs = held(RT_BLAS_LIMIT, floors.rt_blas);
         let mut keys = Capacity::new(RT_KEYS_LIMIT);
+        keys.floor(floors.rt_keys);
+        let rt_sizes = RtSizes {
+            clas: clas.held(),
+            jobs: jobs.held(),
+            keys: key_entries(keys.wanted()),
+        };
+        let rt = RtTables::new(device, rt_sizes, traced)?;
+        // The table of equal cuts holds an entry at least.
         keys.set(rt.sizes.keys / 2);
         let model_cut = merged_cuts(device, sizes.models)?;
         let counters = block(4 * COUNTERS as u64, "cut counters")?.cast();
@@ -679,8 +693,8 @@ impl Cuts {
             histogram,
             feedback,
             admit,
-            queue_capacity: 0,
-            candidate_capacity: 0,
+            queue_capacity: queue.held(),
+            candidate_capacity: candidates.held(),
             clas_capacity: 0,
             job_capacity: 0,
             key_mask: 0,
@@ -704,12 +718,12 @@ impl Cuts {
             gpu,
             record: cut_record(device, gpu)?,
             lists,
-            queue: Capacity::new(u32::MAX),
-            candidates: Capacity::new(u32::MAX),
+            queue,
+            candidates,
             floors,
             retry: 0,
-            clas: Capacity::new(RT_CLAS_LIMIT),
-            jobs: Capacity::new(RT_BLAS_LIMIT),
+            clas,
+            jobs,
             keys,
             rt,
             rt_retry: 0,
