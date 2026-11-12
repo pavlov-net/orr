@@ -16,6 +16,7 @@ use std::io::{BufRead, BufReader, Cursor, Read, Seek};
 use std::path::Path;
 
 use crate::par::prelude::*;
+use crate::simd;
 use ctt::input::{InputOverrides, decode_container};
 use ctt::{ColorSpace, FormatExt, TextureKind};
 use image::ImageDecoder;
@@ -338,13 +339,13 @@ pub(super) fn open_blocks(bytes: &[u8]) -> Result<(Source, Option<Swizzle>), Str
 
 /// Texels `px` as swizzle `s` reads them.
 pub(super) fn swizzle(px: &mut [[f32; 4]], s: Swizzle) {
-    for p in px {
+    simd::update(px, |p| {
         let t = *p;
         *p = s.map(|c| match c {
             Component::Channel(i) => t[i],
             Component::Value(v) => v,
         });
-    }
+    });
 }
 
 /// [`open`], taking at most `levels` mips of a KTX2 file.

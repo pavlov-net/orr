@@ -126,6 +126,7 @@ mod raster;
 mod report;
 mod run;
 mod shading;
+mod simd;
 mod skin;
 mod state;
 mod subd;
@@ -159,6 +160,7 @@ pub use report::{
     LevelReport, MeshReport, NeuralReport, NeuralTextureReport, Outcome, TangentReport,
     TextureReport,
 };
+pub use simd::force_level as force_simd_level;
 pub use skin::ClipSettings;
 pub use subd::{
     Boundary, CageColor, CageInput, CageUv, CageValues, Corner, Crease, FaceVarying, SubdSettings,

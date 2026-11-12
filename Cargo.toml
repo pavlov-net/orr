@@ -44,6 +44,8 @@ env_logger = { version = "0.11.11", default-features = false }
 glam = { version = "0.34", default-features = false, features = ["std", "f64", "i32", "i64", "u32"] }
 blake3 = "1"
 bitflags = "2"
+fearless_simd = "1.2.0"
+fearless_simd_macros = "0.1.0"
 bytemuck = { version = "1", features = ["derive"] }
 # 0.14 is the version ctt uses, so one zstd-sys builds.
 zstd = "0.14"

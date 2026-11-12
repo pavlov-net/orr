@@ -16,7 +16,10 @@ use orr_pack::{Archive, Class, Codec, Entry};
 const USAGE: &str = "usage:
   orr_cook build <manifest.toml> [--jobs N] [--force] [--cache DIR] [--cache-cap BYTES]
                  [--working-set BYTES] [--quality Q] [--zstd-level L] [--report r.json]
+                 [--simd LEVEL]
       Q: ultrafast, veryfast, fast (the default), basic, slow or veryslow
+      LEVEL: the vector instructions of the cook's loops, in place of the best the CPU has:
+             sse2, sse4.2, avx2, avx512, neon or (built with simd-fallback) fallback
   orr_cook inspect <archive> [--class C] [--name N]
   orr_cook verify <archive>
   orr_cook bench-decode <archive>";
@@ -73,6 +76,7 @@ fn build(args: &[String]) -> Result<bool> {
                 opts.zstd_level = Some(it.next().ok_or(USAGE)?.parse().map_err(|_| USAGE)?);
             }
             "--report" => opts.report = Some(it.next().ok_or(USAGE)?.into()),
+            "--simd" => orr_cook::force_simd_level(it.next().ok_or(USAGE)?)?,
             _ if manifest.is_none() => manifest = Some(Path::new(a)),
             _ => return Err(USAGE.into()),
         }

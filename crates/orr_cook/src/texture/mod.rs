@@ -30,6 +30,8 @@ use load::{Blocks, Source};
 pub(crate) use load::{decode_blocks, decode_channel, file_header};
 use mips::{MipSpec, Toksvig};
 
+use crate::par::prelude::*;
+use crate::simd::{self, Simd, dispatch, simd};
 use crate::{Error, Result};
 
 /// How one texture is cooked.
@@ -241,25 +243,32 @@ impl Img {
         let held = self.px.iter().flatten().any(|v| !v.is_finite()).then(|| {
             let ranges: [_; 4] = std::array::from_fn(|c| self.finite_range(c));
             let mut held = (*self).clone();
-            for p in &mut held.px {
+            simd::update(&mut held.px, |p| {
                 for (v, (lo, hi)) in p.iter_mut().zip(ranges) {
                     if !v.is_finite() {
                         *v = if lo <= hi { v.max(lo).min(hi) } else { 0.0 };
                     }
                 }
-            }
+            });
             held
         });
         let src = held.as_ref().unwrap_or(&self);
         let mut out = Self::new(w, h);
-        for y in 0..h {
-            for x in 0..w {
-                let sx = (x as f32 + 0.5) * self.w as f32 / w as f32 - 0.5;
-                let sy = (y as f32 + 0.5) * self.h as f32 / h as f32 - 0.5;
-                out.px[(y * w + x) as usize] = src.bilinear(sx, sy);
-            }
-        }
+        out.px.par_chunks_mut(w as usize).enumerate().for_each(
+            |(y, row)| dispatch!(simd::level(), s => src.resized_row(s, y as u32, h, row)),
+        );
         Arc::new(out)
+    }
+
+    /// Row `y` of [`Self::resized`] to `row.len()` x `h`.
+    #[simd]
+    fn resized_row<S: Simd>(&self, _: S, y: u32, h: u32, row: &mut [[f32; 4]]) {
+        let w = row.len() as u32;
+        let sy = (y as f32 + 0.5) * self.h as f32 / h as f32 - 0.5;
+        for (x, o) in (0..w).zip(row) {
+            let sx = (x as f32 + 0.5) * self.w as f32 / w as f32 - 0.5;
+            *o = self.bilinear(sx, sy);
+        }
     }
 
     /// Bilinear sample at texel coordinates (texel centers at integers), clamped at edges.

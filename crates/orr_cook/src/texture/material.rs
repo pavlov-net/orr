@@ -63,6 +63,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::par::prelude::*;
+use crate::simd;
 use ctt::Quality;
 use orr_color::RgbPrimaries;
 use orr_math::{DMat3, DVec3};
@@ -74,7 +75,7 @@ use serde::Deserialize;
 
 use super::color::{BELOW_ZERO, Decode, FileColor, ImageColor, Read, clipped, multiply};
 use super::load::{self, Blocks, Component, Gray, Source, Swizzle};
-use super::mips::{MipSpec, Toksvig, normalized, settled};
+use super::mips::{MipSpec, Toksvig, normalize, normalized, settled};
 use super::neural::{self, NeuralJob, NeuralSettings};
 use super::tiles::Cell;
 use super::{
@@ -197,7 +198,12 @@ impl TexRef {
     /// The normal in texel `t`, with [`Packer::normal_source`]'s remap, of an image laid out as
     /// `source` says.
     fn normal(&self, source: NormalSource, t: [f32; 4]) -> [f32; 3] {
-        let value = |c: usize| source.decode.value(t[c]);
+        self.normal_of(source, t, |v| source.decode.value(v))
+    }
+
+    /// [`Self::normal`], with `value` reading each stored component.
+    fn normal_of(&self, source: NormalSource, t: [f32; 4], value: impl Fn(f32) -> f32) -> [f32; 3] {
+        let value = |c: usize| value(t[c]);
         let [x, y] = [self.read(0, value(0)), self.read(1, value(source.y))];
         let z = if source.rg {
             normal::z(x, y)
@@ -2832,7 +2838,7 @@ impl TextureJob {
                 }
                 let mut img = self.pack(&mips, [mw, mh]);
                 if self.pack.normal {
-                    img.px.par_iter_mut().for_each(|p| *p = normalized(*p));
+                    normalize(&mut img.px);
                 }
                 Ok(img)
             })
@@ -2861,8 +2867,8 @@ impl TextureJob {
         let as_stored = Read::of(Decode::STORED);
         for (c, ch) in self.pack.channels.iter().enumerate() {
             match &ch.texels {
-                &Texels::Constant(v) => img.px.par_iter_mut().for_each(|t| t[c] = v),
-                Texels::Unused => img.px.par_iter_mut().for_each(|t| t[c] = 1.0),
+                &Texels::Constant(v) => simd::update(&mut img.px, |t| t[c] = v),
+                Texels::Unused => simd::update(&mut img.px, |t| t[c] = 1.0),
                 &Texels::NormalZ {
                     encoded,
                     image,
@@ -2874,10 +2880,17 @@ impl TextureJob {
                     } else {
                         (0.0, 1.0)
                     };
-                    img.px
-                        .par_iter_mut()
-                        .zip(&decoded[&image].px)
-                        .for_each(|(t, s)| t[c] = a + b * r.normal(source, *s)[2]);
+                    let texels = &decoded[&image].px;
+                    if source.decode == Decode::STORED {
+                        // What `source.decode` reads of a stored value: the value itself.
+                        simd::zip(&mut img.px, texels, |t, s| {
+                            t[c] = a + b * r.normal_of(source, *s, |v| v)[2];
+                        });
+                    } else {
+                        simd::zip(&mut img.px, texels, |t, s| {
+                            t[c] = a + b * r.normal(source, *s)[2];
+                        });
+                    }
                 }
                 Texels::Image {
                     image,
@@ -2888,21 +2901,28 @@ impl TextureJob {
                 } => {
                     let source = &decoded[image].px;
                     let (texels, read) = if read.icc.is_some() {
-                        let texels = profiled.entry(*image).or_insert_with(|| {
-                            source.par_iter().map(|s| read.color(*s, None)).collect()
-                        });
+                        let texels = profiled
+                            .entry(*image)
+                            .or_insert_with(|| simd::mapped(source, |s| read.color(*s, None)));
                         (&*texels, &as_stored)
                     } else {
                         (source, read)
                     };
-                    img.px.par_iter_mut().zip(texels).for_each(|(t, s)| {
-                        t[c] = stored(read.value(*s, *channel), *a, *b, limit);
-                    });
+                    if read.is(Decode::STORED) {
+                        // What `read.value` gives of a stored value: the value itself.
+                        simd::zip(&mut img.px, texels, |t, s| {
+                            t[c] = stored(s[*channel], *a, *b, limit);
+                        });
+                    } else {
+                        simd::zip(&mut img.px, texels, |t, s| {
+                            t[c] = stored(read.value(*s, *channel), *a, *b, limit);
+                        });
+                    }
                 }
             }
         }
         if let Some(m) = &self.gamut {
-            img.px.par_iter_mut().for_each(|t| {
+            simd::update(&mut img.px, |t| {
                 let [r, g, b] = multiply(m, [t[0], t[1], t[2]]);
                 *t = [r, g, b, t[3]];
             });

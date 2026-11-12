@@ -19,6 +19,8 @@ bytemuck.workspace = true
 # encoders the cook does not use.
 ctt = { version = "=0.6.1", default-features = false, features = ["encoder-amd", "encoder-bc7enc", "encoder-intel", "ispc-prebuilt", "rayon"] }
 exr = { version = "1.74", default-features = false }
+fearless_simd.workspace = true
+fearless_simd_macros.workspace = true
 libloading = { workspace = true, optional = true }
 gltf = { version = "=1.4.1", default-features = false, features = ["utils", "names", "extras", "KHR_materials_emissive_strength", "KHR_materials_ior"] }
 half.workspace = true
@@ -60,6 +62,9 @@ subd = ["dep:cc", "dep:orr_shaders"]
 # GDeflate payload blobs through NVIDIA's libdeflate fork (`gdeflate` branch; MIT and
 # Apache-2.0, never vendored), compiled from the checkout at ORR_GDEFLATE.
 gdeflate = ["dep:cc", "dep:orr_shaders"]
+# `--simd fallback`: the vector loops' scalar build, which no x86-64 or aarch64 CPU picks, for
+# checking that it cooks the bytes every level does.
+simd-fallback = ["fearless_simd/force_support_fallback"]
 
 [build-dependencies]
 cc = { workspace = true, optional = true }

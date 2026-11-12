@@ -16,7 +16,7 @@ pub(crate) mod prelude {
 }
 
 /// Items of a loop of light items each piece takes at least ([`InJob::light`]).
-const LIGHT_MIN: usize = 1 << 16;
+pub(crate) const LIGHT_MIN: usize = 1 << 16;
 
 /// A parallel iterator whose pieces run in `job`, each at least `min` items.
 pub(crate) struct InJob<I> {

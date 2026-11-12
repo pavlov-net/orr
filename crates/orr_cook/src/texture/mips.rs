@@ -2,6 +2,9 @@
 //! cells allow, normal renormalization, alpha-coverage scaling and Toksvig roughness.
 
 use crate::par::prelude::*;
+use crate::simd::{self, Simd, dispatch, simd};
+use fearless_simd::f32x4;
+use fearless_simd::prelude::*;
 use orr_math::Vec3;
 use orr_pack::texture::mip_size;
 
@@ -32,7 +35,7 @@ pub(super) struct Toksvig {
 pub(super) fn chain(base: Img, spec: &MipSpec, count: u32) -> Vec<Img> {
     let mut base = base;
     if spec.normal {
-        base.px.par_iter_mut().for_each(|p| *p = normalized(*p));
+        normalize(&mut base.px);
     }
     let range = spec.height.then(|| settle_heights(&mut base));
     let mut out = {
@@ -44,7 +47,7 @@ pub(super) fn chain(base: Img, spec: &MipSpec, count: u32) -> Vec<Img> {
     if spec.normal {
         let _z = crate::profile::zone!("mips.renormalize");
         for m in &mut out[1..] {
-            m.px.par_iter_mut().for_each(|p| *p = normalized(*p));
+            normalize(&mut m.px);
         }
     }
     if let Some((channel, cutoff)) = spec.coverage {
@@ -66,9 +69,7 @@ pub(super) fn settled(v: f32, lo: f32, hi: f32) -> f32 {
 /// spreads them through the mips: an infinite tap under a negative lobe makes NaN of its
 /// neighbors, and a mip should average what the mip above it stores.
 pub(super) fn settle(l: &mut Img, lo: f32, hi: f32) {
-    l.px.par_iter_mut()
-        .flatten()
-        .for_each(|v| *v = settled(*v, lo, hi));
+    simd::update(&mut l.px, |p| *p = p.map(|v| settled(v, lo, hi)));
 }
 
 /// Stores non-finite heights as a format of fixed span does, at an end of the image's finite
@@ -86,8 +87,8 @@ pub(super) fn settle_heights(l: &mut Img) -> (f32, f32) {
 /// Holds the heights of `chain` to `lo..hi`: a mip's filter overshoots at steps, past what a
 /// material declares. Unlike `clamp`, this leaves no NaN.
 pub(super) fn keep_heights(chain: &mut [Img], (lo, hi): (f32, f32)) {
-    for p in chain.iter_mut().flat_map(|m| &mut m.px) {
-        p[0] = p[0].max(lo).min(hi);
+    for m in chain {
+        simd::update(&mut m.px, |p| p[0] = p[0].max(lo).min(hi));
     }
 }
 
@@ -123,6 +124,34 @@ pub(super) fn normalized(p: [f32; 4]) -> [f32; 4] {
     }
 }
 
+/// [`normalized`] of every texel of `px`.
+pub(super) fn normalize(px: &mut [[f32; 4]]) {
+    px.par_chunks_mut(simd::PIECE)
+        .for_each(|p| dispatch!(simd::level(), s => normalize_piece(s, p)));
+}
+
+/// [`normalized`] four texels at a time, with the same operations in the same order.
+#[simd]
+fn normalize_piece<S: Simd>(s: S, px: &mut [[f32; 4]]) {
+    let (quads, rest) = px.as_chunks_mut::<4>();
+    for q in quads {
+        let flat: &mut [f32; 16] = bytemuck::cast_mut(q);
+        let [x, y, z, a] = f32x4::load_four_interleaved(s, flat);
+        let l = (x * x + y * y + z * z).sqrt();
+        let unit = l.simd_gt(0.0) & l.simd_lt(f32::INFINITY);
+        let (zero, one) = (f32x4::splat(s, 0.0), f32x4::splat(s, 1.0));
+        let n = [
+            unit.select(x / l, zero),
+            unit.select(y / l, zero),
+            unit.select(z / l, one),
+        ];
+        f32x4::store_four_interleaved([n[0], n[1], n[2], a], flat);
+    }
+    for p in rest {
+        *p = normalized(*p);
+    }
+}
+
 /// Resamples `src` to `dw` x `dh`. With `cells`, each atlas cell resamples alone with its
 /// edges clamped; otherwise the whole image resamples with `wrap`.
 fn downsample(
@@ -153,40 +182,60 @@ fn downsample(
     let mut tmp = vec![[0.0f32; 4]; dw as usize * src.h as usize];
     tmp.par_chunks_mut(dw as usize)
         .zip(src.px.par_chunks(sw))
-        .for_each(|(out, row)| {
-            for (o, taps) in out.iter_mut().zip(&wx) {
-                *o = taps.iter().fold([0.0; 4], |acc, &(j, k)| {
-                    let p = row[j as usize];
-                    std::array::from_fn(|c| acc[c] + p[c] * k)
-                });
-            }
-        });
+        .for_each(|(out, row)| dispatch!(simd::level(), s => filter_row(s, row, &wx, out)));
     let mut out = Img::new(dw, dh);
     out.px
         .par_chunks_mut(dw as usize)
         .zip(&wy)
         .for_each(|(row, taps)| {
-            for (x, o) in row.iter_mut().enumerate() {
-                *o = taps.iter().fold([0.0; 4], |acc, &(j, k)| {
-                    let p = tmp[j as usize * dw as usize + x];
-                    std::array::from_fn(|c| acc[c] + p[c] * k)
-                });
-            }
+            dispatch!(simd::level(), s => filter_rows(s, &tmp, dw as usize, taps, row));
         });
     if filter == MipFilter::Kaiser {
         // Negative lobes can overshoot; clamp values that were non-negative everywhere.
         let floor = src.px.iter().fold([f32::INFINITY; 4], |a, p| {
             std::array::from_fn(|c| a[c].min(p[c]))
         });
-        for p in &mut out.px {
+        simd::update(&mut out.px, |p| {
             for c in 0..4 {
                 if floor[c] >= 0.0 {
                     p[c] = p[c].max(0.0);
                 }
             }
-        }
+        });
     }
     out
+}
+
+/// Each texel of `out` from the texels of `row` its taps in `taps` weigh.
+#[simd]
+fn filter_row<S: Simd>(_: S, row: &[[f32; 4]], taps: &[Vec<(u32, f32)>], out: &mut [[f32; 4]]) {
+    for (o, taps) in out.iter_mut().zip(taps) {
+        *o = taps.iter().fold([0.0; 4], |acc, &(j, k)| {
+            let p = row[j as usize];
+            std::array::from_fn(|c| acc[c] + p[c] * k)
+        });
+    }
+}
+
+/// `out` as the rows `taps` weigh of `src`, rows of `w` texels. Each texel sums its taps in
+/// their order from 0, as [`filter_row`] does, a whole row per tap so the sums vectorize along
+/// it.
+#[simd]
+fn filter_rows<S: Simd>(
+    _: S,
+    src: &[[f32; 4]],
+    w: usize,
+    taps: &[(u32, f32)],
+    out: &mut [[f32; 4]],
+) {
+    let out = out.as_flattened_mut();
+    out.fill(0.0);
+    for &(j, k) in taps {
+        let row = src[j as usize * w..][..w].as_flattened();
+        for (o, &p) in out.iter_mut().zip(row) {
+            *o += p * k;
+        }
+    }
 }
 
 /// Normalized taps per destination texel: (source index, weight).
@@ -438,20 +487,23 @@ impl<'a> Coverage<'a> {
         let r = self.r;
         (r.y..r.y + r.h)
             .into_par_iter()
-            .map(|y| {
-                let mut hits = 0;
-                self.row(y, scale, |_, a| {
-                    hits += u64::from(self.hits(a).0.count_ones());
-                });
-                hits
-            })
+            .map(|y| dispatch!(simd::level(), s => self.count_row(s, y, scale)))
             .sum()
+    }
+
+    /// [`Self::count`] of row `y`.
+    #[simd]
+    fn count_row<S: Simd>(&self, _: S, y: u32, scale: f32) -> u64 {
+        let mut hits = 0;
+        self.row(y, scale, |_, a| {
+            hits += u64::from(self.hits(a).0.count_ones());
+        });
+        hits
     }
 
     /// Histogram of the unscaled sub-sample values.
     fn histogram(&self, bins: usize) -> Vec<u32> {
         let r = self.r;
-        let bin = |a: f32| ((a * (bins - 1) as f32) as usize).min(bins - 1);
         // Rows per partial histogram, so each counts about a million samples.
         let rows = (1 << 16) / r.w as usize + 1;
         let add = |mut a: Vec<u32>, b: Vec<u32>| {
@@ -464,15 +516,7 @@ impl<'a> Coverage<'a> {
             .fold(
                 || vec![0u32; bins],
                 |mut hist, y| {
-                    self.row(y, 1.0, |_, a| {
-                        // Bilinear weights summing to 1 keep 0 and 1 exact.
-                        let v = a[0][0];
-                        if (v == 0.0 || v == 1.0) && a.iter().flatten().all(|&a| a == v) {
-                            hist[bin(v)] += (SUB * SUB) as u32;
-                        } else {
-                            subsamples(a).iter().for_each(|&v| hist[bin(v)] += 1);
-                        }
-                    });
+                    dispatch!(simd::level(), s => self.histogram_row(s, y, &mut hist));
                     hist
                 },
             )
@@ -488,17 +532,7 @@ impl<'a> Coverage<'a> {
             .fold(
                 || (0u64, Vec::new()),
                 |(mut hits, mut pending), y| {
-                    self.row(y, scale, |x, a| {
-                        let (hit, reachable) = self.hits(a);
-                        hits += u64::from(hit.count_ones());
-                        if hit != u16::MAX && reachable {
-                            pending.push(Pending {
-                                texel: y * self.img.w + x,
-                                mask: !hit,
-                                hit,
-                            });
-                        }
-                    });
+                    dispatch!(simd::level(), s => self.start_row(s, y, scale, &mut hits, &mut pending));
                     (hits, pending)
                 },
             )
@@ -511,6 +545,59 @@ impl<'a> Coverage<'a> {
             )
     }
 
+    /// Adds the histogram of row `y` to `hist`, [`Self::histogram`]'s bins.
+    #[simd]
+    fn histogram_row<S: Simd>(&self, _: S, y: u32, hist: &mut [u32]) {
+        let bins = hist.len();
+        let bin = |a: f32| ((a * (bins - 1) as f32) as usize).min(bins - 1);
+        self.row(y, 1.0, |_, a| {
+            // Bilinear weights summing to 1 keep 0 and 1 exact.
+            let v = a[0][0];
+            if (v == 0.0 || v == 1.0) && a.iter().flatten().all(|&a| a == v) {
+                hist[bin(v)] += (SUB * SUB) as u32;
+            } else {
+                subsamples(a).iter().for_each(|&v| hist[bin(v)] += 1);
+            }
+        });
+    }
+
+    /// [`Self::start`] of row `y`, added to `hits` and `pending`.
+    #[simd]
+    fn start_row<S: Simd>(
+        &self,
+        _: S,
+        y: u32,
+        scale: f32,
+        hits: &mut u64,
+        pending: &mut Vec<Pending>,
+    ) {
+        self.row(y, scale, |x, a| {
+            let (hit, reachable) = self.hits(a);
+            *hits += u64::from(hit.count_ones());
+            if hit != u16::MAX && reachable {
+                pending.push(Pending {
+                    texel: y * self.img.w + x,
+                    mask: !hit,
+                    hit,
+                });
+            }
+        });
+    }
+
+    /// The hits of `pending` at `scale` among the sub-samples each still has undecided.
+    #[simd]
+    fn test<S: Simd>(&self, _: S, pending: &mut [Pending], scale: f32) -> u64 {
+        let w = self.img.w;
+        pending
+            .iter_mut()
+            .map(|p| {
+                let a = self.neighborhood(p.texel % w, p.texel / w, scale);
+                p.hit = self.hits(&a).0 & p.mask;
+                u64::from(p.hit.count_ones())
+            })
+            .sum()
+    }
+
     /// The smallest scale from `from` on, to bisection precision, whose coverage reaches
     /// `goal`, and the hits at it. Each test counts only the sub-samples not already known
     /// to hit at the bracket's low end or to miss at its high end.
@@ -519,16 +606,10 @@ impl<'a> Coverage<'a> {
         if self.reaches(known, goal) {
             return (from, known);
         }
-        let w = self.img.w;
         let mut test = |scale: f32| {
             let hit: u64 = pending
-                .par_iter_mut()
-                .with_min_len(1024)
-                .map(|p| {
-                    let a = self.neighborhood(p.texel % w, p.texel / w, scale);
-                    p.hit = self.hits(&a).0 & p.mask;
-                    u64::from(p.hit.count_ones())
-                })
+                .par_chunks_mut(1024)
+                .map(|p| dispatch!(simd::level(), s => self.test(s, p, scale)))
                 .sum();
             let hits = known + hit;
             let reached = self.reaches(hits, goal);
@@ -591,14 +672,20 @@ fn match_coverage(chain: &mut [Img], channel: usize, cutoff: f32, grid: Option<[
         };
         for (r, target) in rects(img, cells).into_iter().zip(targets) {
             let scale = coverage_scale(&Coverage::new(img, r, channel, cutoff), target);
-            for y in r.y..r.y + r.h {
-                for x in r.x..r.x + r.w {
-                    let p = &mut img.px[(y * img.w + x) as usize][channel];
-                    *p = (*p * scale).clamp(0.0, 1.0);
-                }
-            }
+            dispatch!(simd::level(), s => scale_coverage(s, img, r, channel, scale));
         }
     });
+}
+
+/// Scales `channel` of the texels of `r` in `img` by `scale`, held to `0..=1`.
+#[simd]
+fn scale_coverage<S: Simd>(_: S, img: &mut Img, r: Rect, channel: usize, scale: f32) {
+    for y in r.y..r.y + r.h {
+        let at = (y * img.w + r.x) as usize;
+        for p in &mut img.px[at..at + r.w as usize] {
+            p[channel] = (p[channel] * scale).clamp(0.0, 1.0);
+        }
+    }
 }
 
 /// The smallest alpha scale whose coverage reaches `target`.
@@ -664,10 +751,10 @@ impl Toksvig {
             height: false,
         };
         let mut base = self.normals.clone();
-        base.px.par_iter_mut().for_each(|p| *p = normalized(*p));
+        normalize(&mut base.px);
         let raw = raw_chain(base, &normal_spec, chain.len() as u32);
         for (m, n) in chain.iter_mut().zip(&raw).skip(first) {
-            m.px.par_iter_mut().zip(&n.px).for_each(|(p, v)| {
+            simd::zip(&mut m.px, &n.px, |p, v| {
                 let r = Vec3::from_slice(v).length().clamp(1e-4, 1.0);
                 let var = (1.0 - r) / r;
                 let rough = p[self.channel].clamp(0.0, 1.0);
@@ -1060,6 +1147,56 @@ mod tests {
                 (0.95..=1.05).contains(&ratio),
                 "mip {m}: read {ratio} of it"
             );
+        }
+    }
+
+    /// The vector `normalize` gives `normalized`'s bits at every level this CPU has and the
+    /// fallback, for zeros, subnormals, overflow, infinity and NaN, over lengths that leave a
+    /// partial group of four.
+    #[test]
+    fn normalize_matches_normalized_at_every_level() {
+        let v = [
+            0.0,
+            -0.0,
+            1.0,
+            -3.5,
+            1e-30,
+            f32::MIN_POSITIVE / 8.0,
+            1e30,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        let px: Vec<[f32; 4]> = (0..v.len().pow(3))
+            .map(|i| [v[i % 10], v[i / 10 % 10], v[i / 100], v[(i * 7) % 10]])
+            .collect();
+        let detected = fearless_simd::Level::new();
+        #[allow(unused_mut, reason = "x86 adds the levels below the detected one")]
+        let mut levels = vec![detected];
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        levels.extend(
+            [
+                detected.as_sse2().map(Simd::level),
+                detected.as_sse4_2().map(Simd::level),
+                detected.as_avx2().map(Simd::level),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+        #[cfg(feature = "simd-fallback")]
+        levels.push(fearless_simd::Level::fallback());
+        for len in [0, 1, 3, 5, 6, 7, px.len()] {
+            let want: Vec<_> = px[..len]
+                .iter()
+                .map(|&p| normalized(p).map(f32::to_bits))
+                .collect();
+            for &level in &levels {
+                let mut got = px[..len].to_vec();
+                dispatch!(level, s => normalize_piece(s, &mut got));
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(g.map(f32::to_bits), *w, "{level:?} texel {i}: {:?}", px[i]);
+                }
+            }
         }
     }
 }

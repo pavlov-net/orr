@@ -12,6 +12,7 @@ use orr_pack::texture::{FormatInfo, vk};
 
 use super::mips::settled;
 use super::{DataFormat, Img, MipFilter, Usage, linear_to_srgb};
+use crate::simd;
 
 /// Stored format of a cooked texture.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -155,30 +156,36 @@ fn half(v: f32) -> [u8; 2] {
     f16::from_f32(v.clamp(-max, max)).to_le_bytes()
 }
 
+/// `f` of every texel of `m`, one after another.
+fn texel_bytes<const N: usize>(m: &Img, f: impl Fn(&[f32; 4]) -> [u8; N] + Sync) -> Vec<u8>
+where
+    [u8; N]: Default,
+{
+    simd::mapped(&m.px, f).into_flattened()
+}
+
 fn raw(d: DataFormat, m: &Img) -> Vec<u8> {
-    let mut out = Vec::new();
-    for p in &m.px {
-        match d {
-            DataFormat::R8 => out.push(unorm8(p[0])),
-            DataFormat::Rg8 => out.extend(p[..2].iter().map(|&v| unorm8(v))),
-            DataFormat::Rgba8 => out.extend(p.iter().map(|&v| unorm8(v))),
-            DataFormat::Rgba8Srgb => {
-                out.extend(p[..3].iter().map(|&v| unorm8(linear_to_srgb(v))));
-                out.push(unorm8(p[3]));
-            }
-            DataFormat::R16 => out.extend(unorm16(p[0])),
-            DataFormat::R16Snorm => out.extend(snorm16(p[0])),
-            DataFormat::Rg16 => out.extend(p[..2].iter().flat_map(|&v| unorm16(v))),
-            DataFormat::Rgba16 => out.extend(p.iter().flat_map(|&v| unorm16(v))),
-            DataFormat::R16f => out.extend(half(p[0])),
-            DataFormat::Rg16f => out.extend(p[..2].iter().flat_map(|&v| half(v))),
-            DataFormat::Rgba16f => out.extend(p.iter().flat_map(|&v| half(v))),
-            DataFormat::R32f => out.extend(p[0].to_le_bytes()),
-            DataFormat::Rg32f => out.extend(p[..2].iter().flat_map(|v| v.to_le_bytes())),
-            DataFormat::Rgba32f => out.extend(p.iter().flat_map(|v| v.to_le_bytes())),
-        }
+    use DataFormat as D;
+    let le = |v: f32| v.to_le_bytes();
+    match d {
+        D::R8 => texel_bytes(m, |p| [unorm8(p[0])]),
+        D::Rg8 => texel_bytes(m, |p| [unorm8(p[0]), unorm8(p[1])]),
+        D::Rgba8 => texel_bytes(m, |p| p.map(unorm8)),
+        D::Rgba8Srgb => texel_bytes(m, |p| {
+            let [r, g, b] = [p[0], p[1], p[2]].map(|v| unorm8(linear_to_srgb(v)));
+            [r, g, b, unorm8(p[3])]
+        }),
+        D::R16 => texel_bytes(m, |p| unorm16(p[0])),
+        D::R16Snorm => texel_bytes(m, |p| snorm16(p[0])),
+        D::Rg16 => texel_bytes::<4>(m, |p| bytemuck::cast([unorm16(p[0]), unorm16(p[1])])),
+        D::Rgba16 => texel_bytes::<8>(m, |p| bytemuck::cast(p.map(unorm16))),
+        D::R16f => texel_bytes(m, |p| half(p[0])),
+        D::Rg16f => texel_bytes::<4>(m, |p| bytemuck::cast([half(p[0]), half(p[1])])),
+        D::Rgba16f => texel_bytes::<8>(m, |p| bytemuck::cast(p.map(half))),
+        D::R32f => texel_bytes(m, |p| le(p[0])),
+        D::Rg32f => texel_bytes::<8>(m, |p| bytemuck::cast([le(p[0]), le(p[1])])),
+        D::Rgba32f => texel_bytes::<16>(m, |p| bytemuck::cast(p.map(le))),
     }
-    out
 }
 
 /// ctt encoder, preset and input layout for each BCn encoding: bc7e for BC7, Compressonator
@@ -216,31 +223,21 @@ fn bc(e: Encoding, quality: Quality, chains: &[Vec<Img>]) -> Result<Vec<Vec<Vec<
     };
     let srgb = e == Encoding::Bc7Srgb;
     let (lo, hi) = e.range();
-    let texel = |p: &[f32; 4], out: &mut Vec<u8>| match e {
-        Encoding::Bc6h => {
+    let texels = |m: &Img| match e {
+        Encoding::Bc6h => texel_bytes::<16>(m, |p| {
             let [r, g, b] = [p[0], p[1], p[2]].map(|v| settled(v, lo, hi));
-            out.extend([r, g, b, 1.0].iter().flat_map(|v| v.to_le_bytes()));
-        }
-        Encoding::Bc4 | Encoding::Bc5 => out.extend(p[..bpp].iter().map(|&v| unorm8(v))),
-        Encoding::Bc4Snorm | Encoding::Bc5Snorm => {
-            out.extend(p[..bpp].iter().map(|&v| snorm8(v)));
-        }
-        _ => {
-            let rgb = |v: f32| unorm8(if srgb { linear_to_srgb(v) } else { v });
-            out.extend([rgb(p[0]), rgb(p[1]), rgb(p[2]), unorm8(p[3])]);
-        }
+            bytemuck::cast([r, g, b, 1.0].map(f32::to_le_bytes))
+        }),
+        Encoding::Bc4 => raw(DataFormat::R8, m),
+        Encoding::Bc5 => raw(DataFormat::Rg8, m),
+        Encoding::Bc4Snorm => texel_bytes(m, |p| [snorm8(p[0])]),
+        Encoding::Bc5Snorm => texel_bytes(m, |p| [snorm8(p[0]), snorm8(p[1])]),
+        Encoding::Bc7Srgb => raw(DataFormat::Rgba8Srgb, m),
+        _ => raw(DataFormat::Rgba8, m),
     };
     let inputs: Vec<Vec<Vec<u8>>> = chains
         .iter()
-        .map(|c| {
-            c.iter()
-                .map(|m| {
-                    let mut out = Vec::with_capacity(m.px.len() * bpp);
-                    m.px.iter().for_each(|p| texel(p, &mut out));
-                    out
-                })
-                .collect()
-        })
+        .map(|c| c.iter().map(texels).collect())
         .collect();
     let image = ImageRef {
         surfaces: chains
