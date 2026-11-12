@@ -288,10 +288,6 @@ impl Img {
     }
 }
 
-pub(crate) fn srgb_to_linear(v: f32) -> f32 {
-    orr_color::srgb_decode(f64::from(v)) as f32
-}
-
 /// The sRGB encoding of `v`, clamped to 0..1 first.
 pub(crate) fn linear_to_srgb(v: f32) -> f32 {
     orr_color::srgb_encode(f64::from(v.clamp(0.0, 1.0))) as f32

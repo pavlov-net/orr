@@ -770,7 +770,7 @@ mod tests {
     use orr_pack::texture::full_mip_count;
 
     use super::*;
-    use crate::texture::{linear_to_srgb, srgb_to_linear};
+    use crate::texture::linear_to_srgb;
 
     fn full_chain(base: Img, spec: &MipSpec) -> Vec<Img> {
         let count = full_mip_count(base.w, base.h);
@@ -1052,8 +1052,8 @@ mod tests {
         // code value.
         let mut img = Img::new(64, 64);
         for (i, p) in img.px.iter_mut().enumerate() {
-            let v = if (i + i / 64) % 2 == 0 { 1.0 } else { 0.0 };
-            *p = [srgb_to_linear(v); 4];
+            let code = if (i + i / 64) % 2 == 0 { 255 } else { 0 };
+            *p = [orr_color::srgb8_decode(code); 4];
         }
         for filter in [MipFilter::Box, MipFilter::Kaiser] {
             let c = full_chain(img.clone(), &spec(filter));

@@ -3262,7 +3262,14 @@ fn emission_map(arc: &Archive, id: AssetId) -> Result<EmissionMap> {
     let srgb = h.vk_format == orr_pack::texture::vk::BC7_SRGB;
     let planes = mip_planes(h.vk_format, w, hh, &bytes, 3)?;
     let y = header_luminance(h.primaries)?;
-    let linear = |c: f32| if srgb { texture::srgb_to_linear(c) } else { c };
+    // BC7 decodes to its 8-bit codes over 255.
+    let linear = |c: f32| {
+        if srgb {
+            orr_color::srgb8_decode((c * 255.0).round() as u8)
+        } else {
+            c
+        }
+    };
     let [r, g, b] = [&planes[0], &planes[1], &planes[2]];
     let texels = (0..r.len())
         .map(|i| y.x * linear(r[i]) + y.y * linear(g[i]) + y.z * linear(b[i]))
