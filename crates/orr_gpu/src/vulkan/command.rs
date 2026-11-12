@@ -1048,8 +1048,9 @@ impl Drop for CommandList<'_> {
             shared.lists.lock().unwrap().dropped(seq);
         }
         // No other list uses what this one keeps.
+        let after = shared.submitted();
         for item in self.keep.drain(..) {
-            shared.defer(shared.submitted(), item);
+            shared.defer(after, item);
         }
     }
 }

@@ -192,12 +192,7 @@ impl Queue {
         let wait = wait.to_vec();
         let mut backlog = lock(&self.backlog);
         let point = self.next_point();
-        {
-            let mut lists = lock(&self.shared.lists);
-            for f in &finished {
-                lists.submitted(f.seq, point);
-            }
-        }
+        lock(&self.shared.lists).submitted(finished.iter().map(|f| f.seq), point);
         self.resolve_passes(point, passes);
         let unissued = wait.iter().any(|&p| {
             self.queue_timeline(p)
@@ -335,7 +330,7 @@ impl Queue {
                 let mut list = CommandList::new(self).expect("a command list for a CPU step");
                 step(&mut list);
                 let mut done = list.finish();
-                lock(&self.shared.lists).submitted(done.seq, point);
+                lock(&self.shared.lists).submitted([done.seq], point);
                 self.run_steps(&mut done, point, ready, steps);
                 steps.push(done);
             }

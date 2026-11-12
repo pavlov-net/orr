@@ -85,10 +85,12 @@ impl OpenLists {
         seq
     }
 
-    /// List `seq` resolves once `point` has completed.
-    pub(crate) fn submitted(&mut self, seq: u64, point: TimelinePoint) {
-        let i = self.position(seq);
-        self.unresolved[i].1 = Some(point);
+    /// Lists `seqs` resolve once `point` has completed.
+    pub(crate) fn submitted(&mut self, seqs: impl IntoIterator<Item = u64>, point: TimelinePoint) {
+        for seq in seqs {
+            let i = self.position(seq);
+            self.unresolved[i].1 = Some(point);
+        }
     }
 
     /// List `seq` ended without a submit that runs it.

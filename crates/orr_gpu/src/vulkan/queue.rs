@@ -402,12 +402,11 @@ impl Queue {
             .collect();
         self.shared.record_submit(self.kind, value, passes);
         let after = self.shared.after_point(self.point(value));
-        {
-            let mut lists = self.shared.lists.lock().unwrap();
-            for f in &finished {
-                lists.submitted(f.seq, self.point(value));
-            }
-        }
+        self.shared
+            .lists
+            .lock()
+            .unwrap()
+            .submitted(finished.iter().map(|f| f.seq), self.point(value));
         let mut pools = self.pools.lock().unwrap();
         for f in finished {
             for item in f.keep {
@@ -436,11 +435,12 @@ impl Queue {
                 lists.dropped(f.seq);
             }
         }
+        let after = self.shared.submitted();
         let mut pools = self.pools.lock().unwrap();
         for f in finished {
             pools.free.push(f.res);
             for item in f.keep {
-                self.shared.defer(self.shared.submitted(), item);
+                self.shared.defer(after, item);
             }
         }
     }
