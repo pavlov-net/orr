@@ -212,7 +212,7 @@ struct Buffers {
 
 /// Feedback ids of `lights` lights and `entries` emissive list entries: every light, every
 /// entry, then the environment.
-fn feedback_ids(lights: u32, entries: u64) -> u64 {
+pub(crate) fn feedback_ids(lights: u32, entries: u64) -> u64 {
     u64::from(lights) + entries + 1
 }
 

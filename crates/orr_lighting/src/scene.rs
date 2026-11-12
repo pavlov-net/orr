@@ -9,7 +9,7 @@ use orr_scene::orr_gpu::{
 };
 use orr_scene::{LightTables, SceneDesc, SceneRoot, SkyStats};
 
-use crate::caustics::{CausticSettings, CausticStats, Caustics};
+use crate::caustics::{CausticSettings, CausticStats, Caustics, feedback_ids};
 use crate::environment::EnvironmentBake;
 use crate::shaders::light_sampling::{directional, tiles};
 use crate::shaders::types::{
@@ -201,15 +201,15 @@ impl PerLight {
     /// For `lights` lights and `entries` emissive list entries.
     fn new(device: &Device, lights: u32, entries: u64) -> Result<Self, Error> {
         let n = u64::from(lights);
+        let ids = feedback_ids(lights, entries);
         Ok(Self {
             lights,
             states: device_local(device, n, "directional states")?,
             directional_ids: device_local(device, n, "directional ids")?,
             cdf: device_local(device, n + entries, "light cdf")?,
             light_probability: device_local(device, n, "light probabilities")?,
-            // Every candidate, then the environment.
-            feedback_counts: device_local(device, n + entries + 1, "light feedback counts")?,
-            feedback_weights: device_local(device, n + entries + 1, "light feedback weights")?,
+            feedback_counts: device_local(device, ids, "light feedback counts")?,
+            feedback_weights: device_local(device, ids, "light feedback weights")?,
         })
     }
 }
