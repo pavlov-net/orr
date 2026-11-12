@@ -409,7 +409,7 @@ impl Quads {
         let root = c
             .put_root(&emit::Root {
                 scene: c.root,
-                producer: self.producer,
+                producer: c.producer_entry(ProducerId(self.producer)).unwrap(),
                 count: self.count,
                 size: self.size,
                 _pad0: 0,
@@ -497,10 +497,7 @@ fn set_producers_of(
 
 #[test]
 fn emissive_producer_tiles_match_the_density_and_irradiance() {
-    let mut scene = TestScene::new(SceneDesc {
-        producer_capacity: 4,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::new(SceneDesc::default());
     // Entry 0 faces the receiver from y = 2; entry 1 is turned over at y = 2.5 beside it, so
     // only its double-sided quads light the receiver.
     let flip = Mat3::from_rotation_x(PI as f32);
@@ -595,10 +592,7 @@ fn lit_through_a_texture(
     shown: f32,
     what: &str,
 ) {
-    let mut scene = TestScene::new(SceneDesc {
-        producer_capacity: 4,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::new(SceneDesc::default());
     let transforms = [Affine3::from_translation(Vec3::new(0.0, 2.0, 0.0))];
     let quads = Quads {
         producer: 0,
@@ -757,10 +751,7 @@ fn forced_local(
 /// included, and mixed with the tile samples they keep the density of the mixture.
 #[test]
 fn local_sampler_candidates_match_the_hit_side_density() {
-    let mut scene = TestScene::new(SceneDesc {
-        producer_capacity: 4,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::new(SceneDesc::default());
     let quads = Quads {
         producer: 0,
         count: 8,
@@ -989,10 +980,7 @@ fn directional_share_matches_the_lights_weights() {
 
 #[test]
 fn selection_probabilities_follow_power_and_sum_to_one() {
-    let mut scene = TestScene::procedural(SceneDesc {
-        producer_capacity: 2,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::procedural(SceneDesc::default());
     let quads = Quads {
         producer: 1,
         count: 5,
@@ -1151,10 +1139,7 @@ fn check_power(
 
 #[test]
 fn producer_power_equals_area_times_luminance_after_it_moves() {
-    let mut scene = TestScene::new(SceneDesc {
-        producer_capacity: 1,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::new(SceneDesc::default());
     let linear = Mat3::from_rotation_z(0.4) * Mat3::from_diagonal(Vec3::splat(1.5));
     let first = Quads {
         producer: 0,
@@ -1211,10 +1196,7 @@ fn producer_power_equals_area_times_luminance_after_it_moves() {
 
 #[test]
 fn a_scene_without_lights_gives_empty_candidates_and_no_nan() {
-    let mut scene = TestScene::new(SceneDesc {
-        producer_capacity: 2,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::new(SceneDesc::default());
     scene.write(|_, _| {});
     let mut lighting = scene.lighting();
     let threads = 1u32 << 14;
@@ -1370,10 +1352,7 @@ struct Passed {
 /// once a reset has dropped the feedback. With `in_flight` the three frames that grow the table
 /// run one behind another, none waiting for the one before.
 fn grow_lights(in_flight: bool) -> (Vec<Passed>, u32, [[f64; 3]; 2]) {
-    let mut scene = TestScene::procedural(SceneDesc {
-        producer_capacity: 2,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::procedural(SceneDesc::default());
     let quads = Quads {
         producer: 0,
         count: 4,
@@ -1601,10 +1580,7 @@ fn cooked_emitter_tiles_match_the_hit_side_density() {
         .unwrap()
         .memory
         .remove(0);
-    let mut scene = TestScene::new(SceneDesc {
-        producer_capacity: 0,
-        ..SceneDesc::default()
-    });
+    let mut scene = TestScene::new(SceneDesc::default());
     let m = scene.mount(bytes);
     let model = scene
         .scenes

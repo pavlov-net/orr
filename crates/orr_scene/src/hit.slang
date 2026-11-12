@@ -103,7 +103,7 @@ public bool cluster_placement(SceneRoot* s, uint copy, InstanceGpu inst, Cluster
 public bool hit_producer(SceneRoot* s, uint index, out uint entry)
 {
     entry = index - s.producer_base;
-    return may2(MAY2_PRODUCERS) && index >= s.producer_base && entry < s.producer_capacity;
+    return may2(MAY2_PRODUCERS) && index >= s.producer_base && index < s.proxy_base;
 }
 
 // The transform of producer entry `p`, current or previous, relative to the point at

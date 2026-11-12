@@ -24,7 +24,7 @@ use crate::shaders::types::{
 use crate::{Error, Result};
 use orr_gpu::GpuPtr;
 
-/// One copy of a model's subdivision cage, diced as tessellated producer entry `id` of
+/// One copy of a model's subdivision cage, diced as the tessellated producer `id` of
 /// [`crate::SceneWriter::set_subd`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SubdDesc<'a> {

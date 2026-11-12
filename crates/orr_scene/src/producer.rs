@@ -57,7 +57,9 @@ const STRAND_GROUP: u32 = 64;
 /// Swept-sphere builds read two NaN vertices past a strand batch's maximum.
 const SENTINELS: u32 = 2;
 
-/// A producer entry of one scene, below `SceneDesc::producer_capacity`.
+/// A producer of one scene, as the consumer names it: any number. While it is set the scene
+/// keeps it in an entry of its producer table, which
+/// [`SceneWriter::producer_entry`](crate::SceneWriter::producer_entry) gives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProducerId(pub u32);
 
@@ -370,6 +372,8 @@ pub(crate) struct Producer {
     pub(crate) model: Option<ModelId>,
     /// Its entry of its scene's emissive list, which the scene gives it.
     pub(crate) emissive: u32,
+    /// The consumer's name for it.
+    pub(crate) id: Option<ProducerId>,
     accel: Option<Accel>,
     /// Held while the entry is set.
     _memory: Allocation<u8>,
@@ -966,6 +970,7 @@ pub(crate) fn build(
             subd: subd.map(|s| (copy_ptr, s.shape)),
             model: None,
             emissive: 0,
+            id: None,
             accel,
             _memory: memory,
         },

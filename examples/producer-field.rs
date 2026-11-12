@@ -78,13 +78,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
     let scene = renderer
-        .create_scene(
-            &SceneDesc {
-                producer_capacity: 4,
-                ..SceneDesc::default()
-            },
-            &SceneLightingSettings::default(),
-        )
+        .create_scene(&SceneDesc::default(), &SceneLightingSettings::default())
         .expect("scene");
     let history = renderer.create_raster_view_history().expect("view history");
     let [
@@ -356,7 +350,10 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             view: view.view,
             gbuffer: view.gbuffer,
             target: target.storage,
-            entry: GRASS.0,
+            entry: f
+                .producer_entry(scene, GRASS)
+                .expect("scene")
+                .expect("the grass is set"),
         };
         water_roots.as_mut_slice().expect("pond roots")[slot as usize] = pond::Root {
             scene: view.scene,

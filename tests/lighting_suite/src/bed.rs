@@ -258,9 +258,6 @@ const STRAND_SEGMENTS: u32 = 4;
 /// The producer entry of the bed's particles, or of its strands.
 const PARTICLES: ProducerId = ProducerId(0);
 
-/// `SceneDesc::producer_capacity` of every bed scene.
-pub const PRODUCER_CAPACITY: u32 = 1;
-
 /// A particle square's two triangles.
 const PARTICLE_QUAD: [[u8; 3]; 2] = [[0, 1, 2], [0, 2, 3]];
 
@@ -1993,10 +1990,7 @@ impl Bed {
         let mount = mounted(&mut scenes, pack());
         let feature_mount = features.map(|_| mounted(&mut scenes, feature_pack()));
 
-        let desc = SceneDesc {
-            producer_capacity: PRODUCER_CAPACITY,
-            ..SceneDesc::default()
-        };
+        let desc = SceneDesc::default();
         let scene = scenes.create_scene(&desc).unwrap();
         let history = scenes.create_view_history().unwrap();
         let environment = spec.environment.map(|c| {
@@ -2377,7 +2371,7 @@ impl Bed {
             let root = c
                 .put_root(&strands::Root {
                     scene: c.root,
-                    producer: PARTICLES.0,
+                    producer: c.producer_entry(PARTICLES).unwrap(),
                     count: row.count,
                     first: [row.first.x, row.first.y, row.first.z, row.height],
                     step: [row.step.x, row.step.y, row.step.z, row.radius],
@@ -2605,7 +2599,7 @@ impl Bed {
                         scene: c.root,
                         particles: p.list.gpu(),
                         eye,
-                        producer: PARTICLES.0,
+                        producer: c.producer_entry(PARTICLES).unwrap(),
                         count: p.count,
                         _pad: 0,
                     })

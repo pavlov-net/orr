@@ -37,7 +37,7 @@ use crate::mount::{
 use crate::neural::{NeuralTextures, Precision};
 use crate::pipelines::{MeshPipelineId, MeshStages, PipelineId, Pipelines, ReloadReport};
 use crate::producer::{
-    self, Job, ProducerKernels, ProducerStats, ProducerUpdate, Readback, StateTables,
+    self, Job, ProducerId, ProducerKernels, ProducerStats, ProducerUpdate, Readback, StateTables,
 };
 use crate::ptlas::{FrameInputs, PtlasPipelines, RtStats};
 use crate::raster::{self, ListSizes, RasterPipelines, TargetSizes, ViewLists, ViewTargets};
@@ -394,7 +394,7 @@ pub struct SceneCompute<'a, 'q> {
     pub cmd: &'a mut CommandList<'q>,
     pub scene: SceneId,
     pub root: GpuPtr<SceneRoot>,
-    /// The scene's producer batches, indexed by `ProducerId`.
+    /// The scene's producer batches, by producer entry ([`Self::producer_entry`]).
     pub batches: GpuPtr<ProducerBatch>,
     pub time: FrameTime,
     /// The scene focus and the render pixels per radian this update chooses geometry for.
@@ -404,9 +404,16 @@ pub struct SceneCompute<'a, 'q> {
     device: &'a Device,
     window: &'a UploadWindow,
     pipelines: &'a Pipelines,
+    entries: &'a Scene,
 }
 
 impl<'a> SceneCompute<'a, '_> {
+    /// The entry of the scene's producer table that producer `id` holds while it is set, as
+    /// [`SceneWriter::producer_entry`] gives it.
+    pub fn producer_entry(&self, id: ProducerId) -> Option<u32> {
+        self.entries.producer_entry(id)
+    }
+
     /// The current pipeline of `id`.
     pub fn pipeline(&self, id: PipelineId) -> &'a ComputePipeline {
         self.pipelines.get(id)
@@ -748,7 +755,8 @@ impl Scenes {
     /// Unmounts a pack. A pending mount stops loading; a ready one's memory is freed once
     /// every frame submitted so far has completed. Copies of its models and their edits in every
     /// scene are gone from the next frame, placed by hand, on pages or as subdivision copies, and
-    /// their [`InstanceRange`]s and producer entries stay the consumer's.
+    /// their [`InstanceRange`]s stay the consumer's; a subdivision copy's [`ProducerId`] names
+    /// nothing until it is set again.
     pub fn unmount(&mut self, m: MountId) {
         let frame = self.core.next_frame - 1;
         let core = &mut self.core;
@@ -1068,6 +1076,12 @@ impl Scenes {
         crate::scene::page_needs(&self.core.mounts, &self.core.model_cpu, id).map(|(n, ..)| n)
     }
 
+    /// The entry of `scene`'s producer table that producer `id` holds while it is set, as
+    /// [`SceneWriter::producer_entry`] gives it.
+    pub fn producer_entry(&self, scene: SceneId, id: ProducerId) -> Result<Option<u32>> {
+        Ok(self.core.scene(scene)?.producer_entry(id))
+    }
+
     /// Holds back the binds that finish tile moves, as a loading thread busy binding does, or
     /// lets them go.
     #[cfg(feature = "test-hooks")]
@@ -1336,6 +1350,14 @@ impl Scenes {
                 }
                 !done
             });
+            let removed = std::mem::take(&mut cpu.producers_removed);
+            for (frame, first, count) in removed {
+                if frame <= completed {
+                    scene.free_producers(cpu, first, count);
+                } else {
+                    cpu.producers_removed.push((frame, first, count));
+                }
+            }
             cpu.retired.retain(|(frame, _)| *frame > completed);
             cpu.groups_removed.retain(|(frame, _)| *frame > completed);
             let sets = &scene.tables.page_sets;
@@ -1970,7 +1992,7 @@ impl<'a> Frame<'a> {
                 frame_index: self.id as u32,
                 skinned_capacity: t.skinned.capacity(),
                 light_capacity: t.lights.capacity(),
-                producer_capacity: scene.desc.producer_capacity,
+                producer_capacity: t.producers.capacity(),
                 emissive_capacity: t.emissive.capacity(),
                 near_range: cpu.near_range,
                 part_base: layout.slots,
@@ -1986,12 +2008,12 @@ impl<'a> Frame<'a> {
                 decal_globals: cpu.decal_globals,
                 decal_bin_slots: cpu.decal_bin_slots,
                 decal_bin_log2: decals::bin_log2(core.cell_log2),
-                proxy_base: layout.slots + layout.parts + scene.desc.producer_capacity,
+                proxy_base: layout.slots + layout.parts + cpu.ptlas.producer_entries(),
                 proxies: t.proxies.gpu(),
                 proxy_capacity: t.proxies.capacity(),
                 light_base: layout.slots
                     + layout.parts
-                    + scene.desc.producer_capacity
+                    + cpu.ptlas.producer_entries()
                     + cpu.ptlas.proxy_entries(),
                 emissive_lists: t.emissive_lists.gpu().cast(),
             };
@@ -2005,7 +2027,6 @@ impl<'a> Frame<'a> {
                 t.root.gpu(),
                 t.batches.gpu(),
                 cpu.focus_detail(),
-                scene.desc,
                 scene.light_tables(),
             ));
         }
@@ -2207,7 +2228,8 @@ impl<'a> Frame<'a> {
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         }
         core.mounts.record_edit_history(&mut list);
-        for &(scene, root, batches, focus, _, light_tables) in &roots {
+        for &(scene, root, batches, focus, light_tables) in &roots {
+            let entries = core.scene(scene)?;
             let mut sc = SceneCompute {
                 cmd: &mut list,
                 scene,
@@ -2219,6 +2241,7 @@ impl<'a> Frame<'a> {
                 device,
                 window,
                 pipelines: self.pipelines,
+                entries,
             };
             compute(&mut sc);
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
@@ -2372,6 +2395,7 @@ impl<'a> Frame<'a> {
                     origin_cell: cpu.origin_cell,
                     cell_log2: core.cell_log2,
                     rebased,
+                    producers: scene.tables.producers.capacity(),
                     budget: core.budgets.ptlas_rebuilt,
                     proxy_blas,
                     slot: (self.id % u64::from(core.fif)) as usize,
@@ -2394,7 +2418,7 @@ impl<'a> Frame<'a> {
             // The PTLAS kernels write the cuts this pass reads.
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
             list.begin_pass("emissive", false);
-            for &(_, scene, _, _, desc, tables) in &roots {
+            for &(_, scene, _, _, tables) in &roots {
                 let r = emissive::Root {
                     scene,
                     jobs: GpuPtr::NULL,
@@ -2403,9 +2427,9 @@ impl<'a> Frame<'a> {
                     _pad1: 0,
                 };
                 let ptr = window.put_root(device, &r)?;
-                if desc.producer_capacity > 0 {
+                if tables.producers > 0 {
                     let p = self.pipelines.get(own.emissive_producers);
-                    list.dispatch(p, ptr, [desc.producer_capacity, 1, 1]);
+                    list.dispatch(p, ptr, [tables.producers, 1, 1]);
                 }
                 if tables.entries > 0 {
                     let groups = tables.entries.div_ceil(64);
@@ -2508,6 +2532,12 @@ impl<'a> Frame<'a> {
     /// alone and enters [`ViewStep::Raster`].
     pub fn raster_view(&mut self, view: &ViewDesc) -> Result<RasterView> {
         self.raster_view_with(view, &[], None)
+    }
+
+    /// The entry of `scene`'s producer table that producer `id` holds while it is set, as
+    /// [`SceneWriter::producer_entry`] gives it.
+    pub fn producer_entry(&self, scene: SceneId, id: ProducerId) -> Result<Option<u32>> {
+        Ok(self.core.scene(scene)?.producer_entry(id))
     }
 
     /// What `scene` may hold now: [`RasterView::features`] before the view is rastered.
@@ -2967,7 +2997,7 @@ fn record_producers(
                 scene: scene.tables.root.gpu(),
                 entry: i as u32,
                 tess,
-                state: scene.tables.tess_state.gpu().offset(i as u64),
+                state: scene.tables.tess_state.entry(i as u32),
                 focus,
                 seen,
                 subd: p.as_ref().and_then(|p| p.subd),
@@ -3031,7 +3061,7 @@ fn record_producers(
     }
     drop(jobs);
     for (scene, cpu) in &mut scenes {
-        let capacity = scene.desc.producer_capacity;
+        let capacity = scene.tables.producers.capacity();
         if capacity == 0 {
             continue;
         }

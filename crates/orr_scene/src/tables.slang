@@ -431,10 +431,10 @@ public struct SceneRoot
     public uint* page_material_sets; // the placed pages': MaterialId per model section
     public LightGpu* lights;
     public EmissiveGpu* emissive;    // `emissive_capacity` entries
-    public ProducerGpu* producers;   // by ProducerId
-    public ProducerBatch* batches;   // by ProducerId: what is drawn and traced; a tessellated entry's generated clusters
-    public ProducerBatch* patches;   // by ProducerId: the patches a tessellated entry's kernel emits; zero for others
-    public ProducerStateGpu* producer_state; // by ProducerId, written by the GPU
+    public ProducerGpu* producers;   // `producer_capacity` entries
+    public ProducerBatch* batches;   // by producer entry: what is drawn and traced; a tessellated entry's generated clusters
+    public ProducerBatch* patches;   // by producer entry: the patches a tessellated entry's kernel emits; zero for others
+    public ProducerStateGpu* producer_state; // by producer entry, written by the GPU
     public SkyStats* sky_stats;
     public uint64_t environment;     // consumer data for the linked environment
     public uint64_t medium;          // consumer data for the linked medium
@@ -446,12 +446,12 @@ public struct SceneRoot
     public uint frame_index;
     public uint skinned_capacity;
     public uint light_capacity;
-    public uint producer_capacity;
+    public uint producer_capacity;   // entries of `producers`
     public uint emissive_capacity;   // entries of `emissive`
     public float near_range;         // m
     public uint part_base;           // PTLAS index of part instance 0; the instance slots come first, so also their count
     public uint part_capacity;
-    public uint producer_base;       // PTLAS index of producer entry 0; also how `SurfaceInput`, `GSurface` and `VisibleCluster` name producer entries
+    public uint producer_base;       // PTLAS index of producer entry 0, the entries the PTLAS holds ending at `proxy_base`; also how `SurfaceInput`, `GSurface` and `VisibleCluster` name producer entries
     public CutGpu* cut;              // the frame's cuts
     public SkinnedGpu* skinned;      // skinned copies, `skinned_capacity` entries
     public SkinStateGpu* skin_state; // per skinned copy, written by the GPU

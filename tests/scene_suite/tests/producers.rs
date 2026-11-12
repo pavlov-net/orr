@@ -184,12 +184,7 @@ impl Field {
             },
         )
         .unwrap();
-        let scene = scenes
-            .create_scene(&SceneDesc {
-                producer_capacity: 4,
-                ..SceneDesc::default()
-            })
-            .unwrap();
+        let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
         let history = scenes.create_view_history().unwrap();
         let mut triangles = d
             .gpu_malloc::<u8>(MemoryKind::Upload, 16, "blade triangles")
@@ -229,6 +224,11 @@ impl Field {
             triangles,
             frame: 1,
         }
+    }
+
+    /// The entry of the scene's producer table that producer `id` holds.
+    fn entry(&self, id: ProducerId) -> u32 {
+        entry(&self.scenes, self.scene, id)
     }
 
     fn set(&mut self, id: ProducerId, desc: &ProducerDesc<'_>) {
@@ -285,7 +285,7 @@ impl Field {
                     .put_root(&blades::Root {
                         scene: c.root,
                         triangles,
-                        producer: e.id.0,
+                        producer: c.producer_entry(e.id).unwrap(),
                         count: e.count,
                         time: e.time,
                         previous_time: e.time,
@@ -376,6 +376,11 @@ fn blade_desc<'a>(
         user_tag: 77,
         ..ProducerDesc::default()
     }
+}
+
+/// The entry of `scene`'s producer table that producer `id` holds.
+fn entry(scenes: &Scenes, scene: SceneId, id: ProducerId) -> u32 {
+    scenes.producer_entry(scene, id).unwrap().unwrap()
 }
 
 /// What `producer_rays` saw at every pixel of `view`.
@@ -509,7 +514,7 @@ fn grass_changes_cluster_count_every_frame_and_draws_and_traces_only_this_frames
                     .map(|(i, tri, _)| words(FIELD_WORD, i, tri))
                 })
                 .collect();
-            let entry = FIELD.0 + 1;
+            let entry = field.entry(FIELD) + 1;
             // No pixel shows a blade this frame did not emit.
             for s in &seen {
                 for (e, w) in [
@@ -649,7 +654,7 @@ fn a_drawn_entry_shows_its_hook_s_blades_among_stored_ones_with_their_words_dept
         previous_time: before,
         z,
         base: FIELD_WORD,
-        producer: FIELD.0,
+        producer: field.entry(FIELD),
         _pad0: 0,
         _pad1: 0,
     };
@@ -669,7 +674,7 @@ fn a_drawn_entry_shows_its_hook_s_blades_among_stored_ones_with_their_words_dept
     let seen = rays(&view, 0, MASK_OPAQUE);
     // The nearer of the drawn and the stored blades on each pixel's ray, as its entry + 1, and
     // the drawn hit where that is the nearer.
-    let (entry, stored_entry) = (FIELD.0 + 1, STORED.0 + 1);
+    let (entry, stored_entry) = (field.entry(FIELD) + 1, field.entry(STORED) + 1);
     let mut want = Vec::new();
     let mut hits = Vec::new();
     for s in &seen {
@@ -893,7 +898,7 @@ fn particles_are_drawn_only_at_the_transparency_point_and_traced_only_under_thei
         &radiance,
         &TextureRegion::whole_mip(radiance.desc(), 0),
     ));
-    let particle_entry = PARTICLES.0 + 1;
+    let particle_entry = field.entry(PARTICLES) + 1;
     assert!(
         seen.iter().all(|s| s.raster_entry != particle_entry),
         "particles in the raster"
@@ -1059,12 +1064,7 @@ impl Plane {
             },
         )
         .unwrap();
-        let scene = scenes
-            .create_scene(&SceneDesc {
-                producer_capacity: 2,
-                ..SceneDesc::default()
-            })
-            .unwrap();
+        let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
         let history = scenes.create_view_history().unwrap();
         let mesh = PatchMesh::new(seam);
         let attrs: Vec<[u32; 3]> = mesh
@@ -1200,7 +1200,7 @@ impl Plane {
                     attrs: g[1].cast(),
                     triangles: g[2],
                     clusters: g[3].cast(),
-                    producer: PLANE.0,
+                    producer: c.producer_entry(PLANE).unwrap(),
                     count: clusters,
                 })
                 .unwrap();
@@ -1280,9 +1280,9 @@ struct Generated {
     state: ProducerStateGpu,
 }
 
-fn generated(view: &RasterView, entry: ProducerId) -> Generated {
+fn generated(view: &RasterView, entry: u32) -> Generated {
     let root = read_buffer(view.scene, 1)[0];
-    let i = u64::from(entry.0);
+    let i = u64::from(entry);
     let b = read_buffer(root.batches.offset(i), 1)[0];
     let p = read_buffer(root.patches.offset(i), 1)[0];
     let count = |b: &ProducerBatch| {
@@ -1415,7 +1415,7 @@ fn tessellated_patches_dice_at_mixed_rates_with_bit_identical_shared_edges() {
     let (eye, target) = (Vec3::new(0.3, 1.0, 0.5), Vec3::new(0.0, 0.0, -3.0));
     plane.frame(Some(&desc), eye, target, eye);
     let view = plane.frame(None, eye, target, eye);
-    let g = generated(&view, PLANE);
+    let g = generated(&view, entry(&plane.scenes, plane.scene, PLANE));
     let stats = plane.stats();
     assert_eq!(stats.patches, 48, "{stats:?}");
     assert!(stats.subpatches > 2 * stats.patches, "{stats:?}");
@@ -1533,7 +1533,7 @@ fn a_displaced_plane_with_a_uv_seam_closes_in_raster_and_rays_with_normals_of_it
         plane.frame(None, eye, target, eye);
     }
     let view = plane.frame(None, eye, target, eye);
-    let g = generated(&view, PLANE);
+    let g = generated(&view, entry(&plane.scenes, plane.scene, PLANE));
     let seen = depths(&view);
     let stats = plane.stats();
     assert!(stats.welded > 0, "{stats:?}");
@@ -1782,7 +1782,7 @@ fn moved_patches(linear: Mat3, flags: u32, share: f32, across: [f32; 2], uvs: bo
     let (eye, target) = (Vec3::new(0.3, 1.0, 0.5), Vec3::new(0.0, 0.0, -3.0));
     plane.frame(Some(&desc), eye, target, eye);
     let view = plane.frame(None, eye, target, eye);
-    let g = generated(&view, PLANE);
+    let g = generated(&view, entry(&plane.scenes, plane.scene, PLANE));
     let stats = plane.stats();
     // The same texel on both sides of the seam: nothing for the weld to move.
     assert_eq!(stats.welded, 0, "{stats:?}");
@@ -1825,8 +1825,9 @@ fn rate_sweep(steps: u32) -> (f32, [HashSet<[u32; 3]>; 2]) {
     let desc = plane.desc(&materials, RIPPLE, 8192);
     plane.frame(Some(&desc), eye, target, focus(0));
     plane.frame(None, eye, target, focus(0));
+    let held = entry(&plane.scenes, plane.scene, PLANE);
     let counts = |view: &RasterView| -> HashSet<[u32; 3]> {
-        generated(view, PLANE)
+        generated(view, held)
             .clusters
             .iter()
             .map(|k| tessellation::pattern(u32::from(k.topology)).counts)
@@ -2712,12 +2713,7 @@ impl CageScene {
         if let LoadState::Failed(e) = scenes.mount_state(mount) {
             panic!("mount failed: {e}");
         }
-        let scene = scenes
-            .create_scene(&SceneDesc {
-                producer_capacity: 2,
-                ..SceneDesc::default()
-            })
-            .unwrap();
+        let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
         let history = scenes.create_view_history().unwrap();
         Self {
             scenes,
@@ -2987,8 +2983,8 @@ fn subdivision_cages_dice_closed_at_mixed_rates_on_their_limit_surface_in_raster
         s.frame(|_| {}, eye, target, focus);
     }
     let view = s.frame(|_| {}, eye, target, focus);
-    let smooth = generated(&view, SMOOTH);
-    let rippled = generated(&view, RIPPLED);
+    let smooth = generated(&view, entry(&s.scenes, s.scene, SMOOTH));
+    let rippled = generated(&view, entry(&s.scenes, s.scene, RIPPLED));
     let seen = depths(&view);
     let stats = s.stats();
     assert_eq!(stats.entries, 2, "{stats:?}");
@@ -3159,7 +3155,7 @@ fn a_cage_carries_its_colors_across_a_crease_and_a_seam_to_what_the_raster_shows
         s.frame(|_| {}, eye, target, target);
     }
     let view = s.frame(|_| {}, eye, target, target);
-    let g = generated(&view, SMOOTH);
+    let g = generated(&view, entry(&s.scenes, s.scene, SMOOTH));
     let seen = seen_colors(&view);
     let stats = s.stats();
     assert_eq!(stats.dice_dropped + stats.split_dropped, 0, "{stats:?}");
@@ -3386,7 +3382,7 @@ fn a_skinned_cage_poses_before_it_dices_and_moves_from_last_frames_pose() {
         target,
         eye,
     );
-    let g = generated(&view, SMOOTH);
+    let g = generated(&view, entry(&s.scenes, s.scene, SMOOTH));
     let stats = s.stats();
     assert_eq!(
         stats.dice_dropped + stats.split_dropped + stats.weld_dropped,
@@ -3460,12 +3456,7 @@ struct Strands<'d> {
 impl<'d> Strands<'d> {
     fn new(d: &'d Device) -> Self {
         let mut scenes = Scenes::new(d, &RendererDesc::default()).unwrap();
-        let scene = scenes
-            .create_scene(&SceneDesc {
-                producer_capacity: 2,
-                ..SceneDesc::default()
-            })
-            .unwrap();
+        let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
         let history = scenes.create_view_history().unwrap();
         let mut frame = 0;
         let list = [scene];
@@ -3523,7 +3514,7 @@ impl<'d> Strands<'d> {
             let r = c
                 .put_root(&strands::Root {
                     scene: c.root,
-                    producer: STRANDS.0,
+                    producer: c.producer_entry(STRANDS).unwrap(),
                     count: STRAND_COUNT,
                     segments: STRAND_SEGMENTS,
                     base: STRAND_WORD,
@@ -3587,7 +3578,7 @@ impl<'d> Strands<'d> {
             gbuffer: view.gbuffer,
             seen: seen.gpu(),
             mode,
-            entry: STRANDS.0,
+            entry: entry(&self.scenes, self.scene, STRANDS),
             width: cells[0],
             height: cells[1],
             grid_x: -1.6,

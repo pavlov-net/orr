@@ -146,6 +146,7 @@ impl Terrain {
         kernel: PipelineId,
         heights: &Heights,
     ) {
+        let producer = c.producer_entry(id).expect("the terrain is set");
         let root = c
             .put_root(&terrain::Root {
                 scene: c.root,
@@ -154,7 +155,7 @@ impl Terrain {
                 spacing: heights.spacing,
                 origin_x: heights.origin[0],
                 origin_z: heights.origin[1],
-                producer: id.0,
+                producer,
                 patches: self.patches,
                 patch_size: self.patch_size,
                 corner_x: self.corner[0],
@@ -222,6 +223,7 @@ impl Grass {
         time: f32,
         previous_time: f32,
     ) {
+        let producer = c.producer_entry(id).expect("the grass is set");
         let root = c
             .put_root(&grass::Root {
                 scene: c.root,
@@ -230,7 +232,7 @@ impl Grass {
                 spacing: heights.spacing,
                 origin_x: heights.origin[0],
                 origin_z: heights.origin[1],
-                producer: id.0,
+                producer,
                 cells: self.cells,
                 cell_size: self.cell_size,
                 corner_x: self.corner[0],
@@ -286,10 +288,11 @@ impl Slab {
         kernel: PipelineId,
         time: f32,
     ) {
+        let producer = c.producer_entry(id).expect("the slab is set");
         let root = c
             .put_root(&slab::Root {
                 scene: c.root,
-                producer: id.0,
+                producer,
                 patches: self.patches,
                 patch_size: self.patch_size,
                 corner_x: self.corner[0],

@@ -1068,13 +1068,7 @@ impl DenseVegetation {
         }
         let (lights, textured) = settings.directional_lights;
         let scene = renderer
-            .create_scene(
-                &SceneDesc {
-                    producer_capacity: 8,
-                    ..SceneDesc::default()
-                },
-                &SceneLightingSettings::default(),
-            )
+            .create_scene(&SceneDesc::default(), &SceneLightingSettings::default())
             .expect("scene");
         let history = renderer.create_view_history().expect("view history");
         let kernels = Kernels {
@@ -1445,7 +1439,7 @@ impl DenseVegetation {
                     spacing: self.heights.spacing,
                     origin_x: self.heights.origin[0],
                     origin_z: self.heights.origin[1],
-                    producer: PARTICLES.0,
+                    producer: c.producer_entry(PARTICLES).expect("the particles are set"),
                     clusters,
                     center_x: center[0],
                     center_z: center[1],
@@ -1711,12 +1705,13 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                     * Mat4::from_translation(-eye);
                 let heights = &scene.heights;
                 let forward = view_from_world.inverse() * Vec3::NEG_Z;
-                let field = scene.blades.as_mut().map(|b| {
+                let grass = f.producer_entry(scene.scene, GRASS).expect("scene");
+                let field = scene.blades.as_mut().zip(grass).map(|(b, grass)| {
                     let (t, previous) = (t as f32, previous as f32);
                     b.write(
                         id,
                         heights,
-                        GRASS,
+                        grass,
                         eye,
                         forward,
                         clip_from_world,

@@ -11,7 +11,7 @@ use orr::orr_gpu::{
 use orr::orr_pack::material::Material;
 use orr::{
     ClusterTopology, InstanceFlags, MaterialId, MeshPipelineId, MeshStages, OpaquePass, PipelineId,
-    ProducerDesc, ProducerId, ProducerUpdate, Renderer, SceneCompute, TransformGroupId,
+    ProducerDesc, ProducerUpdate, Renderer, SceneCompute, TransformGroupId,
 };
 use orr_math::{Mat4, Vec2, Vec3};
 
@@ -386,7 +386,7 @@ impl Blades {
         }
     }
 
-    /// Writes frame `frame`'s field for entry `producer` on `heights`, seen from `eye`
+    /// Writes frame `frame`'s field for producer entry `producer` on `heights`, seen from `eye`
     /// along `forward` through `clip_from_entry` at wind times `time` and `previous_time`, and
     /// returns it: the scene's surface data and what [`Self::record`] and [`Self::draw`] take.
     #[allow(clippy::too_many_arguments)]
@@ -394,7 +394,7 @@ impl Blades {
         &mut self,
         frame: u64,
         heights: &Heights,
-        producer: ProducerId,
+        producer: u32,
         eye: Vec3,
         forward: Vec3,
         clip_from_entry: Mat4,
@@ -450,7 +450,7 @@ impl Blades {
             eye_x: eye.x,
             eye_y: eye.y,
             eye_z: eye.z,
-            producer: producer.0,
+            producer,
         };
         self.fields.gpu().offset(slot)
     }

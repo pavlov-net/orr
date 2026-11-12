@@ -6,7 +6,8 @@
 //! decide each frame's writes, null writes, BLAS updates and part runs on the GPU and spend
 //! the frame's budget of rebuilt instances from the focus outward, mandatory work first.
 //! Producer entries, medium proxies (from `proxy_base`) and light proxies (from `light_base`)
-//! sit in the global partition and their writes are mandatory.
+//! sit in the global partition and their writes are mandatory; the PTLAS reserves an instance
+//! for each entry of the three tables up to the highest in use.
 //!
 //! The PTLAS holds what the copies placed take: a slot for each handed out, the part
 //! instances their runs may hold at once, and the cell partitions they fill. When a placement
@@ -173,9 +174,10 @@ struct Storage {
     /// The partition table its record names. Partitions given back and grown again make
     /// another table that the same limits can describe.
     partitions: GpuPtr<PartitionGpu>,
-    /// The medium proxies it reserves, which its light proxies' instances come after. Room the
-    /// light proxies give the medium proxies, or take from them, leaves the limits as they are.
-    proxies: u32,
+    /// The producer entries and the medium proxies it reserves, which the instances of the
+    /// medium proxies and of the light proxies come after. Room one of the three gives another
+    /// leaves the limits as they are.
+    reserved: [u32; 2],
     tlas: Allocation<u8>,
     record: Allocation<PtlasGpu>,
     _blocks: Vec<Allocation<u8>>,
@@ -330,32 +332,33 @@ struct Share {
 }
 
 /// The takers of [`Budget::take`]: a cell partition takes one of the device's partitions, a
-/// medium proxy and a light proxy one each as an instance of the global partition, and a
-/// skinned copy two, its instance there and the far instance it may hold while it fades.
+/// medium proxy, a light proxy and a producer entry one each as an instance of the global
+/// partition, and a skinned copy two, its instance there and the far instance it may hold
+/// while it fades.
 const PARTITIONS: usize = 0;
 const SKINNED: usize = 1;
 const PROXIES: usize = 2;
 const LIGHTS: usize = 3;
-const TAKERS: usize = 4;
+const PRODUCERS: usize = 4;
+const TAKERS: usize = 5;
 
 /// The partitions a device's PTLAS holds, cell partitions and instances of the global
 /// partition together, and what a scene's PTLAS takes of them beside its shares: the copies
-/// its global partition takes and the entries fixed when it was made.
+/// its global partition takes.
 #[derive(Clone, Copy)]
 struct Budget {
     /// 0 on a device without a PTLAS, which builds none and bounds nothing.
     max: u32,
     copies: u32,
-    entries: u32,
 }
 
 impl Budget {
     /// The device's partitions a PTLAS of `counts` takes, as [`Ptlas::limits`] counts its
     /// global partition with every part instance the pool can hold.
-    fn total(&self, [partitions, skinned, proxies, lights]: [u32; TAKERS]) -> u64 {
+    fn total(self, [partitions, skinned, proxies, lights, producers]: [u32; TAKERS]) -> u64 {
         let copies = u64::from(self.copies) + u64::from(skinned);
         let fading = copies.min(u64::from(MAX_PARTS));
-        let entries = u64::from(self.entries) + u64::from(proxies) + u64::from(lights);
+        let entries = u64::from(producers) + u64::from(proxies) + u64::from(lights);
         u64::from(partitions) + copies + fading + entries
     }
 
@@ -364,7 +367,7 @@ impl Budget {
     /// leaves beside the other reservations; when it needs more than they leave, the others
     /// give back what they hold beyond their use. Fails when the device cannot hold what is
     /// in use.
-    fn take(&self, shares: [Share; TAKERS], which: usize, used: u32) -> Result<[Share; TAKERS]> {
+    fn take(self, shares: [Share; TAKERS], which: usize, used: u32) -> Result<[Share; TAKERS]> {
         let mut out = shares;
         let held = shares[which].reserved;
         out[which].used = used;
@@ -398,8 +401,8 @@ impl Budget {
     }
 }
 
-/// What a PTLAS takes of the device's partitions once it holds a proxy more, or nothing where
-/// it holds the proxy already.
+/// What a PTLAS takes of the device's partitions once it holds a proxy or a producer entry
+/// more, or nothing where it holds that already.
 pub(crate) struct Room(Option<[Share; TAKERS]>);
 
 /// The entries of a table that hold an instance in the global partition.
@@ -449,12 +452,13 @@ pub(crate) struct Ptlas {
     /// The layout of the next build.
     layout: Layout,
     max_per_partition: u32,
-    producer_capacity: u32,
+    /// Producer entries up to the highest held, which the global partition holds.
+    producers: Share,
     /// Medium proxies up to the highest set, which the global partition holds.
     proxies: Share,
     /// Lights up to the highest that has a proxy, which the global partition holds.
     lights: Share,
-    /// Copies the global partition takes; producer entries and medium proxies come on top.
+    /// Copies the global partition takes; producer entries and proxies come on top.
     global_copies: u32,
     /// Copies of skinned meshes, which sit in the global partition.
     skinned: Share,
@@ -504,7 +508,7 @@ impl Ptlas {
         Ok(Self {
             layout: Layout { slots: 0, parts: 0 },
             max_per_partition: desc.partition_instances,
-            producer_capacity: desc.producer_capacity,
+            producers: Share::default(),
             proxies: Share::default(),
             lights: Share::default(),
             global_copies: desc.global_instances,
@@ -541,7 +545,7 @@ impl Ptlas {
         // global one, hold up to one instance more for every copy in them that the pool has.
         let fading = |copies: u32| copies.min(layout.parts);
         let global_copies = self.global_copies + self.skinned.reserved;
-        let entries = self.producer_capacity + self.proxies.reserved + self.lights.reserved;
+        let entries = self.producers.reserved + self.proxies.reserved + self.lights.reserved;
         PtlasLimits {
             instances: layout.slots + layout.parts + entries,
             partitions,
@@ -607,8 +611,8 @@ impl Ptlas {
     }
 
     /// What the PTLAS takes of the device's partitions: its cell partitions, of which those up
-    /// to the last that is not free are in use, its skinned copies, its medium proxies and its
-    /// light proxies.
+    /// to the last that is not free are in use, its skinned copies, its medium proxies, its
+    /// light proxies and its producer entries.
     fn shares(&self) -> [Share; TAKERS] {
         let mut free = vec![false; self.partitions.len()];
         for &p in &self.free {
@@ -619,7 +623,13 @@ impl Ptlas {
             used: (self.partitions.len() - unused) as u32,
             reserved: self.partitions.len() as u32,
         };
-        [partitions, self.skinned, self.proxies, self.lights]
+        [
+            partitions,
+            self.skinned,
+            self.proxies,
+            self.lights,
+            self.producers,
+        ]
     }
 
     /// The device's limit and what the PTLAS takes of it whatever the scene holds.
@@ -627,17 +637,18 @@ impl Ptlas {
         Budget {
             max: device.caps().cluster.max_partitions,
             copies: self.global_copies,
-            entries: self.producer_capacity,
         }
     }
 
-    /// Takes the skinned copies', medium proxies' and light proxies' shares of `shares`, and
-    /// gives back the cell partitions past the ones `shares` keeps, which are free.
+    /// Takes the skinned copies', medium proxies', light proxies' and producer entries' shares
+    /// of `shares`, and gives back the cell partitions past the ones `shares` keeps, which are
+    /// free.
     fn keep(&mut self, shares: [Share; TAKERS]) {
-        let [partitions, skinned, proxies, lights] = shares;
+        let [partitions, skinned, proxies, lights, producers] = shares;
         self.skinned = skinned;
         self.proxies = proxies;
         self.lights = lights;
+        self.producers = producers;
         let kept = partitions.reserved;
         if (kept as usize) < self.partitions.len() {
             self.partitions.truncate(kept as usize);
@@ -686,6 +697,25 @@ impl Ptlas {
     /// As [`Self::proxy_room`].
     pub(crate) fn light_room(&self, device: &Device, id: u32) -> Result<Room> {
         self.entry_room(device, LIGHTS, self.lights, id)
+    }
+
+    /// The room the scene needs to hold producer entry `id`, an entry of its producer table:
+    /// the global partition counts the entries up to the highest held. As [`Self::proxy_room`];
+    /// [`Self::set_producers`] then says what is held.
+    pub(crate) fn producer_room(&self, device: &Device, id: u32) -> Result<Room> {
+        self.entry_room(device, PRODUCERS, self.producers, id)
+    }
+
+    /// Counts the producer entries below `end`, one past the highest held, as in use. Those it
+    /// takes have their room from [`Self::producer_room`].
+    pub(crate) fn set_producers(&mut self, end: u32) {
+        self.producers.used = end;
+    }
+
+    /// The producer entries the layout of the next build holds: medium proxies come after
+    /// them.
+    pub(crate) fn producer_entries(&self) -> u32 {
+        self.producers.reserved
     }
 
     /// The room for the entries up to `id` of taker `which`, which holds `held`.
@@ -944,9 +974,9 @@ impl Ptlas {
     }
 
     /// The scene's TLAS for the frame about to record. Its storage is made the first time a
-    /// slot has been handed out or a producer entry or medium proxy is set, and made again,
-    /// for the frame's build to fill anew, when the copies placed have grown past its layout
-    /// or its cell partitions.
+    /// slot has been handed out or a producer entry or proxy is set, and made again, for the
+    /// frame's build to fill anew, when what the scene holds has grown past its layout or its
+    /// cell partitions, or has moved the instances of its entries.
     pub(crate) fn tlas(
         &mut self,
         device: &Device,
@@ -965,9 +995,10 @@ impl Ptlas {
         let layout = self.wanted();
         let limits = self.limits(layout, self.partitions.len() as u32);
         let partitions = self.partition_table.gpu();
-        let proxies = self.proxies.reserved;
-        let fits =
-            |s: &Storage| s.limits == limits && s.partitions == partitions && s.proxies == proxies;
+        let reserved = [self.producers.reserved, self.proxies.reserved];
+        let fits = |s: &Storage| {
+            s.limits == limits && s.partitions == partitions && s.reserved == reserved
+        };
         if !self.storage.as_ref().is_some_and(fits) {
             // A build has filled a storage, this one or one it replaced that no build has
             // since: the counters and the pool hold its state, which the next build rewrites
@@ -1066,7 +1097,7 @@ impl Ptlas {
         Ok(Storage {
             limits,
             partitions: record.partitions,
-            proxies: self.proxies.reserved,
+            reserved: [self.producers.reserved, self.proxies.reserved],
             tlas,
             bytes,
             record: gpu,
@@ -1233,8 +1264,8 @@ impl Ptlas {
         list.dispatch(p.get(k.recycle), root, [1, 1, 1]);
         step(list);
         list.dispatch(p.get(k.want), root, groups(self.high_water));
-        if self.producer_capacity > 0 {
-            list.dispatch(p.get(k.producer_want), root, groups(self.producer_capacity));
+        if f.producers > 0 {
+            list.dispatch(p.get(k.producer_want), root, groups(f.producers));
         }
         if !proxies.is_empty() {
             list.dispatch(p.get(k.proxy_write), root, groups(proxies.len() as u32));
@@ -1245,8 +1276,8 @@ impl Ptlas {
         list.dispatch(p.get(k.admit), root, groups(partitions));
         step(list);
         list.dispatch(p.get(k.emit), root, groups(self.high_water));
-        if self.producer_capacity > 0 {
-            list.dispatch(p.get(k.producer_emit), root, groups(self.producer_capacity));
+        if f.producers > 0 {
+            list.dispatch(p.get(k.producer_emit), root, groups(f.producers));
         }
         if !jobs.is_empty() {
             list.dispatch(p.get(k.translate), root, groups(jobs.len() as u32));
@@ -1296,6 +1327,8 @@ pub(crate) struct FrameInputs {
     pub(crate) origin_cell: IVec3,
     pub(crate) cell_log2: u32,
     pub(crate) rebased: bool,
+    /// Entries of the scene's producer table.
+    pub(crate) producers: u32,
     pub(crate) budget: u32,
     /// The BLAS medium and light proxies trace; 0 while the scene has none.
     pub(crate) proxy_blas: GpuAddress,
@@ -1325,7 +1358,6 @@ mod tests {
         let budget = Budget {
             max: 65_536,
             copies: 4096,
-            entries: 512,
         };
         let grow = |mut shares: [Share; TAKERS], which: usize, to: u32| {
             let mut used = shares[which].used;
@@ -1335,7 +1367,12 @@ mod tests {
             }
             shares
         };
-        let none = [Share::default(); TAKERS];
+        // 512 producer entries are in use throughout.
+        let mut none = [Share::default(); TAKERS];
+        none[PRODUCERS] = Share {
+            used: 512,
+            reserved: 512,
+        };
         let skinned = grow(none, SKINNED, 12_001);
         assert_eq!(skinned[SKINNED].reserved, 16_384);
         // The partitions fit beside the skinned copies in use, not beside those reserved.
@@ -1344,19 +1381,22 @@ mod tests {
             used,
             reserved: used,
         };
-        assert_eq!(both, [exact(25_000), exact(12_001), exact(0), exact(0)]);
+        let all = [25_000, 12_001, 0, 0, 512];
+        assert_eq!(both, all.map(exact));
         let other = grow(grow(none, PARTITIONS, 25_000), SKINNED, 12_001);
         for shares in [both, other] {
-            assert_eq!(shares.map(|s| s.used), [25_000, 12_001, 0, 0]);
+            assert_eq!(shares.map(|s| s.used), all);
             assert!(budget.total(shares.map(|s| s.reserved)) <= 65_536);
         }
-        // One skinned copy, medium proxy or light proxy more than the device leaves beside what
-        // is in use.
+        // One skinned copy, medium proxy, light proxy or producer entry more than the device
+        // leaves beside what is in use.
         let left = 65_536 - budget.total(both.map(|s| s.used));
         let most = 12_001 + (left / 2) as u32;
         assert!(budget.take(both, SKINNED, most).is_ok());
         assert!(budget.take(both, SKINNED, most + 1).is_err());
         assert!(budget.take(both, PROXIES, left as u32 + 1).is_err());
         assert!(budget.take(both, LIGHTS, left as u32 + 1).is_err());
+        assert!(budget.take(both, PRODUCERS, 512 + left as u32).is_ok());
+        assert!(budget.take(both, PRODUCERS, 512 + left as u32 + 1).is_err());
     }
 }

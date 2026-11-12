@@ -33,8 +33,8 @@ use orr_scene::{
     BoundTexture, Budgets, DirectionalLight, DiscProfile, EmissiveGpu, Error, FrameDesc, FrameTime,
     GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, Light, LightId, LoadState,
     MaterialGpu, MaterialId, MeshGpu, ModelGpu, ModelId, MountId, NeuralTextures, PackSource,
-    PoolSize, RendererDesc, ResidencyClass, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes,
-    TransformGroupDesc, TransformGroupId, material_flags,
+    PoolSize, ProducerDesc, ProducerId, RendererDesc, ResidencyClass, SceneDesc, SceneId,
+    SceneRoot, SceneWriter, Scenes, TransformGroupDesc, TransformGroupId, material_flags,
 };
 use scene_suite::Workers;
 
@@ -708,9 +708,9 @@ fn limited_device(partitions: u32) -> Device {
 
 /// A placement that needs one cell partition more than the device's PTLAS holds is refused and
 /// leaves nothing placed: the scene traces the copies it held, and takes copies again for the
-/// partitions that removed ones give back. A light whose proxy the PTLAS has no instance left
-/// for is refused too and takes no entry of the light table, which a light without a proxy
-/// then takes.
+/// partitions that removed ones give back. A producer and a light whose proxy the PTLAS has no
+/// instance left for are refused too and take no entry of the producer table, the emissive
+/// list or the light table, which a light without a proxy then takes.
 #[test]
 fn a_placement_past_the_devices_partitions_is_refused_and_leaves_the_scene_as_it_was() {
     const COPIES: u32 = 40;
@@ -721,9 +721,9 @@ fn a_placement_past_the_devices_partitions_is_refused_and_leaves_the_scene_as_it
         global_instances: 16,
         ..SceneDesc::default()
     };
-    // What the global partition holds whatever is placed: its copies, a far instance for each,
-    // and the producer entries.
-    let fixed = 2 * desc.global_instances + desc.producer_capacity;
+    // What the global partition holds whatever is placed: its copies and a far instance for
+    // each.
+    let fixed = 2 * desc.global_instances;
     let limited = limited_device(fixed + COPIES);
     if limited.caps().cluster.max_partitions != fixed + COPIES {
         return;
@@ -817,8 +817,20 @@ fn a_placement_past_the_devices_partitions_is_refused_and_leaves_the_scene_as_it
         let root = frame_with(&mut scenes, &mut |w| {
             let r = w.set_light(LightId(2), Some(&lamp));
             assert!(matches!(r, Err(Error::Capacity { .. })), "{r:?}");
+            let untraced = ProducerDesc {
+                flags: InstanceFlags::RASTER,
+                ..ProducerDesc::default()
+            };
+            let r = w.set_producer(ProducerId(5), Some(&untraced));
+            assert!(matches!(r, Err(Error::Capacity { .. })), "{r:?}");
+            assert_eq!(w.producer_entry(ProducerId(5)), None);
         });
         assert_eq!(root.light_capacity, 0, "the refused light took an entry");
+        assert_eq!(
+            (root.producer_capacity, root.emissive_capacity),
+            (0, 0),
+            "the refused producer took an entry"
+        );
         let sun = Light::Directional(DirectionalLight {
             direction_to_light: Vec3::Y,
             illuminance: Vec3::ONE,
@@ -974,11 +986,7 @@ fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
     let a = Archive::from_memory(Arc::clone(bytes)).unwrap();
     let mut scenes = Scenes::new(device(), &RendererDesc::default()).unwrap();
     let _workers = Workers::start(&scenes, 2);
-    let s = scenes
-        .create_scene(&SceneDesc {
-            ..SceneDesc::default()
-        })
-        .unwrap();
+    let s = scenes.create_scene(&SceneDesc::default()).unwrap();
     let m = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
     ready(&mut scenes, m);
     let panel_id = AssetId::from_name("kit/panel");
@@ -1166,11 +1174,7 @@ fn an_unmount_takes_copies_and_pages_of_its_models_from_a_scene_that_keeps_rende
         .id;
     let mut scenes = Scenes::new(device(), &RendererDesc::default()).unwrap();
     let _workers = Workers::start(&scenes, 2);
-    let s = scenes
-        .create_scene(&SceneDesc {
-            ..SceneDesc::default()
-        })
-        .unwrap();
+    let s = scenes.create_scene(&SceneDesc::default()).unwrap();
     let m = scenes.mount(PackSource::Memory(models));
     ready(&mut scenes, m);
     let p = scenes.mount(PackSource::Memory(pages));

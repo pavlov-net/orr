@@ -85,6 +85,14 @@ impl RangeAllocator {
         runs
     }
 
+    /// One past the highest index of `0..capacity` that is not free.
+    pub fn end(&self, capacity: u32) -> u32 {
+        match self.free.iter().next_back() {
+            Some((&start, &end)) if end == capacity => start,
+            _ => capacity,
+        }
+    }
+
     /// Adds `from..to` to the free list: the indices a capacity of `from` grown to `to` gains.
     pub fn grow(&mut self, from: u32, to: u32) {
         assert!(from <= to, "a capacity of {from} cannot grow to {to}");
@@ -117,6 +125,21 @@ mod tests {
     use super::RangeAllocator;
 
     #[test]
+    fn the_end_is_one_past_the_highest_index_taken() {
+        let mut a = RangeAllocator::new(100);
+        assert_eq!(a.end(100), 0);
+        assert_eq!((a.alloc(10), a.alloc(20)), (Some(0), Some(10)));
+        assert_eq!(a.end(100), 30);
+        // A hole below the highest index taken leaves the end where it is.
+        a.free(0, 10);
+        assert_eq!(a.end(100), 30);
+        a.free(10, 20);
+        assert_eq!(a.end(100), 0);
+        assert!(a.take(99, 1));
+        assert_eq!(a.end(100), 100);
+    }
+
+    #[test]
     fn freed_ranges_merge_and_are_reused_first_fit() {
         let mut a = RangeAllocator::new(100);
         let x = a.alloc(10).unwrap();
@@ -138,6 +161,7 @@ mod tests {
             (a.alloc(5), a.alloc(4), a.alloc(1)),
             (Some(40), Some(46), None)
         );
+
         a.free(3, 30);
         assert_eq!(a.alloc_aligned(8, 16), Some(16));
         assert_eq!(

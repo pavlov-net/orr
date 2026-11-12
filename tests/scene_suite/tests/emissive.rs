@@ -23,8 +23,6 @@ use orr_shaders::bytemuck::Zeroable;
 use scene_suite::shaders::emit;
 use scene_suite::{Workers, pipeline};
 
-const PRODUCERS: u32 = 4;
-
 fn frame(scenes: &[SceneId]) -> FrameDesc<'_> {
     FrameDesc {
         time: FrameTime {
@@ -48,7 +46,7 @@ fn entries(root: &SceneRoot) -> Vec<EmissiveGpu> {
     read_buffer(root.emissive, u64::from(root.emissive_capacity))
 }
 
-/// The entry of `all` that producer entry `producer` holds.
+/// The entry of `all` that entry `producer` of the producer table holds.
 fn producer_entry(all: &[EmissiveGpu], producer: u32) -> Option<&EmissiveGpu> {
     all.iter().find(|e| e.kind == 2 && e.source == producer)
 }
@@ -171,12 +169,7 @@ fn instance_entries_follow_scale_material_sets_hidden_sections_and_removal() {
 
     let mut scenes = Scenes::new(d, &RendererDesc::default()).unwrap();
     let _workers = Workers::start(&scenes, 2);
-    let s = scenes
-        .create_scene(&SceneDesc {
-            producer_capacity: PRODUCERS,
-            ..SceneDesc::default()
-        })
-        .unwrap();
+    let s = scenes.create_scene(&SceneDesc::default()).unwrap();
     let m = scenes.mount(PackSource::Memory(bytes));
     while mount_pending(&scenes, m) {
         let f = scenes.begin_frame(&frame(&[])).unwrap();
@@ -436,11 +429,7 @@ fn an_edit_of_a_dag_mesh_takes_the_sets_of_level_0() {
 
     let mut scenes = Scenes::new(d, &RendererDesc::default()).unwrap();
     let _workers = Workers::start(&scenes, 2);
-    let s = scenes
-        .create_scene(&SceneDesc {
-            ..SceneDesc::default()
-        })
-        .unwrap();
+    let s = scenes.create_scene(&SceneDesc::default()).unwrap();
     let m = scenes.mount(PackSource::Memory(bytes));
     while mount_pending(&scenes, m) {
         let f = scenes.begin_frame(&frame(&[])).unwrap();
@@ -524,11 +513,7 @@ fn a_copy_takes_the_sets_of_the_cached_cut_it_traces() {
     };
     let mut scenes = Scenes::new(d, &desc).unwrap();
     let _workers = Workers::start(&scenes, 2);
-    let s = scenes
-        .create_scene(&SceneDesc {
-            ..SceneDesc::default()
-        })
-        .unwrap();
+    let s = scenes.create_scene(&SceneDesc::default()).unwrap();
     let m = scenes.mount(PackSource::Memory(bytes));
     while mount_pending(&scenes, m) {
         let f = scenes.begin_frame(&frame(&[])).unwrap();
@@ -633,12 +618,7 @@ fn producer_power_follows_emitted_clusters_every_frame() {
     let d = device();
     let mut scenes = Scenes::new(d, &RendererDesc::default()).unwrap();
     let _workers = Workers::start(&scenes, 2);
-    let s = scenes
-        .create_scene(&SceneDesc {
-            producer_capacity: PRODUCERS,
-            ..SceneDesc::default()
-        })
-        .unwrap();
+    let s = scenes.create_scene(&SceneDesc::default()).unwrap();
     let p = pipeline(&emit::MODULE, "main");
     let mut quad = d
         .gpu_malloc::<u8>(MemoryKind::Upload, 8, "quad triangles")
@@ -670,7 +650,7 @@ fn producer_power_follows_emitted_clusters_every_frame() {
                 .put_root(&emit::Root {
                     scene: c.root,
                     triangles: quad.gpu(),
-                    producer: producer.0,
+                    producer: c.producer_entry(producer).unwrap(),
                     count,
                     size,
                     _pad: 0,
@@ -748,6 +728,8 @@ fn producer_power_follows_emitted_clusters_every_frame() {
     f.update_scenes(&mut |c| dispatch(c, &[(ProducerId(2), 11, 0.5)]))
         .unwrap();
     wait(f.end(&[]).unwrap());
+    let held = |scenes: &Scenes, id: u32| scenes.producer_entry(s, ProducerId(id)).unwrap();
+    let (every, fixed) = (held(&scenes, 1).unwrap(), held(&scenes, 2).unwrap());
 
     let expected = |m: DMat3, count: u32, size: f64| {
         let a = emitted(m, count, size);
@@ -775,11 +757,15 @@ fn producer_power_follows_emitted_clusters_every_frame() {
         let root = run(&mut scenes, &mut |_| {}, &[(ProducerId(1), count, size)]);
         let all = entries(&root);
         check(
-            producer_entry(&all, 1).unwrap(),
+            producer_entry(&all, every).unwrap(),
             expected(m, count, f64::from(size)),
             "every-frame entry",
         );
-        check(producer_entry(&all, 2).unwrap(), statics, "static entry");
+        check(
+            producer_entry(&all, fixed).unwrap(),
+            statics,
+            "static entry",
+        );
         assert_eq!(all.iter().filter(|e| e.kind != 0).count(), 2);
     }
 
@@ -787,7 +773,7 @@ fn producer_power_follows_emitted_clusters_every_frame() {
     let root = run(&mut scenes, &mut |_| {}, &[(ProducerId(1), 150, 1.0)]);
     let all = entries(&root);
     let full = expected(m, 150, 1.0);
-    let e = producer_entry(&all, 1).unwrap();
+    let e = producer_entry(&all, every).unwrap();
     assert!(e.cluster_count <= 100 && e.cluster_count >= 50);
     assert!(f64::from(e.area) < full.0 && e.area > 0.0);
 
@@ -800,7 +786,7 @@ fn producer_power_follows_emitted_clusters_every_frame() {
         &[(ProducerId(1), 20, 1.0)],
     );
     check(
-        producer_entry(&entries(&root), 1).unwrap(),
+        producer_entry(&entries(&root), every).unwrap(),
         expected(DMat3::IDENTITY, 20, 1.0),
         "moved entry",
     );
@@ -812,9 +798,13 @@ fn producer_power_follows_emitted_clusters_every_frame() {
         &[],
     );
     let all = entries(&root);
-    assert!(producer_entry(&all, 1).is_none());
+    assert!(held(&scenes, 1).is_none() && producer_entry(&all, every).is_none());
     assert_eq!(all.iter().filter(|e| e.kind != 0).count(), 1);
-    check(producer_entry(&all, 2).unwrap(), statics, "static entry");
+    check(
+        producer_entry(&all, fixed).unwrap(),
+        statics,
+        "static entry",
+    );
     assert_clean();
 }
 
@@ -1369,11 +1359,7 @@ fn a_streaming_emissive_mesh_lists_only_resident_clusters() {
     };
     let mut scenes = Scenes::new(d, &desc).unwrap();
     let _workers = Workers::start(&scenes, 2);
-    let s = scenes
-        .create_scene(&SceneDesc {
-            ..SceneDesc::default()
-        })
-        .unwrap();
+    let s = scenes.create_scene(&SceneDesc::default()).unwrap();
     let mut models = [ModelId(0); 3];
     for model in &mut models {
         let m = scenes.mount(PackSource::Memory(Arc::clone(&bytes)));

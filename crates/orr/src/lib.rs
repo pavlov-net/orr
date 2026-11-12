@@ -881,6 +881,12 @@ impl Renderer {
         Ok(self.scenes.page_needs(id)?)
     }
 
+    /// The entry of `scene`'s producer table that producer `id` holds while it is set, as
+    /// [`orr_scene::SceneWriter::producer_entry`] gives it.
+    pub fn producer_entry(&self, scene: SceneId, id: ProducerId) -> Result<Option<u32>> {
+        Ok(self.scenes.producer_entry(scene, id)?)
+    }
+
     /// Wants the records of instance page `id` resident from the next frame on. Requests last
     /// one frame.
     pub fn prefetch_page(&mut self, id: PageId, cell_distance: u32) {
@@ -1057,6 +1063,12 @@ impl<'a> Frame<'a> {
     /// What `scene` may hold now, which the path pipelines of its views are made for.
     pub fn scene_features(&self, scene: SceneId) -> Result<orr_scene::SceneFeatures> {
         Ok(self.scenes.scene_features(scene)?)
+    }
+
+    /// The entry of `scene`'s producer table that producer `id` holds while it is set, as
+    /// [`orr_scene::SceneWriter::producer_entry`] gives it.
+    pub fn producer_entry(&self, scene: SceneId, id: ProducerId) -> Result<Option<u32>> {
+        Ok(self.scenes.producer_entry(scene, id)?)
     }
 
     /// orr's frame id: strictly increasing from 1.
