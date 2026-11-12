@@ -7,7 +7,8 @@ use crate::material::MaterialId;
 use crate::world::WorldPos;
 use crate::{DecalBinGpu, DecalGpu};
 
-/// A slot in a scene's decal table, which holds every id set. Where decals overlap,
+/// A decal of a scene: its entry in the scene's decal table, which holds every entry up to
+/// the highest id set. Where decals overlap,
 /// higher ids are written over lower ones.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DecalId(pub u32);

@@ -1320,13 +1320,17 @@ impl Scenes {
                 }
                 !done
             });
+            let mut freed = Vec::new();
             cpu.skins_removed.retain(|&(frame, first, count, _)| {
                 let done = frame <= completed;
                 if done {
-                    cpu.skinned.free(first, count);
+                    freed.push((first, count));
                 }
                 !done
             });
+            for (first, count) in freed {
+                scene.free_skinned(cpu, first, count);
+            }
             cpu.ptlas.retire(completed);
             scene.retire(cpu, completed);
         }
@@ -1955,7 +1959,7 @@ impl<'a> Frame<'a> {
                 light_base: layout.slots
                     + layout.parts
                     + scene.desc.producer_capacity
-                    + t.proxies.capacity(),
+                    + cpu.ptlas.proxy_entries(),
                 emissive_lists: t.emissive_lists.gpu(),
             };
             let src = window.put(device, &root)?;

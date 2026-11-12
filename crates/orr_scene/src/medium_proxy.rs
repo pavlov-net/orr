@@ -19,7 +19,8 @@ use crate::world::WorldPos;
 /// `medium_proxy.slang` constants.
 const PROXY_LIVE: u32 = 1;
 
-/// A slot in a scene's medium proxy table, which holds every id set.
+/// A medium proxy of a scene: its entry in the scene's proxy table, which holds every entry
+/// up to the highest id set, as the PTLAS holds an instance for each.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MediumProxyId(pub u32);
 

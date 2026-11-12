@@ -746,6 +746,8 @@ pub(crate) struct SceneCpu {
     pub(crate) skinned: RangeAllocator,
     /// One past the highest skinned-copy entry handed out.
     pub(crate) skinned_high_water: u32,
+    /// Skinned-copy entries handed out and not yet free.
+    skinned_live: u32,
     /// A group has hung from a palette's joint.
     pub(crate) hung: bool,
     skins: Vec<SkinRange>,
@@ -981,25 +983,38 @@ impl Scene {
         sets.reserve(device, grown("material sets", held, more, limit)?)
     }
 
-    /// The first of `count` consecutive free skinned-copy entries. Without a free run that
-    /// long the skinned tables grow as [`grown`] says, within what the device's PTLAS takes in
-    /// its global partition: a skinned copy traces from there and may hold a far instance
-    /// beside it. Fails past that or what a table can hold, or without device memory for the
-    /// grown tables and the frame's skinning, leaving them as they were.
+    /// The first of `count` consecutive free skinned-copy entries, which the device's PTLAS
+    /// takes in its global partition beside what else is in use: a skinned copy traces from
+    /// there and may hold a far instance beside it. Without a free run that long the skinned
+    /// tables grow as [`grown`] says. Fails past the device's PTLAS or what a table can hold,
+    /// or without device memory for the grown tables and the frame's skinning, leaving the
+    /// tables as they were.
     fn take_skinned(&self, cpu: &mut SceneCpu, device: &Device, count: u32) -> Result<u32> {
         // A run of no entries takes none, and its start names no entry.
         if count == 0 {
             return Ok(0);
         }
+        let live = cpu.skinned_live.checked_add(count).ok_or(Error::Capacity {
+            what: "skinned copies",
+            capacity: u32::MAX,
+        })?;
+        cpu.ptlas.hold_skinned(device, live)?;
+        let taken = self.skinned_entries(cpu, device, count);
+        match taken {
+            Ok(_) => cpu.skinned_live = live,
+            Err(_) => cpu.ptlas.release_skinned(cpu.skinned_live),
+        }
+        taken
+    }
+
+    /// [`Self::take_skinned`] once the PTLAS counts the entries.
+    fn skinned_entries(&self, cpu: &mut SceneCpu, device: &Device, count: u32) -> Result<u32> {
         if let Some(first) = cpu.skinned.alloc(count) {
             return Ok(first);
         }
         let t = &self.tables;
         let held = t.skinned.capacity();
-        let limit = held
-            .saturating_add(cpu.ptlas.global_room(device) / 2)
-            .min(t.skinned.limit())
-            .min(t.skin_state.limit());
+        let limit = t.skinned.limit().min(t.skin_state.limit());
         let entries = grown("skinned copies", held, count, limit)?;
         let skinned = t.skinned.room(device, entries)?;
         let skin_state = t.skin_state.room(device, entries)?;
@@ -1009,12 +1024,18 @@ impl Scene {
         }
         t.skinned.grow(skinned, entries);
         t.skin_state.grow(skin_state, entries);
-        cpu.ptlas.hold_skinned(entries);
         cpu.skinned.grow(held, entries);
         Ok(cpu
             .skinned
             .alloc(count)
             .expect("the grown tables have a free run of `count`"))
+    }
+
+    /// Gives back `count` skinned-copy entries from `first`, which the PTLAS counts no more.
+    pub(crate) fn free_skinned(&self, cpu: &mut SceneCpu, first: u32, count: u32) {
+        cpu.skinned.free(first, count);
+        cpu.skinned_live -= count;
+        cpu.ptlas.release_skinned(cpu.skinned_live);
     }
 
     /// Moves the scene's tables that grew since its last update: see [`Column::land`].
@@ -1480,6 +1501,7 @@ impl Scene {
                 cuts: None,
                 skinned: RangeAllocator::new(0),
                 skinned_high_water: 0,
+                skinned_live: 0,
                 hung: false,
                 skins: Vec::new(),
                 skins_removed: Vec::new(),
@@ -2396,7 +2418,7 @@ impl<'f> SceneWriter<'f> {
             };
             let Some(emissive) = emissive else {
                 cpu.slots.free(first, desc.copies);
-                cpu.skinned.free(entry, desc.copies);
+                self.scene.free_skinned(cpu, entry, desc.copies);
                 return Err(Error::Capacity {
                     what: "emissive list entries",
                     capacity: self.scene.desc.emissive_capacity,
@@ -2876,8 +2898,8 @@ impl<'f> SceneWriter<'f> {
         Ok(())
     }
 
-    /// Sets or clears decal `id`, from this frame on. The decal table grows to hold the
-    /// highest id set.
+    /// Sets or clears decal `id`, from this frame on. An id is the decal's entry in the
+    /// scene's decal table, which grows to hold the highest id set.
     pub fn set_decal(&mut self, id: DecalId, decal: Option<&Decal>) -> Result<()> {
         let table = &self.scene.tables.decals;
         let held = table.capacity();
@@ -2902,9 +2924,10 @@ impl<'f> SceneWriter<'f> {
         Ok(())
     }
 
-    /// Sets or clears medium proxy `id`, from this frame on. The proxy table grows to hold the
-    /// highest id set, within what the device's PTLAS takes in its global partition, where
-    /// proxies trace from.
+    /// Sets or clears medium proxy `id`, from this frame on. An id is the proxy's entry in the
+    /// scene's proxy table, which grows to hold the highest id set, and the device's PTLAS
+    /// takes an instance in its global partition for every id up to it: a set past what it
+    /// takes beside what else is in use fails.
     pub fn set_medium_proxy(
         &mut self,
         id: MediumProxyId,
@@ -2918,15 +2941,12 @@ impl<'f> SceneWriter<'f> {
             if proxy.is_none() {
                 return Ok(());
             }
-            let room = cpu.ptlas.global_room(self.device);
-            let limit = held.saturating_add(room).min(table.limit());
-            let entries = grown_to_hold("medium proxies", held, id.0, limit)?;
+            let entries = grown_to_hold("medium proxies", held, id.0, table.limit())?;
             table.reserve(self.device, entries)?;
-            cpu.ptlas.hold_proxies(entries);
         }
         let record = proxy.map_or_else(MediumProxyGpu::zeroed, |p| proxy_gpu(p, self.cell_log2));
         let copy = self.staged(table.entry(id.0), &record)?;
-        cpu.ptlas.set_proxy(id.0, proxy.is_some());
+        cpu.ptlas.set_proxy(self.device, id.0, proxy.is_some())?;
         cpu.records.push(copy);
         Ok(())
     }
