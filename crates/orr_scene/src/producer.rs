@@ -368,6 +368,8 @@ pub(crate) struct Producer {
     pub(crate) subd: Option<(GpuPtr<SubdCopyGpu>, CageShape)>,
     /// The model of a subdivision copy, which it reads the cage of every frame.
     pub(crate) model: Option<ModelId>,
+    /// Its entry of its scene's emissive list, which the scene gives it.
+    pub(crate) emissive: u32,
     accel: Option<Accel>,
     /// Held while the entry is set.
     _memory: Allocation<u8>,
@@ -925,6 +927,8 @@ pub(crate) fn build(
             tessellated: u32::from(tessellated),
             strands: u32::from(strands),
             drawn: u32::from(desc.drawn),
+            emissive: 0,
+            _pad: 0,
         },
         batch: drawn_batch,
         patches,
@@ -961,6 +965,7 @@ pub(crate) fn build(
             }),
             subd: subd.map(|s| (copy_ptr, s.shape)),
             model: None,
+            emissive: 0,
             accel,
             _memory: memory,
         },

@@ -430,7 +430,7 @@ public struct SceneRoot
     public uint* material_sets;      // the consumer's: MaterialId per model section per set
     public uint* page_material_sets; // the placed pages': MaterialId per model section
     public LightGpu* lights;
-    public EmissiveGpu* emissive;    // producer_capacity + emissive_capacity entries
+    public EmissiveGpu* emissive;    // `emissive_capacity` entries
     public ProducerGpu* producers;   // by ProducerId
     public ProducerBatch* batches;   // by ProducerId: what is drawn and traced; a tessellated entry's generated clusters
     public ProducerBatch* patches;   // by ProducerId: the patches a tessellated entry's kernel emits; zero for others
@@ -447,7 +447,7 @@ public struct SceneRoot
     public uint skinned_capacity;
     public uint light_capacity;
     public uint producer_capacity;
-    public uint emissive_capacity;   // instance entries, after the producer entries
+    public uint emissive_capacity;   // entries of `emissive`
     public float near_range;         // m
     public uint part_base;           // PTLAS index of part instance 0; the instance slots come first, so also their count
     public uint part_capacity;
@@ -466,7 +466,16 @@ public struct SceneRoot
     public MediumProxyGpu* proxies;  // by MediumProxyId
     public uint proxy_capacity;
     public uint light_base;          // PTLAS index of the proxy of LightId 0
-    public uint* emissive_lists;     // per instance entry: its gathered list (`gathered_list`)
+    public uint* emissive_lists;     // per entry of `emissive`: an instance entry's gathered list (`gathered_list`)
+}
+
+// The entry of `SceneRoot.emissive` that producer entry `p` holds; false where the producer
+// table holds no entry.
+public bool producer_emissive(SceneRoot* s, uint p, out uint entry)
+{
+    entry = s.producers[p].emissive;
+    EmissiveGpu e = s.emissive[entry];
+    return e.kind == EMISSIVE_PRODUCER && e.source == p;
 }
 
 // The medium proxy a PTLAS instance index of class CLASS_MEDIUM names.

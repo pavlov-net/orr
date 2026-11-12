@@ -35,8 +35,9 @@ struct Root
     // as this frame leaves them.
     uint* feedback_counts;
     float* feedback_weights;
-    // The two as the frames before left them, for a light table of `lights_before` entries:
-    // other arrays than the two above once the table has grown.
+    // The two as the frames before left them, for a light table of `lights_before` entries
+    // and an emissive list of `entries_before`: other arrays than the two above once either
+    // has grown.
     uint* feedback_counts_before;
     float* feedback_weights_before;
     // Shadow rays of the frame before past the candidate limit.
@@ -53,7 +54,7 @@ struct Root
     // 1: drop the feedback so far.
     uint clear_feedback;
     uint lights_before;
-    uint _pad0;
+    uint entries_before;
 }
 ORR_ROOT(Root);
 
@@ -217,21 +218,23 @@ bool stack_entry(SceneRoot* s, uint e)
     return false;
 }
 
-// Whether producer entry `e` has an instance in the PTLAS that MASK_PARTICLE rays meet: the
-// mask its class gave it when it was written.
+// Whether emissive list entry `e` is a producer entry's with an instance in the PTLAS that
+// MASK_PARTICLE rays meet: the mask its class gave it when it was written.
 bool particle_entry(SceneRoot* s, uint e)
 {
-    return s.producers[e].class_id == CLASS_PARTICLE && (s.producer_state[e].rt_flags & PRODUCER_RT_WRITTEN) != 0;
+    EmissiveGpu g = s.emissive[e];
+    return g.kind == EMISSIVE_PRODUCER && s.producers[g.source].class_id == CLASS_PARTICLE
+        && (s.producer_state[g.source].rt_flags & PRODUCER_RT_WRITTEN) != 0;
 }
 
-// The list of instance entry `e` (from `s.producer_capacity`) as `select` hands it to
+// The list of instance entry `e` as `select` hands it to
 // sampling: its cooked set at the row its copy traces, or the list its traversal gathered.
 void instance_list(SceneRoot* s, uint e, inout EmissiveSelection sel)
 {
     EmissiveGpu g = s.emissive[e];
     if (g.set == GATHERED_SET)
     {
-        uint* list = gathered_list(s.emissive_lists, e - s.producer_capacity);
+        uint* list = gathered_list(s.emissive_lists, e);
         sel.clusters = list;
         sel.cdf = list + GATHERED_CLUSTERS;
         return;
@@ -247,19 +250,31 @@ void instance_list(SceneRoot* s, uint e, inout EmissiveSelection sel)
         sel.nodes = (uint8_t*)((SetNode*)t.nodes + k.first_node);
 }
 
-// Feedback weight of feedback id `i` this frame: the weight before, decayed, plus the pixels
-// counted for it in the frame before, whose count it clears. The frames before named `i` by
-// their own light table: a light by the same id, and an emissive entry or the environment by
-// one as far past that table's lights as `i` is past this one's `lights`. A clear drops both,
-// and the counts are not yet written after the light set is created; a light the table before
-// did not hold has neither.
-float feedback(uint i, uint lights)
+// Feedback weight of feedback id `i` this frame, of `lights` lights and `entries` emissive
+// list entries: the weight before, decayed, plus the pixels counted for it in the frame
+// before, whose count it clears. The frames before named `i` by their own tables: a light by
+// the same id, an emissive entry by its entry past that light table's lights, and the
+// environment past that emissive list's entries. A clear drops both, and the counts are not
+// yet written after the light set is created; a light or an entry the tables before did not
+// hold has neither.
+float feedback(uint i, uint lights, uint entries)
 {
     uint pixels = 0;
     float h = 0.0;
-    if (root.clear_feedback == 0 && (i >= lights || i < root.lights_before))
+    uint before = root.lights_before + root.entries_before;
+    bool held = true;
+    if (i < lights)
     {
-        uint before = i < lights ? i : i - lights + root.lights_before;
+        before = i;
+        held = i < root.lights_before;
+    }
+    else if (i - lights < entries)
+    {
+        before = root.lights_before + (i - lights);
+        held = i - lights < root.entries_before;
+    }
+    if (root.clear_feedback == 0 && held)
+    {
         pixels = root.feedback_counts_before[before];
         h = root.feedback_weights_before[before] * FEEDBACK_HISTORY + float(pixels);
     }
@@ -280,14 +295,14 @@ void select(uint lane: SV_GroupIndex)
 {
     SceneRoot* s = root.scene;
     uint lights = s.light_capacity;
-    uint n = lights + s.producer_capacity + s.emissive_capacity;
+    uint n = lights + s.emissive_capacity;
     if (lane < 7)
         counts[lane] = 0;
     GroupMemoryBarrierWithGroupSync();
     bool environment = root.environment.mean.a > 0.0;
     if (lane == 0)
     {
-        float h = feedback(n, lights);
+        float h = feedback(n, lights, s.emissive_capacity);
         environment_feedback = environment ? h : 0.0;
     }
     float carry_w = 0.0;
@@ -303,10 +318,10 @@ void select(uint lane: SV_GroupIndex)
         if (i < n)
         {
             candidate(s, i, w, c, pooled);
-            h = feedback(i, lights);
+            h = feedback(i, lights, s.emissive_capacity);
             if (i >= lights && stack_entry(s, i - lights))
                 InterlockedAdd(counts[5], 1);
-            if (i >= lights && i - lights < s.producer_capacity && particle_entry(s, i - lights))
+            if (i >= lights && particle_entry(s, i - lights))
                 InterlockedAdd(counts[6], 1);
         }
         uint chunk_c;
@@ -439,7 +454,9 @@ void select(uint lane: SV_GroupIndex)
 [numthreads(64, 1, 1)]
 void clusters(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
 {
-    uint entry = group.x;
+    uint entry;
+    if (!producer_emissive(root.scene, group.x, entry))
+        return;
     EmissiveSelection e = root.emissive[entry];
     uint count = e.count;
     if (count == 0)
@@ -450,7 +467,7 @@ void clusters(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
     for (uint base = 0; base < count; base += 64)
     {
         uint c = base + lane;
-        float w = c < count ? producer_cluster_weight(root.scene, entry, c) : 0.0;
+        float w = c < count ? producer_cluster_weight(root.scene, group.x, c) : 0.0;
         float chunk;
         float sum = carry + scan_float(lane, 64, w, chunk);
         if (w > 0.0)

@@ -4,7 +4,7 @@
 use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, GpuPtr, Hazards, MemoryKind, Stages,
 };
-use orr_scene::{SceneDesc, SceneRoot};
+use orr_scene::{LightTables, SceneRoot};
 
 use crate::scene::{FRAME_SLOTS, Ring, device_local};
 use crate::shaders::caustics::{casters, resolve};
@@ -176,13 +176,10 @@ fn resolve_grid(count: u64) -> [u32; 3] {
 /// One scene's caustics: the photon source and the real-time grid.
 pub(crate) struct Caustics {
     settings: CausticSettings,
-    producers: u32,
-    /// Emissive list entries of the scene.
-    entries: u64,
-    /// Entries of the scene's light table at the last scene pass.
-    lights: u32,
     pipelines: CausticPipelines,
     b: Buffers,
+    /// For the scene's light tables at the last scene pass.
+    per: PerEntry,
     roots: Ring<CausticsGpu>,
     caster_roots: Ring<casters::Root>,
     resolve_roots: Ring<resolve::Root>,
@@ -200,31 +197,47 @@ struct Buffers {
     counters: Allocation<u32>,
     readback: Allocation<CausticStatsGpu>,
     source: Allocation<PhotonSourceGpu>,
+    pool: Allocation<u32>,
+}
+
+/// What a scene's caustics hold per emissive list entry and per feedback id, for light tables
+/// `tables`.
+pub(crate) struct PerEntry {
+    tables: LightTables,
     selections: Allocation<EmissiveSelection>,
     cdf: Allocation<f32>,
     started: Allocation<u32>,
     deposited: Allocation<u32>,
     yields: Allocation<f32>,
     areas: Allocation<f32>,
-    pool: Allocation<u32>,
     interiors: Allocation<EyeInterior>,
 }
 
-/// Feedback ids of `lights` lights and `entries` emissive list entries: every light, every
-/// entry, then the environment.
-pub(crate) fn feedback_ids(lights: u32, entries: u64) -> u64 {
-    u64::from(lights) + entries + 1
+/// Feedback ids of light tables `tables`: every light, every emissive list entry, then the
+/// environment.
+pub(crate) fn feedback_ids(tables: LightTables) -> u64 {
+    u64::from(tables.lights) + u64::from(tables.entries) + 1
+}
+
+impl PerEntry {
+    fn new(device: &Device, tables: LightTables) -> Result<Self, Error> {
+        let entries = u64::from(tables.entries);
+        Ok(Self {
+            tables,
+            selections: device_local(device, entries, "caster lists")?,
+            cdf: device_local(device, entries, "caster cdf")?,
+            started: device_local(device, entries, "caster photons started")?,
+            deposited: device_local(device, entries, "caster photons deposited")?,
+            yields: device_local(device, entries, "caster yields")?,
+            areas: device_local(device, entries, "caster areas")?,
+            interiors: device_local(device, feedback_ids(tables), "light interiors")?,
+        })
+    }
 }
 
 impl Buffers {
-    fn new(
-        device: &Device,
-        lights: u32,
-        entries: u64,
-        settings: &CausticSettings,
-    ) -> Result<Self, Error> {
+    fn new(device: &Device, settings: &CausticSettings) -> Result<Self, Error> {
         let capacity = 1u64 << settings.capacity_log2;
-        let ids = feedback_ids(lights, entries);
         Ok(Self {
             checks: device_local(device, capacity, "caustic grid checks")?,
             accumulated: device_local(device, 2 * capacity, "caustic grid deposits")?,
@@ -237,18 +250,11 @@ impl Buffers {
                 "caustic stats readback",
             )?,
             source: device_local(device, 1, "photon source")?,
-            selections: device_local(device, entries, "caster lists")?,
-            cdf: device_local(device, entries, "caster cdf")?,
-            started: device_local(device, entries, "caster photons started")?,
-            deposited: device_local(device, entries, "caster photons deposited")?,
-            yields: device_local(device, entries, "caster yields")?,
-            areas: device_local(device, entries, "caster areas")?,
             pool: device_local(
                 device,
                 u64::from(settings.producer_clusters),
                 "producer caster cdf",
             )?,
-            interiors: device_local(device, ids, "light interiors")?,
         })
     }
 }
@@ -257,18 +263,14 @@ impl Caustics {
     pub(crate) fn new(
         device: &Device,
         kernels: &KernelSet,
-        scene: &SceneDesc,
         settings: &CausticSettings,
     ) -> Result<Self, Error> {
         check_settings(settings)?;
-        let entries = u64::from(scene.producer_capacity) + u64::from(scene.emissive_capacity);
         Ok(Self {
             settings: *settings,
-            producers: scene.producer_capacity,
-            entries,
-            lights: 0,
             pipelines: CausticPipelines::new(device, kernels)?,
-            b: Buffers::new(device, 0, entries, settings)?,
+            b: Buffers::new(device, settings)?,
+            per: PerEntry::new(device, LightTables::default())?,
             roots: Ring::new(device, "caustic roots")?,
             caster_roots: Ring::new(device, "caster roots")?,
             resolve_roots: Ring::new(device, "caustic resolve roots")?,
@@ -290,7 +292,7 @@ impl Caustics {
         if settings.capacity_log2 != old.capacity_log2
             || settings.producer_clusters != old.producer_clusters
         {
-            self.b = Buffers::new(device, self.lights, self.entries, settings)?;
+            self.b = Buffers::new(device, settings)?;
             self.recorded = [false; FRAME_SLOTS];
             self.clear = true;
         }
@@ -309,22 +311,22 @@ impl Caustics {
         self.clear = true;
     }
 
-    /// Makes the lights' interiors, which every scene pass writes whole, anew for a light
-    /// table of `lights` entries; returns the ones before, which the frames in flight read.
-    /// Fails without device memory, changing nothing.
-    pub(crate) fn follow_lights(
-        &mut self,
-        device: &Device,
-        lights: u32,
-    ) -> Result<Allocation<EyeInterior>, Error> {
-        let ids = feedback_ids(lights, self.entries);
-        let interiors = device_local(device, ids, "light interiors")?;
-        self.lights = lights;
-        Ok(std::mem::replace(&mut self.b.interiors, interiors))
+    /// What the caustics hold per entry and per feedback id for light tables `tables`, for
+    /// [`Self::follow`] to take once nothing else can fail. Fails without device memory.
+    pub(crate) fn room(&self, device: &Device, tables: LightTables) -> Result<PerEntry, Error> {
+        PerEntry::new(device, tables)
+    }
+
+    /// Takes `room`, from [`Self::room`]; returns what the caustics held before, which the
+    /// frames in flight read and the next [`Self::record`] takes the casters' yields from.
+    pub(crate) fn follow(&mut self, room: PerEntry) -> PerEntry {
+        std::mem::replace(&mut self.per, room)
     }
 
     /// Records slot `slot`'s photon source after the light set's selection and starts the
-    /// grid's frame, for a frame focused on `focus`. Records nothing with caustics off.
+    /// grid's frame, for a frame focused on `focus`. `before` is what [`Self::follow`]
+    /// returned since the last record, when the scene's light tables have grown since.
+    /// Records nothing with caustics off.
     pub(crate) fn record(
         &mut self,
         list: &mut CommandList<'_>,
@@ -332,6 +334,7 @@ impl Caustics {
         scene: GpuPtr<SceneRoot>,
         set: GpuPtr<LightSetGpu>,
         focus: [f32; 3],
+        before: Option<&PerEntry>,
     ) {
         let s = self.settings;
         self.recorded[slot] = s.photons > 0;
@@ -340,6 +343,8 @@ impl Caustics {
         }
         let capacity = 1u64 << s.capacity_log2;
         let clear = std::mem::take(&mut self.clear);
+        let per = &self.per;
+        let before = before.unwrap_or(per);
         self.roots.write(
             slot,
             CausticsGpu {
@@ -371,14 +376,18 @@ impl Caustics {
                 scene,
                 set,
                 source: self.b.source.gpu(),
-                entries: self.b.selections.gpu(),
-                cdf: self.b.cdf.gpu(),
-                started: self.b.started.gpu(),
-                deposited: self.b.deposited.gpu(),
-                yields: self.b.yields.gpu(),
-                areas: self.b.areas.gpu(),
+                entries: per.selections.gpu(),
+                cdf: per.cdf.gpu(),
+                started: per.started.gpu(),
+                deposited: per.deposited.gpu(),
+                yields: per.yields.gpu(),
+                areas: per.areas.gpu(),
+                started_before: before.started.gpu(),
+                deposited_before: before.deposited.gpu(),
+                yields_before: before.yields.gpu(),
+                _pad4: 0,
                 pool: self.b.pool.gpu(),
-                interiors: self.b.interiors.gpu(),
+                interiors: per.interiors.gpu(),
                 focus: [focus[0], focus[1], focus[2], s.lod_scale],
                 pool_capacity: s.producer_clusters,
                 clear: u32::from(clear),
@@ -386,7 +395,7 @@ impl Caustics {
                 capacity: capacity as u32,
                 base_cell_log2: s.base_cell_log2,
                 cell_lifetime: s.cell_lifetime,
-                _pad0: 0,
+                entries_before: before.tables.entries,
                 _pad2: 0,
                 _pad3: 0,
             },
@@ -405,12 +414,12 @@ impl Caustics {
         let p = &self.pipelines;
         list.dispatch(&p.pool, casters, [1, 1, 1]);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        if self.producers > 0 {
-            list.dispatch(&p.lists, casters, [self.producers, 1, 1]);
+        if per.tables.producers > 0 {
+            list.dispatch(&p.lists, casters, [per.tables.producers, 1, 1]);
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         }
         list.dispatch(&p.weigh, casters, [1, 1, 1]);
-        let ids = feedback_ids(self.lights, self.entries);
+        let ids = feedback_ids(per.tables);
         list.dispatch(&p.interiors, casters, [ids.div_ceil(64) as u32, 1, 1]);
         if clear {
             list.dispatch(&p.clear, grid, resolve_grid(capacity));

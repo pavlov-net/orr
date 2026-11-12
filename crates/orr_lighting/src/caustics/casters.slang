@@ -35,6 +35,13 @@ struct Root
     // render-space area this frame.
     float* yields;
     float* areas;
+    // `started`, `deposited` and `yields` as the frames before left them, for an emissive
+    // list of `entries_before` entries: other arrays than those once the scene's light tables
+    // have grown.
+    uint* started_before;
+    uint* deposited_before;
+    float* yields_before;
+    uint64_t _pad4;
     // The producer entries' caster lists' CDFs.
     uint* pool;
     EyeInterior* interiors;
@@ -48,7 +55,7 @@ struct Root
     uint capacity;                  // the grid's cells
     int base_cell_log2;             // the grid's level 0, as for `CausticsGpu`
     uint cell_lifetime;             // frames without a deposit before a cell is evicted
-    uint _pad0;
+    uint entries_before;
     uint _pad2;
     uint _pad3;
 }
@@ -145,12 +152,12 @@ void write_fixed_cdf(uint lane, uint* cdf, uint count, float total, uint end)
     }
 }
 
-// Whether producer entry `entry` is traced this frame: only what rays meet can cast.
-bool producer_traced(SceneRoot* s, uint entry)
+// Whether producer entry `producer` is traced this frame: only what rays meet can cast.
+bool producer_traced(SceneRoot* s, uint producer)
 {
-    ProducerGpu p = s.producers[entry];
-    return s.emissive[entry].kind == EMISSIVE_PRODUCER && p.strands == 0
-        && (p.flags & INSTANCE_RAY) != 0 && (s.producer_state[entry].rt_flags & PRODUCER_RT_WRITTEN) != 0;
+    ProducerGpu p = s.producers[producer];
+    return p.strands == 0 && (p.flags & INSTANCE_RAY) != 0
+        && (s.producer_state[producer].rt_flags & PRODUCER_RT_WRITTEN) != 0;
 }
 
 // The producer entries' places in the pool, one workgroup; the pool's overflow leaves an entry
@@ -166,14 +173,16 @@ void pool(uint lane: SV_GroupIndex)
     {
         uint i = base + lane;
         uint n = 0;
-        if (i < s.producer_capacity && producer_traced(s, i))
+        uint entry = 0;
+        bool set = i < s.producer_capacity && producer_emissive(s, i, entry);
+        if (set && producer_traced(s, i))
         {
             ProducerBatch b = s.batches[i];
             n = emitted_clusters(b);
         }
         uint chunk;
         uint first = carry + scan_uint(lane, n, chunk) - n;
-        if (i < s.producer_capacity)
+        if (set)
         {
             EmissiveSelection e = (EmissiveSelection)0;
             if (n > 0 && first + n <= root.pool_capacity)
@@ -181,18 +190,18 @@ void pool(uint lane: SV_GroupIndex)
                 e.count = n;
                 e.cdf = root.pool + first;
             }
-            root.entries[i] = e;
+            root.entries[entry] = e;
         }
         carry += chunk;
     }
 }
 
-// Render-space area of cluster `c` of producer entry `entry`'s batch where its material casts;
-// 0 elsewhere.
-float producer_caster_area(SceneRoot* s, uint entry, uint c)
+// Render-space area of cluster `c` of producer entry `producer`'s batch where its material
+// casts; 0 elsewhere.
+float producer_caster_area(SceneRoot* s, uint producer, uint c)
 {
-    ProducerGpu p = s.producers[entry];
-    ProducerBatch b = s.batches[entry];
+    ProducerGpu p = s.producers[producer];
+    ProducerBatch b = s.batches[producer];
     ProducerClusterGpu k = b.clusters[c];
     uint material = producer_material(p, k);
     Placement pl;
@@ -220,7 +229,9 @@ float producer_caster_area(SceneRoot* s, uint entry, uint c)
 void lists(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
 {
     ORR_OMM(lists);
-    uint entry = group.x;
+    uint entry;
+    if (!producer_emissive(root.scene, group.x, entry))
+        return;
     EmissiveSelection e = root.entries[entry];
     uint count = e.count;
     if (count == 0)
@@ -235,7 +246,7 @@ void lists(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
     for (uint base = 0; base < count; base += 64)
     {
         uint c = base + lane;
-        float w = c < count ? producer_caster_area(root.scene, entry, c) : 0.0;
+        float w = c < count ? producer_caster_area(root.scene, group.x, c) : 0.0;
         float chunk;
         float sum = carry + scan_float(lane, 64, w, chunk);
         if (w > 0.0)
@@ -255,7 +266,7 @@ void lists(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
     }
 }
 
-// The caster list of instance entry `e` (from `s.producer_capacity`), its copy's mesh `mesh`:
+// The caster list of instance entry `e`, its copy's mesh `mesh`:
 // the cooked set of the row its copy traces, or the list its traversal gathered.
 EmissiveSelection instance_casters(SceneRoot* s, uint e, MeshGpu* mesh)
 {
@@ -264,7 +275,7 @@ EmissiveSelection instance_casters(SceneRoot* s, uint e, MeshGpu* mesh)
     sel.count = g.cluster_count;
     if (g.set == GATHERED_SET)
     {
-        uint* list = gathered_list(s.emissive_lists, e - s.producer_capacity);
+        uint* list = gathered_list(s.emissive_lists, e);
         sel.clusters = list;
         sel.cdf = list + GATHERED_CLUSTERS;
         return sel;
@@ -277,23 +288,24 @@ EmissiveSelection instance_casters(SceneRoot* s, uint e, MeshGpu* mesh)
     return sel;
 }
 
-// Weight of entry `i` this frame and its caster list, which instance entries write here.
+// Weight of entry `i` this frame and its caster list, which every entry but a producer's
+// writes here.
 float entry_weight(SceneRoot* s, uint i)
 {
     float area = 0.0;
     float3 center = root.focus.xyz;
-    if (i < s.producer_capacity)
+    EmissiveGpu g = s.emissive[i];
+    if (g.kind == EMISSIVE_PRODUCER)
     {
         if (root.entries[i].count == 0)
             return 0.0;
         area = root.areas[i];
         Placement pl;
-        if (producer_placement(s, s.producers[i], false, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), pl))
+        if (producer_placement(s, s.producers[g.source], false, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), pl))
             center = place(pl, float3(0.0));
     }
     else
     {
-        EmissiveGpu g = s.emissive[i];
         EmissiveSelection sel = (EmissiveSelection)0;
         if (g.kind == EMISSIVE_INSTANCE && g.set != NO_SET && g.cluster_count > 0)
         {
@@ -324,7 +336,7 @@ void weigh(uint lane: SV_GroupIndex)
 {
     ORR_OMM(weigh);
     SceneRoot* s = root.scene;
-    uint n = s.producer_capacity + s.emissive_capacity;
+    uint n = s.emissive_capacity;
     float carry = 0.0;
     for (uint base = 0; base < n; base += GROUP)
     {
@@ -332,12 +344,13 @@ void weigh(uint lane: SV_GroupIndex)
         float w = 0.0;
         if (i < n)
         {
-            // A clear follows new buffers, whose counts hold nothing yet.
-            bool clear = root.clear != 0;
-            uint started = clear ? 0 : root.started[i];
-            float y = clear ? 1.0 : root.yields[i];
+            // A clear follows new buffers, whose counts hold nothing yet, and an entry the list
+            // before did not hold has none.
+            bool none = root.clear != 0 || i >= root.entries_before;
+            uint started = none ? 0 : root.started_before[i];
+            float y = none ? 1.0 : root.yields_before[i];
             if (started > 0)
-                y = lerp(float(root.deposited[i]) / float(started), y, YIELD_HISTORY);
+                y = lerp(float(root.deposited_before[i]) / float(started), y, YIELD_HISTORY);
             root.yields[i] = y;
             root.started[i] = 0;
             root.deposited[i] = 0;
@@ -401,7 +414,7 @@ bool light_point(SceneRoot* s, LightSetGpu* set, uint id, out float3 p, out floa
         return l.kind == LIGHT_SPHERE || l.kind == LIGHT_RECT;
     }
     uint entry = id - s.light_capacity;
-    if (entry >= s.producer_capacity + s.emissive_capacity)
+    if (entry >= s.emissive_capacity)
         return false;
     EmissiveSelection e = set.emissive[entry];
     uint instance_index, cluster_id, triangles, alpha_first;
@@ -425,7 +438,7 @@ void interiors(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(interiors);
     SceneRoot* s = root.scene;
-    uint n = s.light_capacity + s.producer_capacity + s.emissive_capacity + 1;
+    uint n = s.light_capacity + s.emissive_capacity + 1;
     if (id.x >= n)
         return;
     float3 origin;

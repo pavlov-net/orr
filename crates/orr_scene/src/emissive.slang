@@ -14,7 +14,7 @@ import orr_scene.tables;
 struct Root
 {
     SceneRoot* scene;
-    // `entries`: (slot, first instance entry, entries, 0) per slot.
+    // `entries`: (slot, first entry, entries, 0) per slot.
     uint4* jobs;
     uint job_count;
     uint _pad0;
@@ -32,7 +32,7 @@ void entries(uint3 id: SV_DispatchThreadID)
         return;
     SceneRoot* s = root.scene;
     uint4 j = root.jobs[id.x];
-    uint first = s.producer_capacity + j.y;
+    uint first = j.y;
     s.instances[j.x].first_emissive = j.z != 0 ? first : NO_EMISSIVE;
     s.instances[j.x].emissive_count = j.z;
     for (uint k = 0; k < j.z; k++)
@@ -91,7 +91,7 @@ float gathered_cdf(SceneRoot* s, uint entry, uint count)
     return total;
 }
 
-// One thread per instance entry: the cooked set of the row the copy traces, or the list its
+// One thread per entry, for the instance entries: the cooked set of the row the copy traces, or the list its
 // traversal gathered for a cut built this frame, at the copy's nearer chain step, so a copy
 // outside ray tracing emits and casts nothing. An entry past the mesh's emissive ranks is a
 // caster rank's, which emits nothing. Area scales by |det|^(2/3), exact under uniform scale,
@@ -103,7 +103,7 @@ void instances(uint3 id: SV_DispatchThreadID)
     SceneRoot* s = root.scene;
     if (id.x >= s.emissive_capacity)
         return;
-    EmissiveGpu* e = s.emissive + s.producer_capacity + id.x;
+    EmissiveGpu* e = s.emissive + id.x;
     if (e.kind != EMISSIVE_INSTANCE)
         return;
     InstanceGpu inst = copy_record(s, e.source);
@@ -162,9 +162,10 @@ void producers(uint3 entry: SV_GroupID, uint3 thread: SV_GroupThreadID)
     SceneRoot* s = root.scene;
     uint id = entry.x;
     uint t = thread.x;
-    EmissiveGpu* e = s.emissive + id;
-    if (e.kind != EMISSIVE_PRODUCER)
+    uint held;
+    if (!producer_emissive(s, id, held))
         return;
+    EmissiveGpu* e = s.emissive + held;
     ProducerGpu p = s.producers[id];
     ProducerBatch b = s.batches[id];
     float3x3 m = linear_part(s, p.group, p.group_index);

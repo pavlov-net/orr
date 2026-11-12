@@ -85,6 +85,8 @@ public struct ProducerGpu
     public uint tessellated;     // 1: clusters are base patches for the tessellator
     public uint strands;         // 1: a strand entry, which emits segments instead of clusters
     public uint drawn;           // linked IDrawn id of a drawn entry, whose opaque raster the view's opaque hook draws; 0: its clusters raster
+    public uint emissive;        // its entry in SceneRoot.emissive
+    public uint _pad;
 }
 
 // `ProducerStateGpu.rt_flags`.

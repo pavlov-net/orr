@@ -2119,8 +2119,7 @@ impl Bed {
             .wait_while_completing(point, Duration::from_secs(10))
             .unwrap();
 
-        let lighting =
-            SceneLighting::new(d, kernels, &desc, &SceneLightingSettings::default()).unwrap();
+        let lighting = SceneLighting::new(d, kernels, &SceneLightingSettings::default()).unwrap();
         let buffer = |kind, name| d.gpu_malloc::<[f32; 4]>(kind, PIXELS, name).unwrap();
         let mut arena = ViewArena::new(d, false);
         let mut list = render().command_list().unwrap();

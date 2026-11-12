@@ -900,7 +900,7 @@ impl Scenes {
             // Every scene's ranges first, so a scene without room changes none.
             let mut growths = Vec::new();
             for scene in core.scenes.iter().flatten() {
-                match scene.reserve_entries(model.0, stride, page_strides) {
+                match scene.reserve_entries(&self.device, model.0, stride, page_strides) {
                     Ok(g) => growths.push((scene, g)),
                     Err(e) => {
                         for (scene, g) in growths {
@@ -1971,7 +1971,7 @@ impl<'a> Frame<'a> {
                 skinned_capacity: t.skinned.capacity(),
                 light_capacity: t.lights.capacity(),
                 producer_capacity: scene.desc.producer_capacity,
-                emissive_capacity: scene.desc.emissive_capacity,
+                emissive_capacity: t.emissive.capacity(),
                 near_range: cpu.near_range,
                 part_base: layout.slots,
                 part_capacity: layout.parts,
@@ -1993,7 +1993,7 @@ impl<'a> Frame<'a> {
                     + layout.parts
                     + scene.desc.producer_capacity
                     + cpu.ptlas.proxy_entries(),
-                emissive_lists: t.emissive_lists.gpu(),
+                emissive_lists: t.emissive_lists.gpu().cast(),
             };
             let src = window.put(device, &root)?;
             records.push(Record::values(core.next_seq(), t.root.gpu(), src, 1));
@@ -2394,7 +2394,7 @@ impl<'a> Frame<'a> {
             // The PTLAS kernels write the cuts this pass reads.
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
             list.begin_pass("emissive", false);
-            for &(_, scene, _, _, desc, _) in &roots {
+            for &(_, scene, _, _, desc, tables) in &roots {
                 let r = emissive::Root {
                     scene,
                     jobs: GpuPtr::NULL,
@@ -2407,8 +2407,8 @@ impl<'a> Frame<'a> {
                     let p = self.pipelines.get(own.emissive_producers);
                     list.dispatch(p, ptr, [desc.producer_capacity, 1, 1]);
                 }
-                if desc.emissive_capacity > 0 {
-                    let groups = desc.emissive_capacity.div_ceil(64);
+                if tables.entries > 0 {
+                    let groups = tables.entries.div_ceil(64);
                     let p = self.pipelines.get(own.emissive_instances);
                     list.dispatch(p, ptr, [groups, 1, 1]);
                 }

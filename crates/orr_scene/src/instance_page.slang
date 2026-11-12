@@ -57,7 +57,7 @@ void expand(uint3 id: SV_DispatchThreadID)
     SceneRoot* s = root.scene;
     uint slot = root.first_slot + i;
     PageEntriesGpu entries = root.entries[prototype];
-    uint entry = s.producer_capacity + root.first_entry + entries.first + r.rank * entries.count;
+    uint entry = root.first_entry + entries.first + r.rank * entries.count;
     uint first = entries.count != 0 ? entry : NO_EMISSIVE;
     if (root.entries_only != 0)
     {

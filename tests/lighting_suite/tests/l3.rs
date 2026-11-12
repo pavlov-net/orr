@@ -499,7 +499,6 @@ fn set_producers_of(
 fn emissive_producer_tiles_match_the_density_and_irradiance() {
     let mut scene = TestScene::new(SceneDesc {
         producer_capacity: 4,
-        emissive_capacity: 0,
         ..SceneDesc::default()
     });
     // Entry 0 faces the receiver from y = 2; entry 1 is turned over at y = 2.5 beside it, so
@@ -598,7 +597,6 @@ fn lit_through_a_texture(
 ) {
     let mut scene = TestScene::new(SceneDesc {
         producer_capacity: 4,
-        emissive_capacity: 0,
         ..SceneDesc::default()
     });
     let transforms = [Affine3::from_translation(Vec3::new(0.0, 2.0, 0.0))];
@@ -761,7 +759,6 @@ fn forced_local(
 fn local_sampler_candidates_match_the_hit_side_density() {
     let mut scene = TestScene::new(SceneDesc {
         producer_capacity: 4,
-        emissive_capacity: 0,
         ..SceneDesc::default()
     });
     let quads = Quads {
@@ -994,7 +991,6 @@ fn directional_share_matches_the_lights_weights() {
 fn selection_probabilities_follow_power_and_sum_to_one() {
     let mut scene = TestScene::procedural(SceneDesc {
         producer_capacity: 2,
-        emissive_capacity: 4,
         ..SceneDesc::default()
     });
     let quads = Quads {
@@ -1068,8 +1064,9 @@ fn selection_probabilities_follow_power_and_sum_to_one() {
 
     let set: LightSetGpu = read(lighting.light_set(), 1)[0];
     let light_p = read(set.light_probability, u64::from(scene.tables.lights));
-    let emissive_p: Vec<EmissiveSelection> = read(set.emissive, 6);
-    let power: Vec<EmissiveGpu> = read(scene.root_value().emissive, 6);
+    let entries = u64::from(scene.tables.entries);
+    let emissive_p: Vec<EmissiveSelection> = read(set.emissive, entries);
+    let power: Vec<EmissiveGpu> = read(scene.root_value().emissive, entries);
     let env = f64::from(set.environment_probability);
     assert_eq!(env, 0.25);
     let lights = scene.lights();
@@ -1156,7 +1153,6 @@ fn check_power(
 fn producer_power_equals_area_times_luminance_after_it_moves() {
     let mut scene = TestScene::new(SceneDesc {
         producer_capacity: 1,
-        emissive_capacity: 0,
         ..SceneDesc::default()
     });
     let linear = Mat3::from_rotation_z(0.4) * Mat3::from_diagonal(Vec3::splat(1.5));
@@ -1201,7 +1197,6 @@ fn producer_power_equals_area_times_luminance_after_it_moves() {
     let mut small = SceneLighting::new(
         lighting_suite::device(),
         &KernelSet::default(),
-        &scene.desc,
         &SceneLightingSettings {
             emissive_clusters: 4,
             ..SceneLightingSettings::default()
@@ -1218,7 +1213,6 @@ fn producer_power_equals_area_times_luminance_after_it_moves() {
 fn a_scene_without_lights_gives_empty_candidates_and_no_nan() {
     let mut scene = TestScene::new(SceneDesc {
         producer_capacity: 2,
-        emissive_capacity: 4,
         ..SceneDesc::default()
     });
     scene.write(|_, _| {});
@@ -1378,7 +1372,6 @@ struct Passed {
 fn grow_lights(in_flight: bool) -> (Vec<Passed>, u32, [[f64; 3]; 2]) {
     let mut scene = TestScene::procedural(SceneDesc {
         producer_capacity: 2,
-        emissive_capacity: 0,
         ..SceneDesc::default()
     });
     let quads = Quads {
@@ -1427,7 +1420,7 @@ fn grow_lights(in_flight: bool) -> (Vec<Passed>, u32, [[f64; 3]; 2]) {
 
     let list = [scene.id];
     let mut passed = Vec::new();
-    let mut lights = 0;
+    let mut tables = LightTables::default();
     for (k, id) in [Some(1u32), Some(9), Some(40), None, None]
         .into_iter()
         .enumerate()
@@ -1459,7 +1452,7 @@ fn grow_lights(in_flight: bool) -> (Vec<Passed>, u32, [[f64; 3]; 2]) {
         })
         .unwrap();
         let pass = pass.unwrap();
-        lights = pass.tables.lights;
+        tables = pass.tables;
         let list = f.list().unwrap();
         lighting.record(list, &pass).unwrap();
         list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
@@ -1486,6 +1479,7 @@ fn grow_lights(in_flight: bool) -> (Vec<Passed>, u32, [[f64; 3]; 2]) {
             assert_eq!(counted, [if k == 2 { 6000 } else { 0 }, 0, 0]);
         }
     }
+    let lights = tables.lights;
     let fed = probabilities(&lighting, lights);
     lighting.reset_history();
     let mut list = render().command_list().unwrap();
@@ -1493,7 +1487,7 @@ fn grow_lights(in_flight: bool) -> (Vec<Passed>, u32, [[f64; 3]; 2]) {
         frame: passed[4].frame + 1,
         scene: scene.root,
         focus: [0.0; 3],
-        tables: LightTables { lights },
+        tables,
     };
     lighting.record(&mut list, &pass).unwrap();
     finish(list);
@@ -1609,7 +1603,6 @@ fn cooked_emitter_tiles_match_the_hit_side_density() {
         .remove(0);
     let mut scene = TestScene::new(SceneDesc {
         producer_capacity: 0,
-        emissive_capacity: 2,
         ..SceneDesc::default()
     });
     let m = scene.mount(bytes);

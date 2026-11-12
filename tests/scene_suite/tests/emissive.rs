@@ -45,10 +45,12 @@ fn emitting(color: [f32; 3], luminance: f32) -> MaterialGpu {
 }
 
 fn entries(root: &SceneRoot) -> Vec<EmissiveGpu> {
-    read_buffer(
-        root.emissive,
-        u64::from(root.producer_capacity + root.emissive_capacity),
-    )
+    read_buffer(root.emissive, u64::from(root.emissive_capacity))
+}
+
+/// The entry of `all` that producer entry `producer` holds.
+fn producer_entry(all: &[EmissiveGpu], producer: u32) -> Option<&EmissiveGpu> {
+    all.iter().find(|e| e.kind == 2 && e.source == producer)
 }
 
 fn close(got: f32, expected: f64, what: &str) {
@@ -172,7 +174,6 @@ fn instance_entries_follow_scale_material_sets_hidden_sections_and_removal() {
     let s = scenes
         .create_scene(&SceneDesc {
             producer_capacity: PRODUCERS,
-            emissive_capacity: 12,
             ..SceneDesc::default()
         })
         .unwrap();
@@ -255,12 +256,6 @@ fn instance_entries_follow_scale_material_sets_hidden_sections_and_removal() {
     untraced.first = 5;
     untraced.flags = InstanceFlags::RASTER;
     let untraced = w.add_instances(&untraced).unwrap();
-    // Twelve entries hold six copies of two sections; a seventh does not fit, and the failed
-    // call leaves its slot free.
-    let full = w.add_instances(&desc(lamp_model, 1, None));
-    assert!(full.is_err());
-    let next = w.add_instances(&desc(plain, 1, None)).unwrap();
-    assert_eq!(next.first, untraced.first + 1);
     drop(w);
     let mut root = GpuPtr::NULL;
     f.update_scenes(&mut |c| root = c.root).unwrap();
@@ -276,7 +271,7 @@ fn instance_entries_follow_scale_material_sets_hidden_sections_and_removal() {
     let check = |all: &[EmissiveGpu], live: &[(u32, usize, u32, Option<DVec3>)]| {
         let instances: Vec<InstanceGpu> = read_buffer(root.instances, u64::from(root.part_base));
         let mut seen = 0;
-        for (at, e) in all.iter().enumerate().skip(PRODUCERS as usize) {
+        for (at, e) in all.iter().enumerate() {
             if e.kind == 0 {
                 continue;
             }
@@ -443,7 +438,6 @@ fn an_edit_of_a_dag_mesh_takes_the_sets_of_level_0() {
     let _workers = Workers::start(&scenes, 2);
     let s = scenes
         .create_scene(&SceneDesc {
-            emissive_capacity: ranks,
             ..SceneDesc::default()
         })
         .unwrap();
@@ -532,7 +526,6 @@ fn a_copy_takes_the_sets_of_the_cached_cut_it_traces() {
     let _workers = Workers::start(&scenes, 2);
     let s = scenes
         .create_scene(&SceneDesc {
-            emissive_capacity: ranks,
             ..SceneDesc::default()
         })
         .unwrap();
@@ -643,7 +636,6 @@ fn producer_power_follows_emitted_clusters_every_frame() {
     let s = scenes
         .create_scene(&SceneDesc {
             producer_capacity: PRODUCERS,
-            emissive_capacity: 0,
             ..SceneDesc::default()
         })
         .unwrap();
@@ -783,20 +775,21 @@ fn producer_power_follows_emitted_clusters_every_frame() {
         let root = run(&mut scenes, &mut |_| {}, &[(ProducerId(1), count, size)]);
         let all = entries(&root);
         check(
-            &all[1],
+            producer_entry(&all, 1).unwrap(),
             expected(m, count, f64::from(size)),
             "every-frame entry",
         );
-        check(&all[2], statics, "static entry");
-        assert_eq!((all[0].kind, all[3].kind), (0, 0));
+        check(producer_entry(&all, 2).unwrap(), statics, "static entry");
+        assert_eq!(all.iter().filter(|e| e.kind != 0).count(), 2);
     }
 
     // Past capacity the batch keeps 100 clusters and drops the rest.
     let root = run(&mut scenes, &mut |_| {}, &[(ProducerId(1), 150, 1.0)]);
     let all = entries(&root);
     let full = expected(m, 150, 1.0);
-    assert!(all[1].cluster_count <= 100 && all[1].cluster_count >= 50);
-    assert!(f64::from(all[1].area) < full.0 && all[1].area > 0.0);
+    let e = producer_entry(&all, 1).unwrap();
+    assert!(e.cluster_count <= 100 && e.cluster_count >= 50);
+    assert!(f64::from(e.area) < full.0 && e.area > 0.0);
 
     // Moving the entry's transform changes its power with no write to the list.
     let root = run(
@@ -807,7 +800,7 @@ fn producer_power_follows_emitted_clusters_every_frame() {
         &[(ProducerId(1), 20, 1.0)],
     );
     check(
-        &entries(&root)[1],
+        producer_entry(&entries(&root), 1).unwrap(),
         expected(DMat3::IDENTITY, 20, 1.0),
         "moved entry",
     );
@@ -819,8 +812,9 @@ fn producer_power_follows_emitted_clusters_every_frame() {
         &[],
     );
     let all = entries(&root);
-    assert_eq!((all[1].kind, all[1].power), (0, [0.0; 3]));
-    check(&all[2], statics, "static entry");
+    assert!(producer_entry(&all, 1).is_none());
+    assert_eq!(all.iter().filter(|e| e.kind != 0).count(), 1);
+    check(producer_entry(&all, 2).unwrap(), statics, "static entry");
     assert_clean();
 }
 
@@ -828,17 +822,11 @@ fn producer_power_follows_emitted_clusters_every_frame() {
 const GATHERED_SET: u32 = 0xffff_fffe;
 const GATHERED_CLUSTERS: u32 = 16;
 
-/// Mounts `bytes` on new scenes with one scene of `emissive_capacity` instance entries, and the
-/// workers that load it.
-fn mounted(bytes: Arc<[u8]>, emissive_capacity: u32) -> (Scenes, SceneId, MountId, Workers) {
+/// Mounts `bytes` on new scenes with one scene, and the workers that load it.
+fn mounted(bytes: Arc<[u8]>) -> (Scenes, SceneId, MountId, Workers) {
     let mut scenes = Scenes::new(device(), &RendererDesc::default()).unwrap();
     let workers = Workers::start(&scenes, 2);
-    let s = scenes
-        .create_scene(&SceneDesc {
-            emissive_capacity,
-            ..SceneDesc::default()
-        })
-        .unwrap();
+    let s = scenes.create_scene(&SceneDesc::default()).unwrap();
     let m = scenes.mount(PackSource::Memory(bytes));
     while mount_pending(&scenes, m) {
         let f = scenes.begin_frame(&frame(&[])).unwrap();
@@ -937,7 +925,7 @@ fn a_copy_tracing_a_cut_it_built_samples_its_gathered_clusters() {
         "the block's cuts fit a gathered list"
     );
     let ranks = info.emissive.rank_count();
-    let (mut scenes, s, m, _workers) = mounted(bytes, ranks);
+    let (mut scenes, s, m, _workers) = mounted(bytes);
     let model = scenes.model(m, AssetId::from_name("lamp")).unwrap();
     // 100 m across, its near corner at the focus.
     let (copy, _) = place(
@@ -970,7 +958,7 @@ fn a_copy_tracing_a_cut_it_built_samples_its_gathered_clusters() {
             let n = e.gathered.min(GATHERED_CLUSTERS);
             assert!(n > 0, "rank {}: nothing gathered", e.rank);
             assert_eq!(e.cluster_count, n);
-            let at = (i - root.producer_capacity) * 2 * GATHERED_CLUSTERS;
+            let at = i * 2 * GATHERED_CLUSTERS;
             let list: Vec<u32> = read_buffer(
                 root.emissive_lists.offset(u64::from(at)),
                 u64::from(2 * GATHERED_CLUSTERS),
@@ -1033,7 +1021,7 @@ fn a_chain_with_a_more_emissive_step_grows_its_copies_entries() {
     if d.caps().cluster.max_tris == 0 || d.caps().cluster.max_partitions == 0 {
         return;
     }
-    let (mut scenes, s, m, _workers) = mounted(pack(), 8);
+    let (mut scenes, s, m, _workers) = mounted(pack());
     let lamp = scenes.model(m, AssetId::from_name("lamp")).unwrap();
     let plain = scenes.model(m, AssetId::from_name("plain")).unwrap();
     let (copy, g) = place(&mut scenes, s, plain, Affine3::IDENTITY);
@@ -1133,7 +1121,7 @@ fn a_page_takes_entries_for_each_prototype_s_copies() {
         .id;
     let (lamps, all) = (3, PAGE_PROTOTYPES.len() as u32);
     // Room for the page's entries with the chain, and for the ones it holds before.
-    let (mut scenes, s, m, _workers) = mounted(bytes, 2 * (lamps + all));
+    let (mut scenes, s, m, _workers) = mounted(bytes);
     let lamp = scenes.model(m, AssetId::from_name("lamp")).unwrap();
     let plain = scenes.model(m, AssetId::from_name("plain")).unwrap();
     let page = scenes.instance_page(m, page_id).unwrap();
@@ -1246,7 +1234,7 @@ fn a_page_s_material_set_reaches_its_prototype_s_copies() {
         .find(|e| e.class == Class::InstancePage as u16)
         .unwrap()
         .id;
-    let (mut scenes, s, m, _workers) = mounted(bytes, 2 * 3);
+    let (mut scenes, s, m, _workers) = mounted(bytes);
     let page = scenes.instance_page(m, page_id).unwrap();
     let list = [s];
     let mut f = scenes.begin_frame(&frame(&list)).unwrap();
@@ -1290,7 +1278,7 @@ fn a_page_s_material_set_reaches_its_prototype_s_copies() {
 fn listed_streamed_clusters(root: &SceneRoot, sets: &orr_pack::mesh::ClusterSets) -> u32 {
     let mut streamed = 0;
     let all = entries(root);
-    for (i, e) in (0..).zip(&all).skip(root.producer_capacity as usize) {
+    for (i, e) in (0..).zip(&all) {
         if e.kind != 1 || e.set == u32::MAX {
             continue;
         }
@@ -1303,7 +1291,7 @@ fn listed_streamed_clusters(root: &SceneRoot, sets: &orr_pack::mesh::ClusterSets
         let bases: Vec<u32> = read_buffer(mesh.page_bases, n);
         let page_of = |c: u32| firsts.partition_point(|&f| f <= c) - 1;
         let ids: Vec<u32> = if e.set == GATHERED_SET {
-            let at = (i - root.producer_capacity) * 2 * GATHERED_CLUSTERS;
+            let at = i * 2 * GATHERED_CLUSTERS;
             let n = e.gathered.min(GATHERED_CLUSTERS);
             read_buffer(root.emissive_lists.offset(u64::from(at)), u64::from(n))
         } else {
@@ -1383,7 +1371,6 @@ fn a_streaming_emissive_mesh_lists_only_resident_clusters() {
     let _workers = Workers::start(&scenes, 2);
     let s = scenes
         .create_scene(&SceneDesc {
-            emissive_capacity: 4,
             ..SceneDesc::default()
         })
         .unwrap();

@@ -667,7 +667,7 @@ impl Renderer {
         lighting: &SceneLightingSettings,
     ) -> Result<SceneId> {
         let gpu = self.scenes.device().clone();
-        let state = SceneLighting::new(&gpu, self.lighting.kernels, desc, lighting)?;
+        let state = SceneLighting::new(&gpu, self.lighting.kernels, lighting)?;
         let id = self.scenes.create_scene(desc)?;
         self.scenes.set_near_range(id, lighting.near_range)?;
         self.lighting.scenes.insert(id, state);

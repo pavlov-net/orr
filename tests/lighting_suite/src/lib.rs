@@ -299,13 +299,7 @@ impl TestScene {
 
     /// Lighting for this scene with default settings, on the scene's kernels.
     pub fn lighting(&self) -> SceneLighting {
-        SceneLighting::new(
-            device(),
-            self.kernels,
-            &self.desc,
-            &SceneLightingSettings::default(),
-        )
-        .unwrap()
+        SceneLighting::new(device(), self.kernels, &SceneLightingSettings::default()).unwrap()
     }
 
     /// Runs one frame: `write` changes the scene, then `compute` records its scene compute;

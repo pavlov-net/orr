@@ -114,7 +114,6 @@ impl Rig {
         let lighting = SceneLighting::new(
             device(),
             &linked::KERNELS,
-            &SceneDesc::default(),
             &SceneLightingSettings::default(),
         )
         .unwrap();

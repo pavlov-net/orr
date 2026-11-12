@@ -59,14 +59,13 @@ public static const uint GATHERED_SET = 0xfffffffe;
 // emissive or caster section in a cut traces cached cuts only (`SetTablesGpu.cached`).
 public static const uint GATHERED_CLUSTERS = 16;
 
-// One entry of the scene's emissive list. Entries 0..producer_capacity are the producer
-// entries by ProducerId; the rest are the emissive sections of instance slots, one per
-// (slot, section rank). All but `kind`, `source` and `rank` are rewritten on the GPU every
-// frame the scene is updated.
+// One entry of the scene's emissive list: a producer entry's, or one of the emissive sections
+// of an instance slot, one per (slot, section rank). An entry nothing holds is all zero. All
+// but `kind`, `source` and `rank` are rewritten on the GPU every frame the scene is updated.
 public struct EmissiveGpu
 {
     public uint kind;            // EMISSIVE_*
-    public uint source;          // instance slot or ProducerId
+    public uint source;          // instance slot or producer entry
     // Instance: its section's rank in its mesh's emissive sets, or past their count its rank in
     // the caster sets, less that count.
     public uint rank;
@@ -79,9 +78,9 @@ public struct EmissiveGpu
     public uint gathered;        // instance: clusters its copy's traversal gathered this frame
 }
 
-// An instance entry's gathered list in `SceneRoot.emissive_lists`: its cluster ids, then
-// their inclusive fixed-point CDF.
-public uint* gathered_list(uint* lists, uint instance_entry)
+// The gathered list of instance entry `entry` in `SceneRoot.emissive_lists`: its cluster ids,
+// then their inclusive fixed-point CDF.
+public uint* gathered_list(uint* lists, uint entry)
 {
-    return lists + instance_entry * 2 * GATHERED_CLUSTERS;
+    return lists + entry * 2 * GATHERED_CLUSTERS;
 }

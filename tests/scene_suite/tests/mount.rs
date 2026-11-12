@@ -976,7 +976,6 @@ fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
     let _workers = Workers::start(&scenes, 2);
     let s = scenes
         .create_scene(&SceneDesc {
-            emissive_capacity: 64,
             ..SceneDesc::default()
         })
         .unwrap();
@@ -1025,12 +1024,8 @@ fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
     render.wait(point, Duration::from_secs(10)).unwrap();
     let gpu = Gpu(device());
     let root: SceneRoot = gpu.value(root);
-    let entries: Vec<EmissiveGpu> = gpu.values(
-        root.emissive,
-        root.producer_capacity + root.emissive_capacity,
-    );
-    let instances = &entries[root.producer_capacity as usize..];
-    let live: Vec<&EmissiveGpu> = instances.iter().filter(|e| e.kind != 0).collect();
+    let entries: Vec<EmissiveGpu> = gpu.values(root.emissive, root.emissive_capacity);
+    let live: Vec<&EmissiveGpu> = entries.iter().filter(|e| e.kind != 0).collect();
     let info = ModelInfo::parse(&blob(&a, entry(&a, panel_id), 0)).unwrap();
     let me = entry(&a, info.header.mesh);
     let mi = MeshInfo::parse(&blob(&a, me, 0)).unwrap();
@@ -1173,7 +1168,6 @@ fn an_unmount_takes_copies_and_pages_of_its_models_from_a_scene_that_keeps_rende
     let _workers = Workers::start(&scenes, 2);
     let s = scenes
         .create_scene(&SceneDesc {
-            emissive_capacity: 64,
             ..SceneDesc::default()
         })
         .unwrap();
@@ -1249,10 +1243,7 @@ fn an_unmount_takes_copies_and_pages_of_its_models_from_a_scene_that_keeps_rende
         // The slot tables move when the scene takes more slots than they hold.
         let root: SceneRoot = gpu.value(root);
         let instances: Vec<orr_scene::InstanceGpu> = gpu.values(root.instances, root.part_base);
-        let entries: Vec<EmissiveGpu> = gpu.values(
-            root.emissive,
-            root.producer_capacity + root.emissive_capacity,
-        );
+        let entries: Vec<EmissiveGpu> = gpu.values(root.emissive, root.emissive_capacity);
         let flags = instances.iter().map(|i| i.flags).collect();
         (flags, entries.iter().filter(|e| e.kind != 0).count())
     };

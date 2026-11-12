@@ -1645,7 +1645,7 @@ void gather_into(SceneRoot* s, uint first, uint entries, uint entry, uint id)
     uint at;
     InterlockedAdd(s.emissive[first + entry].gathered, 1, at);
     if (at < GATHERED_CLUSTERS)
-        gathered_list(s.emissive_lists, first + entry - s.producer_capacity)[at] = id;
+        gathered_list(s.emissive_lists, first + entry)[at] = id;
 }
 
 // Adds the cluster of cluster id `id`, of section `section`, of a slot of record `inst` tracing

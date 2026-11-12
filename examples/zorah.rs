@@ -930,15 +930,8 @@ fn run(options: &Options) -> Option<Capture> {
         }
     });
     log::info!("{} instance pages need {needs:?}", pages.len());
-    let defaults = SceneDesc::default();
     let scene = renderer
-        .create_scene(
-            &SceneDesc {
-                emissive_capacity: needs.emissive.max(defaults.emissive_capacity),
-                ..defaults
-            },
-            &SceneLightingSettings::default(),
-        )
+        .create_scene(&SceneDesc::default(), &SceneLightingSettings::default())
         .expect("scene");
     let history = renderer.create_view_history().expect("view history");
     options.wait_for_paths(&mut renderer);

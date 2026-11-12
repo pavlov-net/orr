@@ -664,13 +664,13 @@ public float below(float x, float total)
     return min(x * total, asfloat(asuint(total) - 1));
 }
 
-// Luminance x render-space area of cluster `c` of producer entry `entry`'s batch, both sides of
-// a surface with a back emitting; 0 where its group hides it. It weighs selection alone, so it
-// reads positions and the entry's transform only.
-public float producer_cluster_weight(SceneRoot* s, uint entry, uint c)
+// Luminance x render-space area of cluster `c` of producer entry `producer`'s batch, both sides
+// of a surface with a back emitting; 0 where its group hides it. It weighs selection alone, so
+// it reads positions and the entry's transform only.
+public float producer_cluster_weight(SceneRoot* s, uint producer, uint c)
 {
-    ProducerGpu p = s.producers[entry];
-    ProducerBatch b = s.batches[entry];
+    ProducerGpu p = s.producers[producer];
+    ProducerBatch b = s.batches[producer];
     ProducerClusterGpu k = b.clusters[c];
     uint material = producer_material(p, k);
     Placement pl;
@@ -768,17 +768,18 @@ public bool list_cluster(SceneRoot* s, EmissiveSelection e, uint entry, uint p, 
     cluster_id = 0;
     triangles = 0;
     alpha_first = 0;
-    if (entry < s.producer_capacity)
+    EmissiveGpu g = s.emissive[entry];
+    if (g.kind == EMISSIVE_PRODUCER)
     {
-        ProducerBatch b = s.batches[entry];
+        ProducerBatch b = s.batches[g.source];
         if (p >= emitted_clusters(b))
             return false;
-        instance_index = s.producer_base + entry;
+        instance_index = s.producer_base + g.source;
         cluster_id = p;
         triangles = b.clusters[p].tri_count;
         return true;
     }
-    uint slot = s.emissive[entry].source;
+    uint slot = g.source;
     InstanceGpu inst = copy_record(s, slot);
     MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
     cluster_id = e.index != nullptr ? mesh_cluster_id(mesh, e.clusters[p]) : e.clusters[p];
@@ -842,12 +843,13 @@ LightSample emissive_sample<S : ISurface>(LightSetGpu* set, uint entry, uint fir
     MaterialGpu* shown = s.materials + i.material;
     float3 emitted = decal_emission(surface_decals(i), surface_emission(i, shown));
     bool tested;
-    if (entry < s.producer_capacity)
-        tested = producer_tested(s.producers[entry], section);
+    EmissiveGpu held = s.emissive[entry];
+    if (held.kind == EMISSIVE_PRODUCER)
+        tested = producer_tested(s.producers[held.source], section);
     else
     {
         tested = (section.flags & MATERIAL_ALPHA_TESTED) != 0 && triangle >= alpha_first;
-        SlotStateGpu st = s.slot_state[s.emissive[entry].source];
+        SlotStateGpu st = s.slot_state[held.source];
         emitted *= step_presence(st, chain_near(st));
     }
     // A presence layer's and an alpha test's coverage is the section material's on both sides.
@@ -931,11 +933,13 @@ public EmitterHit emitter_hit(LightSetGpu* set, uint instance_index, uint cluste
     uint entry;
     uint p = 0;
     uint triangles = 0;
-    if (hit_producer(s, instance_index, entry))
+    uint producer;
+    if (hit_producer(s, instance_index, producer))
     {
-        ProducerBatch b = s.batches[entry];
+        ProducerBatch b = s.batches[producer];
         if (cluster_id >= emitted_clusters(b))
             return h;
+        entry = s.producers[producer].emissive;
         p = cluster_id;
         triangles = b.clusters[cluster_id].tri_count;
     }
@@ -998,7 +1002,8 @@ LightSample local_sample(LightSetGpu* set, uint id, float2 u, float probability)
 
 // The environment's feedback id. Sphere and rect lights take their LightId, and emissive
 // entries the light capacity plus their entry, so an entry's id and the environment's are a
-// frame's: they move when the light table grows.
+// frame's: an entry's moves when the light table grows, and the environment's when that or the
+// emissive list does.
 public uint feedback_environment(LightSetGpu* set)
 {
     return set.candidate_count;

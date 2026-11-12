@@ -18,11 +18,16 @@ impl LightId {
 }
 
 /// What a scene's light tables hold room for in a frame, as its root says: state kept per
-/// light by whoever reads the tables is sized from it.
+/// light, per emissive list entry or per producer entry by whoever reads the tables is sized
+/// from it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LightTables {
     /// Entries of the light table: every `LightId` set is below it.
     pub lights: u32,
+    /// Entries of the emissive list, `SceneRoot::emissive_capacity`.
+    pub entries: u32,
+    /// Entries of the producer table, `SceneRoot::producer_capacity`.
+    pub producers: u32,
 }
 
 /// A light. Colors are linear Rec.709 and convert to Rec.2020 when written.
@@ -94,6 +99,8 @@ pub(crate) const EMISSIVE_PRODUCER: u32 = 2;
 pub(crate) const NO_SET: u32 = !0;
 /// `lights.slang` `GATHERED_CLUSTERS`: clusters an instance entry's gathered list holds.
 pub(crate) const GATHERED_CLUSTERS: u32 = 16;
+/// An instance entry's gathered list: its cluster ids, then their CDF (`gathered_list`).
+pub(crate) type GatheredList = [u32; 2 * GATHERED_CLUSTERS as usize];
 /// `InstanceGpu::first_emissive` of a copy with no emissive list entries.
 pub(crate) const NO_EMISSIVE: u32 = !0;
 

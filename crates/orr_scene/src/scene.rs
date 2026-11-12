@@ -11,8 +11,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::decals::{Bins, Decal, DecalId, Listing, decal_gpu, listing};
 use crate::lights::{
-    EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, GATHERED_CLUSTERS, Light, LightId, LightTables,
-    NO_EMISSIVE, NO_SET, light_gpu,
+    EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, GatheredList, Light, LightId, LightTables, NO_EMISSIVE,
+    NO_SET, light_gpu,
 };
 use crate::material::{MaterialId, MaterialTable};
 use crate::medium_proxy::{MediumProxy, MediumProxyId, proxy_gpu};
@@ -65,14 +65,12 @@ const GROUP_QUANTIZED_PAGE: u32 = 1;
 pub struct SceneId(pub u32);
 
 /// Table sizes of a scene, fixed at creation. Its instance slots, transform groups, material
-/// sets, decals, skinned copies, medium proxies and lights take what the scene's content needs.
+/// sets, decals, skinned copies, medium proxies, lights and emissive list take what the scene's
+/// content needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SceneDesc {
     /// Producer entries: every `ProducerId` is below it.
     pub producer_capacity: u32,
-    /// Emissive list entries for instances: one per copy per emissive and per caster section of
-    /// the chain step of its model that has the most of them.
-    pub emissive_capacity: u32,
     /// Instances the copies of one PTLAS partition count, at most: their bodies and part runs.
     /// A copy fading between two chain steps holds one more. A write rebuilds its partition,
     /// so this sets how much a frame rebuilds for one copy that changes; the PTLAS holds as
@@ -89,7 +87,6 @@ impl Default for SceneDesc {
     fn default() -> Self {
         Self {
             producer_capacity: 256,
-            emissive_capacity: 16_384,
             partition_instances: 1000,
             global_instances: 4096,
             skinned_clusters: 8192,
@@ -103,8 +100,8 @@ pub use orr_pack::AffineRows;
 /// its models have now.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PageNeeds {
-    /// Of `emissive_capacity`: every copy takes room for the emissive and caster sections of
-    /// the most emissive step of its model's chain.
+    /// Emissive list entries: every copy takes one for each emissive and each caster section
+    /// of the most emissive step of its model's chain.
     pub emissive: u32,
 }
 
@@ -334,10 +331,12 @@ pub(crate) struct Tables {
     pub(crate) page_sets: Table<MaterialId>,
     /// By `LightId`: an entry for every id set.
     pub(crate) lights: Column<LightGpu>,
-    /// Producer entries first, then instance entries.
-    pub(crate) emissive: Allocation<EmissiveGpu>,
-    /// Per instance entry, the list its copy's traversal gathers (`SceneRoot.emissive_lists`).
-    pub(crate) emissive_lists: Allocation<u32>,
+    /// The entries of producers and of copies, from one allocator. By entry, like
+    /// `emissive_lists`: the two grow together.
+    pub(crate) emissive: Column<EmissiveGpu>,
+    /// Per entry, the list an instance entry's copy's traversal gathers
+    /// (`SceneRoot.emissive_lists`).
+    pub(crate) emissive_lists: Column<GatheredList>,
     pub(crate) producers: Allocation<ProducerGpu>,
     pub(crate) batches: Allocation<ProducerBatch>,
     /// Tessellated entries' patch batches, zero for others.
@@ -646,8 +645,7 @@ struct GroupRoom {
 #[derive(Clone, Copy)]
 struct SlotHold {
     model: u32,
-    /// Its entries of the instance part of the emissive list; none on a page, which holds its
-    /// copies' entries.
+    /// Its entries of the emissive list; none on a page, which holds its copies' entries.
     first_entry: u32,
     entries: u32,
     /// Its copy's `InstanceGpu::material_base`.
@@ -707,12 +705,12 @@ pub(crate) struct SceneCpu {
     pub(crate) masks: HashSet<(ModelId, u16)>,
     /// Ranges removed in a frame, freed once that frame has completed.
     pub(crate) removed: Vec<(u64, InstanceRange)>,
-    /// Instance entries of the emissive list, counted after the producer entries.
+    /// Entries of the emissive list.
     pub(crate) emissive: RangeAllocator,
     /// Entry ranges removed in a frame, freed once that frame has completed.
     pub(crate) emissive_removed: Vec<(u64, u32, u32)>,
     /// Slots of written records that take new emissive list entries at the next update:
-    /// (slot, first instance entry, entries, 0).
+    /// (slot, first entry, entries, 0).
     pub(crate) entry_jobs: Vec<[u32; 4]>,
     pub(crate) producers: Vec<Option<Producer>>,
     /// Memory of replaced or cleared producer entries, freed once that frame has completed.
@@ -1046,6 +1044,8 @@ impl Scene {
         self.tables.skin_state.land(frame, copies, records);
         self.tables.proxies.land(frame, copies, records);
         self.tables.lights.land(frame, copies, records);
+        self.tables.emissive.land(frame, copies, records);
+        self.tables.emissive_lists.land(frame, copies, records);
     }
 
     /// Frees the tables moved from in frames at or before `completed`.
@@ -1061,6 +1061,8 @@ impl Scene {
         self.tables.skin_state.retire(completed);
         self.tables.proxies.retire(completed);
         self.tables.lights.retire(completed);
+        self.tables.emissive.retire(completed);
+        self.tables.emissive_lists.retire(completed);
     }
 
     /// What the root of the scene's next update says its light tables hold, and the root of
@@ -1068,15 +1070,14 @@ impl Scene {
     pub(crate) fn light_tables(&self) -> LightTables {
         LightTables {
             lights: self.tables.lights.capacity(),
+            entries: self.tables.emissive.capacity(),
+            producers: self.desc.producer_capacity,
         }
     }
 
-    /// Instance entry `entry` of the emissive list.
+    /// Entry `entry` of the emissive list.
     fn emissive_entry(&self, entry: u32) -> GpuPtr<EmissiveGpu> {
-        self.tables
-            .emissive
-            .gpu()
-            .offset(u64::from(self.desc.producer_capacity + entry))
+        self.tables.emissive.entry(entry)
     }
 
     /// Empties group `id` and its record.
@@ -1167,9 +1168,11 @@ impl Scene {
     /// entries where it holds fewer, and every page a range for its prototypes' strides from
     /// `page_strides` where one is larger than the page holds, as a chain that grows the model's
     /// most emissive step asks. `page_strides` gives one per prototype, or `None` for a page
-    /// the chain leaves alone. Fails without a change when the list has no room.
+    /// the chain leaves alone. Fails, taking no range, past what the list can hold or without
+    /// device memory for it.
     pub(crate) fn reserve_entries(
         &self,
+        device: &Device,
         model: u32,
         stride: u32,
         page_strides: impl Fn(PageId) -> Option<Vec<u32>>,
@@ -1205,16 +1208,13 @@ impl Scene {
             .map(|_| stride)
             .chain(pages.iter().map(|(_, e)| page_entries(e)));
         for n in wanted {
-            match cpu.emissive.alloc(n) {
-                Some(first) => taken.push((first, n)),
-                None => {
+            match self.take_entries(cpu, device, n) {
+                Ok(first) => taken.push((first, n)),
+                Err(e) => {
                     for (first, n) in taken {
                         cpu.emissive.free(first, n);
                     }
-                    return Err(Error::Capacity {
-                        what: "emissive list entries",
-                        capacity: self.desc.emissive_capacity,
-                    });
+                    return Err(e);
                 }
             }
         }
@@ -1370,8 +1370,12 @@ impl Scene {
         }
     }
 
-    /// Clears producer entry `i` as `SceneWriter::set_producer` with nothing does, between frames.
+    /// Clears producer entry `i`, which gives up its emissive list entry once `frame` has
+    /// completed. An entry that holds nothing stays as it is.
     fn end_producer(&self, cpu: &mut SceneCpu, i: usize, frame: u64, seq: u64) {
+        let Some(old) = cpu.producers[i].take() else {
+            return;
+        };
         let t = &self.tables;
         let at = i as u64;
         let state = t.producer_state.gpu().offset(at).address().0;
@@ -1395,7 +1399,7 @@ impl Scene {
                 words(size_of::<TessStateGpu>()),
             ),
             (
-                t.emissive.gpu().offset(at).address().0,
+                self.emissive_entry(old.emissive).address().0,
                 words(size_of::<EmissiveGpu>()),
             ),
             (state + blas, 2),
@@ -1404,9 +1408,34 @@ impl Scene {
         for (dst, n) in zeroed {
             cpu.records.push(Record::fill(seq, dst, n, 0));
         }
-        if let Some(old) = cpu.producers[i].take() {
-            cpu.retired.push((frame, old));
+        cpu.emissive_removed.push((frame, old.emissive, 1));
+        cpu.retired.push((frame, old));
+    }
+
+    /// The first of `count` consecutive free entries of the emissive list. Without a free run
+    /// that long the list grows as [`grown`] says. Fails past what the list can hold or without
+    /// device memory for the grown list, leaving it as it was.
+    fn take_entries(&self, cpu: &mut SceneCpu, device: &Device, count: u32) -> Result<u32> {
+        // A run of no entries takes none, and its start names no entry.
+        if count == 0 {
+            return Ok(0);
         }
+        if let Some(first) = cpu.emissive.alloc(count) {
+            return Ok(first);
+        }
+        let t = &self.tables;
+        let held = t.emissive.capacity();
+        let limit = t.emissive.limit().min(t.emissive_lists.limit());
+        let entries = grown("emissive list entries", held, count, limit)?;
+        let list = t.emissive.room(device, entries)?;
+        let gathered = t.emissive_lists.room(device, entries)?;
+        t.emissive.grow(list, entries);
+        t.emissive_lists.grow(gathered, entries);
+        cpu.emissive.grow(held, entries);
+        Ok(cpu
+            .emissive
+            .alloc(count)
+            .expect("the grown list has a free run of `count`"))
     }
 
     pub(crate) fn new(device: &Device, desc: &SceneDesc) -> Result<Self> {
@@ -1425,15 +1454,12 @@ impl Scene {
                 PAGE_MATERIAL_SET,
             )?,
             lights: Column::new(device, MemoryPriority::Normal, "lights", true)?,
-            emissive: device.gpu_malloc(
-                dl,
-                n(desc.producer_capacity + desc.emissive_capacity),
-                "emissive list",
-            )?,
-            emissive_lists: device.gpu_malloc(
-                dl,
-                n(desc.emissive_capacity * 2 * GATHERED_CLUSTERS),
+            emissive: Column::new(device, MemoryPriority::Normal, "emissive list", true)?,
+            emissive_lists: Column::new(
+                device,
+                MemoryPriority::Normal,
                 "gathered emissive lists",
+                false,
             )?,
             producers: device.gpu_malloc(dl, n(desc.producer_capacity), "producers")?,
             batches: device.gpu_malloc(dl, n(desc.producer_capacity), "producer batches")?,
@@ -1451,7 +1477,6 @@ impl Scene {
         // Tables start zeroed. These apply before any write (sequence 0).
         let zero = |a: GpuAddress, bytes: u64| Record::fill(0, a.0, words(bytes as usize), 0);
         let records = vec![
-            zero(tables.emissive.gpu().address(), tables.emissive.size()),
             zero(tables.producers.gpu().address(), tables.producers.size()),
             zero(tables.batches.gpu().address(), tables.batches.size()),
             zero(tables.patches.gpu().address(), tables.patches.size()),
@@ -1472,7 +1497,7 @@ impl Scene {
                 copies: FxHashMap::default(),
                 masks: HashSet::new(),
                 removed: Vec::new(),
-                emissive: RangeAllocator::new(desc.emissive_capacity),
+                emissive: RangeAllocator::new(0),
                 emissive_removed: Vec::new(),
                 entry_jobs: Vec::new(),
                 producers: (0..desc.producer_capacity).map(|_| None).collect(),
@@ -1584,7 +1609,7 @@ impl<'f> SceneWriter<'f> {
     }
 
     /// Fills window room `out` at `src` with the emissive list entries of the copies from slot
-    /// `first`, `stride` each, recorded as a copy to instance entry `entry`.
+    /// `first`, `stride` each, recorded as a copy to entry `entry`.
     fn put_entries(
         &self,
         (src, out): (GpuPtr<EmissiveGpu>, &mut [EmissiveGpu]),
@@ -1778,17 +1803,15 @@ impl<'f> SceneWriter<'f> {
             cpu.ptlas
                 .reserve_place(self.device, desc.copies, cell, cost)?;
             let first = self.scene.take_slots(cpu, self.device, desc.copies)?;
-            let entry = if ranks > 0 {
-                cpu.emissive.alloc(desc.copies * ranks)
-            } else {
-                Some(0)
-            };
-            let Some(entry) = entry else {
-                cpu.slots.free(first, desc.copies);
-                return Err(Error::Capacity {
-                    what: "emissive list entries",
-                    capacity: self.scene.desc.emissive_capacity,
-                });
+            let entry = match self
+                .scene
+                .take_entries(cpu, self.device, desc.copies * ranks)
+            {
+                Ok(entry) => entry,
+                Err(e) => {
+                    cpu.slots.free(first, desc.copies);
+                    return Err(e);
+                }
             };
             let slots = first as usize..(first + desc.copies) as usize;
             cpu.slot_runs[slots.clone()].fill((desc.model.0, body));
@@ -1815,7 +1838,7 @@ impl<'f> SceneWriter<'f> {
         if let Some(room) = entries {
             self.put_entries(room, first, entry, ranks);
         }
-        let first_entry = self.scene.desc.producer_capacity + entry;
+        let first_entry = entry;
         let range = InstanceRange {
             first,
             count: desc.copies,
@@ -1969,18 +1992,13 @@ impl<'f> SceneWriter<'f> {
                 return Err(e);
             }
         };
-        let entry = if emissive > 0 {
-            cpu.emissive.alloc(emissive)
-        } else {
-            Some(0)
-        };
-        let Some(entry) = entry else {
-            cpu.slots.free(first, count);
-            self.scene.tables.page_sets.free(set_base, set_entries);
-            return Err(Error::Capacity {
-                what: "emissive list entries",
-                capacity: self.scene.desc.emissive_capacity,
-            });
+        let entry = match self.scene.take_entries(cpu, self.device, emissive) {
+            Ok(entry) => entry,
+            Err(e) => {
+                cpu.slots.free(first, count);
+                self.scene.tables.page_sets.free(set_base, set_entries);
+                return Err(e);
+            }
         };
         if emissive > 0 {
             let at = self.scene.emissive_entry(entry).address().0;
@@ -2402,18 +2420,16 @@ impl<'f> SceneWriter<'f> {
                     return Err(e);
                 }
             };
-            let emissive = if ranks > 0 {
-                cpu.emissive.alloc(desc.copies * ranks)
-            } else {
-                Some(0)
-            };
-            let Some(emissive) = emissive else {
-                cpu.slots.free(first, desc.copies);
-                self.scene.free_skinned(cpu, entry, desc.copies);
-                return Err(Error::Capacity {
-                    what: "emissive list entries",
-                    capacity: self.scene.desc.emissive_capacity,
-                });
+            let entries = self
+                .scene
+                .take_entries(cpu, self.device, desc.copies * ranks);
+            let emissive = match entries {
+                Ok(emissive) => emissive,
+                Err(e) => {
+                    cpu.slots.free(first, desc.copies);
+                    self.scene.free_skinned(cpu, entry, desc.copies);
+                    return Err(e);
+                }
             };
             cpu.skinned_high_water = cpu.skinned_high_water.max(entry + desc.copies);
             let holds = &mut cpu.slot_holds[first as usize..(first + desc.copies) as usize];
@@ -2437,7 +2453,7 @@ impl<'f> SceneWriter<'f> {
         if let Some(room) = entries {
             self.put_entries(room, first, emissive, ranks);
         }
-        let first_emissive = self.scene.desc.producer_capacity + emissive;
+        let first_emissive = emissive;
         let range = InstanceRange {
             first,
             count: desc.copies,
@@ -2791,67 +2807,73 @@ impl<'f> SceneWriter<'f> {
             "{id:?} outside the producer table"
         );
         self.check_groups(desc.map(|d| d.transform.0));
-        let t = &self.scene.tables;
-        let i = u64::from(id.0);
-        // Window room comes first, so nothing is recorded unless all of it is.
-        let mut copies = Vec::with_capacity(6);
-        let (record, batch, patches, entry, producer) = match desc {
-            None => (
-                ProducerGpu::zeroed(),
-                ProducerBatch::zeroed(),
-                ProducerBatch::zeroed(),
-                EmissiveGpu::zeroed(),
-                None,
-            ),
-            Some(d) => {
-                let b = producer::build(self.device, d, self.patterns, subd)?;
-                let n = (b.static_bytes.len() / 4) as u32;
-                let (src, words) = self.window.slice::<u32>(self.device, n)?;
-                bytemuck::cast_slice_mut(words).copy_from_slice(&b.static_bytes);
-                copies.push(Record::values(self.next_seq(), b.static_at, src, n));
-                let entry = EmissiveGpu {
-                    kind: EMISSIVE_PRODUCER,
-                    source: id.0,
-                    ..Zeroable::zeroed()
-                };
-                (b.record, b.batch, b.patches, entry, Some(b.producer))
-            }
+        let index = id.0;
+        let Some(d) = desc else {
+            let seq = self.next_seq();
+            let cpu = &mut *self.scene.cpu.lock().unwrap();
+            self.scene
+                .end_producer(cpu, index as usize, self.frame, seq);
+            return Ok(());
         };
-        copies.push(self.staged(t.producers.gpu().offset(i), &record)?);
-        copies.push(self.staged(t.batches.gpu().offset(i), &batch)?);
-        copies.push(self.staged(t.patches.gpu().offset(i), &patches)?);
-        copies.push(self.staged(t.tess_state.gpu().offset(i), &TessStateGpu::zeroed())?);
-        copies.push(self.staged(t.emissive.gpu().offset(i), &entry)?);
+        let b = producer::build(self.device, d, self.patterns, subd)?;
+        // Window room comes first, then the entry's emissive list entry, so nothing is
+        // recorded unless all of it is.
+        let n = (b.static_bytes.len() / 4) as u32;
+        let (static_src, words) = self.window.slice::<u32>(self.device, n)?;
+        bytemuck::cast_slice_mut(words).copy_from_slice(&b.static_bytes);
+        let (record_src, record) = self.window.slice::<ProducerGpu>(self.device, 1)?;
+        let (entry_src, entry) = self.window.slice::<EmissiveGpu>(self.device, 1)?;
+        let batch = self.window.put(self.device, &b.batch)?;
+        let patches = self.window.put(self.device, &b.patches)?;
+        let tess = self.window.put(self.device, &TessStateGpu::zeroed())?;
+        let t = &self.scene.tables;
+        let i = u64::from(index);
         let cpu = &mut *self.scene.cpu.lock().unwrap();
-        cpu.records.append(&mut copies);
-        if let Some(p) = &producer {
-            // A tessellated entry's kernel emits against its patch batch's counts.
-            let mut counts = vec![p.counts];
-            if p.emit_counts != p.counts {
-                counts.push(p.emit_counts);
-            }
-            for at in counts {
-                cpu.records
-                    .push(Record::fill(self.next_seq(), at.address().0, 4, 0));
-            }
-        }
-        // The new entry has built nothing; its PTLAS instance follows from the record.
-        let state = t.producer_state.gpu().offset(i);
+        // An entry set again keeps its emissive list entry.
+        let emissive = match &cpu.producers[index as usize] {
+            Some(held) => held.emissive,
+            None => self.scene.take_entries(cpu, self.device, 1)?,
+        };
+        record[0] = ProducerGpu {
+            emissive,
+            ..b.record
+        };
+        entry[0] = EmissiveGpu {
+            kind: EMISSIVE_PRODUCER,
+            source: index,
+            ..Zeroable::zeroed()
+        };
+        let mut producer = b.producer;
+        producer.emissive = emissive;
+        let state = t.producer_state.gpu().offset(i).address().0;
         let blas = std::mem::offset_of!(ProducerStateGpu, blas) as u64;
-        cpu.records.push(Record::fill(
-            self.next_seq(),
-            state.address().0 + blas,
-            2,
-            0,
-        ));
         let clusters = std::mem::offset_of!(ProducerStateGpu, clusters) as u64;
-        cpu.records.push(Record::fill(
-            self.next_seq(),
-            state.address().0 + clusters,
-            1,
-            0,
-        ));
-        if let Some(old) = std::mem::replace(&mut cpu.producers[id.0 as usize], producer) {
+        // A tessellated entry's kernel emits against its patch batch's counts.
+        let patch_counts =
+            (producer.emit_counts != producer.counts).then_some(producer.emit_counts);
+        let counts = std::iter::once(producer.counts).chain(patch_counts);
+        // The new entry has built nothing; its PTLAS instance follows from the record.
+        let zeroed = counts
+            .map(|c| (c.address().0, 4))
+            .chain([(state + blas, 2), (state + clusters, 1)]);
+        cpu.records.extend([
+            Record::values(self.next_seq(), b.static_at, static_src, n),
+            Record::values(self.next_seq(), t.producers.gpu().offset(i), record_src, 1),
+            Record::values(self.next_seq(), t.batches.gpu().offset(i), batch, 1),
+            Record::values(self.next_seq(), t.patches.gpu().offset(i), patches, 1),
+            Record::values(self.next_seq(), t.tess_state.gpu().offset(i), tess, 1),
+            Record::values(
+                self.next_seq(),
+                self.scene.emissive_entry(emissive),
+                entry_src,
+                1,
+            ),
+        ]);
+        for (dst, words) in zeroed {
+            cpu.records
+                .push(Record::fill(self.next_seq(), dst, words, 0));
+        }
+        if let Some(old) = cpu.producers[index as usize].replace(producer) {
             cpu.retired.push((self.frame, old));
         }
         Ok(())
