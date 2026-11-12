@@ -170,6 +170,9 @@ struct PartitionCpu {
 /// the scene's first traced frame and again when the layout grows.
 struct Storage {
     limits: PtlasLimits,
+    /// The partition table its record names. Partitions given back and grown again make
+    /// another table that the same limits can describe.
+    partitions: GpuPtr<PartitionGpu>,
     tlas: Allocation<u8>,
     record: Allocation<PtlasGpu>,
     _blocks: Vec<Allocation<u8>>,
@@ -602,36 +605,55 @@ impl Ptlas {
         }
     }
 
-    /// Counts `used` skinned copies in the global partition. Fails, changing nothing, when the
-    /// device's PTLAS cannot take them beside what else is in use.
-    pub(crate) fn hold_skinned(&mut self, device: &Device, used: u32) -> Result<()> {
+    /// Counts `count` more skinned copies in use in the global partition. Fails, changing
+    /// nothing, when the device's PTLAS cannot take them beside what else is in use.
+    pub(crate) fn hold_skinned(&mut self, device: &Device, count: u32) -> Result<()> {
+        let used = self
+            .skinned
+            .used
+            .checked_add(count)
+            .ok_or(Error::Capacity {
+                what: "skinned copies",
+                capacity: u32::MAX,
+            })?;
+        if used <= self.skinned.reserved {
+            self.skinned.used = used;
+            return Ok(());
+        }
         let shares = self.budget(device).take(self.shares(), SKINNED, used)?;
         self.keep(shares);
         Ok(())
     }
 
-    /// Counts the skinned copies in use as `used`, no more than before.
-    pub(crate) fn release_skinned(&mut self, used: u32) {
-        self.skinned.used = used;
+    /// Counts `count` skinned copies no longer in use.
+    pub(crate) fn release_skinned(&mut self, count: u32) {
+        self.skinned.used -= count;
     }
 
-    /// Marks medium proxy `id` set or cleared; its instance is written at the next build. The
-    /// global partition counts the proxies up to the highest set. Fails, changing nothing,
-    /// when the device's PTLAS cannot take them beside what else is in use.
-    pub(crate) fn set_proxy(&mut self, device: &Device, id: u32, live: bool) -> Result<()> {
+    /// Makes room for [`Self::set_proxy`] to set medium proxy `id`, an entry of the scene's
+    /// proxy table: the global partition counts the proxies up to the highest set. Fails,
+    /// changing nothing, when the device's PTLAS cannot take them beside what else is in use.
+    pub(crate) fn reserve_proxy(&mut self, device: &Device, id: u32) -> Result<()> {
+        if id < self.proxies.reserved {
+            return Ok(());
+        }
+        let mut shares = self.budget(device).take(self.shares(), PROXIES, id + 1)?;
+        // The proxy is in use once it is set.
+        shares[PROXIES].used = self.proxies.used;
+        self.keep(shares);
+        Ok(())
+    }
+
+    /// Marks medium proxy `id` set or cleared; its instance is written at the next build. A
+    /// set has its room from [`Self::reserve_proxy`].
+    pub(crate) fn set_proxy(&mut self, id: u32, live: bool) {
         let at = id as usize;
         if live && at >= self.proxy_live.len() {
-            let used = id.checked_add(1).ok_or(Error::Capacity {
-                what: "medium proxies",
-                capacity: u32::MAX,
-            })?;
-            let shares = self.budget(device).take(self.shares(), PROXIES, used)?;
-            self.keep(shares);
-            self.proxy_live.resize(used as usize, false);
+            self.proxy_live.resize(at + 1, false);
         }
         // An id past the highest set holds no proxy to clear.
         let Some(set) = self.proxy_live.get_mut(at) else {
-            return Ok(());
+            return;
         };
         let was = std::mem::replace(set, live);
         self.proxies_live = self.proxies_live + u32::from(live) - u32::from(was);
@@ -639,7 +661,6 @@ impl Ptlas {
         let last = self.proxy_live.iter().rposition(|&l| l);
         self.proxy_live.truncate(last.map_or(0, |i| i + 1));
         self.proxies.used = self.proxy_live.len() as u32;
-        Ok(())
     }
 
     /// The medium proxies the layout of the next build holds: light proxies come after them.
@@ -889,7 +910,9 @@ impl Ptlas {
         }
         let layout = self.wanted();
         let limits = self.limits(layout, self.partitions.len() as u32);
-        if self.storage.as_ref().is_none_or(|s| s.limits != limits) {
+        let partitions = self.partition_table.gpu();
+        let fits = |s: &Storage| s.limits == limits && s.partitions == partitions;
+        if !self.storage.as_ref().is_some_and(fits) {
             // A build has filled a storage, this one or one it replaced that no build has
             // since: the counters and the pool hold its state, which the next build rewrites
             // and carries. Before any build there is nothing to carry: the first build starts
@@ -986,6 +1009,7 @@ impl Ptlas {
             .sum();
         Ok(Storage {
             limits,
+            partitions: record.partitions,
             tlas,
             bytes,
             record: gpu,

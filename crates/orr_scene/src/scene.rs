@@ -746,8 +746,6 @@ pub(crate) struct SceneCpu {
     pub(crate) skinned: RangeAllocator,
     /// One past the highest skinned-copy entry handed out.
     pub(crate) skinned_high_water: u32,
-    /// Skinned-copy entries handed out and not yet free.
-    skinned_live: u32,
     /// A group has hung from a palette's joint.
     pub(crate) hung: bool,
     skins: Vec<SkinRange>,
@@ -994,15 +992,10 @@ impl Scene {
         if count == 0 {
             return Ok(0);
         }
-        let live = cpu.skinned_live.checked_add(count).ok_or(Error::Capacity {
-            what: "skinned copies",
-            capacity: u32::MAX,
-        })?;
-        cpu.ptlas.hold_skinned(device, live)?;
+        cpu.ptlas.hold_skinned(device, count)?;
         let taken = self.skinned_entries(cpu, device, count);
-        match taken {
-            Ok(_) => cpu.skinned_live = live,
-            Err(_) => cpu.ptlas.release_skinned(cpu.skinned_live),
+        if taken.is_err() {
+            cpu.ptlas.release_skinned(count);
         }
         taken
     }
@@ -1034,8 +1027,7 @@ impl Scene {
     /// Gives back `count` skinned-copy entries from `first`, which the PTLAS counts no more.
     pub(crate) fn free_skinned(&self, cpu: &mut SceneCpu, first: u32, count: u32) {
         cpu.skinned.free(first, count);
-        cpu.skinned_live -= count;
-        cpu.ptlas.release_skinned(cpu.skinned_live);
+        cpu.ptlas.release_skinned(count);
     }
 
     /// Moves the scene's tables that grew since its last update: see [`Column::land`].
@@ -1501,7 +1493,6 @@ impl Scene {
                 cuts: None,
                 skinned: RangeAllocator::new(0),
                 skinned_high_water: 0,
-                skinned_live: 0,
                 hung: false,
                 skins: Vec::new(),
                 skins_removed: Vec::new(),
@@ -2936,17 +2927,22 @@ impl<'f> SceneWriter<'f> {
         let table = &self.scene.tables.proxies;
         let cpu = &mut *self.scene.cpu.lock().unwrap();
         let held = table.capacity();
-        // An id past the table holds no proxy to clear.
-        if id.0 >= held {
-            if proxy.is_none() {
-                return Ok(());
-            }
-            let entries = grown_to_hold("medium proxies", held, id.0, table.limit())?;
-            table.reserve(self.device, entries)?;
+        let entries = if id.0 < held {
+            held
+        } else if proxy.is_some() {
+            grown_to_hold("medium proxies", held, id.0, table.limit())?
+        } else {
+            // An id past the table holds no proxy to clear.
+            return Ok(());
+        };
+        if proxy.is_some() {
+            // Before the table grows, so an id the PTLAS refuses takes no memory for it.
+            cpu.ptlas.reserve_proxy(self.device, id.0)?;
         }
+        table.reserve(self.device, entries)?;
         let record = proxy.map_or_else(MediumProxyGpu::zeroed, |p| proxy_gpu(p, self.cell_log2));
         let copy = self.staged(table.entry(id.0), &record)?;
-        cpu.ptlas.set_proxy(self.device, id.0, proxy.is_some())?;
+        cpu.ptlas.set_proxy(id.0, proxy.is_some());
         cpu.records.push(copy);
         Ok(())
     }
