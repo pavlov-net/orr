@@ -11,7 +11,7 @@ use std::borrow::Cow;
 
 use meshopt::{SimplifyOptions, SimplifyVertex, ffi};
 
-use super::dag::Uvs;
+use super::dag::{Uvs, uv_bits};
 use super::lod;
 use crate::par::prelude::*;
 use orr_math::Vec3;
@@ -950,14 +950,11 @@ pub(super) fn build<G: Send>(
                         attributes,
                         normal,
                         uvs,
-                    } => {
-                        let bits = [uvs[0][0], uvs[0][1], uvs[1][0], uvs[1][1]].map(f32::to_bits);
-                        *made
-                            .entry((v, attributes, normal, bits))
-                            .or_insert_with(|| {
-                                vx.wedge(v, attributes, fit.normals[normal as usize], uvs)
-                            })
-                    }
+                    } => *made
+                        .entry((v, attributes, normal, uv_bits(uvs)))
+                        .or_insert_with(|| {
+                            vx.wedge(v, attributes, fit.normals[normal as usize], uvs)
+                        }),
                 };
             }
             next.push((base + gi as i32, simplified, bounds));

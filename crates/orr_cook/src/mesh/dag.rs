@@ -57,16 +57,19 @@ fn shade(w: &Welded, v: u32) -> Shade {
     (w.normals[v], w.classes[v], lod::uvs_of(w, v as u32))
 }
 
+/// `uvs` as bits, for keys.
+pub(super) fn uv_bits(uvs: Uvs) -> [u32; 4] {
+    bytemuck::cast(uvs)
+}
+
 /// A triangle corner: the welded vertices that shade and place it, its normal, the welded
-/// vertex it stands for in simplification and that vertex's normal, its grid position and
-/// section.
+/// vertex it stands for in simplification, its grid position and section.
 #[derive(Copy, Clone)]
 struct Corner {
     shading: u32,
     normal: Shade,
     placing: u32,
     base: u32,
-    base_normal: Shade,
     cell: [i32; 3],
     section: u16,
 }
@@ -107,19 +110,11 @@ impl Input {
         }
     }
 
-    /// Adds a vertex of welded vertex `v` with `normal` at `cell` in `section` whose position
-    /// the vertex `first` stands for, the new one when it is `None`; returns it.
-    fn push(
-        &mut self,
-        (v, normal): (u32, Shade),
-        cell: [i32; 3],
-        section: u16,
-        lock: u8,
-        first: Option<u32>,
-    ) -> u32 {
+    /// Adds a vertex of welded vertex `v` at `cell` in `section` whose position the vertex
+    /// `first` stands for, the new one when it is `None`; returns it.
+    fn push(&mut self, v: u32, cell: [i32; 3], section: u16, lock: u8, first: Option<u32>) -> u32 {
         let l = self.welded.len() as u32;
         self.welded.push(v);
-        self.normals.push(normal);
         self.cells.push(cell);
         self.sections.push(section);
         self.lock.push(lock);
@@ -302,7 +297,9 @@ fn stages(
         .into_iter()
         .map(|((part, _), pieces)| (part, pieces))
         .collect();
-    let corners = |pieces| part_corners(w, grid, pieces);
+    let corners = |pieces| {
+        part_corners(w, grid, pieces).map(|(v, id, section)| (v, lod::uvs_of(w, v), id, section))
+    };
     let (shared, seams) = borders(
         w,
         grid.reps.len(),
@@ -346,14 +343,11 @@ fn stages(
                     let k = c.verts.start + usize::from(k);
                     let v = gc.verts[k];
                     let other = |of: &[u32]| of.get(k).copied().unwrap_or(v);
-                    let base = other(&gc.base);
-                    let b = base as usize;
                     corners.push(Corner {
                         shading: v,
                         normal: gc.shade(w, k),
                         placing: other(&gc.placing),
-                        base,
-                        base_normal: shade(w, b as u32),
+                        base: other(&gc.base),
                         cell: gc.cells[k],
                         section: c.section,
                     });
@@ -395,7 +389,7 @@ fn stages(
             corners
                 .iter()
                 .zip(ids)
-                .map(|(c, &id)| (c.shading, id, c.section))
+                .map(|(c, &id)| (c.shading, c.normal.2, id, c.section))
         }),
     );
     // Vertices of different parts join where they share a position, attributes and section.
@@ -426,8 +420,7 @@ fn stages(
         .zip(&ids)
         .map(|((sections, corners), ids)| {
             let _z = crate::profile::zone!("dag.build_merged_stage");
-            let welded = w.positions.len();
-            let input = merged_input(corners, ids, positions, welded, attrs, &shared, &seams);
+            let input = merged_input(corners, ids, positions, w, attrs, &shared, &seams);
             let mut groups = build(&input, w, &snap, options(sections[0]));
             for g in &mut groups {
                 g.error += m;
@@ -468,9 +461,9 @@ fn part_corners<'a>(
 }
 
 /// Positions the stages share, which stay locked, and uv and section seams, which stay
-/// protected, by the ids below `positions` that the stages' corners (welded vertex, position
-/// id, section) name.
-fn borders<C: Iterator<Item = (u32, u32, u16)>>(
+/// protected, by the ids below `positions` that the stages' corners (welded vertex that shades
+/// it, its uvs, position id, section) name.
+fn borders<C: Iterator<Item = (u32, Uvs, u32, u16)>>(
     w: &Welded,
     positions: usize,
     stages: impl Iterator<Item = C>,
@@ -479,9 +472,10 @@ fn borders<C: Iterator<Item = (u32, u32, u16)>>(
     /// What the corners so far say of a position.
     #[derive(Copy, Clone)]
     struct Seen {
-        /// The first stage and welded vertex to use it.
+        /// The first stage, and welded vertex and uvs, to use it.
         owner: u32,
         first: u32,
+        uvs: Uvs,
         /// The last stage to use it and its section there.
         stage: u32,
         section: u16,
@@ -490,6 +484,7 @@ fn borders<C: Iterator<Item = (u32, u32, u16)>>(
         Seen {
             owner: u32::MAX,
             first: 0,
+            uvs: [[0.0; 2]; 2],
             stage: u32::MAX,
             section: 0,
         };
@@ -498,19 +493,22 @@ fn borders<C: Iterator<Item = (u32, u32, u16)>>(
     let (mut shared, mut seams) = (vec![false; positions], vec![false; positions]);
     for (si, corners) in stages.enumerate() {
         let si = si as u32;
-        for (v, id, section) in corners {
+        for (v, uvs, id, section) in corners {
             let (s, i) = (&mut seen[id as usize], id as usize);
             if s.owner == u32::MAX {
                 *s = Seen {
                     owner: si,
                     first: v,
+                    uvs,
                     stage: si,
                     section,
                 };
                 continue;
             }
             shared[i] |= s.owner != si;
-            seams[i] |= lod::attributes_differ(w, s.first, v);
+            let colors = w.colors.as_ref();
+            seams[i] |=
+                s.uvs != uvs || colors.is_some_and(|c| c[s.first as usize] != c[v as usize]);
             if s.stage != si {
                 (s.stage, s.section) = (si, section);
             } else if s.section != section {
@@ -550,8 +548,7 @@ fn part_inputs(
                     let f = &mut first[id as usize];
                     let stands = (f.0 == si).then_some(f.1);
                     let lock = lod::vertex_flags(id, shared, seams).bits();
-                    let n = shade(w, v);
-                    let l = input.push((v, n), grid.cells[v as usize], section, lock, stands);
+                    let l = input.push(v, grid.cells[v as usize], section, lock, stands);
                     input.base.push(l);
                     if stands.is_none() {
                         *f = (si, l);
@@ -582,8 +579,6 @@ fn part_inputs(
         if input.base.iter().enumerate().all(|(l, &b)| b == l as u32) {
             input.base = Vec::new();
         }
-        // Each vertex holds its welded vertex's shading.
-        input.normals = Vec::new();
         out.push(input);
     }
     out
@@ -591,44 +586,42 @@ fn part_inputs(
 
 /// The `clodBuild` input of a merged stage over `corners`, whose positions have the ids
 /// `ids` below `positions`: one vertex per position, attributes (`attrs` of its shading
-/// welded vertex, of `welded`, its normal and its placing welded vertex) and section, in the
-/// order the corners first use them, each standing for the vertex of its base welded vertex
-/// there.
+/// welded vertex of `w`, its normal and its placing welded vertex) and section, in the order
+/// the corners first use them, each standing for the vertex of its base welded vertex there.
 fn merged_input<K: std::hash::Hash + Eq>(
     corners: &[Corner],
     ids: &[u32],
     positions: usize,
-    welded: usize,
+    w: &Welded,
     attrs: impl Fn(u32, Shade, u32) -> K,
     shared: &[bool],
     seams: &[bool],
 ) -> Input {
     let _z = crate::profile::zone!("dag.input");
-    // Per welded vertex placing itself, the id of the attributes it last took among those the
-    // corners use, with the normal it took them with.
-    let mut class_of = vec![(u32::MAX, [0u32; 8]); welded];
+    // Per welded vertex shading and placing itself, the id of its attributes among those the
+    // corners use.
+    let mut class_of = vec![u32::MAX; w.positions.len()];
     let mut classes: FxHashMap<K, u32> = FxHashMap::default();
     let mut local_of: FxHashMap<(u32, u32, u32, u16), u32> = FxHashMap::default();
     let mut first = vec![u32::MAX; positions];
     let mut input = Input::with_capacity(corners.len());
     for (c, &id) in corners.iter().zip(ids) {
         let mut class = |v: u32, normal: Shade, placing: u32| {
-            let (n, u) = (normal.0.map(f32::to_bits), normal.2);
-            let u = [u[0][0], u[0][1], u[1][0], u[1][1]].map(f32::to_bits);
-            let bits = [n[0], n[1], n[2], normal.1, u[0], u[1], u[2], u[3]];
-            let k = &mut class_of[v as usize];
-            if placing == v && k.0 != u32::MAX && k.1 == bits {
-                return k.0;
+            if placing == v && normal == shade(w, v) {
+                let k = &mut class_of[v as usize];
+                if *k == u32::MAX {
+                    let next = classes.len() as u32;
+                    *k = *classes.entry(attrs(v, normal, v)).or_insert(next);
+                }
+                *k
+            } else {
+                let next = classes.len() as u32;
+                *classes.entry(attrs(v, normal, placing)).or_insert(next)
             }
-            let next = classes.len() as u32;
-            let id = *classes.entry(attrs(v, normal, placing)).or_insert(next);
-            if placing == v {
-                *k = (id, bits);
-            }
-            id
         };
+        let base_normal = shade(w, c.base);
         let own = class(c.shading, c.normal, c.placing);
-        let base = class(c.base, c.base_normal, c.base);
+        let base = class(c.base, base_normal, c.base);
         // The vertex of the corner's position and section with the attributes of class `own`
         // of welded vertex `v`, `normal` and welded vertex `placing`, standing for the one of
         // class `base`, which it adds first where it is missing.
@@ -639,7 +632,8 @@ fn merged_input<K: std::hash::Hash + Eq>(
                     let f = &mut first[id as usize];
                     let stands = (*f != u32::MAX).then_some(*f);
                     let lock = lod::vertex_flags(id, shared, seams).bits();
-                    let l = input.push((v, normal), c.cell, c.section, lock, stands);
+                    let l = input.push(v, c.cell, c.section, lock, stands);
+                    input.normals.push(normal);
                     input.placing.push(placing);
                     input.base.push(b.unwrap_or(l));
                     if stands.is_none() {
@@ -648,7 +642,7 @@ fn merged_input<K: std::hash::Hash + Eq>(
                     l
                 })
         };
-        let b = vertex(base, c.base, c.base_normal, c.base, None);
+        let b = vertex(base, c.base, base_normal, c.base, None);
         let l = vertex(own, c.shading, c.normal, c.placing, Some(b));
         input.indices.push(l);
     }

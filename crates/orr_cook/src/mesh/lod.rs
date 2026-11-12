@@ -10,7 +10,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::par::prelude::*;
 
-use super::dag::Uvs;
+use super::dag::{Uvs, uv_bits};
 use super::maps::Displacement;
 use super::{Grid, MeshData, MeshSettings, Pivots, Skin};
 
@@ -122,9 +122,9 @@ impl Welded {
     }
 
     /// Adds a vertex placed as `at` is, by its position, moves, skin, part value and pivot,
-    /// with normal `normal` and the tangent, uvs, colors and normal class of `from`; returns
-    /// it. It stands for the vertex `at` does.
-    pub(super) fn wedge(&mut self, at: u32, from: u32, normal: [f32; 3]) -> u32 {
+    /// with normal `normal`, uvs `uvs` and the tangent, colors and normal class of `from`;
+    /// returns it. It stands for the vertex `at` does.
+    pub(super) fn wedge(&mut self, at: u32, from: u32, normal: [f32; 3], uvs: Uvs) -> u32 {
         fn copy<T: Copy>(v: &mut Vec<T>, i: u32) {
             v.push(v[i as usize]);
         }
@@ -141,7 +141,7 @@ impl Welded {
         self.normals.push(normal);
         copy(&mut self.classes, from);
         self.tangents.iter_mut().for_each(|t| copy(t, from));
-        self.uvs.iter_mut().for_each(|u| copy(u, from));
+        self.uvs.iter_mut().zip(uvs).for_each(|(u, uv)| u.push(uv));
         self.colors.iter_mut().for_each(|c| copy(c, from));
         new
     }
@@ -247,16 +247,20 @@ pub(super) fn fit(
         kept.entry(rotated(b, k)).or_insert_with(|| rotated(i, k));
     }
     let tris = simplified.as_chunks::<3>().0;
-    let held = |tri: &[u32; 3]| {
-        let k0 = first(tri);
-        let held = kept.get(&rotated(tri, k0))?;
-        (!tri.iter().any(|&v| (vx.moved)(v))).then(|| [0, 1, 2].map(|k| held[(k + 3 - k0) % 3]))
-    };
+    // Per triangle, the input's corners where the input holds it.
+    let kept_corners: Vec<Option<[u32; 3]>> = tris
+        .iter()
+        .map(|tri| {
+            let k0 = first(tri);
+            let held = kept.get(&rotated(tri, k0))?;
+            (!tri.iter().any(|&v| (vx.moved)(v))).then(|| [0, 1, 2].map(|k| held[(k + 3 - k0) % 3]))
+        })
+        .collect();
     // Per vertex, the input vertices the kept triangles hold there.
     let mut holds: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut out = Fit::default();
-    for (t, tri) in tris.iter().enumerate() {
-        let Some(held) = held(tri) else {
+    for (t, (tri, held)) in tris.iter().zip(&kept_corners).enumerate() {
+        let Some(held) = *held else {
             continue;
         };
         for (k, (&v, u)) in tri.iter().zip(held).enumerate() {
@@ -272,8 +276,9 @@ pub(super) fn fit(
     // The area the fitted triangles cover.
     let fitted: f64 = tris
         .iter()
-        .filter(|t| held(t).is_none())
-        .map(|t| {
+        .zip(&kept_corners)
+        .filter(|(_, held)| held.is_none())
+        .map(|(t, _)| {
             let p = t.map(|v| (vx.at)(v));
             0.5 * (p[1] - p[0]).cross(p[2] - p[0]).length()
         })
@@ -282,8 +287,8 @@ pub(super) fn fit(
     // Per fitted corner: its index, its face, its normal sum, the vertex whose other attributes
     // it takes and its uvs.
     let mut sums: Vec<(usize, DVec3, DVec3, u32, Uvs)> = Vec::new();
-    for (t, tri) in tris.iter().enumerate() {
-        if held(tri).is_some() {
+    for (t, (tri, held)) in tris.iter().zip(&kept_corners).enumerate() {
+        if held.is_some() {
             continue;
         }
         let surface = surface.get_or_insert_with(|| Surface::new(input, vx));
@@ -313,11 +318,7 @@ pub(super) fn fit(
         // between leaves with, no more parts than four per input triangle: the input holds no
         // more normals to sample.
         let part = (0.5 * surface.area).max(fitted / (4 * surface.tris.len()) as f64);
-        let s = if part > 0.0 {
-            (0.5 * twice / part).sqrt().ceil().max(1.0)
-        } else {
-            1.0
-        };
+        let s = (0.5 * twice / part).sqrt().ceil().max(1.0);
         let weight = 0.5 * twice / (s * s);
         let mut sum = [DVec3::ZERO; 3];
         // Per patch the samples land on, their weight.
@@ -1337,19 +1338,12 @@ pub(super) fn simplify(
                 attributes,
                 normal,
                 uvs,
-            } => {
-                let bits = [uvs[0][0], uvs[0][1], uvs[1][0], uvs[1][1]].map(f32::to_bits);
-                *made
-                    .entry((v, attributes, normal, bits))
-                    .or_insert_with(|| {
-                        grid.wedge(v);
-                        let new = w.wedge(v, attributes, fit.normals[normal as usize]);
-                        for (set, u) in w.uvs.iter_mut().enumerate() {
-                            u[new as usize] = uvs[set];
-                        }
-                        new
-                    })
-            }
+            } => *made
+                .entry((v, attributes, normal, uv_bits(uvs)))
+                .or_insert_with(|| {
+                    grid.wedge(v);
+                    w.wedge(v, attributes, fit.normals[normal as usize], uvs)
+                }),
         };
     }
     (out, error)
