@@ -36,7 +36,9 @@ use crate::mount::{
 };
 use crate::neural::{NeuralTextures, Precision};
 use crate::pipelines::{MeshPipelineId, MeshStages, PipelineId, Pipelines, ReloadReport};
-use crate::producer::{self, Job, ProducerKernels, ProducerStats, ProducerUpdate, Readback};
+use crate::producer::{
+    self, Job, ProducerKernels, ProducerStats, ProducerUpdate, Readback, StateTables,
+};
 use crate::ptlas::{FrameInputs, PtlasPipelines, RtStats};
 use crate::raster::{self, ListSizes, RasterPipelines, TargetSizes, ViewLists, ViewTargets};
 #[cfg(feature = "hot-reload")]
@@ -3037,27 +3039,23 @@ fn record_producers(
             p.templates_built = true;
             p.built = true;
         }
-        let set = cpu
+        let set: Vec<_> = cpu
             .producers
             .iter()
             .enumerate()
             .filter_map(|(i, p)| {
                 p.as_ref()
-                    .map(|p| (i as u32, p.capacity(), p.tess.is_some()))
+                    .map(|p| (i as u32, p.counts, p.capacity(), p.tess.is_some()))
             })
             .collect();
-        if cpu.producer_readback.is_none() {
-            cpu.producer_readback = Some(Readback::new(device, capacity, core.fif)?);
-        }
-        let t = &scene.tables;
-        cpu.producer_readback.as_mut().expect("made above").record(
-            list,
-            slot,
-            t.producer_counts.gpu(),
-            t.producer_state.gpu(),
-            t.tess_state.gpu(),
-            set,
-        );
+        let tables = StateTables {
+            state: scene.tables.producer_state.gpu(),
+            tess: scene.tables.tess_state.gpu(),
+            entries: capacity,
+        };
+        cpu.producer_readback
+            .get_or_insert_with(|| Readback::new(core.fif))
+            .record(device, list, slot, &tables, &set)?;
     }
     list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
     Ok(())

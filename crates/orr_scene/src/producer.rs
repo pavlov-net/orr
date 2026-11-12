@@ -3,7 +3,7 @@
 //! frame's list.
 //!
 //! Each entry owns one allocation: its topologies, materials and template positions, its
-//! batch, and its build records and result addresses. Its implicit build results
+//! batch and the counts its kernel emits against, and its build records and result addresses. Its implicit build results
 //! (templates, CLAS, the cluster BLAS) live in blocks sized for its capacities. `EveryFrame`
 //! entries rebuild into the same blocks each frame: frames run in order on the render
 //! queue, so a frame's builds never overlap the traces of the frame before.
@@ -27,6 +27,7 @@ use crate::scene::{InstanceFlags, ModelId, TransformGroupId};
 use crate::shaders::producer_build::{self, BuildRoot, ProducerBuildGpu};
 use crate::shaders::types::{GeneratedClusterGpu, SubdCopyGpu, TessGpu, TessStateGpu};
 use crate::subd::{CageShape, SubdBuild};
+use crate::table::grown;
 use crate::tessellate::{EntryTess, Layout, PATTERNS, Patterns, TessellationStats};
 use crate::{ProducerBatch, ProducerClusterGpu, ProducerGpu, Result, SceneRoot, TopologyGpu};
 use bytemuck::Zeroable;
@@ -357,6 +358,8 @@ pub(crate) struct Producer {
     pub(crate) templates_built: bool,
     /// A `Static` entry has built.
     pub(crate) built: bool,
+    /// Cluster, vertex and segment count of its batch, and a spare word.
+    pub(crate) counts: GpuPtr<[u32; 4]>,
     /// The counts its kernel emits against: the patch batch's for a tessellated entry.
     pub(crate) emit_counts: GpuPtr<[u32; 4]>,
     /// A tessellated entry's work memory.
@@ -482,15 +485,12 @@ impl BatchAt {
     }
 }
 
-/// Builds an entry's allocation and records: `counts` are its cluster, vertex and segment
-/// counts, `batch` its record in the scene's batch table. A tessellated entry takes its
-/// generated clusters' topologies and CLAS templates from `patterns`; a subdivision copy's
-/// also holds its copy record and, skinned, its posed cage points and page points.
+/// Builds an entry's allocation and records. A tessellated entry takes its generated clusters'
+/// topologies and CLAS templates from `patterns`; a subdivision copy's also holds its copy
+/// record and, skinned, its posed cage points and page points.
 pub(crate) fn build(
     device: &Device,
     desc: &ProducerDesc<'_>,
-    counts: GpuPtr<[u32; 4]>,
-    batch: GpuPtr<ProducerBatch>,
     patterns: &Patterns,
     subd: Option<&SubdBuild>,
 ) -> Result<Built> {
@@ -609,6 +609,7 @@ pub(crate) fn build(
     let copy_at = take(only(subd.is_some(), size_of::<SubdCopyGpu>() as u64));
     let tube_batch_at = tubes.then(|| take(size_of::<ProducerBatch>() as u64));
     let static_len = take(0) as usize;
+    let batch_counts_at = take(16);
     let posed = subd.filter(|s| s.palette.is_some()).map(|s| {
         let points = 12 * u64::from(s.shape.points);
         [
@@ -715,7 +716,7 @@ pub(crate) fn build(
         refs: at(refs_at).cast(),
         counts: counts_gpu,
         curve: at(curve_at).cast(),
-        batch: tube_batch_at.map_or(batch, |o| at(o).cast()),
+        batch: tube_batch_at.map_or(GpuPtr::NULL, |o| at(o).cast()),
         swept_indices: at(swept_indices_at).cast(),
         swept_blas: swept.as_ref().map_or(0, |s| s.blas.address().0),
         topology_count: built_topologies as u32,
@@ -871,7 +872,7 @@ pub(crate) fn build(
         None
     };
 
-    let counts = counts.cast::<u32>();
+    let counts = at(batch_counts_at).cast::<u32>();
     let batch_gpu = |b: &BatchAt, counts: GpuPtr<u32>, max_clusters, max_vertices| ProducerBatch {
         clusters: at(b.clusters).cast(),
         positions: at(b.positions).cast(),
@@ -951,6 +952,7 @@ pub(crate) fn build(
             },
             templates_built: n_topo == 0 || tessellated,
             built: false,
+            counts: counts.cast(),
             emit_counts,
             tess: tess_layout.map(|l| EntryTess {
                 record: at(tess_at).cast(),
@@ -1218,12 +1220,29 @@ impl ProducerStats {
 /// A scene's producer counts and states copied back each frame, one copy per frame in
 /// flight, with the capacities of the entries set when it was taken.
 pub(crate) struct Readback {
-    counts: Allocation<[u32; 4]>,
-    state: Allocation<crate::ProducerStateGpu>,
-    tess: Allocation<TessStateGpu>,
-    capacity: u32,
-    /// Per slot: each set entry, its capacities and whether it is tessellated.
-    taken: Vec<Vec<(u32, Capacity, bool)>>,
+    slots: Vec<ReadbackSlot>,
+}
+
+/// A scene's producer state tables, of `entries` entries each.
+pub(crate) struct StateTables {
+    pub(crate) state: GpuPtr<crate::ProducerStateGpu>,
+    pub(crate) tess: GpuPtr<TessStateGpu>,
+    pub(crate) entries: u32,
+}
+
+/// One frame's copy: the state tables whole, and the counts of each set entry in the order of
+/// `taken`.
+#[derive(Default)]
+struct ReadbackSlot {
+    /// Entries of the producer table the state copies hold room for.
+    entries: u32,
+    state: Option<Allocation<crate::ProducerStateGpu>>,
+    tess: Option<Allocation<TessStateGpu>>,
+    /// Set entries the counts hold room for.
+    rows: u32,
+    counts: Option<Allocation<[u32; 4]>>,
+    /// Each set entry, its capacities and whether it is tessellated.
+    taken: Vec<(u32, Capacity, bool)>,
 }
 
 /// An entry's batch capacities, as `FrameStats` reports them.
@@ -1245,65 +1264,86 @@ impl Producer {
 }
 
 impl Readback {
-    pub(crate) fn new(device: &Device, capacity: u32, fif: u32) -> Result<Self> {
-        let n = u64::from(capacity.max(1)) * u64::from(fif.max(1));
-        Ok(Self {
-            counts: device.gpu_malloc(MemoryKind::Readback, n, "producer counts readback")?,
-            state: device.gpu_malloc(MemoryKind::Readback, n, "producer state readback")?,
-            tess: device.gpu_malloc(MemoryKind::Readback, n, "tessellation state readback")?,
-            capacity: capacity.max(1),
-            taken: vec![Vec::new(); fif.max(1) as usize],
-        })
+    pub(crate) fn new(fif: u32) -> Self {
+        Self {
+            slots: (0..fif.max(1)).map(|_| ReadbackSlot::default()).collect(),
+        }
     }
 
-    /// Records the copies of slot `slot` from the scene's tables.
+    /// Records the copies of slot `slot`, whose frame before has completed: the scene's state
+    /// `tables`, and the counts of each entry of `set`, which gives its entry, where its counts
+    /// are, its capacities and whether it is tessellated. The slot's memory grows as [`grown`]
+    /// says when it holds too little. Fails without memory for that, recording nothing.
     pub(crate) fn record(
         &mut self,
+        device: &Device,
         list: &mut CommandList<'_>,
         slot: usize,
-        counts: GpuPtr<[u32; 4]>,
-        state: GpuPtr<crate::ProducerStateGpu>,
-        tess: GpuPtr<TessStateGpu>,
-        set: Vec<(u32, Capacity, bool)>,
-    ) {
-        let at = slot as u64 * u64::from(self.capacity);
-        let c = u64::from(self.capacity);
-        list.copy(
-            self.counts.gpu().offset(at).cast(),
-            counts.cast(),
-            c * size_of::<[u32; 4]>() as u64,
-        );
-        list.copy(
-            self.state.gpu().offset(at).cast(),
-            state.cast(),
-            c * size_of::<crate::ProducerStateGpu>() as u64,
-        );
-        list.copy(
-            self.tess.gpu().offset(at).cast(),
-            tess.cast(),
-            c * size_of::<TessStateGpu>() as u64,
-        );
-        self.taken[slot] = set;
+        tables: &StateTables,
+        set: &[(u32, GpuPtr<[u32; 4]>, Capacity, bool)],
+    ) -> Result<()> {
+        let s = &mut self.slots[slot];
+        let entries = tables.entries;
+        let kind = MemoryKind::Readback;
+        if entries > s.entries {
+            let n = grown(
+                "producer readback",
+                s.entries,
+                entries - s.entries,
+                u32::MAX,
+            )?;
+            let state = device.gpu_malloc(kind, u64::from(n), "producer state readback")?;
+            let tess = device.gpu_malloc(kind, u64::from(n), "tessellation state readback")?;
+            s.state = Some(state);
+            s.tess = Some(tess);
+            s.entries = n;
+        }
+        let rows = set.len() as u32;
+        if rows > s.rows {
+            let n = grown("producer readback", s.rows, rows - s.rows, u32::MAX)?;
+            s.counts = Some(device.gpu_malloc(kind, u64::from(n), "producer counts readback")?);
+            s.rows = n;
+        }
+        s.taken = set
+            .iter()
+            .map(|&(i, _, max, tess)| (i, max, tess))
+            .collect();
+        let n = u64::from(entries);
+        if let (Some(to), true) = (&s.state, n > 0) {
+            let bytes = n * size_of::<crate::ProducerStateGpu>() as u64;
+            list.copy(to.gpu().cast(), tables.state.cast(), bytes);
+        }
+        if let (Some(to), true) = (&s.tess, n > 0) {
+            let bytes = n * size_of::<TessStateGpu>() as u64;
+            list.copy(to.gpu().cast(), tables.tess.cast(), bytes);
+        }
+        if let Some(to) = &s.counts {
+            for (row, &(_, counts, ..)) in (0..).zip(set) {
+                list.copy(to.gpu().offset(row).cast(), counts.cast(), 16);
+            }
+        }
+        Ok(())
     }
 
     /// The figures of slot `slot`.
     pub(crate) fn figures(&self, slot: usize) -> (ProducerStats, TessellationStats) {
-        let at = slot * self.capacity as usize;
-        let (Some(counts), Some(state), Some(tess)) = (
-            self.counts.as_slice(),
-            self.state.as_slice(),
-            self.tess.as_slice(),
-        ) else {
+        let slot = &self.slots[slot];
+        let slices = (
+            slot.counts.as_ref().and_then(Allocation::as_slice),
+            slot.state.as_ref().and_then(Allocation::as_slice),
+            slot.tess.as_ref().and_then(Allocation::as_slice),
+        );
+        let (Some(counts), Some(state), Some(tess)) = slices else {
             return Default::default();
         };
         let mut s = ProducerStats::default();
         let mut t = TessellationStats::default();
-        for &(entry, max, tessellated) in &self.taken[slot] {
+        for (&(entry, max, tessellated), row) in slot.taken.iter().zip(counts) {
             if tessellated {
-                t.add_entry(&tess[at + entry as usize]);
+                t.add_entry(&tess[entry as usize]);
             }
-            let [clusters, vertices, segments, _] = counts[at + entry as usize];
-            let st = &state[at + entry as usize];
+            let [clusters, vertices, segments, _] = *row;
+            let st = &state[entry as usize];
             s.entries += 1;
             s.clusters += clusters.min(max.clusters);
             s.cluster_capacity += max.clusters;

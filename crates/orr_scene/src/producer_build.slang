@@ -53,7 +53,7 @@ public struct ProducerBuildGpu
     public uint* refs;              // per cluster
     public uint* counts;            // BUILD_*
     public float3* curve;           // template positions: vertex i on the moment curve
-    public ProducerBatch* batch;    // what the cluster builds read: the entry's batch, or a strand entry's tube batch
+    public ProducerBatch* batch;    // a strand entry's tube batch, which its cluster builds read; null: they read the entry's batch
     public uint* swept_indices;     // a swept-sphere entry's per-segment first vertex, the BLAS's index list
     public uint64_t swept_blas;     // a swept-sphere entry's BLAS
     public uint topology_count;
@@ -72,6 +72,13 @@ public struct BuildRoot
 }
 ORR_ROOT(BuildRoot);
 
+// The batch the entry's cluster builds read.
+ProducerBatch built_batch()
+{
+    ProducerBuildGpu* b = root.build;
+    return b.batch != nullptr ? *b.batch : root.scene.batches[root.entry];
+}
+
 static const uint GROUP = 128;
 
 // One thread per topology.
@@ -80,7 +87,7 @@ static const uint GROUP = 128;
 void templates(uint t: SV_GroupThreadID)
 {
     ProducerBuildGpu* b = root.build;
-    ProducerBatch batch = *b.batch;
+    ProducerBatch batch = built_batch();
     if (t == 0)
         b.counts[BUILD_TEMPLATES] = b.topology_count;
     for (uint i = t; i < b.topology_count; i += GROUP)
@@ -181,7 +188,7 @@ void strands(uint t: SV_GroupThreadID)
         b.counts[BUILD_TUBE_CLUSTERS] = tube_count;
         b.counts[BUILD_TUBE_VERTICES] = tube_count * TUBE_VERTICES;
     }
-    ProducerBatch tubes = *b.batch;
+    ProducerBatch tubes = built_batch();
     for (uint k = t; k < listed; k += GROUP)
     {
         Segment g;
@@ -231,7 +238,7 @@ void records(uint t: SV_GroupThreadID)
 {
     SceneRoot* s = root.scene;
     ProducerBuildGpu* b = root.build;
-    ProducerBatch batch = *b.batch;
+    ProducerBatch batch = built_batch();
     ProducerStateGpu* st = s.producer_state + root.entry;
     uint n = emitted_clusters(batch);
     for (uint c = t; c < n; c += GROUP)
@@ -304,7 +311,7 @@ void gather(uint t: SV_GroupThreadID)
 {
     SceneRoot* s = root.scene;
     ProducerBuildGpu* b = root.build;
-    ProducerBatch batch = *b.batch;
+    ProducerBatch batch = built_batch();
     uint n = emitted_clusters(batch);
     for (uint c = t; c < n; c += GROUP)
     {

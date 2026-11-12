@@ -343,8 +343,6 @@ pub(crate) struct Tables {
     /// Tessellated entries' patch batches, zero for others.
     pub(crate) patches: Allocation<ProducerBatch>,
     pub(crate) tess_state: Allocation<TessStateGpu>,
-    /// Cluster, vertex and segment count of each producer batch, and a spare word.
-    pub(crate) producer_counts: Allocation<[u32; 4]>,
     pub(crate) producer_state: Allocation<ProducerStateGpu>,
     pub(crate) sky_stats: Allocation<SkyStats>,
     /// By skinned-copy entry, like `skin_state`: the two grow together.
@@ -1400,7 +1398,6 @@ impl Scene {
                 t.emissive.gpu().offset(at).address().0,
                 words(size_of::<EmissiveGpu>()),
             ),
-            (t.producer_counts.gpu().offset(at).address().0, 4),
             (state + blas, 2),
             (state + clusters, 1),
         ];
@@ -1442,7 +1439,6 @@ impl Scene {
             batches: device.gpu_malloc(dl, n(desc.producer_capacity), "producer batches")?,
             patches: device.gpu_malloc(dl, n(desc.producer_capacity), "producer patches")?,
             tess_state: device.gpu_malloc(dl, n(desc.producer_capacity), "tessellation state")?,
-            producer_counts: device.gpu_malloc(dl, n(desc.producer_capacity), "producer counts")?,
             producer_state: device.gpu_malloc(dl, n(desc.producer_capacity), "producer state")?,
             sky_stats: device.gpu_malloc(dl, 1, "sky stats")?,
             skinned: Column::new(device, MemoryPriority::Normal, "skinned copies", true)?,
@@ -1460,10 +1456,6 @@ impl Scene {
             zero(tables.batches.gpu().address(), tables.batches.size()),
             zero(tables.patches.gpu().address(), tables.patches.size()),
             zero(tables.tess_state.gpu().address(), tables.tess_state.size()),
-            zero(
-                tables.producer_counts.gpu().address(),
-                tables.producer_counts.size(),
-            ),
             zero(
                 tables.producer_state.gpu().address(),
                 tables.producer_state.size(),
@@ -2801,7 +2793,6 @@ impl<'f> SceneWriter<'f> {
         self.check_groups(desc.map(|d| d.transform.0));
         let t = &self.scene.tables;
         let i = u64::from(id.0);
-        let counts = t.producer_counts.gpu().offset(i);
         // Window room comes first, so nothing is recorded unless all of it is.
         let mut copies = Vec::with_capacity(6);
         let (record, batch, patches, entry, producer) = match desc {
@@ -2813,14 +2804,7 @@ impl<'f> SceneWriter<'f> {
                 None,
             ),
             Some(d) => {
-                let b = producer::build(
-                    self.device,
-                    d,
-                    counts,
-                    t.batches.gpu().offset(i),
-                    self.patterns,
-                    subd,
-                )?;
+                let b = producer::build(self.device, d, self.patterns, subd)?;
                 let n = (b.static_bytes.len() / 4) as u32;
                 let (src, words) = self.window.slice::<u32>(self.device, n)?;
                 bytemuck::cast_slice_mut(words).copy_from_slice(&b.static_bytes);
@@ -2838,15 +2822,19 @@ impl<'f> SceneWriter<'f> {
         copies.push(self.staged(t.patches.gpu().offset(i), &patches)?);
         copies.push(self.staged(t.tess_state.gpu().offset(i), &TessStateGpu::zeroed())?);
         copies.push(self.staged(t.emissive.gpu().offset(i), &entry)?);
-        let emit_counts = producer.as_ref().map_or(counts, |p| p.emit_counts);
         let cpu = &mut *self.scene.cpu.lock().unwrap();
         cpu.records.append(&mut copies);
-        if emit_counts != counts {
-            cpu.records
-                .push(Record::fill(self.next_seq(), emit_counts.address().0, 4, 0));
+        if let Some(p) = &producer {
+            // A tessellated entry's kernel emits against its patch batch's counts.
+            let mut counts = vec![p.counts];
+            if p.emit_counts != p.counts {
+                counts.push(p.emit_counts);
+            }
+            for at in counts {
+                cpu.records
+                    .push(Record::fill(self.next_seq(), at.address().0, 4, 0));
+            }
         }
-        cpu.records
-            .push(Record::fill(self.next_seq(), counts.address().0, 4, 0));
         // The new entry has built nothing; its PTLAS instance follows from the record.
         let state = t.producer_state.gpu().offset(i);
         let blas = std::mem::offset_of!(ProducerStateGpu, blas) as u64;
