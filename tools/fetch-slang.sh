@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fetches the pinned third-party tools into .tools/ (ignored by git):
-#   slang-2026.21/   Slang release for the host (Linux, Windows or Apple silicon macOS),
+#   slang-2026.22/   Slang release for the host (Linux, Windows or Apple silicon macOS),
 #                    checked against its sha256
 #   openpbr-bsdf/    adobe/openpbr-bsdf at a pinned commit
 #   glm/             GLM 1.0.1 at its tag commit
@@ -43,7 +43,7 @@
 # (for example a separate Linux copy when WSL shares the tree with Windows).
 set -euo pipefail
 
-slang_version=2026.21
+slang_version=2026.22
 openpbr_commit=c91aad1d1ce1693e803f039d7c92c2965c4eb013
 glm_commit=0af55ccecd98d4e5a8d1fad7de25ba429d60e863
 gdeflate_commit=8ba9502fb30d2bf728592d121f0d402e40c8cb05
@@ -69,22 +69,22 @@ case "$(uname -s)" in
     case "${SLANG_ASSET:-default}" in
       default)
         asset=slang-$slang_version-linux-x86_64.tar.gz
-        sum=691f9341e5bec099eec97ee30a83bcbef541cee7fe3b4de68a821d42f9506c2f ;;
+        sum=a877b75c6ec515f5d8bf66ea4bae4f0a5ba85050b9540c2046670285808347e6 ;;
       glibc-2.28)
         asset=slang-$slang_version-linux-x86_64-glibc-2.28.tar.gz
-        sum=7b8800e7115668bfb073456ada3b20fa40718d7be41e7beec7c46c31351ba569 ;;
+        sum=35c765d20b69f6217b02848cdb82a5216bf03990044a8991ceb0b89a198a80fb ;;
       *) echo "unknown SLANG_ASSET '$SLANG_ASSET' (default or glibc-2.28)" >&2; exit 1 ;;
     esac ;;
   Darwin)
     case "$(uname -m)" in
       arm64)
         asset=slang-$slang_version-macos-aarch64.tar.gz
-        sum=c3d3c959ba3e0c8fdb6c2a5cf6a471ed097ed19c41820af9fb21625779794fb2 ;;
+        sum=885b5bd9a79a1ae81fdb92212f5f7c785001f870d45c39f9bb5df01339db3fea ;;
       *) echo "unsupported macOS architecture $(uname -m) (Apple silicon only)" >&2; exit 1 ;;
     esac ;;
   MINGW*|MSYS*|CYGWIN*)
     asset=slang-$slang_version-windows-x86_64.zip
-    sum=4b6f509e73397175ed36a341beb7ad15f4fff5feaf5f6d95fecf896c0d86b8de ;;
+    sum=dd0c4a86bd44cdb7e9cf712af0c8ebf2fff1bba19fa5e3c128ff87384e8ff17b ;;
   *) echo "unsupported host $(uname -s)" >&2; exit 1 ;;
 esac
 
