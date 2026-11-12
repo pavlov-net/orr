@@ -170,10 +170,10 @@ impl Drop for Workers {
     }
 }
 
-/// Test threads that hold scenes at once. A scene's tables are made for a world, whatever a
-/// test puts in them, so each takes about 1 GB of the device's memory, and the render queue
-/// runs the threads' frames one after another whatever their number: more threads add memory,
-/// which the OS pages out between frames once several test processes pass what the device has.
+/// Test threads that hold scenes at once. A scene whose lighting has run holds its world
+/// cache whatever a test puts in it, and the render queue runs the threads' frames one after
+/// another whatever their number: more threads add memory, which the OS pages out between
+/// frames once several test processes pass what the device has.
 const SCENE_THREADS: u64 = 6;
 
 /// The threads holding scenes now.
