@@ -180,6 +180,8 @@ fn midpoint(w: &mut Welded, a: u32, b: u32) -> u32 {
     let n = Vec3::from(w.normals[a]) + Vec3::from(w.normals[b]);
     w.normals
         .push(n.normalize_or(Vec3::from(w.normals[a])).to_array());
+    w.classes
+        .push(lod::normal_class(w.normals[w.normals.len() - 1]));
     for u in &mut w.uvs {
         let (ua, ub) = (u[a], u[b]);
         u.push([mid(ua[0], ub[0]), mid(ua[1], ub[1])]);
@@ -245,6 +247,7 @@ fn smooth_normals(w: &mut Welded, baked: &[bool]) {
             let n = sums[&w.positions[v].map(f32::to_bits)];
             if n != DVec3::ZERO {
                 w.normals[v] = n.normalize().as_vec3().to_array();
+                w.classes[v] = lod::normal_class(w.normals[v]);
             }
         }
     }

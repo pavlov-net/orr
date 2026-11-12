@@ -3,14 +3,15 @@
 //! positions it needs and moves only its own vertices when it dilates borders; groups come
 //! out in the order the original emits them, with the same numbering. Unlike the original,
 //! level 0 clusters each section apart, unless the triangles make one cluster, the sloppy
-//! fallback can keep open borders ([`Mesh::keep_borders`]), and a simplified corner whose
-//! normal opposes its face takes a wedge with a normal from its triangle's side and the other
-//! attributes of the surface the triangle stands on ([`lod::opposed_corners`]).
+//! fallback can keep open borders ([`Mesh::keep_borders`]), and a corner of a simplified
+//! triangle takes a wedge with the attributes of the surface the triangle stands for and a
+//! normal fitted to it ([`lod::fit`]).
 
 use std::borrow::Cow;
 
 use meshopt::{SimplifyOptions, SimplifyVertex, ffi};
 
+use super::dag::Uvs;
 use super::lod;
 use crate::par::prelude::*;
 use orr_math::Vec3;
@@ -47,13 +48,15 @@ impl Cluster {
 pub(super) struct Mesh<'a> {
     pub(super) indices: &'a [u32],
     pub(super) normals: Vec<f32>,
+    /// Per vertex, its normal's class ([`lod::Welded::classes`]) and its uvs.
+    pub(super) classes: Vec<u32>,
+    pub(super) uvs: Vec<Uvs>,
     pub(crate) weights: &'a [f32],
     pub(super) lock: Vec<u8>,
     pub(super) remap: &'a [u32],
     pub(super) sections: &'a [u16],
     /// Per vertex, the vertex it stands for in simplification, where some stand for others:
-    /// a corner an earlier build gave another vertex's normal or attributes
-    /// ([`lod::opposed_corners`]).
+    /// a corner an earlier build gave another normal or attributes ([`lod::fit`]).
     pub(super) base: Option<Vec<u32>>,
     /// The open borders stay where `lock` leaves them: the sloppy fallback, which does not
     /// keep to border loops, locks every vertex on one.
@@ -61,12 +64,12 @@ pub(super) struct Mesh<'a> {
 }
 
 /// The mesh vertices each vertex of `build` takes after: a mesh vertex itself, and a wedge
-/// the vertex that places it, by position and skin, the one that turns it, by its normal, and
-/// the one that shades it, by the other attributes.
+/// the vertex that places it, by position and skin, and the one that shades it, by its
+/// attributes but its normal, which is its own.
 pub(super) struct Sources {
     mesh: u32,
-    /// Per wedge, its shading, turning and placing mesh vertices.
-    wedges: Vec<[u32; 3]>,
+    /// Per wedge, its shading and placing mesh vertices.
+    wedges: Vec<[u32; 2]>,
 }
 
 impl Sources {
@@ -79,20 +82,19 @@ impl Sources {
         self.of(v, 0)
     }
 
-    pub(super) fn turning(&self, v: u32) -> u32 {
-        self.of(v, 1)
-    }
-
     pub(super) fn placing(&self, v: u32) -> u32 {
-        self.of(v, 2)
+        self.of(v, 1)
     }
 }
 
 /// What `build` keeps per vertex: the mesh's vertices, then the wedges it adds, each placed as
-/// one vertex is and turned and shaded as others ([`lod::opposed_corners`]).
+/// one vertex is and shaded as another, with a normal and uvs of its own ([`lod::fit`]).
 struct Vertices {
     positions: Vec<f32>,
     normals: Vec<f32>,
+    /// Per vertex, its normal's class and its uvs.
+    classes: Vec<u32>,
+    uvs: Vec<Uvs>,
     /// The mesh's lock bits.
     lock: Vec<u8>,
     remap: Vec<u32>,
@@ -103,16 +105,17 @@ struct Vertices {
 }
 
 impl Vertices {
-    /// Adds a vertex placed as `at` is, by its position and lock bits, with the normal of
-    /// `normal` and shaded as `from` is; returns it.
-    fn wedge(&mut self, at: u32, normal: u32, from: u32) -> u32 {
+    /// Adds a vertex placed as `at` is, by its position and lock bits, shaded as `from` is,
+    /// with its normal's class, and with normal `normal` and uvs `uvs`; returns it.
+    fn wedge(&mut self, at: u32, from: u32, normal: [f32; 3], uvs: Uvs) -> u32 {
         let new = self.remap.len() as u32;
         let s = &mut self.sources;
-        s.wedges
-            .push([s.shading(from), s.turning(normal), s.placing(at)]);
-        let (at, normal) = (at as usize, normal as usize);
+        s.wedges.push([s.shading(from), s.placing(at)]);
+        let at = at as usize;
         self.positions.extend_from_within(3 * at..3 * at + 3);
-        self.normals.extend_from_within(3 * normal..3 * normal + 3);
+        self.normals.extend_from_slice(&normal);
+        self.classes.push(self.classes[from as usize]);
+        self.uvs.push(uvs);
         self.lock.push(self.lock[at]);
         self.remap.push(self.remap[at]);
         self.base.push(self.base[at]);
@@ -552,6 +555,8 @@ fn simplify_fallback(
     lod.iter().map(|&i| indices[i as usize]).collect()
 }
 
+/// `indices` simplified toward `target` indices, with the error reached in `error` and
+/// whether the sloppy fallback made them in `sloppy`.
 #[allow(clippy::too_many_arguments)]
 fn simplify(
     c: &ffi::clodConfig,
@@ -564,6 +569,7 @@ fn simplify(
     locks: &[u8],
     target: usize,
     error: &mut f32,
+    sloppy: &mut bool,
 ) -> Vec<u32> {
     let _z = crate::profile::zone!("clod.simplify");
     let mut options = SimplifyOptions::Sparse | SimplifyOptions::ErrorAbsolute;
@@ -604,6 +610,7 @@ fn simplify(
         let keep = keep_borders.then_some(remap);
         lod = simplify_fallback(positions, indices, locks, keep, target, error);
         *error *= c.simplify_error_factor_sloppy;
+        *sloppy = true;
     }
     if lod.is_empty() && !indices.is_empty() {
         lod.extend_from_slice(&indices[..3]);
@@ -742,13 +749,16 @@ pub(super) struct Emitted<'a> {
     pub(crate) clusters: &'a [Cluster],
     pub(super) indices: &'a [u32],
     pub(super) positions: &'a [f32],
+    pub(super) normals: &'a [f32],
+    pub(super) classes: &'a [u32],
+    pub(super) uvs: &'a [Uvs],
     pub(super) sources: &'a Sources,
     pub(super) base: &'a [u32],
 }
 
-/// A group simplified and emitted: its triangles, their bounds, and the corners that take
-/// something in place of their vertex, with what ([`lod::opposed_corners`]).
-type Simplified = (Vec<u32>, Bounds, Vec<(usize, lod::Take)>);
+/// A group simplified and emitted: its triangles, their bounds, and what its corners take in
+/// place of their vertex ([`lod::fit`]).
+type Simplified = (Vec<u32>, Bounds, lod::Fit);
 
 /// Builds the DAG of `mesh` at `positions` under `c`, calling `emit` once per group with its
 /// index fixed by emission order, and returns the emitted values in that order.
@@ -765,6 +775,8 @@ pub(super) fn build<G: Send>(
     let Mesh {
         indices,
         normals,
+        classes,
+        uvs,
         weights,
         lock,
         remap,
@@ -781,6 +793,8 @@ pub(super) fn build<G: Send>(
     let mut vx = Vertices {
         positions,
         normals,
+        classes,
+        uvs,
         lock,
         remap: remap.to_vec(),
         sources: Sources {
@@ -829,7 +843,8 @@ pub(super) fn build<G: Send>(
         drop(lock);
         let base = out.len() as i32;
         let positions = Positions(vx.positions.as_mut_ptr(), vx.positions.len());
-        let (normals, remap, sources, bases) = (&vx.normals, &vx.remap, &vx.sources, &vx.base);
+        let (normals, classes, uvs) = (&vx.normals, &vx.classes, &vx.uvs);
+        let (remap, sources, bases) = (&vx.remap, &vx.sources, &vx.base);
         let groups: Vec<(G, Option<Simplified>)> = offsets
             .par_windows(2)
             .map(|w| {
@@ -845,6 +860,7 @@ pub(super) fn build<G: Send>(
                 let target = ((merged.len() / 3) as f32 * c.simplify_ratio) as usize * 3;
                 let mut bounds = bounds_merge(group);
                 let mut error = 0.0f32;
+                let mut sloppy = false;
                 let simplified = simplify(
                     c,
                     weights,
@@ -856,6 +872,7 @@ pub(super) fn build<G: Send>(
                     &locks,
                     target,
                     &mut error,
+                    &mut sloppy,
                 );
                 let emitted = |bounds: Bounds| {
                     let _z = crate::profile::zone!("clod.emit");
@@ -865,6 +882,9 @@ pub(super) fn build<G: Send>(
                         clusters: group,
                         indices: &cluster_indices,
                         positions: positions.read(),
+                        normals,
+                        classes,
+                        uvs,
                         sources,
                         base: bases,
                     })
@@ -888,38 +908,56 @@ pub(super) fn build<G: Send>(
                 } else {
                     FxHashSet::default()
                 };
-                let _z = crate::profile::zone!("clod.opposed");
-                let opposed = lod::opposed_corners(
-                    &simplified,
-                    &merged,
-                    &merged_bases,
-                    |v| moved.contains(&remap[v as usize]),
-                    |v| Vec3::from(positions.get(v as usize)).as_dvec3(),
-                    |v| Vec3::from_slice(&normals[3 * v as usize..]).as_dvec3(),
-                    |v| sections[sources.shading(v) as usize],
-                );
-                (g, Some((simplified, bounds, opposed)))
+                let _z = crate::profile::zone!("clod.fit");
+                let at = |v: u32| Vec3::from(positions.get(v as usize)).as_dvec3();
+                let normal = |v: u32| Vec3::from_slice(&normals[3 * v as usize..]).as_dvec3();
+                let class = |v: u32| classes[v as usize];
+                let uv = |v: u32| uvs[v as usize];
+                let section = |v: u32| sections[sources.shading(v) as usize];
+                let position = |v: u32| remap[v as usize];
+                let locked = |v: u32| locks[v as usize] & LOCK != 0;
+                let moved = |v: u32| moved.contains(&remap[v as usize]);
+                let vertices = lod::FitVertices {
+                    at: &at,
+                    normal: &normal,
+                    class: &class,
+                    uvs: &uv,
+                    section: &section,
+                    position: &position,
+                    locked: &locked,
+                    moved: &moved,
+                };
+                let fit = lod::fit(&simplified, &merged, &merged_bases, sloppy, &vertices);
+                (g, Some((simplified, bounds, fit)))
             })
             .collect();
         let wedges = crate::profile::zone!("clod.wedges");
-        // A wedge per vertex and sources, also where a vertex at the corner's position has the
-        // normal and attributes it takes: unlike that vertex, the wedge stands for the corner's
-        // vertex in simplification.
-        let mut made: FxHashMap<[u32; 3], u32> = FxHashMap::default();
+        // A wedge per group, vertex, attribute source and normal, also where a vertex at the
+        // corner's position has the attributes and normal it takes: unlike that vertex, the
+        // wedge stands for the corner's vertex in simplification.
         let mut next = Vec::new();
         for (gi, (g, simplified)) in groups.into_iter().enumerate() {
             out.push(g);
-            let Some((mut simplified, bounds, opposed)) = simplified else {
+            let Some((mut simplified, bounds, fit)) = simplified else {
                 continue;
             };
-            for (k, take) in opposed {
+            let mut made: FxHashMap<(u32, u32, u32, [u32; 4]), u32> = FxHashMap::default();
+            for (k, take) in fit.corners {
                 let v = simplified[k];
                 simplified[k] = match take {
                     lod::Take::Input(u) => u,
-                    lod::Take::Shade {
-                        normal: n,
-                        attributes: a,
-                    } => *made.entry([v, n, a]).or_insert_with(|| vx.wedge(v, n, a)),
+                    lod::Take::Fit {
+                        attributes,
+                        normal,
+                        uvs,
+                    } => {
+                        let bits = [uvs[0][0], uvs[0][1], uvs[1][0], uvs[1][1]].map(f32::to_bits);
+                        *made
+                            .entry((v, attributes, normal, bits))
+                            .or_insert_with(|| {
+                                vx.wedge(v, attributes, fit.normals[normal as usize], uvs)
+                            })
+                    }
                 };
             }
             next.push((base + gi as i32, simplified, bounds));
@@ -959,6 +997,9 @@ pub(super) fn build<G: Send>(
             clusters: &clusters,
             indices: &cluster_indices,
             positions: &vx.positions,
+            normals: &vx.normals,
+            classes: &vx.classes,
+            uvs: &vx.uvs,
             sources: &vx.sources,
             base: &vx.base,
         }));

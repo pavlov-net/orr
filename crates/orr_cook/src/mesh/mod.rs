@@ -927,37 +927,45 @@ impl Ctx<'_> {
         let n = v.shading.len();
         let mut order = IDENTITY;
         meshopt::optimize_meshlet_level(&mut order[..n], &mut tris, 3);
-        let (mut by_order, mut turning_by_order, mut placing_by_order, mut cells_by_order) = (
-            [0; MAX_CLUSTER_VERTICES],
+        let (mut by_order, mut placing_by_order, mut cells_by_order) = (
             [0; MAX_CLUSTER_VERTICES],
             [0; MAX_CLUSTER_VERTICES],
             [[0; 3]; MAX_CLUSTER_VERTICES],
         );
+        let mut normals_by_order = [[0.0; 3]; MAX_CLUSTER_VERTICES];
+        let mut uvs_by_order = [[[0.0; 2]; 2]; MAX_CLUSTER_VERTICES];
         for (k, &i) in order[..n].iter().enumerate() {
             by_order[k] = v.shading[i as usize];
             cells_by_order[k] = v.cells[i as usize];
-            if !v.turning.is_empty() {
-                turning_by_order[k] = v.turning[i as usize];
-            }
+            normals_by_order[k] = v
+                .normals
+                .get(i as usize)
+                .copied()
+                .unwrap_or(w.normals[by_order[k] as usize]);
+            uvs_by_order[k] = v
+                .uvs
+                .get(i as usize)
+                .copied()
+                .unwrap_or_else(|| lod::uvs_of(w, by_order[k]));
             if !v.placing.is_empty() {
                 placing_by_order[k] = v.placing[i as usize];
             }
         }
-        let turning = &turning_by_order[..v.turning.len()];
+        let (normals, vertex_uvs) = (&normals_by_order[..n], &uvs_by_order[..n]);
         let placing = &placing_by_order[..v.placing.len()];
         let (verts, cells) = (&by_order[..n], &cells_by_order[..n]);
         let sec = &self.sections[usize::from(section)];
         let section_maps = &self.maps[usize::from(section)];
         let mut uv = [ClusterUvs::ZERO; 2];
-        for (r, u) in uv.iter_mut().zip(&w.uvs) {
-            *r = ClusterUvs::new(u, verts);
+        for (set, r) in uv.iter_mut().enumerate().take(w.uvs.len()) {
+            *r = ClusterUvs::new(vertex_uvs.iter().map(|u| u[set]));
         }
         let uv = &uv[..w.uvs.len()];
         // The uvs of set `set` as the page stores them, per cluster vertex.
         let stored = |set: usize| {
             let mut out = [[0.0f32; 2]; MAX_CLUSTER_VERTICES];
-            for (o, &v) in out.iter_mut().zip(verts) {
-                *o = uv[set].stored(w.uvs[set][v as usize]);
+            for (o, u) in out.iter_mut().zip(vertex_uvs) {
+                *o = uv[set].stored(u[set]);
             }
             out
         };
@@ -972,7 +980,7 @@ impl Ctx<'_> {
                 w,
                 self.grid,
                 verts,
-                turning,
+                normals,
                 cells,
                 &mut tris[..3 * usize::from(opaque)],
             )
@@ -982,7 +990,8 @@ impl Ctx<'_> {
         stored_corner_order(&mut tris);
         let ordered = ClusterVertices {
             shading: verts,
-            turning,
+            normals,
+            uvs: vertex_uvs,
             placing,
             cells,
         };
@@ -1000,8 +1009,8 @@ impl Ctx<'_> {
             }
             let mut emission_uvs = [[0.0f32; 2]; MAX_CLUSTER_VERTICES];
             let emission = section_maps.emission.as_ref().map(|e| {
-                for (o, &v) in emission_uvs.iter_mut().zip(verts) {
-                    *o = w.uvs[e.uv_set][v as usize];
+                for (o, u) in emission_uvs.iter_mut().zip(vertex_uvs) {
+                    *o = u[e.uv_set];
                 }
                 (e, &emission_uvs[..n])
             });
@@ -1114,7 +1123,8 @@ fn discrete(cx: &Ctx<'_>, levels: &[lod::LevelGeometry]) -> Result<Built> {
                 let tris = ml.triangles[to..to + tc * 3].to_vec();
                 let v = ClusterVertices {
                     shading: verts,
-                    turning: &[],
+                    normals: &[],
+                    uvs: &[],
                     placing: &[],
                     cells: &cells,
                 };
@@ -1407,13 +1417,13 @@ fn stable_partition(tris: &mut [u8], first: &[bool]) -> u8 {
 
 /// Stable partition of a cluster's triangles: those whose vertex normals all lie within
 /// [`FLAT_NORMAL`] of the face normal first. Returns their count. A corner at `cells` off its
-/// welded grid position, moved by border dilation, has no welded face to compare with. A
-/// vertex takes its normal from its `turning` welded vertex, its own where that is empty.
+/// welded grid position, moved by border dilation, has no welded face to compare with. Vertex
+/// `k`'s normal is `normals[k]`.
 fn partition_flat(
     w: &lod::Welded,
     grid: &Grid,
     verts: &[u32],
-    turning: &[u32],
+    normals: &[[f32; 3]],
     cells: &[[i32; 3]],
     tris: &mut [u8],
 ) -> u8 {
@@ -1428,8 +1438,7 @@ fn partition_flat(
         let v = v as usize;
         welded[k] = cells[k] == grid.cells[v];
         p[k] = Vec3::from(w.positions[v]).as_dvec3();
-        let n = turning.get(k).map_or(v, |&n| n as usize);
-        unit[k] = Vec3::from(w.normals[n]).as_dvec3().normalize_or_zero();
+        unit[k] = Vec3::from(normals[k]).as_dvec3().normalize_or_zero();
     }
     let mut flat = [false; MAX_CLUSTER_CORNERS / 3];
     for (f, t) in flat.iter_mut().zip(tris.as_chunks::<3>().0) {
@@ -1509,13 +1518,11 @@ impl ClusterUvs {
         step: [0.0; 2],
     };
 
-    fn new(uvs: &[[f32; 2]], verts: &[u32]) -> Self {
-        let (lo, hi) = verts
-            .iter()
-            .fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), &v| {
-                let uv = Vec2::from(uvs[v as usize]);
-                (lo.min(uv), hi.max(uv))
-            });
+    fn new(uvs: impl Iterator<Item = [f32; 2]>) -> Self {
+        let (lo, hi) = uvs.fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), uv| {
+            let uv = Vec2::from(uv);
+            (lo.min(uv), hi.max(uv))
+        });
         let axes = [0, 1].map(|a| uv_grid(lo[a], hi[a]));
         Self {
             offset: axes.map(|g| g.0),
@@ -1824,13 +1831,15 @@ impl ClusterData {
     }
 }
 
-/// A cluster's vertices: per vertex the welded vertex that shades it, the one that turns it
-/// by its normal, the one that places it by its skin, and its grid position. `turning` and
-/// `placing` are empty where each vertex's is the one that shades it.
+/// A cluster's vertices: per vertex the welded vertex that shades it, its normal and uvs, the
+/// welded vertex that places it by its skin, and its grid position. `normals` and `uvs` are
+/// empty where each vertex's are its shading vertex's, and `placing` where each vertex's is the
+/// one that shades it.
 #[derive(Copy, Clone)]
 struct ClusterVertices<'a> {
     shading: &'a [u32],
-    turning: &'a [u32],
+    normals: &'a [[f32; 3]],
+    uvs: &'a [dag::Uvs],
     placing: &'a [u32],
     cells: &'a [[i32; 3]],
 }
@@ -1869,17 +1878,18 @@ fn build_cluster(
     let mut attrs = Vec::with_capacity(verts.len() * 3);
     for (k, &shading) in verts.iter().enumerate() {
         let v = shading as usize;
-        let n = vertices.turning.get(k).copied().unwrap_or(shading) as usize;
         attrs.push(oct_encode(
-            Vec3::from(w.normals[n]).normalize_or(Vec3::Z).to_array(),
+            Vec3::from(vertices.normals[k])
+                .normalize_or(Vec3::Z)
+                .to_array(),
         ));
         if let Some(t) = &w.tangents {
             let [x, y, z, s] = t[v];
             let t = Vec3::new(x, y, z).normalize_or(Vec3::X).to_array();
             attrs.push(oct_encode_tangent(t, s));
         }
-        for (u, r) in w.uvs.iter().zip(uv) {
-            let q = r.quantize(u[v]);
+        for (set, r) in uv.iter().enumerate() {
+            let q = r.quantize(vertices.uvs[k][set]);
             attrs.push(q[0] | q[1] << 16);
         }
         if let Some(c) = &w.colors {

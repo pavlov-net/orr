@@ -10,6 +10,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::par::prelude::*;
 
+use super::dag::Uvs;
 use super::maps::Displacement;
 use super::{Grid, MeshData, MeshSettings, Pivots, Skin};
 
@@ -17,6 +18,9 @@ use super::{Grid, MeshData, MeshSettings, Pivots, Skin};
 pub(super) struct Welded {
     pub(super) positions: Vec<[f32; 3]>,
     pub(super) normals: Vec<[f32; 3]>,
+    /// Per vertex, the smoothing class of its normal: vertices at one position whose normals
+    /// are one class shade alike ([`normal_class`]).
+    pub(super) classes: Vec<u32>,
     pub(super) tangents: Option<Vec<[f32; 4]>>,
     /// Per uv set, a uv per vertex.
     pub(super) uvs: Vec<Vec<[f32; 2]>>,
@@ -69,9 +73,11 @@ impl Welded {
         }
         let (count, remap) = meshopt::generate_vertex_remap_multi(n, &streams, Some(&m.indices));
         let remap_all = |v: &[[f32; 3]]| meshopt::remap_vertex_buffer(v, count, &remap);
+        let normals = remap_all(&m.normals);
         Self {
             positions: remap_all(&m.positions),
-            normals: remap_all(&m.normals),
+            classes: normals.iter().map(|&n| normal_class(n)).collect(),
+            normals,
             tangents: stored.map(|t| meshopt::remap_vertex_buffer(t, count, &remap)),
             uvs: m
                 .uvs
@@ -116,9 +122,9 @@ impl Welded {
     }
 
     /// Adds a vertex placed as `at` is, by its position, moves, skin, part value and pivot,
-    /// with the normal of `normal` and the tangent, uvs and colors of `from`; returns it. It
-    /// stands for the vertex `at` does.
-    pub(super) fn wedge(&mut self, at: u32, normal: u32, from: u32) -> u32 {
+    /// with normal `normal` and the tangent, uvs, colors and normal class of `from`; returns
+    /// it. It stands for the vertex `at` does.
+    pub(super) fn wedge(&mut self, at: u32, from: u32, normal: [f32; 3]) -> u32 {
         fn copy<T: Copy>(v: &mut Vec<T>, i: u32) {
             v.push(v[i as usize]);
         }
@@ -132,7 +138,8 @@ impl Welded {
         }
         self.values.iter_mut().for_each(|v| copy(v, at));
         self.pivots.iter_mut().for_each(|p| copy(p, at));
-        copy(&mut self.normals, normal);
+        self.normals.push(normal);
+        copy(&mut self.classes, from);
         self.tangents.iter_mut().for_each(|t| copy(t, from));
         self.uvs.iter_mut().for_each(|u| copy(u, from));
         self.colors.iter_mut().for_each(|c| copy(c, from));
@@ -140,32 +147,388 @@ impl Welded {
     }
 }
 
-/// What a corner of a simplified triangle takes in place of its vertex ([`opposed_corners`]).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// What a corner of a simplified triangle takes in place of its vertex ([`fit`]).
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub(super) enum Take {
     /// The vertex the input holds at the corner.
     Input(u32),
-    /// The normal of `normal` and the tangent, uvs and colors of `attributes`, which may be
-    /// the corner's own vertex.
-    Shade { normal: u32, attributes: u32 },
+    /// The tangent, colors and normal class of `attributes`, the normal of [`Fit::normals`] at
+    /// `normal`, and `uvs`.
+    Fit {
+        attributes: u32,
+        normal: u32,
+        uvs: Uvs,
+    },
 }
 
-/// The vertices a triangle list stands for, for searches by position, and the patch each lies
-/// in: the vertices the list's triangles join, across which their attributes run on. A corner
-/// held by a vertex standing for another joins no patch: its attributes can come from a patch
-/// other than its base's, and joining its base there would join unrelated parts of a texture.
-struct Near {
-    /// The vertices by their coordinate on the axis their box is longest on, so a search stops
-    /// once that coordinate alone is farther than the nearest found: a piece can hold a whole
-    /// section.
-    axis: usize,
-    sorted: Vec<(f64, u32)>,
+/// Vertex `v` of a simplification: at `at(v)` with normal `normal(v)` of class `class(v)`
+/// ([`Welded::classes`]) in section `section(v)`, at the position `position(v)` names, which
+/// every vertex there shares. `locked(v)` when the simplifier leaves it where it is for other
+/// pieces to share, and `moved(v)` when it moved after the simplifier ran.
+pub(super) struct FitVertices<'a> {
+    pub(super) at: &'a dyn Fn(u32) -> DVec3,
+    pub(super) normal: &'a dyn Fn(u32) -> DVec3,
+    pub(super) class: &'a dyn Fn(u32) -> u32,
+    pub(super) uvs: &'a dyn Fn(u32) -> Uvs,
+    pub(super) section: &'a dyn Fn(u32) -> u16,
+    pub(super) position: &'a dyn Fn(u32) -> u32,
+    pub(super) locked: &'a dyn Fn(u32) -> bool,
+    pub(super) moved: &'a dyn Fn(u32) -> bool,
+}
+
+/// What [`fit`] gives a simplified mesh's corners.
+#[derive(Default)]
+pub(super) struct Fit {
+    /// The corners that take something in place of their vertex, by their index in the
+    /// simplified triangles.
+    pub(super) corners: Vec<(usize, Take)>,
+    /// Unit normals.
+    pub(super) normals: Vec<[f32; 3]>,
+}
+
+/// What the corners of the triangles `simplified` take in place of their vertex. `simplified`
+/// comes from `input` with each vertex replaced by the one it stands for, `bases` per corner
+/// of `input`: a vertex added for an earlier corner takes no part in simplification, so it
+/// constrains no collapse. A triangle `input` holds as it is, by the vertices they stand for
+/// and with no vertex moved, keeps the corners the input gives it.
+///
+/// Another triangle stands for the surface it replaces, which its vertices may not: the
+/// `sloppy` simplifier joins vertices without regard to their attributes, across the two sides
+/// of a thin sheet and across uv charts, and a vertex keeps the normal it has at its own point
+/// though its triangles now cover all that surface. Where the attribute-aware simplifier made
+/// `simplified`, a triangle whose corners face its face from vertices of one patch keeps them,
+/// and so does such a corner of another triangle. Each sample of the triangle, at the
+/// centroids of a regular subdivision into parts of about half the area of the triangle a
+/// point of `input` lies in, takes the nearest point of `input` in the triangle's section
+/// whose normal faces the triangle's side, and its normal; where there is none, the nearest
+/// point of the section, and the triangle's own face for its normal.
+///
+/// The triangle's corners take their uvs, tangent, colors and normal class from the patch of
+/// `input` most of its samples land on, the triangles joined by shared vertices, across which
+/// attributes run on, so its uvs keep to one chart. A corner whose vertex lies on the patch
+/// keeps its vertex's. Another takes the uvs the patch's parametrization gives its position,
+/// carried on from the patch triangle nearest it ([`SurfaceTriangle::unfold`]), so the
+/// triangle's uvs are as dense as the surface's: a nearby vertex's uvs would pinch them to a
+/// sliver, whose footprint asks for texels far finer than the surface's. It takes the other
+/// attributes of that triangle's corner nearest it, which on a seam is the vertex the patch
+/// has there. A corner takes whole a vertex of `input` on the patch whose normal faces its
+/// face where a kept triangle holds that vertex at the corner, so the vertex does not split,
+/// and where the corner is locked and the vertex is the one it takes at its position, so the
+/// pieces that share the position agree.
+///
+/// Each other corner's normal is the least squares fit of the samples' normals over the
+/// corner's triangles, with each vertex's mass lumped: a weighted mean, so it stays among the
+/// normals it fits. Corners at one position that take their attributes from one class at one
+/// position share the fit, so the input's creases stay and its uv seams take one normal; a
+/// corner whose face the shared normal does not face takes one of its own, so no corner's
+/// normal opposes its face.
+pub(super) fn fit(
+    simplified: &[u32],
+    input: &[u32],
+    bases: &[u32],
+    sloppy: bool,
+    vx: &FitVertices<'_>,
+) -> Fit {
+    assert_eq!(bases.len(), input.len(), "a base per input corner");
+    // The corner a triangle starts at so that it starts at its least vertex, which keeps its
+    // winding.
+    let first = |t: &[u32; 3]| (0..3).min_by_key(|&k| t[k]).expect("three corners");
+    let rotated = |t: &[u32; 3], k: usize| [t[k], t[(k + 1) % 3], t[(k + 2) % 3]];
+    // The input's triangles by the vertices they stand for, each in the order that starts at
+    // the least of those.
+    let mut kept: FxHashMap<[u32; 3], [u32; 3]> = FxHashMap::default();
+    for (b, i) in bases
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(input.as_chunks::<3>().0)
+    {
+        let k = first(b);
+        kept.entry(rotated(b, k)).or_insert_with(|| rotated(i, k));
+    }
+    let tris = simplified.as_chunks::<3>().0;
+    let held = |tri: &[u32; 3]| {
+        let k0 = first(tri);
+        let held = kept.get(&rotated(tri, k0))?;
+        (!tri.iter().any(|&v| (vx.moved)(v))).then(|| [0, 1, 2].map(|k| held[(k + 3 - k0) % 3]))
+    };
+    // Per vertex, the input vertices the kept triangles hold there.
+    let mut holds: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut out = Fit::default();
+    for (t, tri) in tris.iter().enumerate() {
+        let Some(held) = held(tri) else {
+            continue;
+        };
+        for (k, (&v, u)) in tri.iter().zip(held).enumerate() {
+            if u != v {
+                out.corners.push((3 * t + k, Take::Input(u)));
+            }
+            let h = holds.entry(v).or_default();
+            if !h.contains(&u) {
+                h.push(u);
+            }
+        }
+    }
+    // The area the fitted triangles cover.
+    let fitted: f64 = tris
+        .iter()
+        .filter(|t| held(t).is_none())
+        .map(|t| {
+            let p = t.map(|v| (vx.at)(v));
+            0.5 * (p[1] - p[0]).cross(p[2] - p[0]).length()
+        })
+        .sum();
+    let mut surface: Option<Surface> = None;
+    // Per fitted corner: its index, its face, its normal sum, the vertex whose other attributes
+    // it takes and its uvs.
+    let mut sums: Vec<(usize, DVec3, DVec3, u32, Uvs)> = Vec::new();
+    for (t, tri) in tris.iter().enumerate() {
+        if held(tri).is_some() {
+            continue;
+        }
+        let surface = surface.get_or_insert_with(|| Surface::new(input, vx));
+        let p = tri.map(|v| (vx.at)(v));
+        let cross = (p[1] - p[0]).cross(p[2] - p[0]);
+        let twice = cross.length();
+        // A triangle with no area has no side and no samples.
+        if twice == 0.0 {
+            continue;
+        }
+        let face = cross / twice;
+        let faces = |u: u32| (vx.normal)(u).normalize_or_zero().dot(face) > 0.0;
+        // Where the attribute-aware simplifier made the triangle, a corner that faces its face
+        // on its triangle's patch keeps its vertex, whose normal the simplifier weighed; the
+        // sloppy simplifier weighs none.
+        let keeps =
+            |v: u32, patch: u32| !sloppy && surface.patch.get(&v) == Some(&patch) && faces(v);
+        if let Some(&patch) = surface.patch.get(&tri[0])
+            && tri.iter().all(|&v| keeps(v, patch))
+        {
+            continue;
+        }
+        let section = (vx.section)(tri[0]);
+        let in_section = |s: &SurfaceTriangle| s.section == section;
+        // Subdivisions per edge, so each part holds about half an input triangle, but for
+        // fitted triangles far larger than the input, as the sloppy simplifier spans the gaps
+        // between leaves with, no more parts than four per input triangle: the input holds no
+        // more normals to sample.
+        let part = (0.5 * surface.area).max(fitted / (4 * surface.tris.len()) as f64);
+        let s = if part > 0.0 {
+            (0.5 * twice / part).sqrt().ceil().max(1.0)
+        } else {
+            1.0
+        };
+        let weight = 0.5 * twice / (s * s);
+        let mut sum = [DVec3::ZERO; 3];
+        // Per patch the samples land on, their weight.
+        let mut votes: Vec<(u32, f64)> = Vec::new();
+        let mut sample = |a: f64, b: f64| {
+            let l = [1.0 - a - b, a, b];
+            let q = p[0] * l[0] + p[1] * l[1] + p[2] * l[2];
+            // Where no point faces the triangle's side, as on a triangle the sloppy simplifier
+            // turns over, the triangle's own face is the only way it has to face.
+            let (st, n) = match surface.nearest(q, Some(face), in_section) {
+                Some((st, _, n, _)) => (Some(st), n),
+                None => (surface.nearest(q, None, in_section).map(|h| h.0), face),
+            };
+            for k in 0..3 {
+                sum[k] += n * (l[k] * weight);
+            }
+            if let Some(st) = st {
+                let patch = surface.tris[st].patch;
+                match votes.iter_mut().find(|v| v.0 == patch) {
+                    Some(v) => v.1 += weight,
+                    None => votes.push((patch, weight)),
+                }
+            }
+        };
+        let n = s as u32;
+        for i in 0..n {
+            for j in 0..n - i {
+                sample(
+                    (f64::from(i) + 1.0 / 3.0) / s,
+                    (f64::from(j) + 1.0 / 3.0) / s,
+                );
+                if i + j + 1 < n {
+                    sample(
+                        (f64::from(i) + 2.0 / 3.0) / s,
+                        (f64::from(j) + 2.0 / 3.0) / s,
+                    );
+                }
+            }
+        }
+        // The section holds no triangle with area: the corners keep their vertices.
+        let Some(&(patch, _)) = votes
+            .iter()
+            .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)))
+        else {
+            continue;
+        };
+        for (k, &v) in tri.iter().enumerate() {
+            if keeps(v, patch) {
+                continue;
+            }
+            // The vertex a kept triangle holds here on the patch, which a fitted vertex would
+            // split from.
+            let kept = holds.get(&v).and_then(|h| {
+                h.iter()
+                    .copied()
+                    .find(|&u| surface.patch.get(&u) == Some(&patch) && faces(u))
+            });
+            if let Some(u) = kept {
+                if u != v {
+                    out.corners.push((3 * t + k, Take::Input(u)));
+                }
+                continue;
+            }
+            let (u, uvs) = if surface.patch.get(&v) == Some(&patch) {
+                (v, (vx.uvs)(v))
+            } else {
+                let (st, l, ..) = surface
+                    .nearest(p[k], None, |s| s.patch == patch)
+                    .expect("the patch holds a triangle");
+                let s = &surface.tris[st];
+                (s.v[corner_of(l)], s.extend(s.unfold(p[k], l), vx))
+            };
+            if (vx.locked)(v) && (vx.position)(u) == (vx.position)(v) && faces(u) {
+                if u != v {
+                    out.corners.push((3 * t + k, Take::Input(u)));
+                }
+                continue;
+            }
+            sums.push((3 * t + k, face, sum[k], u, uvs));
+        }
+    }
+    // Corners by the normal they share, in the order they first come.
+    let mut index: FxHashMap<(u32, u32, u32), usize> = FxHashMap::default();
+    let mut shares: Vec<Vec<usize>> = Vec::new();
+    for (i, &(c, _, _, u, _)) in sums.iter().enumerate() {
+        let key = (
+            (vx.position)(simplified[c]),
+            (vx.position)(u),
+            (vx.class)(u),
+        );
+        let g = *index.entry(key).or_insert_with(|| {
+            shares.push(Vec::new());
+            shares.len() - 1
+        });
+        shares[g].push(i);
+    }
+    for members in shares {
+        let mut pending = vec![members];
+        while let Some(m) = pending.pop() {
+            let n: DVec3 = m.iter().map(|&i| sums[i].2).sum();
+            let (keep, off): (Vec<usize>, Vec<usize>) =
+                m.into_iter().partition(|&i| n.dot(sums[i].1) > 0.0);
+            let mut emit = |members: &[usize], n: DVec3| {
+                let normal = out.normals.len() as u32;
+                out.normals.push(n.normalize().as_vec3().to_array());
+                out.corners.extend(members.iter().map(|&i| {
+                    let (attributes, uvs) = (sums[i].3, sums[i].4);
+                    let take = Take::Fit {
+                        attributes,
+                        normal,
+                        uvs,
+                    };
+                    (sums[i].0, take)
+                }));
+            };
+            match (keep.is_empty(), off.as_slice()) {
+                (_, []) => emit(&keep, n),
+                // A corner's own sum faces its face but where its samples' normals lie within
+                // rounding of the face's plane, which leaves it the face.
+                (true, &[i]) => emit(&[i], sums[i].1),
+                (true, _) => pending.extend(off.into_iter().map(|i| vec![i])),
+                (false, _) => {
+                    pending.push(keep);
+                    pending.push(off);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A simplification's input triangles, for nearest point queries, with the patch each lies
+/// in: the triangles its vertices join, across which their attributes run on.
+struct Surface {
+    tris: Vec<SurfaceTriangle>,
+    /// A bounding volume hierarchy: an inner node's children are the next node and the node
+    /// `first` names; a leaf holds `count` triangles from `first`.
+    nodes: Vec<SurfaceNode>,
+    /// The area of the triangle a point of the surface lies in, on the mean: the triangles'
+    /// areas weighted by area, which small triangles holding little of the surface leave be.
+    area: f64,
+    /// Per vertex, its patch.
     patch: FxHashMap<u32, u32>,
 }
 
-impl Near {
-    /// Over the triangles `input`, whose corners stand for those of `bases`.
-    fn new(input: &[u32], bases: &[u32], at: impl Fn(u32) -> DVec3) -> Self {
+struct SurfaceTriangle {
+    p: [DVec3; 3],
+    /// Unit vertex normals.
+    n: [DVec3; 3],
+    v: [u32; 3],
+    section: u16,
+    patch: u32,
+}
+
+struct SurfaceNode {
+    lo: DVec3,
+    hi: DVec3,
+    /// A cone holding the node's vertex normals, and so every normal between them: its axis
+    /// and half angle.
+    axis: DVec3,
+    spread: f64,
+    first: u32,
+    /// 0 for an inner node.
+    count: u32,
+}
+
+impl SurfaceTriangle {
+    /// Where the parametrization takes `q`, whose nearest point of the triangle is at
+    /// barycentrics `l`: above the triangle, that point; past an edge or corner, the point as
+    /// far past it in the triangle's plane as `q` is from it, so a coarse triangle laid past the
+    /// patch keeps its length in uv.
+    fn unfold(&self, q: DVec3, l: [f64; 3]) -> DVec3 {
+        let x = self.p[0] * l[0] + self.p[1] * l[1] + self.p[2] * l[2];
+        if l.iter().all(|&l| l > 0.0) {
+            return x;
+        }
+        let n = (self.p[1] - self.p[0])
+            .cross(self.p[2] - self.p[0])
+            .normalize();
+        let d = q - x;
+        let along = d - n * d.dot(n);
+        let length = along.length();
+        if length == 0.0 {
+            return x;
+        }
+        x + along * (d.length() / length)
+    }
+
+    /// The uvs of the triangle's parametrization, the affine map its corners' uvs make, at the
+    /// point of its plane nearest `q`.
+    fn extend(&self, q: DVec3, vx: &FitVertices<'_>) -> Uvs {
+        let [a, b, c] = self.p;
+        let (e0, e1, e2) = (b - a, c - a, q - a);
+        let (d00, d01, d11) = (e0.dot(e0), e0.dot(e1), e1.dot(e1));
+        let (d20, d21) = (e2.dot(e0), e2.dot(e1));
+        let det = d00 * d11 - d01 * d01;
+        let lb = (d11 * d20 - d01 * d21) / det;
+        let lc = (d00 * d21 - d01 * d20) / det;
+        let l = [1.0 - lb - lc, lb, lc];
+        let uvs = self.v.map(|v| (vx.uvs)(v));
+        std::array::from_fn(|set| {
+            std::array::from_fn(|axis| {
+                let x: f64 = (0..3).map(|k| l[k] * f64::from(uvs[k][set][axis])).sum();
+                x as f32
+            })
+        })
+    }
+}
+
+impl Surface {
+    fn new(input: &[u32], vx: &FitVertices<'_>) -> Self {
         fn root(parent: &mut [u32], mut i: u32) -> u32 {
             while parent[i as usize] != i {
                 let up = parent[parent[i as usize] as usize];
@@ -174,194 +537,225 @@ impl Near {
             }
             i
         }
-        let mut c = bases.to_vec();
-        c.sort_unstable();
-        c.dedup();
-        let dense = |v: u32| c.binary_search(&v).expect("a vertex of the triangles") as u32;
-        let mut parent: Vec<u32> = (0..c.len() as u32).collect();
-        for (b, i) in bases
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .zip(input.as_chunks::<3>().0)
-        {
-            let mut own = (0..3).filter(|&k| b[k] == i[k]).map(|k| dense(b[k]));
-            let Some(first) = own.next() else {
-                continue;
-            };
-            let r = root(&mut parent, first);
-            for v in own {
-                let s = root(&mut parent, v);
+        let mut vertices = input.to_vec();
+        vertices.sort_unstable();
+        vertices.dedup();
+        let dense = |v: u32| vertices.binary_search(&v).expect("an input vertex") as u32;
+        let mut parent: Vec<u32> = (0..vertices.len() as u32).collect();
+        for t in input.as_chunks::<3>().0 {
+            let r = root(&mut parent, dense(t[0]));
+            for &v in &t[1..] {
+                let s = root(&mut parent, dense(v));
                 parent[s as usize] = r;
             }
         }
-        let patch = (0..c.len() as u32)
-            .map(|i| (c[i as usize], root(&mut parent, i)))
+        let patch: FxHashMap<u32, u32> = (0..vertices.len() as u32)
+            .map(|i| (vertices[i as usize], root(&mut parent, i)))
             .collect();
-        let (lo, hi) = c
+        let mut tris: Vec<SurfaceTriangle> = input
+            .as_chunks::<3>()
+            .0
             .iter()
-            .fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(lo, hi), &u| {
-                (lo.min(at(u)), hi.max(at(u)))
-            });
-        let size = hi - lo;
-        let axis = (0..3)
-            .max_by(|&a, &b| size[a].total_cmp(&size[b]))
-            .expect("three axes");
-        let mut sorted: Vec<(f64, u32)> = c.into_iter().map(|u| (at(u)[axis], u)).collect();
-        sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            .map(|t| SurfaceTriangle {
+                p: t.map(|v| (vx.at)(v)),
+                n: t.map(|v| (vx.normal)(v).normalize_or_zero()),
+                v: *t,
+                section: (vx.section)(t[0]),
+                patch: patch[&t[0]],
+            })
+            // A triangle with no area holds no point its neighbors do not, and has no side.
+            .filter(|t| (t.p[1] - t.p[0]).cross(t.p[2] - t.p[0]) != DVec3::ZERO)
+            .collect();
+        let (sum, squares) = tris.iter().fold((0.0, 0.0), |(s, q), t| {
+            let a = 0.5 * (t.p[1] - t.p[0]).cross(t.p[2] - t.p[0]).length();
+            (s + a, q + a * a)
+        });
+        let mut nodes = Vec::with_capacity(tris.len() / 2);
+        if !tris.is_empty() {
+            Self::build(&mut tris, 0, &mut nodes);
+        }
         Self {
-            axis,
-            sorted,
+            tris,
+            nodes,
+            area: squares / sum,
             patch,
         }
     }
 
-    fn patch(&self, v: u32) -> u32 {
-        self.patch[&v]
+    fn build(tris: &mut [SurfaceTriangle], first: u32, nodes: &mut Vec<SurfaceNode>) {
+        let (mut lo, mut hi) = (DVec3::INFINITY, DVec3::NEG_INFINITY);
+        let (mut clo, mut chi) = (DVec3::INFINITY, DVec3::NEG_INFINITY);
+        let mut sum = DVec3::ZERO;
+        for t in tris.iter() {
+            for p in t.p {
+                (lo, hi) = (lo.min(p), hi.max(p));
+            }
+            let c = t.p[0] + t.p[1] + t.p[2];
+            (clo, chi) = (clo.min(c), chi.max(c));
+            sum += t.n[0] + t.n[1] + t.n[2];
+        }
+        let axis = sum.normalize_or_zero();
+        let spread = if axis == DVec3::ZERO {
+            std::f64::consts::PI
+        } else {
+            tris.iter()
+                .flat_map(|t| t.n)
+                .map(|n| axis.dot(n).clamp(-1.0, 1.0).acos())
+                .fold(0.0, f64::max)
+        };
+        let at = nodes.len();
+        nodes.push(SurfaceNode {
+            lo,
+            hi,
+            axis,
+            spread,
+            first,
+            count: tris.len() as u32,
+        });
+        if tris.len() <= 4 {
+            return;
+        }
+        let size = chi - clo;
+        let axis = (0..3)
+            .max_by(|&a, &b| size[a].total_cmp(&size[b]))
+            .expect("three axes");
+        let centroid = |t: &SurfaceTriangle| t.p[0][axis] + t.p[1][axis] + t.p[2][axis];
+        let mid = tris.len() / 2;
+        tris.select_nth_unstable_by(mid, |a, b| centroid(a).total_cmp(&centroid(b)));
+        let (left, right) = tris.split_at_mut(mid);
+        nodes[at].count = 0;
+        Self::build(left, first, nodes);
+        nodes[at].first = nodes.len() as u32;
+        Self::build(right, first + mid as u32, nodes);
     }
 
-    /// The vertex `take` accepts nearest `p`, the least of those as near, when there is one.
+    /// The nearest point to `q` of a triangle `accept` takes, and with `face`, whose
+    /// interpolated normal there faces `face`'s side, of those as near the one whose normal is
+    /// nearest `face`: the triangle, the point's barycentrics, the unit normal there and the
+    /// squared distance.
     fn nearest(
         &self,
-        p: DVec3,
-        at: impl Fn(u32) -> DVec3,
-        take: impl Fn(u32) -> bool,
-    ) -> Option<u32> {
-        let x = p[self.axis];
-        let mut nearest: Option<(f64, u32)> = None;
-        // Whether `u`, at `c` on the axis, and every vertex past it are farther than the
-        // nearest; else takes `u` if it is nearer.
-        let mut past = |c: f64, u: u32| {
-            if nearest.is_some_and(|(d, _)| (c - x) * (c - x) > d) {
-                return true;
+        q: DVec3,
+        face: Option<DVec3>,
+        accept: impl Fn(&SurfaceTriangle) -> bool,
+    ) -> Option<(usize, [f64; 3], DVec3, f64)> {
+        type Best = Option<(f64, f64, usize, [f64; 3], DVec3)>;
+        let mut best: Best = None;
+        if self.nodes.is_empty() {
+            return None;
+        }
+        let past = |d: f64, best: &Best| best.is_some_and(|b| d > b.0);
+        let gap = |node: &SurfaceNode| {
+            let d = (node.lo - q).max(q - node.hi).max(DVec3::ZERO);
+            d.length_squared()
+        };
+        // Whether no normal of the node's cone faces `face`'s side.
+        let away = |node: &SurfaceNode| {
+            face.is_some_and(|f| {
+                let apart = node.axis.dot(f).clamp(-1.0, 1.0).acos();
+                apart - node.spread >= std::f64::consts::FRAC_PI_2
+            })
+        };
+        // Nodes to visit with their gap, the nearer child last.
+        let mut stack = vec![(0usize, gap(&self.nodes[0]))];
+        while let Some((i, g)) = stack.pop() {
+            let node = &self.nodes[i];
+            if past(g, &best) || away(node) {
+                continue;
             }
-            if take(u) {
-                let d = at(u).distance_squared(p);
-                if nearest.is_none_or(|(e, w)| d < e || (d == e && u < w)) {
-                    nearest = Some((d, u));
+            if node.count == 0 {
+                let (a, b) = (i + 1, node.first as usize);
+                let (ga, gb) = (gap(&self.nodes[a]), gap(&self.nodes[b]));
+                if ga <= gb {
+                    stack.extend([(b, gb), (a, ga)]);
+                } else {
+                    stack.extend([(a, ga), (b, gb)]);
+                }
+                continue;
+            }
+            let first = node.first as usize;
+            for (t, tri) in self.tris[first..first + node.count as usize]
+                .iter()
+                .enumerate()
+            {
+                if !accept(tri) {
+                    continue;
+                }
+                let l = closest_on_triangle(q, tri.p);
+                let x = tri.p[0] * l[0] + tri.p[1] * l[1] + tri.p[2] * l[2];
+                let d = x.distance_squared(q);
+                if past(d, &best) {
+                    continue;
+                }
+                let n = (tri.n[0] * l[0] + tri.n[1] * l[1] + tri.n[2] * l[2]).normalize_or_zero();
+                let dot = face.map_or(0.0, |f| n.dot(f));
+                if face.is_some() && dot <= 0.0 {
+                    continue;
+                }
+                if best.is_none_or(|b| d < b.0 || dot > b.1) {
+                    best = Some((d, dot, first + t, l, n));
                 }
             }
-            false
-        };
-        let mid = self.sorted.partition_point(|&(c, _)| c < x);
-        for &(c, u) in &self.sorted[mid..] {
-            if past(c, u) {
-                break;
-            }
         }
-        for &(c, u) in self.sorted[..mid].iter().rev() {
-            if past(c, u) {
-                break;
-            }
-        }
-        nearest.map(|(_, u)| u)
+        best.map(|(d, _, t, l, n)| (t, l, n, d))
     }
 }
 
-/// The corners of the triangles `simplified` that take something in place of their vertex,
-/// with what each takes. `simplified` comes from `input` with each vertex replaced by the one
-/// it stands for, `bases` per corner of `input`: a vertex added for an earlier corner takes no
-/// part in simplification, so it constrains no collapse.
-///
-/// A triangle `input` holds as it is, by the vertices they stand for and with no vertex
-/// `moved`, keeps the corners the input gives it. Elsewhere, a corner takes something when its
-/// vertex normal opposes its face. Simplification joins vertices across thin features, where
-/// one coarse vertex can stand for both sides of a sheet while it carries one side's normal,
-/// and it can fold a curved surface past its normals. Such a corner takes the normal of the
-/// vertex in its vertex's section nearest it whose normal faces the triangle's way, when there
-/// is one. Its uvs, tangent and colors continue those of the surface the triangle stands on,
-/// or its uvs would span unrelated parts of a texture: the patches of the input, the vertices
-/// its triangles join, that hold the triangle's corners whose normal faces its way, or all its
-/// corners where none does. A corner whose vertex lies on that surface keeps its vertex's;
-/// another takes those of the vertex on it nearest it.
-/// Vertex `v` is at `at(v)` with normal `normal(v)` in section `section(v)`.
-pub(super) fn opposed_corners(
-    simplified: &[u32],
-    input: &[u32],
-    bases: &[u32],
-    moved: impl Fn(u32) -> bool,
-    at: impl Fn(u32) -> DVec3,
-    normal: impl Fn(u32) -> DVec3,
-    section: impl Fn(u32) -> u16,
-) -> Vec<(usize, Take)> {
-    assert_eq!(bases.len(), input.len(), "a base per input corner");
-    // The corner a triangle starts at so that it starts at its least vertex, which keeps its
-    // winding.
-    let first = |t: &[u32; 3]| (0..3).min_by_key(|&k| t[k]).expect("three corners");
-    let rotated = |t: &[u32; 3], k: usize| [t[k], t[(k + 1) % 3], t[(k + 2) % 3]];
-    // Whether some input corner is held by a vertex standing for another, which a triangle
-    // kept as it is keeps even where its corners face its way.
-    let stand_ins = bases != input;
-    // The input's triangles by the vertices they stand for, each in the order that starts at
-    // the least of those.
-    let mut kept: Option<FxHashMap<[u32; 3], [u32; 3]>> = None;
-    let mut near: Option<Near> = None;
-    let mut out = Vec::new();
-    for (t, tri) in simplified.as_chunks::<3>().0.iter().enumerate() {
-        let p = tri.map(&at);
-        let face = (p[1] - p[0]).cross(p[2] - p[0]);
-        let faces = tri.map(|v| normal(v).dot(face) >= 0.0);
-        if faces == [true; 3] && !stand_ins {
-            continue;
-        }
-        let kept = kept.get_or_insert_with(|| {
-            let mut kept = FxHashMap::default();
-            for (b, i) in bases
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .zip(input.as_chunks::<3>().0)
-            {
-                let k = first(b);
-                kept.entry(rotated(b, k)).or_insert_with(|| rotated(i, k));
-            }
-            kept
-        });
-        let k0 = first(tri);
-        if let Some(held) = kept.get(&rotated(tri, k0))
-            && !tri.iter().any(|&v| moved(v))
-        {
-            for (k, &v) in tri.iter().enumerate() {
-                let u = held[(k + 3 - k0) % 3];
-                if u != v {
-                    out.push((3 * t + k, Take::Input(u)));
-                }
-            }
-            continue;
-        }
-        if faces == [true; 3] {
-            continue;
-        }
-        let near = near.get_or_insert_with(|| Near::new(input, bases, &at));
-        let stands = if faces == [false; 3] {
-            [true; 3]
-        } else {
-            faces
-        };
-        let surface: Vec<u32> = (0..3)
-            .filter(|&k| stands[k])
-            .map(|k| near.patch(tri[k]))
-            .collect();
-        for (k, &v) in tri.iter().enumerate() {
-            if faces[k] {
-                continue;
-            }
-            let s = section(v);
-            let normal = near
-                .nearest(p[k], &at, |u| section(u) == s && normal(u).dot(face) > 0.0)
-                .unwrap_or(v);
-            let attributes = if surface.contains(&near.patch(v)) {
-                v
-            } else {
-                near.nearest(p[k], &at, |u| surface.contains(&near.patch(u)))
-                    .expect("the triangle's corners lie on its surface")
-            };
-            if (normal, attributes) != (v, v) {
-                out.push((3 * t + k, Take::Shade { normal, attributes }));
-            }
-        }
+/// The corner of a triangle nearest the point at barycentrics `l`.
+fn corner_of(l: [f64; 3]) -> usize {
+    (0..3)
+        .max_by(|&a, &b| l[a].total_cmp(&l[b]))
+        .expect("three corners")
+}
+
+/// Welded vertex `v`'s uvs, in each set the mesh has.
+pub(super) fn uvs_of(w: &Welded, v: u32) -> Uvs {
+    let v = v as usize;
+    [w.uvs[0][v], w.uvs.get(1).map_or([0.0; 2], |u| u[v])]
+}
+
+/// The smoothing class of a source normal: the normal a cluster stores for it, so normals
+/// that store alike are one. A fitted normal keeps the class of the vertex it is shaded as.
+pub(super) fn normal_class(n: [f32; 3]) -> u32 {
+    orr_pack::mesh::oct_encode(Vec3::from(n).normalize_or(Vec3::Z).to_array())
+}
+
+/// Barycentrics of the point of triangle `p` nearest `q` (Ericson, Real-Time Collision
+/// Detection, 5.1.5).
+fn closest_on_triangle(q: DVec3, p: [DVec3; 3]) -> [f64; 3] {
+    let [a, b, c] = p;
+    let (ab, ac, aq) = (b - a, c - a, q - a);
+    let (d1, d2) = (ab.dot(aq), ac.dot(aq));
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return [1.0, 0.0, 0.0];
     }
-    out
+    let bq = q - b;
+    let (d3, d4) = (ab.dot(bq), ac.dot(bq));
+    if d3 >= 0.0 && d4 <= d3 {
+        return [0.0, 1.0, 0.0];
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return [1.0 - v, v, 0.0];
+    }
+    let cq = q - c;
+    let (d5, d6) = (ab.dot(cq), ac.dot(cq));
+    if d6 >= 0.0 && d5 <= d6 {
+        return [0.0, 0.0, 1.0];
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return [1.0 - w, 0.0, w];
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && d4 - d3 >= 0.0 && d5 - d6 >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return [0.0, 1.0 - w, w];
+    }
+    let (v, w) = (vb / (va + vb + vc), vc / (va + vb + vc));
+    [1.0 - v - w, v, w]
 }
 
 /// Parts of a mesh: [`Cluster::part`](orr_pack::mesh::Cluster::part) names them in a u16.
@@ -814,8 +1208,8 @@ pub(super) struct Simplify {
 }
 
 /// Simplifies one piece as `how` says; returns its indices and the error reached. A corner
-/// whose vertex normal comes to oppose its face takes a vertex added to `w` and `grid`
-/// ([`opposed_corners`]).
+/// of a triangle that stands for a surface its vertices do not takes a vertex added to `w`
+/// and `grid` ([`fit`]).
 pub(super) fn simplify(
     indices: &[u32],
     w: &mut Welded,
@@ -831,7 +1225,7 @@ pub(super) fn simplify(
     } = how;
     // A compact vertex buffer of the piece, so the simplifier's work follows its size, over
     // the vertices the piece's stand for: those added for earlier corners constrain no
-    // collapse ([`opposed_corners`]).
+    // collapse ([`fit`]).
     let mut local_of: FxHashMap<u32, u32> = FxHashMap::default();
     let mut global = Vec::new();
     let local: Vec<u32> = indices
@@ -885,6 +1279,7 @@ pub(super) fn simplify(
             | SimplifyOptions::ErrorClamped,
         Some(&mut error),
     );
+    let mut fell_back = false;
     if sloppy && out.len() * 4 > local.len() * 3 {
         let scale = meshopt::simplify_scale(&adapter);
         // Sloppy simplification moves any vertex it does not lock, along a border or not.
@@ -906,34 +1301,55 @@ pub(super) fn simplify(
         if sloppy.len() < out.len() {
             out = sloppy;
             error += sloppy_error * scale;
+            fell_back = true;
         }
     }
     let mut out: Vec<u32> = out.into_iter().map(|v| global[v as usize]).collect();
     let bases: Vec<u32> = local.iter().map(|&l| global[l as usize]).collect();
-    let wedges = opposed_corners(
-        &out,
-        indices,
-        &bases,
-        |_| false,
-        |v| Vec3::from(positions[local_of[&v] as usize]).as_dvec3(),
-        |v| Vec3::from_slice(&normals[3 * local_of[&v] as usize..]).as_dvec3(),
-        |_| 0,
-    );
-    // A wedge per vertex and sources, also where a vertex at the corner's position has the
-    // normal and attributes it takes: unlike that vertex, the wedge stands for the corner's
-    // vertex in simplification.
-    let mut made: FxHashMap<[u32; 3], u32> = FxHashMap::default();
-    for (k, take) in wedges {
+    let fit = {
+        let at = |v: u32| Vec3::from(grid.floats[v as usize]).as_dvec3();
+        let normal = |v: u32| Vec3::from(w.normals[v as usize]).as_dvec3();
+        let class = |v: u32| w.classes[v as usize];
+        let uvs = |v: u32| uvs_of(w, v);
+        let position = |v: u32| grid.reps[v as usize];
+        let locked = |v: u32| locks[local_of[&v] as usize].contains(SimplifyVertex::Lock);
+        let vx = FitVertices {
+            at: &at,
+            normal: &normal,
+            class: &class,
+            uvs: &uvs,
+            section: &|_| 0,
+            position: &position,
+            locked: &locked,
+            moved: &|_| false,
+        };
+        fit(&out, indices, &bases, fell_back, &vx)
+    };
+    // A wedge per vertex, attribute source and normal, also where a vertex at the corner's
+    // position has the attributes and normal it takes: unlike that vertex, the wedge stands
+    // for the corner's vertex in simplification.
+    let mut made: FxHashMap<(u32, u32, u32, [u32; 4]), u32> = FxHashMap::default();
+    for (k, take) in fit.corners {
         let v = out[k];
         out[k] = match take {
             Take::Input(u) => u,
-            Take::Shade {
-                normal: n,
-                attributes: a,
-            } => *made.entry([v, n, a]).or_insert_with(|| {
-                grid.wedge(v);
-                w.wedge(v, n, a)
-            }),
+            Take::Fit {
+                attributes,
+                normal,
+                uvs,
+            } => {
+                let bits = [uvs[0][0], uvs[0][1], uvs[1][0], uvs[1][1]].map(f32::to_bits);
+                *made
+                    .entry((v, attributes, normal, bits))
+                    .or_insert_with(|| {
+                        grid.wedge(v);
+                        let new = w.wedge(v, attributes, fit.normals[normal as usize]);
+                        for (set, u) in w.uvs.iter_mut().enumerate() {
+                            u[new as usize] = uvs[set];
+                        }
+                        new
+                    })
+            }
         };
     }
     (out, error)

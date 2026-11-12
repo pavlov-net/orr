@@ -45,14 +45,28 @@ use super::{
 /// borders dilate.
 type Class = (u16, Option<u16>);
 
-/// A triangle corner: the welded vertices that shade, turn and place it, the one it stands for
-/// in simplification, its grid position and section.
+/// A vertex's normal, its class ([`Welded::classes`]) and its uvs, in each set the mesh has.
+type Shade = ([f32; 3], u32, Uvs);
+
+/// A vertex's uvs, in the sets a mesh has of at most two.
+pub(super) type Uvs = [[f32; 2]; 2];
+
+/// Welded vertex `v`'s [`Shade`].
+fn shade(w: &Welded, v: u32) -> Shade {
+    let v = v as usize;
+    (w.normals[v], w.classes[v], lod::uvs_of(w, v as u32))
+}
+
+/// A triangle corner: the welded vertices that shade and place it, its normal, the welded
+/// vertex it stands for in simplification and that vertex's normal, its grid position and
+/// section.
 #[derive(Copy, Clone)]
 struct Corner {
     shading: u32,
-    turning: u32,
+    normal: Shade,
     placing: u32,
     base: u32,
+    base_normal: Shade,
     cell: [i32; 3],
     section: u16,
 }
@@ -61,9 +75,9 @@ struct Corner {
 /// sections.
 struct Input {
     welded: Vec<u32>,
-    /// Per vertex, the welded vertex that turns it, by its normal; empty when each vertex's is
-    /// its own `welded` one.
-    turning: Vec<u32>,
+    /// Per vertex, its normal, class and uvs; empty when each vertex's are its `welded`
+    /// one's.
+    normals: Vec<Shade>,
     /// Per vertex, the welded vertex that places it, by its skin; empty when each vertex's is
     /// its own `welded` one.
     placing: Vec<u32>,
@@ -82,7 +96,7 @@ impl Input {
     fn with_capacity(corners: usize) -> Self {
         Self {
             welded: Vec::new(),
-            turning: Vec::new(),
+            normals: Vec::new(),
             placing: Vec::new(),
             base: Vec::new(),
             cells: Vec::new(),
@@ -93,11 +107,19 @@ impl Input {
         }
     }
 
-    /// Adds a vertex of welded vertex `v` at `cell` in `section` whose position the vertex
-    /// `first` stands for, the new one when it is `None`; returns it.
-    fn push(&mut self, v: u32, cell: [i32; 3], section: u16, lock: u8, first: Option<u32>) -> u32 {
+    /// Adds a vertex of welded vertex `v` with `normal` at `cell` in `section` whose position
+    /// the vertex `first` stands for, the new one when it is `None`; returns it.
+    fn push(
+        &mut self,
+        (v, normal): (u32, Shade),
+        cell: [i32; 3],
+        section: u16,
+        lock: u8,
+        first: Option<u32>,
+    ) -> u32 {
         let l = self.welded.len() as u32;
         self.welded.push(v);
+        self.normals.push(normal);
         self.cells.push(cell);
         self.sections.push(section);
         self.lock.push(lock);
@@ -105,9 +127,12 @@ impl Input {
         l
     }
 
-    fn turning(&self, v: u32) -> u32 {
+    fn shade(&self, w: &Welded, v: u32) -> Shade {
         let v = v as usize;
-        self.turning.get(v).copied().unwrap_or(self.welded[v])
+        self.normals
+            .get(v)
+            .copied()
+            .unwrap_or_else(|| shade(w, self.welded[v]))
     }
 
     fn placing(&self, v: u32) -> u32 {
@@ -132,9 +157,11 @@ struct Clusters {
     list: Vec<DagCluster>,
     /// Welded vertex per cluster vertex, for the attributes.
     verts: Vec<u32>,
-    /// Welded vertex that turns each cluster vertex, by its normal; empty where each vertex's
-    /// is its own `verts` one.
-    turning: Vec<u32>,
+    /// Normal, its class and uvs per cluster vertex; empty where each vertex's are its `verts`
+    /// one's.
+    normals: Vec<[f32; 3]>,
+    classes: Vec<u32>,
+    uvs: Vec<Uvs>,
     /// Welded vertex that places each cluster vertex, by its skin; empty where each vertex's
     /// is its own `verts` one.
     placing: Vec<u32>,
@@ -147,6 +174,14 @@ struct Clusters {
 }
 
 impl Clusters {
+    /// Cluster vertex `k`'s normal, class and uvs.
+    fn shade(&self, w: &Welded, k: usize) -> Shade {
+        match self.normals.get(k) {
+            Some(&n) => (n, self.classes[k], self.uvs[k]),
+            None => shade(w, self.verts[k]),
+        }
+    }
+
     /// Keeps the clusters `keep` takes, and only what they hold.
     fn retain(&mut self, mut keep: impl FnMut(&DagCluster) -> bool) {
         let (mut v, mut t) = (0, 0);
@@ -156,8 +191,10 @@ impl Clusters {
             }
             let (vn, tn) = (c.verts.len(), c.tris.len());
             self.verts.copy_within(c.verts.clone(), v);
-            if !self.turning.is_empty() {
-                self.turning.copy_within(c.verts.clone(), v);
+            if !self.normals.is_empty() {
+                self.normals.copy_within(c.verts.clone(), v);
+                self.classes.copy_within(c.verts.clone(), v);
+                self.uvs.copy_within(c.verts.clone(), v);
             }
             if !self.placing.is_empty() {
                 self.placing.copy_within(c.verts.clone(), v);
@@ -172,7 +209,9 @@ impl Clusters {
             true
         });
         self.verts.truncate(v);
-        self.turning.truncate(v);
+        self.normals.truncate(v);
+        self.classes.truncate(v);
+        self.uvs.truncate(v);
         self.placing.truncate(v);
         self.base.truncate(v);
         self.cells.truncate(v);
@@ -307,11 +346,14 @@ fn stages(
                     let k = c.verts.start + usize::from(k);
                     let v = gc.verts[k];
                     let other = |of: &[u32]| of.get(k).copied().unwrap_or(v);
+                    let base = other(&gc.base);
+                    let b = base as usize;
                     corners.push(Corner {
                         shading: v,
-                        turning: other(&gc.turning),
+                        normal: gc.shade(w, k),
                         placing: other(&gc.placing),
-                        base: other(&gc.base),
+                        base,
+                        base_normal: shade(w, b as u32),
                         cell: gc.cells[k],
                         section: c.section,
                     });
@@ -357,12 +399,13 @@ fn stages(
         }),
     );
     // Vertices of different parts join where they share a position, attributes and section.
-    // A corner's normal is its turning vertex's and its skin its placing vertex's.
-    let attrs = |v: u32, turning: u32, placing: u32| {
-        let (v, turning, placing) = (v as usize, turning as usize, placing as usize);
-        let mut k = [0u32; 18];
-        k[..3].copy_from_slice(&w.normals[turning].map(f32::to_bits));
-        k[3..5].copy_from_slice(&w.uvs[0][v].map(f32::to_bits));
+    // A corner's skin is its placing vertex's.
+    let attrs = |v: u32, (normal, class, uvs): Shade, placing: u32| {
+        let (v, placing) = (v as usize, placing as usize);
+        let mut k = [0u32; 19];
+        k[..3].copy_from_slice(&normal.map(f32::to_bits));
+        k[18] = class;
+        k[3..5].copy_from_slice(&uvs[0].map(f32::to_bits));
         if let Some(t) = &w.tangents {
             k[5..9].copy_from_slice(&t[v].map(f32::to_bits));
         }
@@ -372,9 +415,7 @@ fn stages(
             k[10] = w[0] | w[1] << 16;
             k[11] = w[2] | w[3] << 16;
         }
-        if let Some(u) = w.uvs.get(1) {
-            k[12..14].copy_from_slice(&u[v].map(f32::to_bits));
-        }
+        k[12..14].copy_from_slice(&uvs[1].map(f32::to_bits));
         if let Some(c) = &w.colors {
             k[14..18].copy_from_slice(&c[v].map(f32::to_bits));
         }
@@ -509,7 +550,8 @@ fn part_inputs(
                     let f = &mut first[id as usize];
                     let stands = (f.0 == si).then_some(f.1);
                     let lock = lod::vertex_flags(id, shared, seams).bits();
-                    let l = input.push(v, grid.cells[v as usize], section, lock, stands);
+                    let n = shade(w, v);
+                    let l = input.push((v, n), grid.cells[v as usize], section, lock, stands);
                     input.base.push(l);
                     if stands.is_none() {
                         *f = (si, l);
@@ -540,60 +582,64 @@ fn part_inputs(
         if input.base.iter().enumerate().all(|(l, &b)| b == l as u32) {
             input.base = Vec::new();
         }
+        // Each vertex holds its welded vertex's shading.
+        input.normals = Vec::new();
         out.push(input);
     }
     out
 }
 
 /// The `clodBuild` input of a merged stage over `corners`, whose positions have the ids
-/// `ids` below `positions`: one vertex per position, attributes (`attrs` of its shading,
-/// turning and placing welded vertices, of `welded`) and section, in the order the corners
-/// first use them, each standing for the vertex of its base welded vertex there.
+/// `ids` below `positions`: one vertex per position, attributes (`attrs` of its shading
+/// welded vertex, of `welded`, its normal and its placing welded vertex) and section, in the
+/// order the corners first use them, each standing for the vertex of its base welded vertex
+/// there.
 fn merged_input<K: std::hash::Hash + Eq>(
     corners: &[Corner],
     ids: &[u32],
     positions: usize,
     welded: usize,
-    attrs: impl Fn(u32, u32, u32) -> K,
+    attrs: impl Fn(u32, Shade, u32) -> K,
     shared: &[bool],
     seams: &[bool],
 ) -> Input {
     let _z = crate::profile::zone!("dag.input");
-    // Per welded vertex turning and placing itself, the id of its attributes among those the
-    // corners use.
-    let mut class_of = vec![u32::MAX; welded];
+    // Per welded vertex placing itself, the id of the attributes it last took among those the
+    // corners use, with the normal it took them with.
+    let mut class_of = vec![(u32::MAX, [0u32; 8]); welded];
     let mut classes: FxHashMap<K, u32> = FxHashMap::default();
     let mut local_of: FxHashMap<(u32, u32, u32, u16), u32> = FxHashMap::default();
     let mut first = vec![u32::MAX; positions];
     let mut input = Input::with_capacity(corners.len());
     for (c, &id) in corners.iter().zip(ids) {
-        let mut class = |v: u32, turning: u32, placing: u32| {
-            if turning == v && placing == v {
-                let k = &mut class_of[v as usize];
-                if *k == u32::MAX {
-                    let next = classes.len() as u32;
-                    *k = *classes.entry(attrs(v, v, v)).or_insert(next);
-                }
-                *k
-            } else {
-                let next = classes.len() as u32;
-                *classes.entry(attrs(v, turning, placing)).or_insert(next)
+        let mut class = |v: u32, normal: Shade, placing: u32| {
+            let (n, u) = (normal.0.map(f32::to_bits), normal.2);
+            let u = [u[0][0], u[0][1], u[1][0], u[1][1]].map(f32::to_bits);
+            let bits = [n[0], n[1], n[2], normal.1, u[0], u[1], u[2], u[3]];
+            let k = &mut class_of[v as usize];
+            if placing == v && k.0 != u32::MAX && k.1 == bits {
+                return k.0;
             }
+            let next = classes.len() as u32;
+            let id = *classes.entry(attrs(v, normal, placing)).or_insert(next);
+            if placing == v {
+                *k = (id, bits);
+            }
+            id
         };
-        let own = class(c.shading, c.turning, c.placing);
-        let base = class(c.base, c.base, c.base);
+        let own = class(c.shading, c.normal, c.placing);
+        let base = class(c.base, c.base_normal, c.base);
         // The vertex of the corner's position and section with the attributes of class `own`
-        // of welded vertices `v`, `turning` and `placing`, standing for the one of class
-        // `base`, which it adds first where it is missing.
-        let mut vertex = |own: u32, v: u32, turning: u32, placing: u32, b: Option<u32>| {
+        // of welded vertex `v`, `normal` and welded vertex `placing`, standing for the one of
+        // class `base`, which it adds first where it is missing.
+        let mut vertex = |own: u32, v: u32, normal: Shade, placing: u32, b: Option<u32>| {
             *local_of
                 .entry((id, own, base, c.section))
                 .or_insert_with(|| {
                     let f = &mut first[id as usize];
                     let stands = (*f != u32::MAX).then_some(*f);
                     let lock = lod::vertex_flags(id, shared, seams).bits();
-                    let l = input.push(v, c.cell, c.section, lock, stands);
-                    input.turning.push(turning);
+                    let l = input.push((v, normal), c.cell, c.section, lock, stands);
                     input.placing.push(placing);
                     input.base.push(b.unwrap_or(l));
                     if stands.is_none() {
@@ -602,12 +648,9 @@ fn merged_input<K: std::hash::Hash + Eq>(
                     l
                 })
         };
-        let b = vertex(base, c.base, c.base, c.base, None);
-        let l = vertex(own, c.shading, c.turning, c.placing, Some(b));
+        let b = vertex(base, c.base, c.base_normal, c.base, None);
+        let l = vertex(own, c.shading, c.normal, c.placing, Some(b));
         input.indices.push(l);
-    }
-    if input.turning == input.welded {
-        input.turning = Vec::new();
     }
     if input.placing == input.welded {
         input.placing = Vec::new();
@@ -664,9 +707,10 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
         .iter()
         .flat_map(|c| c.map(|v| (f64::from(v) * snap.step) as f32))
         .collect();
-    let normals: Vec<f32> = (0..input.welded.len() as u32)
-        .flat_map(|v| w.normals[input.turning(v) as usize])
+    let shades: Vec<Shade> = (0..input.welded.len() as u32)
+        .map(|v| input.shade(w, v))
         .collect();
+    let normals: Vec<f32> = shades.iter().flat_map(|n| n.0).collect();
     drop(attributes);
     let weights = [0.5f32; 3];
     let mut config = meshopt::clod_default_config_rt(usize::from(o.limits.max_triangles));
@@ -687,6 +731,8 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
     let mesh = super::clod::Mesh {
         indices: &input.indices,
         normals,
+        classes: shades.iter().map(|n| n.1).collect(),
+        uvs: shades.iter().map(|n| n.2).collect(),
         weights: &weights,
         lock: lock.into_owned(),
         remap: &input.remap,
@@ -695,7 +741,7 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
         keep_borders: !o.dilate,
     };
     let mut groups = super::clod::build(&config, mesh, positions, |e| {
-        group_of(&e, input, w.skin.is_some(), snap, max_indices)
+        group_of(&e, input, w, snap, max_indices)
     });
     bound_groups(&mut groups, snap.step);
     groups
@@ -802,15 +848,16 @@ fn partition_size(group_max: usize) -> usize {
 }
 
 /// A group as the DAG keeps it: each cluster cut by section, its vertices as `input`'s welded
-/// vertices, their turning ones, and their placing ones when `skinned`, at grid positions
+/// vertices, their normals and uvs, and their placing ones when `skinned`, at grid positions
 /// snapped from `positions`.
 fn group_of(
     e: &super::clod::Emitted<'_>,
     input: &Input,
-    skinned: bool,
+    w: &Welded,
     snap: &Snap,
     max_indices: usize,
 ) -> DagGroup {
+    let skinned = w.skin.is_some();
     let (positions, sources) = (e.positions, e.sources);
     let mut local_vertices = [0u32; MAX_CLUSTER_CORNERS];
     let mut local_triangles = [0u8; MAX_CLUSTER_CORNERS];
@@ -821,8 +868,13 @@ fn group_of(
             used.iter()
                 .map(|&v| input.welded[sources.shading(v) as usize]),
         );
-        out.turning
-            .extend(used.iter().map(|&v| input.turning(sources.turning(v))));
+        out.normals.extend(used.iter().map(|&v| {
+            let n = &e.normals[3 * v as usize..3 * v as usize + 3];
+            [n[0], n[1], n[2]]
+        }));
+        out.classes
+            .extend(used.iter().map(|&v| e.classes[v as usize]));
+        out.uvs.extend(used.iter().map(|&v| e.uvs[v as usize]));
         out.base.extend(
             used.iter()
                 .map(|&v| input.welded[e.base[v as usize] as usize]),
@@ -897,14 +949,15 @@ fn group_of(
             push(&mut out, run[0].0, refined, &used[..nv], &corners[..nc]);
         }
     }
-    if out.turning == out.verts {
-        out.turning = Vec::new();
-    }
     if out.placing == out.verts {
         out.placing = Vec::new();
     }
     if out.base == out.verts {
         out.base = Vec::new();
+    }
+    let own = |k: usize| (out.normals[k], out.classes[k], out.uvs[k]) == shade(w, out.verts[k]);
+    if (0..out.verts.len()).all(own) {
+        (out.normals, out.classes, out.uvs) = (Vec::new(), Vec::new(), Vec::new());
     }
     let b = e.bounds;
     DagGroup {
@@ -1102,7 +1155,8 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
                     .map(|c| {
                         let v = ClusterVertices {
                             shading: &clusters.verts[c.verts.clone()],
-                            turning: clusters.turning.get(c.verts.clone()).unwrap_or(&[]),
+                            normals: clusters.normals.get(c.verts.clone()).unwrap_or(&[]),
+                            uvs: clusters.uvs.get(c.verts.clone()).unwrap_or(&[]),
                             placing: clusters.placing.get(c.verts.clone()).unwrap_or(&[]),
                             cells: &clusters.cells[c.verts.clone()],
                         };
