@@ -109,13 +109,15 @@ impl PoolBytes {
 /// hierarchy nodes, cluster groups and clusters of the scene's copies, the clusters its
 /// producers emit, the feedback cells of the streamed textures. A scene that asks less than
 /// its views are estimated to drops nothing from its first frame. Past the estimate a list
-/// starts at it, grows a few frames after a frame wanted more than it holds, and gives memory
-/// back after a long run of frames that want far less. The estimate takes a cluster to cover
-/// the square of the error it is drawn at, [`RendererDesc::raster_error_pixels`] on a side: a
-/// view's visible clusters over the pixels of its render extent, 2^25 at most, the clusters a
-/// visibility buffer word can name; a scene's traversal over the pixels of the sphere of
-/// directions around its focus at the detail its views ask for, since it chooses geometry
-/// whatever they face; texture feedback a raise for each pixel that reports in a frame.
+/// holds it at least, grows a few frames after a frame wanted more than it holds, and gives
+/// back what it grew by after a long run of frames that want far less. The estimate takes a
+/// cluster to cover the square of the error it is drawn at,
+/// [`RendererDesc::raster_error_pixels`] on a side: a view's visible clusters over the pixels
+/// of its render extent, 2^25 at most, the clusters a visibility buffer word can name; a
+/// scene's traversal over the pixels of the sphere of directions around its focus at the
+/// detail its views ask for, since it chooses geometry whatever they face, beside the roots
+/// and the one candidate item every copy asks however coarse it draws; texture feedback a
+/// raise for each pixel that reported in the frame before.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Budgets {
     /// Bytes per upload block; a window that outgrows its blocks takes another.

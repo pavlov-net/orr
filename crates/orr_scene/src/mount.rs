@@ -165,6 +165,8 @@ struct PlacedMesh {
     parts: Vec<Part>,
     /// Levels of a resident hierarchy; None when it is paged.
     depth: Option<u32>,
+    /// The stages its hierarchy has a root for.
+    roots: u32,
     /// Pages past the pinned ones stream: per page its blob, bytes and clusters.
     streamed: Option<Vec<StreamedPage>>,
     /// DAG mode: the cuts whose clusters are all resident from mount.
@@ -1174,6 +1176,11 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             micromaps: vec![None; info.pages.len()],
             parts: info.parts.clone(),
             depth,
+            roots: info
+                .roots
+                .iter()
+                .filter(|&&r| r != MeshHeader::NO_ROOT)
+                .count() as u32,
             streamed: streams.then(|| all_pages.clone()),
             cached,
             groups: Arc::clone(&groups),
@@ -1602,6 +1609,7 @@ struct ResolvedMesh {
     refs: Vec<ClusterRef>,
     rt: MeshRt,
     depth: Option<u32>,
+    roots: u32,
     streamed: Option<Vec<StreamedPage>>,
     cached: Vec<CutRow>,
     non_opaque: Vec<bool>,
@@ -1629,7 +1637,8 @@ impl ResolvedMesh {
     /// item per 32 of the group's clusters at most; a cut holds a cluster once. A copy of
     /// discrete levels draws one level, in items of up to 32 clusters of one page, and gathers
     /// no cut. A skinned copy's candidates are the clusters its skinning took, an item each at
-    /// most.
+    /// most. However coarse it draws, a copy's first pass visits its hierarchy's roots, and it
+    /// writes an item: its coarsest level's where it has levels.
     fn copy_work(&self) -> CopyWork {
         let items = |clusters: u32| clusters.div_ceil(32);
         let mut work = if self.levels.is_empty() {
@@ -1649,6 +1658,8 @@ impl ResolvedMesh {
                 clusters: self.gpu.cluster_count,
                 rt_clusters: self.gpu.cluster_count,
                 rt_blas: 1,
+                first_nodes: self.roots,
+                first_items: 1,
             }
         } else {
             let level = |&(_, first, count): &(f32, u32, u32)| {
@@ -1669,11 +1680,13 @@ impl ResolvedMesh {
             CopyWork {
                 items,
                 clusters,
+                first_items: self.levels.iter().map(|l| level(l).0).min().unwrap_or(0),
                 ..CopyWork::default()
             }
         };
         if self.header.attributes & MeshHeader::SKIN != 0 {
             work.items = work.items.max(work.clusters);
+            work.first_items = work.first_items.min(1);
         }
         work
     }
@@ -1864,6 +1877,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                 refs: Vec::new(),
                 rt: MeshRt::default(),
                 depth: m.depth,
+                roots: m.roots,
                 streamed: m.streamed,
                 cached: m.cached,
                 non_opaque: Vec::new(),

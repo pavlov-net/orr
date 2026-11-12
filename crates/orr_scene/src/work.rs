@@ -4,14 +4,16 @@
 //! The content gives each list a bound, the most its copies can ask of it in a frame, summed
 //! over the scene's copies from what their models' meshes hold. Where the bound is under what
 //! the views are estimated to ask, the list holds the bound and drops nothing. Past it the
-//! list starts at the estimate and follows what the frames want.
+//! list holds the estimate at least and follows what the frames want.
 //!
 //! The estimate takes a cluster to cover the area of the error it is drawn at, a square of the
 //! detail target's pixels: more clusters than that cannot each show in a visibility buffer. A
 //! view's visible clusters take its extent's pixels. The traversal chooses a scene's cuts
 //! around its focus whatever the views face, so the scene's lists take the pixels of the whole
 //! sphere of directions at the scene's detail, each list the share of its bound that the
-//! clusters estimated are of the clusters the content holds.
+//! clusters estimated are of the clusters the content holds. The queues and the candidate cut
+//! take beside it what every copy asks however coarse it draws, which no detail takes away:
+//! its hierarchy's roots and an item of candidates.
 
 use std::f64::consts::PI;
 
@@ -26,12 +28,15 @@ pub(crate) struct CopyWork {
     /// The CLAS and the BLAS builds of the ray-tracing cut it gathers.
     pub(crate) rt_clusters: u32,
     pub(crate) rt_blas: u32,
+    /// The nodes its first pass visits and the items it writes however coarse it draws.
+    pub(crate) first_nodes: u32,
+    pub(crate) first_items: u32,
 }
 
 impl CopyWork {
     /// What a copy that shows two steps of its chain at once asks of the raster's lists: the
     /// most of each over any two of `steps`, the model's own first. Only its own step gathers
-    /// a ray-tracing cut.
+    /// a ray-tracing cut, and at its coarsest it shows the step that asks least.
     pub(crate) fn fading(steps: &[Self]) -> Self {
         let two = |f: fn(&Self) -> u32| {
             let (mut most, mut next) = (0u32, 0u32);
@@ -48,6 +53,8 @@ impl CopyWork {
             nodes: two(|w| w.nodes),
             items: two(|w| w.items),
             clusters: two(|w| w.clusters),
+            first_nodes: steps.iter().map(|w| w.first_nodes).min().unwrap_or(0),
+            first_items: steps.iter().map(|w| w.first_items).min().unwrap_or(0),
             ..steps[0]
         }
     }
@@ -63,6 +70,8 @@ pub(crate) struct Work {
     pub(crate) rt_blas: u64,
     /// Copies that gather a ray-tracing cut.
     pub(crate) rt_copies: u64,
+    pub(crate) first_nodes: u64,
+    pub(crate) first_items: u64,
 }
 
 impl Work {
@@ -74,6 +83,8 @@ impl Work {
         self.rt_clusters += n * u64::from(w.rt_clusters);
         self.rt_blas += n * u64::from(w.rt_blas);
         self.rt_copies += if w.rt_blas > 0 { n } else { 0 };
+        self.first_nodes += n * u64::from(w.first_nodes);
+        self.first_items += n * u64::from(w.first_items);
     }
 }
 
@@ -127,12 +138,14 @@ impl DetailTarget {
     pub(crate) fn floors(&self, work: &Work) -> Floors {
         let sphere = self.sphere_pixels();
         let clusters = clusters_of(sphere, self.raster_pixels);
-        // The share of what the content holds that the estimate takes.
-        let share = |bound: u64| {
+        // The share of what the content holds that the estimate takes, beside what the copies
+        // ask at their coarsest.
+        let share = |bound: u64, first: u64| {
             if clusters >= work.clusters as f64 {
                 u32::try_from(bound).unwrap_or(u32::MAX)
             } else {
-                least(bound, bound as f64 * clusters / work.clusters as f64)
+                let estimate = bound as f64 * clusters / work.clusters as f64;
+                least(bound, estimate + first as f64)
             }
         };
         // Copies that gather are at least `merge_pixels` in radius, so about this many tile
@@ -145,8 +158,8 @@ impl DetailTarget {
         };
         let rt = clusters_of(sphere, self.rt_pixels) / f64::from(self.rt_cut_pixels);
         Floors {
-            queue: share(work.nodes),
-            candidates: share(work.items),
+            queue: share(work.nodes, work.first_nodes),
+            candidates: share(work.items, work.first_items),
             rt_clas: least(work.rt_clusters, rt),
             rt_blas: least(work.rt_blas, gathering),
             rt_keys: least(work.rt_copies, gathering),
@@ -190,6 +203,8 @@ mod tests {
                 clusters: 40,
                 rt_clusters: 40,
                 rt_blas: 1,
+                first_nodes: 2,
+                first_items: 1,
             },
             5,
         );
@@ -216,13 +231,37 @@ mod tests {
                 clusters: 4000,
                 rt_clusters: 4000,
                 rt_blas: 3,
+                first_nodes: 2,
+                first_items: 1,
             },
             1000,
         );
         let f = d.floors(&large);
         let share = sphere / 4.0e6;
-        assert_eq!(f.queue, (1.0e6 * share).ceil() as u32);
-        assert_eq!(f.candidates, (0.5e6 * share).ceil() as u32);
+        assert_eq!(
+            f.queue,
+            (1.0e6 * share).ceil() as u32 + 2000,
+            "the estimate's share and every copy's roots"
+        );
+        assert_eq!(f.candidates, (0.5e6 * share).ceil() as u32 + 1000);
+
+        // Copies of more clusters than the sphere has pixels still each ask their roots.
+        let mut many = Work::default();
+        many.add(
+            CopyWork {
+                nodes: 9,
+                items: 4,
+                clusters: 64,
+                rt_clusters: 64,
+                rt_blas: 1,
+                first_nodes: 1,
+                first_items: 1,
+            },
+            2_000_000,
+        );
+        let f = d.floors(&many);
+        assert!(f.queue >= 2_000_000 && f.queue < 2_100_000, "{}", f.queue);
+        assert!(f.candidates >= 2_000_000 && f.candidates < 2_100_000);
         assert_eq!(
             f.rt_clas,
             (sphere / 4.0 / 10.0).ceil() as u32,
@@ -245,8 +284,11 @@ mod tests {
             clusters: 3 * n,
             rt_clusters: 3 * n,
             rt_blas: 1,
+            first_nodes: n,
+            first_items: 1,
         };
         let w = CopyWork::fading(&[step(4), step(9), step(9), step(1)]);
+        assert_eq!((w.first_nodes, w.first_items), (1, 1), "its coarsest step");
         assert_eq!((w.nodes, w.items, w.clusters), (18, 36, 54));
         assert_eq!(
             (w.rt_clusters, w.rt_blas),
