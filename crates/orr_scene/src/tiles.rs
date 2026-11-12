@@ -280,16 +280,21 @@ impl SlotRecords {
 /// Feedback the frame's texture taps write: per-cell wanted mips and the records of their
 /// raises, copied back per frame in flight.
 ///
-/// The cells grow as mounts add streamed textures. The record list follows the raises the
-/// completed frames counted ([`Capacity`]); each slot takes the size at its next frame.
+/// The cells grow as mounts add streamed textures. The record list holds the raises the cells
+/// can take in a frame, or one for each pixel that reports in a frame where that is less, and
+/// past that follows the raises the completed frames counted ([`Capacity`]); each slot takes
+/// the size at its next frame, a record at least.
 pub(crate) struct TextureFeedback {
     /// None until a mount adds a streamed texture.
     cells: Option<Allocation<u32>>,
     cell_ranges: RangeAllocator,
     cell_capacity: u32,
     /// The texture each cell range belongs to, by first cell: its mount, index among the
-    /// mount's streamed textures and cell count.
-    owners: BTreeMap<u32, (MountId, u32, u32)>,
+    /// mount's streamed textures, cell count and the mips above its tail.
+    owners: BTreeMap<u32, (MountId, u32, u32, u32)>,
+    /// The raises a frame can count: a cell takes one for each mip above its texture's tail,
+    /// each finer than the last.
+    raises: u64,
     counts: Allocation<u32>,
     pub(crate) gpu: Allocation<TextureFeedbackGpu>,
     slots: Vec<SlotRecords>,
@@ -301,34 +306,34 @@ pub(crate) struct TextureFeedback {
 }
 
 impl TextureFeedback {
-    pub(crate) fn new(device: &Device, records: u32, fif: u32) -> Result<Self> {
+    pub(crate) fn new(device: &Device, fif: u32) -> Result<Self> {
         let dl = MemoryKind::DeviceLocal;
-        let records = records.max(1);
-        let mut list = Capacity::new(records, u32::MAX);
-        list.set(records);
         Ok(Self {
             cells: None,
             cell_ranges: RangeAllocator::new(0),
             cell_capacity: 0,
             owners: BTreeMap::new(),
+            raises: 0,
             counts: device.gpu_malloc(dl, u64::from(fif.max(1)), "texture feedback counts")?,
             gpu: device.gpu_malloc(dl, 1, "texture feedback")?,
             slots: (0..fif.max(1))
-                .map(|_| SlotRecords::new(device, records))
+                .map(|_| SlotRecords::new(device, 1))
                 .collect::<Result<_>>()?,
-            records: list,
+            records: Capacity::new(0, u32::MAX),
             raised: 0,
             retry: 0,
         })
     }
 
-    /// Cells for `count` cells of a texture. Without a free run that long the cells grow: the
-    /// frames in flight keep the old ones, and every cell of the new ones starts unraised, as
-    /// a frame's first tap of a cell raises it whatever it held.
+    /// Cells for `count` cells of a texture with `mips` mips above its tail. Without a free
+    /// run that long the cells grow: the frames in flight keep the old ones, and every cell of
+    /// the new ones starts unraised, as a frame's first tap of a cell raises it whatever it
+    /// held.
     pub(crate) fn alloc(
         &mut self,
         owner: (MountId, u32),
         count: u32,
+        mips: u32,
         w: &mut Apply<'_>,
     ) -> Result<u32> {
         let first = match self.cell_ranges.alloc(count) {
@@ -357,30 +362,39 @@ impl TextureFeedback {
                     .expect("the grown cells end in a free run of `count`")
             }
         };
-        self.owners.insert(first, (owner.0, owner.1, count));
+        self.owners.insert(first, (owner.0, owner.1, count, mips));
+        self.raises += u64::from(count) * u64::from(mips);
         Ok(first)
     }
 
     pub(crate) fn free(&mut self, first: u32) {
-        if let Some((_, _, count)) = self.owners.remove(&first) {
+        if let Some((_, _, count, mips)) = self.owners.remove(&first) {
             self.cell_ranges.free(first, count);
+            self.raises -= u64::from(count) * u64::from(mips);
         }
     }
 
-    /// Starts `frame` in readback slot `slot`: the slot's records take the size the completed
-    /// frames want, its taps stamp the frame, its raise count starts at 0, and the cells clear
-    /// when the 24-bit frame stamp wraps. Without device memory for new records the slot keeps
-    /// its own, the frame starts with them and the allocation's error comes back, and no resize
-    /// is tried before `period` frames have passed.
+    /// Starts `frame` in readback slot `slot`, whose views render `pixels` pixels as the frame
+    /// before did: the slot's records take the raises the cells can take, or those of the
+    /// pixels that report where they are fewer, and what the completed frames want past
+    /// that; its taps stamp the frame, its raise count starts at 0, and the cells clear when
+    /// the 24-bit frame stamp wraps. Without device memory for new records the slot keeps its
+    /// own, the frame starts with them and the allocation's error comes back, and no resize is
+    /// tried before `period` frames have passed.
     pub(crate) fn begin(
         &mut self,
         frame: u64,
         slot: usize,
         period: u64,
+        pixels: u64,
         w: &mut Apply<'_>,
     ) -> Result<Option<Error>> {
         let mut short = None;
-        let wanted = self.records.wanted();
+        let reports = self.raises.min(pixels / FEEDBACK_PERIOD);
+        self.records
+            .floor(u32::try_from(reports).unwrap_or(u32::MAX));
+        // `kept_from` divides a frame's raises by the records.
+        let wanted = self.records.wanted().max(1);
         if self.slots[slot].capacity != wanted && frame >= self.retry {
             match SlotRecords::new(w.device, wanted) {
                 Ok(s) => {
@@ -440,7 +454,8 @@ impl TextureFeedback {
         let mut out = Vec::with_capacity(kept as usize);
         for r in data[1..][..2 * kept as usize].as_chunks::<2>().0 {
             let (cell, value) = (r[0], r[1]);
-            let Some((&first, &(mount, texture, count))) = self.owners.range(..=cell).next_back()
+            let Some((&first, &(mount, texture, count, _))) =
+                self.owners.range(..=cell).next_back()
             else {
                 continue;
             };

@@ -23,12 +23,9 @@ enum Follows {
     Setting(&'static str),
     /// The views' extents.
     Extent,
-    /// Content the scene does not hold: a size stated up front, which is to follow the content
-    /// instead.
-    Reserved,
 }
 
-use Follows::{Device, Extent, Fixed, Reserved, Setting};
+use Follows::{Device, Extent, Fixed, Setting};
 
 impl std::fmt::Display for Follows {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -37,7 +34,6 @@ impl std::fmt::Display for Follows {
             Fixed => f.write_str("a fixed size"),
             Setting(name) => f.write_str(name),
             Extent => f.write_str("the views' extents"),
-            Reserved => f.write_str("a size stated up front"),
         }
     }
 }
@@ -57,8 +53,6 @@ const STATED: &[(&str, Follows)] = &[
     // The renderer.
     ("CLAS pool bits", MESH_PAGES),
     ("CLAS pool runs", MESH_PAGES),
-    ("texture feedback records", Reserved),
-    ("texture feedback readback", Reserved),
     ("materials", Fixed),
     ("meshes", Fixed),
     ("bsdf tables", Fixed),
@@ -181,8 +175,7 @@ fn view(scene: orr::SceneId, history: orr::ViewHistoryId) -> ViewDesc {
 /// Three frames of an empty scene through a raster view, then three through a lit one, leave
 /// nothing in device memory but what [`STATED`] names and, for every table and list the scene
 /// has nothing to put in, one allocation of the device's smallest size. A table or a list
-/// sized before the scene holds anything for it fails here by its label, and so does a label
-/// stated as reserved that holds no more than a table of nothing.
+/// sized before the scene holds anything for it fails here by its label.
 #[test]
 fn an_empty_scene_holds_no_memory_for_content() {
     let kinds = MemoryKind::ALL;
@@ -250,26 +243,27 @@ fn an_empty_scene_holds_no_memory_for_content() {
     wait(last.unwrap());
 
     let ledger = device().memory_breakdown();
-    let mut wrong = Vec::new();
+    // What the empty scene holds and why, and what it holds with no reason stated.
+    let (mut held, mut wrong) = (Vec::new(), Vec::new());
     for l in ledger.labels.iter().filter(|l| &*l.label != PROBE) {
         let kind = kinds.iter().position(|&k| k == l.kind);
         let granule = kind.map(|k| granules[k]);
         let empty = granule.is_some_and(|g| l.bytes == l.allocations * g);
         let stated = STATED.iter().find(|(label, _)| *label == &*l.label);
-        match (stated, empty) {
-            (None, false) => wrong.push(format!(
+        match stated {
+            _ if empty => {}
+            Some((label, follows)) => held.push(format!("{:>12} B  {label}: {follows}", l.bytes)),
+            None => wrong.push(format!(
                 "{:?} {:?}: {} B in {} allocations, with no content and nothing stated",
                 l.kind, l.label, l.bytes, l.allocations
             )),
-            // Only what was reserved shrinks to nothing: a small record can be as small as
-            // the device's smallest allocation.
-            (Some((_, follows @ Reserved)), true) => wrong.push(format!(
-                "{:?} {:?}: stated to follow {follows}, but it holds nothing",
-                l.kind, l.label
-            )),
-            _ => {}
         }
     }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert!(
+        wrong.is_empty(),
+        "{}\nbeside what is stated:\n{}",
+        wrong.join("\n"),
+        held.join("\n")
+    );
     assert_clean();
 }

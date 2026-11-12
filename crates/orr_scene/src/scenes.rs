@@ -103,18 +103,19 @@ impl PoolBytes {
 
 /// Pool sizes and per-frame limits.
 ///
-/// The cluster work lists have no size here. A view's visible clusters, a scene's traversal
-/// queues and raster candidate cut and the tables of the ray-tracing cuts it builds each hold
-/// what the content can ask of them in a frame: the hierarchy nodes, cluster groups and
-/// clusters of the scene's copies and the clusters its producers emit. A scene that asks less
-/// than its views are estimated to drops nothing from its first frame. Past the estimate a
-/// list starts at it, grows a few frames after a frame wanted more than it holds, and gives
-/// memory back after a long run of frames that want far less. The estimate takes a cluster to
-/// cover the square of the error it is drawn at, [`RendererDesc::raster_error_pixels`] on a
-/// side: a view's visible clusters over the pixels of its render extent, 2^25 at most, the
-/// clusters a visibility buffer word can name; a scene's traversal over the pixels of the
-/// sphere of directions around its focus at the detail its views ask for, since it chooses
-/// geometry whatever they face.
+/// The per-frame work lists have no size here. A view's visible clusters, a scene's traversal
+/// queues and raster candidate cut, the tables of the ray-tracing cuts it builds and the
+/// records of texture feedback each hold what the content can ask of them in a frame: the
+/// hierarchy nodes, cluster groups and clusters of the scene's copies, the clusters its
+/// producers emit, the feedback cells of the streamed textures. A scene that asks less than
+/// its views are estimated to drops nothing from its first frame. Past the estimate a list
+/// starts at it, grows a few frames after a frame wanted more than it holds, and gives memory
+/// back after a long run of frames that want far less. The estimate takes a cluster to cover
+/// the square of the error it is drawn at, [`RendererDesc::raster_error_pixels`] on a side: a
+/// view's visible clusters over the pixels of its render extent, 2^25 at most, the clusters a
+/// visibility buffer word can name; a scene's traversal over the pixels of the sphere of
+/// directions around its focus at the detail its views ask for, since it chooses geometry
+/// whatever they face; texture feedback a raise for each pixel that reports in a frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Budgets {
     /// Bytes per upload block; a window that outgrows its blocks takes another.
@@ -181,11 +182,6 @@ pub struct Budgets {
     pub instance_page_pool: u64,
     /// Bytes of requested blobs loading or landed and not released.
     pub user_blob_pool: u64,
-    /// Records of raises of a texture feedback cell's wanted mip a frame keeps at first; the
-    /// list grows a few frames after a frame raised more than it holds. While a frame raises
-    /// more, each frame keeps a different run of its raises, so every cell is heard within a
-    /// few frames.
-    pub initial_texture_feedback_records: u32,
     /// Bytes loading at once: of streamed units and requested blobs from the step that starts
     /// their reads to the one their GPU work lands in, which hold staging and read buffers that
     /// long, and mounts' reads: their stored bytes, and the decoded bytes of those that stage
@@ -223,7 +219,6 @@ impl Default for Budgets {
             texture_pool: PoolSize::HeapPercent(30),
             instance_page_pool: 256 << 20,
             user_blob_pool: 256 << 20,
-            initial_texture_feedback_records: 1 << 14,
             in_flight_bytes: 256 << 20,
             stream_block: 16 << 20,
         }
@@ -1427,6 +1422,16 @@ impl Scenes {
             })
             .min()
             .unwrap_or(frame);
+        // The views of the frame before, whose pixels report texture feedback.
+        let last = frame - 1;
+        let pixels = core
+            .histories
+            .iter()
+            .flatten()
+            .filter(|h| h.rendered[(last % u64::from(core.fif)) as usize] == Some(last))
+            .filter_map(|h| h.previous)
+            .map(|v| u64::from(v.render_extent.x) * u64::from(v.render_extent.y))
+            .sum();
         let mut apply = Apply {
             device: &self.device,
             window: &core.windows[slot],
@@ -1450,6 +1455,7 @@ impl Scenes {
             frame,
             settled,
             core.memory.scale() > 1.0,
+            pixels,
             core.output,
             &self.loading,
             &mut apply,

@@ -2588,8 +2588,8 @@ fn a_texture_without_a_mip_tail_places_whole() {
     assert_clean();
 }
 
-/// The taps raise more cells than the first texture feedback records hold, and still load
-/// every tile they want.
+/// No view renders, so the texture feedback keeps the one record of a frame none reports in:
+/// the taps raise more cells than it holds, and still load every tile they want.
 #[test]
 fn taps_of_a_streamed_texture_read_its_resident_mips_and_load_the_tiles_they_want() {
     use orr_scene::orr_gpu::{AddressMode, Filter, MemoryKind, SamplerDesc};
@@ -2597,14 +2597,7 @@ fn taps_of_a_streamed_texture_read_its_resident_mips_and_load_the_tiles_they_wan
     use scene_suite::shaders::texture_filter::{self, Footprint, Root};
     let _serial = serial();
     let dev = device();
-    let desc = RendererDesc {
-        budgets: Budgets {
-            initial_texture_feedback_records: 1,
-            ..Budgets::default()
-        },
-        ..RendererDesc::default()
-    };
-    let mut scenes = Scenes::new(dev, &desc).unwrap();
+    let mut scenes = Scenes::new(dev, &RendererDesc::default()).unwrap();
     let _workers = Workers::start(&scenes, 2);
     let m = scenes.mount(PackSource::Memory(Arc::clone(tiled_pack())));
     ready(&mut scenes, m);

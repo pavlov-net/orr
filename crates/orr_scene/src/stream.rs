@@ -733,7 +733,7 @@ impl Streaming {
             unbinds: Vec::new(),
             carried: Vec::new(),
             unbinding: FxHashSet::default(),
-            feedback: TextureFeedback::new(device, b.initial_texture_feedback_records, fif)?,
+            feedback: TextureFeedback::new(device, fif)?,
             retired_cells: Vec::new(),
             streams,
             moving: HashMap::new(),
@@ -830,7 +830,10 @@ impl Streaming {
             let g = &stream.grid;
             let [cx, cy] = g.cells();
             let cells = cx * cy * g.layers;
-            let first_cell = match self.feedback.alloc((mount, k as u32), cells, w) {
+            let first_cell = match self
+                .feedback
+                .alloc((mount, k as u32), cells, g.tail_mip(), w)
+            {
                 Ok(first) => first,
                 Err(e) => {
                     for t in &textures {
@@ -1791,13 +1794,16 @@ impl Streaming {
     }
 
     /// Step 1 of frame `frame`: applies the landed batches, plans this step and sends its
-    /// loads. Under `pressure` the detail is coarsened for the mesh page pool. Returns the
-    /// points the frame's submit waits.
+    /// loads. Under `pressure` the detail is coarsened for the mesh page pool. `pixels` are
+    /// the render pixels of the views of the frame before. Returns the points the frame's
+    /// submit waits.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn step(
         &mut self,
         frame: u64,
         settled: u64,
         pressure: bool,
+        pixels: u64,
         output: Option<TimelinePoint>,
         loading: &Arc<Loading>,
         w: &mut Apply<'_>,
@@ -1887,7 +1893,7 @@ impl Streaming {
         }
         let slot = (frame % u64::from(self.fif)) as usize;
         let period = response_period(self.fif);
-        if let Some(e) = self.feedback.begin(frame, slot, period, w)? {
+        if let Some(e) = self.feedback.begin(frame, slot, period, pixels, w)? {
             self.residency.out_of_memory(governs(&self.governed, &e));
         }
         for index in std::mem::take(&mut self.nulls) {
