@@ -352,13 +352,11 @@ impl Capture {
             .iter()
             .enumerate()
             .map(|(k, &v)| {
-                let v = f64::from(v.clamp(0.0, 1.0));
-                let v = if k % 4 == 3 {
-                    v
+                if k % 4 == 3 {
+                    (f64::from(v.clamp(0.0, 1.0)) * 255.0).round() as u8
                 } else {
-                    orr_color::srgb_encode(v)
-                };
-                (v * 255.0).round() as u8
+                    orr_color::srgb8_encode(v)
+                }
             })
             .collect();
         Capture {
