@@ -173,6 +173,9 @@ struct Storage {
     /// The partition table its record names. Partitions given back and grown again make
     /// another table that the same limits can describe.
     partitions: GpuPtr<PartitionGpu>,
+    /// The medium proxies it reserves, which its light proxies' instances come after. Room the
+    /// light proxies give the medium proxies, or take from them, leaves the limits as they are.
+    proxies: u32,
     tlas: Allocation<u8>,
     record: Allocation<PtlasGpu>,
     _blocks: Vec<Allocation<u8>>,
@@ -953,7 +956,9 @@ impl Ptlas {
         let layout = self.wanted();
         let limits = self.limits(layout, self.partitions.len() as u32);
         let partitions = self.partition_table.gpu();
-        let fits = |s: &Storage| s.limits == limits && s.partitions == partitions;
+        let proxies = self.proxies.reserved;
+        let fits =
+            |s: &Storage| s.limits == limits && s.partitions == partitions && s.proxies == proxies;
         if !self.storage.as_ref().is_some_and(fits) {
             // A build has filled a storage, this one or one it replaced that no build has
             // since: the counters and the pool hold its state, which the next build rewrites
@@ -1052,6 +1057,7 @@ impl Ptlas {
         Ok(Storage {
             limits,
             partitions: record.partitions,
+            proxies: self.proxies.reserved,
             tlas,
             bytes,
             record: gpu,
