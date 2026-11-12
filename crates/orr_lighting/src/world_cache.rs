@@ -72,24 +72,28 @@ impl ResolvePipelines {
     }
 }
 
+pub(crate) fn check_settings(settings: &WorldCacheSettings) -> Result<(), Error> {
+    if !(3..=MAX_CAPACITY_LOG2).contains(&settings.capacity_log2) {
+        return Err(Error::Settings(
+            "world cache capacity_log2 must lie in 3..=26",
+        ));
+    }
+    if settings.cell_lifetime > 255 {
+        return Err(Error::Settings(
+            "world cache cell_lifetime must be at most 255",
+        ));
+    }
+    if settings.update_block == 0 {
+        return Err(Error::Settings(
+            "world cache update_block must be at least 1",
+        ));
+    }
+    Ok(())
+}
+
 impl WorldCache {
-    /// An empty cache; the first resolve clears its cells.
+    /// An empty cache for checked `settings`; the first resolve clears its cells.
     pub(crate) fn new(device: &Device, settings: &WorldCacheSettings) -> Result<Self, Error> {
-        if !(3..=MAX_CAPACITY_LOG2).contains(&settings.capacity_log2) {
-            return Err(Error::Settings(
-                "world cache capacity_log2 must lie in 3..=26",
-            ));
-        }
-        if settings.cell_lifetime > 255 {
-            return Err(Error::Settings(
-                "world cache cell_lifetime must be at most 255",
-            ));
-        }
-        if settings.update_block == 0 {
-            return Err(Error::Settings(
-                "world cache update_block must be at least 1",
-            ));
-        }
         let capacity = 1u64 << settings.capacity_log2;
         Ok(Self {
             settings: *settings,

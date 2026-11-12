@@ -55,7 +55,7 @@ impl Default for SceneLightingSettings {
 
 /// The scene's world-space radiance cache: a hash grid of 2^`capacity_log2` cells of 28 B
 /// on voxels whose edge doubles with each level, from 2^`base_cell_log2` m within
-/// `lod_scale` m of the scene focus.
+/// `lod_scale` m of the scene focus. A scene holds it from its first scene pass on.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct WorldCacheSettings {
     /// 3 to [`crate::MAX_CAPACITY_LOG2`].
@@ -170,6 +170,7 @@ fn check_settings(settings: &SceneLightingSettings) -> Result<(), Error> {
     if !(0.0..1.0).contains(&settings.feedback_share) {
         return Err(Error::Settings("feedback_share must lie in [0, 1)"));
     }
+    crate::world_cache::check_settings(&settings.world_cache)?;
     crate::caustics::check_settings(&settings.caustics)
 }
 
@@ -230,7 +231,8 @@ impl Retired {
 
 /// Lighting state of one scene: the baked environment, the directional light states, the
 /// light selection, the presampled light tiles, the caustics' photon source and grid, and the
-/// world cache. The scene pass that first finds a caster makes the grid.
+/// world cache. What follows the scene's content is made by the scene pass that first finds
+/// it: the grid with a caster, and the world cache with the first pass.
 pub struct SceneLighting {
     device: Device,
     settings: SceneLightingSettings,
@@ -257,7 +259,8 @@ pub struct SceneLighting {
     bake_roots: Ring<crate::shaders::environment::bake::Root>,
     directional_roots: Ring<directional::Root>,
     tile_roots: Ring<tiles::Root>,
-    cache: WorldCache,
+    /// None until the first scene pass.
+    cache: Option<WorldCache>,
     cache_pipelines: ResolvePipelines,
     caustics: Caustics,
     /// One past the frame whose first view has recorded its update paths.
@@ -312,7 +315,7 @@ impl SceneLighting {
             bake_roots: Ring::new(device, "environment bake roots")?,
             directional_roots: Ring::new(device, "directional roots")?,
             tile_roots: Ring::new(device, "light tile roots")?,
-            cache: WorldCache::new(device, &settings.world_cache)?,
+            cache: None,
             cache_pipelines: ResolvePipelines::new(device, kernels)?,
             caustics: Caustics::new(device, kernels, &settings.caustics)?,
             first_view: AtomicU64::new(0),
@@ -332,16 +335,22 @@ impl SceneLighting {
         &self.device
     }
 
-    /// A change of `world_cache` reallocates and clears the cache. The caustics take theirs as
-    /// [`CausticSettings`] describes. Old buffers are freed once the work submitted so far has
-    /// completed.
+    /// A change of `world_cache` reallocates and clears a cache the scene holds. The caustics
+    /// take theirs as [`CausticSettings`] describes. Old buffers are freed once the work
+    /// submitted so far has completed.
     pub fn set_settings(&mut self, settings: &SceneLightingSettings) -> Result<(), Error> {
         check_settings(settings)?;
-        if settings.world_cache != *self.cache.settings() {
-            self.cache = WorldCache::new(&self.device, &settings.world_cache)?;
-        }
+        let cache = match &self.cache {
+            Some(cache) if settings.world_cache != *cache.settings() => {
+                Some(WorldCache::new(&self.device, &settings.world_cache)?)
+            }
+            _ => None,
+        };
         self.caustics
             .set_settings(&self.device, &settings.caustics)?;
+        if cache.is_some() {
+            self.cache = cache;
+        }
         self.settings = *settings;
         Ok(())
     }
@@ -354,9 +363,10 @@ impl SceneLighting {
     /// [`Self::stats`] reads. Its outputs are visible to every later stage of the list. A pass
     /// whose light tables have grown since the last makes what the scene holds per light, per
     /// emissive list entry and per producer cluster anew, and takes the light feedback and the
-    /// casters' yields so far by the ids the smaller tables gave. The first pass to find a
-    /// caster makes the caustics' grid, which starts empty in that pass. Fails without device
-    /// memory for any of it, recording nothing and leaving the scene's lighting as it was.
+    /// casters' yields so far by the ids the smaller tables gave. The scene's first pass makes
+    /// its world cache, and the first to find a caster makes the caustics' grid; each starts
+    /// empty in that pass. Fails without device memory for any of it, recording nothing and
+    /// leaving the scene's lighting as it was.
     pub fn record(&mut self, list: &mut CommandList<'_>, pass: &ScenePass) -> Result<(), Error> {
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         // A frame's slot is written again `FRAME_SLOTS` frames on, when its work has completed.
@@ -376,6 +386,10 @@ impl SceneLighting {
         let cluster_cdf = (clusters != self.cluster_room)
             .then(|| device_local(&self.device, u64::from(clusters), "emissive cluster cdf"))
             .transpose()?;
+        let cache = match self.cache {
+            Some(_) => None,
+            None => Some(WorldCache::new(&self.device, &self.settings.world_cache)?),
+        };
         let room = self
             .caustics
             .room(&self.device, pass.tables, grown, casters)?;
@@ -383,6 +397,9 @@ impl SceneLighting {
             let before = std::mem::replace(&mut self.cluster_cdf, cdf);
             self.retired.push(pass.frame, before);
             self.cluster_room = clusters;
+        }
+        if cache.is_some() {
+            self.cache = cache;
         }
         let before = self
             .caustics
@@ -399,9 +416,10 @@ impl SceneLighting {
         let before = replaced.map_or(now, |r| &r.1);
         self.frames[slot] = Some(pass.frame);
         let resets = self.resets();
+        let cache = self.cache.as_mut().expect("made above");
         if self.resets_applied != resets {
             self.resets_applied = resets;
-            self.cache.clear();
+            cache.clear();
             self.caustics.clear();
             self.clear_feedback = true;
         }
@@ -475,8 +493,7 @@ impl SceneLighting {
             pass.focus,
             replaced.map(|r| &r.2),
         );
-        self.cache
-            .record(list, &self.cache_pipelines, slot, pass.scene, pass.focus);
+        cache.record(list, &self.cache_pipelines, slot, pass.scene, pass.focus);
         list.barrier(
             Stages::COMPUTE,
             Stages::ALL | Stages::HOST,
@@ -524,7 +541,11 @@ impl SceneLighting {
                 capped_walks: s.capped_walks,
                 photon_overflows: s.photon_overflows,
                 stack_entries: s.stack_entries,
-                world_cache: self.cache.stats(slot),
+                world_cache: self
+                    .cache
+                    .as_ref()
+                    .expect("made by the frame's pass")
+                    .stats(slot),
                 caustics: self.caustics.stats(slot),
             }
         })
@@ -542,13 +563,17 @@ impl SceneLighting {
     }
 
     /// The world cache as kernels of `frame` read it, after that frame's [`Self::record`]:
-    /// `world_cache`'s `cache_lookup` and `world_cache_irradiance` take it.
+    /// `world_cache`'s `cache_lookup` and `world_cache_irradiance` take it. Null before the
+    /// scene's first pass, which makes the cache.
     pub fn world_cache(&self, frame: u64) -> GpuPtr<WorldCacheGpu> {
-        self.cache.root((frame % FRAME_SLOTS as u64) as usize)
+        let slot = (frame % FRAME_SLOTS as u64) as usize;
+        self.cache
+            .as_ref()
+            .map_or(GpuPtr::NULL, |cache| cache.root(slot))
     }
 
     pub(crate) fn world_cache_settings(&self) -> &WorldCacheSettings {
-        self.cache.settings()
+        &self.settings.world_cache
     }
 
     pub(crate) fn caustics(&self) -> &Caustics {
