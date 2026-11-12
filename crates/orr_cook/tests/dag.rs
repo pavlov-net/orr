@@ -17,7 +17,7 @@ use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MeshInput, MeshParts, MeshSettings,
     Source, StaticDisplacement,
 };
-use orr_math::{Vec2, Vec3};
+use orr_math::{DVec2, DVec3, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{Cluster, MeshHeader, NodePage};
 use orr_pack::model::ModelInfo;
@@ -941,20 +941,71 @@ fn log(around: u32, along: u32, charts: u32, amplitude: f32) -> MeshInput {
     m
 }
 
+/// The singular values of triangle `p`'s uv map `uv`, in uv per meter, largest first.
+fn uv_stretch(p: [[f32; 3]; 3], uv: [[f32; 2]; 3]) -> Option<[f64; 2]> {
+    let p = p.map(|p| Vec3::from(p).as_dvec3());
+    let uv = uv.map(|u| Vec2::from(u).as_dvec2());
+    let (e1, e2) = (p[1] - p[0], p[2] - p[0]);
+    let n = e1.cross(e2);
+    if n == DVec3::ZERO {
+        return None;
+    }
+    let x = e1.normalize();
+    let y = n.cross(e1).normalize();
+    let (a, b) = (DVec2::new(e1.dot(x), 0.0), DVec2::new(e2.dot(x), e2.dot(y)));
+    let (u1, u2) = (uv[1] - uv[0], uv[2] - uv[0]);
+    // The map's matrix J with J a = u1 and J b = u2.
+    let det = a.x * b.y - b.x * a.y;
+    let col = |i: usize| DVec2::new(u1[i] * b.y - u2[i] * a.y, u2[i] * a.x - u1[i] * b.x) / det;
+    let (r0, r1) = (col(0), col(1));
+    let s = r0.length_squared() + r1.length_squared();
+    let d = (r0.x * r1.y - r0.y * r1.x).abs();
+    let s1 = ((s + (s * s - 4.0 * d * d).max(0.0).sqrt()) / 2.0).sqrt();
+    Some([s1, if s1 > 0.0 { d / s1 } else { 0.0 }])
+}
+
 #[test]
 fn simplified_triangles_keep_to_one_uv_chart() {
-    // Simplification folds the bumps past their normals, and a corner that comes to oppose its
-    // face can lie nearest a vertex of the next strip.
+    // Simplification folds the bumps past their normals and joins the strips, so a coarse
+    // triangle stands for parts of more than one chart. Its uvs are one chart's and as dense
+    // as its surface's, within two levels of the source's: uvs spanning charts stretch the
+    // triangle's texels, uvs pinched onto a chart, as a nearby vertex's uvs make them, shrink
+    // its footprint, and either asks the runtime for texels the surface never shows.
     let d = load(&cook(log(96, 144, 6, 0.5), &[0], dag()), "m/mesh");
-    let cell = |uv: [f32; 2]| uv.map(|x| (x * 8.0).floor() as i32);
-    let mut spanning = 0;
-    for c in &d.clusters {
-        for uv in &c.uvs {
-            let cells = uv.map(cell);
-            spanning += usize::from(cells[0] != cells[1] || cells[1] != cells[2]);
-        }
+    // Per triangle with area: its area, largest stretch and footprint measure, the one the
+    // runtime's level follows (`footprint_lod`), and whether it is the source's.
+    let tris: Vec<(f64, f64, f64, bool)> = d
+        .clusters
+        .iter()
+        .flat_map(|c| {
+            let source = c.record.self_error == 0.0;
+            c.tris.iter().zip(&c.uvs).filter_map(move |(t, uv)| {
+                let [s1, s2] = uv_stretch(*t, *uv)?;
+                let p = t.map(|p| Vec3::from(p).as_dvec3());
+                let a = 0.5 * (p[1] - p[0]).cross(p[2] - p[0]).length();
+                Some((a, s1, f64::max(s1 / 16.0, s2), source))
+            })
+        })
+        .collect();
+    let source = tris.iter().filter(|t| t.3);
+    let widest = source.clone().map(|t| t.1).fold(0.0, f64::max);
+    let finest = source.map(|t| t.2).fold(f64::INFINITY, f64::min);
+    let (mut area, mut wide, mut fine) = (0.0, 0.0, 0.0);
+    for &(a, s1, f, _) in tris.iter().filter(|t| !t.3) {
+        area += a;
+        wide += if s1 > 4.0 * widest { a } else { 0.0 };
+        fine += if f < finest / 4.0 { a } else { 0.0 };
     }
-    assert_eq!(spanning, 0);
+    assert!(
+        wide <= 0.001 * area,
+        "{:.3}% of the area stretched",
+        100.0 * wide / area
+    );
+    assert!(
+        fine <= 0.001 * area,
+        "{:.3}% of the area pinched",
+        100.0 * fine / area
+    );
 }
 
 #[test]
