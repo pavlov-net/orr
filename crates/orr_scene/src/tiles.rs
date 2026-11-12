@@ -304,6 +304,8 @@ impl TextureFeedback {
     pub(crate) fn new(device: &Device, records: u32, fif: u32) -> Result<Self> {
         let dl = MemoryKind::DeviceLocal;
         let records = records.max(1);
+        let mut list = Capacity::new(records, u32::MAX);
+        list.set(records);
         Ok(Self {
             cells: None,
             cell_ranges: RangeAllocator::new(0),
@@ -314,7 +316,7 @@ impl TextureFeedback {
             slots: (0..fif.max(1))
                 .map(|_| SlotRecords::new(device, records))
                 .collect::<Result<_>>()?,
-            records: Capacity::new(records, u32::MAX),
+            records: list,
             raised: 0,
             retry: 0,
         })

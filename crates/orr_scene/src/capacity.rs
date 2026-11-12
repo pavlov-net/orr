@@ -1,18 +1,26 @@
-//! The capacity of a per-frame work list, which follows what the frames want of it.
+//! The capacity of a per-frame work list, which follows its floor and what the frames want of
+//! it.
 //!
-//! A list grows once a completed frame wanted more than it holds: to twice its size, or half
-//! as much again as was wanted when that is more. It shrinks once every frame of a window of
-//! [`SHRINK_FRAMES`] completed frames wanted at most a quarter of it, to half as much again
-//! as the most any of them wanted, never under its first size. A demand that holds steady
-//! moves neither way, so the size cannot swing between two. A list never holds more than its
-//! limit, the most entries its readers can name.
+//! A list holds its floor at least: what its content can ask of it in a frame, or what its
+//! views are estimated to ask where that is less. A scene under the estimate so drops nothing
+//! from its first frame on. A floor that rises past what the list holds grows it as [`grown`]
+//! says.
+//!
+//! Past its floor a list grows once a completed frame wanted more than it holds: to twice its
+//! size, or half as much again as was wanted when that is more. It shrinks once every frame of
+//! a window of [`SHRINK_FRAMES`] completed frames wanted at most a quarter of it, to half as
+//! much again as the most any of them wanted, never under its floor. A demand that holds
+//! steady moves neither way, so the size cannot swing between two. A list never holds more
+//! than its limit, the most entries its readers can name.
+
+use crate::table::grown;
 
 /// Completed frames a list waits before it gives memory back.
 const SHRINK_FRAMES: u32 = 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Capacity {
-    initial: u32,
+    floor: u32,
     limit: u32,
     /// What the list's memory holds.
     held: u32,
@@ -24,15 +32,31 @@ pub(crate) struct Capacity {
 }
 
 impl Capacity {
-    pub(crate) fn new(initial: u32, limit: u32) -> Self {
-        let initial = initial.min(limit);
+    /// A list that holds nothing yet, of `floor` at least and `limit` at most.
+    pub(crate) fn new(floor: u32, limit: u32) -> Self {
+        let floor = floor.min(limit);
         Self {
-            initial,
+            floor,
             limit,
-            held: initial,
-            wanted: initial,
+            held: 0,
+            wanted: floor,
             peak: 0,
             frames: 0,
+        }
+    }
+
+    /// The list holds `floor` at least from now on, within its limit: one that holds less grows
+    /// as [`grown`] says, and one that is to shrink shrinks no further.
+    pub(crate) fn floor(&mut self, floor: u32) {
+        let floor = floor.min(self.limit);
+        self.floor = floor;
+        if floor > self.held {
+            let more = floor - self.held;
+            let grown =
+                grown("work list", self.held, more, self.limit).expect("a floor within the limit");
+            self.wanted = self.wanted.max(grown);
+        } else {
+            self.wanted = self.wanted.max(floor);
         }
     }
 
@@ -46,7 +70,7 @@ impl Capacity {
             self.wanted = self.wanted.max(grown).min(self.limit);
         } else if self.frames >= SHRINK_FRAMES {
             if self.peak <= self.held / 4 {
-                self.wanted = self.initial.max(headroom(self.peak));
+                self.wanted = self.floor.max(headroom(self.peak));
             }
             self.peak = 0;
             self.frames = 0;
@@ -102,6 +126,8 @@ mod tests {
     #[test]
     fn a_list_grows_past_its_demand_at_once_and_shrinks_only_after_a_window_far_under_it() {
         let mut c = Capacity::new(100, u32::MAX);
+        assert_eq!((c.held(), c.resize()), (0, Some(100)), "its floor at first");
+        c.set(100);
         run(&mut c, 100, 1);
         assert_eq!(c.wanted(), 100, "what it holds is enough");
         c.observe(101);
@@ -129,10 +155,44 @@ mod tests {
         run(&mut c, 700, 4 * SHRINK_FRAMES);
         assert_eq!(c.wanted(), 1050);
         run(&mut c, 0, SHRINK_FRAMES);
-        assert_eq!(c.wanted(), 100, "never under its first size");
+        assert_eq!(c.wanted(), 100, "never under its floor");
 
         let mut c = Capacity::new(100, 250);
         run(&mut c, 400, 2);
         assert_eq!(c.wanted(), 250, "never past its limit");
+    }
+
+    #[test]
+    fn a_floor_grows_a_list_as_a_table_grows_and_lowers_only_what_it_shrinks_to() {
+        let mut c = Capacity::new(0, 1000);
+        run(&mut c, 0, 1);
+        assert_eq!(c.held(), 0, "a list of nothing holds nothing");
+        c.floor(10);
+        assert_eq!(c.resize(), Some(10), "what its content asks, from nothing");
+        c.set(10);
+        c.floor(11);
+        assert_eq!(c.resize(), Some(20), "twice what it holds past that");
+        c.set(20);
+        c.floor(15);
+        assert_eq!(c.resize(), None, "a floor it holds moves nothing");
+        c.floor(5000);
+        assert_eq!(c.resize(), Some(1000), "within its limit");
+        c.set(1000);
+        c.floor(3);
+        assert_eq!(c.resize(), None, "a lower floor gives nothing back at once");
+        for _ in 0..SHRINK_FRAMES {
+            c.observe(2);
+        }
+        assert_eq!(
+            c.resize(),
+            Some(3),
+            "a window far under it shrinks it to the floor"
+        );
+        c.floor(40);
+        assert_eq!(
+            c.resize(),
+            Some(40),
+            "or to a floor raised before it has shrunk"
+        );
     }
 }

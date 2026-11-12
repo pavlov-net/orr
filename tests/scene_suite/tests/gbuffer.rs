@@ -1493,7 +1493,6 @@ fn place_with(
     let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
     let history = w.scenes.create_view_history().unwrap();
     let models: Vec<ModelId> = copies.iter().map(|c| w.model(c.model)).collect();
-    let mut ranges = Vec::new();
     let list = [scene];
     let f = w
         .scenes
@@ -1507,6 +1506,29 @@ fn place_with(
     if let Some(m) = material {
         s.material_sets(0, 1).unwrap()[0] = m;
     }
+    let set = material.map(|_| 0);
+    let (group, ranges) = place_copies(&mut s, copies, &models, anchor, rt_range, set, lod);
+    drop(s);
+    wait(f.end(&[]).unwrap());
+    Placed {
+        scene,
+        ranges,
+        group,
+        history,
+        count: copies.len() as u32,
+    }
+}
+
+/// Places `copies` of `models` in one new group of `s`'s scene, as [`place_with`] does.
+fn place_copies(
+    s: &mut SceneWriter<'_>,
+    copies: &[Item],
+    models: &[ModelId],
+    anchor: DVec3,
+    rt_range: f32,
+    material_set: Option<u32>,
+    lod: Option<DebugLod>,
+) -> (TransformGroupId, Vec<InstanceRange>) {
     let group = s
         .create_transform_group(&TransformGroupDesc {
             count: copies.len() as u32,
@@ -1514,7 +1536,8 @@ fn place_with(
             anchor,
         })
         .unwrap();
-    for (i, (c, model)) in copies.iter().zip(models).enumerate() {
+    let mut ranges = Vec::new();
+    for (i, (c, &model)) in copies.iter().zip(models).enumerate() {
         s.transforms(group, i as u32, 1).unwrap()[0] =
             Affine3::from_mat3_translation(c.linear, c.at).into();
         let range = s
@@ -1524,7 +1547,7 @@ fn place_with(
                 transforms: group,
                 first: i as u32,
                 pose: None,
-                material_set: material.map(|_| 0),
+                material_set,
                 flags: InstanceFlags::RASTER | InstanceFlags::RAY,
                 rt_range,
                 animation_range: 0.0,
@@ -1536,15 +1559,40 @@ fn place_with(
         }
         ranges.push(range);
     }
-    drop(s);
-    wait(f.end(&[]).unwrap());
-    Placed {
-        scene,
-        ranges,
-        group,
-        history,
+    (group, ranges)
+}
+
+/// [`shoot`] of a scene that holds nothing before the shot's frame places `copies` in it, held
+/// at `lod`: the scene's first update with them is at the shot's detail, and is the frame read
+/// back.
+fn shoot_placing(
+    w: &mut World,
+    copies: &[Item],
+    lod: Option<DebugLod>,
+    shot: &Shot,
+) -> (Placed, Frame) {
+    let models: Vec<ModelId> = copies.iter().map(|c| w.model(c.model)).collect();
+    let mut placed = Placed {
+        scene: w.scenes.create_scene(&SceneDesc::default()).unwrap(),
+        ranges: Vec::new(),
+        group: TransformGroupId(0),
+        history: w.scenes.create_view_history().unwrap(),
         count: copies.len() as u32,
-    }
+    };
+    let mut made = None;
+    let frame = shoot_with(w, &placed, shot, |s| {
+        made = Some(place_copies(
+            s,
+            copies,
+            &models,
+            DVec3::ZERO,
+            100.0,
+            None,
+            lod,
+        ));
+    });
+    (placed.group, placed.ranges) = made.expect("the shot writes the scene");
+    (placed, frame)
 }
 
 /// What one rendered view reads back.
@@ -7355,36 +7403,39 @@ const CUT_EMPTY: usize = 27;
 /// `SlotCutGpu::flags` of a slot that gathered its cut and traces its cached cut instead.
 const CUT_FELL_BACK: u32 = 32;
 
+/// The error the copies of the growth test are drawn at, in pixels, and what their debug hold
+/// scales their errors by: the cuts of an error of one pixel, in lists whose first sizes
+/// follow the detail target.
+const COARSE_PIXELS: f32 = 1024.0;
+
+/// Copies drawn far finer than the detail target says ask more of every work list than the
+/// scene's detail is estimated to, so the lists start under what the frames want.
 #[test]
 fn work_lists_far_too_small_grow_until_nothing_drops_and_the_cut_takes_the_cluster_rule() {
     let _serial = serial();
     let mut w = World::with(&RendererDesc {
         rt_merge_pixels: 0.0,
         culled_error_scale: 1.0,
-        budgets: Budgets {
-            initial_traversal_nodes: 1,
-            initial_candidate_items: 1,
-            initial_visible_clusters: 1,
-            initial_rt_cut_clusters: 1,
-            initial_rt_cut_blas: 1,
-            ..Budgets::default()
-        },
+        raster_error_pixels: COARSE_PIXELS,
+        rt_error_pixels: COARSE_PIXELS,
         ..RendererDesc::default()
     });
     let items = dag_items();
-    let placed = place(&mut w, &items);
     let eye = Vec3::new(0.3, 1.2, 4.0);
     let target = Vec3::new(0.0, 0.0, -10.0);
+    let shot = |frame| Shot::at(eye.as_dvec3(), target.as_dvec3(), frame);
+    let finer = Some(DebugLod::ErrorScale(1.0 / COARSE_PIXELS));
+    let (placed, first) = shoot_placing(&mut w, &items, finer, &shot(1));
+    let mut first = Some(first);
     // Per frame: nodes, candidate items, visible clusters and second-pass work dropped, and
     // gathered cuts tracing cached ones.
     let mut drops = Vec::new();
     let mut last = None;
     for frame in 1..=GROWTH_FRAMES + 3 {
-        let g = shoot(
-            &mut w,
-            &placed,
-            &Shot::at(eye.as_dvec3(), target.as_dvec3(), frame),
-        );
+        let g = match first.take() {
+            Some(g) => g,
+            None => shoot(&mut w, &placed, &shot(frame)),
+        };
         let c = read_cut(&g.view, placed.count).counters;
         drops.push([
             c[8],
@@ -7398,10 +7449,13 @@ fn work_lists_far_too_small_grow_until_nothing_drops_and_the_cut_takes_the_clust
         last = Some(g);
     }
     let clean = drops.iter().position(|d| *d == [0; 7]);
+    // Nodes, candidate items and visible clusters each drop before the lists have grown, the
+    // items once the queues hold the nodes that write them, and a cut falls back.
+    let dropped = |list: usize, frames: usize| drops[..frames].iter().any(|d| d[list] > 0);
     assert!(
-        drops[0][..3].iter().all(|&d| d > 0)
-            && clean
-                .is_some_and(|f| f < GROWTH_FRAMES as usize && drops[..f].iter().any(|d| d[4] > 0)),
+        clean.is_some_and(
+            |f| f < GROWTH_FRAMES as usize && [0, 1, 2, 4].iter().all(|&l| dropped(l, f))
+        ),
         "drops by frame: {drops:?}"
     );
     assert!(
@@ -7415,7 +7469,14 @@ fn work_lists_far_too_small_grow_until_nothing_drops_and_the_cut_takes_the_clust
         let m = CpuMesh::of(item.model);
         let clusters = m.clusters();
         let p = Projector::new(item, eye);
-        let (want, near) = rule_cut(&m, &clusters, &p, 1.0, 1.0, &m.all_resident());
+        let (want, near) = rule_cut(
+            &m,
+            &clusters,
+            &p,
+            COARSE_PIXELS,
+            COARSE_PIXELS,
+            &m.all_resident(),
+        );
         let got = cut.raster(&m, slot);
         let differ: Vec<u32> = want.symmetric_difference(&got).copied().collect();
         assert!(
@@ -7435,6 +7496,11 @@ fn work_lists_far_too_small_grow_until_nothing_drops_and_the_cut_takes_the_clust
     assert_clean();
 }
 
+/// The projected radius, in pixels of the tests' detail, from which a copy gathers a cut in
+/// the worlds whose tables of the built cuts hold two BLAS: two copies of that radius tile the
+/// sphere of directions around the focus.
+const TWO_BLAS_MERGE_PIXELS: f32 = 1.45 * PIXELS_PER_RADIAN;
+
 /// Tilted grounds at growing distances, each cut over several levels, under tables of the
 /// built cuts that hold two BLAS and may not grow: the same copies build their cuts every
 /// frame of a still view, the nearest, and the farther ones trace cached cuts.
@@ -7442,12 +7508,11 @@ fn work_lists_far_too_small_grow_until_nothing_drops_and_the_cut_takes_the_clust
 fn past_tables_that_cannot_grow_the_farthest_copies_trace_cached_cuts_every_frame() {
     let _serial = serial();
     let mut w = World::with(&RendererDesc {
-        rt_merge_pixels: 0.0,
+        rt_merge_pixels: TWO_BLAS_MERGE_PIXELS,
         // Fine enough that each copy's cut mixes the levels several groups make up: a cut that
         // is one whole level may equal a cached cut, which builds nothing.
         rt_error_pixels: 1.0 / 32.0,
         budgets: Budgets {
-            initial_rt_cut_blas: 2,
             rt_cut_memory: PoolSize::Bytes(0),
             ..Budgets::default()
         },
@@ -7468,11 +7533,11 @@ fn past_tables_that_cannot_grow_the_farthest_copies_trace_cached_cuts_every_fram
         })
         .rev()
         .collect();
-    let placed = place(&mut w, &items);
     let eye = DVec3::new(0.3, 1.2, 4.0);
     let target = DVec3::new(0.0, 0.0, -10.0);
+    let (placed, _) = shoot_placing(&mut w, &items, None, &Shot::at(eye, target, 1));
     let mut sets = Vec::new();
-    for frame in 1..=8 {
+    for frame in 2..=8 {
         let g = shoot(&mut w, &placed, &Shot::at(eye, target, frame));
         if frame < 3 {
             continue;
@@ -7519,18 +7584,26 @@ const CUT_JOBS: usize = 6;
 #[test]
 fn equally_near_cuts_fill_tables_that_cannot_grow_in_slot_order() {
     let _serial = serial();
-    for (blas, clas, before) in [(2u32, 1u32 << 18, 0), (1024, 300, 0), (2, 1 << 18, 2100)] {
+    let sphere = 4.0 * std::f32::consts::PI * PIXELS_PER_RADIAN * PIXELS_PER_RADIAN;
+    for (two_blas, before) in [(true, 0), (false, 0), (true, 2100)] {
+        // Two BLAS and every CLAS the grounds can gather, or a BLAS a ground and about 300
+        // CLAS: one to that share of the sphere's pixels.
+        let (merge, cut_pixels) = if two_blas {
+            (TWO_BLAS_MERGE_PIXELS, 1e-3)
+        } else {
+            (0.0, sphere / 300.0)
+        };
         let mut w = World::with(&RendererDesc {
-            rt_merge_pixels: 0.0,
+            rt_merge_pixels: merge,
             budgets: Budgets {
-                initial_rt_cut_clusters: clas,
-                initial_rt_cut_blas: blas,
+                rt_cut_pixels: cut_pixels,
                 rt_cut_memory: PoolSize::Bytes(0),
                 ..Budgets::default()
             },
             ..RendererDesc::default()
         });
-        let what = format!("{blas} BLAS, {clas} CLAS, {before} slots before");
+        let short = if two_blas { "two BLAS" } else { "few CLAS" };
+        let what = format!("{short}, {before} slots before");
         // Out of ray-tracing range behind the camera.
         let far = Item {
             model: "plain",
@@ -7548,7 +7621,6 @@ fn equally_near_cuts_fill_tables_that_cannot_grow_in_slot_order() {
                 at: Vec3::new(3.0 * i as f32 - 6.0, -1.0, z),
             });
         let items: Vec<Item> = std::iter::repeat_n(far, before).chain(grounds).collect();
-        let placed = place(&mut w, &items);
         let (models, meshes, _) = orr_scene::testing::global_tables(&w.scenes);
         let model = u64::from(w.model("dag ground").0);
         let model: ModelGpu = read_buffer(models.offset(model), 1)[0];
@@ -7557,11 +7629,16 @@ fn equally_near_cuts_fill_tables_that_cannot_grow_in_slot_order() {
             read_buffer(mesh.rt_cuts, u64::from(mesh.rt_cut_count));
         let eye = DVec3::new(0.3, 1.2, 4.0);
         let target = DVec3::new(0.0, 0.0, -10.0);
+        let (placed, first) = shoot_placing(&mut w, &items, None, &Shot::at(eye, target, 1));
+        let mut first = Some(first);
         // Per frame: which copies built, and whether the CLAS ran out before the BLAS.
         let mut sets = Vec::new();
         let mut clas_short = false;
         for frame in 1..=8 {
-            let g = shoot(&mut w, &placed, &Shot::at(eye, target, frame));
+            let g = match first.take() {
+                Some(g) => g,
+                None => shoot(&mut w, &placed, &Shot::at(eye, target, frame)),
+            };
             let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
             let tables: CutGpu = read_buffer(root.cut, 1)[0];
             let cut = read_cut(&g.view, placed.count);
@@ -7620,7 +7697,7 @@ fn equally_near_cuts_fill_tables_that_cannot_grow_in_slot_order() {
             if frame < 3 {
                 continue;
             }
-            if blas == 2 {
+            if two_blas {
                 assert!(
                     order.len() > 2 && order.iter().all(|c| c.0.0 == 0) && fit.len() == 2,
                     "frame {frame}: {} of the cuts {order:?} fit",
@@ -7639,7 +7716,7 @@ fn equally_near_cuts_fill_tables_that_cannot_grow_in_slot_order() {
                 );
             }
         }
-        if blas == 2 {
+        if two_blas {
             assert!(
                 sets.windows(2).all(|s| s[0] == s[1]),
                 "the cuts the copies trace change between frames: {sets:?}"

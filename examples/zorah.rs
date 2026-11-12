@@ -396,13 +396,8 @@ fn budgets() -> Budgets {
                     << 30,
             )
         });
-    let count = |name: &str, default: u32| {
-        std::env::var(name).map_or(default, |n| n.parse().expect("a count"))
-    };
     Budgets {
         mesh_page_pool,
-        initial_rt_cut_clusters: count("ZORAH_RT_CUT_CLUSTERS", defaults.initial_rt_cut_clusters),
-        initial_rt_cut_blas: count("ZORAH_RT_CUT_BLAS", defaults.initial_rt_cut_blas),
         rt_cut_memory: std::env::var("ZORAH_RT_CUT_MIB").map_or(defaults.rt_cut_memory, |m| {
             orr::PoolSize::Bytes(
                 m.parse::<u64>()

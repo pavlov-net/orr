@@ -1,6 +1,6 @@
 //! A scene's GPU tables, its CPU bookkeeping and the writer consumers fill it through.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -28,6 +28,7 @@ use crate::tessellate::Patterns;
 use crate::traverse::Cuts;
 use crate::upload::{Op, Record};
 use crate::view::ViewHistoryId;
+use crate::work::{CopyWork, DetailTarget, Work};
 use crate::world::WorldPos;
 use crate::{
     DecalBinGpu, DecalGpu, EmissiveGpu, Error, GroupGpu, InstanceGpu, LightGpu, MediumProxyGpu,
@@ -525,6 +526,8 @@ pub(crate) struct ModelCpu {
     pub(crate) edit: bool,
     /// It has a representation chain, so its copies may fade between two steps.
     pub(crate) chained: bool,
+    /// The most a copy of it alone asks of the work lists.
+    pub(crate) work: CopyWork,
 }
 
 impl ModelCpu {
@@ -710,6 +713,11 @@ pub(crate) struct SceneCpu {
     slot_runs: Vec<(u32, Option<u8>)>,
     /// By model.
     copies: FxHashMap<u32, Copies>,
+    /// What the copies ask of the work lists; none while it is to be summed.
+    work: Option<Work>,
+    /// What the scene's last update sized its work lists from, which its views' lists follow
+    /// that frame.
+    pub(crate) sized: Option<(Work, DetailTarget)>,
     /// Section masks copies name since the last frame: their BLAS build if missing.
     pub(crate) masks: HashSet<(ModelId, u16)>,
     /// Ranges removed in a frame, freed once that frame has completed.
@@ -840,6 +848,7 @@ impl SceneCpu {
         c.count += n;
         let runs = CopyRuns { body, far: c.far };
         self.ptlas.hold_runs(runs, n);
+        self.work = None;
     }
 
     /// Counts `n` copies of `model` removed, whose part runs leave the pool.
@@ -857,6 +866,38 @@ impl SceneCpu {
             self.copies.remove(&model);
         }
         self.ptlas.leave_runs(CopyRuns { body, far }, n);
+        self.work = None;
+    }
+
+    /// The most the scene's copies ask of its work lists in a frame, summed over the models
+    /// that have copies when those or a chain have changed. A copy of a model with a chain
+    /// asks what two of its steps do.
+    pub(crate) fn work(
+        &mut self,
+        models: &[ModelCpu],
+        chains: &HashMap<ModelId, Vec<ModelId>>,
+    ) -> Work {
+        if let Some(work) = self.work {
+            return work;
+        }
+        let mut work = Work::default();
+        for (&model, c) in &self.copies {
+            let own = models[model as usize].work;
+            let mut steps = [own; 1 + crate::scenes::MAX_CHAIN];
+            let mut n = 1;
+            for step in chains.get(&ModelId(model)).into_iter().flatten() {
+                steps[n] = models[step.0 as usize].work;
+                n += 1;
+            }
+            work.add(CopyWork::fading(&steps[..n]), c.count);
+        }
+        self.work = Some(work);
+        work
+    }
+
+    /// A chain has changed, so what the copies ask is summed anew.
+    pub(crate) fn chains_changed(&mut self) {
+        self.work = None;
     }
 
     /// The lowest id no group holds; 0 means none.
@@ -1616,6 +1657,8 @@ impl Scene {
                 slot_holds: Vec::new(),
                 slot_runs: Vec::new(),
                 copies: FxHashMap::default(),
+                work: None,
+                sized: None,
                 masks: HashSet::new(),
                 removed: Vec::new(),
                 emissive: RangeAllocator::new(0),

@@ -56,6 +56,7 @@ use crate::transparency::TransparencyPass;
 use crate::traverse::{CutInputs, CutPipelines, CutSizes, CutStats, Cuts, PageFeedback};
 use crate::upload::{Record, scatter};
 use crate::view::{RasterView, ViewDesc, ViewHistory, ViewHistoryId, view_constants};
+use crate::work::DetailTarget;
 use crate::world::{WorldPos, needs_rebase, origin_for};
 mod probe;
 
@@ -101,39 +102,54 @@ impl PoolBytes {
 }
 
 /// Pool sizes and per-frame limits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// The cluster work lists have no size here. A view's visible clusters, a scene's traversal
+/// queues and raster candidate cut and the tables of the ray-tracing cuts it builds each hold
+/// what the content can ask of them in a frame: the hierarchy nodes, cluster groups and
+/// clusters of the scene's copies and the clusters its producers emit. A scene that asks less
+/// than its views are estimated to drops nothing from its first frame. Past the estimate a
+/// list starts at it, grows a few frames after a frame wanted more than it holds, and gives
+/// memory back after a long run of frames that want far less. The estimate takes a cluster to
+/// cover the square of the error it is drawn at, [`RendererDesc::raster_error_pixels`] on a
+/// side: a view's visible clusters over the pixels of its render extent, 2^25 at most, the
+/// clusters a visibility buffer word can name; a scene's traversal over the pixels of the
+/// sphere of directions around its focus at the detail its views ask for, since it chooses
+/// geometry whatever they face.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Budgets {
     /// Bytes per upload block; a window that outgrows its blocks takes another.
     pub upload_block: u64,
-    /// Visible clusters one view's list holds at first. A list grows a few frames after a
-    /// frame wanted more than it holds, and gives memory back after a long run of frames that
-    /// want far less. It holds 2^25 at most, the clusters a visibility buffer word can name.
-    pub initial_visible_clusters: u32,
-    /// Items of up to 32 clusters a scene's raster candidate cut holds at first; it grows like
-    /// the visible clusters. The work a view's first culling pass leaves to its second holds
-    /// as many as its scene's candidate cut.
-    pub initial_candidate_items: u32,
-    /// Hierarchy nodes each of a scene's traversal queues holds at first, the nodes one pass
-    /// visits; they grow like the visible clusters.
-    pub initial_traversal_nodes: u32,
     /// Mesh pages, hierarchy pages and finer cached cuts a scene's traversal asks the loading
     /// side for in a frame, at most: those of the largest projected errors. The others wait
     /// for a later frame.
     pub traversal_requests: u32,
-    /// CLAS the cluster BLAS a scene builds in a frame for the ray-tracing cuts its traversal
-    /// gathers take at first, and those BLAS. Their tables and arenas grow to what completed
-    /// frames wanted within `rt_cut_memory`. While a frame wants more than they hold, its cuts
-    /// build nearest the focus first, up to the first whose CLAS or BLAS find no room left:
-    /// the copies of that cut and of the cuts after it trace cached cuts. A copy is as far as
-    /// its model's bounds, so every copy whose bounds hold the focus is at distance 0; cuts
-    /// equally far go in the order of their first copies' instance slots. The same copies
-    /// build every frame of a still view. Above 0.
-    pub initial_rt_cut_clusters: u32,
-    pub initial_rt_cut_blas: u32,
+    /// Render pixels, at the scene's detail and an error of one pixel, to each CLAS the
+    /// tables of a scene's built ray-tracing cuts hold room for before the frames have told
+    /// what they want, over the sphere of directions around its focus; a scene whose copies
+    /// can gather fewer holds those. The BLAS they hold room for are the copies that tile
+    /// that sphere at [`RendererDesc::rt_merge_pixels`], under which a copy gathers no cut.
+    /// Above 0.
+    ///
+    /// The gathered cuts hold far fewer clusters than the raster's candidates, by a factor
+    /// the scene sets and nothing the renderer holds gives: only copies near the focus gather,
+    /// and copies with equal cuts share one. A CLAS and the BLAS over it take many times the
+    /// device memory of a candidate, so the tables do not start at the raster's estimate of a
+    /// cluster to the error's square either. This value stands in for that factor. Lower it
+    /// where a scene's first frames or a camera cut leave copies tracing cached cuts
+    /// ([`CutStats::rt_fallback`]) for want of CLAS ([`CutStats::rt_wanted_clas`] over
+    /// `rt_clas_capacity`).
+    ///
+    /// While a frame wants more than the tables hold, its cuts build nearest the focus first,
+    /// up to the first whose CLAS or BLAS find no room left: the copies of that cut and of the
+    /// cuts after it trace cached cuts. A copy is as far as its model's bounds, so every copy
+    /// whose bounds hold the focus is at distance 0; cuts equally far go in the order of their
+    /// first copies' instance slots. The same copies build every frame of a still view.
+    pub rt_cut_pixels: f32,
     /// Device memory a scene's tables of built ray-tracing cuts and their BLAS arenas grow
-    /// to at most; the first sizes take what they take. Past it the gathered cuts coarsen
-    /// evenly until their CLAS fit ([`DetailStats::rt_scale`]), and builds past what fits
-    /// leave the farthest copies their cached cuts.
+    /// to at most, past what the content or `rt_cut_pixels` gives them, which they take
+    /// whatever it is. Past it the gathered cuts coarsen evenly until their CLAS fit
+    /// ([`DetailStats::rt_scale`]), and builds past what fits leave the farthest copies their
+    /// cached cuts.
     pub rt_cut_memory: PoolSize,
     /// Triangles of edited clusters whose CLAS rebuild in one frame, at most; a first edit
     /// past it still rebuilds alone.
@@ -166,8 +182,9 @@ pub struct Budgets {
     /// Bytes of requested blobs loading or landed and not released.
     pub user_blob_pool: u64,
     /// Records of raises of a texture feedback cell's wanted mip a frame keeps at first; the
-    /// list grows like the visible clusters. While a frame raises more, each frame keeps a
-    /// different run of its raises, so every cell is heard within a few frames.
+    /// list grows a few frames after a frame raised more than it holds. While a frame raises
+    /// more, each frame keeps a different run of its raises, so every cell is heard within a
+    /// few frames.
     pub initial_texture_feedback_records: u32,
     /// Bytes loading at once: of streamed units and requested blobs from the step that starts
     /// their reads to the one their GPU work lands in, which hold staging and read buffers that
@@ -194,12 +211,8 @@ impl Default for Budgets {
     fn default() -> Self {
         Self {
             upload_block: 16 << 20,
-            initial_visible_clusters: 1 << 20,
-            initial_candidate_items: 1 << 18,
-            initial_traversal_nodes: 1 << 18,
             traversal_requests: 4096,
-            initial_rt_cut_clusters: 1 << 18,
-            initial_rt_cut_blas: 1024,
+            rt_cut_pixels: 32.0,
             rt_cut_memory: PoolSize::HeapPercent(10),
             edit_triangles: 1 << 18,
             stream_clas_triangles: 1 << 18,
@@ -218,7 +231,7 @@ impl Default for Budgets {
 }
 
 /// Farther models a representation chain holds: the length of `ModelGpu::chain`.
-const MAX_CHAIN: usize = 3;
+pub(crate) const MAX_CHAIN: usize = 3;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RendererDesc {
@@ -534,10 +547,7 @@ impl Scenes {
         assert!(desc.cell_log2 <= 16, "cells of 2^{} m", desc.cell_log2);
         let b = &desc.budgets;
         assert!(b.in_flight_bytes > 0, "in_flight_bytes is above 0");
-        assert!(
-            b.initial_rt_cut_clusters > 0 && b.initial_rt_cut_blas > 0,
-            "initial_rt_cut_clusters and initial_rt_cut_blas are above 0"
-        );
+        assert!(b.rt_cut_pixels > 0.0, "rt_cut_pixels is above 0");
         assert!(
             desc.culled_error_scale >= 1.0 && desc.hidden_detail_lead >= 1.0,
             "culled_error_scale and hidden_detail_lead are at least 1"
@@ -772,6 +782,9 @@ impl Scenes {
             .filter(|(model, steps)| gone.contains(model) || steps.iter().any(|s| gone.contains(s)))
             .map(|(&model, _)| model)
             .collect();
+        for scene in core.scenes.iter().flatten() {
+            scene.cpu.lock().unwrap().chains_changed();
+        }
         for model in ended {
             core.chains.remove(&model);
             if !gone.contains(&model) {
@@ -921,6 +934,9 @@ impl Scenes {
             core.chains
                 .insert(model, chain.iter().map(|&(m, _)| m).collect());
             core.chained = true;
+        }
+        for scene in core.scenes.iter().flatten() {
+            scene.cpu.lock().unwrap().chains_changed();
         }
         if gains_far {
             for scene in core.scenes.iter().flatten() {
@@ -1190,8 +1206,7 @@ impl Scenes {
             u64::from(self.core.fif),
             "visible cluster readback",
         )?;
-        let visible = self.core.budgets.initial_visible_clusters;
-        let history = ViewHistory::new(exposure, arena, visible, readback);
+        let history = ViewHistory::new(exposure, arena, readback);
         Ok(ViewHistoryId(insert(&mut self.core.histories, history)))
     }
 
@@ -1883,14 +1898,20 @@ impl<'a> Frame<'a> {
             let producers = cpu.producers.iter().any(Option::is_some);
             let tlas = cpu.ptlas.tlas(device, core.fif, producers)?;
             let layout = cpu.ptlas.layout();
+            let work = cpu.work(&core.model_cpu, &core.chains);
+            let detail = DetailTarget {
+                pixels_per_radian: cpu.pixels_per_radian,
+                raster_pixels: core.raster_error_pixels,
+                rt_pixels: core.rt_error_pixels,
+                merge_pixels: core.rt_merge_pixels,
+                rt_cut_pixels: core.budgets.rt_cut_pixels,
+            };
+            cpu.sized = Some((work, detail));
+            let floors = detail.floors(&work);
             if cpu.cuts.is_none() {
                 let heap = device.memory_report().heap_of(MemoryKind::DeviceLocal).size;
                 let sizes = CutSizes {
                     slots: cpu.slot_capacity(),
-                    queue: core.budgets.initial_traversal_nodes,
-                    candidates: core.budgets.initial_candidate_items,
-                    rt_clas: core.budgets.initial_rt_cut_clusters,
-                    rt_blas: core.budgets.initial_rt_cut_blas,
                     rt_bytes: core.budgets.rt_cut_memory.bytes(heap),
                     models: core.mounts.models.capacity(),
                     entries: core.mounts.mesh_pages.entries(),
@@ -1901,7 +1922,7 @@ impl<'a> Frame<'a> {
             let cuts = cpu.cuts.as_mut().expect("made above");
             cuts.follow_models(device, core.mounts.models.capacity())?;
             cuts.follow_entries(device, core.mounts.mesh_pages.entries())?;
-            match cuts.fit(device, self.id, response_period(core.fif)) {
+            match cuts.fit(device, self.id, response_period(core.fif), floors) {
                 Err(e) if e.is_out_of_memory() => short.push(e),
                 r => r?,
             }
@@ -2587,7 +2608,7 @@ impl<'a> Frame<'a> {
                 core.cell_log2,
             )
             .to_array();
-        let (slots, slot_capacity, smoke, scene_features, work, producers) = {
+        let (slots, slot_capacity, smoke, scene_features, work, producers, sized) = {
             let cpu = scene.cpu.lock().unwrap();
             let features = cpu.features();
             let smoke = features.contains(SceneFeatures::SMOKE);
@@ -2604,6 +2625,7 @@ impl<'a> Frame<'a> {
                 features,
                 cuts.candidate_capacity(),
                 producers,
+                cpu.sized.expect("an updated scene has sized its lists"),
             )
         };
         let features = core.features() | scene_features;
@@ -2634,30 +2656,37 @@ impl<'a> Frame<'a> {
         let mut all = ViewTargets::requests(&sizes);
         all.extend_from_slice(requests);
         history.arena.layout(&all, list)?;
+        let produced = producers.iter().map(|&(_, n)| u64::from(n)).sum();
+        let pixels = u64::from(view.render_extent.x) * u64::from(view.render_extent.y);
+        history
+            .visible
+            .floor(sized.1.visible(&sized.0, produced, pixels));
         // The second culling pass takes at most one work item per candidate item.
         let want = ListSizes {
             visible_clusters: history.visible.wanted(),
             work,
         };
         let mut short = None;
-        match &mut history.lists {
-            None => history.lists = Some(ViewLists::new(device, want)?),
-            Some(lists) if lists.sizes() != want && self.id >= history.lists_retry => {
-                match lists.resize(device, want) {
-                    Ok(()) => {}
-                    // The view keeps the lists it has while the streaming budgets make room.
-                    Err(e) if e.is_out_of_memory() => {
-                        history.lists_retry = self.id + response_period(core.fif);
-                        short = Some(e);
-                    }
-                    Err(e) => return Err(e),
+        if history.lists.is_none() {
+            let none = ListSizes {
+                visible_clusters: 0,
+                work: 0,
+            };
+            history.lists = Some(ViewLists::new(device, none)?);
+        }
+        let lists = history.lists.as_mut().expect("lists made above");
+        if lists.sizes() != want && self.id >= history.lists_retry {
+            match lists.resize(device, want) {
+                Ok(()) => {}
+                // The view keeps the lists it has while the streaming budgets make room.
+                Err(e) if e.is_out_of_memory() => {
+                    history.lists_retry = self.id + response_period(core.fif);
+                    short = Some(e);
                 }
+                Err(e) => return Err(e),
             }
-            Some(_) => {}
         }
-        if let Some(lists) = &history.lists {
-            history.visible.set(lists.sizes().visible_clusters);
-        }
+        history.visible.set(lists.sizes().visible_clusters);
         history.arena.enter(ViewStep::Raster, list);
         match &mut history.targets {
             Some(t) if t.sizes == sizes => t.bind(&history.arena),

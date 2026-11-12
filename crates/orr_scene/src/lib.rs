@@ -83,6 +83,7 @@ mod transparency;
 mod traverse;
 mod upload;
 mod view;
+mod work;
 mod world;
 
 pub use orr_gpu;

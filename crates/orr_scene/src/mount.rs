@@ -57,6 +57,7 @@ use crate::table::{Column, Table, TableCopy, grown};
 use crate::tiles::{TexStream, TileGrid};
 use crate::traverse::{PAGED_DEPTH, PageFeedback};
 use crate::upload::Record;
+use crate::work::CopyWork;
 use crate::{
     ClusterRef, EditGroupGpu, Error, MaskGpu, MaterialGpu, MeshGpu, ModelGpu, NeuralSetGpu,
     NeuralTextureGpu, PartGpu, Result, SetTablesGpu, SkinMeshGpu, TextureStreamGpu, material_flags,
@@ -1621,6 +1622,63 @@ struct ResolvedModel {
     bounds: Aabb,
 }
 
+impl ResolvedMesh {
+    /// The most a copy of a model of the mesh asks of the work lists in a frame.
+    ///
+    /// A traversal pass visits a hierarchy node once for a copy, and a group's leaf writes an
+    /// item per 32 of the group's clusters at most; a cut holds a cluster once. A copy of
+    /// discrete levels draws one level, in items of up to 32 clusters of one page, and gathers
+    /// no cut. A skinned copy's candidates are the clusters its skinning took, an item each at
+    /// most.
+    fn copy_work(&self) -> CopyWork {
+        let items = |clusters: u32| clusters.div_ceil(32);
+        let mut work = if self.levels.is_empty() {
+            let paged: u64 = self
+                .node_units
+                .iter()
+                .map(|&(_, bytes, _)| u64::from(bytes))
+                .sum();
+            let paged = paged / size_of::<orr_pack::mesh::Node>() as u64;
+            CopyWork {
+                nodes: self.header.nodes.count + paged as u32,
+                items: self
+                    .groups
+                    .iter()
+                    .map(|g| items(u32::from(g.cluster_count)))
+                    .sum(),
+                clusters: self.gpu.cluster_count,
+                rt_clusters: self.gpu.cluster_count,
+                rt_blas: 1,
+            }
+        } else {
+            let level = |&(_, first, count): &(f32, u32, u32)| {
+                let end = first + count;
+                let of_page = |p: &StreamedPage| {
+                    let shared = end
+                        .min(p.first + p.clusters)
+                        .saturating_sub(first.max(p.first));
+                    items(shared)
+                };
+                (self.all_pages.iter().map(of_page).sum::<u32>(), count)
+            };
+            let (items, clusters) = self
+                .levels
+                .iter()
+                .map(level)
+                .fold((0, 0), |a, l| (a.0.max(l.0), a.1.max(l.1)));
+            CopyWork {
+                items,
+                clusters,
+                ..CopyWork::default()
+            }
+        };
+        if self.header.attributes & MeshHeader::SKIN != 0 {
+            work.items = work.items.max(work.clusters);
+        }
+        work
+    }
+}
+
 /// A mount's assets with every reference between them resolved inside the pack.
 struct Resolved {
     source: Arc<BlobSource>,
@@ -3112,10 +3170,18 @@ impl Mounts {
         if w.cages.len() <= i {
             w.cages.resize(i + 1, None);
         }
+        // An edit's copies always gather: the clusters it holds, in a BLAS for its body and
+        // one per animated part.
+        let source = w.model_cpu[p.model.0 as usize];
         w.model_cpu[i] = ModelCpu {
             edit: true,
             chained: false,
-            ..w.model_cpu[p.model.0 as usize]
+            work: CopyWork {
+                rt_clusters: source.work.clusters,
+                rt_blas: 1 + source.animated_parts,
+                ..source.work
+            },
+            ..source
         };
         w.cages[i] = None;
         self.owners.insert(id, (p.mount, p.mesh));
@@ -3932,6 +3998,7 @@ impl Mounts {
                 cage_only: false,
                 edit: false,
                 chained: false,
+                work: mesh.copy_work(),
             };
         }
         let mut page_entries = Vec::with_capacity(pages.len());

@@ -236,10 +236,11 @@ pub struct RasterView {
     /// of room, 1, cluster work items asked for, mesh-shader opaque and alpha draws,
     /// software-rastered clusters, and visible particle clusters; entry 16 counts the visible
     /// dielectric and presence clusters that drew into `targets.layer_tiles`, and entry 17 the
-    /// visible smoke clusters. The lists grow to what the frames ask for from
-    /// [`crate::Budgets::initial_visible_clusters`], so they drop only in the frames before
-    /// they have grown, while device memory has no room for them, and past the 2^25 visible
-    /// clusters a visibility buffer word can name.
+    /// visible smoke clusters. The lists hold what the scene's copies and producers can ask of
+    /// them ([`crate::Budgets`]), so they drop only where that is more than a cluster to each
+    /// pixel of the detail target's error over the render extent, in the frames before they
+    /// have grown to what the frames ask for; while device memory has no room for them; and
+    /// past the 2^25 visible clusters a visibility buffer word can name.
     pub counts: GpuPtr<u32>,
     /// The view's raster state: `gbuffer` and the culling lists, the particle list among
     /// them.
@@ -286,7 +287,6 @@ impl ViewHistory {
     pub(crate) fn new(
         exposure: Allocation<ExposureState>,
         arena: ViewArena,
-        visible: u32,
         readback: Allocation<u32>,
     ) -> Self {
         Self {
@@ -296,7 +296,7 @@ impl ViewHistory {
             targets: None,
             arena,
             lists: None,
-            visible: Capacity::new(visible, VISIBLE_CLUSTER_LIMIT),
+            visible: Capacity::new(0, VISIBLE_CLUSTER_LIMIT),
             lists_retry: 0,
             draws: Vec::new(),
             rendered: vec![None; readback.len() as usize],

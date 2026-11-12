@@ -15,12 +15,12 @@ use orr::orr_output::{
     ReconstructionSupport, UpscaleQuality,
 };
 use orr::{
-    ArenaReport, AutoExposure, Budgets, DirectionalLight, DiscProfile, Exposure, FrameDesc,
-    FrameTime, Glare, GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens,
-    Light, LightId, LitView, LoadState, MountId, OutputDebug, PackSource, PathEntry, PipelineId,
-    PostQuality, Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId,
-    TextureFilter, TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks, ViewLighting,
-    ViewOutput, ViewTarget,
+    ArenaReport, AutoExposure, DirectionalLight, DiscProfile, Exposure, FrameDesc, FrameTime,
+    Glare, GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId,
+    LitView, LoadState, MountId, OutputDebug, PackSource, PathEntry, PipelineId, PostQuality,
+    Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId, TextureFilter,
+    TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks, ViewLighting, ViewOutput,
+    ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source};
 use orr_gpu::{
@@ -455,15 +455,9 @@ fn view_of<'a>(
 /// each frame's image and the view's arena after a frame with hooks.
 fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
     let d = device();
-    // Small cluster lists, so the per-pixel targets take most of the arena and share bytes.
     let desc = RendererDesc {
         alias_view_targets: alias,
         path_entry: PathEntry::Compute,
-        budgets: Budgets {
-            initial_visible_clusters: 1024,
-            initial_candidate_items: 1024,
-            ..Budgets::default()
-        },
         ..RendererDesc::default()
     };
     let mut r = Renderer::new(d, desc).unwrap();

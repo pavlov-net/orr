@@ -21,9 +21,12 @@
 //! serve them; an edit's copies always gather, with what it touches held at level 0, split
 //! into a BLAS for the body and one per animated part while they take their pose.
 //!
-//! The tables of the built cuts and the arenas their BLAS build into grow to what completed
-//! frames wanted, within [`crate::Budgets::rt_cut_memory`] and the device memory there is.
-//! Only past what they can hold do the gathered cuts' thresholds take a scale of their own,
+//! The queues, the candidate cut and the tables of the built cuts hold what the scene's copies
+//! can ask of them, or what its detail is estimated to ask where that is less
+//! ([`crate::work`]), and past that grow to what completed frames wanted: the tables and the
+//! arenas their BLAS build into within [`crate::Budgets::rt_cut_memory`], all within the
+//! device memory there is. Only past what the tables can hold do the gathered cuts'
+//! thresholds take a scale of their own,
 //! steered ([`Detail`]) from the CLAS the cuts wanted against what the tables hold, so that
 //! the cuts coarsen evenly rather than more copies fall back.
 
@@ -39,6 +42,7 @@ use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::shaders::feedback::{self, FeedbackRoot};
 use crate::shaders::traverse::{self, TraverseRoot};
+use crate::work::Floors;
 use crate::{
     BlasJob, ClusterWork, CutGpu, CutKey, FeedbackGpu, NodeItem, PartListGpu, Result, SceneRoot,
     SeenView, SlotCutGpu,
@@ -105,9 +109,9 @@ pub struct CutStats {
     /// Hierarchy nodes the passes visited.
     pub nodes: u32,
     /// Nodes and candidate items past their capacity, and nodes a hierarchy deeper than the
-    /// passes left. The traversal queues and the candidate cut grow to what the frames want
-    /// from their first sizes ([`crate::Budgets::initial_traversal_nodes`],
-    /// `initial_candidate_items`), so they drop only in the frames before they have grown and
+    /// passes left. The traversal queues and the candidate cut hold what the scene's copies
+    /// can ask of them, so they drop only where that is more than the scene's detail is
+    /// estimated to ask, in the frames before they have grown to what the frames want, and
     /// while device memory has no room for them.
     pub nodes_dropped: u32,
     pub candidates_dropped: u32,
@@ -248,13 +252,8 @@ impl CutPipelines {
 pub(crate) struct CutSizes {
     /// The scene's instance slots, which the slots' cuts follow as they grow.
     pub(crate) slots: u32,
-    /// The first sizes of each traversal queue and of the candidate cut, which grow.
-    pub(crate) queue: u32,
-    pub(crate) candidates: u32,
-    /// The first CLAS and BLAS builds the tables of the built cuts hold, which grow, and the
-    /// bytes those tables and their arenas grow to at most.
-    pub(crate) rt_clas: u32,
-    pub(crate) rt_blas: u32,
+    /// The bytes the tables of the built cuts and their arenas grow to at most, past what
+    /// their floors take.
     pub(crate) rt_bytes: u64,
     /// Entries of the model table, which the merged cuts follow as it grows.
     pub(crate) models: u32,
@@ -341,6 +340,20 @@ struct RtSizes {
 }
 
 impl RtSizes {
+    /// What tables at the floors `f` hold.
+    fn of(f: &Floors) -> Self {
+        Self {
+            clas: f.rt_clas,
+            jobs: f.rt_blas,
+            keys: key_entries(f.rt_keys),
+        }
+    }
+
+    /// Whether a frame can build a cut into them.
+    fn builds(&self) -> bool {
+        self.clas > 0 && self.jobs > 0
+    }
+
     /// The frame's build. The admission keeps every cut within the CLAS, so one BLAS may take
     /// them all.
     fn blas_desc(&self) -> RtasOpDesc {
@@ -368,7 +381,7 @@ impl RtSizes {
             + u64::from(device.rtas_args_stride(RtasOp::BuildClusterBlas))
             + size_of::<PartListGpu>() as u64;
         let tables = 16 * clas + per_job * jobs;
-        if !traced {
+        if !traced || !self.builds() {
             return tables;
         }
         let sizes = device.rtas_sizes(&self.blas_desc());
@@ -425,8 +438,8 @@ struct RtTables {
     records: Allocation<u8>,
     part_lists: Allocation<PartListGpu>,
     keys: Allocation<CutKey>,
-    /// Two arenas, made on devices that build cluster BLAS: a frame builds into one while the
-    /// PTLAS may still reference the other.
+    /// Two arenas, made on devices that build cluster BLAS for tables that can hold a cut: a
+    /// frame builds into one while the PTLAS may still reference the other.
     arenas: Option<([Allocation<u8>; 2], Allocation<u8>)>,
 }
 
@@ -435,7 +448,7 @@ impl RtTables {
         let dl = MemoryKind::DeviceLocal;
         let n = |c: u32| u64::from(c.max(1));
         let (clas, jobs) = (n(sizes.clas), n(sizes.jobs));
-        let arenas = if traced {
+        let arenas = if traced && sizes.builds() {
             let rtas = device.rtas_sizes(&sizes.blas_desc());
             let arena = || {
                 device.gpu_malloc_with_priority(
@@ -541,6 +554,8 @@ pub(crate) struct Cuts {
     lists: Lists,
     queue: Capacity,
     candidates: Capacity,
+    /// What the lists and the tables of the built cuts hold at least.
+    floors: Floors,
     /// The frame from which a growth that found no memory may be tried again.
     retry: u64,
     rt: RtTables,
@@ -612,6 +627,8 @@ pub(crate) struct CutInputs {
 }
 
 impl Cuts {
+    /// The cut tables of a scene, their work lists holding nothing until [`Self::fit`] gives
+    /// them their floors.
     pub(crate) fn new(device: &Device, sizes: CutSizes, fif: u32) -> Result<Self> {
         let dl = MemoryKind::DeviceLocal;
         let mut blocks = Vec::new();
@@ -622,18 +639,13 @@ impl Cuts {
             Ok(gpu)
         };
         let slot_cut = slot_cuts(device, sizes.slots)?;
-        let lists = Lists::new(device, sizes.queue, sizes.candidates)?;
-        let keys = 4 * sizes.rt_blas.max(1);
+        let floors = Floors::default();
+        let lists = Lists::new(device, 0, 0)?;
         let traced = device.caps().cluster.max_partitions > 0;
-        let rt = RtTables::new(
-            device,
-            RtSizes {
-                clas: sizes.rt_clas.max(1),
-                jobs: sizes.rt_blas.max(1),
-                keys: key_entries(keys),
-            },
-            traced,
-        )?;
+        let rt = RtTables::new(device, RtSizes::of(&floors), traced)?;
+        // The table of equal cuts holds an entry at least.
+        let mut keys = Capacity::new(0, RT_KEYS_LIMIT);
+        keys.set(rt.sizes.keys / 2);
         let model_cut = merged_cuts(device, sizes.models)?;
         let counters = block(4 * COUNTERS as u64, "cut counters")?.cast();
         let args = block(4 * ARGS_TOTAL, "cut args")?.cast();
@@ -666,8 +678,8 @@ impl Cuts {
             histogram,
             feedback,
             admit,
-            queue_capacity: sizes.queue,
-            candidate_capacity: sizes.candidates,
+            queue_capacity: 0,
+            candidate_capacity: 0,
             clas_capacity: 0,
             job_capacity: 0,
             key_mask: 0,
@@ -691,12 +703,13 @@ impl Cuts {
             gpu,
             record: cut_record(device, gpu)?,
             lists,
-            queue: Capacity::new(sizes.queue, u32::MAX),
-            candidates: Capacity::new(sizes.candidates, u32::MAX),
+            queue: Capacity::new(0, u32::MAX),
+            candidates: Capacity::new(0, u32::MAX),
+            floors,
             retry: 0,
-            clas: Capacity::new(rt.sizes.clas, RT_CLAS_LIMIT),
-            jobs: Capacity::new(rt.sizes.jobs, RT_BLAS_LIMIT),
-            keys: Capacity::new(keys, RT_KEYS_LIMIT),
+            clas: Capacity::new(0, RT_CLAS_LIMIT),
+            jobs: Capacity::new(0, RT_BLAS_LIMIT),
+            keys,
             rt,
             rt_retry: 0,
             clas_short: false,
@@ -823,13 +836,30 @@ impl Cuts {
         Ok(())
     }
 
-    /// Resizes the queues, the candidate cut and the tables of the built cuts to what the
-    /// completed frames wanted, before `frame` records anything that reads them; the frames before keep the old ones, whose memory is freed
-    /// after the work submitted so far. The built cuts' tables take what fits their budget.
-    /// Without device memory for new ones the old ones stay, the error is returned, and no
-    /// resize of them is tried before `period` frames have passed; nor of the built cuts'
-    /// tables after their budget held them back.
-    pub(crate) fn fit(&mut self, device: &Device, frame: u64, period: u64) -> Result<()> {
+    /// Resizes the queues, the candidate cut and the tables of the built cuts to `floors` and
+    /// to what the completed frames wanted past them, before `frame` records anything that
+    /// reads them; the frames before keep the old ones, whose memory is freed after the work
+    /// submitted so far. The built cuts' tables take their floors and, past them, what fits
+    /// their budget. Without device memory for new ones the old ones stay, the error is
+    /// returned, and no resize of them is tried before `period` frames have passed or the
+    /// floors change; nor of the built cuts' tables after their budget held them back.
+    pub(crate) fn fit(
+        &mut self,
+        device: &Device,
+        frame: u64,
+        period: u64,
+        floors: Floors,
+    ) -> Result<()> {
+        if floors != self.floors {
+            self.floors = floors;
+            self.queue.floor(floors.queue);
+            self.candidates.floor(floors.candidates);
+            self.clas.floor(floors.rt_clas);
+            self.jobs.floor(floors.rt_blas);
+            self.keys.floor(floors.rt_keys);
+            self.retry = 0;
+            self.rt_retry = 0;
+        }
         let mut error = None;
         let lists = self.grow_lists(device, frame, period).unwrap_or_else(|e| {
             error = Some(e);
@@ -897,8 +927,15 @@ impl Cuts {
         if wanted == held || frame < self.rt_retry {
             return Ok(None);
         }
-        let budget = self.sizes.rt_bytes.max(held.budgeted(device, self.traced));
-        let fit = wanted.within(held, budget, device, self.traced);
+        // The floors take what they take; the budget holds what the tables grow by past them.
+        let floor = RtSizes::of(&self.floors);
+        let base = RtSizes {
+            clas: held.clas.max(floor.clas),
+            jobs: held.jobs.max(floor.jobs),
+            keys: wanted.keys,
+        };
+        let budget = self.sizes.rt_bytes.max(base.budgeted(device, self.traced));
+        let fit = wanted.within(base, budget, device, self.traced);
         if fit != wanted {
             self.rt_retry = frame + period;
         }
