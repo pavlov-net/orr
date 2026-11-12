@@ -721,6 +721,12 @@ impl LightingView {
         self.history_reset
     }
 
+    /// The view's local light samplers as its last paths built them, one per screen tile row
+    /// by row, and the tiles in a row and the rows.
+    pub fn local_lights(&self) -> (GpuPtr<LocalLights>, [u32; 2]) {
+        (self.local.gpu(), self.local_tiles)
+    }
+
     /// RGBA16F, pre-exposed noisy radiance; alpha is 1 where the G-buffer holds a surface.
     pub fn radiance(&self) -> &Texture {
         self.targets.radiance.texture()

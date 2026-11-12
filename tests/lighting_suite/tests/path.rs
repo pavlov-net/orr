@@ -12,14 +12,18 @@ use lighting_suite::bed::{
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::assert_same_mean;
-use lighting_suite::{assert_clean, device, pipeline, readback, render, run, texture, upload};
-use orr_gpu::{Hazards, KernelSet, Stages};
-use orr_lighting::{
-    DirectionalLight, DiscProfile, DofBackgroundPass, Light, LightId, LightingDebugView,
-    OriginProbes, PathEntry, ReferenceSettings, SceneLightingSettings, ThinLens, ViewLighting,
+use lighting_suite::{
+    assert_clean, device, pipeline, read, readback, render, run, texture, upload,
 };
-use orr_math::{Affine3, DVec3, Mat3, Vec2, Vec3};
-use orr_scene::{Opacity, Projection, RendererDesc};
+use orr_gpu::{Hazards, KernelSet, Stages};
+use orr_lighting::types::LocalLights;
+use orr_lighting::{
+    DirectionalLight, DiscProfile, DofBackgroundPass, Light, LightId, LightSetGpu,
+    LightingDebugView, OriginProbes, PathEntry, ReferenceSettings, SceneLightingSettings, ThinLens,
+    ViewLighting,
+};
+use orr_math::{Affine3, DVec3, Mat3, Quat, Vec2, Vec3};
+use orr_scene::{MediumProxy, MediumProxyId, Opacity, Projection, ProxyDensity, RendererDesc};
 
 fn paths(settings: ViewLighting) -> Paths {
     Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
@@ -694,6 +698,70 @@ fn light_feedback_and_local_samplers_keep_direct_light_unbiased() {
     {
         assert_close(&format!("quarter {q}"), g, p, 0.04);
     }
+    assert_clean();
+}
+
+/// Tiles of the bed view's local samplers that hold a slot for the light with feedback id `id`.
+fn tiles_naming(bed: &Bed, id: u32) -> usize {
+    let (local, [columns, rows]) = bed.view().local_lights();
+    let tiles: Vec<LocalLights> = read(local, u64::from(columns * rows));
+    tiles
+        .iter()
+        .filter(|t| t.lights[..t.count as usize].iter().any(|l| l.id == id))
+        .count()
+}
+
+/// A sphere light and the sky feed back from the ground they light, and the frame after the
+/// light table grows finds both in the view's local samplers as the frame before did: the
+/// environment's feedback id moved with the table, and the samplers read what the view fed
+/// back by the ids of the table it was written under. The scene's selection still counts the
+/// feedback of the frame that grew the table.
+#[test]
+fn a_views_light_feedback_follows_its_lights_as_the_light_table_grows() {
+    let lamp = |intensity: f32, x: f64| Light::Sphere {
+        position: DVec3::new(x, 1.5, 1.0),
+        radius: 0.1,
+        intensity: Vec3::splat(intensity),
+        cone: None,
+    };
+    let mut bed = Bed::with(sphere_on_ground(
+        vec![lamp(200.0, 0.0)],
+        Some(SKY.map(|c| c / 20.0)),
+    ));
+    let p = paths(ViewLighting {
+        debug_view: LightingDebugView::DirectOnly,
+        ..ViewLighting::default()
+    });
+    let environment =
+        |bed: &Bed| read::<LightSetGpu>(bed.lighting.light_set(), 1)[0].candidate_count;
+    bed.accumulate(4, 1, &mut |list, f| p.record(list, f));
+    let held = environment(&bed);
+    let before = [0, held].map(|id| tiles_naming(&bed, id));
+    assert!(
+        before.iter().all(|&tiles| tiles > 0),
+        "tiles naming the lamp and the sky: {before:?}"
+    );
+
+    bed.set_light(LightId(40), Some(lamp(0.0, 30.0)));
+    bed.accumulate_on(4, 1, 1, &mut |list, f| p.record(list, f));
+    let grown = environment(&bed);
+    assert!(grown > held, "the light table never grew");
+    let after = [0, grown].map(|id| tiles_naming(&bed, id));
+    for (what, (before, after)) in ["lamp", "sky"]
+        .into_iter()
+        .zip(before.into_iter().zip(after))
+    {
+        assert!(
+            2 * after > before,
+            "{what}: {after} tiles name it after the table grew, {before} before"
+        );
+    }
+    bed.accumulate_on(5, 1, 1, &mut |list, f| p.record(list, f));
+    let stats = bed.lighting.stats(bed.last_frame()).unwrap();
+    assert!(
+        stats.feedback_pixels > 0,
+        "no pixel of the frame that grew the table fed back a light"
+    );
     assert_clean();
 }
 
@@ -1384,7 +1452,8 @@ fn a_sparse_emitter_field_lights_alike_by_every_technique_and_refines_toward_the
 
 /// A sphere light and a rect light over a glossy floor show in its reflection alike by
 /// next-event estimation and by BSDF rays, which meet the lights' proxies and weigh them against
-/// light sampling.
+/// light sampling: as placed, and once the lights have moved to ids past their table and a
+/// medium proxy set after them has moved their instances in the PTLAS.
 #[test]
 fn sphere_and_rect_lights_reach_bsdf_rays_through_their_proxies() {
     let lights = vec![
@@ -1412,35 +1481,65 @@ fn sphere_and_rect_lights_reach_bsdf_rays_through_their_proxies() {
         focus: None,
     };
     let mut bed = Bed::with(spec.clone());
-    for (what, under) in [
-        ("sphere", Vec3::new(-0.6, 0.0, 0.2)),
-        ("rect", Vec3::new(0.6, 0.0, 0.2)),
-    ] {
-        let patch = pixel_of(&spec, under);
-        let nee = patch_means(
-            &mut bed,
-            &paths(debug(LightingDebugView::NeeOnly, 1)),
-            patch,
-            16,
-            8,
-            1,
-        );
-        let bsdf = patch_means(
-            &mut bed,
-            &paths(debug(LightingDebugView::BsdfOnly, 1)),
-            patch,
-            16,
-            16,
-            2,
-        );
-        let full = patch_means(&mut bed, &paths(reference(1)), patch, 16, 8, 3);
-        assert!(
-            bsdf.iter().sum::<f64>() > 0.0,
-            "{what}: BSDF rays met no light"
-        );
-        assert_same_mean(&format!("{what}: next-event against BSDF"), &nee, &bsdf);
-        assert_same_mean(&format!("{what}: full against BSDF"), &full, &bsdf);
+    let lit = |bed: &mut Bed, when: &str| {
+        for (what, under) in [
+            ("sphere", Vec3::new(-0.6, 0.0, 0.2)),
+            ("rect", Vec3::new(0.6, 0.0, 0.2)),
+        ] {
+            let patch = pixel_of(&spec, under);
+            let nee = patch_means(
+                bed,
+                &paths(debug(LightingDebugView::NeeOnly, 1)),
+                patch,
+                16,
+                8,
+                1,
+            );
+            let bsdf = patch_means(
+                bed,
+                &paths(debug(LightingDebugView::BsdfOnly, 1)),
+                patch,
+                16,
+                16,
+                2,
+            );
+            let full = patch_means(bed, &paths(reference(1)), patch, 16, 8, 3);
+            assert!(
+                bsdf.iter().sum::<f64>() > 0.0,
+                "{when}, {what}: BSDF rays met no light"
+            );
+            assert_same_mean(
+                &format!("{when}, {what}: next-event against BSDF"),
+                &nee,
+                &bsdf,
+            );
+            assert_same_mean(&format!("{when}, {what}: full against BSDF"), &full, &bsdf);
+        }
+    };
+    lit(&mut bed, "as placed");
+    // The lights move to ids past their table and past the proxies the PTLAS holds for it. A
+    // frame later a medium proxy that nothing meets moves the light proxies' instances, which
+    // the PTLAS made for it writes anew.
+    for (from, to) in [(0, 23), (1, 57)] {
+        bed.set_light(LightId(from), None);
+        bed.set_light(LightId(to), Some(spec.lights[from as usize]));
     }
+    render_paths(&mut bed, &paths(reference(1)), 1, 0);
+    bed.set_medium_proxy(
+        MediumProxyId(6),
+        Some(MediumProxy {
+            position: DVec3::new(0.0, 500.0, 0.0),
+            rotation: Quat::IDENTITY,
+            scale: 1.0,
+            density: ProxyDensity::Uniform {
+                half_extent: Vec3::ONE,
+            },
+            extinction: Vec3::ZERO,
+            albedo: Vec3::ZERO,
+            anisotropy: 0.0,
+        }),
+    );
+    lit(&mut bed, "after the tables grew");
     assert_clean();
 }
 

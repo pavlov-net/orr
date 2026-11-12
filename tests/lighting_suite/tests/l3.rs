@@ -2,14 +2,15 @@
 //! emissive producer power.
 
 use std::f64::consts::PI;
+use std::time::Duration;
 
 use bytemuck::Zeroable;
 use lighting_suite::shaders::{emit, hotspot_bake, local_probe, nee_probe, tile_probe};
 use lighting_suite::{
-    TestScene, assert_clean, compute_barrier, finish, kernels, linear_clamp, pipeline, read,
-    readback, render, texture, upload,
+    TestScene, assert_clean, compute_barrier, copy_back, finish, kernels, linear_clamp, pipeline,
+    read, readback, render, texture, upload,
 };
-use orr_gpu::{ComputePipeline, DEFAULT_MEDIUM, GpuPtr, Hazards, KernelSet, Stages};
+use orr_gpu::{Allocation, ComputePipeline, DEFAULT_MEDIUM, GpuPtr, Hazards, KernelSet, Stages};
 use orr_lighting::types::{LocalLight, LocalLights};
 use orr_lighting::{
     DirectionalLight, DiscProfile, EmissiveSelection, LIGHT_TILE_SIZE, LIGHT_TILES, Light, LightId,
@@ -18,9 +19,10 @@ use orr_lighting::{
 use orr_math::{Affine3, DVec3, Mat3, Vec3};
 use orr_pack::texture::octahedral;
 use orr_scene::{
-    ClusterTopology, Cone, EmissiveGpu, EnvironmentData, GroupWriter, InstanceFlags, MaterialGpu,
-    MaterialId, MaterialWriter, Opacity, ProducerDesc, ProducerId, ProducerUpdate, SceneCompute,
-    SceneDesc, SceneWriter, TransformGroupDesc, material_flags,
+    ClusterTopology, Cone, EmissiveGpu, EnvironmentData, FrameDesc, FrameTime, GroupWriter,
+    InstanceFlags, LightTables, MaterialGpu, MaterialId, MaterialWriter, Opacity, ProducerDesc,
+    ProducerId, ProducerUpdate, SceneCompute, SceneDesc, SceneWriter, TransformGroupDesc,
+    material_flags,
 };
 use shader_math::stats::chi_square_p;
 
@@ -1357,6 +1359,188 @@ fn light_feedback_blends_into_the_selection_and_clears_on_a_reset() {
         (0..3).all(|i| (reset[i] - power[i]).abs() <= 1e-6),
         "after a reset: {reset:?} against {power:?}"
     );
+    assert_clean();
+}
+
+/// What one frame's scene pass left: its tile samples and its light set record.
+struct Passed {
+    frame: u64,
+    tiles: Allocation<LightSample>,
+    set: Allocation<LightSetGpu>,
+}
+
+/// A scene with sphere light 0, an emitting producer entry and the procedural sky takes
+/// feedback for the three, then lights 1, 9 and 40 in three frames, each past its light table,
+/// and two frames more. Returns each of the five frames' scene pass, the light table's entries
+/// after them, and the probabilities of light 0, the entry and the environment after them and
+/// once a reset has dropped the feedback. With `in_flight` the three frames that grow the table
+/// run one behind another, none waiting for the one before.
+fn grow_lights(in_flight: bool) -> (Vec<Passed>, u32, [[f64; 3]; 2]) {
+    let mut scene = TestScene::procedural(SceneDesc {
+        producer_capacity: 2,
+        emissive_capacity: 0,
+        ..SceneDesc::default()
+    });
+    let quads = Quads {
+        producer: 0,
+        count: 4,
+        size: 0.5,
+        origin: Vec3::new(-1.0, 0.0, 0.0),
+        step: Vec3::new(0.6, 0.0, 0.0),
+    };
+    let sphere = |id: u32| Light::Sphere {
+        position: DVec3::new(f64::from(id), 3.0, 0.0),
+        radius: 0.2,
+        intensity: Vec3::splat(100.0 + id as f32),
+        cone: None,
+    };
+    let p = pipeline(&emit::MODULE, "main");
+    scene.frame(
+        |w, m| {
+            let id = m.create(&emitting([1.0, 0.6, 0.3], 400.0, 0)).unwrap();
+            let above = Affine3::from_translation(Vec3::new(0.0, 2.0, 0.0));
+            set_producers(w, &[id; 3], DVec3::ZERO, &[above], ProducerUpdate::Static);
+            w.set_light(LightId(0), Some(&sphere(0))).unwrap();
+        },
+        |c| quads.dispatch(c, &p),
+    );
+    let mut lighting = scene.lighting();
+    scene_pass(&scene, &mut lighting, scene.frame);
+    let set: LightSetGpu = read(lighting.light_set(), 1)[0];
+    let entries = set.candidate_count - scene.tables.lights;
+    let probabilities = |lighting: &SceneLighting, lights: u32| {
+        let set: LightSetGpu = read(lighting.light_set(), 1)[0];
+        assert_eq!(set.candidate_count, lights + entries);
+        [
+            read(set.light_probability, 1)[0],
+            read(set.emissive, 1)[0].probability,
+            set.environment_probability,
+        ]
+        .map(f64::from)
+    };
+    // Light 0, entry 0 after the table's one light, and the environment after every candidate.
+    let mut counts = vec![0u32; set.candidate_count as usize + 1];
+    counts[0] = 3000;
+    counts[scene.tables.lights as usize] = 2000;
+    counts[set.candidate_count as usize] = 1000;
+    feed_back(&set, &counts);
+
+    let list = [scene.id];
+    let mut passed = Vec::new();
+    let mut lights = 0;
+    for (k, id) in [Some(1u32), Some(9), Some(40), None, None]
+        .into_iter()
+        .enumerate()
+    {
+        let mut f = scene
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: FrameTime {
+                    absolute: 0.0,
+                    delta: 1.0 / 60.0,
+                },
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        let frame = f.id();
+        if let Some(id) = id {
+            let mut w = f.scene(scene.id).unwrap();
+            w.set_light(LightId(id), Some(&sphere(id))).unwrap();
+        }
+        let mut pass = None;
+        f.update_scenes(&mut |c| {
+            pass = Some(ScenePass {
+                frame,
+                scene: c.root,
+                focus: [0.0; 3],
+                tables: c.light_tables,
+            });
+        })
+        .unwrap();
+        let pass = pass.unwrap();
+        lights = pass.tables.lights;
+        let list = f.list().unwrap();
+        lighting.record(list, &pass).unwrap();
+        list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
+        let tiles = copy_back(list, set.tiles, u64::from(SAMPLES), "tiles");
+        let record = copy_back(list, lighting.light_set(), 1, "light set");
+        list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
+        let point = f.end(&[]).unwrap();
+        passed.push(Passed {
+            frame,
+            tiles,
+            set: record,
+        });
+        // The frames that grow the table are in flight together; the third is waited for.
+        if !in_flight || k >= 2 {
+            render()
+                .wait_while_completing(point, Duration::from_secs(10))
+                .unwrap();
+        }
+        // The first frame takes the feedback counted before the table grew, and no frame
+        // after it finds any.
+        if k >= 2 {
+            let pixels = |k: usize| lighting.stats(passed[k].frame).unwrap().feedback_pixels;
+            let counted: Vec<u32> = (k - 2..=k).map(pixels).collect();
+            assert_eq!(counted, [if k == 2 { 6000 } else { 0 }, 0, 0]);
+        }
+    }
+    let fed = probabilities(&lighting, lights);
+    lighting.reset_history();
+    let mut list = render().command_list().unwrap();
+    let pass = ScenePass {
+        frame: passed[4].frame + 1,
+        scene: scene.root,
+        focus: [0.0; 3],
+        tables: LightTables { lights },
+    };
+    lighting.record(&mut list, &pass).unwrap();
+    finish(list);
+    let power = probabilities(&lighting, lights);
+    (passed, lights, [fed, power])
+}
+
+/// Lights set past the light table in three frames running, none waiting for the one before,
+/// leave every frame's light samples and selection as frames that each waited do, and the
+/// feedback counted before the table grew stays with its light, its emissive entry and the
+/// environment: an entry's feedback id and the environment's move with the table, and each
+/// pass takes the feedback so far by the ids of the table before.
+#[test]
+fn feedback_follows_its_lights_as_the_light_table_grows_under_frames_in_flight() {
+    let (flight, lights, [fed, power]) = grow_lights(true);
+    assert!(lights > 40, "the light table holds {lights}");
+    let share = f64::from(SceneLightingSettings::default().feedback_share);
+    let counted = [3000.0, 2000.0, 1000.0].map(|c| c / 6000.0);
+    for i in 0..3 {
+        let expected = (1.0 - share) * power[i] + share * counted[i];
+        assert!(
+            (fed[i] - expected).abs() <= 1e-5,
+            "probabilities {fed:?} against the power's {power:?} with the feedback {counted:?}"
+        );
+    }
+    let (settled, _, probabilities) = grow_lights(false);
+    assert_eq!(probabilities, [fed, power]);
+    let selection = |p: &Passed| {
+        let s = p.set.as_slice().unwrap()[0];
+        (
+            s.candidate_count,
+            s.candidate_total,
+            s.environment_probability,
+            s.local_lights,
+        )
+    };
+    for (k, (a, b)) in flight.iter().zip(&settled).enumerate() {
+        assert_eq!(a.frame, b.frame);
+        assert_eq!(selection(a), selection(b), "frame {k}: the selection");
+        let (a, b) = (a.tiles.as_slice().unwrap(), b.tiles.as_slice().unwrap());
+        let differing = a
+            .iter()
+            .zip(b)
+            .filter(|(a, b)| bytemuck::bytes_of(*a) != bytemuck::bytes_of(*b))
+            .count();
+        assert_eq!(differing, 0, "frame {k}: tile samples that differ");
+    }
     assert_clean();
 }
 

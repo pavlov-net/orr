@@ -30,10 +30,11 @@ use orr_scene::testing::{
     read_buffer_on, read_texture_on, wait_on,
 };
 use orr_scene::{
-    BoundTexture, Budgets, EmissiveGpu, Error, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
-    InstanceRange, InstancesDesc, LoadState, MaterialGpu, MaterialId, MeshGpu, ModelGpu, ModelId,
-    MountId, NeuralTextures, PackSource, PoolSize, RendererDesc, ResidencyClass, SceneDesc,
-    SceneId, SceneRoot, SceneWriter, Scenes, TransformGroupDesc, TransformGroupId, material_flags,
+    BoundTexture, Budgets, DirectionalLight, DiscProfile, EmissiveGpu, Error, FrameDesc, FrameTime,
+    GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, Light, LightId, LoadState,
+    MaterialGpu, MaterialId, MeshGpu, ModelGpu, ModelId, MountId, NeuralTextures, PackSource,
+    PoolSize, RendererDesc, ResidencyClass, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes,
+    TransformGroupDesc, TransformGroupId, material_flags,
 };
 use scene_suite::Workers;
 
@@ -707,7 +708,9 @@ fn limited_device(partitions: u32) -> Device {
 
 /// A placement that needs one cell partition more than the device's PTLAS holds is refused and
 /// leaves nothing placed: the scene traces the copies it held, and takes copies again for the
-/// partitions that removed ones give back.
+/// partitions that removed ones give back. A light whose proxy the PTLAS has no instance left
+/// for is refused too and takes no entry of the light table, which a light without a proxy
+/// then takes.
 #[test]
 fn a_placement_past_the_devices_partitions_is_refused_and_leaves_the_scene_as_it_was() {
     const COPIES: u32 = 40;
@@ -802,6 +805,30 @@ fn a_placement_past_the_devices_partitions_is_refused_and_leaves_the_scene_as_it
         for _ in 0..3 {
             frame_with(&mut scenes, &mut |_| {});
         }
+        let rt = scenes.stats().rt;
+        assert_eq!((rt.partitions, rt.unplaced), (COPIES, 0));
+
+        let lamp = Light::Sphere {
+            position: DVec3::ZERO,
+            radius: 0.5,
+            intensity: Vec3::ONE,
+            cone: None,
+        };
+        let root = frame_with(&mut scenes, &mut |w| {
+            let r = w.set_light(LightId(2), Some(&lamp));
+            assert!(matches!(r, Err(Error::Capacity { .. })), "{r:?}");
+        });
+        assert_eq!(root.light_capacity, 0, "the refused light took an entry");
+        let sun = Light::Directional(DirectionalLight {
+            direction_to_light: Vec3::Y,
+            illuminance: Vec3::ONE,
+            angular_radius: 0.01,
+            disc: DiscProfile::Uniform,
+        });
+        let root = frame_with(&mut scenes, &mut |w| {
+            w.set_light(LightId(2), Some(&sun)).unwrap();
+        });
+        assert_eq!(root.light_capacity, 3);
         let rt = scenes.stats().rt;
         assert_eq!((rt.partitions, rt.unplaced), (COPIES, 0));
     }
