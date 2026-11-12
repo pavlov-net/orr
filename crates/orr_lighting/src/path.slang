@@ -40,6 +40,7 @@ import orr_shaders.trace;
 import orr_shaders.coherence;
 import orr_pack.mesh;
 import orr_scene.hit;
+import orr_scene.producer;
 import orr_scene.visibility;
 import orr_lighting.bsdf;
 import orr_lighting.media;
@@ -1858,11 +1859,12 @@ public bool surface_chains(PathRoot r, GSurface g)
     if (r.caustics == nullptr || !(g.bsdf.specular_roughness < CHAIN_ROUGHNESS) || g.material == MATERIAL_NONE)
         return false;
     PhotonSourceGpu* source = r.caustics.source;
-    uint entry;
-    if (hit_producer(s, g.instance, entry))
+    uint producer;
+    if (hit_producer(s, g.instance, producer))
     {
         uint m = g.cluster == NO_CLUSTER ? g.material : traced_material(s, g.instance, g.cluster);
-        return m != MATERIAL_NONE && (s.materials[m].flags & MATERIAL_CASTER) != 0 && source.entries[entry].count > 0;
+        return m != MATERIAL_NONE && (s.materials[m].flags & MATERIAL_CASTER) != 0
+            && source.entries[s.producers[producer].emissive].count > 0;
     }
     if ((g.instance & COPY_FAR) != 0)
         return false;
