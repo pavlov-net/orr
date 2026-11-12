@@ -5,7 +5,7 @@
 // per block of cells that reaches inside the cast range one for each run of the ranks chords
 // stand for. `args` sizes the draw and the caster dispatch to the lists.
 #include "orr_root.h"
-import orr_examples.blades;
+import orr_examples_grass.blades;
 import orr_scene.visibility;
 
 struct Root

@@ -5,7 +5,7 @@
 // takes a visible record per window with any; the mesh stage expands the kept blades of its
 // window and reads nothing but the payload.
 #include "orr_root.h"
-import orr_examples.blades;
+import orr_examples_grass.blades;
 import orr_scene.drawn_raster;
 
 struct Root

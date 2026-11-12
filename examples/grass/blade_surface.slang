@@ -3,7 +3,7 @@
 // drawn or traced, by the color its vertices' words carry.
 module blade_surface;
 
-import orr_examples.blades;
+import orr_examples_grass.blades;
 import orr_scene.drawn;
 import orr_scene.surface;
 

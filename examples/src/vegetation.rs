@@ -12,11 +12,11 @@
 //! Switches (all optional):
 //! `--synthetic`, `--trees N`, `--species N`, `--grass-density D` (blades per m^2),
 //! `--grass-radius M`, `--grass producer|drawn|stored|none` (the grass as clusters a kernel
-//! emits every frame; as blades of [`crate::blades`] drawn from the opaque hook with nothing
+//! emits every frame; as blades of [`crate::grass`] drawn from the opaque hook with nothing
 //! stored; as the same blades stored in a batch; or none), `--no-grass-rays` (the grass
 //! is only rastered), `--blade-full M`, `--blade-detail M`,
 //! `--exact-blades N`, `--cast-range M`, `--chords N`, `--cast-stretch S` (see
-//! [`crate::blades::BladeSettings`]), `--dlss` (ray reconstruction at the render size that
+//! [`crate::grass::BladeSettings`]), `--dlss` (ray reconstruction at the render size that
 //! suits the extent), `--parts all|trunk`, `--poses-per-variant N`, `--pose-stride`,
 //! `--no-part-animation`, `--rt-range M`, `--animation-range M`, `--directional-lights L,T`,
 //! `--sw-raster-px P`, `--lod0-only`, `--world-km K`, `--world-density N` (trees per km^2
@@ -55,11 +55,11 @@ use orr_cook::{TextureSettings, Usage};
 use orr_math::camera::rh::view;
 use orr_math::{Affine3, DVec3, Mat3, Mat4, UVec2, Vec3};
 
-use crate::blades::{BladeSettings, Blades, Capacity, FIELD_COUNTS};
 use crate::field::{Grass, Heights, Slab, Terrain, blade_triangles, patch_triangles};
+use crate::grass::shaders::types::Field;
+use crate::grass::{BladeSettings, Blades, Capacity, FIELD_COUNTS};
 use crate::linked::KERNELS;
 use crate::mesh::MeshBuilder;
-use crate::shaders::types::Field;
 use crate::shaders::{fireflies, glow, grass, slab, sway, terrain};
 use crate::window::Window;
 use crate::{Capture, Options, Workers, device, entry_head, fixed_time, gray_png};
@@ -194,9 +194,9 @@ impl Script {
 pub enum GrassMode {
     /// Clusters `shaders/grass.slang` emits around the camera every frame.
     Producer,
-    /// [`crate::blades`], drawn from the opaque hook.
+    /// [`crate::grass`], drawn from the opaque hook.
     Drawn,
-    /// [`crate::blades`], every drawn blade stored in the entry's batch.
+    /// [`crate::grass`], every drawn blade stored in the entry's batch.
     Stored,
     None,
 }

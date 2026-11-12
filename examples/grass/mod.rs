@@ -1,4 +1,4 @@
-//! A field of blades with nothing stored per blade (`shaders/blades.slang`): a drawn producer
+//! A field of blades with nothing stored per blade (`blades.slang`): a drawn producer
 //! entry whose blades a task and mesh pipeline derives and draws from the view's opaque hook,
 //! which the material resolve derives again per pixel through the linked `BladeGeometry`, and
 //! whose batch holds only what rays trace: the drawn blades near the eye and fewer, wider
@@ -17,8 +17,13 @@ use orr_math::{Mat4, Vec2, Vec3};
 
 use crate::field::Heights;
 use crate::linked_blades as linked;
-use crate::shaders::types::Field;
-use crate::shaders::{blade_casters, blade_draw, blade_items};
+use shaders::types::Field;
+use shaders::{blade_casters, blade_draw, blade_items};
+
+/// The field's compiled kernels and the Rust types of their Slang structs.
+pub mod shaders {
+    include!(concat!(env!("OUT_DIR"), "/grass/orr_shaders.rs"));
+}
 
 /// `blades.slang`: the side of a tile, m, its cells, and the candidates of a draw item and of
 /// the two kinds of caster item.

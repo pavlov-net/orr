@@ -4,7 +4,7 @@
 // for the blades of exact cells. Each vertex's word is its blade's color, as the draw's linked
 // geometry gives a drawn triangle.
 #include "orr_root.h"
-import orr_examples.blades;
+import orr_examples_grass.blades;
 import orr_scene.producer;
 import orr_scene.tables;
 import orr_scene.visibility;

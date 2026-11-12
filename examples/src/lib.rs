@@ -23,9 +23,10 @@ use orr::{
 };
 
 pub mod average;
-pub mod blades;
 pub mod creature;
 pub mod field;
+#[path = "../grass/mod.rs"]
+pub mod grass;
 pub mod mesh;
 pub mod overlay;
 pub mod quality;
@@ -46,7 +47,7 @@ pub mod linked {
 }
 
 /// [`linked`]'s kernels with the blade field's `BladeGeometry` and `BladeSurface` linked too
-/// ([`blades`]).
+/// ([`grass`]).
 pub mod linked_blades {
     include!(concat!(env!("OUT_DIR"), "/linked_blades/orr_kernels.rs"));
 }
