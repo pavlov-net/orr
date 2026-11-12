@@ -420,7 +420,7 @@ impl SceneLighting {
             let before = std::mem::replace(&mut self.per, per);
             self.replaced.push((pass.frame, before, entries));
         }
-        self.per.tables.producers = pass.tables.producers;
+        self.per.tables = pass.tables;
         self.caustics.set_producers(pass.tables.producers);
         let now = &self.per;
         // The frames before left their feedback in what this pass's tables replaced.
