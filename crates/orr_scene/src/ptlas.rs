@@ -398,6 +398,10 @@ impl Budget {
     }
 }
 
+/// What a PTLAS takes of the device's partitions once it holds a proxy more, or nothing where
+/// it holds the proxy already.
+pub(crate) struct Room(Option<[Share; TAKERS]>);
+
 /// The entries of a table that hold an instance in the global partition.
 #[derive(Default)]
 struct Live {
@@ -669,36 +673,41 @@ impl Ptlas {
         self.skinned.used -= count;
     }
 
-    /// Makes room for [`Self::set_proxy`] to set medium proxy `id`, an entry of the scene's
-    /// proxy table: the global partition counts the proxies up to the highest set. Fails,
-    /// changing nothing, when the device's PTLAS cannot take them beside what else is in use.
-    pub(crate) fn reserve_proxy(&mut self, device: &Device, id: u32) -> Result<()> {
-        self.reserve_entry(device, PROXIES, id)
+    /// The room [`Self::set_proxy`] needs to set medium proxy `id`, an entry of the scene's
+    /// proxy table: the global partition counts the proxies up to the highest set. Changes
+    /// nothing, and fails when the device's PTLAS cannot take them beside what else is in use;
+    /// [`Self::take_room`] takes the room while the PTLAS is as it was.
+    pub(crate) fn proxy_room(&self, device: &Device, id: u32) -> Result<Room> {
+        self.entry_room(device, PROXIES, self.proxies, id)
     }
 
-    /// Makes room for [`Self::set_light`] to give light `id`, an entry of the scene's light
+    /// The room [`Self::set_light`] needs to give light `id`, an entry of the scene's light
     /// table, a proxy: the global partition counts the lights up to the highest that has one.
-    /// Fails, changing nothing, when the device's PTLAS cannot take them beside what else is
-    /// in use.
-    pub(crate) fn reserve_light(&mut self, device: &Device, id: u32) -> Result<()> {
-        self.reserve_entry(device, LIGHTS, id)
+    /// As [`Self::proxy_room`].
+    pub(crate) fn light_room(&self, device: &Device, id: u32) -> Result<Room> {
+        self.entry_room(device, LIGHTS, self.lights, id)
     }
 
-    /// Reserves the entries of taker `which` up to `id`.
-    fn reserve_entry(&mut self, device: &Device, which: usize, id: u32) -> Result<()> {
-        let held = self.shares()[which];
+    /// The room for the entries up to `id` of taker `which`, which holds `held`.
+    fn entry_room(&self, device: &Device, which: usize, held: Share, id: u32) -> Result<Room> {
         if id < held.reserved {
-            return Ok(());
+            return Ok(Room(None));
         }
         let mut shares = self.budget(device).take(self.shares(), which, id + 1)?;
         // The entry is in use once it is set.
         shares[which].used = held.used;
-        self.keep(shares);
-        Ok(())
+        Ok(Room(Some(shares)))
+    }
+
+    /// Takes `room`, from [`Self::proxy_room`] or [`Self::light_room`].
+    pub(crate) fn take_room(&mut self, room: Room) {
+        if let Room(Some(shares)) = room {
+            self.keep(shares);
+        }
     }
 
     /// Marks medium proxy `id` set or cleared; its instance is written at the next build. A
-    /// set has its room from [`Self::reserve_proxy`].
+    /// set has its room from [`Self::proxy_room`].
     pub(crate) fn set_proxy(&mut self, id: u32, live: bool) {
         // An id past the highest set holds no proxy to clear.
         if self.proxy_live.set(id, live).is_some() {
@@ -881,7 +890,7 @@ impl Ptlas {
     }
 
     /// Marks light `id` as having a proxy or not; its instance is written at the next build.
-    /// A light given one has its room from [`Self::reserve_light`].
+    /// A light given one has its room from [`Self::light_room`].
     pub(crate) fn set_light(&mut self, id: u32, live: bool) {
         let was = self.light_live.set(id, live);
         if live || was == Some(true) {

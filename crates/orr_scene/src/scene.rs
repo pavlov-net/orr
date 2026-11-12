@@ -2892,13 +2892,17 @@ impl<'f> SceneWriter<'f> {
             // An id past the table holds no light to clear.
             return Ok(());
         };
-        // Window room, then the table's, then the PTLAS's: a set that finds one missing leaves
-        // the scene as it was.
+        // Window room, then the PTLAS's, then the table's memory, each before anything
+        // changes: a set that finds one missing leaves the scene as it was, and an id the PTLAS
+        // refuses takes no memory.
         let (src, out) = self.window.slice::<LightGpu>(self.device, 1)?;
-        let room = table.room(self.device, entries)?;
         let cpu = &mut *self.scene.cpu.lock().unwrap();
-        if proxied {
-            cpu.ptlas.reserve_light(self.device, id.0)?;
+        let proxy = proxied
+            .then(|| cpu.ptlas.light_room(self.device, id.0))
+            .transpose()?;
+        let room = table.room(self.device, entries)?;
+        if let Some(proxy) = proxy {
+            cpu.ptlas.take_room(proxy);
         }
         table.grow(room, entries);
         cpu.ptlas.set_light(id.0, proxied);
@@ -2946,7 +2950,6 @@ impl<'f> SceneWriter<'f> {
         proxy: Option<&MediumProxy>,
     ) -> Result<()> {
         let table = &self.scene.tables.proxies;
-        let cpu = &mut *self.scene.cpu.lock().unwrap();
         let held = table.capacity();
         let entries = if id.0 < held {
             held
@@ -2956,15 +2959,21 @@ impl<'f> SceneWriter<'f> {
             // An id past the table holds no proxy to clear.
             return Ok(());
         };
-        if proxy.is_some() {
-            // Before the table grows, so an id the PTLAS refuses takes no memory for it.
-            cpu.ptlas.reserve_proxy(self.device, id.0)?;
-        }
-        table.reserve(self.device, entries)?;
+        // As `set_light` takes its room.
         let record = proxy.map_or_else(MediumProxyGpu::zeroed, |p| proxy_gpu(p, self.cell_log2));
-        let copy = self.staged(table.entry(id.0), &record)?;
+        let src = self.window.put(self.device, &record)?;
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
+        let instance = proxy
+            .map(|_| cpu.ptlas.proxy_room(self.device, id.0))
+            .transpose()?;
+        let room = table.room(self.device, entries)?;
+        if let Some(instance) = instance {
+            cpu.ptlas.take_room(instance);
+        }
+        table.grow(room, entries);
         cpu.ptlas.set_proxy(id.0, proxy.is_some());
-        cpu.records.push(copy);
+        cpu.records
+            .push(Record::values(self.next_seq(), table.entry(id.0), src, 1));
         Ok(())
     }
 
