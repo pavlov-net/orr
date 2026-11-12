@@ -239,6 +239,19 @@ impl ClusterTable {
         Ok(Some(point))
     }
 
+    /// Its step, the pages it holds memory for and those that wait for their bind or hold no
+    /// id, for [`crate::Scenes::loading_report`].
+    pub(crate) fn report(&self) -> String {
+        let s = self.state.lock().unwrap();
+        format!(
+            "step {}, {} pages with memory, {} to bind, {} idle",
+            s.step,
+            s.pages.len(),
+            s.unbound.len(),
+            s.idle.len()
+        )
+    }
+
     /// What the table's memory holds.
     pub(crate) fn fill(&self) -> PoolFill {
         self.state.lock().unwrap().backing.fill()

@@ -252,6 +252,28 @@ pub struct Loading {
     /// Staging that found no room in the imported arena and took the staging pool.
     staging_misses: AtomicU64,
     in_flight: Arc<InFlight>,
+    /// What the loading thread held the last time it went round its loop.
+    status: Mutex<Status>,
+}
+
+/// What the loading thread holds, for [`Loading::report`].
+#[derive(Clone, Debug, Default)]
+struct Status {
+    /// Times it has gone round its loop.
+    rounds: u64,
+    /// When it last did, and whether it then waited to be woken.
+    at: Option<Instant>,
+    waiting: bool,
+    /// Stream tasks whose reads have not all ended, mounts placing, mount reads waiting for
+    /// room in the in-flight limit.
+    streams: usize,
+    placing: usize,
+    reads: usize,
+    /// Mount builds, finer cut builds and batches of staged copies in their lanes, each
+    /// lane's front waiting for the point beside it.
+    mounts: (usize, Option<TimelinePoint>),
+    cuts: (usize, Option<TimelinePoint>),
+    copies: (usize, Option<TimelinePoint>),
 }
 
 /// The read arena's figures, from [`Loading::read_arena`], to weigh its size and allocator.
@@ -366,6 +388,7 @@ impl Loading {
             imported,
             staging_misses: AtomicU64::new(0),
             in_flight,
+            status: Mutex::default(),
         })
     }
 
@@ -377,6 +400,79 @@ impl Loading {
             read_misses: self.buffers.misses(),
             staging_misses: self.staging_misses.load(Ordering::Relaxed),
         }
+    }
+
+    /// What the loading side holds: the loading thread's lanes and the points they wait for,
+    /// the jobs queued for workers, the batches no frame has taken and the bytes in flight.
+    /// For reporting a load that does not land.
+    pub fn report(&self, device: &Device) -> String {
+        use std::fmt::Write;
+        let done = |p: TimelinePoint| {
+            let state = if device.is_complete(p) {
+                "complete"
+            } else {
+                "pending"
+            };
+            format!("{p:?} {state}")
+        };
+        let lane = |(items, until): (usize, Option<TimelinePoint>)| {
+            format!(
+                "{items} waiting for {}",
+                until.map_or_else(|| "nothing".into(), done)
+            )
+        };
+        let mut out = String::new();
+        let s = self.status.lock().unwrap().clone();
+        let ago = s.at.map_or(f64::NAN, |at| at.elapsed().as_secs_f64());
+        let _ = writeln!(
+            out,
+            "loading thread: round {} {ago:.3} s ago, {}; {} stream tasks reading, {} mounts \
+             placing, {} mount reads waiting for room",
+            s.rounds,
+            if s.waiting {
+                "waiting to be woken"
+            } else {
+                "running"
+            },
+            s.streams,
+            s.placing,
+            s.reads,
+        );
+        let _ = writeln!(
+            out,
+            "lanes: mount builds {}; cut builds {}; staged copies {}",
+            lane(s.mounts),
+            lane(s.cuts),
+            lane(s.copies),
+        );
+        {
+            let jobs = self.jobs.lock().unwrap();
+            let queued: Vec<usize> = jobs.queues.iter().map(VecDeque::len).collect();
+            let _ = writeln!(
+                out,
+                "jobs queued by queue {queued:?}, workers stopped {}",
+                jobs.stopped
+            );
+        }
+        let _ = writeln!(
+            out,
+            "inbox {} messages; {} mount batches, {} stream batches, {} cut batches, {} edit \
+             batches not taken",
+            self.inbox.lock().unwrap().len(),
+            self.batches.lock().unwrap().len(),
+            self.streams.lock().unwrap().len(),
+            self.cuts.lock().unwrap().len(),
+            self.edits.lock().unwrap().len(),
+        );
+        for b in self.batches.lock().unwrap().iter() {
+            let _ = writeln!(
+                out,
+                "  mount batch waits for {}",
+                b.point.map_or_else(|| "nothing".into(), done)
+            );
+        }
+        let _ = writeln!(out, "in flight: {:?}", self.in_flight);
+        out
     }
 
     /// Runs jobs on the calling thread until [`Loading::stop_workers`]: archive decodes and
@@ -1083,7 +1179,22 @@ fn run(loading: &Arc<Loading>, device: &Device, watch: &Watch) {
         if let Some(r) = &mut ring {
             r.pump();
         }
-        if idle && loading.inbox.lock().unwrap().is_empty() {
+        let waits = idle && loading.inbox.lock().unwrap().is_empty();
+        {
+            let mut status = loading.status.lock().unwrap();
+            *status = Status {
+                rounds: status.rounds + 1,
+                at: Some(Instant::now()),
+                waiting: waits,
+                streams: streams.len(),
+                placing: placing.len(),
+                reads: reads.len(),
+                mounts: (mounts.items.len(), mounts.until),
+                cuts: (cuts.items.len(), cuts.until),
+                copies: (copies.items.len(), copies.until),
+            };
+        }
+        if waits {
             // Both build lanes wait on points of the one queue their builds submit, which
             // complete in order.
             let until = mounts.until.into_iter().chain(cuts.until);

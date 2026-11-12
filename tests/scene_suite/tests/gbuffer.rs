@@ -37,8 +37,8 @@ use orr_pack::model::ModelInfo;
 use orr_pack::skeleton::{SkeletonInfo, Trs};
 use orr_pack::{Archive, AssetId, Entry, Span, Target};
 use orr_scene::testing::{
-    Image, Pixels, Tolerance, assert_clean, check, device, flip, read_buffer, read_texture,
-    visible_clusters, wait,
+    Image, Pixels, Tolerance, assert_clean, check, device, flip, mount_pending, read_buffer,
+    read_texture, visible_clusters, wait,
 };
 use orr_scene::{
     AffineRows, BoundTexture, ClusterWork, CopyVariant, CutGpu, DebugLod, Decal, DecalChannels,
@@ -10053,7 +10053,7 @@ fn an_unmount_takes_a_skinned_page_and_its_motion_from_the_scene() {
     };
     let mounted = |scenes: &mut Scenes, pack| {
         let m = scenes.mount(PackSource::Memory(pack));
-        while matches!(scenes.mount_state(m), LoadState::Pending) {
+        while mount_pending(scenes, m) {
             scenes.begin_frame(&desc).unwrap().end(&[]).unwrap();
             std::thread::sleep(Duration::from_millis(1));
         }

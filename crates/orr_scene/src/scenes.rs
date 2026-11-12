@@ -690,6 +690,28 @@ impl Scenes {
         Arc::clone(&self.loading)
     }
 
+    /// What the loading side, the queues and the streamed pools hold, for reporting a mount or
+    /// a load that does not land.
+    pub fn loading_report(&self) -> String {
+        use std::fmt::Write;
+        let d = &self.device;
+        let mut out = format!("device lost {}\n", d.is_lost());
+        let kinds = [QueueKind::Render, QueueKind::Loading, QueueKind::Compute];
+        for kind in kinds {
+            if let Some(q) = d.queue(kind) {
+                let _ = writeln!(out, "{kind:?} queue completed {}", q.completed());
+            }
+        }
+        out += &self.loading.report(d);
+        let _ = writeln!(
+            out,
+            "resident cluster table: {}",
+            self.core.mounts.clusters().report()
+        );
+        let _ = writeln!(out, "{:?}", self.residency());
+        out
+    }
+
     /// Mounts a pack. Returns at once: its index and every asset load on the loading side,
     /// and lookups fail with [`Error::NotReady`] until [`Scenes::mount_state`] is `Ready`.
     pub fn mount(&mut self, source: PackSource) -> MountId {

@@ -64,6 +64,42 @@ pub fn loading() -> Loading {
     Loading::new(false, 1 << 20, None, Arc::new(InFlight::new(u64::MAX))).expect("read buffers")
 }
 
+/// How long a test waits for a mount before it fails with what the loading side holds.
+const MOUNT_WAIT: Duration = Duration::from_secs(60);
+
+/// Whether mount `m` of `scenes` is still pending, for a loop that runs frames until it lands.
+/// Panics with [`crate::Scenes::loading_report`] once the mount has stayed pending for
+/// [`MOUNT_WAIT`] of such calls on this thread.
+pub fn mount_pending(scenes: &crate::Scenes, m: crate::MountId) -> bool {
+    thread_local! {
+        static SINCE: std::cell::RefCell<Vec<((usize, u32), std::time::Instant)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key = (std::ptr::from_ref(scenes) as usize, m.0);
+    SINCE.with_borrow_mut(|since| {
+        let at = since.iter().position(|(k, _)| *k == key);
+        if !matches!(scenes.mount_state(m), crate::LoadState::Pending) {
+            if let Some(at) = at {
+                since.swap_remove(at);
+            }
+            return false;
+        }
+        let started = match at {
+            Some(at) => since[at].1,
+            None => {
+                since.push((key, std::time::Instant::now()));
+                since[since.len() - 1].1
+            }
+        };
+        assert!(
+            started.elapsed() < MOUNT_WAIT,
+            "{m:?} stayed pending for {MOUNT_WAIT:?}:\n{}",
+            scenes.loading_report()
+        );
+        true
+    })
+}
+
 /// Fails the calling test if the validation layer has reported anything on [`device`].
 pub fn assert_clean() {
     assert_clean_on(device());

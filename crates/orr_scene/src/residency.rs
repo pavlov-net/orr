@@ -552,6 +552,7 @@ pub(crate) struct Limits {
 
 /// The in-flight limit's figures that the render thread's plans and the loading thread's
 /// mount reads share.
+#[derive(Debug)]
 pub(crate) struct InFlight {
     limit: u64,
     /// Bytes in flight of the streamed lanes, as their plans and landings leave them.

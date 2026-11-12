@@ -11,7 +11,7 @@ use orr_math::{Affine3, DMat3, DVec3, Mat3, Quat, Vec2, Vec3};
 use orr_pack::material::Material;
 use orr_pack::mesh::{Cluster, MeshInfo};
 use orr_pack::{Archive, AssetId, Class, Span, Target};
-use orr_scene::testing::{assert_clean, device, read_buffer, wait};
+use orr_scene::testing::{assert_clean, device, mount_pending, read_buffer, wait};
 use orr_scene::{
     Budgets, ClusterRef, ClusterTopology, CopyVariant, EditDesc, EmissiveGpu, FrameDesc, FrameTime,
     GroupWriter, InstanceFlags, InstanceGpu, InstancePageRef, InstanceRange, InstancesDesc,
@@ -177,7 +177,7 @@ fn instance_entries_follow_scale_material_sets_hidden_sections_and_removal() {
         })
         .unwrap();
     let m = scenes.mount(PackSource::Memory(bytes));
-    while matches!(scenes.mount_state(m), LoadState::Pending) {
+    while mount_pending(&scenes, m) {
         let f = scenes.begin_frame(&frame(&[])).unwrap();
         f.end(&[]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -357,7 +357,7 @@ fn material_sets_hold_every_entry_a_write_or_a_copy_names() {
     let _workers = Workers::start(&scenes, 2);
     let s = scenes.create_scene(&SceneDesc::default()).unwrap();
     let m = scenes.mount(PackSource::Memory(pack()));
-    while matches!(scenes.mount_state(m), LoadState::Pending) {
+    while mount_pending(&scenes, m) {
         let f = scenes.begin_frame(&frame(&[])).unwrap();
         f.end(&[]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -448,7 +448,7 @@ fn an_edit_of_a_dag_mesh_takes_the_sets_of_level_0() {
         })
         .unwrap();
     let m = scenes.mount(PackSource::Memory(bytes));
-    while matches!(scenes.mount_state(m), LoadState::Pending) {
+    while mount_pending(&scenes, m) {
         let f = scenes.begin_frame(&frame(&[])).unwrap();
         f.end(&[]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -537,7 +537,7 @@ fn a_copy_takes_the_sets_of_the_cached_cut_it_traces() {
         })
         .unwrap();
     let m = scenes.mount(PackSource::Memory(bytes));
-    while matches!(scenes.mount_state(m), LoadState::Pending) {
+    while mount_pending(&scenes, m) {
         let f = scenes.begin_frame(&frame(&[])).unwrap();
         f.end(&[]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -840,7 +840,7 @@ fn mounted(bytes: Arc<[u8]>, emissive_capacity: u32) -> (Scenes, SceneId, MountI
         })
         .unwrap();
     let m = scenes.mount(PackSource::Memory(bytes));
-    while matches!(scenes.mount_state(m), LoadState::Pending) {
+    while mount_pending(&scenes, m) {
         let f = scenes.begin_frame(&frame(&[])).unwrap();
         f.end(&[]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -1390,7 +1390,7 @@ fn a_streaming_emissive_mesh_lists_only_resident_clusters() {
     let mut models = [ModelId(0); 3];
     for model in &mut models {
         let m = scenes.mount(PackSource::Memory(Arc::clone(&bytes)));
-        while matches!(scenes.mount_state(m), LoadState::Pending) {
+        while mount_pending(&scenes, m) {
             let f = scenes.begin_frame(&frame(&[])).unwrap();
             f.end(&[]).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(1));
