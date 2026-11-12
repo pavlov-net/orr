@@ -161,7 +161,8 @@ impl Device {
         );
     }
 
-    /// Returns `slot` once everything submitted so far has completed.
+    /// Returns `slot` once the GPU is done with the work submitted so far and with the
+    /// command lists open now.
     pub fn free_image_slot_after_submitted(&self, slot: u32) {
         assert_freeable(slot);
         let shared = std::sync::Arc::clone(&self.shared);

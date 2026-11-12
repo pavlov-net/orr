@@ -20,7 +20,8 @@ use crate::{
 
 /// A texture and its memory. It has no layout state.
 ///
-/// Dropping it releases it once everything submitted before the drop has completed.
+/// Dropping it releases it once the GPU is done with the work submitted before the drop and
+/// with the command lists open at it.
 pub struct Texture {
     pub(super) raw: Obj<ProtocolObject<dyn MTLTexture>>,
     desc: TextureDesc,

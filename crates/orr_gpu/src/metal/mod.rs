@@ -129,27 +129,38 @@ impl Timeline {
 /// Work to run once the GPU has finished with something.
 type Release = Box<dyn FnOnce() + Send>;
 
-/// Releases waiting on timeline values: each entry runs once every timeline has reached the
-/// value it had been submitted to when the entry was queued.
+/// Releases waiting on timeline values and command lists: each entry runs once every timeline
+/// has reached the value it had been submitted to when the entry was queued, and every list
+/// open then has resolved (see [`crate::queue::OpenLists`]).
 #[derive(Default)]
 pub(super) struct Garbage {
-    pending: Vec<([u64; MAX_TIMELINES], Release)>,
+    /// Each release's values, the first list sequence number it does not wait for and the
+    /// release.
+    pending: Vec<([u64; MAX_TIMELINES], u64, Release)>,
 }
 
 impl Garbage {
-    pub(super) fn push(&mut self, after: [u64; MAX_TIMELINES], release: Release) {
-        self.pending.push((after, release));
+    pub(super) fn push(&mut self, after: [u64; MAX_TIMELINES], lists: u64, release: Release) {
+        self.pending.push((after, lists, release));
     }
 
-    /// Takes every release whose values `completed` has reached. The caller runs them after
-    /// unlocking the list, since a release may defer releases of its own.
+    /// Takes every release whose values `completed` has reached and whose lists have all
+    /// resolved, `first_unresolved` being the smallest sequence number of a list that has not.
+    /// The caller runs them after unlocking the list, since a release may defer releases of
+    /// its own.
     #[must_use]
-    pub(super) fn take_done(&mut self, completed: &[u64; MAX_TIMELINES]) -> Vec<Release> {
+    pub(super) fn take_done(
+        &mut self,
+        completed: &[u64; MAX_TIMELINES],
+        first_unresolved: u64,
+    ) -> Vec<Release> {
         let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
             .into_iter()
-            .partition(|(after, _)| after.iter().zip(completed).all(|(a, c)| c >= a));
+            .partition(|(after, lists, _)| {
+                *lists <= first_unresolved && after.iter().zip(completed).all(|(a, c)| c >= a)
+            });
         self.pending = keep;
-        done.into_iter().map(|(_, release)| release).collect()
+        done.into_iter().map(|(_, _, release)| release).collect()
     }
 }
 

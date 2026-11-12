@@ -105,8 +105,9 @@ struct ConvertArgs {
     pad: u32,
 }
 
-/// A classic acceleration structure in caller memory. Dropping it releases it once
-/// everything submitted before the drop has completed; its memory stays the caller's.
+/// A classic acceleration structure in caller memory. Dropping it releases it once the GPU
+/// is done with the work submitted before the drop and with the command lists open at it;
+/// its memory stays the caller's.
 pub struct ClassicAs {
     raw: Obj<ProtocolObject<dyn MTLAccelerationStructure>>,
     /// The resource ID.

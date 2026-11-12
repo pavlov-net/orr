@@ -155,7 +155,7 @@ impl Queue {
         })
     }
 
-    fn timeline(&self) -> u32 {
+    pub(super) fn timeline(&self) -> u32 {
         self.kind as u32
     }
 
@@ -192,6 +192,12 @@ impl Queue {
         let wait = wait.to_vec();
         let mut backlog = lock(&self.backlog);
         let point = self.next_point();
+        {
+            let mut lists = lock(&self.shared.lists);
+            for f in &finished {
+                lists.submitted(f.seq, point);
+            }
+        }
         self.resolve_passes(point, passes);
         let unissued = wait.iter().any(|&p| {
             self.queue_timeline(p)
@@ -271,7 +277,7 @@ impl Queue {
         let mut ready = Vec::new();
         let mut steps = Vec::new();
         for f in &mut finished {
-            self.run_steps(f, &mut ready, &mut steps);
+            self.run_steps(f, point, &mut ready, &mut steps);
         }
         self.commit(&mut ready);
         if let Some(d) = drawable {
@@ -312,10 +318,12 @@ impl Queue {
     }
 
     /// Queues `f`'s command buffers on `ready`, committing and running each CPU step on the
-    /// way; the lists the steps record (themselves split by steps) go to `steps`.
+    /// way; the lists the steps record (themselves split by steps) go to `steps`, part of the
+    /// submit that signals `point`.
     fn run_steps(
         &self,
         f: &mut Finished,
+        point: TimelinePoint,
         ready: &mut Vec<Retained<ProtocolObject<dyn MTL4CommandBuffer>>>,
         steps: &mut Vec<Finished>,
     ) {
@@ -327,7 +335,8 @@ impl Queue {
                 let mut list = CommandList::new(self).expect("a command list for a CPU step");
                 step(&mut list);
                 let mut done = list.finish();
-                self.run_steps(&mut done, ready, steps);
+                lock(&self.shared.lists).submitted(done.seq, point);
+                self.run_steps(&mut done, point, ready, steps);
                 steps.push(done);
             }
         }

@@ -55,6 +55,8 @@ pub(super) struct Finished {
     _keep: Vec<Box<dyn Any + Send>>,
     /// The list's passes: each name and the sequence number of its begin timestamp.
     pub(super) passes: Vec<(&'static str, u64)>,
+    /// The list's sequence number in the device's open lists.
+    pub(super) seq: u64,
 }
 
 // SAFETY: a finished list is only dropped, on whichever thread collects garbage; Metal command
@@ -63,7 +65,9 @@ pub(super) struct Finished {
 unsafe impl Send for Finished {}
 
 /// A one-shot command list for one queue. Record on any thread, then hand it to the queue's
-/// owner for [`Queue::submit`]. Dropping it unsubmitted discards it.
+/// owner for [`Queue::submit`]. Dropping it unsubmitted discards it. It names memory and
+/// objects without holding them, so what is dropped while it is open lives until its submit
+/// has completed, or until it is dropped unsubmitted.
 pub struct CommandList<'q> {
     pub(super) queue: &'q Queue,
     pub(super) buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
@@ -88,6 +92,8 @@ pub struct CommandList<'q> {
     in_pass: bool,
     /// Set by `finish`, so dropping does not end the buffer twice.
     finished: bool,
+    /// The list's sequence number in the device's open lists, until `finish` takes it.
+    seq: Option<u64>,
 }
 
 // SAFETY: one thread at a time records a list: `CommandList` is not `Sync` and every method
@@ -116,6 +122,7 @@ impl<'q> CommandList<'q> {
             .device
             .newArgumentTableWithDescriptor_error(&desc)
             .map_err(|e| super::device::metal_error("newArgumentTableWithDescriptor", &e))?;
+        let seq = lock(&shared.lists).open(queue.timeline(), queue.completed());
         let b = &shared.bindings;
         // SAFETY: both addresses are of live device buffers the residency set holds.
         unsafe {
@@ -138,6 +145,7 @@ impl<'q> CommandList<'q> {
             passes: Vec::new(),
             in_pass: false,
             finished: false,
+            seq: Some(seq),
         })
     }
 
@@ -158,6 +166,7 @@ impl<'q> CommandList<'q> {
             _inline: std::mem::take(&mut self.inline),
             _keep: std::mem::take(&mut self.keep),
             passes: std::mem::take(&mut self.passes),
+            seq: self.seq.take().expect("a list is finished once"),
         }
     }
 
@@ -485,6 +494,9 @@ impl Drop for CommandList<'_> {
         if !self.finished {
             self.end_encoder();
             self.buffer.endCommandBuffer();
+        }
+        if let Some(seq) = self.seq.take() {
+            lock(&self.queue.shared.lists).dropped(seq);
         }
     }
 }

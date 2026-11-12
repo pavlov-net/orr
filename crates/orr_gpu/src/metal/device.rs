@@ -49,6 +49,8 @@ pub(super) struct Shared {
     /// [`HostTimeline`]: super::HostTimeline
     pub(super) host_timelines: Mutex<Vec<Obj<ProtocolObject<dyn MTLSharedEvent>>>>,
     pub(super) garbage: Mutex<Garbage>,
+    /// Command lists that releases deferred while they are open wait for.
+    pub(super) lists: Mutex<crate::queue::OpenLists>,
     /// Held while releases run, so that a thread finding nothing left to take still returns
     /// after what another thread took: [`Device::pass_results`] reads what they write.
     pub(super) collecting: Mutex<()>,
@@ -89,10 +91,12 @@ pub(super) struct Residency {
 }
 
 impl Shared {
-    /// Runs `release` once everything submitted so far has completed.
+    /// Runs `release` once everything submitted so far has completed and every command list
+    /// open now has resolved: the lists may have recorded uses of what it releases.
     pub(super) fn defer(&self, release: Release) {
+        let lists = lock(&self.lists).next();
         let after = self.submitted();
-        lock(&self.garbage).push(after, release);
+        lock(&self.garbage).push(after, lists, release);
     }
 
     /// Runs `release` once `value` of `timeline` has completed.
@@ -103,7 +107,7 @@ impl Shared {
         );
         let mut after = [0; MAX_TIMELINES];
         after[timeline as usize] = value;
-        lock(&self.garbage).push(after, release);
+        lock(&self.garbage).push(after, 0, release);
     }
 
     pub(super) fn submitted(&self) -> [u64; MAX_TIMELINES] {
@@ -114,10 +118,12 @@ impl Shared {
     /// a finished list's allocations, which free once what was submitted when they dropped has.
     pub(super) fn collect(&self) {
         let _collecting = lock(&self.collecting);
-        let completed = std::array::from_fn(|i| self.timelines[i].completed());
+        let completed: [u64; MAX_TIMELINES] =
+            std::array::from_fn(|i| self.timelines[i].completed());
+        let first_unresolved = lock(&self.lists).first_unresolved(&completed);
         autoreleasepool(|_| {
             loop {
-                let done = lock(&self.garbage).take_done(&completed);
+                let done = lock(&self.garbage).take_done(&completed, first_unresolved);
                 if done.is_empty() {
                     break;
                 }
@@ -217,6 +223,7 @@ impl Device {
             timelines,
             host_timelines: Mutex::default(),
             garbage: Mutex::default(),
+            lists: Mutex::default(),
             collecting: Mutex::default(),
             buffers: Mutex::default(),
             heaps,
