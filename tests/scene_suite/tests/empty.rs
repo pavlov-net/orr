@@ -1,8 +1,9 @@
 //! The device memory of a renderer with an empty scene and two views of it, a raster view and
 //! a lit one, against what holds it: a table or a list of the scene's content holds nothing, so
 //! its allocation is the smallest the device makes, and every allocation that is larger states
-//! what it follows. The target holds this test alone: the device's ledger of live allocations
-//! by label is then this renderer's.
+//! what it follows. What only a lit view or a kind of content needs is not there without it.
+//! The target holds this test alone: the device's ledger of live allocations by label is then
+//! this renderer's.
 
 use orr::{
     FrameDesc, FrameTime, Lens, LitView, PathEntry, Projection, Renderer, RendererDesc, SceneDesc,
@@ -39,7 +40,6 @@ impl std::fmt::Display for Follows {
 }
 
 const WORLD_CACHE: Follows = Setting("SceneLightingSettings::world_cache");
-const CAUSTICS: Follows = Setting("SceneLightingSettings::caustics");
 const MESH_PAGES: Follows = Setting("Budgets::mesh_page_pool");
 
 /// Every label whose allocations are not the device's smallest, and what it follows.
@@ -79,19 +79,9 @@ const STATED: &[(&str, Follows)] = &[
     ("world cache checks", WORLD_CACHE),
     ("world cache roots", Fixed),
     ("world cache resolve roots", Fixed),
-    ("caustic grid deposits", CAUSTICS),
-    ("caustic grid irradiance", CAUSTICS),
-    ("caustic grid checks", CAUSTICS),
-    ("caustic grid photons", CAUSTICS),
-    ("producer caster cdf", CAUSTICS),
     ("caustic roots", Fixed),
     ("caustic resolve roots", Fixed),
     ("caster roots", Fixed),
-    (
-        "emissive cluster cdf",
-        Setting("SceneLightingSettings::emissive_clusters"),
-    ),
-    ("light tiles", Fixed),
     ("light tile roots", Fixed),
     ("directional roots", Fixed),
     ("environment map", Fixed),
@@ -139,7 +129,20 @@ const STATED: &[(&str, Follows)] = &[
     ("particle lighting", Fixed),
 ];
 
+/// What the scene's lighting makes only for a lit view: the world cache, with its roots.
+const LIT_ONLY: &str = "world cache";
+
+/// What it makes only for content the empty scene lacks: the caustics' grid for a caster, and
+/// the light tiles for a light, an emissive list entry or an environment that may radiate.
+const CONTENT_ONLY: [&str; 2] = ["caustic grid", "light tiles"];
+
 const PROBE: &str = "smallest allocation";
+
+/// Whether the device holds an allocation whose label starts with `prefix`.
+fn holds(prefix: &str) -> bool {
+    let ledger = device().memory_breakdown();
+    ledger.labels.iter().any(|l| l.label.starts_with(prefix))
+}
 
 /// Bytes of the smallest allocation of `kind`, by making one.
 fn smallest(kind: MemoryKind) -> u64 {
@@ -175,7 +178,8 @@ fn view(scene: orr::SceneId, history: orr::ViewHistoryId) -> ViewDesc {
 /// Three frames of an empty scene through a raster view, then three through a lit one, leave
 /// nothing in device memory but what [`STATED`] names and, for every table and list the scene
 /// has nothing to put in, one allocation of the device's smallest size. A table or a list
-/// sized before the scene holds anything for it fails here by its label.
+/// sized before the scene holds anything for it fails here by its label. The raster view's
+/// frames leave no world cache, and neither view's leave a caustic grid or light tiles.
 #[test]
 fn an_empty_scene_holds_no_memory_for_content() {
     let kinds = MemoryKind::ALL;
@@ -238,9 +242,18 @@ fn an_empty_scene_holds_no_memory_for_content() {
             )
             .unwrap();
         }
-        last = Some(f.end().unwrap());
+        let end = f.end().unwrap();
+        if i == 2 {
+            wait(end);
+            assert!(!holds(LIT_ONLY), "a world cache with no lit view");
+        }
+        last = Some(end);
     }
     wait(last.unwrap());
+    assert!(holds(LIT_ONLY), "no world cache under a lit view");
+    for label in CONTENT_ONLY {
+        assert!(!holds(label), "{label} in an empty scene");
+    }
 
     let ledger = device().memory_breakdown();
     // What the empty scene holds and why, and what it holds with no reason stated.
