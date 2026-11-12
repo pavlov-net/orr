@@ -834,8 +834,8 @@ impl Scenes {
     /// when a pack holding one of its models is unmounted. Each copy holds an emissive list
     /// entry per emissive section of its chain's most emissive model; a chain that needs more
     /// gives every copy of the model in every scene more, on pages too, and fails with
-    /// [`Error::Capacity`], changing nothing, where a scene's list has no room or its PTLAS
-    /// part pool no room for the far instances of the model's copies.
+    /// [`Error::Capacity`], changing nothing, where a scene's PTLAS part pool has no room for
+    /// the far instances of the model's copies.
     pub fn set_chain(&mut self, model: ModelId, chain: &[(ModelId, f32)]) -> Result<()> {
         let invalid = |reason| Err(Error::InvalidChain { model, reason });
         if !self.core.mounts.is_live(model) {
@@ -1069,11 +1069,6 @@ impl Scenes {
     /// A resident instance page.
     pub fn page(&self, id: PageId) -> Option<&InstancePage> {
         self.core.mounts.page(id)
-    }
-
-    /// What placing instance page `id` takes of a scene's tables.
-    pub fn page_needs(&self, id: PageId) -> Result<crate::PageNeeds> {
-        crate::scene::page_needs(&self.core.mounts, &self.core.model_cpu, id).map(|(n, ..)| n)
     }
 
     /// The entry of `scene`'s producer table that producer `id` holds while it is set, as

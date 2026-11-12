@@ -1179,12 +1179,10 @@ fn a_page_takes_entries_for_each_prototype_s_copies() {
         .unwrap()
         .id;
     let (lamps, all) = (3, PAGE_PROTOTYPES.len() as u32);
-    // Room for the page's entries with the chain, and for the ones it holds before.
     let (mut scenes, s, m, _workers) = mounted(bytes);
     let lamp = scenes.model(m, AssetId::from_name("lamp")).unwrap();
     let plain = scenes.model(m, AssetId::from_name("plain")).unwrap();
     let page = scenes.instance_page(m, page_id).unwrap();
-    assert_eq!(scenes.page_needs(page).unwrap().emissive, 2 * lamps);
 
     let list = [s];
     let mut f = scenes.begin_frame(&frame(&list)).unwrap();

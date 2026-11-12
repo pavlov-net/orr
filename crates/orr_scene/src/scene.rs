@@ -93,15 +93,6 @@ impl Default for SceneDesc {
 
 pub use orr_pack::AffineRows;
 
-/// What placing an instance page takes of a scene's tables, with the chains its models have
-/// now.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PageNeeds {
-    /// Emissive list entries: every copy takes one for each emissive and each caster section
-    /// of the most emissive step of its model's chain.
-    pub emissive: u32,
-}
-
 /// What the copies of one prototype of a placed page take of the emissive list: `stride`
 /// entries each for its `records`, after the entries of the prototypes before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,13 +106,14 @@ fn page_entries(entries: &[PrototypeEntries]) -> u32 {
     entries.iter().map(|e| e.records * e.stride).sum()
 }
 
-/// What placing page `id` takes, the emissive entries of each of its prototypes, and its
-/// prototypes.
-pub(crate) fn page_needs(
+/// The prototypes of page `id` and the emissive list entries of each, with the chains its
+/// models have now: every copy takes an entry for each emissive and each caster section of the
+/// most emissive step of its model's chain.
+fn page_prototypes(
     mounts: &Mounts,
     model_cpu: &[ModelCpu],
     id: PageId,
-) -> Result<(PageNeeds, Vec<PrototypeEntries>, Vec<PagePrototype>)> {
+) -> Result<(Vec<PrototypeEntries>, Vec<PagePrototype>)> {
     let protos = mounts.page_prototypes(id)?;
     let entries: Vec<PrototypeEntries> = protos
         .iter()
@@ -132,10 +124,7 @@ pub(crate) fn page_needs(
                 .map_or(0, |m| m.emissive_stride),
         })
         .collect();
-    let needs = PageNeeds {
-        emissive: page_entries(&entries),
-    };
-    Ok((needs, entries, protos))
+    Ok((entries, protos))
 }
 
 /// A transform group in one scene. Group 0 is the null group: it holds nothing and hides
@@ -2032,8 +2021,8 @@ impl<'f> SceneWriter<'f> {
     /// if a group in `r.poses` is neither the null group nor one from `create_transform_group`.
     pub fn add_instance_page(&mut self, r: &InstancePageRef<'_>) -> Result<InstanceRange> {
         self.check_groups(r.poses.iter().map(|(_, pose)| pose.group));
-        let page = page_needs(self.mounts, self.model_cpu, r.page)?;
-        let protos = &page.2;
+        let page = page_prototypes(self.mounts, self.model_cpu, r.page)?;
+        let protos = &page.1;
         let mut named = vec![None; protos.len()];
         for &(index, base) in r.material_sets {
             let i = usize::from(index);
@@ -2057,7 +2046,7 @@ impl<'f> SceneWriter<'f> {
     fn place_instance_page(
         &self,
         r: &InstancePageRef<'_>,
-        (needs, entries, protos): (PageNeeds, Vec<PrototypeEntries>, Vec<PagePrototype>),
+        (entries, protos): (Vec<PrototypeEntries>, Vec<PagePrototype>),
         named: &[Option<u32>],
         motion: Option<TransformGroupId>,
     ) -> Result<(InstanceRange, TransformGroupId)> {
@@ -2068,7 +2057,7 @@ impl<'f> SceneWriter<'f> {
         let header = page.info.header;
         let exact_rows = header.exact_rows(page.bytes as usize)? as u32;
         let count = u32::from(header.record_count);
-        let emissive = needs.emissive;
+        let emissive = page_entries(&entries);
         let set_entries = protos
             .iter()
             .zip(named)

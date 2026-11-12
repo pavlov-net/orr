@@ -31,9 +31,9 @@ use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
     Budgets, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime,
     InstanceFlags, InstancePageRef, Lens, Light, LightId, LitView, LoadState, PackSource,
-    PageNeeds, Projection, Renderer, RendererDesc, RequestSource, ResidencyClass, ResidencyStats,
-    SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter, UiPass, ViewHooks,
-    ViewLighting, ViewOutput, ViewTarget,
+    Projection, Renderer, RendererDesc, RequestSource, ResidencyClass, ResidencyStats, SceneDesc,
+    SceneLightingSettings, ScreenshotRequest, TextureFilter, UiPass, ViewHooks, ViewLighting,
+    ViewOutput, ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, CookOptions, GltfLayout, GltfSettings, InputChannels, LodMode,
@@ -923,13 +923,6 @@ fn run(options: &Options) -> Option<Capture> {
         .into_iter()
         .map(|id| renderer.instance_page(mount, id).expect("instance page"))
         .collect();
-    let needs = pages.iter().fold(PageNeeds::default(), |n, &p| {
-        let p = renderer.page_needs(p).expect("page needs");
-        PageNeeds {
-            emissive: n.emissive + p.emissive,
-        }
-    });
-    log::info!("{} instance pages need {needs:?}", pages.len());
     let scene = renderer
         .create_scene(&SceneDesc::default(), &SceneLightingSettings::default())
         .expect("scene");

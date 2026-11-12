@@ -66,13 +66,13 @@ pub use orr_scene::{
     InstanceFlags, InstancePage, InstancePageRef, InstanceRange, InstancesDesc, JobResult, Lens,
     LensDistortion, Light, LightId, LoadState, Loading, MaterialGpu, MaterialId, MaterialWriter,
     MediumData, MeshPipelineId, MeshStages, ModelId, MountId, NeuralTextures, Opacity, OpaqueHook,
-    OpaquePass, OriginPolicy, PackSource, PageId, PageNeeds, PipelineId, PoolSize, Pose,
-    ProducerBatch, ProducerDesc, ProducerId, ProducerStats, ProducerUpdate, Projection, RasterGpu,
-    ReloadReport, RendererDesc, RequestSource, ResidencyClass, ResidencyStats, RtStats,
-    SceneCompute, SceneDesc, SceneId, SceneMemory, SceneRoot, SkeletonRef, SkinStats, SkinnedDesc,
-    SkinnedPageRef, SkyStats, Span, TextureFilter, TextureSamplerGpu, TextureStreamGpu,
-    TransformGroupDesc, TransformGroupId, TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId,
-    ViewStep, WorldPos, abi, binding_sampler, material_flags, orr_gpu, orr_pack,
+    OpaquePass, OriginPolicy, PackSource, PageId, PipelineId, PoolSize, Pose, ProducerBatch,
+    ProducerDesc, ProducerId, ProducerStats, ProducerUpdate, Projection, RasterGpu, ReloadReport,
+    RendererDesc, RequestSource, ResidencyClass, ResidencyStats, RtStats, SceneCompute, SceneDesc,
+    SceneId, SceneMemory, SceneRoot, SkeletonRef, SkinStats, SkinnedDesc, SkinnedPageRef, SkyStats,
+    Span, TextureFilter, TextureSamplerGpu, TextureStreamGpu, TransformGroupDesc, TransformGroupId,
+    TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId, ViewStep, WorldPos, abi,
+    binding_sampler, material_flags, orr_gpu, orr_pack,
 };
 
 use orr_gpu::{
@@ -874,11 +874,6 @@ impl Renderer {
 
     pub fn page(&self, id: PageId) -> Option<&InstancePage> {
         self.scenes.page(id)
-    }
-
-    /// What placing instance page `id` takes of a scene's tables.
-    pub fn page_needs(&self, id: PageId) -> Result<PageNeeds> {
-        Ok(self.scenes.page_needs(id)?)
     }
 
     /// The entry of `scene`'s producer table that producer `id` holds while it is set, as
