@@ -8,7 +8,7 @@ mod dag_read;
 #[path = "common/glb.rs"]
 mod glb;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use dag_read::{Cut, Dag, coverage, covers_once, load, read};
@@ -1291,5 +1291,159 @@ fn static_displacement_bakes_a_crack_free_surface() {
     for cut in cuts {
         let flat = dag.select(cut, |_| true);
         assert_eq!(unmatched_edges(&dag, &flat, rim), 0, "{cut:?}");
+    }
+}
+
+/// Plates on a barrel vault of radius [`R`] about the x axis, as a vaulted roof lays them:
+/// `rows` x `cols` plates of 6 x 4 quads, 20 cm along the axis and 30 cm around it, 1 cm
+/// apart. Each is an outer and an inner sheet 4 mm apart whose normals point out and in
+/// along the radius, joined by a rim of flat quads with normals of their own.
+fn barrel_plates(rows: u32, cols: u32) -> MeshInput {
+    let (nu, nv) = (6u32, 4u32);
+    let (arc, step) = (0.3 / R, 0.31 / R);
+    let radial = |a: f32| Vec3::new(0.0, a.cos(), a.sin());
+    let around = |a: f32| Vec3::new(0.0, -a.sin(), a.cos());
+    let mut m = MeshInput::default();
+    let mut uvs = Vec::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            let (x0, a0) = (0.21 * c as f32, step * (r as f32 - 0.5 * rows as f32));
+            let at = |i: u32, j: u32, outer: bool| {
+                let a = a0 + arc * j as f32 / nv as f32;
+                let radius = if outer { R } else { R - 0.004 };
+                (
+                    Vec3::X * (x0 + 0.2 * i as f32 / nu as f32) + radial(a) * radius,
+                    a,
+                )
+            };
+            for outer in [true, false] {
+                let base = m.positions.len() as u32;
+                for j in 0..=nv {
+                    for i in 0..=nu {
+                        let (p, a) = at(i, j, outer);
+                        m.positions.push(p);
+                        m.normals.push(if outer { radial(a) } else { -radial(a) });
+                        uvs.push(Vec2::new(i as f32 / nu as f32, j as f32 / nv as f32));
+                    }
+                }
+                let w = nu + 1;
+                for j in 0..nv {
+                    for i in 0..nu {
+                        let k = base + j * w + i;
+                        let quad = [k, k + 1, k + w, k + 1, k + w + 1, k + w];
+                        // Along the vault, then around it, turns inward.
+                        if outer {
+                            m.indices
+                                .extend(quad.chunks(3).flat_map(|t| [t[0], t[2], t[1]]));
+                        } else {
+                            m.indices.extend(quad);
+                        }
+                    }
+                }
+            }
+            // A rim quad from the outer edge `a`-`b` to the inner one, facing `n`.
+            let mut rim = |a: (u32, u32), b: (u32, u32), n: Vec3| {
+                let base = m.positions.len() as u32;
+                let corners = [(a, true), (b, true), (b, false), (a, false)];
+                m.positions
+                    .extend(corners.map(|((i, j), outer)| at(i, j, outer).0));
+                m.normals.extend([n; 4]);
+                uvs.extend([Vec2::ZERO; 4]);
+                let p = |k: u32| m.positions[(base + k) as usize];
+                let quad = [0, 1, 2, 0, 2, 3].map(|k| base + k);
+                if (p(1) - p(0)).cross(p(2) - p(0)).dot(n) > 0.0 {
+                    m.indices.extend(quad);
+                } else {
+                    m.indices
+                        .extend(quad.chunks(3).flat_map(|t| [t[0], t[2], t[1]]));
+                }
+            };
+            for i in 0..nu {
+                rim((i, 0), (i + 1, 0), -around(a0));
+                rim((i, nv), (i + 1, nv), around(a0 + arc));
+            }
+            for j in 0..nv {
+                rim((0, j), (0, j + 1), -Vec3::X);
+                rim((nu, j), (nu, j + 1), Vec3::X);
+            }
+        }
+    }
+    m.uvs = Some(uvs);
+    m.sections = vec![Span {
+        first: 0,
+        count: m.indices.len() as u32,
+    }];
+    m
+}
+
+/// Radius of [`barrel_plates`]' vault.
+const R: f32 = 2.0;
+
+/// A coarse normal is a weighted mean of the normals the source has on its triangle's side
+/// over the triangles at its vertex, so on a sheet it stays within the turn of the sheet's
+/// normal across them: 2 L / R for a level whose longest edge is L. A vertex that groups of
+/// a level share keeps its normal, which can be a rim's where a coarse triangle bevels over
+/// the rim, so 1% of each level's area may lie past the bound.
+#[test]
+fn coarse_levels_of_thin_curved_plates_shade_as_their_sheets() {
+    let discrete = MeshSettings {
+        lod: LodMode::Discrete {
+            errors: vec![0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64],
+        },
+        ..MeshSettings::default()
+    };
+    for settings in [dag(), discrete] {
+        let lod = settings.lod.clone();
+        let d = load(&cook(barrel_plates(12, 24), &[0], settings), "m/mesh");
+        // Per level, a DAG's depth or a discrete level's error: the longest edge of its
+        // sheet-facing triangles, and their areas and angles from the sheet's normal at their
+        // centroids.
+        let level_of: Vec<u32> = if lod == LodMode::Dag {
+            let mut of = vec![0; d.clusters.len()];
+            for g in &d.info.groups {
+                for c in d.group_of(g) {
+                    of[c] = u32::from(g.depth);
+                }
+            }
+            of
+        } else {
+            d.clusters
+                .iter()
+                .map(|c| c.record.self_error.to_bits())
+                .collect()
+        };
+        let mut levels: BTreeMap<u32, (f32, Vec<(f32, f32)>)> = BTreeMap::new();
+        for (c, &level) in d.clusters.iter().zip(&level_of) {
+            if c.record.self_error == 0.0 {
+                continue;
+            }
+            for (t, n) in c.tris.iter().zip(&c.normals) {
+                let p = t.map(Vec3::from);
+                let cross = (p[1] - p[0]).cross(p[2] - p[0]);
+                let x = (p[0] + p[1] + p[2]) / 3.0;
+                let out = Vec3::new(0.0, x.y, x.z).normalize();
+                let side = cross.normalize_or_zero().dot(out);
+                // Rims and triangles across them face neither sheet.
+                if side.abs() < 0.5 {
+                    continue;
+                }
+                let normal = n.iter().map(|&n| Vec3::from(n)).sum::<Vec3>().normalize();
+                let angle = normal.angle_between(out * side.signum()).to_degrees();
+                let e = levels.entry(level).or_default();
+                e.0 = (0..3).fold(e.0, |l, k| l.max(p[k].distance(p[(k + 1) % 3])));
+                e.1.push((0.5 * cross.length(), angle));
+            }
+        }
+        assert!(levels.len() >= 5, "{lod:?}: {} levels", levels.len());
+        for (level, (longest, tris)) in &levels {
+            let bound = (2.0 * longest / R).to_degrees();
+            let area: f32 = tris.iter().map(|t| t.0).sum();
+            let past: f32 = tris.iter().filter(|t| t.1 > bound).map(|t| t.0).sum();
+            assert!(
+                past <= 0.01 * area,
+                "{lod:?} level {level}: {:.1}% past {bound:.1} degrees",
+                100.0 * past / area
+            );
+        }
     }
 }
