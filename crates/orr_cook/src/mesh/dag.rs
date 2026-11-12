@@ -45,9 +45,17 @@ use super::{
 /// borders dilate.
 type Class = (u16, Option<u16>);
 
-/// A triangle corner: the welded vertices that shade, turn and place it, its grid position
-/// and section.
-type Corner = (u32, u32, u32, [i32; 3], u16);
+/// A triangle corner: the welded vertices that shade, turn and place it, the one it stands for
+/// in simplification, its grid position and section.
+#[derive(Copy, Clone)]
+struct Corner {
+    shading: u32,
+    turning: u32,
+    placing: u32,
+    base: u32,
+    cell: [i32; 3],
+    section: u16,
+}
 
 /// One input to `clodBuild`: vertices referring to welded vertices, at grid positions, in
 /// sections.
@@ -59,6 +67,9 @@ struct Input {
     /// Per vertex, the welded vertex that places it, by its skin; empty when each vertex's is
     /// its own `welded` one.
     placing: Vec<u32>,
+    /// Per vertex, the vertex it stands for in simplification; empty when each stands for
+    /// itself.
+    base: Vec<u32>,
     cells: Vec<[i32; 3]>,
     sections: Vec<u16>,
     lock: Vec<u8>,
@@ -73,6 +84,7 @@ impl Input {
             welded: Vec::new(),
             turning: Vec::new(),
             placing: Vec::new(),
+            base: Vec::new(),
             cells: Vec::new(),
             sections: Vec::new(),
             lock: Vec::new(),
@@ -126,6 +138,9 @@ struct Clusters {
     /// Welded vertex that places each cluster vertex, by its skin; empty where each vertex's
     /// is its own `verts` one.
     placing: Vec<u32>,
+    /// Welded vertex each cluster vertex stands for in simplification; empty where each
+    /// vertex's is its own `verts` one.
+    base: Vec<u32>,
     /// Grid position per cluster vertex, as emitted.
     cells: Vec<[i32; 3]>,
     tris: Vec<u8>,
@@ -147,6 +162,9 @@ impl Clusters {
             if !self.placing.is_empty() {
                 self.placing.copy_within(c.verts.clone(), v);
             }
+            if !self.base.is_empty() {
+                self.base.copy_within(c.verts.clone(), v);
+            }
             self.cells.copy_within(c.verts.clone(), v);
             self.tris.copy_within(c.tris.clone(), t);
             (c.verts, c.tris) = (v..v + vn, t..t + tn);
@@ -156,6 +174,7 @@ impl Clusters {
         self.verts.truncate(v);
         self.turning.truncate(v);
         self.placing.truncate(v);
+        self.base.truncate(v);
         self.cells.truncate(v);
         self.tris.truncate(t);
     }
@@ -287,9 +306,15 @@ fn stages(
                 for &k in &gc.tris[c.tris.clone()] {
                     let k = c.verts.start + usize::from(k);
                     let v = gc.verts[k];
-                    let turning = gc.turning.get(k).copied().unwrap_or(v);
-                    let placing = gc.placing.get(k).copied().unwrap_or(v);
-                    corners.push((v, turning, placing, gc.cells[k], c.section));
+                    let other = |of: &[u32]| of.get(k).copied().unwrap_or(v);
+                    corners.push(Corner {
+                        shading: v,
+                        turning: other(&gc.turning),
+                        placing: other(&gc.placing),
+                        base: other(&gc.base),
+                        cell: gc.cells[k],
+                        section: c.section,
+                    });
                 }
             }
         }
@@ -311,7 +336,7 @@ fn stages(
             let next = |id_of: &FxHashMap<_, _>| id_of.len() as u32;
             corners
                 .iter()
-                .map(|&(_, _, _, cell, _)| {
+                .map(|&Corner { cell, .. }| {
                     let n = next(&id_of);
                     *id_of.entry(cell).or_insert(n)
                 })
@@ -328,7 +353,7 @@ fn stages(
             corners
                 .iter()
                 .zip(ids)
-                .map(|(&(v, _, _, _, section), &id)| (v, id, section))
+                .map(|(c, &id)| (c.shading, id, c.section))
         }),
     );
     // Vertices of different parts join where they share a position, attributes and section.
@@ -508,7 +533,7 @@ fn part_inputs(
 /// The `clodBuild` input of a merged stage over `corners`, whose positions have the ids
 /// `ids` below `positions`: one vertex per position, attributes (`attrs` of its shading,
 /// turning and placing welded vertices, of `welded`) and section, in the order the corners
-/// first use them.
+/// first use them, each standing for the vertex of its base welded vertex there.
 fn merged_input<K: std::hash::Hash + Eq>(
     corners: &[Corner],
     ids: &[u32],
@@ -523,35 +548,47 @@ fn merged_input<K: std::hash::Hash + Eq>(
     // corners use.
     let mut class_of = vec![u32::MAX; welded];
     let mut classes: FxHashMap<K, u32> = FxHashMap::default();
-    let mut local_of: FxHashMap<(u32, u32, u16), u32> = FxHashMap::default();
+    let mut local_of: FxHashMap<(u32, u32, u32, u16), u32> = FxHashMap::default();
     let mut first = vec![u32::MAX; positions];
     let mut input = Input::with_capacity(corners.len());
-    for (&(v, turning, placing, cell, section), &id) in corners.iter().zip(ids) {
+    for (c, &id) in corners.iter().zip(ids) {
         let mut class = |v: u32, turning: u32, placing: u32| {
-            let next = classes.len() as u32;
-            *classes.entry(attrs(v, turning, placing)).or_insert(next)
-        };
-        let class = if turning == v && placing == v {
-            let c = &mut class_of[v as usize];
-            if *c == u32::MAX {
-                *c = class(v, v, v);
+            if turning == v && placing == v {
+                let k = &mut class_of[v as usize];
+                if *k == u32::MAX {
+                    let next = classes.len() as u32;
+                    *k = *classes.entry(attrs(v, v, v)).or_insert(next);
+                }
+                *k
+            } else {
+                let next = classes.len() as u32;
+                *classes.entry(attrs(v, turning, placing)).or_insert(next)
             }
-            *c
-        } else {
-            class(v, turning, placing)
         };
-        let l = *local_of.entry((id, class, section)).or_insert_with(|| {
-            let f = &mut first[id as usize];
-            let stands = (*f != u32::MAX).then_some(*f);
-            let lock = lod::vertex_flags(id, shared, seams).bits();
-            let l = input.push(v, cell, section, lock, stands);
-            input.turning.push(turning);
-            input.placing.push(placing);
-            if stands.is_none() {
-                *f = l;
-            }
-            l
-        });
+        let own = class(c.shading, c.turning, c.placing);
+        let base = class(c.base, c.base, c.base);
+        // The vertex of the corner's position and section with the attributes of class `own`
+        // of welded vertices `v`, `turning` and `placing`, standing for the one of class
+        // `base`, which it adds first where it is missing.
+        let mut vertex = |own: u32, v: u32, turning: u32, placing: u32, b: Option<u32>| {
+            *local_of
+                .entry((id, own, base, c.section))
+                .or_insert_with(|| {
+                    let f = &mut first[id as usize];
+                    let stands = (*f != u32::MAX).then_some(*f);
+                    let lock = lod::vertex_flags(id, shared, seams).bits();
+                    let l = input.push(v, c.cell, c.section, lock, stands);
+                    input.turning.push(turning);
+                    input.placing.push(placing);
+                    input.base.push(b.unwrap_or(l));
+                    if stands.is_none() {
+                        *f = l;
+                    }
+                    l
+                })
+        };
+        let b = vertex(base, c.base, c.base, c.base, None);
+        let l = vertex(own, c.shading, c.turning, c.placing, Some(b));
         input.indices.push(l);
     }
     if input.turning == input.welded {
@@ -559,6 +596,9 @@ fn merged_input<K: std::hash::Hash + Eq>(
     }
     if input.placing == input.welded {
         input.placing = Vec::new();
+    }
+    if input.base.iter().enumerate().all(|(l, &b)| b == l as u32) {
+        input.base = Vec::new();
     }
     input
 }
@@ -636,6 +676,7 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
         lock: lock.into_owned(),
         remap: &input.remap,
         sections: &input.sections,
+        base: (!input.base.is_empty()).then(|| input.base.clone()),
         keep_borders: !o.dilate,
     };
     let mut groups = super::clod::build(&config, mesh, positions, |e| {
@@ -767,6 +808,10 @@ fn group_of(
         );
         out.turning
             .extend(used.iter().map(|&v| input.turning(sources.turning(v))));
+        out.base.extend(
+            used.iter()
+                .map(|&v| input.welded[e.base[v as usize] as usize]),
+        );
         if skinned {
             out.placing
                 .extend(used.iter().map(|&v| input.placing(sources.placing(v))));
@@ -842,6 +887,9 @@ fn group_of(
     }
     if out.placing == out.verts {
         out.placing = Vec::new();
+    }
+    if out.base == out.verts {
+        out.base = Vec::new();
     }
     let b = e.bounds;
     DagGroup {

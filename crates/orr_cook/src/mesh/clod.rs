@@ -51,6 +51,10 @@ pub(super) struct Mesh<'a> {
     pub(super) lock: Vec<u8>,
     pub(super) remap: &'a [u32],
     pub(super) sections: &'a [u16],
+    /// Per vertex, the vertex it stands for in simplification, where some stand for others:
+    /// a corner an earlier build gave another vertex's normal or attributes
+    /// ([`lod::opposed_corners`]).
+    pub(super) base: Option<Vec<u32>>,
     /// The open borders stay where `lock` leaves them: the sloppy fallback, which does not
     /// keep to border loops, locks every vertex on one.
     pub(super) keep_borders: bool,
@@ -93,6 +97,9 @@ struct Vertices {
     lock: Vec<u8>,
     remap: Vec<u32>,
     sources: Sources,
+    /// The mesh vertex each vertex stands for in simplification: a wedge, the one the vertex
+    /// it is placed as does.
+    base: Vec<u32>,
 }
 
 impl Vertices {
@@ -108,6 +115,7 @@ impl Vertices {
         self.normals.extend_from_within(3 * normal..3 * normal + 3);
         self.lock.push(self.lock[at]);
         self.remap.push(self.remap[at]);
+        self.base.push(self.base[at]);
         new
     }
 }
@@ -726,7 +734,8 @@ fn dilate_borders(
 }
 
 /// What a group's emission gets: its depth and bounds, its clusters, their corners, the
-/// positions as they are when it is emitted, and the mesh vertices each vertex takes after.
+/// positions as they are when it is emitted, the mesh vertices each vertex takes after, and
+/// the one each stands for in simplification.
 pub(super) struct Emitted<'a> {
     pub(super) depth: u32,
     pub(crate) bounds: Bounds,
@@ -734,11 +743,12 @@ pub(super) struct Emitted<'a> {
     pub(super) indices: &'a [u32],
     pub(super) positions: &'a [f32],
     pub(super) sources: &'a Sources,
+    pub(super) base: &'a [u32],
 }
 
 /// A group simplified and emitted: its triangles, their bounds, and the corners whose
 /// vertex normal opposes their face with the vertices they take their shading from.
-type Simplified = (Vec<u32>, Bounds, Vec<lod::Opposed>);
+type Simplified = (Vec<u32>, Bounds, Vec<(usize, lod::Take)>);
 
 /// Builds the DAG of `mesh` at `positions` under `c`, calling `emit` once per group with its
 /// index fixed by emission order, and returns the emitted values in that order.
@@ -759,6 +769,7 @@ pub(super) fn build<G: Send>(
         lock,
         remap,
         sections,
+        base,
         keep_borders,
     } = mesh;
     let vertex_count = positions.len() / 3;
@@ -776,7 +787,9 @@ pub(super) fn build<G: Send>(
             mesh: vertex_count as u32,
             wedges: Vec::new(),
         },
+        base: base.unwrap_or_else(|| (0..vertex_count as u32).collect()),
     };
+    assert_eq!(vx.base.len(), vertex_count, "a base vertex per vertex");
     let (mut locks, mut marks) = (Vec::new(), Vec::new());
     let mut out = Vec::new();
 
@@ -816,7 +829,7 @@ pub(super) fn build<G: Send>(
         drop(lock);
         let base = out.len() as i32;
         let positions = Positions(vx.positions.as_mut_ptr(), vx.positions.len());
-        let (normals, remap, sources) = (&vx.normals, &vx.remap, &vx.sources);
+        let (normals, remap, sources, bases) = (&vx.normals, &vx.remap, &vx.sources, &vx.base);
         let groups: Vec<(G, Option<Simplified>)> = offsets
             .par_windows(2)
             .map(|w| {
@@ -826,6 +839,9 @@ pub(super) fn build<G: Send>(
                     .flat_map(|k| k.corners(&cluster_indices))
                     .copied()
                     .collect();
+                // Simplification sees the vertices the wedges stand for, so a wedge constrains
+                // no collapse.
+                let merged_bases: Vec<u32> = merged.iter().map(|&v| bases[v as usize]).collect();
                 let target = ((merged.len() / 3) as f32 * c.simplify_ratio) as usize * 3;
                 let mut bounds = bounds_merge(group);
                 let mut error = 0.0f32;
@@ -836,7 +852,7 @@ pub(super) fn build<G: Send>(
                     normals,
                     remap,
                     positions.read(),
-                    &merged,
+                    &merged_bases,
                     &locks,
                     target,
                     &mut error,
@@ -850,6 +866,7 @@ pub(super) fn build<G: Send>(
                         indices: &cluster_indices,
                         positions: positions.read(),
                         sources,
+                        base: bases,
                     })
                 };
                 if simplified.len() as f32 > merged.len() as f32 * c.simplify_threshold {
@@ -860,7 +877,14 @@ pub(super) fn build<G: Send>(
                     + error * c.simplify_error_merge_additive;
                 let g = emitted(bounds);
                 let moved = if c.simplify_dilate_borders {
-                    dilate_borders(&positions, &merged, &simplified, &locks, remap, &mut bounds)
+                    dilate_borders(
+                        &positions,
+                        &merged_bases,
+                        &simplified,
+                        &locks,
+                        remap,
+                        &mut bounds,
+                    )
                 } else {
                     FxHashSet::default()
                 };
@@ -868,6 +892,7 @@ pub(super) fn build<G: Send>(
                 let opposed = lod::opposed_corners(
                     &simplified,
                     &merged,
+                    |v| bases[v as usize],
                     |v| moved.contains(&remap[v as usize]),
                     |v| Vec3::from(positions.get(v as usize)).as_dvec3(),
                     |v| Vec3::from_slice(&normals[3 * v as usize..]).as_dvec3(),
@@ -877,8 +902,9 @@ pub(super) fn build<G: Send>(
             })
             .collect();
         let wedges = crate::profile::zone!("clod.wedges");
-        // Each corner that takes another vertex's normal and attributes takes that vertex where
-        // it shares the corner's position, else a wedge, one per vertex and sources.
+        // A wedge per vertex and sources, also where a vertex at the corner's position has the
+        // normal and attributes it takes: unlike that vertex, the wedge stands for the corner's
+        // vertex in simplification.
         let mut made: FxHashMap<[u32; 3], u32> = FxHashMap::default();
         let mut next = Vec::new();
         for (gi, (g, simplified)) in groups.into_iter().enumerate() {
@@ -886,15 +912,14 @@ pub(super) fn build<G: Send>(
             let Some((mut simplified, bounds, opposed)) = simplified else {
                 continue;
             };
-            for o in opposed {
-                let (v, n, a) = (simplified[o.corner], o.normal, o.attributes);
-                simplified[o.corner] = if n == a && vx.remap[n as usize] == vx.remap[v as usize] {
-                    // Dilation moves only the vertices `simplified` holds, which `n` may not be.
-                    let v = 3 * v as usize;
-                    vx.positions.copy_within(v..v + 3, 3 * n as usize);
-                    n
-                } else {
-                    *made.entry([v, n, a]).or_insert_with(|| vx.wedge(v, n, a))
+            for (k, take) in opposed {
+                let v = simplified[k];
+                simplified[k] = match take {
+                    lod::Take::Input(u) => u,
+                    lod::Take::Shade {
+                        normal: n,
+                        attributes: a,
+                    } => *made.entry([v, n, a]).or_insert_with(|| vx.wedge(v, n, a)),
                 };
             }
             next.push((base + gi as i32, simplified, bounds));
@@ -935,6 +960,7 @@ pub(super) fn build<G: Send>(
             indices: &cluster_indices,
             positions: &vx.positions,
             sources: &vx.sources,
+            base: &vx.base,
         }));
     }
     out

@@ -28,6 +28,8 @@ pub(super) struct Welded {
     pub(super) indices: Vec<u32>,
     /// Section index range per section.
     pub(super) sections: Vec<std::ops::Range<usize>>,
+    /// Per vertex [`Self::wedge`] adds, the vertex it stands for.
+    pub(super) stands_for: FxHashMap<u32, u32>,
 }
 
 impl Welded {
@@ -92,6 +94,7 @@ impl Welded {
             pivots: pivots.map(remap_all),
             indices: meshopt::remap_index_buffer(Some(&m.indices), count, &remap),
             sections: m.sections.iter().map(|s| s.indices.clone()).collect(),
+            stands_for: FxHashMap::default(),
         }
     }
 
@@ -107,13 +110,20 @@ impl Welded {
         self.indices[r].as_chunks::<3>().0.iter().copied()
     }
 
+    /// The vertex `v` stands for: the one [`Self::wedge`] placed it as, else itself.
+    pub(super) fn base(&self, v: u32) -> u32 {
+        self.stands_for.get(&v).copied().unwrap_or(v)
+    }
+
     /// Adds a vertex placed as `at` is, by its position, moves, skin, part value and pivot,
-    /// with the normal of `normal` and the tangent, uvs and colors of `from`; returns it.
+    /// with the normal of `normal` and the tangent, uvs and colors of `from`; returns it. It
+    /// stands for the vertex `at` does.
     pub(super) fn wedge(&mut self, at: u32, normal: u32, from: u32) -> u32 {
         fn copy<T: Copy>(v: &mut Vec<T>, i: u32) {
             v.push(v[i as usize]);
         }
         let new = self.positions.len() as u32;
+        self.stands_for.insert(new, self.base(at));
         copy(&mut self.positions, at);
         self.moves.iter_mut().for_each(|m| copy(m, at));
         if let Some(k) = &mut self.skin {
@@ -130,16 +140,14 @@ impl Welded {
     }
 }
 
-/// A corner of a simplified triangle whose vertex normal opposes the triangle's face
-/// ([`opposed_corners`]), and the vertices it takes its shading from.
+/// What a corner of a simplified triangle takes in place of its vertex ([`opposed_corners`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) struct Opposed {
-    /// The corner's index in the simplified triangles.
-    pub(super) corner: usize,
-    /// The vertex whose normal the corner takes.
-    pub(super) normal: u32,
-    /// The vertex whose tangent, uvs and colors the corner takes: its own vertex, or another.
-    pub(super) attributes: u32,
+pub(super) enum Take {
+    /// The vertex the input holds at the corner.
+    Input(u32),
+    /// The normal of `normal` and the tangent, uvs and colors of `attributes`, which may be
+    /// the corner's own vertex.
+    Shade { normal: u32, attributes: u32 },
 }
 
 /// The vertices of a triangle list, for searches by position, and the patch each lies in: the
@@ -238,32 +246,39 @@ impl Near {
     }
 }
 
-/// The corners of the triangles `simplified` whose vertex normal opposes their face, with the
-/// vertices of `input` they take their shading from. Simplification joins vertices across thin
-/// features, where one coarse vertex can stand for both sides of a sheet while it carries one
-/// side's normal, and it can fold a curved surface past its normals. Such a corner takes the
-/// normal of the vertex in its vertex's section nearest it whose normal faces the triangle's
-/// way, when there is one. Its uvs, tangent and colors continue those of the surface the
-/// triangle stands on, or its uvs would span unrelated parts of a texture: the patches of
-/// `input`, the vertices its triangles join, that hold the triangle's corners whose normal
-/// faces its way, or all its corners where none does. A corner whose vertex lies on that
-/// surface keeps its vertex's; another takes those of the vertex on it nearest it. A triangle
-/// `input` holds as it is, with no vertex `moved`, keeps its corners as the input has them.
+/// The corners of the triangles `simplified` whose vertex normal opposes their face, with what
+/// each takes in place of its vertex. `simplified` comes from `input` with each vertex
+/// replaced by the one it stands for, `base(v)`: a vertex added for an earlier corner takes no
+/// part in simplification, so it constrains no collapse.
+///
+/// A triangle `input` holds as it is, by the vertices they stand for and with no vertex
+/// `moved`, keeps the corners the input gives it. Elsewhere, simplification joins vertices
+/// across thin features, where one coarse vertex can stand for both sides of a sheet while it
+/// carries one side's normal, and it can fold a curved surface past its normals. Such a corner
+/// takes the normal of the vertex in its vertex's section nearest it whose normal faces the
+/// triangle's way, when there is one. Its uvs, tangent and colors continue those of the
+/// surface the triangle stands on, or its uvs would span unrelated parts of a texture: the
+/// patches of the input, the vertices its triangles join, that hold the triangle's corners
+/// whose normal faces its way, or all its corners where none does. A corner whose vertex lies
+/// on that surface keeps its vertex's; another takes those of the vertex on it nearest it.
 /// Vertex `v` is at `at(v)` with normal `normal(v)` in section `section(v)`.
 pub(super) fn opposed_corners(
     simplified: &[u32],
     input: &[u32],
+    base: impl Fn(u32) -> u32,
     moved: impl Fn(u32) -> bool,
     at: impl Fn(u32) -> DVec3,
     normal: impl Fn(u32) -> DVec3,
     section: impl Fn(u32) -> u16,
-) -> Vec<Opposed> {
-    // A triangle by its corners from the least, which keeps its winding.
-    let key = |t: &[u32; 3]| {
-        let k = (0..3).min_by_key(|&k| t[k]).expect("three corners");
-        [t[k], t[(k + 1) % 3], t[(k + 2) % 3]]
-    };
-    let mut kept: Option<FxHashSet<[u32; 3]>> = None;
+) -> Vec<(usize, Take)> {
+    // The corner a triangle starts at so that it starts at its least vertex, which keeps its
+    // winding.
+    let first = |t: &[u32; 3]| (0..3).min_by_key(|&k| t[k]).expect("three corners");
+    let rotated = |t: &[u32; 3], k: usize| [t[k], t[(k + 1) % 3], t[(k + 2) % 3]];
+    let bases: Vec<u32> = input.iter().map(|&v| base(v)).collect();
+    // The input's triangles by the vertices they stand for, each in the order that starts at
+    // the least of those.
+    let mut kept: Option<FxHashMap<[u32; 3], [u32; 3]>> = None;
     let mut near: Option<Near> = None;
     let mut out = Vec::new();
     for (t, tri) in simplified.as_chunks::<3>().0.iter().enumerate() {
@@ -273,11 +288,32 @@ pub(super) fn opposed_corners(
         if faces == [true; 3] {
             continue;
         }
-        let kept = kept.get_or_insert_with(|| input.as_chunks::<3>().0.iter().map(key).collect());
-        if kept.contains(&key(tri)) && !tri.iter().any(|&v| moved(v)) {
+        let kept = kept.get_or_insert_with(|| {
+            let mut kept = FxHashMap::default();
+            for (b, i) in bases
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(input.as_chunks::<3>().0)
+            {
+                let k = first(b);
+                kept.entry(rotated(b, k)).or_insert_with(|| rotated(i, k));
+            }
+            kept
+        });
+        let k0 = first(tri);
+        if let Some(held) = kept.get(&rotated(tri, k0))
+            && !tri.iter().any(|&v| moved(v))
+        {
+            for (k, &v) in tri.iter().enumerate() {
+                let u = held[(k + 3 - k0) % 3];
+                if u != v {
+                    out.push((3 * t + k, Take::Input(u)));
+                }
+            }
             continue;
         }
-        let near = near.get_or_insert_with(|| Near::new(input, &at));
+        let near = near.get_or_insert_with(|| Near::new(&bases, &at));
         let stands = if faces == [false; 3] {
             [true; 3]
         } else {
@@ -302,11 +338,7 @@ pub(super) fn opposed_corners(
                     .expect("the triangle's corners lie on its surface")
             };
             if (normal, attributes) != (v, v) {
-                out.push(Opposed {
-                    corner: 3 * t + k,
-                    normal,
-                    attributes,
-                });
+                out.push((3 * t + k, Take::Shade { normal, attributes }));
             }
         }
     }
@@ -778,12 +810,15 @@ pub(super) fn simplify(
         sloppy,
         keep_borders,
     } = how;
-    // A compact vertex buffer of the piece, so the simplifier's work follows its size.
+    // A compact vertex buffer of the piece, so the simplifier's work follows its size, over
+    // the vertices the piece's stand for: those added for earlier corners constrain no
+    // collapse ([`opposed_corners`]).
     let mut local_of: FxHashMap<u32, u32> = FxHashMap::default();
     let mut global = Vec::new();
     let local: Vec<u32> = indices
         .iter()
         .map(|&v| {
+            let v = w.base(v);
             *local_of.entry(v).or_insert_with(|| {
                 global.push(v);
                 global.len() as u32 - 1
@@ -854,26 +889,31 @@ pub(super) fn simplify(
             error += sloppy_error * scale;
         }
     }
+    let mut out: Vec<u32> = out.into_iter().map(|v| global[v as usize]).collect();
     let wedges = opposed_corners(
         &out,
-        &local,
+        indices,
+        |v| w.base(v),
         |_| false,
-        |v| Vec3::from(positions[v as usize]).as_dvec3(),
-        |v| Vec3::from_slice(&normals[3 * v as usize..]).as_dvec3(),
+        |v| Vec3::from(positions[local_of[&v] as usize]).as_dvec3(),
+        |v| Vec3::from_slice(&normals[3 * local_of[&v] as usize..]).as_dvec3(),
         |_| 0,
     );
-    let mut out: Vec<u32> = out.into_iter().map(|v| global[v as usize]).collect();
+    // A wedge per vertex and sources, also where a vertex at the corner's position has the
+    // normal and attributes it takes: unlike that vertex, the wedge stands for the corner's
+    // vertex in simplification.
     let mut made: FxHashMap<[u32; 3], u32> = FxHashMap::default();
-    for o in wedges {
-        let v = out[o.corner];
-        let [n, a] = [o.normal, o.attributes].map(|u| global[u as usize]);
-        out[o.corner] = if n == a && grid.reps[n as usize] == grid.reps[v as usize] {
-            n
-        } else {
-            *made.entry([v, n, a]).or_insert_with(|| {
+    for (k, take) in wedges {
+        let v = out[k];
+        out[k] = match take {
+            Take::Input(u) => u,
+            Take::Shade {
+                normal: n,
+                attributes: a,
+            } => *made.entry([v, n, a]).or_insert_with(|| {
                 grid.wedge(v);
                 w.wedge(v, n, a)
-            })
+            }),
         };
     }
     (out, error)
