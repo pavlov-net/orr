@@ -147,6 +147,12 @@ impl Cache {
         );
         let cells = readback::<[u32; 4]>(u64::from(self.capacity), "cells");
         let frame = self.scene.frame;
+        let mut list = render().command_list().unwrap();
+        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+        self.lighting
+            .record(&mut list, &self.scene.pass([0.0; 3]))
+            .unwrap();
+        // The scene's first pass makes the cache.
         let root = upload(
             &[cache_probe::Root {
                 samples: input.gpu(),
@@ -156,11 +162,6 @@ impl Cache {
             }],
             "cache root",
         );
-        let mut list = render().command_list().unwrap();
-        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-        self.lighting
-            .record(&mut list, &self.scene.pass([0.0; 3]))
-            .unwrap();
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         list.dispatch(&self.cells, root.gpu(), [self.capacity.div_ceil(64), 1, 1]);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
