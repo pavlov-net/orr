@@ -1460,16 +1460,21 @@ impl<'a> Frame<'a> {
         arena.enter(ViewStep::Lighting, list);
 
         if !self.lit.contains(&view.scene) {
-            scene.record(
-                list,
-                &ScenePass {
-                    frame: id,
-                    scene: raster.scene,
-                    focus: raster.focus,
-                    tables: raster.light_tables,
-                    features: raster.features,
-                },
-            )?;
+            let pass = ScenePass {
+                frame: id,
+                scene: raster.scene,
+                focus: raster.focus,
+                tables: raster.light_tables,
+                features: raster.features,
+            };
+            if let Err(e) = scene.record(list, &pass) {
+                // What the pass makes when the scene first needs it finds memory once the
+                // budgets have made room.
+                if let orr_lighting::Error::Gpu(e) = &e {
+                    self.scenes.out_of_memory(e);
+                }
+                return Err(e.into());
+            }
             self.lit.push(view.scene);
         }
         match &mut state.lighting {

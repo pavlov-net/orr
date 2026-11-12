@@ -2816,6 +2816,12 @@ impl Streaming {
         self.residency.out_of_memory(governs(&self.governed, e));
     }
 
+    /// As [`Self::out_of_memory`], for an allocation the device refused with `e`.
+    pub(crate) fn device_out_of_memory(&mut self, e: &orr_gpu::Error) {
+        self.residency
+            .out_of_memory(governs_device(&self.governed, e));
+    }
+
     /// Frees the slots retired at or before `completed`; the tiles among them unbind with
     /// the next task.
     pub(crate) fn retire(&mut self, completed: u64) {
@@ -3469,7 +3475,15 @@ fn block_bytes(stream_block: u64, full: u64, max_allocations: u32) -> u64 {
 /// device-local heap, or device memory of no named kind.
 fn governs(governed: &[MemoryKind], e: &Error) -> bool {
     match e {
-        Error::Gpu(orr_gpu::Error::OutOfMemory { device, kind, .. }) => {
+        Error::Gpu(e) => governs_device(governed, e),
+        _ => false,
+    }
+}
+
+/// [`governs`], for the device's own error.
+fn governs_device(governed: &[MemoryKind], e: &orr_gpu::Error) -> bool {
+    match e {
+        orr_gpu::Error::OutOfMemory { device, kind, .. } => {
             kind.map_or(*device, |k| governed.contains(&k))
         }
         _ => false,

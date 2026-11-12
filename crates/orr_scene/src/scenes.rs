@@ -2611,6 +2611,13 @@ impl<'a> Frame<'a> {
         Ok(self.core.scene(scene)?.producer_entry(id))
     }
 
+    /// Says that an allocation made for the frame beside the scenes' own found no device
+    /// memory with `e`, as one of a scene's lighting does: the mesh and texture budgets then
+    /// make room where they govern its kind, as they do for the scenes' own.
+    pub fn out_of_memory(&mut self, e: &orr_gpu::Error) {
+        self.core.mounts.streaming.device_out_of_memory(e);
+    }
+
     /// What `scene` may hold now: [`RasterView::features`] before the view is rastered.
     pub fn scene_features(&self, scene: SceneId) -> Result<SceneFeatures> {
         let cpu = &mut *self.core.scene(scene)?.cpu.lock().unwrap();
