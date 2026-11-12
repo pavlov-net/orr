@@ -887,6 +887,76 @@ fn thin_plates_keep_their_normals_on_their_faces() {
     }
 }
 
+/// A rough log: a cylinder 0.6 m long of `around` x `along` quads whose 0.1 m radius varies by
+/// `amplitude` of it from vertex to vertex, with smooth normals. Its side is `charts` strips
+/// around, each on a cell of its own of an 8 x 8 atlas, with the vertices where they meet apart.
+fn log(around: u32, along: u32, charts: u32, amplitude: f32) -> MeshInput {
+    let mut seed = 0x2545_F491u32;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed as f32 / u32::MAX as f32
+    };
+    let bumps: Vec<f32> = (0..around * (along + 1)).map(|_| next()).collect();
+    let at = |i: u32, j: u32| {
+        let i = i % around;
+        let a = i as f32 / around as f32 * std::f32::consts::TAU;
+        let r = 0.1 * (1.0 + amplitude * (bumps[(j * around + i) as usize] - 0.5));
+        Vec3::new(r * a.cos(), r * a.sin(), 0.6 * j as f32 / along as f32)
+    };
+    let normal = |i: u32, j: u32| {
+        let (l, r) = (at(i + around - 1, j), at(i + 1, j));
+        let (d, u) = (at(i, j.saturating_sub(1)), at(i, (j + 1).min(along)));
+        (r - l).cross(u - d).normalize()
+    };
+    let mut m = MeshInput::default();
+    let mut uvs = Vec::new();
+    let w = around / charts;
+    for c in 0..charts {
+        let base = m.positions.len() as u32;
+        for j in 0..=along {
+            for k in 0..=w {
+                let i = c * w + k;
+                m.positions.push(at(i, j));
+                m.normals.push(normal(i, j));
+                let cell = Vec2::new((c % 8) as f32, (c / 8) as f32);
+                let uv = Vec2::new(k as f32 / w as f32, j as f32 / along as f32);
+                uvs.push((cell + Vec2::splat(0.125) + uv * 0.75) / 8.0);
+            }
+        }
+        for j in 0..along {
+            for k in 0..w {
+                let q = base + j * (w + 1) + k;
+                m.indices
+                    .extend([q, q + 1, q + w + 1, q + 1, q + w + 2, q + w + 1]);
+            }
+        }
+    }
+    m.uvs = Some(uvs);
+    m.sections = vec![Span {
+        first: 0,
+        count: m.indices.len() as u32,
+    }];
+    m
+}
+
+#[test]
+fn simplified_triangles_keep_to_one_uv_chart() {
+    // Simplification folds the bumps past their normals, and a corner that comes to oppose its
+    // face can lie nearest a vertex of the next strip.
+    let d = load(&cook(log(96, 144, 6, 0.5), &[0], dag()), "m/mesh");
+    let cell = |uv: [f32; 2]| uv.map(|x| (x * 8.0).floor() as i32);
+    let mut spanning = 0;
+    for c in &d.clusters {
+        for uv in &c.uvs {
+            let cells = uv.map(cell);
+            spanning += usize::from(cells[0] != cells[1] || cells[1] != cells[2]);
+        }
+    }
+    assert_eq!(spanning, 0);
+}
+
 #[test]
 fn skinned_thin_plates_keep_each_vertex_skin_with_its_position() {
     // Two joints whose weights change through the plates' thickness as well as across them,
