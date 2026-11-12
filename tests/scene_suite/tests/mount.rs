@@ -1905,6 +1905,142 @@ fn hierarchy_pages_stream_with_the_pages_below_them_and_leave_after_them() {
     assert_clean();
 }
 
+/// Panics unless the paged dome of `model` is whole in the mesh page table: its node pages and
+/// its mesh pages hold the cooked bytes, and each page's base names the page's clusters in the
+/// resident cluster table.
+fn check_whole_dome(scenes: &Scenes, gpu: &Gpu<'_>, root: &SceneRoot, model: ModelId) {
+    let a = Archive::from_memory(Arc::clone(paged_hierarchy())).unwrap();
+    let e = entry(&a, AssetId::from_name(DOME_MESH));
+    let (info, node_bytes) = paged_dome();
+    let (nodes, pages) = tables(scenes, gpu, model);
+    for (n, (&at, cooked)) in nodes.iter().zip(&node_bytes).enumerate() {
+        assert!(at != 0, "node page {n} of {model:?} is not resident");
+        assert!(gpu.bytes(at, cooked.len()) == *cooked, "node page {n}");
+    }
+    let (mesh, _) = mesh_of(scenes, gpu, model);
+    let firsts: Vec<u32> = gpu.values(mesh.page_clusters, mesh.page_count + 1);
+    let bases: Vec<u32> = gpu.values(
+        root.mesh_page_bases.offset(u64::from(mesh.pages)),
+        mesh.page_count,
+    );
+    for (p, page) in info.pages.iter().enumerate() {
+        assert!(pages[p] != 0, "page {p} of {model:?} is not resident");
+        let mut cooked = vec![0; page.resident_len as usize];
+        decode_page(&blob(&a, e, page.blob as usize), &mut cooked).unwrap();
+        assert!(gpu.bytes(pages[p], cooked.len()) == cooked, "page {p}");
+        let refs: Vec<orr_scene::ClusterRef> = gpu.values(
+            root.clusters.offset(u64::from(bases[p])),
+            firsts[p + 1] - firsts[p],
+        );
+        for (r, i) in refs.iter().zip(0..) {
+            assert_eq!(
+                (r.page.address().0, r.local, r.mesh_cluster),
+                (pages[p], i, firsts[p] + i),
+                "cluster {i} of page {p} of {model:?}"
+            );
+        }
+    }
+}
+
+/// Six mounts of the paged dome land one after another under frames in flight, each while the
+/// dome of the mount before streams in, so the mesh page table grows under streamed landings
+/// and under a traversal that reads the first dome every frame. Every entry then reads back
+/// as it was written, whether its page landed before a growth, in the frame of one or after
+/// it. The feedback follows the table: the last mount's dome, whose entries the table first
+/// held no room for, streams its node page in on the traversal's requests alone.
+#[test]
+fn the_mesh_page_table_grows_under_streamed_landings() {
+    const MOUNTS: usize = 6;
+    let _serial = serial();
+    let dev = device();
+    let gpu = Gpu(dev);
+    let bytes = paged_hierarchy();
+    let (info, nodes) = paged_dome();
+    let desc = RendererDesc {
+        budgets: Budgets {
+            mesh_resident_max: 0,
+            mesh_page_pool: PoolSize::Bytes(MOUNTS as u64 * dome_budget(&info, &nodes, dev)),
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    };
+    let mut scenes = Scenes::new(dev, &desc).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
+    let entries = |scenes: &Scenes| mesh_page_tables(scenes).2;
+    assert_eq!(
+        entries(&scenes),
+        0,
+        "a renderer with no mount holds no entry"
+    );
+
+    let mut models: Vec<ModelId> = Vec::new();
+    let mut held = Vec::new();
+    let mut drawn = Vec::new();
+    for _ in 0..MOUNTS {
+        let m = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
+        while mount_pending(&scenes, m) {
+            if let Some(&before) = models.last() {
+                scenes.prefetch(before, 0);
+            }
+            let (_, c) = streamed_frame(&mut scenes, scene, |_| {});
+            if !models.is_empty() {
+                drawn.push(c.candidate_clusters);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if let LoadState::Failed(e) = scenes.mount_state(m) {
+            panic!("{m:?} failed: {e}");
+        }
+        let model = scenes.model(m, AssetId::from_name("kit/dome")).unwrap();
+        if models.is_empty() {
+            streamed_frame(&mut scenes, scene, |s| {
+                place_copies(s, &[model]);
+            });
+        }
+        models.push(model);
+        held.push(entries(&scenes));
+    }
+    let grows = held.windows(2).filter(|w| w[1] > w[0]).count();
+    assert!(grows >= 2, "the table grew under the mounts: {held:?}");
+    assert!(
+        drawn.iter().skip(2).all(|&n| n > 0),
+        "the first dome drawn under every growth: {drawn:?}"
+    );
+
+    let (streamed, last) = models.split_at(MOUNTS - 1);
+    for &m in streamed {
+        stream_in(&mut scenes, &gpu, m, &models, (&info, u64::MAX));
+    }
+    let (root, _) = streamed_frame(&mut scenes, scene, |_| {});
+    let root: SceneRoot = gpu.value(root);
+    for &m in streamed {
+        check_whole_dome(&scenes, &gpu, &root, m);
+    }
+
+    let last = last[0];
+    assert_eq!(tables(&scenes, &gpu, last).0[1], 0, "no request yet");
+    streamed_frame(&mut scenes, scene, |s| {
+        place_copies(s, &[last]);
+    });
+    let start = Instant::now();
+    let mut requests = 0;
+    while tables(&scenes, &gpu, last).0[1] == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the last mount's node page never streamed in"
+        );
+        requests += streamed_frame(&mut scenes, scene, |_| {}).1.page_requests;
+    }
+    assert!(requests > 0, "the traversal requested the page");
+    assert_eq!(
+        gpu.bytes(tables(&scenes, &gpu, last).0[1], nodes[1].len()),
+        nodes[1]
+    );
+    assert_eq!(scenes.residency().failed, 0);
+    assert_clean();
+}
+
 /// Runs one frame of `scene` with its focus 3 m above the origin, after `write`; returns the
 /// figures of the last completed frame.
 fn traverse_frame(
