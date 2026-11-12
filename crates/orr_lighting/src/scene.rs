@@ -356,7 +356,10 @@ impl SceneLighting {
         // A frame's slot is written again `FRAME_SLOTS` frames on, when its work has completed.
         self.replaced
             .retain(|r| pass.frame < r.0 + FRAME_SLOTS as u64);
-        let grown = pass.tables != self.per.tables;
+        // What is held follows the lights and the emissive list; the producer table's entries
+        // only say how far the per-producer kernels run.
+        let held = self.per.tables;
+        let grown = (pass.tables.lights, pass.tables.entries) != (held.lights, held.entries);
         if grown {
             let next = PerTable::new(&self.device, pass.tables)?;
             let casters = self.caustics.room(&self.device, pass.tables)?;
@@ -364,6 +367,8 @@ impl SceneLighting {
             self.replaced
                 .push((pass.frame, before, self.caustics.follow(casters)));
         }
+        self.per.tables.producers = pass.tables.producers;
+        self.caustics.set_producers(pass.tables.producers);
         let now = &self.per;
         // The frames before left their feedback in what this pass's tables replaced.
         let replaced = self.replaced.last().filter(|_| grown);

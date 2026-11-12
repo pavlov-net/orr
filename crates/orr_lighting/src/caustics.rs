@@ -323,6 +323,12 @@ impl Caustics {
         std::mem::replace(&mut self.per, room)
     }
 
+    /// Takes the entries of the scene's producer table, which the producers' caster lists
+    /// run over.
+    pub(crate) fn set_producers(&mut self, producers: u32) {
+        self.per.tables.producers = producers;
+    }
+
     /// Records slot `slot`'s photon source after the light set's selection and starts the
     /// grid's frame, for a frame focused on `focus`. `before` is what [`Self::follow`]
     /// returned since the last record, when the scene's light tables have grown since.
