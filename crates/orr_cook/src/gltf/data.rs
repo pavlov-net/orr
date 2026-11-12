@@ -27,6 +27,7 @@ use orr_pack::Hash32;
 use percent_encoding::percent_decode_str;
 
 use crate::par::prelude::*;
+use crate::simd::{self, Simd, dispatch, simd};
 use serde_json::{Map, Value};
 
 /// Extensions the cook reads itself, removed from `extensionsRequired` before validation.
@@ -525,9 +526,8 @@ impl<'d> Data<'d> {
             out.par_chunks_mut(n * ROWS)
                 .enumerate()
                 .for_each(|(block, rows)| {
-                    for (i, row) in (block * ROWS..).zip(rows.chunks_exact_mut(n)) {
-                        read(&base[i * stride..], row);
-                    }
+                    let first = block * ROWS;
+                    dispatch!(simd::level(), s => read_rows(s, base, stride, first, n, rows, &read));
                 });
         }
         self.sparse_elements(a, |i, b| read(b, &mut out[i * n..(i + 1) * n]))
@@ -706,6 +706,22 @@ fn decode_view(e: &Value, src: &[u8], length: usize) -> Result<Vec<u8>, String> 
         }
     }
     Ok(dst)
+}
+
+/// Rows `first..` of `n` floats from elements `stride` bytes apart in `base`, through `read`.
+#[simd]
+fn read_rows<S: Simd>(
+    _: S,
+    base: &[u8],
+    stride: usize,
+    first: usize,
+    n: usize,
+    rows: &mut [f32],
+    read: &impl Fn(&[u8], &mut [f32]),
+) {
+    for (i, row) in (first..).zip(rows.chunks_exact_mut(n)) {
+        read(&base[i * stride..], row);
+    }
 }
 
 #[cfg(test)]

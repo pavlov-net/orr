@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::par::prelude::*;
+use crate::simd::{self, Simd, dispatch, simd};
 use crate::texture::Wrap;
 use crate::texture::tiles::Cell;
 use orr_math::{Mat3, Vec3};
@@ -522,25 +523,15 @@ impl Passes {
         prefix
             .par_chunks_mut(w + 1)
             .zip(mip.texels.par_chunks(w))
-            .for_each(|(out, row)| {
-                let mut n = 0u16;
-                for (o, &t) in out[1..].iter_mut().zip(row) {
-                    n += u16::from(t >= cutoff);
-                    *o = n;
-                }
-            });
+            .for_each(|(out, row)| dispatch!(simd::level(), s => pass_counts(s, row, cutoff, out)));
         let (mut cols, mut rows) = (w.div_ceil(2), (mip.h as usize).div_ceil(2));
         let mut flags = vec![0u8; cols * rows];
         flags
             .par_chunks_mut(cols)
             .zip(mip.texels.par_chunks(2 * w))
-            .for_each(|(out, band)| {
-                for row in band.chunks_exact(w) {
-                    for (x, &t) in row.iter().enumerate() {
-                        out[x / 2] |= if t >= cutoff { PASS } else { FAIL };
-                    }
-                }
-            });
+            .for_each(
+                |(out, band)| dispatch!(simd::level(), s => pass_sides(s, band, w, cutoff, out)),
+            );
         let mut levels = vec![SideLevel {
             shift: 1,
             cols,
@@ -553,13 +544,9 @@ impl Passes {
             flags
                 .par_chunks_mut(c)
                 .zip(fine.flags.par_chunks(2 * cols))
-                .for_each(|(out, band)| {
-                    for row in band.chunks_exact(cols) {
-                        for (x, &f) in row.iter().enumerate() {
-                            out[x / 2] |= f;
-                        }
-                    }
-                });
+                .for_each(
+                    |(out, band)| dispatch!(simd::level(), s => merge_sides(s, band, cols, out)),
+                );
             levels.push(SideLevel {
                 shift: fine.shift + 1,
                 cols: c,
@@ -651,6 +638,36 @@ impl Passes {
             sides & stop != stop
         });
         sides
+    }
+}
+
+/// Per texel of `row`, how many of the texels up to it pass `cutoff`, into `out[1..]`.
+#[simd]
+fn pass_counts<S: Simd>(_: S, row: &[f32], cutoff: f32, out: &mut [u16]) {
+    let mut n = 0u16;
+    for (o, &t) in out[1..].iter_mut().zip(row) {
+        n += u16::from(t >= cutoff);
+        *o = n;
+    }
+}
+
+/// The sides of `cutoff` of each pair of texels of the rows of `w` in `band`, into `out`.
+#[simd]
+fn pass_sides<S: Simd>(_: S, band: &[f32], w: usize, cutoff: f32, out: &mut [u8]) {
+    for row in band.chunks_exact(w) {
+        for (x, &t) in row.iter().enumerate() {
+            out[x / 2] |= if t >= cutoff { PASS } else { FAIL };
+        }
+    }
+}
+
+/// The sides of each pair of tiles of the rows of `cols` in `band`, into `out`.
+#[simd]
+fn merge_sides<S: Simd>(_: S, band: &[u8], cols: usize, out: &mut [u8]) {
+    for row in band.chunks_exact(cols) {
+        for (x, &f) in row.iter().enumerate() {
+            out[x / 2] |= f;
+        }
     }
 }
 

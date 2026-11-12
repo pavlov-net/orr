@@ -42,6 +42,7 @@ use serde::Deserialize;
 
 use crate::assembly::AssemblySettings;
 use crate::shading::stream_holds;
+use crate::simd;
 use crate::state::Memo;
 use crate::texture::Wrap;
 use crate::texture::tiles::Cell;
@@ -1719,11 +1720,7 @@ impl Grid {
         let b = position_bounds(positions);
         let k = mesh_exponent(&b, step_log2, min);
         let snap = Snap::new(k);
-        let cells: Vec<[i32; 3]> = positions
-            .par_iter()
-            .light()
-            .map(|p| p.map(|x| snap.cell(x)))
-            .collect();
+        let cells = simd::mapped(positions, |p| p.map(|x| snap.cell(x)));
         // The box's corners hold the extreme cells, which `k` keeps within 2^23.
         let (lo, hi) = if positions.is_empty() {
             ([0; 3], [0; 3])
@@ -1736,11 +1733,7 @@ impl Grid {
             .map(i32::unsigned_abs)
             .max()
             .unwrap_or(0);
-        let floats: Vec<[f32; 3]> = cells
-            .par_iter()
-            .light()
-            .map(|g| g.map(|v| snap.coordinate(v)))
-            .collect();
+        let floats = simd::mapped(&cells, |g| g.map(|v| snap.coordinate(v)));
         // Grid positions are exact floats, so equal floats are equal cells.
         let reps = meshopt::generate_position_remap(
             &VertexDataAdapter::new(bytemuck::cast_slice(&floats), 12, 0)

@@ -77,6 +77,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::par::prelude::*;
+use crate::simd;
 use gltf::image::Source as ImageSource;
 use gltf::mesh::{Mode, Semantic};
 use orr_math::{DMat3, DMat4, DVec3, Mat3, Quat, Vec3};
@@ -416,11 +417,7 @@ fn corner_tangents(
     };
     let corners = match local_normals {
         Some(n) => {
-            let unit: Vec<[f32; 3]> = n
-                .par_iter()
-                .light()
-                .map(|&n| Vec3::from(n).normalize_or_zero().to_array())
-                .collect();
+            let unit = simd::mapped(n, |&n| Vec3::from(n).normalize_or_zero().to_array());
             tangents::generate(Some(indices), local, &unit, uv)
         }
         None => tangents::generate_flat(indices, local, uv),
@@ -593,14 +590,11 @@ fn read_primitive(
         Some(ns) if at.displaced => Some(ns.iter().map(|&n| moved(Vec3::from(n))).collect()),
         _ => None,
     };
-    positions
-        .par_iter_mut()
-        .light()
-        .for_each(|p| *p = place(*p));
+    simd::update(&mut positions, |p| *p = place(*p));
     if let Some(ns) = &mut normals {
-        ns.par_iter_mut()
-            .light()
-            .for_each(|nv| *nv = (normal_m * Vec3::from(*nv)).normalize_or_zero().to_array());
+        simd::update(ns, |nv| {
+            *nv = (normal_m * Vec3::from(*nv)).normalize_or_zero().to_array();
+        });
     }
     for (s, uv) in (0..).zip(&mut uv_sets) {
         if uv.is_none() {

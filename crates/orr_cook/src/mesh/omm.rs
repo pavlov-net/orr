@@ -1,7 +1,7 @@
 //! Opacity micromaps of alpha-tested clusters, rasterized from the cooked opacity mip 0 over
 //! the triangles and corners as the page stores them.
 
-use crate::par::prelude::*;
+use crate::simd;
 use meshopt::{AlphaTexture, OpacityStates};
 use orr_pack::mesh::{
     MicromapEntry, OMM_OPAQUE, OMM_STATE_OPAQUE, OMM_STATE_TRANSPARENT, OMM_STATE_UNKNOWN_OPAQUE,
@@ -78,12 +78,7 @@ impl OmmAlpha {
         if mip0.w > Self::MAX_SIZE || mip0.h > Self::MAX_SIZE {
             return None;
         }
-        let alpha: Vec<u8> = mip0
-            .texels
-            .par_iter()
-            .light()
-            .map(|&t| remap(t, cutoff))
-            .collect();
+        let alpha = simd::mapped(&mip0.texels, |&t| remap(t, cutoff));
         Some(Self {
             alpha,
             w: mip0.w,
