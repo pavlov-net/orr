@@ -526,6 +526,8 @@ pub(crate) struct ModelCpu {
     pub(crate) edit: bool,
     /// It has a representation chain, so its copies may fade between two steps.
     pub(crate) chained: bool,
+    /// Its mesh has a caster section.
+    pub(crate) casts: bool,
     /// The most a copy of it alone asks of the work lists.
     pub(crate) work: CopyWork,
 }
@@ -887,11 +889,17 @@ impl SceneCpu {
             let own = models[model as usize].work;
             let mut steps = [own; 1 + crate::scenes::MAX_CHAIN];
             let mut n = 1;
+            // A copy holds a caster entry for the step of its chain it traces.
+            let mut casts = models[model as usize].casts;
             for step in chains.get(&ModelId(model)).into_iter().flatten() {
                 steps[n] = models[step.0 as usize].work;
+                casts |= models[step.0 as usize].casts;
                 n += 1;
             }
             work.add(CopyWork::fading(&steps[..n]), c.count);
+            if casts {
+                work.caster_copies += u64::from(c.count);
+            }
         }
         self.work = Some(work);
         work

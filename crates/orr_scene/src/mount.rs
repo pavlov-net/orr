@@ -4012,6 +4012,7 @@ impl Mounts {
                 cage_only: false,
                 edit: false,
                 chained: false,
+                casts: mesh.gpu.casters.count > 0,
                 work: mesh.copy_work(),
             };
         }

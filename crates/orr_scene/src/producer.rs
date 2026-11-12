@@ -353,6 +353,8 @@ pub(crate) struct Producer {
     /// The clusters the raster culls of it at most: none of a drawn entry, and a strand
     /// entry's ribbon clusters.
     pub(crate) raster_clusters: u32,
+    /// Rays trace its clusters, so those of a material that casts are caustic casters.
+    pub(crate) casts: bool,
     /// Its templates have built.
     pub(crate) templates_built: bool,
     /// A `Static` entry has built.
@@ -952,6 +954,7 @@ pub(crate) fn build(
             } else {
                 desc.max_clusters
             },
+            casts: !strands && desc.flags.0 & InstanceFlags::RAY.0 != 0,
             templates_built: n_topo == 0 || tessellated,
             built: false,
             counts: counts.cast(),

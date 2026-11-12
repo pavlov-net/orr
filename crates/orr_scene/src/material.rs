@@ -365,6 +365,11 @@ impl MaterialTable {
         self.features.lock().unwrap().any()
     }
 
+    /// Whether any material casts caustics.
+    pub(crate) fn casts(&self) -> bool {
+        self.features.lock().unwrap().casts()
+    }
+
     /// Whether any of `ids` displaces by a world length.
     pub(crate) fn any_world_length(&self, ids: &[MaterialId]) -> bool {
         let set = self.world_lengths.lock().unwrap();

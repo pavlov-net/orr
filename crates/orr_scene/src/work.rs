@@ -72,6 +72,9 @@ pub(crate) struct Work {
     pub(crate) rt_copies: u64,
     pub(crate) first_nodes: u64,
     pub(crate) first_items: u64,
+    /// Copies of a model whose mesh, or a step of whose chain, has a caster section: the
+    /// scene's caustics start photons from them.
+    pub(crate) caster_copies: u64,
 }
 
 impl Work {

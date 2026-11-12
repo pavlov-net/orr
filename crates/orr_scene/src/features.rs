@@ -71,9 +71,18 @@ impl SceneFeatures {
     /// Geometry of the dielectric class may show a material that bounds no interior: a
     /// thin-walled dielectric, or a record rewritten under a mesh built as glass.
     pub const THIN_DIELECTRICS: Self = Self(1 << 23);
+    /// The scene may hold a caustic caster: a copy of a model with a caster section, or a
+    /// producer entry of clusters that rays trace while a material casts.
+    pub const CASTERS: Self = Self(1 << 26);
+    /// The scene's environment may radiate: its kernels link one that is not the default map,
+    /// or its map is set.
+    pub const ENVIRONMENT: Self = Self(1 << 27);
     /// A record has the coat or fuzz flag, which with [`Self::EMISSIVE`] makes
     /// [`Self::COATED_EMITTERS`].
     const LAYERED: Self = Self(1 << 24);
+    /// A record has the caster flag, which with a producer entry that rays trace makes
+    /// [`Self::CASTERS`].
+    const CASTING: Self = Self(1 << 28);
     /// What a mesh keeps from the material it was built with, whatever the record holds now:
     /// once a record has shown one of these, the table keeps it.
     const BUILT: Self = Self(Self::LAYERS.0 | Self::COVERAGE.0);
@@ -144,6 +153,7 @@ impl SceneFeatures {
                 Self::TILED_TEXTURES,
             ),
             (m.flags & (f::COAT | f::FUZZ) != 0, Self::LAYERED),
+            (m.flags & f::CASTER != 0, Self::CASTING),
             (
                 m.flags & (f::DIELECTRIC | f::THIN_WALLED) == f::DIELECTRIC | f::THIN_WALLED,
                 Self::THIN_DIELECTRICS,
@@ -226,7 +236,12 @@ impl MaterialFeatures {
         if out & layered != 0 && out & emissive != 0 {
             out |= SceneFeatures::COATED_EMITTERS.0;
         }
-        SceneFeatures((out & !layered) | self.built)
+        SceneFeatures((out & !(layered | SceneFeatures::CASTING.0)) | self.built)
+    }
+
+    /// Whether any record has the caster flag.
+    pub(crate) fn casts(&self) -> bool {
+        self.counts[SceneFeatures::CASTING.0.trailing_zeros() as usize] > 0
     }
 }
 

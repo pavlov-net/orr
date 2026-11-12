@@ -44,7 +44,9 @@ use crate::raster::{self, ListSizes, RasterPipelines, TargetSizes, ViewLists, Vi
 #[cfg(feature = "hot-reload")]
 use crate::reload::Reloader;
 use crate::residency::{HOLD_FRAMES, RequestSource, ResidencyStats, response_period};
-use crate::scene::{GroupWriter, ModelCpu, ModelId, Scene, SceneDesc, SceneId, SceneWriter};
+use crate::scene::{
+    GroupWriter, ModelCpu, ModelId, Scene, SceneCpu, SceneDesc, SceneId, SceneWriter,
+};
 use crate::shaders::transparency::CompositeRoot;
 use crate::shaders::{animation, emissive, instance_page, page_motion, world as world_kernel};
 use crate::skin::{SkinFrame, SkinKernels, SkinStats};
@@ -406,6 +408,8 @@ pub struct SceneCompute<'a, 'q> {
     pub focus: Option<(DVec3, f32)>,
     /// What `root` says the scene's light tables hold.
     pub light_tables: LightTables,
+    /// What the scene may hold this frame.
+    pub features: SceneFeatures,
     device: &'a Device,
     window: &'a UploadWindow,
     pipelines: &'a Pipelines,
@@ -1567,6 +1571,22 @@ impl Core {
         self.materials.features() | fades | streams
     }
 
+    /// What the scene of `cpu` may hold now, under kernels that link `environment`: what any
+    /// scene may, what it holds itself, and what the two decide together.
+    fn scene_features(&self, cpu: &mut SceneCpu, environment: &str) -> SceneFeatures {
+        let mut features = self.features() | cpu.features();
+        let work = cpu.work(&self.model_cpu, &self.chains, |m| self.mounts.is_live(m));
+        let traced = cpu.producers.iter().flatten().any(|p| p.casts);
+        if work.caster_copies > 0 || (traced && self.materials.casts()) {
+            features |= SceneFeatures::CASTERS;
+        }
+        // The default map without data is black.
+        if environment != DEFAULT_ENVIRONMENT || cpu.environment.is_some_and(|data| data != 0) {
+            features |= SceneFeatures::ENVIRONMENT;
+        }
+        features
+    }
+
     /// The memory scale's parts ([`DetailStats::visible_scale`], `hidden_scale`): hidden
     /// geometry takes up to the lead first.
     fn detail_scales(&self) -> (f32, f32) {
@@ -2069,6 +2089,7 @@ impl<'a> Frame<'a> {
                 t.batches.gpu(),
                 cpu.focus_detail(),
                 scene.light_tables(),
+                core.scene_features(cpu, self.kernels.environment),
             ));
         }
         for e in &short {
@@ -2269,7 +2290,7 @@ impl<'a> Frame<'a> {
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         }
         core.mounts.record_edit_history(&mut list);
-        for &(scene, root, batches, focus, light_tables) in &roots {
+        for &(scene, root, batches, focus, light_tables, features) in &roots {
             let entries = core.scene(scene)?;
             let mut sc = SceneCompute {
                 cmd: &mut list,
@@ -2279,6 +2300,7 @@ impl<'a> Frame<'a> {
                 time: self.time,
                 focus,
                 light_tables,
+                features,
                 device,
                 window,
                 pipelines: self.pipelines,
@@ -2459,7 +2481,7 @@ impl<'a> Frame<'a> {
             // The PTLAS kernels write the cuts this pass reads.
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
             list.begin_pass("emissive", false);
-            for &(_, scene, _, _, tables) in &roots {
+            for &(_, scene, _, _, tables, _) in &roots {
                 let r = emissive::Root {
                     scene,
                     jobs: GpuPtr::NULL,
@@ -2583,8 +2605,8 @@ impl<'a> Frame<'a> {
 
     /// What `scene` may hold now: [`RasterView::features`] before the view is rastered.
     pub fn scene_features(&self, scene: SceneId) -> Result<SceneFeatures> {
-        let cpu = self.core.scene(scene)?.cpu.lock().unwrap();
-        Ok(self.core.features() | cpu.features())
+        let cpu = &mut *self.core.scene(scene)?.cpu.lock().unwrap();
+        Ok(self.core.scene_features(cpu, self.kernels.environment))
     }
 
     /// [`Self::raster_view`], with `requests`, the transient targets of the passes that
@@ -2619,9 +2641,9 @@ impl<'a> Frame<'a> {
                 core.cell_log2,
             )
             .to_array();
-        let (slots, slot_capacity, smoke, scene_features, work, producers, sized) = {
-            let cpu = scene.cpu.lock().unwrap();
-            let features = cpu.features();
+        let (slots, slot_capacity, smoke, features, work, producers, sized) = {
+            let cpu = &mut *scene.cpu.lock().unwrap();
+            let features = core.scene_features(cpu, self.kernels.environment);
             let smoke = features.contains(SceneFeatures::SMOKE);
             let cuts = cpu.cuts.as_ref().expect("an updated scene has cut tables");
             let producers: Vec<(u32, u32)> = (0..)
@@ -2639,7 +2661,6 @@ impl<'a> Frame<'a> {
                 cpu.sized.expect("an updated scene has sized its lists"),
             )
         };
-        let features = core.features() | scene_features;
         let sizes = TargetSizes {
             extent: view.render_extent.to_array(),
             extended: core.materials.any_extended(),
