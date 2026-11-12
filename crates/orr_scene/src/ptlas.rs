@@ -387,7 +387,7 @@ impl Ptlas {
             proxy_capacity: desc.medium_proxy_capacity,
             light_capacity: desc.light_capacity,
             global_copies: desc.global_instances,
-            skinned_capacity: desc.skinned_capacity,
+            skinned_capacity: 0,
             proxy_live: vec![false; desc.medium_proxy_capacity as usize],
             proxies_live: 0,
             proxy_dirty: BTreeSet::new(),
@@ -485,6 +485,20 @@ impl Ptlas {
         if runs.far {
             leave(0);
         }
+    }
+
+    /// Counts `entries` skinned copies in the global partition, which [`Self::global_room`]
+    /// has room for.
+    pub(crate) fn hold_skinned(&mut self, entries: u32) {
+        self.skinned_capacity = entries;
+    }
+
+    /// Instances the device's PTLAS takes in the global partition beyond the most it can hold
+    /// now, beside the cell partitions made; unbounded on a device without one, which builds
+    /// none.
+    pub(crate) fn global_room(&self, device: &Device) -> u32 {
+        self.partition_room(device)
+            .saturating_sub(self.partitions.len() as u32)
     }
 
     /// Cell partitions the device's PTLAS takes beside the most the global partition can

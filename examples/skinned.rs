@@ -86,7 +86,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                 light_capacity: 1,
                 emissive_capacity: 16,
                 global_instances: 16,
-                skinned_capacity: copies,
                 skinned_clusters: copies * 16,
                 ..SceneDesc::default()
             },

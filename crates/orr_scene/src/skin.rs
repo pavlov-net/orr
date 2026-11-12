@@ -232,9 +232,27 @@ pub(crate) struct SkinFrame {
     blas_records: GpuAddress,
     readback: Allocation<u32>,
     _memory: Allocation<u8>,
+    /// The clusters and copies a frame skins at most, and the frames in flight.
+    clusters: u32,
+    copies: u32,
+    fif: u32,
 }
 
 impl SkinFrame {
+    /// Gives the frame's skinning room for `copies` skinned copies, before the frame records
+    /// anything that reads it; every frame builds its CLAS and BLAS anew. The counters of the
+    /// frames in flight stay where they read them. Fails without device memory, changing
+    /// nothing.
+    pub(crate) fn follow_copies(&mut self, device: &Device, copies: u32) -> Result<()> {
+        if copies <= self.copies {
+            return Ok(());
+        }
+        let mut next = Self::new(device, self.clusters, copies, self.fif)?;
+        std::mem::swap(&mut next.readback, &mut self.readback);
+        *self = next;
+        Ok(())
+    }
+
     pub(crate) fn new(device: &Device, clusters: u32, copies: u32, fif: u32) -> Result<Self> {
         let caps = device.caps();
         let traced = caps.cluster.max_tris > 0 && caps.cluster.max_partitions > 0;
@@ -331,6 +349,9 @@ impl SkinFrame {
             blas,
             scratch,
             _memory: memory,
+            clusters,
+            copies,
+            fif,
         })
     }
 

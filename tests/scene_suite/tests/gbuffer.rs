@@ -10117,6 +10117,103 @@ fn an_unmount_takes_a_skinned_page_and_its_motion_from_the_scene() {
     assert_clean();
 }
 
+/// The tables of a scene's skinned copies and its frame's skinning memory grow under frames in
+/// flight: three frames running place more skinned worms behind the camera than they hold. Every
+/// frame traces the first worms where the settled frames did, each posed by its palette entries.
+#[test]
+fn skinned_tables_grow_under_frames_in_flight_and_every_frame_stays_exact() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let copies = CROWD.map(|p| (Mat3::IDENTITY, Vec3::from(p)));
+    let worms = place_worms(&mut w, "worm", &copies, false);
+    let model = w.model("worm");
+    let pose = worm_palette(0.7);
+    let mut frame = 0;
+    let mut next = |w: &mut World, more: u32| {
+        frame += 1;
+        shoot_later_with(w, &worms.placed, &worm_shot(frame), 0, |s| {
+            write_palette(s, &worms, 0.7, 0.45);
+            if more == 0 {
+                return;
+            }
+            let desc = |count| TransformGroupDesc {
+                count,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            };
+            let group = s.create_transform_group(&desc(more)).unwrap();
+            let palette = s
+                .create_transform_group(&desc(more * worms.joints))
+                .unwrap();
+            for (i, t) in s.transforms(group, 0, more).unwrap().iter_mut().enumerate() {
+                *t = Affine3::from_translation(Vec3::new(i as f32, 0.0, 30.0)).into();
+            }
+            let joints = s.transforms(palette, 0, more * worms.joints).unwrap();
+            for (o, p) in joints.iter_mut().zip(pose.iter().cycle()) {
+                *o = (*p).into();
+            }
+            s.add_skinned(&SkinnedDesc {
+                model,
+                copies: more,
+                transforms: group,
+                first: 0,
+                palette,
+                palette_first: 0,
+                material_set: None,
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: 100.0,
+                user_tag: 0,
+            })
+            .unwrap();
+        })
+    };
+    // Frames, each read while the next is in flight, until two in a row trace the same.
+    let start = Instant::now();
+    let mut flight = next(&mut w, 0);
+    let mut last: Option<Vec<u8>> = None;
+    let settled = loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the worms never settled"
+        );
+        let following = next(&mut w, 0);
+        wait(flight.point);
+        let now: Vec<u8> = bytemuck::cast_slice(&flight.read().traced).to_vec();
+        flight = following;
+        if last.as_ref() == Some(&now) {
+            break now;
+        }
+        last = Some(now);
+    };
+    wait(flight.point);
+    let traced: &[trace::Traced] = bytemuck::cast_slice(&settled);
+    assert!(traced.iter().filter(|t| t.instance != 0).count() > 500);
+    let held: SceneRoot = read_buffer(flight.scene, 1)[0];
+
+    let mut later = vec![flight];
+    for more in [2, 6, 20, 0, 0, 0] {
+        later.push(next(&mut w, more));
+    }
+    wait(later.last().unwrap().point);
+    let grown: SceneRoot = read_buffer(later[0].scene, 1)[0];
+    assert!(
+        grown.skinned != held.skinned && grown.skin_state != held.skin_state,
+        "the skinned tables never grew"
+    );
+    assert!(grown.skinned_capacity >= 30);
+    for (i, l) in later.iter().enumerate() {
+        let traced: Vec<u8> = bytemuck::cast_slice(&l.read().traced).to_vec();
+        assert!(
+            traced == settled,
+            "frame {} of the growth traced other hits at {} pixels",
+            i + 1,
+            differing(&traced, &settled),
+        );
+    }
+    assert_eq!(w.scenes.stats().skin.refused, 0);
+    assert_clean();
+}
+
 /// A skinned copy of an animated page stands where its rows say, like one placed there by hand:
 /// the rows give the transform and the palette the pose.
 #[test]

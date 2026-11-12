@@ -1845,7 +1845,7 @@ impl<'a> Frame<'a> {
                 cpu.skin_frame = Some(SkinFrame::new(
                     device,
                     scene.desc.skinned_clusters,
-                    scene.desc.skinned_capacity,
+                    scene.tables.skinned.capacity(),
                     core.fif,
                 )?);
             }
@@ -1931,7 +1931,7 @@ impl<'a> Frame<'a> {
                 origin_cell: cpu.origin_cell.extend(core.cell_log2 as i32).to_array(),
                 delta_time: self.time.delta,
                 frame_index: self.id as u32,
-                skinned_capacity: scene.desc.skinned_capacity,
+                skinned_capacity: t.skinned.capacity(),
                 light_capacity: scene.desc.light_capacity,
                 producer_capacity: scene.desc.producer_capacity,
                 emissive_capacity: scene.desc.emissive_capacity,

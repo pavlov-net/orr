@@ -82,8 +82,6 @@ pub struct SceneDesc {
     /// Instances the PTLAS global partition holds, at most: movers beyond it stay in their
     /// cell partitions.
     pub global_instances: u32,
-    /// Skinned copies (`add_skinned`), at most.
-    pub skinned_capacity: u32,
     /// Clusters all skinned copies skin and instantiate in one frame, at most.
     pub skinned_clusters: u32,
     /// Medium proxies: every `MediumProxyId` is below it. They trace from the PTLAS global
@@ -99,7 +97,6 @@ impl Default for SceneDesc {
             emissive_capacity: 16_384,
             partition_instances: 1000,
             global_instances: 4096,
-            skinned_capacity: 256,
             skinned_clusters: 8192,
             medium_proxy_capacity: 64,
         }
@@ -355,8 +352,9 @@ pub(crate) struct Tables {
     pub(crate) producer_counts: Allocation<[u32; 4]>,
     pub(crate) producer_state: Allocation<ProducerStateGpu>,
     pub(crate) sky_stats: Allocation<SkyStats>,
-    pub(crate) skinned: Allocation<SkinnedGpu>,
-    pub(crate) skin_state: Allocation<SkinStateGpu>,
+    /// By skinned-copy entry, like `skin_state`: the two grow together.
+    pub(crate) skinned: Column<SkinnedGpu>,
+    pub(crate) skin_state: Column<SkinStateGpu>,
     /// By `DecalId`: an entry for every id set.
     pub(crate) decals: Column<DecalGpu>,
     pub(crate) proxies: Allocation<MediumProxyGpu>,
@@ -986,6 +984,42 @@ impl Scene {
         sets.reserve(device, grown("material sets", held, more, limit)?)
     }
 
+    /// The first of `count` consecutive free skinned-copy entries. Without a free run that
+    /// long the skinned tables grow as [`grown`] says, within what the device's PTLAS takes in
+    /// its global partition: a skinned copy traces from there and may hold a far instance
+    /// beside it. Fails past that or what a table can hold, or without device memory for the
+    /// grown tables and the frame's skinning, leaving them as they were.
+    fn take_skinned(&self, cpu: &mut SceneCpu, device: &Device, count: u32) -> Result<u32> {
+        // A run of no entries takes none, and its start names no entry.
+        if count == 0 {
+            return Ok(0);
+        }
+        if let Some(first) = cpu.skinned.alloc(count) {
+            return Ok(first);
+        }
+        let t = &self.tables;
+        let held = t.skinned.capacity();
+        let limit = held
+            .saturating_add(cpu.ptlas.global_room(device) / 2)
+            .min(t.skinned.limit())
+            .min(t.skin_state.limit());
+        let entries = grown("skinned copies", held, count, limit)?;
+        let skinned = t.skinned.room(device, entries)?;
+        let skin_state = t.skin_state.room(device, entries)?;
+        // No frame has recorded its skinning while the scene is written.
+        if let Some(frame) = &mut cpu.skin_frame {
+            frame.follow_copies(device, entries)?;
+        }
+        t.skinned.grow(skinned, entries);
+        t.skin_state.grow(skin_state, entries);
+        cpu.ptlas.hold_skinned(entries);
+        cpu.skinned.grow(held, entries);
+        Ok(cpu
+            .skinned
+            .alloc(count)
+            .expect("the grown tables have a free run of `count`"))
+    }
+
     /// Moves the scene's tables that grew since its last update: see [`Column::land`].
     pub(crate) fn land(
         &self,
@@ -1001,6 +1035,8 @@ impl Scene {
         self.tables.material_sets.land(frame, copies, records);
         self.tables.page_sets.land(frame, copies, records);
         self.tables.decals.land(frame, copies, records);
+        self.tables.skinned.land(frame, copies, records);
+        self.tables.skin_state.land(frame, copies, records);
     }
 
     /// Frees the tables moved from in frames at or before `completed`.
@@ -1012,6 +1048,8 @@ impl Scene {
         self.tables.material_sets.retire(completed);
         self.tables.page_sets.retire(completed);
         self.tables.decals.retire(completed);
+        self.tables.skinned.retire(completed);
+        self.tables.skin_state.retire(completed);
     }
 
     /// Instance entry `entry` of the emissive list.
@@ -1386,8 +1424,8 @@ impl Scene {
             producer_counts: device.gpu_malloc(dl, n(desc.producer_capacity), "producer counts")?,
             producer_state: device.gpu_malloc(dl, n(desc.producer_capacity), "producer state")?,
             sky_stats: device.gpu_malloc(dl, 1, "sky stats")?,
-            skinned: device.gpu_malloc(dl, n(desc.skinned_capacity), "skinned copies")?,
-            skin_state: device.gpu_malloc(dl, n(desc.skinned_capacity), "skin state")?,
+            skinned: Column::new(device, MemoryPriority::Normal, "skinned copies", true)?,
+            skin_state: Column::new(device, MemoryPriority::Normal, "skin state", true)?,
             decals: Column::new(device, MemoryPriority::Normal, "decals", true)?,
             proxies: device.gpu_malloc(dl, n(desc.medium_proxy_capacity), "medium proxies")?,
         };
@@ -1411,8 +1449,6 @@ impl Scene {
                 tables.producer_state.size(),
             ),
             zero(tables.sky_stats.gpu().address(), tables.sky_stats.size()),
-            zero(tables.skinned.gpu().address(), tables.skinned.size()),
-            zero(tables.skin_state.gpu().address(), tables.skin_state.size()),
             zero(tables.proxies.gpu().address(), tables.proxies.size()),
         ];
         Ok(Self {
@@ -1444,7 +1480,7 @@ impl Scene {
                 ptlas: Ptlas::new(device, desc)?,
                 lights: crate::lights::LightKinds::default(),
                 cuts: None,
-                skinned: RangeAllocator::new(desc.skinned_capacity),
+                skinned: RangeAllocator::new(0),
                 skinned_high_water: 0,
                 hung: false,
                 skins: Vec::new(),
@@ -2348,12 +2384,12 @@ impl<'f> SceneWriter<'f> {
             let runs = cpu.copy_runs(desc.model.0, model.chained, body);
             cpu.ptlas.check_runs([(runs, desc.copies)])?;
             let first = self.scene.take_slots(cpu, self.device, desc.copies)?;
-            let Some(entry) = cpu.skinned.alloc(desc.copies) else {
-                cpu.slots.free(first, desc.copies);
-                return Err(Error::Capacity {
-                    what: "skinned copies",
-                    capacity: self.scene.desc.skinned_capacity,
-                });
+            let entry = match self.scene.take_skinned(cpu, self.device, desc.copies) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    cpu.slots.free(first, desc.copies);
+                    return Err(e);
+                }
             };
             let emissive = if ranks > 0 {
                 cpu.emissive.alloc(desc.copies * ranks)
@@ -2429,7 +2465,7 @@ impl<'f> SceneWriter<'f> {
         }
         self.push(Record::values(
             self.next_seq(),
-            self.scene.tables.skinned.gpu().offset(u64::from(entry)),
+            self.scene.tables.skinned.entry(entry),
             skinned_src,
             desc.copies,
         ));
@@ -2449,7 +2485,7 @@ impl<'f> SceneWriter<'f> {
         }
         self.push(Record::values(
             self.next_seq(),
-            self.scene.tables.skin_state.gpu().offset(u64::from(entry)),
+            self.scene.tables.skin_state.entry(entry),
             states_src,
             desc.copies,
         ));
