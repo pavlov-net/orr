@@ -26,13 +26,14 @@ use orr_scene::orr_gpu::{
     Texture, TextureIndex, TextureRegion,
 };
 use orr_scene::testing::{
-    assert_clean, device, global_tables, mounted_texture, read_buffer_on, read_texture_on,
+    assert_clean, assert_clean_on, device, global_tables, mounted_texture, read_buffer_on,
+    read_texture_on, wait_on,
 };
 use orr_scene::{
     BoundTexture, Budgets, EmissiveGpu, Error, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
-    InstancesDesc, LoadState, MaterialGpu, MaterialId, MeshGpu, ModelGpu, ModelId, MountId,
-    NeuralTextures, PackSource, PoolSize, RendererDesc, ResidencyClass, SceneDesc, SceneId,
-    SceneRoot, SceneWriter, Scenes, TransformGroupDesc, material_flags,
+    InstanceRange, InstancesDesc, LoadState, MaterialGpu, MaterialId, MeshGpu, ModelGpu, ModelId,
+    MountId, NeuralTextures, PackSource, PoolSize, RendererDesc, ResidencyClass, SceneDesc,
+    SceneId, SceneRoot, SceneWriter, Scenes, TransformGroupDesc, TransformGroupId, material_flags,
 };
 use scene_suite::Workers;
 
@@ -692,6 +693,126 @@ fn staged_device() -> Device {
     .unwrap();
     assert!(!staged.caps().rebar && !staged.caps().host_image_copy);
     staged
+}
+
+/// A second device whose PTLAS holds `partitions` cell partitions and global instances together.
+fn limited_device(partitions: u32) -> Device {
+    let _ = device();
+    Device::new(&DeviceDesc {
+        name: "orr-test-limited",
+        queues: QueueRequest {
+            render_compute: true,
+            async_compute: true,
+            copy: true,
+            present: false,
+        },
+        max_partitions: Some(partitions),
+        ..DeviceDesc::default()
+    })
+    .unwrap()
+}
+
+/// A placement that needs one cell partition more than the device's PTLAS holds is refused and
+/// leaves nothing placed: the scene traces the copies it held, and takes copies again for the
+/// partitions that removed ones give back.
+#[test]
+fn a_placement_past_the_devices_partitions_is_refused_and_leaves_the_scene_as_it_was() {
+    const COPIES: u32 = 40;
+    let _serial = serial();
+    // A copy to a partition, so few copies reach the limit.
+    let desc = SceneDesc {
+        partition_instances: 1,
+        global_instances: 16,
+        ..SceneDesc::default()
+    };
+    // What the global partition holds whatever is placed: its copies, a far instance for each,
+    // and the producer and light entries.
+    let fixed = 2 * desc.global_instances + desc.producer_capacity + desc.light_capacity;
+    let limited = limited_device(fixed + COPIES);
+    if limited.caps().cluster.max_partitions != fixed + COPIES {
+        return;
+    }
+    {
+        let mut scenes = Scenes::new(&limited, &RendererDesc::default()).unwrap();
+        let (_workers, quad) = scene_suite::mount_quad(&mut scenes);
+        let s = scenes.create_scene(&desc).unwrap();
+        let list = [s];
+        let copies = |group: TransformGroupId, count| InstancesDesc {
+            model: quad,
+            copies: count,
+            transforms: group,
+            first: 0,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 100.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        };
+        let refused = |r: orr_scene::Result<InstanceRange>| {
+            assert!(matches!(r, Err(Error::Capacity { .. })), "{r:?}");
+        };
+        let frame_with = |scenes: &mut Scenes, write: &mut dyn FnMut(&mut SceneWriter<'_>)| {
+            let mut f = scenes
+                .begin_frame(&FrameDesc {
+                    time: FrameTime::default(),
+                    scenes: &list,
+                    low_latency: None,
+                })
+                .unwrap();
+            let mut w = f.scene(s).unwrap();
+            w.set_focus(DVec3::ZERO);
+            write(&mut w);
+            drop(w);
+            let mut root = GpuPtr::NULL;
+            f.update_scenes(&mut |c| root = c.root).unwrap();
+            wait_on(&limited, f.end(&[]).unwrap());
+            read_buffer_on::<SceneRoot>(&limited, root, 1)[0]
+        };
+        let mut placed = None;
+        let root = frame_with(&mut scenes, &mut |w| {
+            let group = w
+                .create_transform_group(&TransformGroupDesc {
+                    count: COPIES,
+                    writer: GroupWriter::Cpu,
+                    anchor: DVec3::ZERO,
+                })
+                .unwrap();
+            let rows = w.transforms(group, 0, COPIES).unwrap();
+            rows.fill(Affine3::IDENTITY.into());
+            placed = Some((w.add_instances(&copies(group, COPIES)).unwrap(), group));
+            refused(w.add_instances(&copies(group, 1)));
+        });
+        let (placed, group) = placed.unwrap();
+        // The refused copy took no slot.
+        assert_eq!(root.part_base, COPIES);
+        for _ in 0..3 {
+            frame_with(&mut scenes, &mut |_| {});
+        }
+        let rt = scenes.stats().rt;
+        assert_eq!((rt.partitions, rt.unplaced), (COPIES, 0));
+
+        // Ten copies go, and once their frame has completed ten more fit, and no more.
+        frame_with(&mut scenes, &mut |w| {
+            w.remove(InstanceRange {
+                first: placed.first,
+                count: 10,
+            });
+        });
+        for _ in 0..4 {
+            frame_with(&mut scenes, &mut |_| {});
+        }
+        frame_with(&mut scenes, &mut |w| {
+            w.add_instances(&copies(group, 10)).unwrap();
+            refused(w.add_instances(&copies(group, 1)));
+        });
+        for _ in 0..3 {
+            frame_with(&mut scenes, &mut |_| {});
+        }
+        let rt = scenes.stats().rt;
+        assert_eq!((rt.partitions, rt.unplaced), (COPIES, 0));
+    }
+    assert_clean_on(&limited);
 }
 
 /// A memory pack of `count` whole textures, which no material binds: every mip of each is
@@ -3513,7 +3634,7 @@ fn streamed_frame(
 }
 
 /// Places one copy of each of `models` at the origin, drawn and traced.
-fn place_copies(s: &mut SceneWriter<'_>, models: &[ModelId]) -> orr_scene::TransformGroupId {
+fn place_copies(s: &mut SceneWriter<'_>, models: &[ModelId]) -> TransformGroupId {
     place_copies_as(s, models, InstanceFlags::RASTER | InstanceFlags::RAY)
 }
 
@@ -3522,7 +3643,7 @@ fn place_copies_as(
     s: &mut SceneWriter<'_>,
     models: &[ModelId],
     flags: InstanceFlags,
-) -> orr_scene::TransformGroupId {
+) -> TransformGroupId {
     let group = s
         .create_transform_group(&TransformGroupDesc {
             count: models.len() as u32,
@@ -3552,7 +3673,7 @@ fn place_copies_as(
 }
 
 /// Moves copy `i` of `group` to `x` m along the x axis.
-fn move_copy(s: &mut SceneWriter<'_>, group: orr_scene::TransformGroupId, i: u32, x: f32) {
+fn move_copy(s: &mut SceneWriter<'_>, group: TransformGroupId, i: u32, x: f32) {
     s.transforms(group, i, 1).unwrap()[0] =
         Affine3::from_translation(Vec3::new(x, 0.0, 0.0)).into();
 }

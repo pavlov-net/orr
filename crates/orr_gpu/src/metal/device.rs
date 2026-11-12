@@ -384,7 +384,7 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
             align_bounds: 32,
             max_geometry_index: (1 << 24) - 1,
             omm_in_clusters: false,
-            max_partitions: 1 << 16,
+            max_partitions: desc.max_partitions.map_or(1 << 16, |max| max.min(1 << 16)),
         },
         limits: Limits {
             image_descriptor_bytes: 8,

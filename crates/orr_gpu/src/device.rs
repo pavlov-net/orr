@@ -44,6 +44,9 @@ pub struct DeviceDesc<'a> {
     /// Image heap slots for sampled and storage image views.
     pub image_heap_slots: u32,
     pub sampler_heap_slots: u32,
+    /// Reports at most this many [`ClusterCaps::max_partitions`](crate::ClusterCaps), so a test
+    /// reaches the limit with a small scene. `None`: what the device offers.
+    pub max_partitions: Option<u32>,
 }
 
 impl Default for DeviceDesc<'_> {
@@ -60,6 +63,7 @@ impl Default for DeviceDesc<'_> {
             perf_counters: false,
             image_heap_slots: 262_144,
             sampler_heap_slots: 1024,
+            max_partitions: None,
         }
     }
 }

@@ -514,7 +514,13 @@ impl Device {
             present_metering: optional.present_metering,
             present_timing: optional.present_timing,
             hdr_metadata: optional.hdr_metadata,
-            cluster: cluster_caps(&cluster_props, &ptlas_props, optional.omm),
+            cluster: {
+                let mut cluster = cluster_caps(&cluster_props, &ptlas_props, optional.omm);
+                if let Some(max) = desc.max_partitions {
+                    cluster.max_partitions = cluster.max_partitions.min(max);
+                }
+                cluster
+            },
             limits: Limits {
                 image_descriptor_bytes: p.image_descriptor_size as u32,
                 sampler_descriptor_bytes: p.sampler_descriptor_size as u32,
