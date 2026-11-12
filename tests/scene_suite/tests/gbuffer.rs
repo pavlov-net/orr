@@ -1392,6 +1392,9 @@ struct World {
     mount: MountId,
     _workers: Workers,
     texture_filter: TextureFilter,
+    /// Its scenes ask more of their work lists than their detail is estimated to, so a frame
+    /// may drop what a list has no room for.
+    short: bool,
 }
 
 fn time(frame: u32) -> FrameTime {
@@ -1439,6 +1442,7 @@ impl World {
             mount,
             texture_filter: TextureFilter::Hardware,
             _workers: workers,
+            short: false,
         }
     }
 
@@ -2829,7 +2833,32 @@ fn shoot_probed(
     let id = f.id();
     wait(f.end(&[]).unwrap());
     let probes = w.scenes.probes(placed.history, id);
-    (read_back(&view), probes)
+    let frame = read_back(&view);
+    if !w.short {
+        // The lists hold what the scene's copies and producers can ask of them, from the
+        // frame that placed them on: the last completed frame is the one before this.
+        let before = w.scenes.stats().cuts;
+        assert_eq!(
+            (before.nodes_dropped, before.candidates_dropped),
+            (0, 0),
+            "nodes and candidate items the frame before dropped"
+        );
+        assert_eq!(
+            dropped(&view, &frame.counts),
+            [0; 4],
+            "nodes, candidate items, visible clusters and second-pass work dropped"
+        );
+    }
+    (frame, probes)
+}
+
+/// What a frame's work lists dropped for want of room: hierarchy nodes, candidate items,
+/// visible clusters and second-pass work (`CutGpu.counters` 8 and 9, the view's counts).
+fn dropped(view: &RasterView, counts: &[u32]) -> [u32; 4] {
+    let root: SceneRoot = read_buffer(view.scene, 1)[0];
+    let cut: CutGpu = read_buffer(root.cut, 1)[0];
+    let c: Vec<u32> = read_buffer(cut.counters, 10);
+    [c[8], c[9], counts[1], counts[2]]
 }
 
 /// What the `trace` kernels wrote for one view.
@@ -7420,6 +7449,7 @@ fn work_lists_far_too_small_grow_until_nothing_drops_and_the_cut_takes_the_clust
         rt_error_pixels: COARSE_PIXELS,
         ..RendererDesc::default()
     });
+    w.short = true;
     let items = dag_items();
     let eye = Vec3::new(0.3, 1.2, 4.0);
     let target = Vec3::new(0.0, 0.0, -10.0);
