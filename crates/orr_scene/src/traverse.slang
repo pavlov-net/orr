@@ -48,7 +48,7 @@ import orr_scene.visibility;
 
 // `TraverseRoot.flags`.
 static const uint TRAVERSE_FOCUS = 1;   // the scene has a focus
-static const uint TRAVERSE_ERRORS = 2;  // `clear` zeroes `CutGpu.wanted_errors`: the first frame
+static const uint TRAVERSE_ERRORS = 2;  // `clear` zeroes `CutGpu.wanted_errors`: the first frame of each allocation of them
 static const uint TRAVERSE_FILL = 4;    // the passes write the clusters of the cuts built this frame
 
 // `CutGpu.args` grids after the passes': gather, then jobs, then per digit of the admission
