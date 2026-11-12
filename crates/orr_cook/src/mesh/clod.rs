@@ -4,8 +4,8 @@
 //! out in the order the original emits them, with the same numbering. Unlike the original,
 //! level 0 clusters each section apart, unless the triangles make one cluster, the sloppy
 //! fallback can keep open borders ([`Mesh::keep_borders`]), and a simplified corner whose
-//! normal opposes its face takes a wedge with a normal from its triangle's side
-//! ([`lod::opposed_corners`]).
+//! normal opposes its face takes a wedge with a normal from its triangle's side and the other
+//! attributes of the surface the triangle stands on ([`lod::opposed_corners`]).
 
 use std::borrow::Cow;
 
@@ -57,28 +57,35 @@ pub(super) struct Mesh<'a> {
 }
 
 /// The mesh vertices each vertex of `build` takes after: a mesh vertex itself, and a wedge
-/// the vertex that places it, by position and skin, and the one that shades it, by normal and
-/// the other attributes.
+/// the vertex that places it, by position and skin, the one that turns it, by its normal, and
+/// the one that shades it, by the other attributes.
 pub(super) struct Sources {
     mesh: u32,
-    /// Per wedge, its shading and placing mesh vertices.
-    wedges: Vec<[u32; 2]>,
+    /// Per wedge, its shading, turning and placing mesh vertices.
+    wedges: Vec<[u32; 3]>,
 }
 
 impl Sources {
-    pub(super) fn shading(&self, v: u32) -> u32 {
+    fn of(&self, v: u32, i: usize) -> u32 {
         v.checked_sub(self.mesh)
-            .map_or(v, |w| self.wedges[w as usize][0])
+            .map_or(v, |w| self.wedges[w as usize][i])
+    }
+
+    pub(super) fn shading(&self, v: u32) -> u32 {
+        self.of(v, 0)
+    }
+
+    pub(super) fn turning(&self, v: u32) -> u32 {
+        self.of(v, 1)
     }
 
     pub(super) fn placing(&self, v: u32) -> u32 {
-        v.checked_sub(self.mesh)
-            .map_or(v, |w| self.wedges[w as usize][1])
+        self.of(v, 2)
     }
 }
 
 /// What `build` keeps per vertex: the mesh's vertices, then the wedges it adds, each placed as
-/// one vertex is and shaded as another ([`lod::opposed_corners`]).
+/// one vertex is and turned and shaded as others ([`lod::opposed_corners`]).
 struct Vertices {
     positions: Vec<f32>,
     normals: Vec<f32>,
@@ -89,15 +96,16 @@ struct Vertices {
 }
 
 impl Vertices {
-    /// Adds a vertex placed as `at` is, by its position and lock bits, and shaded as `from`
-    /// is; returns it.
-    fn wedge(&mut self, at: u32, from: u32) -> u32 {
+    /// Adds a vertex placed as `at` is, by its position and lock bits, with the normal of
+    /// `normal` and shaded as `from` is; returns it.
+    fn wedge(&mut self, at: u32, normal: u32, from: u32) -> u32 {
         let new = self.remap.len() as u32;
         let s = &mut self.sources;
-        s.wedges.push([s.shading(from), s.placing(at)]);
-        let (at, from) = (at as usize, from as usize);
+        s.wedges
+            .push([s.shading(from), s.turning(normal), s.placing(at)]);
+        let (at, normal) = (at as usize, normal as usize);
         self.positions.extend_from_within(3 * at..3 * at + 3);
-        self.normals.extend_from_within(3 * from..3 * from + 3);
+        self.normals.extend_from_within(3 * normal..3 * normal + 3);
         self.lock.push(self.lock[at]);
         self.remap.push(self.remap[at]);
         new
@@ -729,8 +737,8 @@ pub(super) struct Emitted<'a> {
 }
 
 /// A group simplified and emitted: its triangles, their bounds, and the corners whose
-/// vertex normal opposes their face with the vertex whose attributes they take.
-type Simplified = (Vec<u32>, Bounds, Vec<(usize, u32)>);
+/// vertex normal opposes their face with the vertices they take their shading from.
+type Simplified = (Vec<u32>, Bounds, Vec<lod::Opposed>);
 
 /// Builds the DAG of `mesh` at `positions` under `c`, calling `emit` once per group with its
 /// index fixed by emission order, and returns the emitted values in that order.
@@ -869,24 +877,24 @@ pub(super) fn build<G: Send>(
             })
             .collect();
         let wedges = crate::profile::zone!("clod.wedges");
-        // Each corner that takes another vertex's attributes takes that vertex where it shares
-        // the corner's position, else a wedge, one per vertex and attribute source.
-        let mut made: FxHashMap<(u32, u32), u32> = FxHashMap::default();
+        // Each corner that takes another vertex's normal and attributes takes that vertex where
+        // it shares the corner's position, else a wedge, one per vertex and sources.
+        let mut made: FxHashMap<[u32; 3], u32> = FxHashMap::default();
         let mut next = Vec::new();
         for (gi, (g, simplified)) in groups.into_iter().enumerate() {
             out.push(g);
             let Some((mut simplified, bounds, opposed)) = simplified else {
                 continue;
             };
-            for (k, u) in opposed {
-                let v = simplified[k];
-                simplified[k] = if vx.remap[u as usize] == vx.remap[v as usize] {
-                    // Dilation moves only the vertices `simplified` holds, which `u` may not be.
+            for o in opposed {
+                let (v, n, a) = (simplified[o.corner], o.normal, o.attributes);
+                simplified[o.corner] = if n == a && vx.remap[n as usize] == vx.remap[v as usize] {
+                    // Dilation moves only the vertices `simplified` holds, which `n` may not be.
                     let v = 3 * v as usize;
-                    vx.positions.copy_within(v..v + 3, 3 * u as usize);
-                    u
+                    vx.positions.copy_within(v..v + 3, 3 * n as usize);
+                    n
                 } else {
-                    *made.entry((v, u)).or_insert_with(|| vx.wedge(v, u))
+                    *made.entry([v, n, a]).or_insert_with(|| vx.wedge(v, n, a))
                 };
             }
             next.push((base + gi as i32, simplified, bounds));

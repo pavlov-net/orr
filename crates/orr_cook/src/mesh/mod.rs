@@ -927,7 +927,8 @@ impl Ctx<'_> {
         let n = v.shading.len();
         let mut order = IDENTITY;
         meshopt::optimize_meshlet_level(&mut order[..n], &mut tris, 3);
-        let (mut by_order, mut placing_by_order, mut cells_by_order) = (
+        let (mut by_order, mut turning_by_order, mut placing_by_order, mut cells_by_order) = (
+            [0; MAX_CLUSTER_VERTICES],
             [0; MAX_CLUSTER_VERTICES],
             [0; MAX_CLUSTER_VERTICES],
             [[0; 3]; MAX_CLUSTER_VERTICES],
@@ -935,10 +936,14 @@ impl Ctx<'_> {
         for (k, &i) in order[..n].iter().enumerate() {
             by_order[k] = v.shading[i as usize];
             cells_by_order[k] = v.cells[i as usize];
+            if !v.turning.is_empty() {
+                turning_by_order[k] = v.turning[i as usize];
+            }
             if !v.placing.is_empty() {
                 placing_by_order[k] = v.placing[i as usize];
             }
         }
+        let turning = &turning_by_order[..v.turning.len()];
         let placing = &placing_by_order[..v.placing.len()];
         let (verts, cells) = (&by_order[..n], &cells_by_order[..n]);
         let sec = &self.sections[usize::from(section)];
@@ -967,6 +972,7 @@ impl Ctx<'_> {
                 w,
                 self.grid,
                 verts,
+                turning,
                 cells,
                 &mut tris[..3 * usize::from(opaque)],
             )
@@ -976,6 +982,7 @@ impl Ctx<'_> {
         stored_corner_order(&mut tris);
         let ordered = ClusterVertices {
             shading: verts,
+            turning,
             placing,
             cells,
         };
@@ -1107,6 +1114,7 @@ fn discrete(cx: &Ctx<'_>, levels: &[lod::LevelGeometry]) -> Result<Built> {
                 let tris = ml.triangles[to..to + tc * 3].to_vec();
                 let v = ClusterVertices {
                     shading: verts,
+                    turning: &[],
                     placing: &[],
                     cells: &cells,
                 };
@@ -1399,11 +1407,13 @@ fn stable_partition(tris: &mut [u8], first: &[bool]) -> u8 {
 
 /// Stable partition of a cluster's triangles: those whose vertex normals all lie within
 /// [`FLAT_NORMAL`] of the face normal first. Returns their count. A corner at `cells` off its
-/// welded grid position, moved by border dilation, has no welded face to compare with.
+/// welded grid position, moved by border dilation, has no welded face to compare with. A
+/// vertex takes its normal from its `turning` welded vertex, its own where that is empty.
 fn partition_flat(
     w: &lod::Welded,
     grid: &Grid,
     verts: &[u32],
+    turning: &[u32],
     cells: &[[i32; 3]],
     tris: &mut [u8],
 ) -> u8 {
@@ -1418,7 +1428,8 @@ fn partition_flat(
         let v = v as usize;
         welded[k] = cells[k] == grid.cells[v];
         p[k] = Vec3::from(w.positions[v]).as_dvec3();
-        unit[k] = Vec3::from(w.normals[v]).as_dvec3().normalize_or_zero();
+        let n = turning.get(k).map_or(v, |&n| n as usize);
+        unit[k] = Vec3::from(w.normals[n]).as_dvec3().normalize_or_zero();
     }
     let mut flat = [false; MAX_CLUSTER_CORNERS / 3];
     for (f, t) in flat.iter_mut().zip(tris.as_chunks::<3>().0) {
@@ -1813,12 +1824,13 @@ impl ClusterData {
     }
 }
 
-/// A cluster's vertices: per vertex the welded vertex that shades it, the one that places it
-/// by its skin, and its grid position. `placing` is empty where each vertex's is the one that
-/// shades it.
+/// A cluster's vertices: per vertex the welded vertex that shades it, the one that turns it
+/// by its normal, the one that places it by its skin, and its grid position. `turning` and
+/// `placing` are empty where each vertex's is the one that shades it.
 #[derive(Copy, Clone)]
 struct ClusterVertices<'a> {
     shading: &'a [u32],
+    turning: &'a [u32],
     placing: &'a [u32],
     cells: &'a [[i32; 3]],
 }
@@ -1857,8 +1869,9 @@ fn build_cluster(
     let mut attrs = Vec::with_capacity(verts.len() * 3);
     for (k, &shading) in verts.iter().enumerate() {
         let v = shading as usize;
+        let n = vertices.turning.get(k).copied().unwrap_or(shading) as usize;
         attrs.push(oct_encode(
-            Vec3::from(w.normals[v]).normalize_or(Vec3::Z).to_array(),
+            Vec3::from(w.normals[n]).normalize_or(Vec3::Z).to_array(),
         ));
         if let Some(t) = &w.tangents {
             let [x, y, z, s] = t[v];

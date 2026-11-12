@@ -108,8 +108,8 @@ impl Welded {
     }
 
     /// Adds a vertex placed as `at` is, by its position, moves, skin, part value and pivot,
-    /// and shaded as `from` is, by its normal, tangent, uvs and colors; returns it.
-    pub(super) fn wedge(&mut self, at: u32, from: u32) -> u32 {
+    /// with the normal of `normal` and the tangent, uvs and colors of `from`; returns it.
+    pub(super) fn wedge(&mut self, at: u32, normal: u32, from: u32) -> u32 {
         fn copy<T: Copy>(v: &mut Vec<T>, i: u32) {
             v.push(v[i as usize]);
         }
@@ -122,7 +122,7 @@ impl Welded {
         }
         self.values.iter_mut().for_each(|v| copy(v, at));
         self.pivots.iter_mut().for_each(|p| copy(p, at));
-        copy(&mut self.normals, from);
+        copy(&mut self.normals, normal);
         self.tangents.iter_mut().for_each(|t| copy(t, from));
         self.uvs.iter_mut().for_each(|u| copy(u, from));
         self.colors.iter_mut().for_each(|c| copy(c, from));
@@ -130,13 +130,126 @@ impl Welded {
     }
 }
 
-/// The corners of the triangles `simplified` whose vertex normal opposes their face, each with
-/// the vertex of `input` in its vertex's section nearest it whose normal faces the triangle's
-/// way, when there is one. A triangle `input` holds as it is, with no vertex `moved`, keeps its
-/// corners as the input has them. Simplification joins vertices across thin features: one
-/// coarse vertex can stand for both sides of a sheet while it carries one side's normal, and
-/// the other side's triangles then take the attributes of a vertex from their own side. Vertex
-/// `v` is at `at(v)` with normal `normal(v)` in section `section(v)`.
+/// A corner of a simplified triangle whose vertex normal opposes the triangle's face
+/// ([`opposed_corners`]), and the vertices it takes its shading from.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) struct Opposed {
+    /// The corner's index in the simplified triangles.
+    pub(super) corner: usize,
+    /// The vertex whose normal the corner takes.
+    pub(super) normal: u32,
+    /// The vertex whose tangent, uvs and colors the corner takes: its own vertex, or another.
+    pub(super) attributes: u32,
+}
+
+/// The vertices of a triangle list, for searches by position, and the patch each lies in: the
+/// vertices the list's triangles join, across which their attributes run on.
+struct Near {
+    /// The vertices by their coordinate on the axis their box is longest on, so a search stops
+    /// once that coordinate alone is farther than the nearest found: a piece can hold a whole
+    /// section.
+    axis: usize,
+    sorted: Vec<(f64, u32)>,
+    patch: FxHashMap<u32, u32>,
+}
+
+impl Near {
+    fn new(triangles: &[u32], at: impl Fn(u32) -> DVec3) -> Self {
+        fn root(parent: &mut [u32], mut i: u32) -> u32 {
+            while parent[i as usize] != i {
+                let up = parent[parent[i as usize] as usize];
+                parent[i as usize] = up;
+                i = up;
+            }
+            i
+        }
+        let mut c = triangles.to_vec();
+        c.sort_unstable();
+        c.dedup();
+        let dense = |v: u32| c.binary_search(&v).expect("a vertex of the triangles") as u32;
+        let mut parent: Vec<u32> = (0..c.len() as u32).collect();
+        for t in triangles.as_chunks::<3>().0 {
+            let r = root(&mut parent, dense(t[0]));
+            for &v in &t[1..] {
+                let s = root(&mut parent, dense(v));
+                parent[s as usize] = r;
+            }
+        }
+        let patch = (0..c.len() as u32)
+            .map(|i| (c[i as usize], root(&mut parent, i)))
+            .collect();
+        let (lo, hi) = c
+            .iter()
+            .fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(lo, hi), &u| {
+                (lo.min(at(u)), hi.max(at(u)))
+            });
+        let size = hi - lo;
+        let axis = (0..3)
+            .max_by(|&a, &b| size[a].total_cmp(&size[b]))
+            .expect("three axes");
+        let mut sorted: Vec<(f64, u32)> = c.into_iter().map(|u| (at(u)[axis], u)).collect();
+        sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        Self {
+            axis,
+            sorted,
+            patch,
+        }
+    }
+
+    fn patch(&self, v: u32) -> u32 {
+        self.patch[&v]
+    }
+
+    /// The vertex `take` accepts nearest `p`, the least of those as near, when there is one.
+    fn nearest(
+        &self,
+        p: DVec3,
+        at: impl Fn(u32) -> DVec3,
+        take: impl Fn(u32) -> bool,
+    ) -> Option<u32> {
+        let x = p[self.axis];
+        let mut nearest: Option<(f64, u32)> = None;
+        // Whether `u`, at `c` on the axis, and every vertex past it are farther than the
+        // nearest; else takes `u` if it is nearer.
+        let mut past = |c: f64, u: u32| {
+            if nearest.is_some_and(|(d, _)| (c - x) * (c - x) > d) {
+                return true;
+            }
+            if take(u) {
+                let d = at(u).distance_squared(p);
+                if nearest.is_none_or(|(e, w)| d < e || (d == e && u < w)) {
+                    nearest = Some((d, u));
+                }
+            }
+            false
+        };
+        let mid = self.sorted.partition_point(|&(c, _)| c < x);
+        for &(c, u) in &self.sorted[mid..] {
+            if past(c, u) {
+                break;
+            }
+        }
+        for &(c, u) in self.sorted[..mid].iter().rev() {
+            if past(c, u) {
+                break;
+            }
+        }
+        nearest.map(|(_, u)| u)
+    }
+}
+
+/// The corners of the triangles `simplified` whose vertex normal opposes their face, with the
+/// vertices of `input` they take their shading from. Simplification joins vertices across thin
+/// features, where one coarse vertex can stand for both sides of a sheet while it carries one
+/// side's normal, and it can fold a curved surface past its normals. Such a corner takes the
+/// normal of the vertex in its vertex's section nearest it whose normal faces the triangle's
+/// way, when there is one. Its uvs, tangent and colors continue those of the surface the
+/// triangle stands on, or its uvs would span unrelated parts of a texture: the patches of
+/// `input`, the vertices its triangles join, that hold the triangle's corners whose normal
+/// faces its way, or all its corners where none does. A corner whose vertex lies on that
+/// surface keeps its vertex's; another takes those of the vertex on it nearest it. A triangle
+/// `input` holds as it is, with no vertex `moved`, keeps its corners as the input has them.
+/// Vertex `v` is at `at(v)` with normal `normal(v)` in section `section(v)`.
 pub(super) fn opposed_corners(
     simplified: &[u32],
     input: &[u32],
@@ -144,78 +257,56 @@ pub(super) fn opposed_corners(
     at: impl Fn(u32) -> DVec3,
     normal: impl Fn(u32) -> DVec3,
     section: impl Fn(u32) -> u16,
-) -> Vec<(usize, u32)> {
+) -> Vec<Opposed> {
     // A triangle by its corners from the least, which keeps its winding.
     let key = |t: &[u32; 3]| {
         let k = (0..3).min_by_key(|&k| t[k]).expect("three corners");
         [t[k], t[(k + 1) % 3], t[(k + 2) % 3]]
     };
     let mut kept: Option<FxHashSet<[u32; 3]>> = None;
-    // The input's vertices by their coordinate on the axis their box is longest on, so a
-    // search stops once that coordinate alone is farther than the nearest found: a piece can
-    // hold a whole section.
-    let mut candidates: Option<(usize, Vec<(f64, u32)>)> = None;
+    let mut near: Option<Near> = None;
     let mut out = Vec::new();
     for (t, tri) in simplified.as_chunks::<3>().0.iter().enumerate() {
         let p = tri.map(&at);
         let face = (p[1] - p[0]).cross(p[2] - p[0]);
-        if tri.iter().all(|&v| normal(v).dot(face) >= 0.0) {
+        let faces = tri.map(|v| normal(v).dot(face) >= 0.0);
+        if faces == [true; 3] {
             continue;
         }
         let kept = kept.get_or_insert_with(|| input.as_chunks::<3>().0.iter().map(key).collect());
         if kept.contains(&key(tri)) && !tri.iter().any(|&v| moved(v)) {
             continue;
         }
-        let (axis, sorted) = &*candidates.get_or_insert_with(|| {
-            let mut c = input.to_vec();
-            c.sort_unstable();
-            c.dedup();
-            let (lo, hi) = c
-                .iter()
-                .fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(lo, hi), &u| {
-                    (lo.min(at(u)), hi.max(at(u)))
-                });
-            let size = hi - lo;
-            let axis = (0..3)
-                .max_by(|&a, &b| size[a].total_cmp(&size[b]))
-                .expect("three axes");
-            let mut sorted: Vec<(f64, u32)> = c.into_iter().map(|u| (at(u)[axis], u)).collect();
-            sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            (axis, sorted)
-        });
+        let near = near.get_or_insert_with(|| Near::new(input, &at));
+        let stands = if faces == [false; 3] {
+            [true; 3]
+        } else {
+            faces
+        };
+        let surface: Vec<u32> = (0..3)
+            .filter(|&k| stands[k])
+            .map(|k| near.patch(tri[k]))
+            .collect();
         for (k, &v) in tri.iter().enumerate() {
-            if normal(v).dot(face) >= 0.0 {
+            if faces[k] {
                 continue;
             }
-            let (s, x) = (section(v), p[k][*axis]);
-            let mut nearest: Option<(f64, u32)> = None;
-            // Whether `u`, at `c` on the axis, and every vertex past it are farther than the
-            // nearest; else takes `u` if it is nearer.
-            let mut past = |c: f64, u: u32| {
-                if nearest.is_some_and(|(d, _)| (c - x) * (c - x) > d) {
-                    return true;
-                }
-                if section(u) == s && normal(u).dot(face) > 0.0 {
-                    let d = at(u).distance_squared(p[k]);
-                    if nearest.is_none_or(|(e, w)| d < e || (d == e && u < w)) {
-                        nearest = Some((d, u));
-                    }
-                }
-                false
+            let s = section(v);
+            let normal = near
+                .nearest(p[k], &at, |u| section(u) == s && normal(u).dot(face) > 0.0)
+                .unwrap_or(v);
+            let attributes = if surface.contains(&near.patch(v)) {
+                v
+            } else {
+                near.nearest(p[k], &at, |u| surface.contains(&near.patch(u)))
+                    .expect("the triangle's corners lie on its surface")
             };
-            let mid = sorted.partition_point(|&(c, _)| c < x);
-            for &(c, u) in &sorted[mid..] {
-                if past(c, u) {
-                    break;
-                }
-            }
-            for &(c, u) in sorted[..mid].iter().rev() {
-                if past(c, u) {
-                    break;
-                }
-            }
-            if let Some((_, u)) = nearest {
-                out.push((3 * t + k, u));
+            if (normal, attributes) != (v, v) {
+                out.push(Opposed {
+                    corner: 3 * t + k,
+                    normal,
+                    attributes,
+                });
             }
         }
     }
@@ -772,15 +863,16 @@ pub(super) fn simplify(
         |_| 0,
     );
     let mut out: Vec<u32> = out.into_iter().map(|v| global[v as usize]).collect();
-    let mut made: FxHashMap<(u32, u32), u32> = FxHashMap::default();
-    for (k, u) in wedges {
-        let (v, u) = (out[k], global[u as usize]);
-        out[k] = if grid.reps[u as usize] == grid.reps[v as usize] {
-            u
+    let mut made: FxHashMap<[u32; 3], u32> = FxHashMap::default();
+    for o in wedges {
+        let v = out[o.corner];
+        let [n, a] = [o.normal, o.attributes].map(|u| global[u as usize]);
+        out[o.corner] = if n == a && grid.reps[n as usize] == grid.reps[v as usize] {
+            n
         } else {
-            *made.entry((v, u)).or_insert_with(|| {
+            *made.entry([v, n, a]).or_insert_with(|| {
                 grid.wedge(v);
-                w.wedge(v, u)
+                w.wedge(v, n, a)
             })
         };
     }

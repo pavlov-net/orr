@@ -45,14 +45,17 @@ use super::{
 /// borders dilate.
 type Class = (u16, Option<u16>);
 
-/// A triangle corner: the welded vertices that shade and place it, its grid position and
-/// section.
-type Corner = (u32, u32, [i32; 3], u16);
+/// A triangle corner: the welded vertices that shade, turn and place it, its grid position
+/// and section.
+type Corner = (u32, u32, u32, [i32; 3], u16);
 
 /// One input to `clodBuild`: vertices referring to welded vertices, at grid positions, in
 /// sections.
 struct Input {
     welded: Vec<u32>,
+    /// Per vertex, the welded vertex that turns it, by its normal; empty when each vertex's is
+    /// its own `welded` one.
+    turning: Vec<u32>,
     /// Per vertex, the welded vertex that places it, by its skin; empty when each vertex's is
     /// its own `welded` one.
     placing: Vec<u32>,
@@ -68,6 +71,7 @@ impl Input {
     fn with_capacity(corners: usize) -> Self {
         Self {
             welded: Vec::new(),
+            turning: Vec::new(),
             placing: Vec::new(),
             cells: Vec::new(),
             sections: Vec::new(),
@@ -87,6 +91,11 @@ impl Input {
         self.lock.push(lock);
         self.remap.push(first.unwrap_or(l));
         l
+    }
+
+    fn turning(&self, v: u32) -> u32 {
+        let v = v as usize;
+        self.turning.get(v).copied().unwrap_or(self.welded[v])
     }
 
     fn placing(&self, v: u32) -> u32 {
@@ -111,6 +120,9 @@ struct Clusters {
     list: Vec<DagCluster>,
     /// Welded vertex per cluster vertex, for the attributes.
     verts: Vec<u32>,
+    /// Welded vertex that turns each cluster vertex, by its normal; empty where each vertex's
+    /// is its own `verts` one.
+    turning: Vec<u32>,
     /// Welded vertex that places each cluster vertex, by its skin; empty where each vertex's
     /// is its own `verts` one.
     placing: Vec<u32>,
@@ -129,6 +141,9 @@ impl Clusters {
             }
             let (vn, tn) = (c.verts.len(), c.tris.len());
             self.verts.copy_within(c.verts.clone(), v);
+            if !self.turning.is_empty() {
+                self.turning.copy_within(c.verts.clone(), v);
+            }
             if !self.placing.is_empty() {
                 self.placing.copy_within(c.verts.clone(), v);
             }
@@ -139,6 +154,7 @@ impl Clusters {
             true
         });
         self.verts.truncate(v);
+        self.turning.truncate(v);
         self.placing.truncate(v);
         self.cells.truncate(v);
         self.tris.truncate(t);
@@ -270,8 +286,10 @@ fn stages(
             for c in &gc.list {
                 for &k in &gc.tris[c.tris.clone()] {
                     let k = c.verts.start + usize::from(k);
-                    let placing = gc.placing.get(k).copied().unwrap_or(gc.verts[k]);
-                    corners.push((gc.verts[k], placing, gc.cells[k], c.section));
+                    let v = gc.verts[k];
+                    let turning = gc.turning.get(k).copied().unwrap_or(v);
+                    let placing = gc.placing.get(k).copied().unwrap_or(v);
+                    corners.push((v, turning, placing, gc.cells[k], c.section));
                 }
             }
         }
@@ -293,7 +311,7 @@ fn stages(
             let next = |id_of: &FxHashMap<_, _>| id_of.len() as u32;
             corners
                 .iter()
-                .map(|&(_, _, cell, _)| {
+                .map(|&(_, _, _, cell, _)| {
                     let n = next(&id_of);
                     *id_of.entry(cell).or_insert(n)
                 })
@@ -310,15 +328,15 @@ fn stages(
             corners
                 .iter()
                 .zip(ids)
-                .map(|(&(v, _, _, section), &id)| (v, id, section))
+                .map(|(&(v, _, _, _, section), &id)| (v, id, section))
         }),
     );
     // Vertices of different parts join where they share a position, attributes and section.
-    // A corner's skin is its placing vertex's.
-    let attrs = |v: u32, placing: u32| {
-        let (v, placing) = (v as usize, placing as usize);
+    // A corner's normal is its turning vertex's and its skin its placing vertex's.
+    let attrs = |v: u32, turning: u32, placing: u32| {
+        let (v, turning, placing) = (v as usize, turning as usize, placing as usize);
         let mut k = [0u32; 18];
-        k[..3].copy_from_slice(&w.normals[v].map(f32::to_bits));
+        k[..3].copy_from_slice(&w.normals[turning].map(f32::to_bits));
         k[3..5].copy_from_slice(&w.uvs[0][v].map(f32::to_bits));
         if let Some(t) = &w.tangents {
             k[5..9].copy_from_slice(&t[v].map(f32::to_bits));
@@ -488,43 +506,46 @@ fn part_inputs(
 }
 
 /// The `clodBuild` input of a merged stage over `corners`, whose positions have the ids
-/// `ids` below `positions`: one vertex per position, attributes (`attrs` of its shading and
-/// placing welded vertices, of `welded`) and section, in the order the corners first use them.
+/// `ids` below `positions`: one vertex per position, attributes (`attrs` of its shading,
+/// turning and placing welded vertices, of `welded`) and section, in the order the corners
+/// first use them.
 fn merged_input<K: std::hash::Hash + Eq>(
     corners: &[Corner],
     ids: &[u32],
     positions: usize,
     welded: usize,
-    attrs: impl Fn(u32, u32) -> K,
+    attrs: impl Fn(u32, u32, u32) -> K,
     shared: &[bool],
     seams: &[bool],
 ) -> Input {
     let _z = crate::profile::zone!("dag.input");
-    // Per welded vertex placing itself, the id of its attributes among those the corners use.
+    // Per welded vertex turning and placing itself, the id of its attributes among those the
+    // corners use.
     let mut class_of = vec![u32::MAX; welded];
     let mut classes: FxHashMap<K, u32> = FxHashMap::default();
     let mut local_of: FxHashMap<(u32, u32, u16), u32> = FxHashMap::default();
     let mut first = vec![u32::MAX; positions];
     let mut input = Input::with_capacity(corners.len());
-    for (&(v, placing, cell, section), &id) in corners.iter().zip(ids) {
-        let mut class = |v: u32, placing: u32| {
+    for (&(v, turning, placing, cell, section), &id) in corners.iter().zip(ids) {
+        let mut class = |v: u32, turning: u32, placing: u32| {
             let next = classes.len() as u32;
-            *classes.entry(attrs(v, placing)).or_insert(next)
+            *classes.entry(attrs(v, turning, placing)).or_insert(next)
         };
-        let class = if placing == v {
+        let class = if turning == v && placing == v {
             let c = &mut class_of[v as usize];
             if *c == u32::MAX {
-                *c = class(v, v);
+                *c = class(v, v, v);
             }
             *c
         } else {
-            class(v, placing)
+            class(v, turning, placing)
         };
         let l = *local_of.entry((id, class, section)).or_insert_with(|| {
             let f = &mut first[id as usize];
             let stands = (*f != u32::MAX).then_some(*f);
             let lock = lod::vertex_flags(id, shared, seams).bits();
             let l = input.push(v, cell, section, lock, stands);
+            input.turning.push(turning);
             input.placing.push(placing);
             if stands.is_none() {
                 *f = l;
@@ -532,6 +553,9 @@ fn merged_input<K: std::hash::Hash + Eq>(
             l
         });
         input.indices.push(l);
+    }
+    if input.turning == input.welded {
+        input.turning = Vec::new();
     }
     if input.placing == input.welded {
         input.placing = Vec::new();
@@ -585,10 +609,8 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
         .iter()
         .flat_map(|c| c.map(|v| (f64::from(v) * snap.step) as f32))
         .collect();
-    let normals: Vec<f32> = input
-        .welded
-        .iter()
-        .flat_map(|&v| w.normals[v as usize])
+    let normals: Vec<f32> = (0..input.welded.len() as u32)
+        .flat_map(|v| w.normals[input.turning(v) as usize])
         .collect();
     drop(attributes);
     let weights = [0.5f32; 3];
@@ -724,8 +746,8 @@ fn partition_size(group_max: usize) -> usize {
 }
 
 /// A group as the DAG keeps it: each cluster cut by section, its vertices as `input`'s welded
-/// vertices, and their placing ones when `skinned`, at grid positions snapped from
-/// `positions`.
+/// vertices, their turning ones, and their placing ones when `skinned`, at grid positions
+/// snapped from `positions`.
 fn group_of(
     e: &super::clod::Emitted<'_>,
     input: &Input,
@@ -743,6 +765,8 @@ fn group_of(
             used.iter()
                 .map(|&v| input.welded[sources.shading(v) as usize]),
         );
+        out.turning
+            .extend(used.iter().map(|&v| input.turning(sources.turning(v))));
         if skinned {
             out.placing
                 .extend(used.iter().map(|&v| input.placing(sources.placing(v))));
@@ -812,6 +836,9 @@ fn group_of(
             }
             push(&mut out, run[0].0, refined, &used[..nv], &corners[..nc]);
         }
+    }
+    if out.turning == out.verts {
+        out.turning = Vec::new();
     }
     if out.placing == out.verts {
         out.placing = Vec::new();
@@ -1012,6 +1039,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
                     .map(|c| {
                         let v = ClusterVertices {
                             shading: &clusters.verts[c.verts.clone()],
+                            turning: clusters.turning.get(c.verts.clone()).unwrap_or(&[]),
                             placing: clusters.placing.get(c.verts.clone()).unwrap_or(&[]),
                             cells: &clusters.cells[c.verts.clone()],
                         };
