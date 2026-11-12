@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use orr_gpu::{
     AddressMode, Allocation, DEFAULT_MEDIUM, Filter, Format, GpuPtr, Hazards, KernelSet,
@@ -284,10 +284,8 @@ impl TestScene {
             self.workers = Some(Workers::start(&self.scenes));
         }
         let m = self.scenes.mount(PackSource::Memory(bytes));
-        let start = Instant::now();
-        while matches!(self.scenes.mount_state(m), LoadState::Pending) {
+        while orr_scene::testing::mount_pending(&self.scenes, m) {
             self.write(|_, _| {});
-            assert!(start.elapsed() < Duration::from_secs(60), "mount pending");
             std::thread::sleep(Duration::from_millis(1));
         }
         if let LoadState::Failed(e) = self.scenes.mount_state(m) {

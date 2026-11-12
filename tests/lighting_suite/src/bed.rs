@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub use openpbr_ref::walk::fresnel;
 use orr_cook::{
@@ -26,7 +26,7 @@ use orr_lighting::{
 use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
 use orr_pack::{AssetId, Span, Target};
-use orr_scene::testing::{FlipError, Image, Pixels, flip};
+use orr_scene::testing::{FlipError, Image, Pixels, flip, mount_pending};
 use orr_scene::{
     ClusterTopology, Decal, DecalChannels, DecalId, FrameDesc, FrameTime, GroupWriter,
     InstanceFlags, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, MediumProxy,
@@ -1973,8 +1973,7 @@ impl Bed {
         let mut frame = 0;
         let mut mounted = |scenes: &mut Scenes, pack: &Arc<[u8]>| {
             let mount = scenes.mount(PackSource::Memory(Arc::clone(pack)));
-            let start = Instant::now();
-            while matches!(scenes.mount_state(mount), LoadState::Pending) {
+            while mount_pending(scenes, mount) {
                 frame += 1;
                 let f = scenes
                     .begin_frame(&FrameDesc {
@@ -1984,7 +1983,6 @@ impl Bed {
                     })
                     .unwrap();
                 f.end(&[]).unwrap();
-                assert!(start.elapsed() < Duration::from_secs(60), "mount pending");
                 std::thread::sleep(Duration::from_millis(1));
             }
             if let LoadState::Failed(e) = scenes.mount_state(mount) {
