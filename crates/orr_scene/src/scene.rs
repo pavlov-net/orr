@@ -64,8 +64,8 @@ const GROUP_QUANTIZED_PAGE: u32 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SceneId(pub u32);
 
-/// Table sizes of a scene, fixed at creation. Its instance slots take what the copies placed
-/// need.
+/// Table sizes of a scene, fixed at creation. Its instance slots, transform groups, material
+/// sets and decals take what the scene's content needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SceneDesc {
     pub light_capacity: u32,
@@ -769,7 +769,6 @@ pub(crate) struct SceneCpu {
     /// has changed, and the slots and words they hold room for.
     pub(crate) decal_bins: Allocation<DecalBinGpu>,
     pub(crate) decal_refs: Allocation<u32>,
-    decal_room: (u32, u32),
     /// Set when a decal changed since the bin table was last written.
     pub(crate) decals_changed: bool,
     pub(crate) decal_bin_slots: u32,
@@ -860,29 +859,39 @@ impl SceneCpu {
             .unwrap_or(self.groups.len())
     }
 
-    /// Gives the bin table and run list room for `bins`, each twice what it held at least
-    /// when it holds too little, before the frame records anything that reads them. Fails
-    /// without device memory, leaving both as they were.
+    /// Gives the bin table and run list room for `bins`, each grown as [`grown`] says when it
+    /// holds too little, before the frame records anything that reads them. Fails past the
+    /// words one record writes or without device memory, leaving both as they were.
     pub(crate) fn fit_decal_bins(&mut self, device: &Device, bins: &Bins) -> Result<()> {
-        let dl = MemoryKind::DeviceLocal;
-        let (slots, refs) = (bins.slots.len() as u32, bins.refs.len() as u32);
-        let (held_slots, held_refs) = self.decal_room;
-        let room = |held: u32, needed: u32| needed.max(held.saturating_mul(2));
-        let new_slots = (slots > held_slots).then(|| room(held_slots, slots));
-        let new_refs = (refs > held_refs).then(|| room(held_refs, refs));
-        let bin_table = new_slots
-            .map(|n| device.gpu_malloc(dl, u64::from(n), "decal bins"))
-            .transpose()?;
-        let run_list = new_refs
-            .map(|n| device.gpu_malloc(dl, u64::from(n), "decal runs"))
-            .transpose()?;
-        if let (Some(table), Some(n)) = (bin_table, new_slots) {
-            self.decal_bins = table;
-            self.decal_room.0 = n;
+        /// A table of `name` for `needed` entries where `held` has room for fewer.
+        fn larger<T>(
+            device: &Device,
+            held: &Allocation<T>,
+            needed: usize,
+            name: &'static str,
+        ) -> Result<Option<Allocation<T>>> {
+            // The scatter counts the words of the record that writes the table whole in 32 bits.
+            let limit = u32::MAX / words(size_of::<T>());
+            let room = (held.size() / size_of::<T>() as u64) as u32;
+            let more = (needed as u64).saturating_sub(u64::from(room));
+            if more == 0 {
+                return Ok(None);
+            }
+            let more = u32::try_from(more).unwrap_or(u32::MAX);
+            let entries = u64::from(grown(name, room, more, limit)?);
+            Ok(Some(device.gpu_malloc(
+                MemoryKind::DeviceLocal,
+                entries,
+                name,
+            )?))
         }
-        if let (Some(list), Some(n)) = (run_list, new_refs) {
+        let bin_table = larger(device, &self.decal_bins, bins.slots.len(), "decal bins")?;
+        let run_list = larger(device, &self.decal_refs, bins.refs.len(), "decal runs")?;
+        if let Some(table) = bin_table {
+            self.decal_bins = table;
+        }
+        if let Some(list) = run_list {
             self.decal_refs = list;
-            self.decal_room.1 = n;
         }
         Ok(())
     }
@@ -1445,7 +1454,6 @@ impl Scene {
                 decals: Vec::new(),
                 decal_bins: device.gpu_malloc(dl, 1, "decal bins")?,
                 decal_refs: device.gpu_malloc(dl, 1, "decal runs")?,
-                decal_room: (0, 0),
                 decals_changed: false,
                 decal_bin_slots: 0,
                 decal_globals: 0,
@@ -2459,14 +2467,20 @@ impl<'f> SceneWriter<'f> {
         Ok(range)
     }
 
-    /// Gives the consumer's material sets the entries of set `set` from base `base`, one per
-    /// section of `model`, as [`Scene::reserve_material_sets`] does.
-    fn hold_material_set(&self, model: ModelId, base: u32, set: u8) -> Result<()> {
+    /// One past the entries of set `set` from base `base` of the consumer's material sets, one
+    /// per section of `model`.
+    fn material_set_end(&self, model: ModelId, base: u32, set: u8) -> u64 {
         let sections = self
             .model_cpu
             .get(model.0 as usize)
             .map_or(0, |m| m.sections);
-        let end = u64::from(base) + (u64::from(set) + 1) * u64::from(sections);
+        u64::from(base) + (u64::from(set) + 1) * u64::from(sections)
+    }
+
+    /// Gives the consumer's material sets the entries of set `set` from base `base`, one per
+    /// section of `model`, as [`Scene::reserve_material_sets`] does.
+    fn hold_material_set(&self, model: ModelId, base: u32, set: u8) -> Result<()> {
+        let end = self.material_set_end(model, base, set);
         self.scene.reserve_material_sets(self.device, end)
     }
 
@@ -2573,6 +2587,7 @@ impl<'f> SceneWriter<'f> {
             !on_page,
             "copies of a cooked page take their variants from the page"
         );
+        let mut end = 0;
         for (v, hold) in variants.iter().zip(&holds) {
             match hold.material_base {
                 NO_MATERIAL_SET => {}
@@ -2581,9 +2596,13 @@ impl<'f> SceneWriter<'f> {
                     "material set {} of a cooked page's base, which holds one",
                     v.material_set
                 ),
-                b => self.hold_material_set(ModelId(hold.model), b, v.material_set)?,
+                b => {
+                    let model = ModelId(hold.model);
+                    end = end.max(self.material_set_end(model, b, v.material_set));
+                }
             }
         }
+        self.scene.reserve_material_sets(self.device, end)?;
         let (src, out) = self.window.slice::<CopyVariant>(self.device, count)?;
         out.copy_from_slice(variants);
         let cpu = &mut *self.scene.cpu.lock().unwrap();
@@ -2832,10 +2851,13 @@ impl<'f> SceneWriter<'f> {
             if decal.is_none() {
                 return Ok(());
             }
-            table.reserve(
-                self.device,
-                grown("decals", held, id.0 - held + 1, table.limit())?,
-            )?;
+            let limit = table.limit();
+            // The entries up to the highest id of an empty table pass 32 bits.
+            let more = (id.0 - held).checked_add(1).ok_or(Error::Capacity {
+                what: "decals",
+                capacity: limit,
+            })?;
+            table.reserve(self.device, grown("decals", held, more, limit)?)?;
         }
         let record = decal.map_or_else(DecalGpu::zeroed, |d| decal_gpu(d, self.cell_log2));
         let copy = self.staged(table.entry(id.0), &record)?;

@@ -1859,23 +1859,25 @@ impl<'a> Frame<'a> {
                 }
             }
             let t = &scene.tables;
-            if std::mem::take(&mut cpu.decals_changed) {
+            if cpu.decals_changed {
                 let bins = build_bins(&cpu.decals);
-                cpu.fit_decal_bins(device, &bins)?;
                 let slots: &[u32] = bytemuck::cast_slice(&bins.slots);
-                for (dst, words) in [
-                    (cpu.decal_bins.gpu().cast::<u32>(), slots),
-                    (cpu.decal_refs.gpu(), &bins.refs),
+                // Window room and then the tables' come first, so a failure leaves the bins
+                // the kernels read as they were.
+                let (slots_src, slots_out) = window.slice::<u32>(device, slots.len() as u32)?;
+                let (refs_src, refs_out) = window.slice::<u32>(device, bins.refs.len() as u32)?;
+                cpu.fit_decal_bins(device, &bins)?;
+                slots_out.copy_from_slice(slots);
+                refs_out.copy_from_slice(&bins.refs);
+                for (dst, src, n) in [
+                    (cpu.decal_bins.gpu().cast::<u32>(), slots_src, slots.len()),
+                    (cpu.decal_refs.gpu(), refs_src, bins.refs.len()),
                 ] {
-                    if !words.is_empty() {
-                        let n = words.len() as u32;
-                        let (src, out) = window.slice::<u32>(device, n)?;
-                        out.copy_from_slice(words);
-                        records.push(Record::values(core.next_seq(), dst, src, n));
-                    }
+                    records.push(Record::values(core.next_seq(), dst, src, n as u32));
                 }
                 cpu.decal_bin_slots = bins.slots.len() as u32;
                 cpu.decal_globals = bins.globals;
+                cpu.decals_changed = false;
             }
             let root = SceneRoot {
                 instances: t.instances.gpu(),
