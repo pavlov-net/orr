@@ -8,10 +8,11 @@ use ctt::{
     PipelineOutput, Quality, SurfaceRef, TargetFormat, TextureKind,
 };
 use half::f16;
+use orr_color::srgb8_encode;
 use orr_pack::texture::{FormatInfo, vk};
 
 use super::mips::settled;
-use super::{DataFormat, Img, MipFilter, Usage, linear_to_srgb};
+use super::{DataFormat, Img, MipFilter, Usage};
 use crate::simd;
 
 /// Stored format of a cooked texture.
@@ -172,7 +173,7 @@ fn raw(d: DataFormat, m: &Img) -> Vec<u8> {
         D::Rg8 => texel_bytes(m, |p| [unorm8(p[0]), unorm8(p[1])]),
         D::Rgba8 => texel_bytes(m, |p| p.map(unorm8)),
         D::Rgba8Srgb => texel_bytes(m, |p| {
-            let [r, g, b] = [p[0], p[1], p[2]].map(|v| unorm8(linear_to_srgb(v)));
+            let [r, g, b] = [p[0], p[1], p[2]].map(srgb8_encode);
             [r, g, b, unorm8(p[3])]
         }),
         D::R16 => texel_bytes(m, |p| unorm16(p[0])),
