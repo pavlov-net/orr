@@ -384,11 +384,11 @@ impl Ptlas {
             layout: Layout { slots: 0, parts: 0 },
             max_per_partition: desc.partition_instances,
             producer_capacity: desc.producer_capacity,
-            proxy_capacity: desc.medium_proxy_capacity,
+            proxy_capacity: 0,
             light_capacity: desc.light_capacity,
             global_copies: desc.global_instances,
             skinned_capacity: 0,
-            proxy_live: vec![false; desc.medium_proxy_capacity as usize],
+            proxy_live: Vec::new(),
             proxies_live: 0,
             proxy_dirty: BTreeSet::new(),
             light_live: vec![false; desc.light_capacity as usize],
@@ -491,6 +491,13 @@ impl Ptlas {
     /// has room for.
     pub(crate) fn hold_skinned(&mut self, entries: u32) {
         self.skinned_capacity = entries;
+    }
+
+    /// Counts `entries` medium proxies in the global partition, which [`Self::global_room`]
+    /// has room for.
+    pub(crate) fn hold_proxies(&mut self, entries: u32) {
+        self.proxy_capacity = entries;
+        self.proxy_live.resize(entries as usize, false);
     }
 
     /// Instances the device's PTLAS takes in the global partition beyond the most it can hold

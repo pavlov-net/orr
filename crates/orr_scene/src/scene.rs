@@ -84,9 +84,6 @@ pub struct SceneDesc {
     pub global_instances: u32,
     /// Clusters all skinned copies skin and instantiate in one frame, at most.
     pub skinned_clusters: u32,
-    /// Medium proxies: every `MediumProxyId` is below it. They trace from the PTLAS global
-    /// partition.
-    pub medium_proxy_capacity: u32,
 }
 
 impl Default for SceneDesc {
@@ -98,7 +95,6 @@ impl Default for SceneDesc {
             partition_instances: 1000,
             global_instances: 4096,
             skinned_clusters: 8192,
-            medium_proxy_capacity: 64,
         }
     }
 }
@@ -357,7 +353,8 @@ pub(crate) struct Tables {
     pub(crate) skin_state: Column<SkinStateGpu>,
     /// By `DecalId`: an entry for every id set.
     pub(crate) decals: Column<DecalGpu>,
-    pub(crate) proxies: Allocation<MediumProxyGpu>,
+    /// By `MediumProxyId`: an entry for every id set.
+    pub(crate) proxies: Column<MediumProxyGpu>,
 }
 
 pub(crate) struct Group {
@@ -1037,6 +1034,7 @@ impl Scene {
         self.tables.decals.land(frame, copies, records);
         self.tables.skinned.land(frame, copies, records);
         self.tables.skin_state.land(frame, copies, records);
+        self.tables.proxies.land(frame, copies, records);
     }
 
     /// Frees the tables moved from in frames at or before `completed`.
@@ -1050,6 +1048,7 @@ impl Scene {
         self.tables.decals.retire(completed);
         self.tables.skinned.retire(completed);
         self.tables.skin_state.retire(completed);
+        self.tables.proxies.retire(completed);
     }
 
     /// Instance entry `entry` of the emissive list.
@@ -1427,7 +1426,7 @@ impl Scene {
             skinned: Column::new(device, MemoryPriority::Normal, "skinned copies", true)?,
             skin_state: Column::new(device, MemoryPriority::Normal, "skin state", true)?,
             decals: Column::new(device, MemoryPriority::Normal, "decals", true)?,
-            proxies: device.gpu_malloc(dl, n(desc.medium_proxy_capacity), "medium proxies")?,
+            proxies: Column::new(device, MemoryPriority::Normal, "medium proxies", true)?,
         };
         // The null group.
         tables.groups.reserve(device, 1)?;
@@ -1449,7 +1448,6 @@ impl Scene {
                 tables.producer_state.size(),
             ),
             zero(tables.sky_stats.gpu().address(), tables.sky_stats.size()),
-            zero(tables.proxies.gpu().address(), tables.proxies.size()),
         ];
         Ok(Self {
             desc: *desc,
@@ -2909,22 +2907,35 @@ impl<'f> SceneWriter<'f> {
         Ok(())
     }
 
-    /// Sets or clears medium proxy `id`, from this frame on.
+    /// Sets or clears medium proxy `id`, from this frame on. The proxy table grows to hold the
+    /// highest id set, within what the device's PTLAS takes in its global partition, where
+    /// proxies trace from.
     pub fn set_medium_proxy(
         &mut self,
         id: MediumProxyId,
         proxy: Option<&MediumProxy>,
     ) -> Result<()> {
-        assert!(
-            id.0 < self.scene.desc.medium_proxy_capacity,
-            "{id:?} outside the medium proxy table"
-        );
-        let record = proxy.map_or_else(MediumProxyGpu::zeroed, |p| proxy_gpu(p, self.cell_log2));
-        let copy = self.staged(
-            self.scene.tables.proxies.gpu().offset(u64::from(id.0)),
-            &record,
-        )?;
+        let table = &self.scene.tables.proxies;
         let cpu = &mut *self.scene.cpu.lock().unwrap();
+        let held = table.capacity();
+        // An id past the table holds no proxy to clear.
+        if id.0 >= held {
+            if proxy.is_none() {
+                return Ok(());
+            }
+            let room = cpu.ptlas.global_room(self.device);
+            let limit = held.saturating_add(room).min(table.limit());
+            // The entries up to the highest id of an empty table pass 32 bits.
+            let more = (id.0 - held).checked_add(1).ok_or(Error::Capacity {
+                what: "medium proxies",
+                capacity: limit,
+            })?;
+            let entries = grown("medium proxies", held, more, limit)?;
+            table.reserve(self.device, entries)?;
+            cpu.ptlas.hold_proxies(entries);
+        }
+        let record = proxy.map_or_else(MediumProxyGpu::zeroed, |p| proxy_gpu(p, self.cell_log2));
+        let copy = self.staged(table.entry(id.0), &record)?;
         cpu.ptlas.set_proxy(id.0, proxy.is_some());
         cpu.records.push(copy);
         Ok(())

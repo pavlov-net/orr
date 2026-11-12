@@ -1951,11 +1951,11 @@ impl<'a> Frame<'a> {
                 decal_bin_log2: decals::bin_log2(core.cell_log2),
                 proxy_base: layout.slots + layout.parts + scene.desc.producer_capacity,
                 proxies: t.proxies.gpu(),
-                proxy_capacity: scene.desc.medium_proxy_capacity,
+                proxy_capacity: t.proxies.capacity(),
                 light_base: layout.slots
                     + layout.parts
                     + scene.desc.producer_capacity
-                    + scene.desc.medium_proxy_capacity,
+                    + t.proxies.capacity(),
                 emissive_lists: t.emissive_lists.gpu(),
             };
             let src = window.put(device, &root)?;
