@@ -5,15 +5,15 @@
 
 use lighting_suite::assert_clean;
 use lighting_suite::bed::{
-    Accumulated, Bed, EMITTER, GLASS_SPHERE, Item, Paths, SKY, SUN, Spec, TINTED_SLAB, WHITE_FLOOR,
-    WHITE_FLOOR_ALBEDO, fresnel, pixel_of, reference,
+    Accumulated, Bed, EMITTER, GLASS_SPHERE, Item, Particle, Paths, SKY, SUN, Spec, TINTED_SLAB,
+    WHITE_FLOOR, WHITE_FLOOR_ALBEDO, fresnel, pixel_of, reference,
 };
 use lighting_suite::welch::{assert_mean, assert_same_mean};
 use orr_gpu::KernelSet;
 use orr_lighting::{
     DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry, ViewLighting,
 };
-use orr_math::{DVec2, Mat3, Vec2, Vec3};
+use orr_math::{Affine3, DVec2, Mat3, Vec2, Vec3};
 
 fn paths(settings: ViewLighting) -> Paths {
     Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
@@ -286,5 +286,54 @@ fn photons_and_bsdf_rays_carry_the_same_light_through_a_glass_sphere() {
             );
         }
     }
+    assert_clean();
+}
+
+/// The floor before a mirror takes the light of two emitters above by the reference's photons
+/// as it does by BSDF rays alone, by Welch's test. The mirror is a producer set once frames
+/// have run, after a producer that emits nothing: the two emitters' copies hold the emissive
+/// list's first entries, so its emissive list entry is not its producer table entry, and it
+/// grows the producer table while the emissive list holds room for it, so lighting keeps what
+/// it holds per entry and runs the producers' caster lists over one entry more.
+#[test]
+fn photons_reflect_off_a_producer_set_as_the_producer_table_alone_grows() {
+    let emitter = |x: f32| at(EMITTER, Vec3::new(x, 3.0, 0.0));
+    let spec = Spec {
+        copies: vec![at(WHITE_FLOOR, Vec3::ZERO), emitter(-0.4), emitter(0.4)],
+        lights: Vec::new(),
+        environment: None,
+        eye: Vec3::new(0.0, 1.0, 4.0),
+        target: Vec3::new(0.0, 0.2, 0.0),
+        fov_y: 0.9,
+        focus: None,
+    };
+    // Where the floor sees the emitters in the mirror.
+    let lit = pixel_of(&spec, Vec3::new(0.0, 0.0, -0.6));
+    let mut bed = Bed::with(spec);
+    bed.set_idle_producer();
+    let full_paths = paths(reference(2));
+    let bsdf_paths = paths(ViewLighting {
+        debug_view: LightingDebugView::BsdfOnly,
+        ..reference(2)
+    });
+    render_paths(&mut bed, &full_paths, 2, 1);
+    let before = bed.table_entries();
+    bed.set_mirror_quads(
+        &[Particle {
+            center: Vec3::new(0.0, 0.85, -1.0),
+            size: 0.8,
+        }],
+        Affine3::IDENTITY,
+    );
+    let photons = render_paths(&mut bed, &paths(gathered()), 8, 3).around(lit, 6)[1];
+    let after = bed.table_entries();
+    assert!(
+        after.0 > before.0 && after.1 == before.1,
+        "the producer table alone grows: {before:?} to {after:?}"
+    );
+    assert!(photons > 0.0, "no photon reached the floor by the mirror");
+    let full = patch_means(&mut bed, &full_paths, lit, 16, 8, 1);
+    let bsdf = patch_means(&mut bed, &bsdf_paths, lit, 16, 32, 2);
+    assert_same_mean("full against BSDF", &full, &bsdf);
     assert_clean();
 }

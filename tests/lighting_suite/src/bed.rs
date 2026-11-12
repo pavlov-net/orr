@@ -257,6 +257,8 @@ const STRAND_SEGMENTS: u32 = 4;
 
 /// The producer entry of the bed's particles, or of its strands.
 const PARTICLES: ProducerId = ProducerId(0);
+/// The producer of [`Bed::set_idle_producer`].
+const IDLE: ProducerId = ProducerId(1);
 
 /// A particle square's two triangles.
 const PARTICLE_QUAD: [[u8; 3]; 2] = [[0, 1, 2], [0, 2, 3]];
@@ -2261,6 +2263,55 @@ impl Bed {
             0.0,
             Opacity::Opaque,
         );
+    }
+
+    /// As [`Self::set_sided_quads`], but squares of a smooth metal that reflects all it
+    /// takes, so light leaves them as a caustic.
+    pub fn set_mirror_quads(&mut self, particles: &[Particle], transform: Affine3) {
+        let mut m = MaterialGpu::zeroed();
+        m.base_color = [1.0; 3];
+        m.base_weight = 1.0;
+        m.specular_color = [1.0; 3];
+        m.specular_weight = 1.0;
+        m.specular_ior = 1.5;
+        m.metalness = 1.0;
+        m.geometry_opacity = 1.0;
+        m.flags = material_flags::DOUBLE_SIDED | material_flags::CASTER;
+        self.set_quads(particles, m, None, transform, 0.0, Opacity::Opaque);
+    }
+
+    /// Sets a producer beside the bed's own that emits nothing: it takes an entry of the
+    /// producer table and of the emissive list all the same.
+    pub fn set_idle_producer(&mut self) {
+        self.frame += 1;
+        let list = [self.scene];
+        let f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        let idle = ProducerDesc {
+            flags: InstanceFlags::RASTER,
+            ..ProducerDesc::default()
+        };
+        f.scene(self.scene)
+            .unwrap()
+            .set_producer(IDLE, Some(&idle))
+            .unwrap();
+        let point = f.end(&[]).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
+    }
+
+    /// The entries of the scene's producer table and of its emissive list at the last frame
+    /// run.
+    pub fn table_entries(&self) -> (u32, u32) {
+        let root = read(self.last_root, 1)[0];
+        (root.producer_capacity, root.emissive_capacity)
     }
 
     fn set_quads(
