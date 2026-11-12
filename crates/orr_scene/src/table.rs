@@ -207,6 +207,8 @@ impl<T: Pod> Column<T> {
 /// A device table of `T` indexed by the ids it hands out.
 pub(crate) struct Table<T: 'static> {
     name: &'static str,
+    /// The ids it hands out are below it.
+    limit: u32,
     ids: Mutex<RangeAllocator>,
     column: Column<T>,
 }
@@ -217,10 +219,22 @@ impl<T: Pod> Table<T> {
         priority: MemoryPriority,
         name: &'static str,
     ) -> Result<Self> {
+        Self::below(device, priority, name, u32::MAX)
+    }
+
+    /// A table whose ids stay below `limit`.
+    pub(crate) fn below(
+        device: &Device,
+        priority: MemoryPriority,
+        name: &'static str,
+        limit: u32,
+    ) -> Result<Self> {
+        let column = Column::new(device, priority, name, false)?;
         Ok(Self {
             name,
+            limit: limit.min(column.limit()),
             ids: Mutex::new(RangeAllocator::new(0)),
-            column: Column::new(device, priority, name, false)?,
+            column,
         })
     }
 
@@ -240,8 +254,8 @@ impl<T: Pod> Table<T> {
     }
 
     /// The first of `count` consecutive free ids. Without a free run that long the table grows
-    /// as [`grown`] says. Fails only without device memory for the grown table, leaving the
-    /// table as it was.
+    /// as [`grown`] says. Fails past the table's limit or without device memory for the grown
+    /// table, leaving the table as it was.
     pub(crate) fn alloc(&self, device: &Device, count: u32) -> Result<u32> {
         // A run of no ids takes none, and its start names no entry.
         if count == 0 {
@@ -252,7 +266,7 @@ impl<T: Pod> Table<T> {
             return Ok(id);
         }
         let capacity = self.column.capacity();
-        let grown = grown(self.name, capacity, count, self.column.limit())?;
+        let grown = grown(self.name, capacity, count, self.limit)?;
         self.column.reserve(device, grown)?;
         ids.grow(capacity, grown);
         Ok(ids

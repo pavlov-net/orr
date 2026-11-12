@@ -23,7 +23,7 @@ use crate::ptlas::{CopyRuns, Ptlas, run_class};
 use crate::shaders::instance_page::{PageEntriesGpu, PagePrototypeGpu};
 use crate::skin::{CopyArrays, SkinFrame, SkinnedDesc};
 use crate::subd::{self, ModelCage, SubdBuild, SubdDesc};
-use crate::table::{Column, TableCopy, grown};
+use crate::table::{Column, Table, TableCopy, grown};
 use crate::tessellate::Patterns;
 use crate::traverse::Cuts;
 use crate::upload::{Op, Record};
@@ -339,8 +339,8 @@ pub(crate) struct Tables {
     pub(crate) groups: Column<GroupGpu>,
     /// The consumer's material sets, which hold every entry a write or a copy has named.
     pub(crate) material_sets: Column<MaterialId>,
-    /// The material sets of placed pages' prototypes.
-    pub(crate) page_sets: Column<MaterialId>,
+    /// The material sets of placed pages' prototypes, below the 2^31 a base names.
+    pub(crate) page_sets: Table<MaterialId>,
     pub(crate) lights: Allocation<LightGpu>,
     /// Producer entries first, then instance entries.
     pub(crate) emissive: Allocation<EmissiveGpu>,
@@ -788,8 +788,6 @@ pub(crate) struct SceneCpu {
     /// Entries of skinned pages' material sets by the frames that removed them, freed once
     /// those have completed.
     pub(crate) skinned_sets_removed: Vec<(u64, (u32, u32))>,
-    /// Entries of the pages' material sets.
-    pub(crate) page_sets: RangeAllocator,
 }
 
 /// A view of a scene: its history, the frame and its constants.
@@ -977,29 +975,6 @@ impl Scene {
         let limit = PAGE_MATERIAL_SET;
         let more = u32::try_from(end - u64::from(held)).unwrap_or(u32::MAX);
         sets.reserve(device, grown("material sets", held, more, limit)?)
-    }
-
-    /// The first of `count` consecutive free entries of the pages' material sets, as the
-    /// base of a copy's record names it. Without a free run that long the table grows as
-    /// [`grown`] says. Fails past the 2^31 a base names or without device memory, with no
-    /// entry taken.
-    fn take_page_sets(&self, cpu: &mut SceneCpu, device: &Device, count: u32) -> Result<u32> {
-        // A run of no entries takes none, and its start names no entry.
-        if count == 0 {
-            return Ok(0);
-        }
-        if let Some(first) = cpu.page_sets.alloc(count) {
-            return Ok(first);
-        }
-        let sets = &self.tables.page_sets;
-        let held = sets.capacity();
-        let entries = grown("page material sets", held, count, PAGE_MATERIAL_SET)?;
-        sets.reserve(device, entries)?;
-        cpu.page_sets.grow(held, entries);
-        Ok(cpu
-            .page_sets
-            .alloc(count)
-            .expect("the grown table has a free run of `count`"))
     }
 
     /// Moves the scene's tables that grew since its last update: see [`Column::land`].
@@ -1378,7 +1353,12 @@ impl Scene {
             slot_state: Column::new(device, MemoryPriority::Normal, "slot state", true)?,
             groups: Column::new(device, MemoryPriority::Normal, "transform groups", true)?,
             material_sets: Column::new(device, MemoryPriority::Normal, "material sets", true)?,
-            page_sets: Column::new(device, MemoryPriority::Normal, "page material sets", false)?,
+            page_sets: Table::below(
+                device,
+                MemoryPriority::Normal,
+                "page material sets",
+                PAGE_MATERIAL_SET,
+            )?,
             lights: device.gpu_malloc(dl, n(desc.light_capacity), "lights")?,
             emissive: device.gpu_malloc(
                 dl,
@@ -1476,7 +1456,6 @@ impl Scene {
                 page_motions: Vec::new(),
                 groups_removed: Vec::new(),
                 skinned_sets_removed: Vec::new(),
-                page_sets: RangeAllocator::new(0),
             }),
             writing: AtomicBool::new(false),
         })
@@ -1928,7 +1907,7 @@ impl<'f> SceneWriter<'f> {
         )?;
         cpu.ptlas.reserve_runs(self.device, &runs)?;
         let first = self.scene.take_slots(cpu, self.device, count)?;
-        let set_base = match self.scene.take_page_sets(cpu, self.device, set_entries) {
+        let set_base = match self.scene.tables.page_sets.alloc(self.device, set_entries) {
             Ok(base) => base,
             Err(e) => {
                 cpu.slots.free(first, count);
@@ -1942,7 +1921,7 @@ impl<'f> SceneWriter<'f> {
         };
         let Some(entry) = entry else {
             cpu.slots.free(first, count);
-            cpu.page_sets.free(set_base, set_entries);
+            self.scene.tables.page_sets.free(set_base, set_entries);
             return Err(Error::Capacity {
                 what: "emissive list entries",
                 capacity: self.scene.desc.emissive_capacity,
@@ -2220,7 +2199,11 @@ impl<'f> SceneWriter<'f> {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
             let room = self.scene.group_room(cpu, self.device)?;
             let id = room.id;
-            let set_base = self.scene.take_page_sets(cpu, self.device, set_entries)?;
+            let set_base = self
+                .scene
+                .tables
+                .page_sets
+                .alloc(self.device, set_entries)?;
             if let Some(set) = cooked {
                 for (o, m) in sets_out.iter_mut().zip(set) {
                     *o = m.0;

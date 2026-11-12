@@ -1284,7 +1284,7 @@ impl Scenes {
             });
             cpu.retired.retain(|(frame, _)| *frame > completed);
             cpu.groups_removed.retain(|(frame, _)| *frame > completed);
-            let sets = &mut cpu.page_sets;
+            let sets = &scene.tables.page_sets;
             cpu.pages_removed.retain(|(frame, p)| {
                 let done = *frame <= completed;
                 if done {
