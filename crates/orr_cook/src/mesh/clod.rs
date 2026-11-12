@@ -924,6 +924,7 @@ pub(super) fn build<G: Send>(
                     uvs: &uv,
                     section: &section,
                     position: &position,
+                    base: &|v| bases[v as usize],
                     locked: &locked,
                     moved: &moved,
                 };

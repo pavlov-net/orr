@@ -163,7 +163,7 @@ pub(super) enum Take {
 
 /// Vertex `v` of a simplification: at `at(v)` with normal `normal(v)` of class `class(v)`
 /// ([`Welded::classes`]) in section `section(v)`, at the position `position(v)` names, which
-/// every vertex there shares. `locked(v)` when the simplifier leaves it where it is for other
+/// every vertex there shares, standing for `base(v)` in simplification. `locked(v)` when the simplifier leaves it where it is for other
 /// pieces to share, and `moved(v)` when it moved after the simplifier ran.
 pub(super) struct FitVertices<'a> {
     pub(super) at: &'a dyn Fn(u32) -> DVec3,
@@ -172,6 +172,7 @@ pub(super) struct FitVertices<'a> {
     pub(super) uvs: &'a dyn Fn(u32) -> Uvs,
     pub(super) section: &'a dyn Fn(u32) -> u16,
     pub(super) position: &'a dyn Fn(u32) -> u32,
+    pub(super) base: &'a dyn Fn(u32) -> u32,
     pub(super) locked: &'a dyn Fn(u32) -> bool,
     pub(super) moved: &'a dyn Fn(u32) -> bool,
 }
@@ -213,8 +214,8 @@ pub(super) struct Fit {
 /// attributes of that triangle's corner nearest it, which on a seam is the vertex the patch
 /// has there. A corner takes whole a vertex of `input` on the patch whose normal faces its
 /// face where a kept triangle holds that vertex at the corner, so the vertex does not split,
-/// and where the corner is locked and the vertex is the one it takes at its position, so the
-/// pieces that share the position agree.
+/// and where the corner is locked and the vertex is the one it takes, standing for the
+/// corner's own, so the pieces that share the position agree.
 ///
 /// Each other corner's normal is the least squares fit of the samples' normals over the
 /// corner's triangles, with each vertex's mass lumped: a weighted mean, so it stays among the
@@ -388,10 +389,10 @@ pub(super) fn fit(
                 let (st, l, ..) = surface
                     .nearest(p[k], None, |s| s.patch == patch)
                     .expect("the patch holds a triangle");
-                let s = &surface.tris[st];
-                (s.v[corner_of(l)], s.extend(s.unfold(p[k], l), vx))
+                let near = surface.tris[st].v[corner_of(l)];
+                (near, surface.carry(st, l, p[k], vx))
             };
-            if (vx.locked)(v) && (vx.position)(u) == (vx.position)(v) && faces(u) {
+            if (vx.locked)(v) && (vx.base)(u) == v && faces(u) {
                 if u != v {
                     out.corners.push((3 * t + k, Take::Input(u)));
                 }
@@ -462,6 +463,8 @@ struct Surface {
     area: f64,
     /// Per vertex, its patch.
     patch: FxHashMap<u32, u32>,
+    /// Per vertex, the triangles at it.
+    fans: FxHashMap<u32, Vec<u32>>,
 }
 
 struct SurfaceTriangle {
@@ -507,22 +510,29 @@ impl SurfaceTriangle {
         x + along * (d.length() / length)
     }
 
-    /// The uvs of the triangle's parametrization, the affine map its corners' uvs make, at the
-    /// point of its plane nearest `q`.
-    fn extend(&self, q: DVec3, vx: &FitVertices<'_>) -> Uvs {
+    /// The point at barycentrics `l` and the triangle's uvs there.
+    fn at(&self, l: [f64; 3], vx: &FitVertices<'_>) -> (DVec3, [[f64; 2]; 2]) {
+        let x = self.p[0] * l[0] + self.p[1] * l[1] + self.p[2] * l[2];
+        let uvs = self.v.map(|v| (vx.uvs)(v));
+        let uv = std::array::from_fn(|set| {
+            std::array::from_fn(|axis| (0..3).map(|k| l[k] * f64::from(uvs[k][set][axis])).sum())
+        });
+        (x, uv)
+    }
+
+    /// Twice the triangle's area times the 3D gradient of each of its uvs, which a triangle of
+    /// little area, however its uvs spread, holds little of.
+    fn gradient(&self, vx: &FitVertices<'_>) -> [[DVec3; 2]; 2] {
         let [a, b, c] = self.p;
-        let (e0, e1, e2) = (b - a, c - a, q - a);
-        let (d00, d01, d11) = (e0.dot(e0), e0.dot(e1), e1.dot(e1));
-        let (d20, d21) = (e2.dot(e0), e2.dot(e1));
-        let det = d00 * d11 - d01 * d01;
-        let lb = (d11 * d20 - d01 * d21) / det;
-        let lc = (d00 * d21 - d01 * d20) / det;
-        let l = [1.0 - lb - lc, lb, lc];
+        let n = (b - a).cross(c - a).normalize();
+        // The edges facing each corner, around the triangle.
+        let across = [c - b, a - c, b - a].map(|e| n.cross(e));
         let uvs = self.v.map(|v| (vx.uvs)(v));
         std::array::from_fn(|set| {
             std::array::from_fn(|axis| {
-                let x: f64 = (0..3).map(|k| l[k] * f64::from(uvs[k][set][axis])).sum();
-                x as f32
+                (0..3)
+                    .map(|k| across[k] * f64::from(uvs[k][set][axis]))
+                    .sum()
             })
         })
     }
@@ -575,12 +585,54 @@ impl Surface {
         if !tris.is_empty() {
             Self::build(&mut tris, 0, &mut nodes);
         }
+        let mut fans: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        for (t, tri) in tris.iter().enumerate() {
+            for v in tri.v {
+                fans.entry(v).or_default().push(t as u32);
+            }
+        }
         Self {
             tris,
             nodes,
             area: squares / sum,
             patch,
+            fans,
         }
+    }
+
+    /// The uvs of patch `patch`'s parametrization carried to `q`, whose nearest point of the
+    /// patch is at barycentrics `l` of triangle `t`: above the patch, the uvs there; past its
+    /// border, those at the point as far past it in the triangle's plane as `q` is
+    /// ([`SurfaceTriangle::unfold`]), along the patch's uv gradient at the triangle's corner
+    /// nearest, the area-weighted mean of its triangles' there, which a sliver's ill-shaped
+    /// gradient barely moves.
+    fn carry(&self, t: usize, l: [f64; 3], q: DVec3, vx: &FitVertices<'_>) -> Uvs {
+        let tri = &self.tris[t];
+        let (x, uv) = tri.at(l, vx);
+        let d = tri.unfold(q, l) - x;
+        let (mut sum, mut twice) = ([[DVec3::ZERO; 2]; 2], 0.0);
+        if d != DVec3::ZERO {
+            for &f in &self.fans[&tri.v[corner_of(l)]] {
+                let f = &self.tris[f as usize];
+                if f.patch == tri.patch {
+                    let g = f.gradient(vx);
+                    for (s, g) in sum.iter_mut().flatten().zip(g.iter().flatten()) {
+                        *s += *g;
+                    }
+                    twice += (f.p[1] - f.p[0]).cross(f.p[2] - f.p[0]).length();
+                }
+            }
+        }
+        std::array::from_fn(|set| {
+            std::array::from_fn(|axis| {
+                let along = if twice > 0.0 {
+                    sum[set][axis].dot(d) / twice
+                } else {
+                    0.0
+                };
+                (uv[set][axis] + along) as f32
+            })
+        })
     }
 
     fn build(tris: &mut [SurfaceTriangle], first: u32, nodes: &mut Vec<SurfaceNode>) {
@@ -1321,6 +1373,7 @@ pub(super) fn simplify(
             uvs: &uvs,
             section: &|_| 0,
             position: &position,
+            base: &|v| w.base(v),
             locked: &locked,
             moved: &|_| false,
         };
