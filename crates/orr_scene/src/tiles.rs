@@ -319,7 +319,7 @@ impl TextureFeedback {
             slots: (0..fif.max(1))
                 .map(|_| SlotRecords::new(device, 1))
                 .collect::<Result<_>>()?,
-            records: Capacity::new(0, u32::MAX),
+            records: Capacity::new(u32::MAX),
             raised: 0,
             retry: 0,
         })

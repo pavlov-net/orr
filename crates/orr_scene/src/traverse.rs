@@ -644,7 +644,7 @@ impl Cuts {
         let traced = device.caps().cluster.max_partitions > 0;
         let rt = RtTables::new(device, RtSizes::of(&floors), traced)?;
         // The table of equal cuts holds an entry at least.
-        let mut keys = Capacity::new(0, RT_KEYS_LIMIT);
+        let mut keys = Capacity::new(RT_KEYS_LIMIT);
         keys.set(rt.sizes.keys / 2);
         let model_cut = merged_cuts(device, sizes.models)?;
         let counters = block(4 * COUNTERS as u64, "cut counters")?.cast();
@@ -703,12 +703,12 @@ impl Cuts {
             gpu,
             record: cut_record(device, gpu)?,
             lists,
-            queue: Capacity::new(0, u32::MAX),
-            candidates: Capacity::new(0, u32::MAX),
+            queue: Capacity::new(u32::MAX),
+            candidates: Capacity::new(u32::MAX),
             floors,
             retry: 0,
-            clas: Capacity::new(0, RT_CLAS_LIMIT),
-            jobs: Capacity::new(0, RT_BLAS_LIMIT),
+            clas: Capacity::new(RT_CLAS_LIMIT),
+            jobs: Capacity::new(RT_BLAS_LIMIT),
             keys,
             rt,
             rt_retry: 0,

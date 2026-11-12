@@ -296,7 +296,7 @@ impl ViewHistory {
             targets: None,
             arena,
             lists: None,
-            visible: Capacity::new(0, VISIBLE_CLUSTER_LIMIT),
+            visible: Capacity::new(VISIBLE_CLUSTER_LIMIT),
             lists_retry: 0,
             draws: Vec::new(),
             rendered: vec![None; readback.len() as usize],
