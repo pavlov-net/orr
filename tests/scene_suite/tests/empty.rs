@@ -133,7 +133,8 @@ const STATED: &[(&str, Follows)] = &[
 const LIT_ONLY: &str = "world cache";
 
 /// What it makes only for content the empty scene lacks: the caustics' grid for a caster, and
-/// the light tiles for a light, an emissive list entry or an environment that may radiate.
+/// the light tiles for a sphere or rect light, an emissive list entry or an environment that
+/// may radiate.
 const CONTENT_ONLY: [&str; 2] = ["caustic grid", "light tiles"];
 
 const PROBE: &str = "smallest allocation";

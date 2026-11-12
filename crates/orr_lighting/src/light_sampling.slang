@@ -592,8 +592,9 @@ public float directional_weight(LightSetGpu* set, uint id, float3 normal)
     return w;
 }
 
-// Whether a tile sample can name a light. A scene that has held no light, no emissive list
-// entry and no environment that may radiate has no tiles: `LightSetGpu.tiles` is null.
+// Whether a tile sample can name a light. A scene that has held no sphere or rect light, no
+// emissive list entry and no environment that may radiate has no tiles: `LightSetGpu.tiles` is
+// null.
 public bool light_tiles(LightSetGpu* set)
 {
     return set.environment_probability > 0.0 || set.candidate_total > 0.0;

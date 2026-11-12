@@ -74,8 +74,8 @@ impl SceneFeatures {
     /// The scene may hold a caustic caster: a copy of a model with a caster section, or a
     /// producer entry of clusters that rays trace while a material casts.
     pub const CASTERS: Self = Self(1 << 26);
-    /// The scene's environment may radiate: its kernels link one that is not the default map,
-    /// or its map is set.
+    /// The scene's environment may radiate: the scene's kernels link one that is not the
+    /// default map, or its map is set.
     pub const ENVIRONMENT: Self = Self(1 << 27);
     /// A record has the coat or fuzz flag, which with [`Self::EMISSIVE`] makes
     /// [`Self::COATED_EMITTERS`].

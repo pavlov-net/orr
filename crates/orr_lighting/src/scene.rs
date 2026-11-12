@@ -5,8 +5,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use orr_scene::orr_gpu::{
-    Allocation, CommandList, ComputePipeline, Device, GpuAddress, GpuPtr, Hazards, MemoryKind,
-    ROOT_ALIGN, Stages,
+    Allocation, CommandList, ComputePipeline, DEFAULT_ENVIRONMENT, Device, GpuAddress, GpuPtr,
+    Hazards, MemoryKind, ROOT_ALIGN, Stages,
 };
 use orr_scene::{LightTables, SceneFeatures, SceneRoot, SkyStats};
 
@@ -232,8 +232,8 @@ impl Retired {
 /// Lighting state of one scene: the baked environment, the directional light states, the
 /// light selection, the presampled light tiles, the caustics' photon source and grid, and the
 /// world cache. What follows the scene's content is made by the scene pass that first finds
-/// it: the tiles with a light, an emissive list entry or an environment that may radiate, the
-/// grid with a caster, and the world cache with the first pass.
+/// it: the tiles with a sphere or rect light, an emissive list entry or an environment that
+/// may radiate, the grid with a caster, and the world cache with the first pass.
 pub struct SceneLighting {
     device: Device,
     settings: SceneLightingSettings,
@@ -255,6 +255,9 @@ pub struct SceneLighting {
     cluster_room: u32,
     /// None until a scene pass finds something a tile sample can name.
     tiles: Option<Allocation<LightSample>>,
+    /// The kernels bake an environment other than the default map, which may radiate whatever
+    /// the scene holds for it.
+    linked_environment: bool,
     shadow_overflows: Allocation<u32>,
     reference_counts: Allocation<u32>,
     readback: Allocation<LightSetStats>,
@@ -303,6 +306,7 @@ impl SceneLighting {
             cluster_cdf: device_local(device, 0, "emissive cluster cdf")?,
             cluster_room: 0,
             tiles: None,
+            linked_environment: kernels.environment != DEFAULT_ENVIRONMENT,
             shadow_overflows: device_local(device, 1, "shadow overflows")?,
             reference_counts: device_local(device, 2, "reference counts")?,
             readback: device.gpu_malloc(
@@ -377,10 +381,12 @@ impl SceneLighting {
         let held = self.per.tables;
         let grown = (pass.tables.lights, pass.tables.entries) != (held.lights, held.entries);
         let casters = pass.features.contains(SceneFeatures::CASTERS);
-        // A tile sample names a light, an emissive list entry or the environment.
-        let sampled = pass.tables.lights > 0
+        // A tile sample names a sphere or rect light, an emissive list entry or the
+        // environment these kernels bake.
+        let sampled = pass.features.contains(SceneFeatures::LOCAL_LIGHTS)
             || pass.tables.entries > 0
-            || pass.features.contains(SceneFeatures::ENVIRONMENT);
+            || pass.features.contains(SceneFeatures::ENVIRONMENT)
+            || self.linked_environment;
         // Every allocation first, so a pass that finds one missing changes nothing.
         let per = grown
             .then(|| PerTable::new(&self.device, pass.tables))
