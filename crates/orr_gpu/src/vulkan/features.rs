@@ -438,7 +438,7 @@ pub(super) fn select(
     };
 
     let c = &q.core.features;
-    let required: [(&str, vk::Bool32); 43] = [
+    let required: [(&str, vk::Bool32); 44] = [
         ("shaderInt64", c.shader_int64),
         // Slang declares the Geometry capability for SV_PrimitiveID in mesh and pixel stages.
         ("geometryShader", c.geometry_shader),
@@ -493,6 +493,7 @@ pub(super) fn select(
         ),
         ("dynamicRendering", q.v13.dynamic_rendering),
         ("maintenance4", q.v13.maintenance4),
+        ("shaderIntegerDotProduct", q.v13.shader_integer_dot_product),
         ("maintenance5", q.v14.maintenance5),
         ("descriptorHeap", q.heap.descriptor_heap),
         ("shaderUntypedPointers", q.untyped.shader_untyped_pointers),
@@ -624,7 +625,8 @@ pub(super) fn select(
         .synchronization2(true)
         .pipeline_creation_cache_control(true)
         .dynamic_rendering(true)
-        .maintenance4(true);
+        .maintenance4(true)
+        .shader_integer_dot_product(true);
     e.v14 = e
         .v14
         .maintenance5(true)
