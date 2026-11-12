@@ -261,7 +261,8 @@ fn instance_entries_follow_scale_material_sets_hidden_sections_and_removal() {
 
     let det23 = |m: Mat3| f64::from(m.determinant().abs()).powf(2.0 / 3.0);
     // (slot, copy, rank, emission), None when the entry emits nothing.
-    let check = |all: &[EmissiveGpu], live: &[(u32, usize, u32, Option<DVec3>)]| {
+    let check = |root: &SceneRoot, live: &[(u32, usize, u32, Option<DVec3>)]| {
+        let all = entries(root);
         let instances: Vec<InstanceGpu> = read_buffer(root.instances, u64::from(root.part_base));
         let mut seen = 0;
         for (at, e) in all.iter().enumerate() {
@@ -301,7 +302,7 @@ fn instance_entries_follow_scale_material_sets_hidden_sections_and_removal() {
     live.push((with_set.first, 4, 1, Some(DVec3::ZERO)));
     live.push((untraced.first, 5, 0, None));
     live.push((untraced.first, 5, 1, None));
-    check(&entries(&root), &live);
+    check(&root, &live);
 
     // Removing copies 1 and 2 clears their entries; the rest keep their power.
     let mut f = scenes.begin_frame(&frame(&list)).unwrap();
@@ -312,7 +313,7 @@ fn instance_entries_follow_scale_material_sets_hidden_sections_and_removal() {
     f.update_scenes(&mut |_| {}).unwrap();
     wait(f.end(&[]).unwrap());
     live.retain(|&(slot, ..)| slot != lamps.first + 1 && slot != lamps.first + 2);
-    check(&entries(&root), &live);
+    check(&root, &live);
 
     // Once that frame has completed, the freed entries take two new copies.
     for _ in 0..2 {
@@ -332,7 +333,36 @@ fn instance_entries_follow_scale_material_sets_hidden_sections_and_removal() {
         live.push((again.first + copy as u32, copy, 0, Some(red)));
         live.push((again.first + copy as u32, copy, 1, Some(blue)));
     }
-    check(&entries(&root), &live);
+    check(&root, &live);
+
+    // Copies placed in three frames that run one behind another, none waiting for the one
+    // before, grow the emissive list and the slot tables under the frames in flight: every
+    // copy keeps its entries, and the new ones take theirs.
+    let held = root.emissive_capacity;
+    let mut last = GpuPtr::NULL;
+    let mut point = None;
+    for _ in 0..3 {
+        let mut f = scenes.begin_frame(&frame(&list)).unwrap();
+        let more = f
+            .scene(s)
+            .unwrap()
+            .add_instances(&desc(lamp_model, 4, None))
+            .unwrap();
+        for copy in 0..4 {
+            live.push((more.first + copy as u32, copy, 0, Some(red)));
+            live.push((more.first + copy as u32, copy, 1, Some(blue)));
+        }
+        f.update_scenes(&mut |c| last = c.root).unwrap();
+        point = Some(f.end(&[]).unwrap());
+    }
+    wait(point.unwrap());
+    let root: SceneRoot = read_buffer(last, 1)[0];
+    assert!(
+        root.emissive_capacity >= 2 * held,
+        "an emissive list of {} entries after {held}",
+        root.emissive_capacity
+    );
+    check(&root, &live);
     assert_clean();
 }
 
@@ -805,6 +835,45 @@ fn producer_power_follows_emitted_clusters_every_frame() {
         statics,
         "static entry",
     );
+
+    // Producers set in six frames that run one behind another, none waiting for the one
+    // before, grow the producer tables and the emissive list under the frames in flight. The
+    // static entry keeps what it built and emits as before, and every producer emits from the
+    // entry it took.
+    let capacity = (root.producer_capacity, root.emissive_capacity);
+    let more = |k: u32| ProducerId(100 + k);
+    let emits = |k: u32| -> Vec<_> { (0..=k).map(|j| (more(j), 2 + j, 0.5)).collect() };
+    for k in 0..6 {
+        let mut f = scenes.begin_frame(&frame(&list)).unwrap();
+        f.scene(s)
+            .unwrap()
+            .set_producer(more(k), Some(&producer(ProducerUpdate::EveryFrame, 16, 1)))
+            .unwrap();
+        f.update_scenes(&mut |c| dispatch(c, &emits(k))).unwrap();
+        f.end(&[]).unwrap();
+    }
+    let root = run(&mut scenes, &mut |_| {}, &emits(5));
+    assert!(
+        root.producer_capacity >= 4 * capacity.0 && root.emissive_capacity >= 4 * capacity.1,
+        "tables of {} producers and {} entries",
+        root.producer_capacity,
+        root.emissive_capacity
+    );
+    let all = entries(&root);
+    assert_eq!(all.iter().filter(|e| e.kind != 0).count(), 7);
+    check(
+        producer_entry(&all, fixed).unwrap(),
+        statics,
+        "static entry after the tables grew",
+    );
+    for j in 0..6 {
+        let e = producer_entry(&all, held(&scenes, 100 + j).unwrap()).unwrap();
+        check(
+            e,
+            expected(DMat3::IDENTITY, 2 + j, 0.5),
+            "a producer set in flight",
+        );
+    }
     assert_clean();
 }
 

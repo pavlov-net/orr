@@ -847,6 +847,215 @@ fn a_placement_past_the_devices_partitions_is_refused_and_leaves_the_scene_as_it
     assert_clean_on(&limited);
 }
 
+/// On a device whose PTLAS is full, a light proxy takes the instance a cleared producer left
+/// reserved and a medium proxy the one a cleared light did. The PTLAS then holds as many
+/// instances as before, with the proxies after the producers and the lights after the proxies
+/// at other indices: rays through each still meet it, by the index its table's base gives.
+#[test]
+fn proxies_keep_their_instances_as_a_full_ptlas_trades_their_room() {
+    use orr_math::Quat;
+    use orr_scene::orr_gpu::{Hazards, MemoryKind, QueueKind, ShaderStage, SpecData, Stages};
+    use orr_scene::{MediumProxy, MediumProxyId, ProxyDensity};
+    use scene_suite::shaders::proxy_rays::{self, Root, Seen};
+
+    const MEDIUM: u32 = 0x04;
+    const LIGHT: u32 = 0x08;
+    let _serial = serial();
+    let desc = SceneDesc {
+        global_instances: 16,
+        ..SceneDesc::default()
+    };
+    // The global partition's copies and a far instance for each, the cell partition of one
+    // copy, and four instances for producers and proxies.
+    let partitions = 2 * desc.global_instances + 1 + 4;
+    let limited = limited_device(partitions);
+    if limited.caps().cluster.max_partitions != partitions {
+        return;
+    }
+    {
+        let mut scenes = Scenes::new(&limited, &RendererDesc::default()).unwrap();
+        let (_workers, quad) = scene_suite::mount_quad(&mut scenes);
+        let s = scenes.create_scene(&desc).unwrap();
+        let list = [s];
+        let frame_with = |scenes: &mut Scenes, write: &mut dyn FnMut(&mut SceneWriter<'_>)| {
+            let mut f = scenes
+                .begin_frame(&FrameDesc {
+                    time: FrameTime::default(),
+                    scenes: &list,
+                    low_latency: None,
+                })
+                .unwrap();
+            let mut w = f.scene(s).unwrap();
+            w.set_focus(DVec3::ZERO);
+            write(&mut w);
+            drop(w);
+            let mut root = GpuPtr::NULL;
+            f.update_scenes(&mut |c| root = c.root).unwrap();
+            wait_on(&limited, f.end(&[]).unwrap());
+            root
+        };
+        // Medium proxy and light `k` stand at x = 4 k, the lights 8 m behind the proxies.
+        let at = |k: u32, z: f64| DVec3::new(4.0 * f64::from(k), 0.0, z);
+        let proxy = |k: u32| MediumProxy {
+            position: at(k, 0.0),
+            rotation: Quat::IDENTITY,
+            scale: 1.0,
+            density: ProxyDensity::Uniform {
+                half_extent: Vec3::splat(0.5),
+            },
+            extinction: Vec3::ONE,
+            albedo: Vec3::ONE,
+            anisotropy: 0.0,
+        };
+        let lamp = |k: u32| Light::Sphere {
+            position: at(k, 8.0),
+            radius: 0.5,
+            intensity: Vec3::ONE,
+            cone: None,
+        };
+        let untraced = ProducerDesc {
+            flags: InstanceFlags::RASTER,
+            ..ProducerDesc::default()
+        };
+        let stage = ShaderStage::new(&proxy_rays::MODULE, "main", SpecData::default()).unwrap();
+        let probe = limited
+            .create_compute_pipeline(&stage, proxy_rays::MODULE.name)
+            .unwrap();
+        // What a ray straight down through medium proxy `k`, or light `k`, meets under its
+        // mask: the candidates, and the last one's index past its table's base.
+        let seen = |root: GpuPtr<SceneRoot>, light: bool, k: u32| -> (u32, u32) {
+            let scene: SceneRoot = read_buffer_on(&limited, root, 1)[0];
+            let upload = MemoryKind::Upload;
+            let mut origin = limited.gpu_malloc::<[f32; 4]>(upload, 1, "origin").unwrap();
+            let p = at(k, if light { 8.0 } else { 0.0 }).as_vec3() + Vec3::new(0.0, 10.0, 0.0);
+            origin.as_mut_slice().unwrap()[0] = p.extend(0.0).to_array();
+            let out = limited
+                .gpu_malloc::<Seen>(MemoryKind::Readback, 1, "seen")
+                .unwrap();
+            let mut ray = limited.gpu_malloc::<Root>(upload, 1, "root").unwrap();
+            ray.as_mut_slice().unwrap()[0] = Root {
+                scene: root,
+                origins: origin.gpu(),
+                seen: out.gpu(),
+                count: 1,
+                mask: if light { LIGHT } else { MEDIUM },
+                dir: [0.0, -1.0, 0.0, 0.0],
+            };
+            let render = limited.queue(QueueKind::Render).unwrap();
+            let mut list = render.command_list().unwrap();
+            list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::ACCEL_STRUCT);
+            list.dispatch(&probe, ray.gpu(), [1, 1, 1]);
+            list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+            wait_on(&limited, render.submit(vec![list], &[]).unwrap());
+            let seen = out.as_slice().unwrap()[0];
+            let base = if light {
+                scene.light_base
+            } else {
+                scene.proxy_base
+            };
+            // A ray that met nothing names no instance.
+            let index = if seen.count == 0 {
+                0
+            } else {
+                seen.instance - base
+            };
+            (seen.count, index)
+        };
+        let bases = |root: GpuPtr<SceneRoot>| {
+            let scene: SceneRoot = read_buffer_on(&limited, root, 1)[0];
+            let first = scene.producer_base;
+            [scene.proxy_base - first, scene.light_base - first]
+        };
+
+        // Two producers, a medium proxy and a light take the four instances.
+        frame_with(&mut scenes, &mut |w| {
+            let group = w
+                .create_transform_group(&TransformGroupDesc {
+                    count: 1,
+                    writer: GroupWriter::Cpu,
+                    anchor: DVec3::new(0.0, 0.0, -20.0),
+                })
+                .unwrap();
+            w.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
+            w.add_instances(&InstancesDesc {
+                model: quad,
+                copies: 1,
+                transforms: group,
+                first: 0,
+                pose: None,
+                material_set: None,
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: 100.0,
+                animation_range: 0.0,
+                user_tag: 0,
+            })
+            .unwrap();
+            w.set_producer(ProducerId(10), Some(&untraced)).unwrap();
+            w.set_producer(ProducerId(11), Some(&untraced)).unwrap();
+            w.set_medium_proxy(MediumProxyId(0), Some(&proxy(0)))
+                .unwrap();
+            w.set_light(LightId(0), Some(&lamp(0))).unwrap();
+            let r = w.set_medium_proxy(MediumProxyId(1), Some(&proxy(1)));
+            assert!(matches!(r, Err(Error::Capacity { .. })), "{r:?}");
+        });
+        // The second producer goes, and its entry is free once that frame has completed.
+        frame_with(&mut scenes, &mut |w| {
+            w.set_producer(ProducerId(11), None).unwrap();
+        });
+        let mut root = GpuPtr::NULL;
+        for _ in 0..4 {
+            root = frame_with(&mut scenes, &mut |_| {});
+        }
+        assert_eq!(bases(root), [2, 3]);
+        assert_eq!(
+            [seen(root, false, 0), seen(root, true, 0)],
+            [(1, 0), (1, 0)]
+        );
+
+        // A second light takes the instance the producers held in reserve: the medium proxy
+        // and the first light each start one instance earlier.
+        let mut root = frame_with(&mut scenes, &mut |w| {
+            w.set_light(LightId(1), Some(&lamp(1))).unwrap();
+        });
+        for _ in 0..2 {
+            root = frame_with(&mut scenes, &mut |_| {});
+        }
+        assert_eq!(bases(root), [1, 2]);
+        let met = [
+            seen(root, false, 0),
+            seen(root, true, 0),
+            seen(root, true, 1),
+        ];
+        assert_eq!(met, [(1, 0), (1, 0), (1, 1)], "after the producers' trade");
+
+        // The second light goes and a second medium proxy takes its instance: the first light
+        // starts one instance later.
+        frame_with(&mut scenes, &mut |w| {
+            w.set_light(LightId(1), None).unwrap();
+        });
+        let mut root = frame_with(&mut scenes, &mut |w| {
+            w.set_medium_proxy(MediumProxyId(1), Some(&proxy(1)))
+                .unwrap();
+        });
+        for _ in 0..2 {
+            root = frame_with(&mut scenes, &mut |_| {});
+        }
+        assert_eq!(bases(root), [1, 3]);
+        let met = [
+            seen(root, false, 0),
+            seen(root, false, 1),
+            seen(root, true, 0),
+            seen(root, true, 1),
+        ];
+        assert_eq!(
+            met,
+            [(1, 0), (1, 1), (1, 0), (0, 0)],
+            "after the lights' trade"
+        );
+    }
+    assert_clean_on(&limited);
+}
+
 /// A memory pack of `count` whole textures, which no material binds: every mip of each is
 /// staged at mount. Returns it with the bytes of their texels.
 fn whole_textures(count: usize) -> (Arc<[u8]>, u64) {

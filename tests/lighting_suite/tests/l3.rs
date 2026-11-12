@@ -1346,12 +1346,13 @@ struct Passed {
 }
 
 /// A scene with sphere light 0, an emitting producer entry and the procedural sky takes
-/// feedback for the three, then lights 1, 9 and 40 in three frames, each past its light table,
-/// and two frames more. Returns each of the five frames' scene pass, the light table's entries
-/// after them, and the probabilities of light 0, the entry and the environment after them and
-/// once a reset has dropped the feedback. With `in_flight` the three frames that grow the table
-/// run one behind another, none waiting for the one before.
-fn grow_lights(in_flight: bool) -> (Vec<Passed>, u32, [[f64; 3]; 2]) {
+/// feedback for the three, then lights 1, 9 and 40 in three frames, each past its light table
+/// and each with a producer more, which grow the producer table and the emissive list, and two
+/// frames more. Returns each of the five frames' scene pass, the scene's light tables after
+/// them, and the probabilities of light 0, the entry and the environment after them and once a
+/// reset has dropped the feedback. With `in_flight` the three frames that grow the tables run
+/// one behind another, none waiting for the one before.
+fn grow_tables(in_flight: bool) -> (Vec<Passed>, LightTables, [[f64; 3]; 2]) {
     let mut scene = TestScene::procedural(SceneDesc::default());
     let quads = Quads {
         producer: 0,
@@ -1379,10 +1380,9 @@ fn grow_lights(in_flight: bool) -> (Vec<Passed>, u32, [[f64; 3]; 2]) {
     let mut lighting = scene.lighting();
     scene_pass(&scene, &mut lighting, scene.frame);
     let set: LightSetGpu = read(lighting.light_set(), 1)[0];
-    let entries = set.candidate_count - scene.tables.lights;
-    let probabilities = |lighting: &SceneLighting, lights: u32| {
+    let probabilities = |lighting: &SceneLighting, tables: LightTables| {
         let set: LightSetGpu = read(lighting.light_set(), 1)[0];
-        assert_eq!(set.candidate_count, lights + entries);
+        assert_eq!(set.candidate_count, tables.lights + tables.entries);
         [
             read(set.light_probability, 1)[0],
             read(set.emissive, 1)[0].probability,
@@ -1419,6 +1419,12 @@ fn grow_lights(in_flight: bool) -> (Vec<Passed>, u32, [[f64; 3]; 2]) {
         if let Some(id) = id {
             let mut w = f.scene(scene.id).unwrap();
             w.set_light(LightId(id), Some(&sphere(id))).unwrap();
+            // A producer that emits nothing takes an entry of each table all the same.
+            let idle = ProducerDesc {
+                flags: InstanceFlags::RASTER,
+                ..ProducerDesc::default()
+            };
+            w.set_producer(ProducerId(100 + id), Some(&idle)).unwrap();
         }
         let mut pass = None;
         f.update_scenes(&mut |c| {
@@ -1458,8 +1464,7 @@ fn grow_lights(in_flight: bool) -> (Vec<Passed>, u32, [[f64; 3]; 2]) {
             assert_eq!(counted, [if k == 2 { 6000 } else { 0 }, 0, 0]);
         }
     }
-    let lights = tables.lights;
-    let fed = probabilities(&lighting, lights);
+    let fed = probabilities(&lighting, tables);
     lighting.reset_history();
     let mut list = render().command_list().unwrap();
     let pass = ScenePass {
@@ -1470,19 +1475,23 @@ fn grow_lights(in_flight: bool) -> (Vec<Passed>, u32, [[f64; 3]; 2]) {
     };
     lighting.record(&mut list, &pass).unwrap();
     finish(list);
-    let power = probabilities(&lighting, lights);
-    (passed, lights, [fed, power])
+    let power = probabilities(&lighting, tables);
+    (passed, tables, [fed, power])
 }
 
-/// Lights set past the light table in three frames running, none waiting for the one before,
-/// leave every frame's light samples and selection as frames that each waited do, and the
-/// feedback counted before the table grew stays with its light, its emissive entry and the
-/// environment: an entry's feedback id and the environment's move with the table, and each
-/// pass takes the feedback so far by the ids of the table before.
+/// Lights set past the light table and producers past the producer table and the emissive list
+/// in three frames running, none waiting for the one before, leave every frame's light samples
+/// and selection as frames that each waited do, and the feedback counted before the tables
+/// grew stays with its light, its emissive entry and the environment: an entry's feedback id
+/// moves with the light table and the environment's with that and the emissive list, and each
+/// pass takes the feedback so far by the ids of the tables before.
 #[test]
-fn feedback_follows_its_lights_as_the_light_table_grows_under_frames_in_flight() {
-    let (flight, lights, [fed, power]) = grow_lights(true);
-    assert!(lights > 40, "the light table holds {lights}");
+fn feedback_follows_its_lights_as_the_light_tables_grow_under_frames_in_flight() {
+    let (flight, tables, [fed, power]) = grow_tables(true);
+    assert!(
+        tables.lights > 40 && tables.entries >= 4 && tables.producers >= 4,
+        "the light tables hold {tables:?}"
+    );
     let share = f64::from(SceneLightingSettings::default().feedback_share);
     let counted = [3000.0, 2000.0, 1000.0].map(|c| c / 6000.0);
     for i in 0..3 {
@@ -1492,7 +1501,7 @@ fn feedback_follows_its_lights_as_the_light_table_grows_under_frames_in_flight()
             "probabilities {fed:?} against the power's {power:?} with the feedback {counted:?}"
         );
     }
-    let (settled, _, probabilities) = grow_lights(false);
+    let (settled, _, probabilities) = grow_tables(false);
     assert_eq!(probabilities, [fed, power]);
     let selection = |p: &Passed| {
         let s = p.set.as_slice().unwrap()[0];

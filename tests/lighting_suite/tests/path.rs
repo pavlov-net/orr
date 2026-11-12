@@ -712,12 +712,12 @@ fn tiles_naming(bed: &Bed, id: u32) -> usize {
 }
 
 /// A sphere light and the sky feed back from the ground they light, and the frame after the
-/// light table grows finds both in the view's local samplers as the frame before did: the
-/// environment's feedback id moved with the table, and the samplers read what the view fed
-/// back by the ids of the table it was written under. The scene's selection still counts the
-/// feedback of the frame that grew the table.
+/// light table and the emissive list grow finds both in the view's local samplers as the frame
+/// before did: the environment's feedback id moved with the two, and the samplers read what
+/// the view fed back by the ids of the tables it was written under. The scene's selection
+/// still counts the feedback of the frame that grew the tables.
 #[test]
-fn a_views_light_feedback_follows_its_lights_as_the_light_table_grows() {
+fn a_views_light_feedback_follows_its_lights_as_the_light_tables_grow() {
     let lamp = |intensity: f32, x: f64| Light::Sphere {
         position: DVec3::new(x, 1.5, 1.0),
         radius: 0.1,
@@ -743,9 +743,24 @@ fn a_views_light_feedback_follows_its_lights_as_the_light_table_grows() {
     );
 
     bed.set_light(LightId(40), Some(lamp(0.0, 30.0)));
+    // A dark particle out of sight takes the emissive list's first entry.
+    let speck = Particle {
+        center: Vec3::new(0.0, -50.0, 0.0),
+        size: 0.01,
+    };
+    let dark = ParticleLook {
+        albedo: [0.0; 3],
+        emission: [0.0; 3],
+        opacity: 1.0,
+        anisotropy: 0.0,
+    };
+    bed.set_particles(&[speck], dark, Opacity::Particle);
     bed.accumulate_on(4, 1, 1, &mut |list, f| p.record(list, f));
     let grown = environment(&bed);
-    assert!(grown > held, "the light table never grew");
+    assert!(
+        grown > held + 40,
+        "the light table and the emissive list never grew"
+    );
     let after = [0, grown].map(|id| tiles_naming(&bed, id));
     for (what, (before, after)) in ["lamp", "sky"]
         .into_iter()
