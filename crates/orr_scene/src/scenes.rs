@@ -696,7 +696,13 @@ impl Scenes {
         use std::fmt::Write;
         let d = &self.device;
         let mut out = format!("device lost {}\n", d.is_lost());
-        let kinds = [QueueKind::Render, QueueKind::Loading, QueueKind::Compute];
+        let kinds = [
+            QueueKind::Render,
+            QueueKind::Compute,
+            QueueKind::Loading,
+            QueueKind::Copy,
+            QueueKind::Present,
+        ];
         for kind in kinds {
             if let Some(q) = d.queue(kind) {
                 let _ = writeln!(out, "{kind:?} queue completed {}", q.completed());

@@ -9,7 +9,7 @@ use orr_gpu::{ComputePipeline, ShaderModule, ShaderStage, SpecData};
 use orr_math::{Vec2, Vec3};
 use orr_pack::material::Material;
 use orr_pack::{AssetId, Span, Target};
-use orr_scene::testing::device;
+use orr_scene::testing::{device, mount_pending};
 use orr_scene::{FrameDesc, FrameTime, LoadState, Loading, ModelId, PackSource, Scenes};
 
 pub mod shaders {
@@ -98,19 +98,12 @@ pub fn mount_quad(scenes: &mut Scenes) -> (Workers, ModelId) {
         scenes: &[],
         low_latency: None,
     };
-    let start = std::time::Instant::now();
-    loop {
-        match scenes.mount_state(m) {
-            LoadState::Pending => {}
-            LoadState::Failed(e) => panic!("the quad failed to mount: {e}"),
-            _ => break,
-        }
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(60),
-            "the quad never mounted"
-        );
+    while mount_pending(scenes, m) {
         scenes.begin_frame(&frame).unwrap().end(&[]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    if let LoadState::Failed(e) = scenes.mount_state(m) {
+        panic!("the quad failed to mount: {e}");
     }
     (
         workers,

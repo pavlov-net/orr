@@ -261,7 +261,7 @@ pub struct Loading {
 struct Status {
     /// Times it has gone round its loop.
     rounds: u64,
-    /// When it last did, and whether it then waited to be woken.
+    /// When it last did, and whether it is waiting to be woken.
     at: Option<Instant>,
     waiting: bool,
     /// Stream tasks whose reads have not all ended, mounts placing, mount reads waiting for
@@ -423,12 +423,17 @@ impl Loading {
         };
         let mut out = String::new();
         let s = self.status.lock().unwrap().clone();
-        let ago = s.at.map_or(f64::NAN, |at| at.elapsed().as_secs_f64());
+        let round = s.at.map_or_else(
+            || "has ended no round".to_owned(),
+            |at| {
+                let ago = at.elapsed().as_secs_f64();
+                format!("ended round {} {ago:.3} s ago", s.rounds)
+            },
+        );
         let _ = writeln!(
             out,
-            "loading thread: round {} {ago:.3} s ago, {}; {} stream tasks reading, {} mounts \
-             placing, {} mount reads waiting for room",
-            s.rounds,
+            "loading thread: {round}, {}; {} stream tasks reading, {} mounts placing, {} mount \
+             reads waiting for room",
             if s.waiting {
                 "waiting to be woken"
             } else {
@@ -454,21 +459,23 @@ impl Loading {
                 jobs.stopped
             );
         }
+        let inbox = self.inbox.lock().unwrap().len();
+        let batches: Vec<Option<TimelinePoint>> =
+            (self.batches.lock().unwrap().iter().map(|b| b.point)).collect();
+        let streams = self.streams.lock().unwrap().len();
+        let cuts = self.cuts.lock().unwrap().len();
+        let edits = self.edits.lock().unwrap().len();
         let _ = writeln!(
             out,
-            "inbox {} messages; {} mount batches, {} stream batches, {} cut batches, {} edit \
-             batches not taken",
-            self.inbox.lock().unwrap().len(),
-            self.batches.lock().unwrap().len(),
-            self.streams.lock().unwrap().len(),
-            self.cuts.lock().unwrap().len(),
-            self.edits.lock().unwrap().len(),
+            "inbox {inbox} messages; {} mount batches, {streams} stream batches, {cuts} cut \
+             batches, {edits} edit batches not taken",
+            batches.len(),
         );
-        for b in self.batches.lock().unwrap().iter() {
+        for point in batches {
             let _ = writeln!(
                 out,
                 "  mount batch waits for {}",
-                b.point.map_or_else(|| "nothing".into(), done)
+                point.map_or_else(|| "nothing".into(), done)
             );
         }
         let _ = writeln!(out, "in flight: {:?}", self.in_flight);
@@ -1201,6 +1208,8 @@ fn run(loading: &Arc<Loading>, device: &Device, watch: &Watch) {
             watch.until(BUILDS, until.min_by_key(|p| p.value()));
             watch.until(COPIES, copies.until);
             loading.wake.wait(ring.as_ref());
+            // A round that then stalls reports as running, not as waiting.
+            loading.status.lock().unwrap().waiting = false;
         }
     }
 }

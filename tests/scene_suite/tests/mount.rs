@@ -26,8 +26,8 @@ use orr_scene::orr_gpu::{
     Texture, TextureIndex, TextureRegion,
 };
 use orr_scene::testing::{
-    assert_clean, assert_clean_on, device, global_tables, mounted_texture, read_buffer_on,
-    read_texture_on, wait_on,
+    assert_clean, assert_clean_on, device, global_tables, mount_pending, mounted_texture,
+    read_buffer_on, read_texture_on, wait_on,
 };
 use orr_scene::{
     BoundTexture, Budgets, EmissiveGpu, Error, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
@@ -226,17 +226,11 @@ fn frame(scenes: &mut Scenes) {
 
 /// Runs frames until `m` is no longer pending.
 fn settle(scenes: &mut Scenes, m: MountId) -> LoadState {
-    let start = Instant::now();
     loop {
         frame(scenes);
-        let state = scenes.mount_state(m);
-        if !matches!(state, LoadState::Pending) {
-            return state;
+        if !mount_pending(scenes, m) {
+            return scenes.mount_state(m);
         }
-        assert!(
-            start.elapsed() < Duration::from_secs(60),
-            "{m:?} still pending"
-        );
         std::thread::sleep(Duration::from_millis(1));
     }
 }
@@ -676,40 +670,39 @@ fn a_file_renamed_over_a_mount_is_not_read() {
     assert_clean();
 }
 
-/// A second device without resizable BAR or host image copy, so every write is staged.
-fn staged_device() -> Device {
+/// A second device as `desc` makes it, with the test device's queues less the present one.
+fn second_device(desc: DeviceDesc<'_>) -> Device {
     let _ = device();
-    let staged = Device::new(&DeviceDesc {
-        name: "orr-test-staged",
+    Device::new(&DeviceDesc {
         queues: QueueRequest {
             render_compute: true,
             async_compute: true,
             copy: true,
             present: false,
         },
+        ..desc
+    })
+    .unwrap()
+}
+
+/// A second device without resizable BAR or host image copy, so every write is staged.
+fn staged_device() -> Device {
+    let staged = second_device(DeviceDesc {
+        name: "orr-test-staged",
         force_staging: true,
         ..DeviceDesc::default()
-    })
-    .unwrap();
+    });
     assert!(!staged.caps().rebar && !staged.caps().host_image_copy);
     staged
 }
 
 /// A second device whose PTLAS holds `partitions` cell partitions and global instances together.
 fn limited_device(partitions: u32) -> Device {
-    let _ = device();
-    Device::new(&DeviceDesc {
+    second_device(DeviceDesc {
         name: "orr-test-limited",
-        queues: QueueRequest {
-            render_compute: true,
-            async_compute: true,
-            copy: true,
-            present: false,
-        },
         max_partitions: Some(partitions),
         ..DeviceDesc::default()
     })
-    .unwrap()
 }
 
 /// A placement that needs one cell partition more than the device's PTLAS holds is refused and
