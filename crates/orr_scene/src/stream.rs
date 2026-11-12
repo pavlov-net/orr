@@ -73,7 +73,7 @@ use crate::loading::{
     BlobSource, Loading, Msg, Queue, Resumable, landed, read_into, reads_straight,
 };
 use crate::memory::{Block, Pool, PoolSlot, SceneMemory};
-use crate::mount::{Apply, PageId, page_infos};
+use crate::mount::{Apply, MeshPages, PageId, page_infos};
 use crate::neural::NeuralLink;
 use crate::residency::{
     Demand, HOLD_FRAMES, HeapUse, Held, Holder, InFlight, Key, Limits, MARK_TENTHS, Plan, Priority,
@@ -172,8 +172,8 @@ const MOVE_COLD_FRAMES: u64 = 8;
 /// Who learns the address of a unit in a stream pool slot, null while it is not resident.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PoolTarget {
-    /// A table entry on the GPU.
-    Table(GpuPtr<u64>),
+    /// An entry of the mesh page table.
+    Table(u32),
     /// The transform groups placing an instance page.
     InstancePage(PageId),
     /// A window of an animated page's rows.
@@ -209,10 +209,8 @@ pub(crate) struct MeshStream {
     pub(crate) entry: u32,
     pub(crate) header: MeshHeader,
     pub(crate) pages: Vec<StreamedPage>,
-    /// The mesh's page table, and beside it the cluster id of each resident page's first
-    /// cluster.
-    pub(crate) table: GpuPtr<u64>,
-    pub(crate) bases: GpuPtr<u32>,
+    /// Its first entry of the mesh page table.
+    pub(crate) entries: u32,
     /// The resident cluster table.
     pub(crate) clusters: GpuPtr<ClusterRef>,
     /// Sections whose every triangle is non-opaque.
@@ -458,10 +456,10 @@ struct MeshPlaced {
 }
 
 impl MeshPlaced {
-    /// Its page table entry and its clusters' entries in the resident cluster table.
-    fn entries(&self) -> (GpuPtr<u64>, GpuPtr<ClusterRef>, u32) {
+    /// Its mesh page table entry and its clusters' entries in the resident cluster table.
+    fn entries(&self) -> (u32, GpuPtr<ClusterRef>, u32) {
         (
-            self.stream.table.offset(u64::from(self.page)),
+            self.stream.entries + self.page,
             self.stream.clusters.offset(u64::from(self.ids)),
             self.clusters(),
         )
@@ -520,6 +518,8 @@ struct UserBlob {
 pub(crate) struct Streaming {
     residency: Residency,
     accel: Arc<AccelShared>,
+    /// The mesh page table, where the entries of what lands and leaves are written.
+    mesh_pages: Arc<MeshPages>,
     /// Streamed pages' CLAS; none without cluster acceleration structures.
     clas: Option<Arc<ClasPool>>,
     /// Streamed pages' CLAS and cluster ids, freed once the frame has completed.
@@ -622,6 +622,7 @@ impl Streaming {
         b: &Budgets,
         pools: PoolBytes,
         accel: &Arc<AccelShared>,
+        mesh_pages: &Arc<MeshPages>,
         streams: GpuPtr<GpuPtr<TextureStreamGpu>>,
         fif: u32,
     ) -> Result<Self> {
@@ -665,6 +666,7 @@ impl Streaming {
         };
         Ok(Self {
             accel: Arc::clone(accel),
+            mesh_pages: Arc::clone(mesh_pages),
             clas,
             retired_pages: Vec::new(),
             loading_ids: FxHashMap::default(),
@@ -2100,7 +2102,7 @@ impl Streaming {
     /// Gives a stream pool unit's target its address, 0 when the unit leaves.
     fn point_target(&mut self, target: PoolTarget, at: u64, w: &mut Apply<'_>) -> Result<()> {
         match target {
-            PoolTarget::Table(table) => w.put(table, &[at])?,
+            PoolTarget::Table(entry) => w.put(self.mesh_pages.table.entry(entry), &[at])?,
             PoolTarget::InstancePage(page) => self.page_events.push((page, at)),
             PoolTarget::PageWindow { page, window } => {
                 self.window_events.push((page, window, at));
@@ -2118,16 +2120,17 @@ impl Streaming {
                 self.retire_unit(k, slot, frame - 1);
             }
             Placed::MeshPage(p) => {
-                let (table, refs, count) = p.entries();
+                let (entry, refs, count) = p.entries();
                 let zeros = vec![bytemuck::Zeroable::zeroed(); count as usize];
-                w.put(table, &[0])?;
+                let table = &self.mesh_pages.table;
+                w.put(table.entry(entry), &[0])?;
                 w.put(refs, &zeros)?;
                 if let Some(f) = self.fine.get_mut(&(k.mount, p.stream.mesh)) {
                     f.init.resident[p.page as usize] = None;
                 }
                 for mirror in p.stream.mirrors.lock().unwrap().iter() {
                     if !mirror.own[p.page as usize] {
-                        w.put(mirror.table.offset(u64::from(p.page)), &[0])?;
+                        w.put(table.entry(mirror.entries + p.page), &[0])?;
                     }
                 }
                 let (slot, free) = p.free();
@@ -2428,8 +2431,9 @@ impl Streaming {
             }
             Placed::MeshPage(mut p) => {
                 let from = p.address;
-                let (table, refs, count) = p.entries();
-                w.put(table, &[at])?;
+                let (entry, refs, count) = p.entries();
+                let table = &self.mesh_pages.table;
+                w.put(table.entry(entry), &[at])?;
                 // Each cluster's entry names the page first; the rest of it stays.
                 let stride = (size_of::<ClusterRef>() / 4) as u32;
                 for (word, value) in [(0, at as u32), (4, (at >> 32) as u32)] {
@@ -2443,7 +2447,7 @@ impl Streaming {
                 }
                 for mirror in p.stream.mirrors.lock().unwrap().iter() {
                     if !mirror.own[p.page as usize] {
-                        w.put(mirror.table.offset(u64::from(p.page)), &[at])?;
+                        w.put(table.entry(mirror.entries + p.page), &[at])?;
                     }
                 }
                 self.retire_page(k, p.slot, frame);
@@ -2741,7 +2745,7 @@ impl Streaming {
             self.free_now(p);
             return Ok(());
         }
-        let (table, refs, count) = p.entries();
+        let (entry, refs, count) = p.entries();
         let first = p.stream.pages[p.page as usize].first;
         let pool = self.clas.as_deref();
         let entries: Vec<ClusterRef> = (0..count)
@@ -2757,13 +2761,15 @@ impl Streaming {
                 },
             })
             .collect();
-        w.put(table, &[l.gpu])?;
-        w.put(p.stream.bases.offset(u64::from(p.page)), &[p.ids])?;
+        let (table, bases) = (&self.mesh_pages.table, &self.mesh_pages.bases);
+        w.put(table.entry(entry), &[l.gpu])?;
+        w.put(bases.entry(entry), &[p.ids])?;
         w.put(refs, &entries)?;
         for mirror in p.stream.mirrors.lock().unwrap().iter() {
             if !mirror.own[p.page as usize] {
-                w.put(mirror.table.offset(u64::from(p.page)), &[l.gpu])?;
-                w.put(mirror.bases.offset(u64::from(p.page)), &[p.ids])?;
+                let entry = mirror.entries + p.page;
+                w.put(table.entry(entry), &[l.gpu])?;
+                w.put(bases.entry(entry), &[p.ids])?;
             }
         }
         p.address = l.gpu;

@@ -32,7 +32,7 @@ use crate::medium_proxy::{ProxyBlas, VolumeRef};
 use crate::memory::{PreprocessArenas, SceneMemory, UploadWindow};
 use crate::mount::{
     Apply, ClipRef, InstancePage, LoadState, MountId, MountTask, Mounts, PackSource, PageId,
-    SkeletonRef, TableSizes,
+    SkeletonRef,
 };
 use crate::neural::{NeuralTextures, Precision};
 use crate::pipelines::{MeshPipelineId, MeshStages, PipelineId, Pipelines, ReloadReport};
@@ -105,10 +105,6 @@ impl PoolBytes {
 pub struct Budgets {
     /// Bytes per upload block; a window that outgrows its blocks takes another.
     pub upload_block: u64,
-    /// Entries of the mesh page table: per mounted mesh one per page and node page, which
-    /// hold their addresses, and one per finer cached cut of a streaming mesh, and per edit one
-    /// per page. A scene's traversal reports what it reads and wants by entry, a bit each.
-    pub mesh_pages: u32,
     /// Visible clusters one view's list holds at first. A list grows a few frames after a
     /// frame wanted more than it holds, and gives memory back after a long run of frames that
     /// want far less. It holds 2^25 at most, the clusters a visibility buffer word can name.
@@ -198,7 +194,6 @@ impl Default for Budgets {
     fn default() -> Self {
         Self {
             upload_block: 16 << 20,
-            mesh_pages: 1 << 20,
             initial_visible_clusters: 1 << 20,
             initial_candidate_items: 1 << 18,
             initial_traversal_nodes: 1 << 18,
@@ -560,9 +555,6 @@ impl Scenes {
         let materials = MaterialTable::new(device)?;
         let mounts = Mounts::new(
             device,
-            TableSizes {
-                page_table: b.mesh_pages,
-            },
             b,
             pools,
             &accel,
@@ -1113,6 +1105,12 @@ impl Scenes {
     #[cfg(feature = "testing")]
     pub(crate) fn model_materials(&self) -> GpuPtr<u32> {
         self.core.mounts.model_materials.gpu()
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn mesh_page_tables(&self) -> (GpuPtr<u64>, GpuPtr<u32>, u32) {
+        let pages = &self.core.mounts.mesh_pages;
+        (pages.table.gpu(), pages.bases.gpu(), pages.entries())
     }
 
     #[cfg(feature = "testing")]
@@ -1895,13 +1893,14 @@ impl<'a> Frame<'a> {
                     rt_blas: core.budgets.initial_rt_cut_blas,
                     rt_bytes: core.budgets.rt_cut_memory.bytes(heap),
                     models: core.mounts.models.capacity(),
-                    entries: core.budgets.mesh_pages,
+                    entries: core.mounts.mesh_pages.entries(),
                     requests: core.budgets.traversal_requests,
                 };
                 cpu.cuts = Some(Cuts::new(device, sizes, core.fif)?);
             }
             let cuts = cpu.cuts.as_mut().expect("made above");
             cuts.follow_models(device, core.mounts.models.capacity())?;
+            cuts.follow_entries(device, core.mounts.mesh_pages.entries())?;
             match cuts.fit(device, self.id, response_period(core.fif)) {
                 Err(e) if e.is_out_of_memory() => short.push(e),
                 r => r?,
@@ -1979,6 +1978,8 @@ impl<'a> Frame<'a> {
                 meshes: core.mounts.meshes.gpu(),
                 materials: core.materials.table.gpu(),
                 clusters: core.mounts.clusters().gpu(),
+                mesh_pages: core.mounts.mesh_pages.table.gpu(),
+                mesh_page_bases: core.mounts.mesh_pages.bases.gpu(),
                 model_materials: core.mounts.model_materials.gpu(),
                 material_sets: t.material_sets.gpu().cast(),
                 page_material_sets: t.page_sets.gpu().cast(),

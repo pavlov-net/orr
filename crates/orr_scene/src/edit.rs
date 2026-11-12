@@ -84,11 +84,11 @@ pub(crate) struct EditSource {
     pub(crate) finest_level: Option<(u32, u32)>,
 }
 
-/// An edit's page table and page bases, which a streaming source keeps in step for the pages
-/// the edit has no copy of.
+/// An edit's entries of the mesh page table, which a streaming source keeps in step for the
+/// pages the edit has no copy of.
 pub(crate) struct Mirror {
-    pub(crate) table: GpuPtr<u64>,
-    pub(crate) bases: GpuPtr<u32>,
+    /// Its first entry.
+    pub(crate) entries: u32,
     /// By page: the edit holds a copy.
     pub(crate) own: Vec<bool>,
 }

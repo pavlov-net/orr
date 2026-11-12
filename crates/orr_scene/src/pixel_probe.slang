@@ -84,7 +84,7 @@ public struct ProbeGpu
     public uint from_group;
     public uint mesh_page;          // the page holding the cluster
     public uint cluster_id;         // its resident cluster id
-    public uint64_t page_address;   // mesh.pages[mesh_page] this frame
+    public uint64_t page_address;   // where the page is resident this frame
     public uint page_count;
     public uint pinned_pages;
     public uint level_count;
@@ -255,8 +255,8 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
     o.self_error = cl.self_error;
     o.parent_error = cl.parent_error;
     o.mesh_page = cluster_page(mesh, vc.cluster);
-    o.page_address = mesh.pages[o.mesh_page];
-    o.cluster_id = mesh_cluster_id(mesh, vc.cluster);
+    o.page_address = mesh_page(s, mesh, o.mesh_page);
+    o.cluster_id = mesh_cluster_id(s, mesh, vc.cluster);
 
     // The thresholds as the traversal's `slot_lod` takes them.
     uint d = mesh.edit != nullptr ? 0 : inst.debug_lod;
@@ -291,18 +291,18 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
 
     CutGpu* cut = s.cut;
     bool streams = mesh.pinned_pages != mesh.page_count;
-    o.page_bits = page_bits(cut, mesh.feedback_pages + o.mesh_page, streams && o.mesh_page >= mesh.pinned_pages);
+    o.page_bits = page_bits(cut, mesh.pages + o.mesh_page, streams && o.mesh_page >= mesh.pinned_pages);
     o.from_page = 0xffffffff;
     if (mesh.level_count == 0 && cl.from_group != CLUSTER_SOURCE && mesh.groups != nullptr)
     {
         o.flags |= PROBE_FROM_GROUP;
         Group from = ((Group*)mesh.groups)[cl.from_group];
         o.from_page = from.page;
-        o.from_address = mesh.pages[from.page];
+        o.from_address = mesh_page(s, mesh, from.page);
         o.from_error = from.error;
         if ((o.flags & PROBE_PLACED) != 0)
             o.from_pixels = focus_error(p, from.simplified, from.error * o.debug_scale);
-        uint entry = mesh.feedback_pages + from.page;
+        uint entry = mesh.pages + from.page;
         o.page_bits |= page_bits(cut, entry, streams && from.page >= mesh.pinned_pages) << 4;
         o.page_wanted_error = asfloat(cut.wanted_errors[entry]);
     }

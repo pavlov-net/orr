@@ -24,7 +24,7 @@ void main(uint3 id: SV_DispatchThreadID)
 {
     MeshGpu* mesh = root.scene.meshes + root.mesh;
     EditGroupGpu g = root.groups[id.x];
-    uint8_t* page = (uint8_t*)mesh.pages[g.page];
+    uint8_t* page = (uint8_t*)mesh_page(root.scene, mesh, g.page);
     PageHeader h = load_page_header(page);
     float step = mesh.position_step;
     for (uint k = 0; k < g.cluster_count; k++)

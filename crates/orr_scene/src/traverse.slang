@@ -388,7 +388,7 @@ void candidates(CutGpu* cut, MeshGpu* mesh, uint slot, uint first, uint end)
     uint c = first;
     for (uint page = cluster_page(mesh, first); page < mesh.page_count && c < end; page++)
     {
-        if (mesh.pages[page] == 0)
+        if (mesh_page(root.scene, mesh, page) == 0)
         {
             c = min(end, mesh.page_clusters[page + 1]);
             continue;
@@ -603,9 +603,9 @@ void edit_clusters(SceneRoot* s, CutGpu* cut, uint slot, MeshGpu* mesh, Instance
     for (uint g = 0; g < mesh.edit.group_count; g++)
     {
         EditGroupGpu held = mesh.edit.groups[g];
-        uint8_t* data = (uint8_t*)mesh.pages[held.page];
+        uint8_t* data = (uint8_t*)mesh_page(s, mesh, held.page);
         uint mesh_first = mesh.page_clusters[held.page] + held.first_cluster;
-        uint id_first = mesh.page_bases[held.page] + held.first_cluster;
+        uint id_first = mesh_page_base(s, mesh, held.page) + held.first_cluster;
         for (uint i = 0; i < held.cluster_count; i++)
         {
             Cluster cl = load_cluster(data, held.first_cluster + i);
@@ -720,7 +720,7 @@ bool node_at(MeshGpu* mesh, uint node, out Node* at, out uint page)
             hi = mid;
     }
     page = lo;
-    uint64_t base = mesh.node_pages[lo];
+    uint64_t base = mesh_node_page(root.scene, mesh, lo);
     if (base == 0)
         return false;
     at = (Node*)base + (node - t[lo].first_node);
@@ -746,7 +746,7 @@ void report(CutGpu* cut, uint entry, bool wanted, float error)
 void touch_cut(CutGpu* cut, MeshGpu* mesh, uint k)
 {
     if (k < mesh.fine_cuts)
-        report(cut, mesh.feedback_nodes + mesh.node_page_count + k, false, 0.0);
+        report(cut, mesh.node_pages + mesh.node_page_count + k, false, 0.0);
 }
 
 // Asks for the finer cut of a streaming mesh that would serve a copy tracing a cached cut, when
@@ -770,7 +770,7 @@ void want_cut(CutGpu* cut, MeshGpu* mesh, float scale, float distance, float lim
     if (mesh.rt_cuts[target].blas != 0)
         touch_cut(cut, mesh, target);
     else
-        report(cut, mesh.feedback_nodes + mesh.node_page_count + target, true, have);
+        report(cut, mesh.node_pages + mesh.node_page_count + target, true, have);
 }
 
 // Node page `page`, unless it is pinned: the top page, and every node page of a mesh whose
@@ -779,7 +779,7 @@ void report_node_page(CutGpu* cut, MeshGpu* mesh, uint page, bool wanted, float 
 {
     if (page == 0xffffffff || page == 0 || mesh.pinned_pages == mesh.page_count)
         return;
-    report(cut, mesh.feedback_nodes + page, wanted, error);
+    report(cut, mesh.node_pages + page, wanted, error);
 }
 
 // Mesh page `page`, if it streams.
@@ -787,7 +787,7 @@ void report_mesh_page(CutGpu* cut, MeshGpu* mesh, uint page, bool wanted, float 
 {
     if (page < mesh.pinned_pages)
         return;
-    report(cut, mesh.feedback_pages + page, wanted, error);
+    report(cut, mesh.pages + page, wanted, error);
 }
 
 // Whether the group cluster `cl` was simplified from cannot be drawn: its mesh page is not
@@ -799,7 +799,7 @@ bool finer_absent(MeshGpu* mesh, Cluster cl)
 {
     if (mesh.pinned_pages == mesh.page_count)
         return false;
-    return mesh.pages[((Group*)mesh.groups)[cl.from_group].page] == 0;
+    return mesh_page(root.scene, mesh, ((Group*)mesh.groups)[cl.from_group].page) == 0;
 }
 
 // Adds a thread's hidden tests and the decisions the hidden threshold took to counter
@@ -892,7 +892,7 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         // group is terminal, so its page is neither wanted nor read.
         if (l.level >= 0 && int(g.depth) < l.level && !isinf(g.error))
             return;
-        data = (uint8_t*)mesh.pages[g.page];
+        data = (uint8_t*)mesh_page(s, mesh, g.page);
         if (data == nullptr)
         {
             // The clusters this group simplifies into stand in for it. The request ranks by the
@@ -920,7 +920,7 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
             report_mesh_page(cut, mesh, g.page, false, 0.0);
         count = g.cluster_count;
         mesh_first = mesh.page_clusters[g.page] + g.first_cluster;
-        id_first = mesh.page_bases[g.page] + g.first_cluster;
+        id_first = mesh_page_base(s, mesh, g.page) + g.first_cluster;
     }
     // A cluster whose group no threshold takes, or one a debug level holds.
     bool fixed = l.level >= 0 || (item.flags & ITEM_FIXED) != 0 || isinf(g.error);

@@ -1343,9 +1343,10 @@ fn listed_streamed_clusters(root: &SceneRoot, sets: &orr_pack::mesh::ClusterSets
         let model: ModelGpu = read_buffer(root.models.offset(u64::from(inst.model)), 1)[0];
         let mesh: MeshGpu = read_buffer(root.meshes.offset(u64::from(model.mesh)), 1)[0];
         let n = u64::from(mesh.page_count);
-        let pages: Vec<u64> = read_buffer(mesh.pages, n);
+        let first = u64::from(mesh.pages);
+        let pages: Vec<u64> = read_buffer(root.mesh_pages.offset(first), n);
         let firsts: Vec<u32> = read_buffer(mesh.page_clusters, n + 1);
-        let bases: Vec<u32> = read_buffer(mesh.page_bases, n);
+        let bases: Vec<u32> = read_buffer(root.mesh_page_bases.offset(first), n);
         let page_of = |c: u32| firsts.partition_point(|&f| f <= c) - 1;
         let ids: Vec<u32> = if e.set == GATHERED_SET {
             let at = i * 2 * GATHERED_CLUSTERS;
@@ -1464,7 +1465,8 @@ fn a_streaming_emissive_mesh_lists_only_resident_clusters() {
     let resident = |root: &SceneRoot| -> Vec<usize> {
         let model: ModelGpu = read_buffer(root.models.offset(u64::from(models[0].0)), 1)[0];
         let mesh: MeshGpu = read_buffer(root.meshes.offset(u64::from(model.mesh)), 1)[0];
-        let pages: Vec<u64> = read_buffer(mesh.pages, u64::from(mesh.page_count));
+        let table = root.mesh_pages.offset(u64::from(mesh.pages));
+        let pages: Vec<u64> = read_buffer(table, u64::from(mesh.page_count));
         (pinned..pages.len()).filter(|&p| pages[p] != 0).collect()
     };
     let mut f = scenes.begin_frame(&frame(&list)).unwrap();

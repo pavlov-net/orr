@@ -26,8 +26,8 @@ use orr_scene::orr_gpu::{
     Texture, TextureIndex, TextureRegion,
 };
 use orr_scene::testing::{
-    assert_clean, assert_clean_on, device, global_tables, mount_pending, mounted_texture,
-    read_buffer_on, read_texture_on, wait_on,
+    assert_clean, assert_clean_on, device, global_tables, mesh_page_tables, mount_pending,
+    mounted_texture, read_buffer_on, read_texture_on, wait_on,
 };
 use orr_scene::{
     BoundTexture, Budgets, DirectionalLight, DiscProfile, EmissiveGpu, Error, FrameDesc, FrameTime,
@@ -426,7 +426,8 @@ fn snapshot(scenes: &Scenes, gpu: &Gpu<'_>, m: MountId, a: &Archive) -> Vec<Vec<
                 assert_eq!(gpu.bytes(base, blob0.len()), blob0);
                 assert_eq!(mesh.page_count as usize, mi.pages.len());
                 assert_eq!(mesh.node_page_count as usize, mi.node_pages.len());
-                let pages = gpu.values(mesh.pages, mesh.page_count);
+                let (table, ..) = mesh_page_tables(scenes);
+                let pages = gpu.values(table.offset(u64::from(mesh.pages)), mesh.page_count);
                 for (p, &address) in mi.pages.iter().zip(&pages) {
                     let mut want = vec![0; p.resident_len as usize];
                     decode_page(&blob(a, me, p.blob as usize), &mut want).unwrap();
@@ -434,7 +435,10 @@ fn snapshot(scenes: &Scenes, gpu: &Gpu<'_>, m: MountId, a: &Archive) -> Vec<Vec<
                     assert!(got == want, "page {} of {}", p.blob, a.name(me));
                     out.push(got);
                 }
-                let nodes = gpu.values(mesh.node_pages, mesh.node_page_count);
+                let nodes = gpu.values(
+                    table.offset(u64::from(mesh.node_pages)),
+                    mesh.node_page_count,
+                );
                 for (p, &address) in mi.node_pages.iter().zip(&nodes) {
                     let want = blob(a, me, p.blob as usize);
                     let got = gpu.bytes(address, want.len());
@@ -1684,9 +1688,13 @@ fn tables(scenes: &Scenes, gpu: &Gpu<'_>, model: ModelId) -> (Vec<u64>, Vec<u64>
     let (models, meshes, _) = global_tables(scenes);
     let model: ModelGpu = gpu.value(models.offset(u64::from(model.0)));
     let mesh: MeshGpu = gpu.value(meshes.offset(u64::from(model.mesh)));
+    let (table, ..) = mesh_page_tables(scenes);
     (
-        gpu.values(mesh.node_pages, mesh.node_page_count),
-        gpu.values(mesh.pages, mesh.page_count),
+        gpu.values(
+            table.offset(u64::from(mesh.node_pages)),
+            mesh.node_page_count,
+        ),
+        gpu.values(table.offset(u64::from(mesh.pages)), mesh.page_count),
     )
 }
 
@@ -3827,7 +3835,8 @@ fn mesh_of(scenes: &Scenes, gpu: &Gpu<'_>, model: ModelId) -> (MeshGpu, Vec<u64>
     let (models, meshes, _) = global_tables(scenes);
     let model: ModelGpu = gpu.value(models.offset(u64::from(model.0)));
     let mesh: MeshGpu = gpu.value(meshes.offset(u64::from(model.mesh)));
-    let pages = gpu.values(mesh.pages, mesh.page_count);
+    let (table, ..) = mesh_page_tables(scenes);
+    let pages = gpu.values(table.offset(u64::from(mesh.pages)), mesh.page_count);
     (mesh, pages)
 }
 
@@ -4039,7 +4048,10 @@ fn stream_sheets(dev: &Device) {
     let (mesh, _) = mesh_of(&scenes, &gpu, models[0]);
     let first = landed[0];
     let firsts: Vec<u32> = gpu.values(mesh.page_clusters, mesh.page_count + 1);
-    let bases: Vec<u32> = gpu.values(mesh.page_bases, mesh.page_count);
+    let bases: Vec<u32> = gpu.values(
+        root.mesh_page_bases.offset(u64::from(mesh.pages)),
+        mesh.page_count,
+    );
     let refs: Vec<orr_scene::ClusterRef> = gpu.values(
         root.clusters.offset(u64::from(bases[first])),
         firsts[first + 1] - firsts[first],

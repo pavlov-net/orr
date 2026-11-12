@@ -393,6 +393,12 @@ pub fn model_materials(scenes: &crate::Scenes) -> GpuPtr<u32> {
     scenes.model_materials()
 }
 
+/// The mesh page table and the page bases beside it, which `MeshGpu::pages` and `node_pages`
+/// index, and the entries they hold room for.
+pub fn mesh_page_tables(scenes: &crate::Scenes) -> (GpuPtr<u64>, GpuPtr<u32>, u32) {
+    scenes.mesh_page_tables()
+}
+
 /// Entries a scene's tables hold room for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TableEntries {

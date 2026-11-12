@@ -274,7 +274,7 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         InstanceGpu inst = copy_record(s, copy);
         ModelGpu* model = s.models + inst.model;
         MeshGpu* mesh = s.meshes + model.mesh;
-        uint8_t* page = (uint8_t*)mesh.pages[w.page];
+        uint8_t* page = (uint8_t*)mesh_page(s, mesh, w.page);
         Placement placed = (Placement)0;
         Placement p = (Placement)0;
         Cluster c = (Cluster)0;

@@ -136,7 +136,7 @@ void select(uint3 id: SV_DispatchThreadID)
     {
         uint c = sm.cut_clusters[i];
         uint page = cluster_page(mesh, c);
-        uint8_t* data = (uint8_t*)mesh.pages[page];
+        uint8_t* data = (uint8_t*)mesh_page(s, mesh, page);
         if (data != nullptr && !section_hidden(inst, load_cluster(data, c - mesh.page_clusters[page]).section))
             n++;
     }
@@ -156,7 +156,7 @@ void select(uint3 id: SV_DispatchThreadID)
     {
         uint c = sm.cut_clusters[i];
         uint page = cluster_page(mesh, c);
-        uint8_t* data = (uint8_t*)mesh.pages[page];
+        uint8_t* data = (uint8_t*)mesh_page(s, mesh, page);
         if (data != nullptr && !section_hidden(inst, load_cluster(data, c - mesh.page_clusters[page]).section))
             s.skin_work[w++] = uint2(e, c);
     }
@@ -225,7 +225,7 @@ void skin(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     SkinMeshGpu* sm = mesh.skin;
     uint c = item.y;
     uint page = cluster_page(mesh, c);
-    uint8_t* data = (uint8_t*)mesh.pages[page];
+    uint8_t* data = (uint8_t*)mesh_page(s, mesh, page);
     PageHeader h = load_page_header(data);
     uint local = c - mesh.page_clusters[page];
     Cluster cl = load_cluster(data, local);
@@ -286,7 +286,7 @@ void skin(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     if (f.traced == 0)
         return;
     Instantiate r;
-    r.cluster_id_offset = mesh.page_bases[page] + local;
+    r.cluster_id_offset = mesh_page_base(s, mesh, page) + local;
     r.geometry_index_offset = 0;
     r.template_address = sm.templates[c];
     r.vertices = (uint64_t)(k.positions + base);

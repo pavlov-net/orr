@@ -1873,7 +1873,7 @@ public bool surface_chains(PathRoot r, GSurface g)
     MeshGpu* mesh = s.meshes + model.mesh;
     if (mesh.casters.count == 0 || inst.first_emissive == NO_EMISSIVE)
         return false;
-    uint id = mesh_cluster_id(mesh, g.cluster);
+    uint id = mesh_cluster_id(s, mesh, g.cluster);
     ClusterRef cr = s.clusters[id];
     Cluster c = load_cluster(cr.page, cr.local);
     uint rank = mesh.casters.ranks[c.section];

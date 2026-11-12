@@ -7850,7 +7850,7 @@ fn debug_level_of_a_streaming_mesh(items: &[Item], eye: Vec3, target: Vec3, leve
         let record: ModelGpu = read_buffer(models.offset(u64::from(model.0)), 1)[0];
         let mesh: MeshGpu = read_buffer(meshes.offset(u64::from(record.mesh)), 1)[0];
         for &p in &finer {
-            let e = mesh.feedback_pages as usize + p;
+            let e = mesh.pages as usize + p;
             let bit = |words: &[u32]| words[e / 32] >> (e % 32) & 1 != 0;
             assert!(
                 !bit(&wanted) && !bit(&touched) && pages[p] == 0,
@@ -7891,14 +7891,15 @@ fn mesh_pages(w: &World, model: ModelId) -> (Vec<u64>, Vec<u32>, Vec<u64>) {
     let (models, meshes, _) = orr_scene::testing::global_tables(&w.scenes);
     let model: ModelGpu = read_buffer(models.offset(u64::from(model.0)), 1)[0];
     let mesh: MeshGpu = read_buffer(meshes.offset(u64::from(model.mesh)), 1)[0];
+    let (table, bases, _) = orr_scene::testing::mesh_page_tables(&w.scenes);
     let n = u64::from(mesh.page_count);
     let nodes = match mesh.node_page_count {
         0 => vec![1],
-        k => read_buffer(mesh.node_pages, u64::from(k)),
+        k => read_buffer(table.offset(u64::from(mesh.node_pages)), u64::from(k)),
     };
     (
-        read_buffer(mesh.pages, n),
-        read_buffer(mesh.page_bases, n),
+        read_buffer(table.offset(u64::from(mesh.pages)), n),
+        read_buffer(bases.offset(u64::from(mesh.pages)), n),
         nodes,
     )
 }

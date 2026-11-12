@@ -57,8 +57,6 @@ const STATED: &[(&str, Follows)] = &[
     // The renderer.
     ("CLAS pool bits", MESH_PAGES),
     ("CLAS pool runs", MESH_PAGES),
-    ("mesh page table", Reserved),
-    ("mesh page bases", Reserved),
     ("texture feedback records", Reserved),
     ("texture feedback readback", Reserved),
     ("materials", Fixed),
@@ -110,12 +108,9 @@ const STATED: &[(&str, Follows)] = &[
     // The scene's traversal and the cuts it builds.
     ("traversal queue", Reserved),
     ("candidate cut", Reserved),
-    ("touched page entries", Reserved),
-    ("wanted page entries", Reserved),
-    ("wanted page errors", Reserved),
     ("wanted page buckets", Fixed),
     ("page requests", Setting("Budgets::traversal_requests")),
-    ("cut readback", Reserved),
+    ("cut readback", Setting("Budgets::traversal_requests")),
     ("cut args", Fixed),
     ("cut admission buckets", Fixed),
     ("cut keys", Reserved),

@@ -258,7 +258,8 @@ pub(crate) struct CutSizes {
     pub(crate) rt_bytes: u64,
     /// Entries of the model table, which the merged cuts follow as it grows.
     pub(crate) models: u32,
-    /// Entries of the mesh page table, by which the feedback reports.
+    /// Entries of the mesh page table, by which the feedback reports and which it follows as
+    /// the table grows.
     pub(crate) entries: u32,
     /// Wanted entries the feedback keeps.
     pub(crate) requests: u32,
@@ -270,10 +271,52 @@ impl CutSizes {
         self.entries.div_ceil(32)
     }
 
-    /// Readback words per frame in flight: counters, touched entries, then kept requests.
-    fn readback_words(&self) -> usize {
-        COUNTERS + self.feedback_words() as usize + 2 * self.requests as usize
+    /// Words a frame whose bitmaps took `words` reads back: counters, touched entries, then
+    /// kept requests.
+    fn readback_words(&self, words: u32) -> usize {
+        COUNTERS + words as usize + 2 * self.requests as usize
     }
+}
+
+/// What the feedback keeps per entry of the mesh page table.
+struct EntryBits {
+    touched: Allocation<u32>,
+    wanted: Allocation<u32>,
+    /// Zero between frames: every frame clears the errors it set.
+    errors: Allocation<u32>,
+}
+
+impl EntryBits {
+    /// Bitmaps of `words` words and an error per bit.
+    fn new(device: &Device, words: u32) -> Result<Self> {
+        let dl = MemoryKind::DeviceLocal;
+        let n = u64::from(words.max(1));
+        Ok(Self {
+            touched: device.gpu_malloc(dl, n, "touched page entries")?,
+            wanted: device.gpu_malloc(dl, n, "wanted page entries")?,
+            errors: device.gpu_malloc(dl, 32 * n, "wanted page errors")?,
+        })
+    }
+
+    /// `gpu` naming these bitmaps of `words` words.
+    fn name(&self, gpu: CutGpu, words: u32) -> CutGpu {
+        CutGpu {
+            touched: self.touched.gpu(),
+            wanted: self.wanted.gpu(),
+            wanted_errors: self.errors.gpu(),
+            feedback_words: words,
+            ..gpu
+        }
+    }
+}
+
+/// The readback of a frame whose bitmaps took `words` words.
+fn readback(device: &Device, sizes: &CutSizes, words: u32) -> Result<Allocation<u32>> {
+    Ok(device.gpu_malloc(
+        MemoryKind::Readback,
+        sizes.readback_words(words) as u64,
+        "cut readback",
+    )?)
 }
 
 /// The most of each built-cut table the kernels can name: CLAS and builds are indexed in 32
@@ -516,10 +559,13 @@ pub(crate) struct Cuts {
     _blocks: Vec<Allocation<u8>>,
     counters: GpuPtr<u32>,
     args: GpuPtr<u32>,
-    touched: GpuPtr<u32>,
+    entry_bits: EntryBits,
+    /// The errors of `entry_bits` hold what their memory held: no frame has cleared them.
+    errors_unset: bool,
     feedback: GpuPtr<FeedbackGpu>,
-    /// Counters, touched entries, then kept requests, per frame in flight.
-    readback: Allocation<u32>,
+    /// Per frame in flight: counters, touched entries, then kept requests, as the frame that
+    /// used the slot last sized them.
+    readback: Vec<Allocation<u32>>,
     updates: u64,
     /// The scale of the gathered cuts' threshold over the configured one, which the memory
     /// scale serves first, and what each frame in flight ran with.
@@ -536,6 +582,8 @@ struct Ran {
     /// What the tables of the built cuts held, and their bytes.
     sizes: RtSizes,
     bytes: u64,
+    /// Words of the feedback's bitmaps.
+    words: u32,
 }
 
 /// What one frame's traversal of a scene reads.
@@ -589,10 +637,8 @@ impl Cuts {
         let model_cut = merged_cuts(device, sizes.models)?;
         let counters = block(4 * COUNTERS as u64, "cut counters")?.cast();
         let args = block(4 * ARGS_TOTAL, "cut args")?.cast();
-        let words = u64::from(sizes.feedback_words());
-        let touched = block(4 * words, "touched page entries")?.cast();
-        let wanted = block(4 * words, "wanted page entries")?.cast();
-        let wanted_errors = block(4 * 32 * words, "wanted page errors")?.cast();
+        let words = sizes.feedback_words();
+        let entry_bits = EntryBits::new(device, words)?;
         let histogram = block(4 * u64::from(FEEDBACK_BUCKETS), "wanted page buckets")?.cast();
         let admit = block(4 * u64::from(ADMIT_WORDS), "cut admission buckets")?.cast();
         let feedback = block(
@@ -600,7 +646,7 @@ impl Cuts {
             "page requests",
         )?
         .cast();
-        let gpu = rt.name(CutGpu {
+        let gpu = CutGpu {
             slots: slot_cut.gpu(),
             queue: lists.queue.each_ref().map(Allocation::gpu),
             candidates: lists.candidates.gpu(),
@@ -614,9 +660,9 @@ impl Cuts {
             args,
             records: GpuPtr::NULL,
             part_lists: GpuPtr::NULL,
-            touched,
-            wanted,
-            wanted_errors,
+            touched: GpuPtr::NULL,
+            wanted: GpuPtr::NULL,
+            wanted_errors: GpuPtr::NULL,
             histogram,
             feedback,
             admit,
@@ -626,15 +672,20 @@ impl Cuts {
             job_capacity: 0,
             key_mask: 0,
             feedback_capacity: sizes.requests,
-            feedback_words: sizes.feedback_words(),
+            feedback_words: 0,
             _pad: 0,
-        });
+        };
+        let gpu = rt.name(entry_bits.name(gpu, words));
         let ran = Ran {
             scale: 1.0,
             rt_scale: 1.0,
             sizes: rt.sizes,
             bytes: rt.bytes,
+            words,
         };
+        let readback = (0..fif.max(1))
+            .map(|_| readback(device, &sizes, words))
+            .collect::<Result<_>>()?;
         Ok(Self {
             sizes,
             gpu,
@@ -655,13 +706,10 @@ impl Cuts {
             _blocks: blocks,
             counters,
             args,
-            touched,
+            entry_bits,
+            errors_unset: true,
             feedback,
-            readback: device.gpu_malloc(
-                MemoryKind::Readback,
-                (sizes.readback_words() * fif.max(1) as usize) as u64,
-                "cut readback",
-            )?,
+            readback,
             updates: 0,
             gather: Detail::new(),
             ran: vec![ran; fif.max(1) as usize],
@@ -754,6 +802,24 @@ impl Cuts {
             self.slot_cut = slot_cut;
             self.sizes.slots = slots;
         }
+        Ok(())
+    }
+
+    /// Gives the feedback a bit and an error for each of `entries` entries of the mesh page
+    /// table, before the frame records anything that reads them. Fails without device memory,
+    /// changing nothing.
+    pub(crate) fn follow_entries(&mut self, device: &Device, entries: u32) -> Result<()> {
+        if entries <= self.sizes.entries {
+            return Ok(());
+        }
+        let words = entries.div_ceil(32);
+        let entry_bits = EntryBits::new(device, words)?;
+        let gpu = entry_bits.name(self.gpu, words);
+        self.record = cut_record(device, gpu)?;
+        self.gpu = gpu;
+        self.entry_bits = entry_bits;
+        self.errors_unset = true;
+        self.sizes.entries = entries;
         Ok(())
     }
 
@@ -851,9 +917,7 @@ impl Cuts {
     }
 
     fn readback(&self, slot: usize) -> &[u32] {
-        let data = self.readback.as_slice().expect("readback is mapped");
-        let words = self.sizes.readback_words();
-        &data[slot * words..(slot + 1) * words]
+        self.readback[slot].as_slice().expect("readback is mapped")
     }
 
     /// The traversal figures of the frame that used readback slot `slot`.
@@ -867,7 +931,7 @@ impl Cuts {
     /// Adds what the frame that used readback slot `slot` read and wanted to `out`.
     pub(crate) fn feedback(&self, slot: usize, out: &mut PageFeedback) {
         let data = self.readback(slot);
-        let words = self.sizes.feedback_words() as usize;
+        let words = self.ran[slot].words as usize;
         let touched = &data[COUNTERS..][..words];
         if out.touched.len() < words {
             out.touched.resize(words, 0);
@@ -898,8 +962,13 @@ impl Cuts {
     ) -> Result<()> {
         let (focus_cell, focus_offset) = f.focus.unwrap_or(([0; 4], [0.0; 4]));
         let mut flags = if f.focus.is_some() { TRAVERSE_FOCUS } else { 0 };
-        if self.updates == 0 {
+        if self.errors_unset {
             flags |= TRAVERSE_ERRORS;
+        }
+        let words = self.sizes.feedback_words();
+        // The frame that used the slot before has completed and been read.
+        if self.ran[f.slot].words != words {
+            self.readback[f.slot] = readback(device, &self.sizes, words)?;
         }
         let rt_scale = (self.gather.scale() / f.visible_scale).max(1.0);
         self.ran[f.slot] = Ran {
@@ -907,6 +976,7 @@ impl Cuts {
             rt_scale,
             sizes: self.rt.sizes,
             bytes: self.rt.bytes,
+            words,
         };
         let base = TraverseRoot {
             scene: f.scene,
@@ -942,18 +1012,14 @@ impl Cuts {
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         };
         list.begin_pass("traverse", false);
-        let errors = if self.updates == 0 {
-            32 * self.sizes.feedback_words()
-        } else {
-            0
-        };
+        let errors = if self.errors_unset { 32 * words } else { 0 };
         let cleared = self
             .rt
             .sizes
             .keys
             .max(self.sizes.models)
             .max(COUNTERS as u32)
-            .max(self.sizes.feedback_words())
+            .max(words)
             .max(errors)
             .max(FEEDBACK_BUCKETS)
             .max(4 * ADMIT_BUCKETS);
@@ -1009,12 +1075,11 @@ impl Cuts {
                 _pad: 0,
             },
         )?;
-        let words = groups(self.sizes.feedback_words());
-        list.dispatch(p.get(k.count), fb, words);
+        list.dispatch(p.get(k.count), fb, groups(words));
         step(list);
         list.dispatch(p.get(k.feedback_select), fb, [1, 1, 1]);
         step(list);
-        list.dispatch(p.get(k.write), fb, words);
+        list.dispatch(p.get(k.write), fb, groups(words));
         step(list);
         list.end_pass();
         list.begin_pass("fill cuts", false);
@@ -1059,17 +1124,14 @@ impl Cuts {
         } else {
             step(list);
         }
-        let at = self
-            .readback
-            .gpu()
-            .offset((self.sizes.readback_words() * f.slot) as u64);
-        let words = u64::from(self.sizes.feedback_words());
+        let at = self.readback[f.slot].gpu();
+        let words = u64::from(words);
         list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
         list.copy(at.cast(), self.counters.cast(), 4 * COUNTERS as u64);
         if words > 0 {
             list.copy(
                 at.offset(COUNTERS as u64).cast(),
-                self.touched.cast(),
+                self.entry_bits.touched.gpu().cast(),
                 4 * words,
             );
         }
@@ -1083,6 +1145,7 @@ impl Cuts {
         list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
         list.end_pass();
         self.updates += 1;
+        self.errors_unset = false;
         Ok(())
     }
 }

@@ -172,7 +172,7 @@ public struct CutGpu
     public uint8_t* records;       // cluster BLAS build records, by job
     public PartListGpu* part_lists;
     // What the traversal tells the loading side, per entry of the mesh page table
-    // (`MeshGpu.feedback_pages`, `feedback_nodes`): the entries it read and those it wanted,
+    // (`MeshGpu.pages`, `node_pages`): the entries it read and those it wanted,
     // a bit each, and the largest error each wanted entry would refine (f32 bits, 0 until
     // wanted). The bitmaps clear each frame; an error clears where `feedback`'s `write` reads
     // it, which keeps the wanted entries of the largest errors.

@@ -209,7 +209,7 @@ public struct MeshLevel
 }
 
 // A resident cluster, named by its cluster id: the id its CLAS carries, its page's base in
-// `MeshGpu.page_bases` plus its index in the page.
+// `SceneRoot.mesh_page_bases` plus its index in the page.
 public struct ClusterRef
 {
     public uint8_t* page;
@@ -303,14 +303,10 @@ public struct SetTablesGpu
     public uint cached;
 }
 
-// A mesh made resident from a mounted pack, or an edit of one. Page and node page addresses
-// are 0 while their data is not resident.
+// A mesh made resident from a mounted pack, or an edit of one.
 public struct MeshGpu
 {
-    public uint64_t* pages;        // resident page per MeshHeader page
-    public uint64_t* node_pages;   // node page per MeshHeader node page
     public uint* page_clusters;    // first mesh cluster index per page, then the cluster count
-    public uint* page_bases;       // per page while it is resident: the cluster id of its first cluster
     public MeshLevel* levels;      // finest first; none in DAG mode
     public uint page_count;
     public uint node_page_count;
@@ -337,8 +333,8 @@ public struct MeshGpu
     public uint pinned_pages;      // pages resident from mount, all of them unless pages stream
     public SkinMeshGpu* skin;      // MESH_SKIN meshes: what skinned copies build from, else null
     public EditGpu* edit;          // an edit's mesh: what stays at level 0; its copies always gather their cut
-    public uint feedback_pages;    // the mesh page table entry the traversal's feedback reports page 0 at
-    public uint feedback_nodes;    // ...node page 0 at, the finer cuts following the node pages
+    public uint pages;             // its first entry of SceneRoot.mesh_pages, one per MeshHeader page; an edit's own, of its copies and its source's other pages
+    public uint node_pages;        // its first entry per MeshHeader node page, an entry per finer cut following them
     public uint fine_cuts;         // the first `fine_cuts` cached cuts need streamed pages: built once wanted, BLAS 0 until then
     public uint section_count;     // sections of the mesh, which a model's cage sections follow
     public uint opaque_sections;   // the sections of opaque class, as `PartGpu.sections`
@@ -426,6 +422,8 @@ public struct SceneRoot
     public MeshGpu* meshes;          // global
     public MaterialGpu* materials;   // global
     public ClusterRef* clusters;     // global, by cluster id
+    public uint64_t* mesh_pages;     // global, each mesh's entries from MeshGpu.pages and node_pages: where the page or node page is resident, or 0
+    public uint* mesh_page_bases;    // global, beside `mesh_pages`: per resident mesh page, the cluster id of its first cluster
     public uint* model_materials;    // global, each model's section materials from ModelGpu.materials
     public uint* material_sets;      // the consumer's: MaterialId per model section per set
     public uint* page_material_sets; // the placed pages': MaterialId per model section
@@ -638,6 +636,24 @@ public bool copy_present(SceneRoot* s, uint copy, float u)
     return to == (u < float(fade) / float(CHAIN_FADE_FRAMES));
 }
 
+// Where page `page` of `mesh` is resident, or 0.
+public uint64_t mesh_page(SceneRoot* s, MeshGpu* mesh, uint page)
+{
+    return s.mesh_pages[mesh.pages + page];
+}
+
+// Where node page `page` of `mesh` is resident, or 0.
+public uint64_t mesh_node_page(SceneRoot* s, MeshGpu* mesh, uint page)
+{
+    return s.mesh_pages[mesh.node_pages + page];
+}
+
+// The cluster id of the first cluster of page `page` of `mesh`, which is resident.
+public uint mesh_page_base(SceneRoot* s, MeshGpu* mesh, uint page)
+{
+    return s.mesh_page_bases[mesh.pages + page];
+}
+
 // The page of `mesh` holding mesh cluster `cluster`.
 public uint cluster_page(MeshGpu* mesh, uint cluster)
 {
@@ -656,12 +672,12 @@ public uint cluster_page(MeshGpu* mesh, uint cluster)
 
 // The cluster id of mesh cluster `cluster` of `mesh`, whose page is resident. A mounted mesh's
 // pinned pages take one run of ids from page 0's; an edit's own pages take ids of the edit's.
-public uint mesh_cluster_id(MeshGpu* mesh, uint cluster)
+public uint mesh_cluster_id(SceneRoot* s, MeshGpu* mesh, uint cluster)
 {
     if (mesh.edit == nullptr && cluster < mesh.page_clusters[mesh.pinned_pages])
-        return mesh.page_bases[0] + cluster;
+        return mesh_page_base(s, mesh, 0) + cluster;
     uint page = cluster_page(mesh, cluster);
-    return mesh.page_bases[page] + cluster - mesh.page_clusters[page];
+    return mesh_page_base(s, mesh, page) + cluster - mesh.page_clusters[page];
 }
 
 // Entry `index` of the transforms in `transforms` as a row-major [L | t] relative to the group's

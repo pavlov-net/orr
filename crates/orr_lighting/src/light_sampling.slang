@@ -782,7 +782,7 @@ public bool list_cluster(SceneRoot* s, EmissiveSelection e, uint entry, uint p, 
     uint slot = g.source;
     InstanceGpu inst = copy_record(s, slot);
     MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
-    cluster_id = e.index != nullptr ? mesh_cluster_id(mesh, e.clusters[p]) : e.clusters[p];
+    cluster_id = e.index != nullptr ? mesh_cluster_id(s, mesh, e.clusters[p]) : e.clusters[p];
     ClusterRef r = s.clusters[cluster_id];
     Cluster c = load_cluster(r.page, r.local);
     SlotStateGpu st = s.slot_state[slot];

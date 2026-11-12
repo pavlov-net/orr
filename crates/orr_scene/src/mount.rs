@@ -53,7 +53,7 @@ use crate::stream::{
     Streaming,
 };
 use crate::subd::{CageShape, CageTables, ModelCage};
-use crate::table::Table;
+use crate::table::{Column, Table, TableCopy, grown};
 use crate::tiles::{TexStream, TileGrid};
 use crate::traverse::{PAGED_DEPTH, PageFeedback};
 use crate::upload::Record;
@@ -1753,10 +1753,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                 // mount's block.
                 gpu: unsafe {
                     MeshGpu {
-                        pages: GpuPtr::NULL,
-                        node_pages: GpuPtr::NULL,
                         page_clusters: GpuPtr::from_address(orr_gpu::GpuAddress(m.page_clusters)),
-                        page_bases: GpuPtr::NULL,
                         levels: table(m.header.levels).cast(),
                         page_count: pages,
                         node_page_count: node_pages,
@@ -1787,8 +1784,8 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                         },
                         skin: GpuPtr::NULL,
                         edit: GpuPtr::NULL,
-                        feedback_pages: 0,
-                        feedback_nodes: 0,
+                        pages: 0,
+                        node_pages: 0,
                         fine_cuts: 0,
                         section_count: m.sections,
                         opaque_sections: m.header.opaque_sections,
@@ -2368,10 +2365,72 @@ pub(crate) struct Hierarchy {
     pub(crate) depth: u32,
 }
 
-/// Capacities of the global tables that do not grow.
-#[derive(Clone, Copy)]
-pub(crate) struct TableSizes {
-    pub(crate) page_table: u32,
+/// The mesh page table: a run of entries per mounted mesh and per edit, an entry per page,
+/// then per node page, then per finer cut. A page's or a node page's entry holds where it is
+/// resident, or 0, and `bases` holds beside a resident page's entry the cluster id of its
+/// first cluster. Meshes name their runs by their first entry, and the traversal's feedback
+/// reports by entry.
+pub(crate) struct MeshPages {
+    pub(crate) table: Column<u64>,
+    pub(crate) bases: Column<u32>,
+    ranges: Mutex<RangeAllocator>,
+}
+
+impl MeshPages {
+    fn new(device: &Device) -> Result<Self> {
+        let n = MemoryPriority::Normal;
+        Ok(Self {
+            table: Column::new(device, n, "mesh page table", false)?,
+            bases: Column::new(device, n, "mesh page bases", false)?,
+            ranges: Mutex::new(RangeAllocator::new(0)),
+        })
+    }
+
+    /// Entries the table holds room for.
+    pub(crate) fn entries(&self) -> u32 {
+        self.table.capacity()
+    }
+
+    /// The first of `count` consecutive free entries. Without a free run that long the table
+    /// and the bases grow as [`grown`] says. Fails past what either can hold or without
+    /// device memory for the grown ones, leaving them as they were.
+    fn alloc(&self, device: &Device, count: u32) -> Result<u32> {
+        // A run of no entries takes none, and its start names no entry.
+        if count == 0 {
+            return Ok(0);
+        }
+        let ranges = &mut *self.ranges.lock().unwrap();
+        if let Some(first) = ranges.alloc(count) {
+            return Ok(first);
+        }
+        let held = self.table.capacity();
+        let limit = self.table.limit().min(self.bases.limit());
+        let entries = grown("mesh page table entries", held, count, limit)?;
+        let table = self.table.room(device, entries)?;
+        let bases = self.bases.room(device, entries)?;
+        self.table.grow(table, entries);
+        self.bases.grow(bases, entries);
+        ranges.grow(held, entries);
+        Ok(ranges
+            .alloc(count)
+            .expect("the grown table has a free run of `count`"))
+    }
+
+    fn free(&self, first: u32, count: u32) {
+        self.ranges.lock().unwrap().free(first, count);
+    }
+
+    /// As [`Column::land`].
+    fn land(&self, frame: u64, copies: &mut Vec<TableCopy>, records: &mut Vec<Record>) {
+        self.table.land(frame, copies, records);
+        self.bases.land(frame, copies, records);
+    }
+
+    /// As [`Column::retire`].
+    fn retire(&self, completed: u64) {
+        self.table.retire(completed);
+        self.bases.retire(completed);
+    }
 }
 
 /// The render thread's mounts and the global model and mesh tables they fill.
@@ -2383,11 +2442,8 @@ pub(crate) struct Mounts {
     /// The section materials of every model, a run of them per model from its
     /// `ModelGpu::materials`.
     pub(crate) model_materials: Table<u32>,
-    page_table: Allocation<u64>,
-    /// Beside each page's entry of the page table, the cluster id of its first cluster.
-    page_bases: Allocation<u32>,
-    page_ranges: RangeAllocator,
-    sizes: TableSizes,
+    /// Shared with `streaming`, which writes the entries of what lands and leaves.
+    pub(crate) mesh_pages: Arc<MeshPages>,
     pages: Vec<Option<InstancePage>>,
     /// By page: the mount and unit of its records, which its windows of rows follow.
     page_keys: Vec<Option<(MountId, u32)>>,
@@ -2479,7 +2535,7 @@ type ResolvedTables = (
 /// stream, each after the coarser tile covering it, and instance pages' records stream.
 fn units(
     meshes: &[ResolvedMesh],
-    tables: &[(GpuPtr<u64>, GpuPtr<u32>)],
+    entries: &[u32],
     clusters: GpuPtr<ClusterRef>,
     textures: &[PlacedTexture],
     pages: &[(PageId, &PlacedPage)],
@@ -2491,7 +2547,7 @@ fn units(
     let mut mesh_pages = Vec::with_capacity(meshes.len());
     let mut mesh_streams = Vec::new();
     let mut fine = Vec::new();
-    for (mesh, (m, &(table, bases))) in (0u32..).zip(meshes.iter().zip(tables)) {
+    for (mesh, (m, &entries)) in (0u32..).zip(meshes.iter().zip(entries)) {
         let base = units.len() as u32;
         let mut mesh_streamed = Vec::new();
         let stream = m.streamed.as_ref().map(|pages| {
@@ -2499,8 +2555,7 @@ fn units(
                 entry: m.entry,
                 header: m.header,
                 pages: pages.clone(),
-                table,
-                bases,
+                entries,
                 clusters,
                 non_opaque: m.non_opaque.clone(),
                 groups: Arc::clone(&m.groups),
@@ -2589,7 +2644,7 @@ fn units(
                     entry: m.entry,
                     blob,
                     bytes,
-                    target: PoolTarget::Table(table.offset(u64::from(m.gpu.page_count) + n as u64)),
+                    target: PoolTarget::Table(entries + m.gpu.page_count + n as u32),
                 };
                 mesh_streamed.push(units.len() as u32);
                 (Start::Absent, vec![nodes + parent], Some(stream))
@@ -2692,29 +2747,25 @@ fn capacity(what: &'static str, capacity: u32) -> Error {
 impl Mounts {
     pub(crate) fn new(
         device: &Device,
-        sizes: TableSizes,
         budgets: &crate::Budgets,
         pools: crate::scenes::PoolBytes,
         accel: &Arc<AccelShared>,
         streams: GpuPtr<GpuPtr<TextureStreamGpu>>,
         fif: u32,
     ) -> Result<Self> {
-        let m = MemoryKind::DeviceLocal;
+        let mesh_pages = Arc::new(MeshPages::new(device)?);
         Ok(Self {
             entries: Vec::new(),
             accel: Arc::clone(accel),
             models: Table::new(device, MemoryPriority::Normal, "models")?,
             meshes: Table::new(device, MemoryPriority::Normal, "meshes")?,
             model_materials: Table::new(device, MemoryPriority::Normal, "model materials")?,
-            page_table: device.gpu_malloc(m, u64::from(sizes.page_table), "mesh page table")?,
-            page_bases: device.gpu_malloc(m, u64::from(sizes.page_table), "mesh page bases")?,
-            page_ranges: RangeAllocator::new(sizes.page_table),
-            sizes,
             pages: Vec::new(),
             page_keys: Vec::new(),
             page_generations: Vec::new(),
             retired: Vec::new(),
-            streaming: Streaming::new(device, budgets, pools, accel, streams, fif)?,
+            streaming: Streaming::new(device, budgets, pools, accel, &mesh_pages, streams, fif)?,
+            mesh_pages,
             owners: FxHashMap::default(),
             entry_owners: BTreeMap::new(),
             masks: HashMap::new(),
@@ -2893,11 +2944,9 @@ impl Mounts {
     /// an error, for [`Self::free_edit_ids`].
     fn take_edit_ids(&mut self, ids: &mut EditIds, device: &Device) -> Result<(u32, u32, u32)> {
         let mesh = *ids.mesh.insert(self.meshes.alloc(device, 1)?);
-        let start = *ids.pages_at.insert(
-            self.page_ranges
-                .alloc(ids.page_count)
-                .ok_or_else(|| capacity("mesh page table", self.sizes.page_table))?,
-        );
+        let start = *ids
+            .pages_at
+            .insert(self.mesh_pages.alloc(device, ids.page_count)?);
         let model = *ids.model.insert(self.models.alloc(device, 1)?);
         Ok((mesh, start, model))
     }
@@ -2908,7 +2957,7 @@ impl Mounts {
             self.meshes.free(mesh, 1);
         }
         if let Some(start) = ids.pages_at {
-            self.page_ranges.free(start, ids.page_count);
+            self.mesh_pages.free(start, ids.page_count);
         }
         if let Some(model) = ids.model {
             self.models.free(model, 1);
@@ -2965,8 +3014,8 @@ impl Mounts {
                 }),
             },
         )?;
-        let table = self.page_table.gpu().offset(u64::from(start));
-        let bases = self.page_bases.gpu().offset(u64::from(start));
+        let table = self.mesh_pages.table.entry(start);
+        let bases = self.mesh_pages.bases.entry(start);
 
         // Its own pages' clusters take its ids, page after page; the rest of its pages are the
         // source's, under the source's ids.
@@ -3030,8 +3079,7 @@ impl Mounts {
 
         // The merged stage would bypass what the edit pins. Part BLAS are gathered with the cut.
         let gpu = MeshGpu {
-            pages: table,
-            page_bases: bases,
+            pages: start,
             merge_error: f32::INFINITY,
             root_count: src_gpu
                 .root_count
@@ -3044,7 +3092,6 @@ impl Mounts {
             mask_count: 0,
             skin: tables.skin,
             edit: tables.edit,
-            feedback_pages: start,
             fine_cuts: 0,
             ..src_gpu
         };
@@ -3081,7 +3128,10 @@ impl Mounts {
                 nodes: 0,
             },
         );
-        let mirror = Arc::new(Mirror { table, bases, own });
+        let mirror = Arc::new(Mirror {
+            entries: start,
+            own,
+        });
         self.streaming.add_mirror(p.mount, p.mesh, &mirror);
         Ok(EditLive {
             model: id,
@@ -3588,17 +3638,13 @@ impl Mounts {
         &self.accel.clusters
     }
 
-    /// Moves the model, mesh and section-material tables that grew since the last upload:
-    /// see [`Table::land`].
-    pub(crate) fn land(
-        &self,
-        frame: u64,
-        copies: &mut Vec<crate::table::TableCopy>,
-        records: &mut Vec<Record>,
-    ) {
+    /// Moves the model, mesh, section-material and mesh page tables that grew since the last
+    /// upload: see [`Table::land`].
+    pub(crate) fn land(&self, frame: u64, copies: &mut Vec<TableCopy>, records: &mut Vec<Record>) {
         self.models.land(frame, copies, records);
         self.meshes.land(frame, copies, records);
         self.model_materials.land(frame, copies, records);
+        self.mesh_pages.land(frame, copies, records);
     }
 
     /// Frees the mounts unmounted at or before `completed`.
@@ -3606,6 +3652,7 @@ impl Mounts {
         self.models.retire(completed);
         self.meshes.retire(completed);
         self.model_materials.retire(completed);
+        self.mesh_pages.retire(completed);
         let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired)
             .into_iter()
             .partition(|(f, _)| *f <= completed);
@@ -3648,7 +3695,7 @@ impl Mounts {
         }
         for &(s, n) in &r.page_ranges {
             self.entry_owners.remove(&s);
-            self.page_ranges.free(s, n);
+            self.mesh_pages.free(s, n);
         }
         for &(s, n) in &r.material_ranges {
             self.model_materials.free(s, n);
@@ -3764,29 +3811,21 @@ impl Mounts {
             w.put(w.materials.table.entry(mid.0), &[w.materials.record(m)])?;
         }
         let mut mesh_ids = Vec::with_capacity(meshes.len());
-        let mut tables = Vec::with_capacity(meshes.len());
+        let mut entries = Vec::with_capacity(meshes.len());
         for m in &meshes {
             let id = self.meshes.alloc(w.device, 1)?;
             res.meshes.push(id);
             let n = m.page_addresses.len() as u32 + m.gpu.fine_cuts;
-            let start = self
-                .page_ranges
-                .alloc(n)
-                .ok_or_else(|| capacity("mesh page table", self.sizes.page_table))?;
+            let start = self.mesh_pages.alloc(w.device, n)?;
             res.page_ranges.push((start, n));
-            let table = self.page_table.gpu().offset(u64::from(start));
-            w.put(table, &m.page_addresses)?;
-            let bases = self.page_bases.gpu().offset(u64::from(start));
-            tables.push((table, bases));
+            w.put(self.mesh_pages.table.entry(start), &m.page_addresses)?;
+            entries.push(start);
             let pinned = &m.all_pages[..m.gpu.pinned_pages as usize];
             let firsts: Vec<u32> = pinned.iter().map(|p| m.cluster_base + p.first).collect();
-            w.put(bases, &firsts)?;
+            w.put(self.mesh_pages.bases.entry(start), &firsts)?;
             let gpu = MeshGpu {
-                pages: table,
-                page_bases: bases,
-                node_pages: table.offset(u64::from(m.gpu.page_count)),
-                feedback_pages: start,
-                feedback_nodes: start + m.gpu.page_count,
+                pages: start,
+                node_pages: start + m.gpu.page_count,
                 ..m.gpu
             };
             w.put(self.meshes.entry(id), &[gpu])?;
@@ -3914,7 +3953,7 @@ impl Mounts {
         }
         let units = units(
             &meshes,
-            &tables,
+            &entries,
             self.accel.clusters.gpu(),
             &res.placed_textures,
             &page_entries,

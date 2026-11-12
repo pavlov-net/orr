@@ -25,7 +25,6 @@ use std::time::{Duration, Instant};
 use orr::orr_gpu::{
     Device, Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
 };
-use orr::orr_pack::mesh::MeshInfo;
 use orr::orr_pack::texture::TextureInfo;
 use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
@@ -386,24 +385,9 @@ fn page_ids(pack: &Path) -> Vec<AssetId> {
         .collect()
 }
 
-/// The renderer's default budgets, with the mesh page table large enough for every mesh of the
-/// archive: a mounted mesh takes an entry per page and per finer cut, resident or not; a cut
-/// row bounds its finer cuts.
-fn budgets(pack: &Path) -> Budgets {
-    let archive = Archive::open(pack).unwrap_or_else(|e| panic!("{}: {e}", pack.display()));
-    let mut pages = 0u64;
-    for e in archive
-        .entries()
-        .iter()
-        .filter(|e| e.class == Class::Mesh as u16)
-    {
-        let head = entry_head(&archive, e.id).expect("a mesh header");
-        let info = MeshInfo::parse(&head).expect("a mesh header");
-        pages += (info.pages.len() + info.node_pages.len() + info.cut_rows.len()) as u64;
-    }
-    log::info!("the archive's meshes take {pages} mesh page table entries");
+/// The renderer's default budgets, with the overrides the environment names.
+fn budgets() -> Budgets {
     let defaults = Budgets::default();
-    let fit = |n: u64, default: u32| u32::try_from(n).expect("a u32 count").max(default);
     let mesh_page_pool =
         std::env::var("ZORAH_MESH_POOL_GIB").map_or(defaults.mesh_page_pool, |g| {
             orr::PoolSize::Bytes(
@@ -416,7 +400,6 @@ fn budgets(pack: &Path) -> Budgets {
         std::env::var(name).map_or(default, |n| n.parse().expect("a count"))
     };
     Budgets {
-        mesh_pages: fit(pages, defaults.mesh_pages),
         mesh_page_pool,
         initial_rt_cut_clusters: count("ZORAH_RT_CUT_CLUSTERS", defaults.initial_rt_cut_clusters),
         initial_rt_cut_blas: count("ZORAH_RT_CUT_BLAS", defaults.initial_rt_cut_blas),
@@ -863,7 +846,7 @@ fn run(options: &Options) -> Option<Capture> {
     };
     let defaults = RendererDesc::default();
     let desc = RendererDesc {
-        budgets: budgets(&pack),
+        budgets: budgets(),
         raster_error_pixels: pixels("ZORAH_RASTER_PIXELS", defaults.raster_error_pixels),
         rt_error_pixels: pixels("ZORAH_RT_PIXELS", defaults.rt_error_pixels),
         rt_merge_pixels: pixels("ZORAH_RT_MERGE_PIXELS", defaults.rt_merge_pixels),
