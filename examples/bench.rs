@@ -270,7 +270,6 @@ fn script_report(script: Script, samples: &[Sample]) -> Value {
             "local_lights": lit(&|l| l.local_lights.into()),
             "emissive_entries": lit(&|l| l.emissive_entries.into()),
             "emissive_clusters": lit(&|l| l.emissive_clusters.into()),
-            "dropped_entries": lit(&|l| l.dropped_entries.into()),
             "environment_probability": lit(&|l| l.environment_probability.into()),
             "cache_occupied": lit(&|l| l.world_cache.occupied.into()),
             "cache_queries": lit(&|l| l.world_cache.queries.into()),

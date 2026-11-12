@@ -10,7 +10,7 @@ use lighting_suite::{
     TestScene, assert_clean, compute_barrier, copy_back, finish, kernels, linear_clamp, pipeline,
     read, readback, render, texture, upload,
 };
-use orr_gpu::{Allocation, ComputePipeline, DEFAULT_MEDIUM, GpuPtr, Hazards, KernelSet, Stages};
+use orr_gpu::{Allocation, ComputePipeline, DEFAULT_MEDIUM, GpuPtr, Hazards, Stages};
 use orr_lighting::types::{LocalLight, LocalLights};
 use orr_lighting::{
     DirectionalLight, DiscProfile, EmissiveSelection, LIGHT_TILE_SIZE, LIGHT_TILES, Light, LightId,
@@ -1044,10 +1044,9 @@ fn selection_probabilities_follow_power_and_sum_to_one() {
             stats.directional_lights,
             stats.local_lights,
             stats.emissive_entries,
-            stats.emissive_clusters,
-            stats.dropped_entries
+            stats.emissive_clusters
         ),
-        (2, 3, 1, 5, 0)
+        (2, 3, 1, 5)
     );
 
     let set: LightSetGpu = read(lighting.light_set(), 1)[0];
@@ -1177,20 +1176,80 @@ fn producer_power_equals_area_times_luminance_after_it_moves() {
     };
     scene.frame(|_, _| {}, |c| moved.dispatch(c, &p));
     check_power(&scene, &mut lighting, moved, linear, "after moving");
+    assert_clean();
+}
 
-    // A cluster pool too small for the entry leaves it out of the selection.
-    let mut small = SceneLighting::new(
-        lighting_suite::device(),
-        &KernelSet::default(),
-        &SceneLightingSettings {
-            emissive_clusters: 4,
-            ..SceneLightingSettings::default()
+/// The producer entries' cluster CDFs are runs of one list that holds every cluster the scene's
+/// producers can emit, which follows the producers set from pass to pass. A producer that
+/// emits every cluster its batch holds fills the list; once two more are set the next pass
+/// makes a list for all three, each entry's CDF its own run of it.
+#[test]
+fn producer_cluster_cdfs_follow_the_producers_set() {
+    let mut scene = TestScene::new(SceneDesc::default());
+    let quads = |producer: u32| Quads {
+        producer,
+        count: 32,
+        size: 0.25,
+        origin: Vec3::new(0.0, 0.0, producer as f32),
+        step: Vec3::new(0.5, 0.0, 0.0),
+    };
+    let p = pipeline(&emit::MODULE, "main");
+    let mut materials = None;
+    scene.frame(
+        |w, m| {
+            let made = producer_materials(m);
+            let one = [Affine3::IDENTITY];
+            set_producers(w, &made, DVec3::ZERO, &one, ProducerUpdate::EveryFrame);
+            materials = Some(made);
         },
-    )
-    .unwrap();
-    scene_pass(&scene, &mut small, scene.frame);
-    let stats = small.stats(scene.frame).unwrap();
-    assert_eq!((stats.emissive_entries, stats.dropped_entries), (0, 1));
+        |c| quads(0).dispatch(c, &p),
+    );
+    assert_eq!(scene.tables.producer_clusters, 32);
+    let mut lighting = scene.lighting();
+    scene_pass(&scene, &mut lighting, scene.frame);
+    let stats = lighting.stats(scene.frame).unwrap();
+    assert_eq!((stats.emissive_entries, stats.emissive_clusters), (1, 32));
+
+    let materials = materials.unwrap();
+    scene.frame(
+        |w, _| {
+            let three = [Affine3::IDENTITY; 3];
+            set_producers(
+                w,
+                &materials,
+                DVec3::ZERO,
+                &three,
+                ProducerUpdate::EveryFrame,
+            );
+        },
+        |c| {
+            for producer in 0..3 {
+                quads(producer).dispatch(c, &p);
+            }
+        },
+    );
+    // The clusters the three batches hold, as a table grows to hold them.
+    assert_eq!(scene.tables.producer_clusters, 128);
+    scene_pass(&scene, &mut lighting, scene.frame);
+    let stats = lighting.stats(scene.frame).unwrap();
+    assert_eq!((stats.emissive_entries, stats.emissive_clusters), (3, 96));
+    let set: LightSetGpu = read(lighting.light_set(), 1)[0];
+    let entries = u64::from(scene.tables.entries);
+    let selections: Vec<EmissiveSelection> = read(set.emissive, entries);
+    let mut runs: Vec<u64> = Vec::new();
+    for s in selections.iter().filter(|s| s.count > 0) {
+        assert_eq!(s.count, 32);
+        let cdf: Vec<u32> = read(s.cdf, 32);
+        assert_eq!(*cdf.last().unwrap(), u32::MAX, "a run's last CDF value");
+        assert!(cdf.is_sorted(), "a run's CDF falls");
+        runs.push(s.cdf.address().0);
+    }
+    runs.sort_unstable();
+    assert_eq!(runs.len(), 3);
+    assert!(
+        runs.windows(2).all(|w| w[1] - w[0] >= 32 * 4),
+        "two entries' runs share clusters of the list: {runs:?}"
+    );
     assert_clean();
 }
 
@@ -1433,6 +1492,7 @@ fn grow_tables(in_flight: bool) -> (Vec<Passed>, LightTables, [[f64; 3]; 2]) {
                 scene: c.root,
                 focus: [0.0; 3],
                 tables: c.light_tables,
+                features: c.features,
             });
         })
         .unwrap();
@@ -1472,6 +1532,7 @@ fn grow_tables(in_flight: bool) -> (Vec<Passed>, LightTables, [[f64; 3]; 2]) {
         scene: scene.root,
         focus: [0.0; 3],
         tables,
+        features: scene.features,
     };
     lighting.record(&mut list, &pass).unwrap();
     finish(list);

@@ -6,7 +6,7 @@ use orr_scene::orr_gpu::{
 };
 use orr_scene::{LightTables, SceneRoot};
 
-use crate::scene::{FRAME_SLOTS, Ring, device_local};
+use crate::scene::{FRAME_SLOTS, Retired, Ring, device_local};
 use crate::shaders::caustics::{casters, resolve};
 use crate::shaders::types::{
     CausticStatsGpu, CausticsGpu, EmissiveSelection, EyeInterior, LightSetGpu, PhotonGpu,
@@ -38,10 +38,15 @@ pub const MAX_PHOTONS: u32 = 4096 * 65535;
 /// scene focus; while the grid runs full the levels start coarser ([`CausticStats::finest`]).
 /// Each cell keeps a running mean of the frames' irradiance.
 ///
+/// A scene holds the grid while it may hold a caster ([`orr_scene::SceneFeatures::CASTERS`])
+/// and `photons` is above 0. The scene pass that first finds both makes it, empty. The pass that
+/// finds either gone gives it up with what its cells held: nothing deposits any more, so the
+/// light they would lose over `cell_lifetime` frames leaves at once, as in a scene that never
+/// had a caster.
+///
 /// Through [`crate::SceneLighting::set_settings`], `photons`, `max_temporal_samples`,
 /// `cell_lifetime` and `jitter` take effect at the next frame and keep the grid. A new
-/// `capacity_log2` or `producer_clusters` reallocates it, and those, a new `base_cell_log2` or
-/// `lod_scale`, or photons after none clear it.
+/// `capacity_log2` reallocates it, and that or a new `base_cell_log2` or `lod_scale` clears it.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct CausticSettings {
     /// Photons each frame, at most [`MAX_PHOTONS`]; 0 turns caustics off, which leaves the
@@ -63,9 +68,6 @@ pub struct CausticSettings {
     /// The share of a cell's edge each read's point jitters across, in [0, 1]: 1 blends
     /// neighboring cells over frames, 0 reads the cell holding the point.
     pub jitter: f32,
-    /// Clusters the producer entries' caster lists hold per frame; a producer entry past it
-    /// casts no photons.
-    pub producer_clusters: u32,
 }
 
 impl Default for CausticSettings {
@@ -78,7 +80,6 @@ impl Default for CausticSettings {
             cell_lifetime: 8,
             max_temporal_samples: 16.0,
             jitter: 1.0,
-            producer_clusters: 1 << 18,
         }
     }
 }
@@ -177,7 +178,14 @@ fn resolve_grid(count: u64) -> [u32; 3] {
 pub(crate) struct Caustics {
     settings: CausticSettings,
     pipelines: CausticPipelines,
-    b: Buffers,
+    counters: Allocation<u32>,
+    readback: Allocation<CausticStatsGpu>,
+    source: Allocation<PhotonSourceGpu>,
+    /// Held while the scene passes find a caster with photons on.
+    grid: Option<Grid>,
+    /// The producer entries' caster lists' CDFs, for `pool_room` clusters.
+    pool: Allocation<u32>,
+    pool_room: u32,
     /// For the scene's light tables at the last scene pass.
     per: PerEntry,
     roots: Ring<CausticsGpu>,
@@ -188,16 +196,19 @@ pub(crate) struct Caustics {
     recorded: [bool; FRAME_SLOTS],
 }
 
-/// What a scene's caustics hold for its settings.
-struct Buffers {
+/// The cells of a scene's real-time grid.
+struct Grid {
     checks: Allocation<u32>,
     accumulated: Allocation<[u32; 4]>,
     resolved: Allocation<[u32; 2]>,
     cell_photons: Allocation<f32>,
-    counters: Allocation<u32>,
-    readback: Allocation<CausticStatsGpu>,
-    source: Allocation<PhotonSourceGpu>,
-    pool: Allocation<u32>,
+}
+
+/// The memory a scene pass takes for the caustics before anything of the pass changes.
+pub(crate) struct Room {
+    per: Option<PerEntry>,
+    pool: Option<(Allocation<u32>, u32)>,
+    grid: Option<Grid>,
 }
 
 /// What a scene's caustics hold per emissive list entry and per feedback id, for light tables
@@ -235,7 +246,7 @@ impl PerEntry {
     }
 }
 
-impl Buffers {
+impl Grid {
     fn new(device: &Device, settings: &CausticSettings) -> Result<Self, Error> {
         let capacity = 1u64 << settings.capacity_log2;
         Ok(Self {
@@ -243,18 +254,6 @@ impl Buffers {
             accumulated: device_local(device, 2 * capacity, "caustic grid deposits")?,
             resolved: device_local(device, capacity, "caustic grid irradiance")?,
             cell_photons: device_local(device, capacity, "caustic grid photons")?,
-            counters: device_local(device, COUNTERS, "caustic counters")?,
-            readback: device.gpu_malloc(
-                MemoryKind::Readback,
-                FRAME_SLOTS as u64,
-                "caustic stats readback",
-            )?,
-            source: device_local(device, 1, "photon source")?,
-            pool: device_local(
-                device,
-                u64::from(settings.producer_clusters),
-                "producer caster cdf",
-            )?,
         })
     }
 }
@@ -269,7 +268,16 @@ impl Caustics {
         Ok(Self {
             settings: *settings,
             pipelines: CausticPipelines::new(device, kernels)?,
-            b: Buffers::new(device, settings)?,
+            counters: device_local(device, COUNTERS, "caustic counters")?,
+            readback: device.gpu_malloc(
+                MemoryKind::Readback,
+                FRAME_SLOTS as u64,
+                "caustic stats readback",
+            )?,
+            source: device_local(device, 1, "photon source")?,
+            grid: None,
+            pool: device_local(device, 0, "producer caster cdf")?,
+            pool_room: 0,
             per: PerEntry::new(device, LightTables::default())?,
             roots: Ring::new(device, "caustic roots")?,
             caster_roots: Ring::new(device, "caster roots")?,
@@ -279,9 +287,9 @@ impl Caustics {
         })
     }
 
-    /// Takes `settings`. New sizes make new buffers; those and new cells, a new focus falloff
-    /// or caustics turned back on clear the grid and the casters' yields at the next scene
-    /// pass. A new photon count, history, lifetime or jitter keeps them.
+    /// Takes `settings`. A new size makes a held grid anew; that and new cells or a new focus
+    /// falloff clear the grid and the casters' yields at the next scene pass. A new photon
+    /// count, history, lifetime or jitter keeps them.
     pub(crate) fn set_settings(
         &mut self,
         device: &Device,
@@ -289,17 +297,14 @@ impl Caustics {
     ) -> Result<(), Error> {
         check_settings(settings)?;
         let old = self.settings;
-        if settings.capacity_log2 != old.capacity_log2
-            || settings.producer_clusters != old.producer_clusters
-        {
-            self.b = Buffers::new(device, settings)?;
+        if settings.capacity_log2 != old.capacity_log2 {
+            if self.grid.is_some() {
+                self.grid = Some(Grid::new(device, settings)?);
+            }
             self.recorded = [false; FRAME_SLOTS];
             self.clear = true;
         }
-        if settings.base_cell_log2 != old.base_cell_log2
-            || settings.lod_scale != old.lod_scale
-            || (old.photons == 0 && settings.photons > 0)
-        {
+        if settings.base_cell_log2 != old.base_cell_log2 || settings.lod_scale != old.lod_scale {
             self.clear = true;
         }
         self.settings = *settings;
@@ -311,16 +316,63 @@ impl Caustics {
         self.clear = true;
     }
 
-    /// What the caustics hold per entry and per feedback id for light tables `tables`, for
-    /// [`Self::follow`] to take once nothing else can fail. Fails without device memory.
-    pub(crate) fn room(&self, device: &Device, tables: LightTables) -> Result<PerEntry, Error> {
-        PerEntry::new(device, tables)
+    /// Whether a scene pass that finds a caster where `casters` records the caustics.
+    fn casts(&self, casters: bool) -> bool {
+        casters && self.settings.photons > 0
     }
 
-    /// Takes `room`, from [`Self::room`]; returns what the caustics held before, which the
-    /// frames in flight read and the next [`Self::record`] takes the casters' yields from.
-    pub(crate) fn follow(&mut self, room: PerEntry) -> PerEntry {
-        std::mem::replace(&mut self.per, room)
+    /// The memory the caustics lack for a scene pass over light tables `tables`, for
+    /// [`Self::follow`] to take once nothing else can fail: what they hold per entry and per
+    /// feedback id where `grown`, the producers' caster lists where the tables hold room for
+    /// other clusters, and the grid where the scene has come to hold `casters`. Fails without
+    /// device memory.
+    pub(crate) fn room(
+        &self,
+        device: &Device,
+        tables: LightTables,
+        grown: bool,
+        casters: bool,
+    ) -> Result<Room, Error> {
+        let per = grown.then(|| PerEntry::new(device, tables)).transpose()?;
+        let clusters = tables.producer_clusters;
+        let pool = (clusters != self.pool_room)
+            .then(|| device_local(device, u64::from(clusters), "producer caster cdf"))
+            .transpose()?;
+        let grid = (self.casts(casters) && self.grid.is_none())
+            .then(|| Grid::new(device, &self.settings))
+            .transpose()?;
+        Ok(Room {
+            per,
+            pool: pool.map(|pool| (pool, clusters)),
+            grid,
+        })
+    }
+
+    /// Takes `room`, from [`Self::room`] with the same `casters`, in the scene pass of `frame`,
+    /// and gives up the grid where the scene holds no caster: what the frames in flight read
+    /// goes to `retired`. Returns what the caustics held per entry before, which the next
+    /// [`Self::record`] takes the casters' yields from.
+    pub(crate) fn follow(
+        &mut self,
+        room: Room,
+        casters: bool,
+        frame: u64,
+        retired: &mut Retired,
+    ) -> Option<PerEntry> {
+        if let Some((pool, clusters)) = room.pool {
+            retired.push(frame, std::mem::replace(&mut self.pool, pool));
+            self.pool_room = clusters;
+        }
+        if let Some(grid) = room.grid {
+            self.grid = Some(grid);
+            self.clear = true;
+        }
+        if !self.casts(casters)
+            && let Some(grid) = self.grid.take()
+        {
+            retired.push(frame, grid);
+        }
+        room.per.map(|per| std::mem::replace(&mut self.per, per))
     }
 
     /// Takes the entries of the scene's producer table, which the producers' caster lists
@@ -332,7 +384,7 @@ impl Caustics {
     /// Records slot `slot`'s photon source after the light set's selection and starts the
     /// grid's frame, for a frame focused on `focus`. `before` is what [`Self::follow`]
     /// returned since the last record, when the scene's light tables have grown since.
-    /// Records nothing with caustics off.
+    /// Records nothing without the grid.
     pub(crate) fn record(
         &mut self,
         list: &mut CommandList<'_>,
@@ -343,10 +395,10 @@ impl Caustics {
         before: Option<&PerEntry>,
     ) {
         let s = self.settings;
-        self.recorded[slot] = s.photons > 0;
-        if s.photons == 0 {
+        self.recorded[slot] = self.grid.is_some();
+        let Some(grid) = &self.grid else {
             return;
-        }
+        };
         let capacity = 1u64 << s.capacity_log2;
         let clear = std::mem::take(&mut self.clear);
         let per = &self.per;
@@ -354,12 +406,12 @@ impl Caustics {
         self.roots.write(
             slot,
             CausticsGpu {
-                source: self.b.source.gpu(),
-                checks: self.b.checks.gpu(),
-                accumulated: self.b.accumulated.gpu(),
-                resolved: self.b.resolved.gpu(),
-                photons: self.b.cell_photons.gpu(),
-                counters: self.b.counters.gpu(),
+                source: self.source.gpu(),
+                checks: grid.checks.gpu(),
+                accumulated: grid.accumulated.gpu(),
+                resolved: grid.resolved.gpu(),
+                photons: grid.cell_photons.gpu(),
+                counters: self.counters.gpu(),
                 map: GpuPtr::NULL,
                 heads: GpuPtr::NULL,
                 focus,
@@ -381,7 +433,7 @@ impl Caustics {
             casters::Root {
                 scene,
                 set,
-                source: self.b.source.gpu(),
+                source: self.source.gpu(),
                 entries: per.selections.gpu(),
                 cdf: per.cdf.gpu(),
                 started: per.started.gpu(),
@@ -392,16 +444,16 @@ impl Caustics {
                 deposited_before: before.deposited.gpu(),
                 yields_before: before.yields.gpu(),
                 _pad4: 0,
-                pool: self.b.pool.gpu(),
+                pool: self.pool.gpu(),
                 interiors: per.interiors.gpu(),
                 focus: [focus[0], focus[1], focus[2], s.lod_scale],
-                pool_capacity: s.producer_clusters,
                 clear: u32::from(clear),
-                counters: self.b.counters.gpu(),
+                counters: self.counters.gpu(),
                 capacity: capacity as u32,
                 base_cell_log2: s.base_cell_log2,
                 cell_lifetime: s.cell_lifetime,
                 entries_before: before.tables.entries,
+                _pad1: 0,
                 _pad2: 0,
                 _pad3: 0,
             },
@@ -410,7 +462,7 @@ impl Caustics {
             slot,
             resolve::Root {
                 caustics: self.roots.at(slot),
-                stats: self.b.readback.gpu().offset(slot as u64),
+                stats: self.readback.gpu().offset(slot as u64),
                 capacity: capacity as u32,
                 cell_lifetime: s.cell_lifetime,
                 max_temporal_samples: s.max_temporal_samples,
@@ -439,8 +491,8 @@ impl Caustics {
         self.settings.photons
     }
 
-    /// The grid as slot `slot`'s frame reads it, after its scene pass; null with caustics
-    /// off.
+    /// The grid as slot `slot`'s frame reads it, after its scene pass; null where that pass
+    /// recorded no caustics.
     pub(crate) fn root(&self, slot: usize) -> GpuPtr<CausticsGpu> {
         if self.recorded[slot] {
             self.roots.at(slot)
@@ -461,8 +513,12 @@ impl Caustics {
         list.dispatch(&self.pipelines.finish, root, [1, 1, 1]);
     }
 
+    /// The statistics of slot `slot`'s frame; none where its scene pass recorded no caustics.
     pub(crate) fn stats(&self, slot: usize) -> CausticStats {
-        let s = self.b.readback.as_slice().unwrap()[slot];
+        if !self.recorded[slot] {
+            return CausticStats::default();
+        }
+        let s = self.readback.as_slice().unwrap()[slot];
         CausticStats {
             started: s.started,
             deposits: s.deposits,
@@ -489,7 +545,7 @@ impl Caustics {
         let root = map.roots.write(
             slot,
             CausticsGpu {
-                source: self.b.source.gpu(),
+                source: self.source.gpu(),
                 checks: GpuPtr::NULL,
                 accumulated: GpuPtr::NULL,
                 resolved: GpuPtr::NULL,

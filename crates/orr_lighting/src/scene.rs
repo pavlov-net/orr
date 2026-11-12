@@ -1,5 +1,6 @@
 //! Per-scene lighting state and the scene pass that runs before the scene's first view.
 
+use std::any::Any;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -7,7 +8,7 @@ use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, GpuAddress, GpuPtr, Hazards, MemoryKind,
     ROOT_ALIGN, Stages,
 };
-use orr_scene::{LightTables, SceneRoot, SkyStats};
+use orr_scene::{LightTables, SceneFeatures, SceneRoot, SkyStats};
 
 use crate::caustics::{CausticSettings, CausticStats, Caustics, PerEntry, feedback_ids};
 use crate::environment::EnvironmentBake;
@@ -36,11 +37,6 @@ pub struct SceneLightingSettings {
     /// Meters from the eye that every view's froxel volume covers; linked environments that
     /// march from it are built with the same value.
     pub near_range: f32,
-    /// Producer entries' emitted clusters the scene's light selection holds per frame;
-    /// instance entries read their copies' cooked sets and gathered lists in place. Emitting
-    /// producer entries past it are left out of next-event estimation (counted in
-    /// [`LightingStats`]); BSDF hits still see them, at full weight.
-    pub emissive_clusters: u32,
     /// Share of the light selection placed by where the views' pixels found their light in
     /// earlier frames, the rest by emitted power; in [0, 1). 0 selects by power alone.
     pub feedback_share: f32,
@@ -52,7 +48,6 @@ impl Default for SceneLightingSettings {
             world_cache: WorldCacheSettings::default(),
             caustics: CausticSettings::default(),
             near_range: 256.0,
-            emissive_clusters: 1 << 20,
             feedback_share: 0.5,
         }
     }
@@ -102,6 +97,9 @@ pub struct ScenePass {
     /// What `scene` says the scene's light tables hold: `RasterView::light_tables` or
     /// `SceneCompute::light_tables` of the frame.
     pub tables: LightTables,
+    /// What the scene may hold this frame: `RasterView::features` or
+    /// `SceneCompute::features` of the frame, which the frame's [`crate::ViewPass`]es name too.
+    pub features: SceneFeatures,
 }
 
 /// Statistics of one frame, read back after it completes.
@@ -116,8 +114,6 @@ pub struct LightingStats {
     pub emissive_entries: u32,
     /// Clusters in those entries' lists.
     pub emissive_clusters: u32,
-    /// Emitting entries left out because `SceneLightingSettings::emissive_clusters` was full.
-    pub dropped_entries: u32,
     /// Share of tile samples taken from the environment.
     pub environment_probability: f32,
     /// Pixels of the frame before whose light feedback named a light.
@@ -216,9 +212,25 @@ impl PerTable {
     }
 }
 
+/// Memory a scene pass replaced or gave up, by the frame of the pass: the frames in flight
+/// before it read it.
+#[derive(Default)]
+pub(crate) struct Retired(Vec<(u64, Box<dyn Any + Send + Sync>)>);
+
+impl Retired {
+    pub(crate) fn push(&mut self, frame: u64, memory: impl Any + Send + Sync) {
+        self.0.push((frame, Box::new(memory)));
+    }
+
+    /// Frees what the pass of a frame whose slot `frame` takes again gave up.
+    fn free(&mut self, frame: u64) {
+        self.0.retain(|r| frame < r.0 + FRAME_SLOTS as u64);
+    }
+}
+
 /// Lighting state of one scene: the baked environment, the directional light states, the
 /// light selection, the presampled light tiles, the caustics' photon source and grid, and the
-/// world cache.
+/// world cache. The scene pass that first finds a caster makes the grid.
 pub struct SceneLighting {
     device: Device,
     settings: SceneLightingSettings,
@@ -233,8 +245,11 @@ pub struct SceneLighting {
     /// replaced it: that pass reads its feedback and its casters' yields, and the frames in
     /// flight before it read all of it.
     replaced: Vec<(u64, PerTable, PerEntry)>,
+    retired: Retired,
     set: Allocation<LightSetGpu>,
+    /// The producer entries' cluster CDFs, for `cluster_room` clusters.
     cluster_cdf: Allocation<u32>,
+    cluster_room: u32,
     tiles: Allocation<LightSample>,
     shadow_overflows: Allocation<u32>,
     reference_counts: Allocation<u32>,
@@ -278,12 +293,10 @@ impl SceneLighting {
             presample: pipeline(device, kernels, &tiles::MODULE, "presample")?,
             per: PerTable::new(device, LightTables::default())?,
             replaced: Vec::new(),
+            retired: Retired::default(),
             set: device_local(device, 1, "light set")?,
-            cluster_cdf: device_local(
-                device,
-                u64::from(settings.emissive_clusters),
-                "emissive cluster cdf",
-            )?,
+            cluster_cdf: device_local(device, 0, "emissive cluster cdf")?,
+            cluster_room: 0,
             tiles: device_local(
                 device,
                 u64::from(LIGHT_TILES * LIGHT_TILE_SIZE),
@@ -319,8 +332,7 @@ impl SceneLighting {
         &self.device
     }
 
-    /// A change of `emissive_clusters` reallocates the producer cluster pool, and a change of
-    /// `world_cache` reallocates and clears the cache. The caustics take theirs as
+    /// A change of `world_cache` reallocates and clears the cache. The caustics take theirs as
     /// [`CausticSettings`] describes. Old buffers are freed once the work submitted so far has
     /// completed.
     pub fn set_settings(&mut self, settings: &SceneLightingSettings) -> Result<(), Error> {
@@ -330,13 +342,6 @@ impl SceneLighting {
         }
         self.caustics
             .set_settings(&self.device, &settings.caustics)?;
-        if settings.emissive_clusters != self.settings.emissive_clusters {
-            self.cluster_cdf = device_local(
-                &self.device,
-                u64::from(settings.emissive_clusters),
-                "emissive cluster cdf",
-            )?;
-        }
         self.settings = *settings;
         Ok(())
     }
@@ -347,25 +352,44 @@ impl SceneLighting {
     /// views of earlier frames, builds the emissive cluster CDFs, presamples the light tiles,
     /// writes `SkyStats`, resolves the world cache at the focus, and writes the statistics
     /// [`Self::stats`] reads. Its outputs are visible to every later stage of the list. A pass
-    /// whose light tables have grown since the last makes what the scene holds per light and
-    /// per emissive list entry anew, and takes the light feedback and the casters' yields so
-    /// far by the ids the smaller tables gave. Fails without device memory for that, recording
-    /// nothing.
+    /// whose light tables have grown since the last makes what the scene holds per light, per
+    /// emissive list entry and per producer cluster anew, and takes the light feedback and the
+    /// casters' yields so far by the ids the smaller tables gave. The first pass to find a
+    /// caster makes the caustics' grid, which starts empty in that pass. Fails without device
+    /// memory for any of it, recording nothing and leaving the scene's lighting as it was.
     pub fn record(&mut self, list: &mut CommandList<'_>, pass: &ScenePass) -> Result<(), Error> {
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         // A frame's slot is written again `FRAME_SLOTS` frames on, when its work has completed.
         self.replaced
             .retain(|r| pass.frame < r.0 + FRAME_SLOTS as u64);
-        // What is held follows the lights and the emissive list; the producer table's entries
-        // only say how far the per-producer kernels run.
+        self.retired.free(pass.frame);
+        // What is held per light and per entry follows the lights and the emissive list; the
+        // producer table's entries only say how far the per-producer kernels run.
         let held = self.per.tables;
         let grown = (pass.tables.lights, pass.tables.entries) != (held.lights, held.entries);
-        if grown {
-            let next = PerTable::new(&self.device, pass.tables)?;
-            let casters = self.caustics.room(&self.device, pass.tables)?;
-            let before = std::mem::replace(&mut self.per, next);
-            self.replaced
-                .push((pass.frame, before, self.caustics.follow(casters)));
+        let casters = pass.features.contains(SceneFeatures::CASTERS);
+        // Every allocation first, so a pass that finds one missing changes nothing.
+        let per = grown
+            .then(|| PerTable::new(&self.device, pass.tables))
+            .transpose()?;
+        let clusters = pass.tables.producer_clusters;
+        let cluster_cdf = (clusters != self.cluster_room)
+            .then(|| device_local(&self.device, u64::from(clusters), "emissive cluster cdf"))
+            .transpose()?;
+        let room = self
+            .caustics
+            .room(&self.device, pass.tables, grown, casters)?;
+        if let Some(cdf) = cluster_cdf {
+            let before = std::mem::replace(&mut self.cluster_cdf, cdf);
+            self.retired.push(pass.frame, before);
+            self.cluster_room = clusters;
+        }
+        let before = self
+            .caustics
+            .follow(room, casters, pass.frame, &mut self.retired);
+        if let (Some(per), Some(entries)) = (per, before) {
+            let before = std::mem::replace(&mut self.per, per);
+            self.replaced.push((pass.frame, before, entries));
         }
         self.per.tables.producers = pass.tables.producers;
         self.caustics.set_producers(pass.tables.producers);
@@ -415,12 +439,12 @@ impl SceneLighting {
                 shadow_overflows: self.shadow_overflows.gpu(),
                 reference_counts: self.reference_counts.gpu(),
                 stats: self.readback.gpu().offset(slot as u64),
-                cluster_capacity: self.settings.emissive_clusters,
                 frame: pass.frame as u32,
                 feedback_share: self.settings.feedback_share,
                 clear_feedback: u32::from(std::mem::take(&mut self.clear_feedback)),
                 lights_before: before.tables.lights,
                 entries_before: before.tables.entries,
+                _pad0: 0,
             },
         );
 
@@ -494,7 +518,6 @@ impl SceneLighting {
                 local_lights: s.local_lights,
                 emissive_entries: s.emissive_entries,
                 emissive_clusters: s.emissive_clusters,
-                dropped_entries: s.dropped_entries,
                 environment_probability: s.environment_probability,
                 feedback_pixels: s.feedback_pixels,
                 shadow_overflows: s.shadow_overflows,

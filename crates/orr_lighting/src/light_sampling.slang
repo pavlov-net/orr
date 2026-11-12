@@ -191,8 +191,6 @@ public struct LightSetStats
     public uint emissive_entries;
     // Clusters in their CDFs.
     public uint emissive_clusters;
-    // Emitting producer entries left out of the selection because the cluster pool was full.
-    public uint dropped_entries;
     public float environment_probability;
     // Pixels whose feedback named a light in the frame before.
     public uint feedback_pixels;

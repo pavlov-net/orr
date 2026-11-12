@@ -2280,6 +2280,29 @@ impl Bed {
         self.set_quads(particles, m, None, transform, 0.0, Opacity::Opaque);
     }
 
+    /// Clears the bed's particle entry from the next frame on.
+    pub fn clear_quads(&mut self) {
+        self.frame += 1;
+        let list = [self.scene];
+        let f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        f.scene(self.scene)
+            .unwrap()
+            .set_producer(PARTICLES, None)
+            .unwrap();
+        let point = f.end(&[]).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
+        self.particles = None;
+    }
+
     /// Sets a producer beside the bed's own that emits nothing: it takes an entry of the
     /// producer table and of the emissive list all the same.
     pub fn set_idle_producer(&mut self) {
@@ -2674,6 +2697,7 @@ impl Bed {
                     scene: view.scene,
                     focus: eye.to_array(),
                     tables: view.light_tables,
+                    features: view.features,
                 },
             )
             .unwrap();

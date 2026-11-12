@@ -1467,6 +1467,7 @@ impl<'a> Frame<'a> {
                     scene: raster.scene,
                     focus: raster.focus,
                     tables: raster.light_tables,
+                    features: raster.features,
                 },
             )?;
             self.lit.push(view.scene);

@@ -1,5 +1,6 @@
 // What the frame's caustic photons start from, after the light set's selection and the
-// emissive entries' pass: `pool` places each producer entry's caster list in the pool, `lists`
+// emissive entries' pass: `pool` places each producer entry's caster list in the pool, which
+// holds every cluster the scene's producers can emit, `lists`
 // writes those lists' CDFs over the area of the clusters whose material casts, `weigh` weighs
 // every entry by its casters' render-space area, its falloff from the focus and the share of
 // its last photons that deposited, and builds the entry CDF, and `interiors` walks each light
@@ -50,12 +51,12 @@ struct Root
     // The focus in render space, and in w the m over which an entry's weight falls with the
     // square of its distance from the focus.
     float4 focus;
-    uint pool_capacity;
     uint clear;                     // 1: forget the yields, the last photons' counts and level
     uint capacity;                  // the grid's cells
     int base_cell_log2;             // the grid's level 0, as for `CausticsGpu`
     uint cell_lifetime;             // frames without a deposit before a cell is evicted
     uint entries_before;
+    uint _pad1;
     uint _pad2;
     uint _pad3;
 }
@@ -160,8 +161,7 @@ bool producer_traced(SceneRoot* s, uint producer)
         && (s.producer_state[producer].rt_flags & PRODUCER_RT_WRITTEN) != 0;
 }
 
-// The producer entries' places in the pool, one workgroup; the pool's overflow leaves an entry
-// without casters.
+// The producer entries' places in the pool, one workgroup.
 [shader("compute")]
 [numthreads(GROUP, 1, 1)]
 void pool(uint lane: SV_GroupIndex)
@@ -185,7 +185,7 @@ void pool(uint lane: SV_GroupIndex)
         if (set)
         {
             EmissiveSelection e = (EmissiveSelection)0;
-            if (n > 0 && first + n <= root.pool_capacity)
+            if (n > 0)
             {
                 e.count = n;
                 e.cdf = root.pool + first;

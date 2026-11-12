@@ -1398,10 +1398,17 @@ fn disperses(features: SceneFeatures, lighting: &ViewLighting) -> bool {
     lighting.dispersion && features.contains(SceneFeatures::DISPERSIVE)
 }
 
-/// Whether the paths of a view with `lighting` read `scene`'s caustics this frame, once the
-/// scene's pass has recorded them.
-fn gathers_caustics(scene: &SceneLighting, lighting: &ViewLighting) -> bool {
-    scene.caustics().photons() > 0 && lighting.reference.is_none_or(|r| r.photons > 0)
+/// Whether the paths of a view with `lighting` read `scene`'s caustics in a frame the scene may
+/// hold `features`, once the scene's pass has recorded them: it records them where the scene
+/// may hold a caster.
+fn gathers_caustics(
+    scene: &SceneLighting,
+    features: SceneFeatures,
+    lighting: &ViewLighting,
+) -> bool {
+    features.contains(SceneFeatures::CASTERS)
+        && scene.caustics().photons() > 0
+        && lighting.reference.is_none_or(|r| r.photons > 0)
 }
 
 /// What the masked support kernels of a view's frame may meet (a mask as the path pipelines'), under
@@ -1540,7 +1547,7 @@ impl StagedPaths {
         let froxels = !reference && fogged(self.linked_medium, features, lighting);
         let path = path_features(features, lighting);
         let shared = scene_may(features)
-            | bit(gathers_caustics(scene, lighting), MAY_CAUSTICS)
+            | bit(gathers_caustics(scene, features, lighting), MAY_CAUSTICS)
             | bit(lens, MAY_LENS)
             | bit(froxels, MAY_FROXELS);
         let layer = lighting.debug_view == LightingDebugView::DielectricLayer;
@@ -1568,7 +1575,7 @@ impl StagedPaths {
         needs: PathNeeds,
         lighting: &ViewLighting,
     ) -> (u64, Vec<Stage>) {
-        let caustics = gathers_caustics(scene, lighting);
+        let caustics = gathers_caustics(scene, needs.features, lighting);
         let may = self.predict(scene, needs, lighting);
         let mut wanted = may.view | Source::View.may();
         let mut stages =

@@ -46,8 +46,6 @@ struct Root
     uint* reference_counts;
     // This frame's slot of the statistics readback.
     LightSetStats* stats;
-    // Values `cluster_cdf` holds: the producer entries' lists.
-    uint cluster_capacity;
     uint frame;
     // Share of the selection placed by feedback once there is any.
     float feedback_share;
@@ -55,6 +53,7 @@ struct Root
     uint clear_feedback;
     uint lights_before;
     uint entries_before;
+    uint _pad0;
 }
 ORR_ROOT(Root);
 
@@ -62,9 +61,9 @@ static const uint SELECT_GROUP = 1024;
 
 groupshared float scan_w[SELECT_GROUP];
 groupshared uint scan_c[SELECT_GROUP];
-// Local lights, emissive entries and clusters kept, entries dropped, feedback pixels,
-// stack entries and particle entries.
-groupshared uint counts[7];
+// Local lights, emissive entries and their clusters, feedback pixels, stack entries and
+// particle entries.
+groupshared uint counts[6];
 groupshared float environment_feedback;
 
 // Inclusive sums over the workgroup; `total` is the group's sum.
@@ -280,12 +279,13 @@ float feedback(uint i, uint lights, uint entries)
     }
     root.feedback_weights[i] = h;
     root.feedback_counts[i] = 0;
-    InterlockedAdd(counts[4], pixels);
+    InterlockedAdd(counts[3], pixels);
     return h;
 }
 
-// The selection CDF and probabilities, each emissive entry's place in the cluster pool, the
-// light set record, `SkyStats` and the frame's statistics. One workgroup. A candidate's
+// The selection CDF and probabilities, each emissive entry's place in the cluster pool, which
+// holds every cluster the scene's producers can emit, the light set record, `SkyStats` and the
+// frame's statistics. One workgroup. A candidate's
 // probability blends its share of the emitted power with its share of the feedback weights,
 // `feedback_share` of the second once any light has fed back; lights with no power take no
 // feedback share, so every light the feedback names stays reachable through its power.
@@ -296,7 +296,7 @@ void select(uint lane: SV_GroupIndex)
     SceneRoot* s = root.scene;
     uint lights = s.light_capacity;
     uint n = lights + s.emissive_capacity;
-    if (lane < 7)
+    if (lane < 6)
         counts[lane] = 0;
     GroupMemoryBarrierWithGroupSync();
     bool environment = root.environment.mean.a > 0.0;
@@ -320,20 +320,12 @@ void select(uint lane: SV_GroupIndex)
             candidate(s, i, w, c, pooled);
             h = feedback(i, lights, s.emissive_capacity);
             if (i >= lights && stack_entry(s, i - lights))
-                InterlockedAdd(counts[5], 1);
+                InterlockedAdd(counts[4], 1);
             if (i >= lights && particle_entry(s, i - lights))
-                InterlockedAdd(counts[6], 1);
+                InterlockedAdd(counts[5], 1);
         }
         uint chunk_c;
         uint first = carry_c + scan_uint(lane, pooled, chunk_c) - pooled;
-        // Instance entries take nothing of the pool, so its overflow leaves them in.
-        bool fits = pooled == 0 || first + pooled <= root.cluster_capacity;
-        if (!fits)
-        {
-            if (w > 0.0)
-                InterlockedAdd(counts[3], 1);
-            w = 0.0;
-        }
         if (w > 0.0)
         {
             InterlockedAdd(counts[i < lights ? 0 : 1], 1);
@@ -415,8 +407,8 @@ void select(uint lane: SV_GroupIndex)
     set.environment_probability = env;
     set.frame = root.frame;
     set.local_lights = counts[0];
-    set.stack_entries = counts[5];
-    set.particle_entries = counts[6];
+    set.stack_entries = counts[4];
+    set.particle_entries = counts[5];
 
     float3 mean = root.environment.mean.rgb;
     float3 xyz = mul(REC2020_TO_XYZ, mean);
@@ -434,16 +426,15 @@ void select(uint lane: SV_GroupIndex)
     st.local_lights = counts[0];
     st.emissive_entries = counts[1];
     st.emissive_clusters = counts[2];
-    st.dropped_entries = counts[3];
     st.environment_probability = env;
-    st.feedback_pixels = counts[4];
+    st.feedback_pixels = counts[3];
     st.shadow_overflows = root.clear_feedback != 0 ? 0 : *root.shadow_overflows;
     *root.shadow_overflows = 0;
     st.capped_walks = root.clear_feedback != 0 ? 0 : root.reference_counts[0];
     st.photon_overflows = root.clear_feedback != 0 ? 0 : root.reference_counts[1];
     root.reference_counts[0] = 0;
     root.reference_counts[1] = 0;
-    st.stack_entries = counts[5];
+    st.stack_entries = counts[4];
     *root.stats = st;
 }
 

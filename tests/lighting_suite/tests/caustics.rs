@@ -11,7 +11,7 @@ use lighting_suite::bed::{
 use lighting_suite::welch::{assert_mean, assert_same_mean};
 use orr_gpu::KernelSet;
 use orr_lighting::{
-    DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry, ViewLighting,
+    CausticStats, DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry, ViewLighting,
 };
 use orr_math::{Affine3, DVec2, Mat3, Vec2, Vec3};
 
@@ -286,6 +286,125 @@ fn photons_and_bsdf_rays_carry_the_same_light_through_a_glass_sphere() {
             );
         }
     }
+    assert_clean();
+}
+
+/// Pipelines compiled for what a scene may hold gather the grid's light where it holds a
+/// caster: the floor under a ball lens shows the sun's focus through the pipelines that hold
+/// everything, and the scene's own render it alike. Without the lens the scene's own hold no
+/// caustics and start no photon.
+#[test]
+fn specialized_pipelines_gather_the_grid_s_light_under_a_caster() {
+    let sun = DirectionalLight {
+        direction_to_light: Vec3::Y,
+        illuminance: Vec3::splat(100_000.0),
+        angular_radius: 4.65e-3,
+        disc: DiscProfile::Uniform,
+    };
+    let spec = Spec {
+        copies: vec![
+            at(WHITE_FLOOR, Vec3::ZERO),
+            at(GLASS_SPHERE, Vec3::new(0.0, 2.2, 0.0)),
+        ],
+        lights: vec![Light::Directional(sun)],
+        environment: None,
+        eye: Vec3::new(0.0, 7.0, 0.01),
+        target: Vec3::ZERO,
+        fov_y: 0.45,
+        focus: None,
+    };
+    let focus = pixel_of(&spec, Vec3::ZERO);
+    let mut paths = paths(gathered());
+    let mut render = |spec: &Spec, specialize| {
+        paths.specialize = specialize;
+        let mut bed = Bed::with(spec.clone());
+        let image = render_paths(&mut bed, &paths, 8, 1);
+        let stats = bed.lighting.stats(bed.last_frame()).unwrap().caustics;
+        (image.around(focus, 8)[1], stats)
+    };
+    let (general, _) = render(&spec, false);
+    assert!(general > 0.0, "the lens lights nothing");
+    let (specialized, _) = render(&spec, true);
+    assert!(
+        (specialized - general).abs() <= 0.02 * general,
+        "the scene's own pipelines gather {specialized} under the lens, the general ones {general}"
+    );
+    let bare = Spec {
+        copies: vec![at(WHITE_FLOOR, Vec3::ZERO)],
+        ..spec
+    };
+    let (dark, stats) = render(&bare, true);
+    assert_eq!(dark, 0.0, "light with no caster");
+    assert_eq!(stats, CausticStats::default(), "photons with no caster");
+    assert_clean();
+}
+
+/// A scene holds its caustics' grid while it holds a caster. A floor under the sun alone
+/// starts no photon and gathers nothing. A mirror set over it, facing the eye, throws the sun
+/// on the floor. The frame after the mirror is cleared starts none again and shows that patch
+/// dark: the grid went with its cells' light, which no path reads. Three mirrors set elsewhere
+/// then light their own patches, the third's among them, which the producers' caster lists
+/// hold room for only once they have grown, and in their first frame the first mirror's patch
+/// is dark: the grid that came with them is empty.
+#[test]
+fn the_grid_comes_with_a_scene_s_first_caster_and_goes_with_its_last() {
+    let spec = Spec {
+        copies: vec![at(WHITE_FLOOR, Vec3::ZERO)],
+        lights: vec![Light::Directional(SUN)],
+        environment: None,
+        eye: Vec3::new(0.0, 3.0, 4.0),
+        target: Vec3::new(0.0, 0.0, -0.5),
+        fov_y: 0.9,
+        focus: None,
+    };
+    // Where the sun off the middle of a mirror at `center`, which faces the eye, meets the
+    // floor.
+    let eye = spec.eye;
+    let thrown = |center: Vec3| {
+        let normal = (eye - center).normalize();
+        let sun = -SUN.direction_to_light.normalize();
+        let off = sun - 2.0 * sun.dot(normal) * normal;
+        center - off * (center.y / off.y)
+    };
+    let mirror = |x: f32| Particle {
+        center: Vec3::new(x, 0.5, -1.0),
+        size: 0.3,
+    };
+    let first = pixel_of(&spec, thrown(mirror(0.0).center));
+    let moved = [-2.0f32, 2.0, 3.0].map(mirror);
+    let third = pixel_of(&spec, thrown(moved[2].center));
+    let mut bed = Bed::with(spec);
+    let gathered = paths(gathered());
+    let none = CausticStats::default();
+    let stats = |bed: &Bed| bed.lighting.stats(bed.last_frame()).unwrap().caustics;
+
+    let image = render_paths(&mut bed, &gathered, 4, 1);
+    assert_eq!(stats(&bed), none, "photons with no caster");
+    assert_eq!(image.around(first, 6), [0.0; 3], "light with no caster");
+
+    bed.set_mirror_quads(&[mirror(0.0)], Affine3::IDENTITY);
+    let image = render_paths(&mut bed, &gathered, 8, 2);
+    assert!(stats(&bed).deposits > 0, "no photon off the mirror");
+    assert!(image.around(first, 6)[1] > 0.0, "the mirror lights nothing");
+
+    bed.clear_quads();
+    let image = render_paths(&mut bed, &gathered, 1, 3);
+    assert_eq!(stats(&bed), none, "photons once the caster is gone");
+    assert_eq!(image.around(first, 6), [0.0; 3], "its light stayed");
+
+    bed.set_mirror_quads(&moved, Affine3::IDENTITY);
+    let image = render_paths(&mut bed, &gathered, 1, 4);
+    assert!(stats(&bed).deposits > 0, "no photon off the new mirrors");
+    assert_eq!(
+        image.around(first, 6),
+        [0.0; 3],
+        "the new grid holds the first mirror's light"
+    );
+    let image = render_paths(&mut bed, &gathered, 8, 5);
+    assert!(
+        image.around(third, 6)[1] > 0.0,
+        "the third mirror lights nothing"
+    );
     assert_clean();
 }
 

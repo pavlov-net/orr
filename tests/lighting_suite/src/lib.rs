@@ -14,8 +14,8 @@ use orr_gpu::{
 use orr_lighting::{SceneLighting, SceneLightingSettings, ScenePass};
 use orr_scene::{
     EnvironmentData, FrameDesc, FrameTime, LightGpu, LightTables, LoadState, Loading,
-    MaterialWriter, MountId, PackSource, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneRoot,
-    SceneWriter, Scenes,
+    MaterialWriter, MountId, PackSource, RendererDesc, SceneCompute, SceneDesc, SceneFeatures,
+    SceneId, SceneRoot, SceneWriter, Scenes,
 };
 
 pub use gpu_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
@@ -227,9 +227,11 @@ pub struct TestScene {
     kernels: &'static KernelSet,
     /// Sets the scene's linked data in its first frame.
     linked: Option<LinkedData>,
-    /// The scene's root, after the first frame, and what it says the light tables hold.
+    /// The scene's root, after the first frame, what it says the light tables hold, and what
+    /// the scene may hold.
     pub root: GpuPtr<SceneRoot>,
     pub tables: LightTables,
+    pub features: SceneFeatures,
     /// The last frame run.
     pub frame: u64,
     /// Loads mounts, from the first [`Self::mount`].
@@ -276,6 +278,7 @@ impl TestScene {
             linked: Some(Box::new(data)),
             root: GpuPtr::NULL,
             tables: LightTables::default(),
+            features: SceneFeatures::NONE,
             frame: 0,
             workers: None,
         }
@@ -332,9 +335,11 @@ impl TestScene {
         }
         let mut root = GpuPtr::NULL;
         let mut tables = LightTables::default();
+        let mut features = SceneFeatures::NONE;
         f.update_scenes(&mut |c| {
             root = c.root;
             tables = c.light_tables;
+            features = c.features;
             compute(c);
         })
         .unwrap();
@@ -344,6 +349,7 @@ impl TestScene {
             .unwrap();
         self.root = root;
         self.tables = tables;
+        self.features = features;
     }
 
     /// A frame that only writes the scene.
@@ -358,6 +364,7 @@ impl TestScene {
             scene: self.root,
             focus,
             tables: self.tables,
+            features: self.features,
         }
     }
 
