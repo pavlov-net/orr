@@ -835,14 +835,17 @@ fn container(image: ctt::Image, bytes: &[u8]) -> Result<Source, String> {
             gray: gray_blocks(vk_format),
         });
     }
-    // Uncompressed: ctt converts to f32 RGBA in the file's color space. Read as straight alpha
-    // it would premultiply and divide back, which loses color where alpha is 0 or negative.
+    // Uncompressed: ctt converts to f32 RGBA, values as stored. Read as sRGB it would decode and
+    // encode again, and as straight alpha premultiply and divide back, which loses color where
+    // alpha is 0 or negative; the file's color reads as for any other file.
+    let (stored, _) = format.normalize();
     let mip0 = ctt::Image {
         surfaces: image.surfaces.iter().map(|l| vec![l[0].clone()]).collect(),
         kind: TextureKind::Texture2D,
         desc: ctt::FormatDesc {
+            format: stored,
+            color_space: ColorSpace::Linear,
             alpha: ctt::AlphaMode::Opaque,
-            ..image.desc
         },
     };
     let out = ctt::convert(
