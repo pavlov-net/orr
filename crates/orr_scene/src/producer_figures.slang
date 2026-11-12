@@ -37,8 +37,7 @@ public struct FiguresRoot
     public SceneRoot* scene;
     public ProducerFigures* figures;
     public TessStateGpu* tess_state; // by producer entry
-    public uint entries;            // of the producer table
-    public uint _pad;
+    public uint64_t _pad;
 }
 ORR_ROOT(FiguresRoot);
 
@@ -105,8 +104,7 @@ ProducerFigures entry_figures(SceneRoot* s, uint i)
         f.weld_dropped = t.weld_dropped;
         f.unseen_edges = t.unseen;
         f.welded = t.welded;
-        // A state no frame has stepped holds no scale, which `tessellate` reads as 1.
-        f.lowest_rate_scale = t.rate_scale > 0.0 ? t.rate_scale : 1.0;
+        f.lowest_rate_scale = t.rate_scale;
     }
     return f;
 }
@@ -119,7 +117,7 @@ void sum(uint t: SV_GroupThreadID)
 {
     SceneRoot* s = root.scene;
     ProducerFigures f = (ProducerFigures)0;
-    for (uint i = t; i < root.entries; i += GROUP)
+    for (uint i = t; i < s.producer_capacity; i += GROUP)
     {
         // An unset entry is all zero.
         if (s.batches[i].cluster_count != nullptr)

@@ -1249,9 +1249,8 @@ impl Readback {
         })
     }
 
-    /// Records the sum over the `entries` entries of the producer table of the scene at
-    /// `scene`, whose tessellation states are at `tess_state`, after the frame's builds.
-    #[allow(clippy::too_many_arguments)]
+    /// Records the sum over the producer table of the scene at `scene`, whose tessellation
+    /// states are at `tess_state`, after the frame's builds.
     pub(crate) fn sum(
         &self,
         device: &Device,
@@ -1260,7 +1259,6 @@ impl Readback {
         p: &Pipelines,
         k: &ProducerKernels,
         (scene, tess_state): (GpuPtr<SceneRoot>, GpuPtr<TessStateGpu>),
-        entries: u32,
     ) -> Result<()> {
         let root = window.put_root(
             device,
@@ -1268,7 +1266,6 @@ impl Readback {
                 scene,
                 figures: self.sums.gpu(),
                 tess_state,
-                entries,
                 _pad: 0,
             },
         )?;

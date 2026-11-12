@@ -3057,33 +3057,28 @@ fn record_producers(
     drop(jobs);
     let mut summed = Vec::new();
     for (scene, cpu) in &mut scenes {
-        let entries = scene.tables.producers.capacity();
-        if entries == 0 {
+        if scene.tables.producers.capacity() == 0 {
             continue;
         }
         for p in cpu.producers.iter_mut().flatten() {
             p.templates_built = true;
             p.built = true;
         }
-        if cpu.producer_readback.is_none() {
-            cpu.producer_readback = Some(Readback::new(device, core.fif)?);
-        }
-        let readback = cpu.producer_readback.as_ref().expect("made above");
+        let readback = match &mut cpu.producer_readback {
+            Some(readback) => readback,
+            none => none.insert(Readback::new(device, core.fif)?),
+        };
         let tables = (scene.tables.root.gpu(), scene.tables.tess_state.gpu());
-        readback.sum(
-            device,
-            window,
-            list,
-            pipelines,
-            &core.producers,
-            tables,
-            entries,
-        )?;
-        summed.push(cpu);
+        summed.push((readback, tables));
     }
-    list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
-    for cpu in summed {
-        if let Some(readback) = &mut cpu.producer_readback {
+    if !summed.is_empty() {
+        list.begin_pass("producer figures", false);
+        for (readback, tables) in &summed {
+            readback.sum(device, window, list, pipelines, &core.producers, *tables)?;
+        }
+        list.end_pass();
+        list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
+        for (readback, _) in summed {
             readback.copy(list, slot);
         }
     }
