@@ -18,8 +18,9 @@ use crate::{
     MicromapTriangle, OmmFormat, QueueKind, RtasFlags, RtasSizes, Stages, Tlas,
 };
 
-/// A classic acceleration structure in caller memory. Dropping it destroys it once
-/// everything submitted before the drop has completed; its memory stays the caller's.
+/// A classic acceleration structure in caller memory. Dropping it destroys it once the GPU
+/// is done with the work submitted before the drop and with the command lists open at it;
+/// its memory stays the caller's.
 pub struct ClassicAs {
     raw: vk::AccelerationStructureKHR,
     address: GpuAddress,
@@ -407,8 +408,8 @@ impl OmmFormat {
 }
 
 /// An opacity micromap in caller memory; CLAS reference it by [`Micromap::address`].
-/// Dropping it destroys it once everything submitted before the drop has completed; its
-/// memory stays the caller's.
+/// Dropping it destroys it once the GPU is done with the work submitted before the drop and
+/// with the command lists open at it; its memory stays the caller's.
 pub struct Micromap {
     raw: vk::AccelerationStructureKHR,
     address: GpuAddress,

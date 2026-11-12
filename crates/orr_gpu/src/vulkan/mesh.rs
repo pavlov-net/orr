@@ -14,8 +14,8 @@ use crate::{
 };
 
 /// A task/mesh/pixel pipeline drawn by [`crate::CommandList::draw_mesh_tasks`] inside
-/// [`crate::CommandList::begin_rendering`]. Dropping it destroys it once everything
-/// submitted before the drop has completed.
+/// [`crate::CommandList::begin_rendering`]. Dropping it destroys it once the GPU is done
+/// with the work submitted before the drop and with the command lists open at it.
 pub struct MeshPipeline {
     pub(super) raw: vk::Pipeline,
     shared: Arc<Shared>,

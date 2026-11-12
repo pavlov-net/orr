@@ -25,7 +25,8 @@ pub(super) struct SparseTail {
 /// An image and its memory. It has no layout state: [`crate::CommandList::discard`] puts it
 /// in `GENERAL` before first use, and it stays there.
 ///
-/// Dropping it destroys it once everything submitted before the drop has completed.
+/// Dropping it destroys it once the GPU is done with the work submitted before the drop and
+/// with the command lists open at it.
 pub struct Texture {
     pub(super) image: vk::Image,
     /// Memory of its own and its entry in the ledger.

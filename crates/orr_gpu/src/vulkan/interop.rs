@@ -201,9 +201,10 @@ pub fn buffer_handle<T>(a: &Allocation<T>) -> vk::Buffer {
     a.raw().buffer
 }
 
-/// Runs `release` once everything submitted to `device` so far has completed, from
-/// [`Device::collect_garbage`] or when the device is destroyed, before the Vulkan
-/// device is. For objects a library made on the device and its commands use.
+/// Runs `release` once the GPU is done with the work submitted to `device` so far and with
+/// the command lists open now, from [`Device::collect_garbage`] or when the device is
+/// destroyed, before the Vulkan device is. For objects a library made on the device and its
+/// commands use.
 pub fn defer_after_submitted(device: &Device, release: impl FnOnce() + Send + 'static) {
     device
         .shared

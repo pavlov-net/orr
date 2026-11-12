@@ -17,8 +17,8 @@ use crate::{Error, GpuAddress};
 /// Host memory imported with [`Device::import_host_memory`]: the GPU reads and writes it at
 /// [`ImportedMemory::gpu`] while the CPU uses it where it lies.
 ///
-/// Dropping it ends the import once everything submitted before the drop has completed, and
-/// then drops what the import keeps.
+/// Dropping it ends the import once the GPU is done with the work submitted before the drop
+/// and with the command lists open at it, and then drops what the import keeps.
 pub struct ImportedMemory {
     gpu: GpuAddress,
     size: u64,

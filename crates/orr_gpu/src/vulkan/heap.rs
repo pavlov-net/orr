@@ -275,8 +275,8 @@ impl Device {
             .defer(self.shared.after_point(after), Item::ImageSlot(slot));
     }
 
-    /// Returns `slot` to the free list once everything submitted so far has completed, as
-    /// dropping a [`Texture`] does.
+    /// Returns `slot` to the free list once the GPU is done with the work submitted so far
+    /// and with the command lists open now, as dropping a [`Texture`] does.
     pub fn free_image_slot_after_submitted(&self, slot: u32) {
         assert_freeable(slot);
         self.shared.defer_after_submitted(Item::ImageSlot(slot));

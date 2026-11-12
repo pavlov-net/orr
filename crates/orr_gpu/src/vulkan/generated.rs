@@ -19,7 +19,8 @@ const GROUPS_OFFSET: u32 = 12;
 const STRIDE: u32 = size_of::<Sequence>() as u32;
 
 /// Pipelines of one kind that GPU-written sequences pick by index. Dropping it destroys it
-/// and its pipelines once everything submitted before the drop has completed.
+/// and its pipelines once the GPU is done with the work submitted before the drop and with
+/// the command lists open at it.
 pub struct ExecutionSet {
     raw: vk::IndirectExecutionSetEXT,
     /// The commands layout for explicit preprocessing; null for mesh sets.

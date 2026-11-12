@@ -144,8 +144,9 @@ impl MemoryTypes {
 /// mapped on the CPU for [`MemoryKind::Upload`], [`MemoryKind::Readback`] and
 /// [`MemoryKind::Staging`].
 ///
-/// Dropping it frees the memory once everything submitted before the drop has completed;
-/// [`Device::gpu_free`] names the point instead.
+/// Dropping it frees the memory once the GPU is done with the work submitted before the
+/// drop and with the command lists open at it; [`Device::gpu_free`] names the point
+/// instead.
 pub struct Allocation<T: 'static> {
     gpu: GpuPtr<T>,
     cpu: Option<NonNull<T>>,
@@ -834,8 +835,8 @@ impl Drop for Ring {
 /// `&mut self`, so no container borrowing the ring outlives it. The GPU may use the memory
 /// until the point given to the `reset` that closed the arena has completed.
 ///
-/// One thread owns the ring. Dropping it frees the blocks once everything submitted before
-/// the drop has completed.
+/// One thread owns the ring. Dropping it frees the blocks once the GPU is done with the
+/// work submitted before the drop and with the command lists open at it.
 pub struct HostArenas {
     ring: Ring,
 }
@@ -845,8 +846,8 @@ pub struct HostArenas {
 /// flight on the loading queue. The blocks hold only transient memory. Nothing is freed one
 /// by one; [`DeviceArenas::reset`] closes the current arena.
 ///
-/// One thread owns the ring. Dropping it frees the blocks once everything submitted before
-/// the drop has completed.
+/// One thread owns the ring. Dropping it frees the blocks once the GPU is done with the
+/// work submitted before the drop and with the command lists open at it.
 pub struct DeviceArenas {
     ring: Ring,
 }

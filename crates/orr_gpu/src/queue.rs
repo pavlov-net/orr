@@ -61,6 +61,68 @@ impl Queue {
     }
 }
 
+/// The device's command lists that may still use what is freed while they are open. Lists
+/// name memory by address and hold nothing, so a free made while one is open waits for that
+/// list as well as for the work submitted before it. Each list takes a sequence number when
+/// it opens and stays unresolved until it is dropped unsubmitted or its submit completes.
+#[derive(Default)]
+pub(crate) struct OpenLists {
+    next: u64,
+    /// Each unresolved list's sequence number, with the point its submit signals once it has
+    /// one.
+    unresolved: Vec<(u64, Option<TimelinePoint>)>,
+}
+
+impl OpenLists {
+    /// Opens a list for the queue of `timeline`, first forgetting that queue's submits up to
+    /// `completed`, so a device that never collects garbage keeps few.
+    pub(crate) fn open(&mut self, timeline: u32, completed: u64) -> u64 {
+        self.unresolved
+            .retain(|(_, p)| !p.is_some_and(|p| p.timeline == timeline && p.value <= completed));
+        let seq = self.next;
+        self.next += 1;
+        self.unresolved.push((seq, None));
+        seq
+    }
+
+    /// List `seq` resolves once `point` has completed.
+    pub(crate) fn submitted(&mut self, seq: u64, point: TimelinePoint) {
+        let i = self.position(seq);
+        self.unresolved[i].1 = Some(point);
+    }
+
+    /// List `seq` ended without a submit that runs it.
+    pub(crate) fn dropped(&mut self, seq: u64) {
+        let i = self.position(seq);
+        self.unresolved.swap_remove(i);
+    }
+
+    /// The sequence number the next list takes: a free made now waits for every list with a
+    /// smaller one.
+    pub(crate) fn next(&self) -> u64 {
+        self.next
+    }
+
+    /// The smallest sequence number of a list still unresolved once each queue timeline has
+    /// reached its value in `completed`; the next list's when none is.
+    pub(crate) fn first_unresolved(&mut self, completed: &[u64]) -> u64 {
+        self.unresolved
+            .retain(|(_, p)| !p.is_some_and(|p| completed[p.timeline as usize] >= p.value));
+        self.unresolved
+            .iter()
+            .map(|&(seq, _)| seq)
+            .min()
+            .unwrap_or(self.next)
+    }
+
+    fn position(&self, seq: u64) -> usize {
+        self.unresolved
+            .iter()
+            .position(|&(s, p)| s == seq && p.is_none())
+            .expect("an open list")
+    }
+}
+
 /// The queues a device creates besides [`QueueKind::Render`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct QueueRequest {

@@ -209,8 +209,8 @@ impl Queue {
     /// A list recording for this queue. Any thread may record it; send it to the queue's
     /// owner thread to submit.
     pub fn command_list(&self) -> Result<CommandList<'_>, Error> {
+        let completed = self.completed();
         let reused = {
-            let completed = self.completed();
             let mut pools = self.pools.lock().unwrap();
             while pools.pending.front().is_some_and(|p| p.value <= completed) {
                 let p = pools.pending.pop_front().unwrap();
@@ -250,7 +250,9 @@ impl Queue {
         if self.shaders {
             self.shared.heaps().bind(&self.shared.heap_fn, res.cmd);
         }
-        Ok(CommandList::new(self, res))
+        let timeline = self.kind.index() as u32;
+        let seq = self.shared.lists.lock().unwrap().open(timeline, completed);
+        Ok(CommandList::new(self, res, seq))
     }
 
     /// Returns an unsubmitted list's resources for reuse.
@@ -393,6 +395,12 @@ impl Queue {
             .collect();
         self.shared.record_submit(self.kind, value, passes);
         let after = self.shared.after_point(self.point(value));
+        {
+            let mut lists = self.shared.lists.lock().unwrap();
+            for f in &finished {
+                lists.submitted(f.seq, self.point(value));
+            }
+        }
         let mut pools = self.pools.lock().unwrap();
         for f in finished {
             for item in f.keep {
@@ -415,11 +423,17 @@ impl Queue {
 
     /// Takes back the resources of lists that were not submitted.
     fn release(&self, finished: Vec<Finished>) {
+        {
+            let mut lists = self.shared.lists.lock().unwrap();
+            for f in &finished {
+                lists.dropped(f.seq);
+            }
+        }
         let mut pools = self.pools.lock().unwrap();
         for f in finished {
             pools.free.push(f.res);
             for item in f.keep {
-                self.shared.defer_after_submitted(item);
+                self.shared.defer(self.shared.submitted(), item);
             }
         }
     }

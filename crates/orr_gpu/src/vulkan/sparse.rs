@@ -16,8 +16,8 @@ use crate::{
 
 /// A device address range of `max_count` values of `T` with no memory until
 /// [`Device::bind_sparse`] binds its pages. The address never changes. Dropping it destroys
-/// it once everything submitted before the drop has completed; the memory bound to it stays
-/// the caller's.
+/// it once the GPU is done with the work submitted before the drop and with the command
+/// lists open at it; the memory bound to it stays the caller's.
 pub struct SparseAllocation<T: 'static> {
     pub gpu: GpuPtr<T>,
     /// Bytes, a whole number of pages.

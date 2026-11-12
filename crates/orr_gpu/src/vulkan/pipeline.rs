@@ -69,8 +69,8 @@ fn root_mapping() -> vk::DescriptorSetAndBindingMappingEXT<'static> {
     }
 }
 
-/// A compute pipeline. Dropping it destroys it once everything submitted before the drop
-/// has completed.
+/// A compute pipeline. Dropping it destroys it once the GPU is done with the work submitted
+/// before the drop and with the command lists open at it.
 pub struct ComputePipeline {
     pub(super) raw: vk::Pipeline,
     /// The size of the root the kernel holds in the push data; 0 for a root in GPU memory.

@@ -45,10 +45,14 @@ pub(super) struct Finished {
     pub(super) passes: Vec<PassRecord>,
     /// Objects the list's commands use, destroyed once its submit completes.
     pub(super) keep: Vec<Item>,
+    /// The list's sequence number in the device's open lists.
+    pub(super) seq: u64,
 }
 
 /// A one-shot command list for one queue. Record on any thread, then hand it to the queue's
-/// owner for [`Queue::submit`]. Dropping it unsubmitted discards it.
+/// owner for [`Queue::submit`]. Dropping it unsubmitted discards it. It names memory and
+/// objects without holding them, so what is dropped while it is open lives until its submit
+/// has completed, or until it is dropped unsubmitted.
 pub struct CommandList<'q> {
     queue: &'q Queue,
     res: Option<ListResources>,
@@ -62,10 +66,12 @@ pub struct CommandList<'q> {
     keep: Vec<Item>,
     /// Compacted-size queries recorded so far.
     pub(super) compact_queries: u32,
+    /// The list's sequence number in the device's open lists, until a submit takes it.
+    seq: Option<u64>,
 }
 
 impl<'q> CommandList<'q> {
-    pub(crate) fn new(queue: &'q Queue, res: ListResources) -> Self {
+    pub(crate) fn new(queue: &'q Queue, res: ListResources, seq: u64) -> Self {
         Self {
             queue,
             res: Some(res),
@@ -76,6 +82,7 @@ impl<'q> CommandList<'q> {
             rebind_heaps: false,
             keep: Vec::new(),
             compact_queries: 0,
+            seq: Some(seq),
         }
     }
 
@@ -154,6 +161,7 @@ impl<'q> CommandList<'q> {
             res,
             passes: std::mem::take(&mut self.passes),
             keep: std::mem::take(&mut self.keep),
+            seq: self.seq.take().expect("a list is finished once"),
         })
     }
 
@@ -1023,11 +1031,16 @@ impl<'q> CommandList<'q> {
 
 impl Drop for CommandList<'_> {
     fn drop(&mut self) {
+        let shared = &self.queue.shared;
         if let Some(res) = self.res.take() {
             self.queue.recycle(res);
         }
+        if let Some(seq) = self.seq.take() {
+            shared.lists.lock().unwrap().dropped(seq);
+        }
+        // No other list uses what this one keeps.
         for item in self.keep.drain(..) {
-            self.queue.shared.defer_after_submitted(item);
+            shared.defer(shared.submitted(), item);
         }
     }
 }

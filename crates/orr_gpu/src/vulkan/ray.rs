@@ -67,7 +67,8 @@ impl RecordBlock {
 }
 
 /// A ray-dispatch pipeline: one raygen entry run by [`crate::CommandList::dispatch_rays`].
-/// Dropping it destroys it once everything submitted before the drop has completed.
+/// Dropping it destroys it once the GPU is done with the work submitted before the drop and
+/// with the command lists open at it.
 pub struct RayDispatchPipeline {
     pub(super) raw: vk::Pipeline,
     /// The size of the root the kernel holds in the push data.
@@ -80,9 +81,9 @@ pub struct RayDispatchPipeline {
 
 impl Drop for RayDispatchPipeline {
     fn drop(&mut self) {
-        let after = self.shared.submitted();
-        self.shared.defer(after, Item::Pipeline(self.raw));
-        self.shared.defer(after, Item::RaygenRecord(self.slot));
+        self.shared.defer_after_submitted(Item::Pipeline(self.raw));
+        self.shared
+            .defer_after_submitted(Item::RaygenRecord(self.slot));
     }
 }
 

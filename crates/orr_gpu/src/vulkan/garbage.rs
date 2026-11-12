@@ -87,9 +87,11 @@ impl Item {
     }
 }
 
-/// Items waiting for timeline points, in the order they were deferred.
+/// Items waiting for timeline points and command lists, in the order they were deferred.
 pub(super) struct Waiting<T> {
-    entries: Vec<(After, Option<Own>, T)>,
+    /// Each item's points, the first list sequence number it does not wait for (see
+    /// [`crate::queue::OpenLists`]), its memory of its own and the item.
+    entries: Vec<(After, u64, Option<Own>, T)>,
     /// Per heap, the bytes of the entries' device memory of their own.
     own_bytes: [u64; vk::MAX_MEMORY_HEAPS],
 }
@@ -106,28 +108,32 @@ impl<T> Default for Waiting<T> {
 pub(super) type Garbage = Waiting<Item>;
 
 impl<T> Waiting<T> {
-    fn push(&mut self, after: After, own: Option<Own>, item: T) {
+    fn push(&mut self, after: After, lists: u64, own: Option<Own>, item: T) {
         if let Some(o) = own {
             self.own_bytes[o.heap] += o.bytes;
         }
-        self.entries.push((after, own, item));
+        self.entries.push((after, lists, own, item));
     }
 
-    /// Removes and returns the items whose points have all completed, oldest first. Of those
-    /// with device memory of their own it takes the oldest [`OWN_FREES`], or one in
-    /// [`OWN_SHARE`] of them when that is more; the rest wait for the next collections.
-    fn take_due(&mut self, completed: &After) -> Vec<T> {
-        let ready = |after: &After| after.iter().zip(completed).all(|(a, c)| a <= c);
+    /// Removes and returns the items whose points have all completed and whose lists have all
+    /// resolved, `first_unresolved` being the smallest sequence number of a list that has not,
+    /// oldest first. Of those with device memory of their own it takes the oldest
+    /// [`OWN_FREES`], or one in [`OWN_SHARE`] of them when that is more; the rest wait for the
+    /// next collections.
+    fn take_due(&mut self, completed: &After, first_unresolved: u64) -> Vec<T> {
+        let ready = |after: &After, lists: u64| {
+            lists <= first_unresolved && after.iter().zip(completed).all(|(a, c)| a <= c)
+        };
         let due_own = self
             .entries
             .iter()
-            .filter(|(after, own, _)| own.is_some() && ready(after))
+            .filter(|(after, lists, own, _)| own.is_some() && ready(after, *lists))
             .count();
         let mut quota = due_own.div_ceil(OWN_SHARE).max(OWN_FREES);
         let own_bytes = &mut self.own_bytes;
         self.entries
-            .extract_if(.., |(after, own, _)| {
-                if !ready(after) {
+            .extract_if(.., |(after, lists, own, _)| {
+                if !ready(after, *lists) {
                     return false;
                 }
                 let Some(o) = own else { return true };
@@ -138,7 +144,7 @@ impl<T> Waiting<T> {
                 own_bytes[o.heap] -= o.bytes;
                 true
             })
-            .map(|(_, _, item)| item)
+            .map(|(_, _, _, item)| item)
             .collect()
     }
 
@@ -149,30 +155,43 @@ impl<T> Waiting<T> {
 
     pub(super) fn take_all(&mut self) -> Vec<T> {
         self.own_bytes = [0; vk::MAX_MEMORY_HEAPS];
-        self.entries.drain(..).map(|(_, _, item)| item).collect()
+        self.entries.drain(..).map(|(_, _, _, item)| item).collect()
     }
 }
 
 impl Shared {
     /// Destroys `item` once every timeline reaches its value in `after`.
     pub(super) fn defer(&self, after: After, item: Item) {
+        self.defer_after_lists(after, 0, item);
+    }
+
+    /// Destroys `item` once everything submitted so far has completed and every command list
+    /// open now has resolved: the lists may have recorded uses of it.
+    pub(super) fn defer_after_submitted(&self, item: Item) {
+        let lists = self.lists.lock().unwrap().next();
+        self.defer_after_lists(self.submitted(), lists, item);
+    }
+
+    /// Destroys `item` once every timeline reaches its value in `after` and every list with a
+    /// sequence number below `lists` has resolved.
+    fn defer_after_lists(&self, after: After, lists: u64, item: Item) {
         let types = &self.memory.properties.memory_types;
         let own = item.own_memory().map(|(ty, bytes)| Own {
             heap: types[ty as usize].heap_index as usize,
             bytes,
         });
-        self.garbage.lock().unwrap().push(after, own, item);
-    }
-
-    /// Destroys `item` once everything submitted so far has completed.
-    pub(super) fn defer_after_submitted(&self, item: Item) {
-        self.defer(self.submitted(), item);
+        self.garbage.lock().unwrap().push(after, lists, own, item);
     }
 
     pub(super) fn collect(&self) {
         self.pools.next_frame();
         let completed = self.completed();
-        let due = self.garbage.lock().unwrap().take_due(&completed);
+        let first_unresolved = self.lists.lock().unwrap().first_unresolved(&completed);
+        let due = self
+            .garbage
+            .lock()
+            .unwrap()
+            .take_due(&completed, first_unresolved);
         for item in due {
             self.destroy(item);
         }
@@ -261,20 +280,20 @@ mod tests {
         const STEADY: u32 = 3;
         let mut w = Waiting::<u32>::default();
         // Not due until the end, ahead of everything else.
-        w.push([2; MAX_TIMELINES], own(1), u32::MAX);
+        w.push([2; MAX_TIMELINES], 0, own(1), u32::MAX);
         for i in 0..BURST {
-            w.push([0; MAX_TIMELINES], own(10), i);
+            w.push([0; MAX_TIMELINES], 0, own(10), i);
         }
         let mut next = BURST;
         let mut freed = Vec::new();
         let mut longest = 0;
         for collection in 0..200u32 {
             for _ in 0..STEADY {
-                w.push([1; MAX_TIMELINES], own(10), next);
+                w.push([1; MAX_TIMELINES], 0, own(10), next);
                 next += 1;
             }
-            w.push([0; MAX_TIMELINES], None, u32::MAX - 1);
-            let due = w.take_due(&DONE);
+            w.push([0; MAX_TIMELINES], 0, None, u32::MAX - 1);
+            let due = w.take_due(&DONE, 0);
             assert_eq!(due.last(), Some(&(u32::MAX - 1)), "an entry without memory");
             let own_due = &due[..due.len() - 1];
             for &i in own_due {
@@ -295,6 +314,6 @@ mod tests {
             "{waiting} still wait"
         );
         assert!(longest <= 64, "an entry waited {longest} collections");
-        assert_eq!(w.take_due(&[2; MAX_TIMELINES])[0], u32::MAX);
+        assert_eq!(w.take_due(&[2; MAX_TIMELINES], 0)[0], u32::MAX);
     }
 }
