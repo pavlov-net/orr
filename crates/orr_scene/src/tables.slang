@@ -435,6 +435,7 @@ public struct SceneRoot
     public ProducerBatch* batches;   // by producer entry: what is drawn and traced; a tessellated entry's generated clusters
     public ProducerBatch* patches;   // by producer entry: the patches a tessellated entry's kernel emits; zero for others
     public ProducerStateGpu* producer_state; // by producer entry, written by the GPU
+    public TessStateGpu* tess_state; // by producer entry, written by the GPU
     public SkyStats* sky_stats;
     public uint64_t environment;     // consumer data for the linked environment
     public uint64_t medium;          // consumer data for the linked medium

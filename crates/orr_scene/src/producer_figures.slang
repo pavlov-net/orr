@@ -36,8 +36,6 @@ public struct FiguresRoot
 {
     public SceneRoot* scene;
     public ProducerFigures* figures;
-    public TessStateGpu* tess_state; // by producer entry
-    public uint64_t _pad;
 }
 ORR_ROOT(FiguresRoot);
 
@@ -95,7 +93,7 @@ ProducerFigures entry_figures(SceneRoot* s, uint i)
     f.built = st.clusters;
     if (s.producers[i].tessellated != 0)
     {
-        TessStateGpu* t = root.tess_state + i;
+        TessStateGpu* t = s.tess_state + i;
         f.tessellated = 1;
         f.patches = t.patches;
         f.subpatches = t.subpatches;

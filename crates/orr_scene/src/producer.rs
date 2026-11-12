@@ -26,7 +26,7 @@ use crate::pipelines::{PipelineId, Pipelines};
 use crate::scene::{InstanceFlags, ModelId, TransformGroupId};
 use crate::shaders::producer_build::{self, BuildRoot, ProducerBuildGpu};
 use crate::shaders::producer_figures::{self, FiguresRoot, ProducerFigures};
-use crate::shaders::types::{GeneratedClusterGpu, SubdCopyGpu, TessGpu, TessStateGpu};
+use crate::shaders::types::{GeneratedClusterGpu, SubdCopyGpu, TessGpu};
 use crate::subd::{CageShape, SubdBuild};
 use crate::tessellate::{EntryTess, Layout, PATTERNS, Patterns, TessellationStats};
 use crate::{ProducerBatch, ProducerClusterGpu, ProducerGpu, Result, SceneRoot, TopologyGpu};
@@ -1249,8 +1249,8 @@ impl Readback {
         })
     }
 
-    /// Records the sum over the producer table of the scene at `scene`, whose tessellation
-    /// states are at `tess_state`, after the frame's builds.
+    /// Records the sum over the producer table of the scene at `scene`, after the frame's
+    /// builds.
     pub(crate) fn sum(
         &self,
         device: &Device,
@@ -1258,15 +1258,13 @@ impl Readback {
         list: &mut CommandList<'_>,
         p: &Pipelines,
         k: &ProducerKernels,
-        (scene, tess_state): (GpuPtr<SceneRoot>, GpuPtr<TessStateGpu>),
+        scene: GpuPtr<SceneRoot>,
     ) -> Result<()> {
         let root = window.put_root(
             device,
             &FiguresRoot {
                 scene,
                 figures: self.sums.gpu(),
-                tess_state,
-                _pad: 0,
             },
         )?;
         list.dispatch(p.get(k.figures), root, [1, 1, 1]);

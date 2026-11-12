@@ -1988,6 +1988,7 @@ impl<'a> Frame<'a> {
                 batches: t.batches.gpu(),
                 patches: t.patches.gpu(),
                 producer_state: t.producer_state.gpu(),
+                tess_state: t.tess_state.gpu(),
                 sky_stats: t.sky_stats.gpu(),
                 environment: cpu.environment.unwrap_or(0),
                 medium: cpu.medium.unwrap_or(0),
@@ -3080,13 +3081,12 @@ fn record_producers(
             Some(readback) => readback,
             none => none.insert(Readback::new(device, core.fif)?),
         };
-        let tables = (scene.tables.root.gpu(), scene.tables.tess_state.gpu());
-        summed.push((readback, tables));
+        summed.push((readback, scene.tables.root.gpu()));
     }
     if !summed.is_empty() {
         list.begin_pass("producer figures", false);
-        for (readback, tables) in &summed {
-            readback.sum(device, window, list, pipelines, &core.producers, *tables)?;
+        for (readback, scene) in &summed {
+            readback.sum(device, window, list, pipelines, &core.producers, *scene)?;
         }
         list.end_pass();
         list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());

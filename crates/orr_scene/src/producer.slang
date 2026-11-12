@@ -106,6 +106,20 @@ public struct ProducerStateGpu
     public uint _pad;
 }
 
+// What the GPU keeps of a tessellated entry from frame to frame, and its last figures.
+public struct TessStateGpu
+{
+    public float rate_scale;     // edge factors' scale; steps down near capacity
+    public float usage;          // last frame's largest share of cluster or vertex capacity asked for
+    public uint patches;
+    public uint subpatches;      // diced
+    public uint split_dropped;
+    public uint dice_dropped;
+    public uint weld_dropped;
+    public uint unseen;
+    public uint welded;
+}
+
 // Floats as uints that order like the floats, for atomic min and max.
 public uint ordered(float f)
 {

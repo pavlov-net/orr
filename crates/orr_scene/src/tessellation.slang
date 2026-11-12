@@ -287,17 +287,3 @@ public struct TessGpu
     public uint weld_mask;
     public float reach;          // m, entry space: the most its displacement moves a point
 }
-
-// What the GPU keeps of a tessellated entry from frame to frame, and its last figures.
-public struct TessStateGpu
-{
-    public float rate_scale;     // edge factors' scale; steps down near capacity
-    public float usage;          // last frame's largest share of cluster or vertex capacity asked for
-    public uint patches;
-    public uint subpatches;      // diced
-    public uint split_dropped;
-    public uint dice_dropped;
-    public uint weld_dropped;
-    public uint unseen;
-    public uint welded;
-}
