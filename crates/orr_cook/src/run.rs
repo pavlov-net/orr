@@ -3374,7 +3374,8 @@ fn mesh_working_set(mesh: &MeshSource, settings: &MeshSettings) -> u64 {
 struct MapBytes {
     /// The decoded maps, each texture once per use ([`MapUse`]).
     held: u64,
-    /// The opacity micromaps bake from: a byte per mip 0 texel, per section that bakes them.
+    /// The opacity micromaps bake from and the entries they keep: two bytes per mip 0 texel,
+    /// per section that bakes them.
     micromaps: u64,
     /// The most texel channels one texture use decodes.
     decode_channels: u64,

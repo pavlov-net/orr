@@ -394,8 +394,8 @@ impl SectionData {
 
     /// The most bytes the section's micromaps bake from for its opacity texture, whose units'
     /// mip 0 sizes are `sizes`, under `settings`: a byte per texel of each unit that fits the
-    /// rasterizer. The bake reads the tiles of a set the mesh's uvs reach, which are not known
-    /// before it is read, and bakes when those all fit.
+    /// rasterizer, and as many again for the entries it keeps. The bake reads the tiles of a set
+    /// the mesh's uvs reach, which are not known before it is read, and bakes when those all fit.
     pub(crate) fn micromap_bytes(&self, settings: &MeshSettings, sizes: &[[u32; 2]]) -> u64 {
         if settings.omm.is_none() || !self.takes_micromaps() {
             return 0;
@@ -403,7 +403,7 @@ impl SectionData {
         sizes
             .iter()
             .filter(|&&[w, h]| w <= OmmAlpha::MAX_SIZE && h <= OmmAlpha::MAX_SIZE)
-            .map(|&[w, h]| u64::from(w) * u64::from(h))
+            .map(|&[w, h]| 2 * u64::from(w) * u64::from(h))
             .sum()
     }
 

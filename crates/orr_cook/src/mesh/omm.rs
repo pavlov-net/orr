@@ -7,7 +7,10 @@ use orr_pack::mesh::{
     MicromapEntry, OMM_OPAQUE, OMM_STATE_OPAQUE, OMM_STATE_TRANSPARENT, OMM_STATE_UNKNOWN_OPAQUE,
     OMM_STATE_UNKNOWN_TRANSPARENT, OMM_TRANSPARENT,
 };
+use rustc_hash::FxHashMap;
 use serde::Deserialize;
+use std::collections::hash_map::Entry;
+use std::sync::RwLock;
 
 use super::maps::{self, FAIL, Map, Opacity, OpacityRead, PASS, Raster};
 use crate::texture::Wrap;
@@ -101,13 +104,73 @@ impl OmmAlpha {
 pub(super) struct OmmRead<'a> {
     read: &'a OpacityRead,
     alpha: OmmAlpha,
+    made: RwLock<Made>,
+}
+
+/// A triangle's level and the bits of its corners' mesh uvs.
+type MadeKey = (u8, [[u32; 2]; 3]);
+
+/// Checked entries of the triangles that lie whole in one texture. A read belongs to one map of
+/// one section, which fixes the texture, its wrap, uv transform and cutoff, so a triangle's
+/// [`MadeKey`] decides both its rasterized states and the check's: foliage repeats its cards'
+/// uvs across clusters and levels. The entries take at most as many bytes as the texture has
+/// texels, which the micromap estimate counts.
+#[derive(Default)]
+struct Made {
+    /// Where each entry's states start in `states`.
+    entries: FxHashMap<MadeKey, usize>,
+    states: Vec<u8>,
+    /// What the entries can take: `states` and the table grow by doubling and hold the old
+    /// and new allocations while they move, and the table keeps some of its slots free.
+    bytes: usize,
+}
+
+impl Made {
+    const SLOT: usize = size_of::<(MadeKey, usize)>() + 1;
+
+    fn key(level: u8, uv: [[f32; 2]; 3]) -> MadeKey {
+        (level, uv.map(|c| c.map(f32::to_bits)))
+    }
 }
 
 impl<'a> OmmRead<'a> {
     /// `None` for a texture wider or taller than [`OmmAlpha::MAX_SIZE`].
     pub(super) fn new(read: &'a OpacityRead, cutoff: f32) -> Option<Self> {
         let alpha = OmmAlpha::new(&read.mip0, cutoff)?;
-        Some(Self { read, alpha })
+        Some(Self {
+            read,
+            alpha,
+            made: RwLock::default(),
+        })
+    }
+
+    /// Copies the entry made for triangle `uv` at `level` into `data`, if there is one.
+    fn made(&self, level: u8, uv: [[f32; 2]; 3], data: &mut [u8]) -> bool {
+        let made = self.made.read().expect("micromap entries");
+        let Some(&at) = made.entries.get(&Made::key(level, uv)) else {
+            return false;
+        };
+        data.copy_from_slice(&made.states[at..at + data.len()]);
+        true
+    }
+
+    /// Keeps `data`, the entry made for triangle `uv` at `level`, while there is room.
+    fn keep(&self, level: u8, uv: [[f32; 2]; 3], data: &[u8]) {
+        let mut made = self.made.write().expect("micromap entries");
+        let bytes = made.bytes + 3 * data.len() + 4 * Made::SLOT;
+        if bytes > self.alpha.alpha.len() {
+            return;
+        }
+        let Made {
+            entries,
+            states,
+            bytes: taken,
+        } = &mut *made;
+        if let Entry::Vacant(slot) = entries.entry(Made::key(level, uv)) {
+            slot.insert(states.len());
+            states.extend_from_slice(data);
+            *taken = bytes;
+        }
     }
 
     /// Whether mapped uvs `p` read the texture as the rasterizer's sampler does, which repeats.
@@ -295,25 +358,34 @@ pub(super) fn cluster_omm(
         at..at + meshopt::opacity_map_entry_size(levels[i], STATES)
     };
     let mesh_uv = |b: &Batch<'_>, t: usize| tris[b.tris[t]].map(|v| uvs[usize::from(v)]);
-    {
+    let made: Vec<bool> = {
         let _z = crate::profile::zone!("omm.rasterize");
-        for (i, &(b, t)) in entries.iter().enumerate() {
-            let entry = &mut data[entry(&levels, i)];
-            match b.read {
-                Some(r) => {
-                    let at = [0, 1, 2].map(|k| b.uvs[3 * t + k]);
-                    let texture = r.alpha.texture();
-                    meshopt::opacity_map_rasterize(entry, levels[i], STATES, &at, &texture);
+        entries
+            .iter()
+            .enumerate()
+            .map(|(i, &(b, t))| {
+                let entry = &mut data[entry(&levels, i)];
+                match b.read {
+                    Some(r) if r.made(levels[i], mesh_uv(b, t), entry) => return true,
+                    Some(r) => {
+                        let at = [0, 1, 2].map(|k| b.uvs[3 * t + k]);
+                        let texture = r.alpha.texture();
+                        meshopt::opacity_map_rasterize(entry, levels[i], STATES, &at, &texture);
+                    }
+                    None => rasterize_across(entry, levels[i], mesh_uv(b, t), alpha, cutoff),
                 }
-                None => rasterize_across(entry, levels[i], mesh_uv(b, t), alpha, cutoff),
-            }
-        }
-    }
+                false
+            })
+            .collect()
+    };
     {
         let _z = crate::profile::zone!("omm.check");
-        for (i, &(b, t)) in entries.iter().enumerate() {
-            let entry = &mut data[entry(&levels, i)];
-            known_states_hold(entry, levels[i], mesh_uv(b, t), alpha);
+        for (i, &(b, t)) in entries.iter().enumerate().filter(|&(i, _)| !made[i]) {
+            let (entry, uv) = (&mut data[entry(&levels, i)], mesh_uv(b, t));
+            known_states_hold(entry, levels[i], uv, alpha);
+            if let Some(r) = b.read {
+                r.keep(levels[i], uv, entry);
+            }
         }
     }
     let _z = crate::profile::zone!("omm.compact");
@@ -637,6 +709,69 @@ mod tests {
         assert_eq!(image.indices, tile.indices);
         assert_eq!(image.levels, tile.levels);
         assert_eq!(image.data, tile.data);
+    }
+
+    /// A cluster repeating triangles another cluster made takes their entries as it would make
+    /// them alone. A triangle one bit away makes its own, and so does the same triangle read under
+    /// another cutoff.
+    #[test]
+    fn repeated_triangles_share_the_entries_they_make_alone() {
+        let n = 64;
+        let ramp: Arc<Vec<f32>> = Arc::new((0..n * n).map(|i| (i % n) as f32 / n as f32).collect());
+        let opacity = |cutoff| {
+            let mip0 = Raster {
+                w: n,
+                h: n,
+                texels: Arc::clone(&ramp),
+                wrap: [Wrap::Repeat; 2],
+                uv: [0.0; 6],
+                outside: 0.0,
+            };
+            Opacity::Texture {
+                map: Map::Image(OpacityRead::new(mip0, cutoff)),
+                cutoff,
+                uv_set: 0,
+            }
+        };
+        fn alpha(o: &Opacity) -> Map<OmmRead<'_>> {
+            let Opacity::Texture { map, cutoff, .. } = o else {
+                unreachable!()
+            };
+            map.try_map(|t| OmmRead::new(t, *cutoff)).unwrap()
+        }
+        let s = settings(4);
+        let make = |o: &Opacity, alpha: &Map<OmmRead<'_>>, uvs: &[[f32; 2]]| {
+            let tris: Vec<[u8; 3]> = (0..uvs.len() as u8 / 3)
+                .map(|t| [3 * t, 3 * t + 1, 3 * t + 2])
+                .collect();
+            cluster_omm(o, Some(alpha), uvs, &tris, &s).unwrap()
+        };
+        let alone = |o: &Opacity, uvs: &[[f32; 2]]| make(o, &alpha(o), uvs);
+        let entries = |alpha: &Map<OmmRead<'_>>| match alpha {
+            Map::Image(r) => r.made.read().unwrap().entries.len(),
+            Map::Tiles(_) => unreachable!(),
+        };
+        let high = opacity(0.5);
+        let card: [[f32; 2]; 3] = [[0.21, 0.2], [0.83, 0.31], [0.4, 0.9]];
+        let other = [[0.1, 0.6], [0.7, 0.55], [0.52, 0.12]];
+        let mut near = card;
+        near[1][0] = f32::from_bits(near[1][0].to_bits() + 1);
+        let shared = alpha(&high);
+        let first = make(&high, &shared, &card);
+        assert_eq!(entries(&shared), 1);
+        let both = [card, other].concat();
+        let (made, fresh) = (make(&high, &shared, &both), alone(&high, &both));
+        assert_eq!(entries(&shared), 2);
+        assert!(!fresh.data.is_empty());
+        assert_eq!(
+            (made.indices, made.levels, made.data),
+            (fresh.indices, fresh.levels, fresh.data)
+        );
+        let made = make(&high, &shared, &near);
+        assert_eq!(entries(&shared), 3);
+        assert_eq!(made.data, alone(&high, &near).data);
+        let low = opacity(0.3);
+        assert_ne!(make(&low, &alpha(&low), &card).data, first.data);
     }
 
     /// Whole in one cell, a micro-triangle states what that cell holds, whichever cell it is.
