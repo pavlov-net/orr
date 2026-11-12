@@ -150,8 +150,10 @@ pub(super) enum Take {
     Shade { normal: u32, attributes: u32 },
 }
 
-/// The vertices of a triangle list, for searches by position, and the patch each lies in: the
-/// vertices the list's triangles join, across which their attributes run on.
+/// The vertices a triangle list stands for, for searches by position, and the patch each lies
+/// in: the vertices the list's triangles join, across which their attributes run on. A corner
+/// held by a vertex standing for another joins no patch: its attributes can come from a patch
+/// other than its base's, and joining its base there would join unrelated parts of a texture.
 struct Near {
     /// The vertices by their coordinate on the axis their box is longest on, so a search stops
     /// once that coordinate alone is farther than the nearest found: a piece can hold a whole
@@ -162,7 +164,8 @@ struct Near {
 }
 
 impl Near {
-    fn new(triangles: &[u32], at: impl Fn(u32) -> DVec3) -> Self {
+    /// Over the triangles `input`, whose corners stand for those of `bases`.
+    fn new(input: &[u32], bases: &[u32], at: impl Fn(u32) -> DVec3) -> Self {
         fn root(parent: &mut [u32], mut i: u32) -> u32 {
             while parent[i as usize] != i {
                 let up = parent[parent[i as usize] as usize];
@@ -171,15 +174,24 @@ impl Near {
             }
             i
         }
-        let mut c = triangles.to_vec();
+        let mut c = bases.to_vec();
         c.sort_unstable();
         c.dedup();
         let dense = |v: u32| c.binary_search(&v).expect("a vertex of the triangles") as u32;
         let mut parent: Vec<u32> = (0..c.len() as u32).collect();
-        for t in triangles.as_chunks::<3>().0 {
-            let r = root(&mut parent, dense(t[0]));
-            for &v in &t[1..] {
-                let s = root(&mut parent, dense(v));
+        for (b, i) in bases
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(input.as_chunks::<3>().0)
+        {
+            let mut own = (0..3).filter(|&k| b[k] == i[k]).map(|k| dense(b[k]));
+            let Some(first) = own.next() else {
+                continue;
+            };
+            let r = root(&mut parent, first);
+            for v in own {
+                let s = root(&mut parent, v);
                 parent[s as usize] = r;
             }
         }
@@ -246,36 +258,40 @@ impl Near {
     }
 }
 
-/// The corners of the triangles `simplified` whose vertex normal opposes their face, with what
-/// each takes in place of its vertex. `simplified` comes from `input` with each vertex
-/// replaced by the one it stands for, `base(v)`: a vertex added for an earlier corner takes no
+/// The corners of the triangles `simplified` that take something in place of their vertex,
+/// with what each takes. `simplified` comes from `input` with each vertex replaced by the one
+/// it stands for, `bases` per corner of `input`: a vertex added for an earlier corner takes no
 /// part in simplification, so it constrains no collapse.
 ///
 /// A triangle `input` holds as it is, by the vertices they stand for and with no vertex
-/// `moved`, keeps the corners the input gives it. Elsewhere, simplification joins vertices
-/// across thin features, where one coarse vertex can stand for both sides of a sheet while it
-/// carries one side's normal, and it can fold a curved surface past its normals. Such a corner
-/// takes the normal of the vertex in its vertex's section nearest it whose normal faces the
-/// triangle's way, when there is one. Its uvs, tangent and colors continue those of the
-/// surface the triangle stands on, or its uvs would span unrelated parts of a texture: the
-/// patches of the input, the vertices its triangles join, that hold the triangle's corners
-/// whose normal faces its way, or all its corners where none does. A corner whose vertex lies
-/// on that surface keeps its vertex's; another takes those of the vertex on it nearest it.
+/// `moved`, keeps the corners the input gives it. Elsewhere, a corner takes something when its
+/// vertex normal opposes its face. Simplification joins vertices across thin features, where
+/// one coarse vertex can stand for both sides of a sheet while it carries one side's normal,
+/// and it can fold a curved surface past its normals. Such a corner takes the normal of the
+/// vertex in its vertex's section nearest it whose normal faces the triangle's way, when there
+/// is one. Its uvs, tangent and colors continue those of the surface the triangle stands on,
+/// or its uvs would span unrelated parts of a texture: the patches of the input, the vertices
+/// its triangles join, that hold the triangle's corners whose normal faces its way, or all its
+/// corners where none does. A corner whose vertex lies on that surface keeps its vertex's;
+/// another takes those of the vertex on it nearest it.
 /// Vertex `v` is at `at(v)` with normal `normal(v)` in section `section(v)`.
 pub(super) fn opposed_corners(
     simplified: &[u32],
     input: &[u32],
-    base: impl Fn(u32) -> u32,
+    bases: &[u32],
     moved: impl Fn(u32) -> bool,
     at: impl Fn(u32) -> DVec3,
     normal: impl Fn(u32) -> DVec3,
     section: impl Fn(u32) -> u16,
 ) -> Vec<(usize, Take)> {
+    assert_eq!(bases.len(), input.len(), "a base per input corner");
     // The corner a triangle starts at so that it starts at its least vertex, which keeps its
     // winding.
     let first = |t: &[u32; 3]| (0..3).min_by_key(|&k| t[k]).expect("three corners");
     let rotated = |t: &[u32; 3], k: usize| [t[k], t[(k + 1) % 3], t[(k + 2) % 3]];
-    let bases: Vec<u32> = input.iter().map(|&v| base(v)).collect();
+    // Whether some input corner is held by a vertex standing for another, which a triangle
+    // kept as it is keeps even where its corners face its way.
+    let stand_ins = bases != input;
     // The input's triangles by the vertices they stand for, each in the order that starts at
     // the least of those.
     let mut kept: Option<FxHashMap<[u32; 3], [u32; 3]>> = None;
@@ -285,7 +301,7 @@ pub(super) fn opposed_corners(
         let p = tri.map(&at);
         let face = (p[1] - p[0]).cross(p[2] - p[0]);
         let faces = tri.map(|v| normal(v).dot(face) >= 0.0);
-        if faces == [true; 3] {
+        if faces == [true; 3] && !stand_ins {
             continue;
         }
         let kept = kept.get_or_insert_with(|| {
@@ -313,7 +329,10 @@ pub(super) fn opposed_corners(
             }
             continue;
         }
-        let near = near.get_or_insert_with(|| Near::new(&bases, &at));
+        if faces == [true; 3] {
+            continue;
+        }
+        let near = near.get_or_insert_with(|| Near::new(input, bases, &at));
         let stands = if faces == [false; 3] {
             [true; 3]
         } else {
@@ -890,10 +909,11 @@ pub(super) fn simplify(
         }
     }
     let mut out: Vec<u32> = out.into_iter().map(|v| global[v as usize]).collect();
+    let bases: Vec<u32> = local.iter().map(|&l| global[l as usize]).collect();
     let wedges = opposed_corners(
         &out,
         indices,
-        |v| w.base(v),
+        &bases,
         |_| false,
         |v| Vec3::from(positions[local_of[&v] as usize]).as_dvec3(),
         |v| Vec3::from_slice(&normals[3 * local_of[&v] as usize..]).as_dvec3(),

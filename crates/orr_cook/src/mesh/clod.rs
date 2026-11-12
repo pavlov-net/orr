@@ -746,8 +746,8 @@ pub(super) struct Emitted<'a> {
     pub(super) base: &'a [u32],
 }
 
-/// A group simplified and emitted: its triangles, their bounds, and the corners whose
-/// vertex normal opposes their face with the vertices they take their shading from.
+/// A group simplified and emitted: its triangles, their bounds, and the corners that take
+/// something in place of their vertex, with what ([`lod::opposed_corners`]).
 type Simplified = (Vec<u32>, Bounds, Vec<(usize, lod::Take)>);
 
 /// Builds the DAG of `mesh` at `positions` under `c`, calling `emit` once per group with its
@@ -892,7 +892,7 @@ pub(super) fn build<G: Send>(
                 let opposed = lod::opposed_corners(
                     &simplified,
                     &merged,
-                    |v| bases[v as usize],
+                    &merged_bases,
                     |v| moved.contains(&remap[v as usize]),
                     |v| Vec3::from(positions.get(v as usize)).as_dvec3(),
                     |v| Vec3::from_slice(&normals[3 * v as usize..]).as_dvec3(),
