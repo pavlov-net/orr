@@ -562,9 +562,10 @@ pub(crate) struct Cuts {
     clas: Capacity,
     jobs: Capacity,
     keys: Capacity,
-    /// The frame from which a growth of `rt` past its budget or the memory there was may be
-    /// tried again, and whether the CLAS `rt` holds fall short of what the frames want.
+    /// The frames from which a growth of `rt` past its budget and one that found no memory
+    /// may be tried again, and whether the CLAS `rt` holds fall short of what the frames want.
     rt_retry: u64,
+    rt_memory_retry: u64,
     clas_short: bool,
     traced: bool,
     /// Per model, the merged cut its copies trace this frame.
@@ -712,6 +713,7 @@ impl Cuts {
             keys,
             rt,
             rt_retry: 0,
+            rt_memory_retry: 0,
             clas_short: false,
             traced,
             model_cut,
@@ -841,8 +843,9 @@ impl Cuts {
     /// reads them; the frames before keep the old ones, whose memory is freed after the work
     /// submitted so far. The built cuts' tables take their floors and, past them, what fits
     /// their budget. Without device memory for new ones the old ones stay, the error is
-    /// returned, and no resize of them is tried before `period` frames have passed or the
-    /// floors change; nor of the built cuts' tables after their budget held them back.
+    /// returned, and no resize of them is tried before `period` frames have passed; nor of the
+    /// built cuts' tables after their budget held them back, unless their floors have risen
+    /// past what they hold since, which the budget does not hold back.
     pub(crate) fn fit(
         &mut self,
         device: &Device,
@@ -857,8 +860,10 @@ impl Cuts {
             self.clas.floor(floors.rt_clas);
             self.jobs.floor(floors.rt_blas);
             self.keys.floor(floors.rt_keys);
-            self.retry = 0;
-            self.rt_retry = 0;
+            let held = self.rt.sizes;
+            if floors.rt_clas > held.clas || floors.rt_blas > held.jobs {
+                self.rt_retry = 0;
+            }
         }
         let mut error = None;
         let lists = self.grow_lists(device, frame, period).unwrap_or_else(|e| {
@@ -924,7 +929,7 @@ impl Cuts {
             jobs: self.jobs.wanted(),
             keys: key_entries(self.keys.wanted()),
         };
-        if wanted == held || frame < self.rt_retry {
+        if wanted == held || frame < self.rt_retry.max(self.rt_memory_retry) {
             return Ok(None);
         }
         // The floors take what they take; the budget holds what the tables grow by past them.
@@ -947,7 +952,7 @@ impl Cuts {
             .map(Some)
             .inspect_err(|e| {
                 if e.is_out_of_memory() {
-                    self.rt_retry = frame + period;
+                    self.rt_memory_retry = frame + period;
                     self.clas_short = held.clas < wanted.clas;
                 }
             })
