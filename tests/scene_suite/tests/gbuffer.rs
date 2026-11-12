@@ -2855,10 +2855,15 @@ fn shoot_probed(
 /// What a frame's work lists dropped for want of room: hierarchy nodes, candidate items,
 /// visible clusters and second-pass work (`CutGpu.counters` 8 and 9, the view's counts).
 fn dropped(view: &RasterView, counts: &[u32]) -> [u32; 4] {
+    let c = cut_tables(view).1;
+    [c[8], c[9], counts[1], counts[2]]
+}
+
+/// The cut tables of `view`'s scene and their counters.
+fn cut_tables(view: &RasterView) -> (CutGpu, Vec<u32>) {
     let root: SceneRoot = read_buffer(view.scene, 1)[0];
     let cut: CutGpu = read_buffer(root.cut, 1)[0];
-    let c: Vec<u32> = read_buffer(cut.counters, 10);
-    [c[8], c[9], counts[1], counts[2]]
+    (cut, read_buffer(cut.counters, 32))
 }
 
 /// What the `trace` kernels wrote for one view.
@@ -6730,9 +6735,7 @@ struct CutRead {
 const RT_CUT_BUILT: u32 = 255;
 
 fn read_cut(view: &RasterView, slots: u32) -> CutRead {
-    let root: SceneRoot = read_buffer(view.scene, 1)[0];
-    let cut: CutGpu = read_buffer(root.cut, 1)[0];
-    let counters: Vec<u32> = read_buffer(cut.counters, 32);
+    let (cut, counters) = cut_tables(view);
     let n = counters[2].min(cut.candidate_capacity);
     let e = counters[5];
     CutRead {
