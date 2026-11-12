@@ -23,11 +23,13 @@
 mod chromaticity;
 mod luminance;
 mod primaries;
+mod srgb8;
 mod transfer;
 
 pub use chromaticity::{Chromaticity, cat16_rec2020, cie_xyz, delta_uv_1976, uv_1976};
 pub use luminance::{LUMINOUS_EFFICACY, luminance};
 pub use primaries::{Primaries, RgbPrimaries, rec709_to_rec2020};
+pub use srgb8::{srgb8_decode, srgb8_decode_fixed, srgb8_encode, srgb8_encode_fixed};
 pub use transfer::{
     EDR_REFERENCE_NITS, PQ_MAX_NITS, SCRGB_WHITE_NITS, hlg_decode, hlg_encode, pq_decode,
     pq_encode, srgb_decode, srgb_encode,

@@ -50,6 +50,7 @@ bytemuck = { version = "1", features = ["derive"] }
 # 0.14 is the version ctt uses, so one zstd-sys builds.
 zstd = "0.14"
 half = "2.7"
+num-bigint = "0.5.1"
 image = { version = "0.25", default-features = false }
 serde = "1"
 meshopt = "=0.7.0"

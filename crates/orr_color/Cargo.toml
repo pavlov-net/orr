@@ -15,5 +15,8 @@ serde = ["dep:serde"]
 orr_math.workspace = true
 serde = { workspace = true, features = ["derive"], optional = true }
 
+[dev-dependencies]
+num-bigint.workspace = true
+
 [lints]
 workspace = true
