@@ -149,6 +149,7 @@ public struct LightSetGpu
     public float* light_probability;
     // By emissive list entry.
     public EmissiveSelection* emissive;
+    // Null until a scene pass finds something a tile sample can name (`light_tiles`).
     public LightSample* tiles;
     // Per feedback id, the pixels whose feedback named it this frame; the next scene pass
     // reads and clears them.
@@ -591,6 +592,13 @@ public float directional_weight(LightSetGpu* set, uint id, float3 normal)
     return w;
 }
 
+// Whether a tile sample can name a light. A scene that has held no light, no emissive list
+// entry and no environment that may radiate has no tiles: `LightSetGpu.tiles` is null.
+public bool light_tiles(LightSetGpu* set)
+{
+    return set.environment_probability > 0.0 || set.candidate_total > 0.0;
+}
+
 // Share of a vertex's candidates drawn from directional lights, and the sum of their
 // weights there.
 public float directional_share(LightSetGpu* set, float3 normal, out float total)
@@ -600,8 +608,7 @@ public float directional_share(LightSetGpu* set, float3 normal, out float total)
         total += directional_weight(set, set.directional_ids[k], normal);
     if (!(total > 0.0))
         return 0.0;
-    bool tiles = set.environment_probability > 0.0 || set.candidate_total > 0.0;
-    return tiles ? DIRECTIONAL_SHARE : 1.0;
+    return light_tiles(set) ? DIRECTIONAL_SHARE : 1.0;
 }
 
 // Probability that a vertex with `normal` draws directional light `id`, among all its
@@ -1300,7 +1307,7 @@ ResolvedLightSample light_candidate<S : ISurface>(LightSetGpu* set, NeeVertex v,
         if (r.pdf > 0.0)
             r.pdf *= light_selection(set, local, r.light, r.position);
     }
-    else
+    else if (light_tiles(set))
     {
         uint tile = light_tile(v.pixel, set.frame);
         uint index = mulhi(pick, TILE_SIZE);
@@ -1308,6 +1315,8 @@ ResolvedLightSample light_candidate<S : ISurface>(LightSetGpu* set, NeeVertex v,
         if (local != nullptr && r.pdf > 0.0)
             r.pdf *= light_selection(set, local, r.light, r.position) / global_selection(set, r.light);
     }
+    else
+        r = no_candidate();
     r.pdf *= 1.0 - v.share;
     return r;
 }

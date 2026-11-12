@@ -232,7 +232,8 @@ impl Retired {
 /// Lighting state of one scene: the baked environment, the directional light states, the
 /// light selection, the presampled light tiles, the caustics' photon source and grid, and the
 /// world cache. What follows the scene's content is made by the scene pass that first finds
-/// it: the grid with a caster, and the world cache with the first pass.
+/// it: the tiles with a light, an emissive list entry or an environment that may radiate, the
+/// grid with a caster, and the world cache with the first pass.
 pub struct SceneLighting {
     device: Device,
     settings: SceneLightingSettings,
@@ -252,7 +253,8 @@ pub struct SceneLighting {
     /// The producer entries' cluster CDFs, for `cluster_room` clusters.
     cluster_cdf: Allocation<u32>,
     cluster_room: u32,
-    tiles: Allocation<LightSample>,
+    /// None until a scene pass finds something a tile sample can name.
+    tiles: Option<Allocation<LightSample>>,
     shadow_overflows: Allocation<u32>,
     reference_counts: Allocation<u32>,
     readback: Allocation<LightSetStats>,
@@ -300,11 +302,7 @@ impl SceneLighting {
             set: device_local(device, 1, "light set")?,
             cluster_cdf: device_local(device, 0, "emissive cluster cdf")?,
             cluster_room: 0,
-            tiles: device_local(
-                device,
-                u64::from(LIGHT_TILES * LIGHT_TILE_SIZE),
-                "light tiles",
-            )?,
+            tiles: None,
             shadow_overflows: device_local(device, 1, "shadow overflows")?,
             reference_counts: device_local(device, 2, "reference counts")?,
             readback: device.gpu_malloc(
@@ -364,9 +362,10 @@ impl SceneLighting {
     /// whose light tables have grown since the last makes what the scene holds per light, per
     /// emissive list entry and per producer cluster anew, and takes the light feedback and the
     /// casters' yields so far by the ids the smaller tables gave. The scene's first pass makes
-    /// its world cache, and the first to find a caster makes the caustics' grid; each starts
-    /// empty in that pass. Fails without device memory for any of it, recording nothing and
-    /// leaving the scene's lighting as it was.
+    /// its world cache, and the first to find something a tile sample can name or a caster
+    /// makes the light tiles or the caustics' grid; each starts empty in that pass. Fails
+    /// without device memory for any of it, recording nothing and leaving the scene's lighting
+    /// as it was.
     pub fn record(&mut self, list: &mut CommandList<'_>, pass: &ScenePass) -> Result<(), Error> {
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         // A frame's slot is written again `FRAME_SLOTS` frames on, when its work has completed.
@@ -378,6 +377,10 @@ impl SceneLighting {
         let held = self.per.tables;
         let grown = (pass.tables.lights, pass.tables.entries) != (held.lights, held.entries);
         let casters = pass.features.contains(SceneFeatures::CASTERS);
+        // A tile sample names a light, an emissive list entry or the environment.
+        let sampled = pass.tables.lights > 0
+            || pass.tables.entries > 0
+            || pass.features.contains(SceneFeatures::ENVIRONMENT);
         // Every allocation first, so a pass that finds one missing changes nothing.
         let per = grown
             .then(|| PerTable::new(&self.device, pass.tables))
@@ -385,6 +388,12 @@ impl SceneLighting {
         let clusters = pass.tables.producer_clusters;
         let cluster_cdf = (clusters != self.cluster_room)
             .then(|| device_local(&self.device, u64::from(clusters), "emissive cluster cdf"))
+            .transpose()?;
+        let tiles = (sampled && self.tiles.is_none())
+            .then(|| {
+                let samples = u64::from(LIGHT_TILES * LIGHT_TILE_SIZE);
+                device_local(&self.device, samples, "light tiles")
+            })
             .transpose()?;
         let cache = match self.cache {
             Some(_) => None,
@@ -397,6 +406,9 @@ impl SceneLighting {
             let before = std::mem::replace(&mut self.cluster_cdf, cdf);
             self.retired.push(pass.frame, before);
             self.cluster_room = clusters;
+        }
+        if tiles.is_some() {
+            self.tiles = tiles;
         }
         if cache.is_some() {
             self.cache = cache;
@@ -449,7 +461,7 @@ impl SceneLighting {
                 light_probability: now.light_probability.gpu(),
                 emissive: now.emissive.gpu(),
                 cluster_cdf: self.cluster_cdf.gpu(),
-                tiles: self.tiles.gpu(),
+                tiles: self.tiles.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
                 feedback_counts: now.feedback_counts.gpu(),
                 feedback_weights: now.feedback_weights.gpu(),
                 feedback_counts_before: before.feedback_counts.gpu(),
@@ -479,12 +491,11 @@ impl SceneLighting {
             list.dispatch(&self.clusters, tile_root, [now.tables.producers, 1, 1]);
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         }
-        list.dispatch(
-            &self.presample,
-            tile_root,
-            [LIGHT_TILES * LIGHT_TILE_SIZE / 64, 1, 1],
-        );
-        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        if self.tiles.is_some() {
+            let groups = LIGHT_TILES * LIGHT_TILE_SIZE / 64;
+            list.dispatch(&self.presample, tile_root, [groups, 1, 1]);
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        }
         self.caustics.record(
             list,
             slot,

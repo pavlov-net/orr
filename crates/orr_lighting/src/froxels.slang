@@ -506,7 +506,7 @@ FroxelLocal froxel_local(FroxelRoot r, uint3 f, float3 x, inout Sampler rng)
     local.scale = 0.0;
     local.t_max = 0.0;
     LightSetGpu* set = r.set;
-    bool tiles = set.environment_probability > 0.0 || set.candidate_total > 0.0;
+    bool tiles = light_tiles(set);
     uint tile = light_tile(uint2(column_pixel(r, float2(f.xy))), set.frame);
     ResolvedLightSample chosen = no_candidate();
     float chosen_target = 0.0;

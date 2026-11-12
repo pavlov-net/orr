@@ -1293,10 +1293,10 @@ fn a_scene_without_lights_gives_empty_candidates_and_no_nan() {
         (set.candidate_total, set.environment_probability),
         (0.0, 0.0)
     );
-    let tiles: Vec<LightSample> = read(set.tiles, u64::from(SAMPLES));
-    assert!(
-        tiles.iter().all(|t| t.pdf == 0.0),
-        "a tile sample with a density"
+    assert_eq!(
+        set.tiles,
+        GpuPtr::NULL,
+        "light tiles with nothing a sample of them can name"
     );
     let sky = lighting.stats(scene.frame).unwrap().sky;
     assert_eq!(
