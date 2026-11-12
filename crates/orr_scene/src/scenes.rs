@@ -1071,7 +1071,7 @@ impl Scenes {
         self.core.mounts.page(id)
     }
 
-    /// What placing instance page `id` takes of a scene's capacities.
+    /// What placing instance page `id` takes of a scene's tables.
     pub fn page_needs(&self, id: PageId) -> Result<crate::PageNeeds> {
         crate::scene::page_needs(&self.core.mounts, &self.core.model_cpu, id).map(|(n, ..)| n)
     }

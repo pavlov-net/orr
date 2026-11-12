@@ -876,7 +876,7 @@ impl Renderer {
         self.scenes.page(id)
     }
 
-    /// What placing instance page `id` takes of a scene's capacities.
+    /// What placing instance page `id` takes of a scene's tables.
     pub fn page_needs(&self, id: PageId) -> Result<PageNeeds> {
         Ok(self.scenes.page_needs(id)?)
     }

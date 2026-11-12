@@ -227,8 +227,8 @@ bool particle_entry(SceneRoot* s, uint e)
         && (s.producer_state[g.source].rt_flags & PRODUCER_RT_WRITTEN) != 0;
 }
 
-// The list of instance entry `e` as `select` hands it to
-// sampling: its cooked set at the row its copy traces, or the list its traversal gathered.
+// The list of instance entry `e` as `select` hands it to sampling: its cooked set at the row
+// its copy traces, or the list its traversal gathered.
 void instance_list(SceneRoot* s, uint e, inout EmissiveSelection sel)
 {
     EmissiveGpu g = s.emissive[e];

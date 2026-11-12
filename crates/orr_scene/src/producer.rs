@@ -3,10 +3,10 @@
 //! frame's list.
 //!
 //! Each entry owns one allocation: its topologies, materials and template positions, its
-//! batch and the counts its kernel emits against, and its build records and result addresses. Its implicit build results
-//! (templates, CLAS, the cluster BLAS) live in blocks sized for its capacities. `EveryFrame`
-//! entries rebuild into the same blocks each frame: frames run in order on the render
-//! queue, so a frame's builds never overlap the traces of the frame before.
+//! batch and the counts its kernel emits against, and its build records and result addresses.
+//! Its implicit build results (templates, CLAS, the cluster BLAS) live in blocks sized for its
+//! capacities. `EveryFrame` entries rebuild into the same blocks each frame: frames run in
+//! order on the render queue, so a frame's builds never overlap the traces of the frame before.
 //!
 //! A strand entry's segments build a linear-swept-sphere BLAS where the device has them;
 //! elsewhere the `strands` kernel turns each segment into a tube of triangles in a tube
@@ -1295,7 +1295,8 @@ impl Readback {
         let s = &mut self.slots[slot];
         let entries = tables.entries;
         let kind = MemoryKind::Readback;
-        if entries > s.entries {
+        // Every allocation comes first, so a failure leaves the slot as its last frame read it.
+        let states = if entries > s.entries {
             let n = grown(
                 "producer readback",
                 s.entries,
@@ -1304,15 +1305,20 @@ impl Readback {
             )?;
             let state = device.gpu_malloc(kind, u64::from(n), "producer state readback")?;
             let tess = device.gpu_malloc(kind, u64::from(n), "tessellation state readback")?;
-            s.state = Some(state);
-            s.tess = Some(tess);
-            s.entries = n;
-        }
+            Some((n, state, tess))
+        } else {
+            None
+        };
         let rows = set.len() as u32;
         if rows > s.rows {
             let n = grown("producer readback", s.rows, rows - s.rows, u32::MAX)?;
             s.counts = Some(device.gpu_malloc(kind, u64::from(n), "producer counts readback")?);
             s.rows = n;
+        }
+        if let Some((n, state, tess)) = states {
+            s.state = Some(state);
+            s.tess = Some(tess);
+            s.entries = n;
         }
         s.taken = set
             .iter()

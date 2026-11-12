@@ -266,8 +266,8 @@ void lists(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
     }
 }
 
-// The caster list of instance entry `e`, its copy's mesh `mesh`:
-// the cooked set of the row its copy traces, or the list its traversal gathered.
+// The caster list of instance entry `e`, its copy's mesh `mesh`: the cooked set of the row its
+// copy traces, or the list its traversal gathered.
 EmissiveSelection instance_casters(SceneRoot* s, uint e, MeshGpu* mesh)
 {
     EmissiveGpu g = s.emissive[e];

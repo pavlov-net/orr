@@ -91,11 +91,11 @@ float gathered_cdf(SceneRoot* s, uint entry, uint count)
     return total;
 }
 
-// One thread per entry, for the instance entries: the cooked set of the row the copy traces, or the list its
-// traversal gathered for a cut built this frame, at the copy's nearer chain step, so a copy
-// outside ray tracing emits and casts nothing. An entry past the mesh's emissive ranks is a
-// caster rank's, which emits nothing. Area scales by |det|^(2/3), exact under uniform scale,
-// taken at unit size since a small transform's determinant underflows first.
+// One thread per entry, for the instance entries: the cooked set of the row the copy traces, or
+// the list its traversal gathered for a cut built this frame, at the copy's nearer chain step,
+// so a copy outside ray tracing emits and casts nothing. An entry past the mesh's emissive
+// ranks is a caster rank's, which emits nothing. Area scales by |det|^(2/3), exact under
+// uniform scale, taken at unit size since a small transform's determinant underflows first.
 [shader("compute")]
 [numthreads(GROUP, 1, 1)]
 void instances(uint3 id: SV_DispatchThreadID)

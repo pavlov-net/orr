@@ -93,8 +93,8 @@ impl Default for SceneDesc {
 
 pub use orr_pack::AffineRows;
 
-/// What placing an instance page takes of a scene's capacities ([`SceneDesc`]), with the chains
-/// its models have now.
+/// What placing an instance page takes of a scene's tables, with the chains its models have
+/// now.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PageNeeds {
     /// Emissive list entries: every copy takes one for each emissive and each caster section
@@ -640,15 +640,14 @@ struct GroupRoom {
     capacity: u32,
 }
 
-/// A run of producer entries a scene holds for a caller, and what taking it changes.
+/// A producer entry a scene holds for a caller, and what taking it changes.
 struct ProducerRoom {
-    first: u32,
-    count: u32,
-    /// Entries of the producer tables when the run was held.
+    entry: u32,
+    /// Entries of the producer tables when the entry was held.
     held: u32,
-    /// The memory of grown tables, where the run is past what they hold.
+    /// The memory of grown tables, where the entry is past what they hold.
     tables: Option<ProducerTables>,
-    ptlas: Option<crate::ptlas::Room>,
+    ptlas: crate::ptlas::Room,
 }
 
 /// The memory of producer tables grown to `entries` entries; a table holds as many where it
@@ -1456,34 +1455,19 @@ impl Scene {
         cpu.retired.push((frame, old));
     }
 
-    /// The room for `count` consecutive entries of the producer table, which the device's PTLAS
-    /// takes in its global partition, every entry up to the highest held, beside what else is
-    /// in use: a producer traces from there. Without a free run that long the producer tables
-    /// grow as [`grown`] says. The run is the caller's, to take with [`Self::take_producers`]
-    /// or give back with [`Self::release_producers`], and until then the tables and the PTLAS
-    /// are as they were. Fails past the device's PTLAS or what a table can hold, or without
-    /// device memory for the grown tables, changing nothing.
-    fn producer_room(
-        &self,
-        cpu: &mut SceneCpu,
-        device: &Device,
-        count: u32,
-    ) -> Result<ProducerRoom> {
+    /// The room for an entry of the producer table, which the device's PTLAS takes in its
+    /// global partition, every entry up to the highest held, beside what else is in use: a
+    /// producer traces from there. Without a free entry the producer tables grow as [`grown`]
+    /// says. The entry is the caller's, to take with [`Self::take_producer`] or give back with
+    /// [`Self::release_producer`], and until then the tables and the PTLAS are as they were.
+    /// Fails past the device's PTLAS or what a table can hold, or without device memory for
+    /// the grown tables, changing nothing.
+    fn producer_room(&self, cpu: &mut SceneCpu, device: &Device) -> Result<ProducerRoom> {
         let t = &self.tables;
         let held = t.producers.capacity();
-        let mut room = ProducerRoom {
-            first: 0,
-            count,
-            held,
-            tables: None,
-            ptlas: None,
-        };
-        // A run of no entries takes none, and its start names no entry.
-        if count == 0 {
-            return Ok(room);
-        }
-        room.first = match cpu.producer_entries.alloc(count) {
-            Some(first) => first,
+        let mut tables = None;
+        let entry = match cpu.producer_entries.alloc(1) {
+            Some(entry) => entry,
             None => {
                 let limit = t
                     .producers
@@ -1491,8 +1475,8 @@ impl Scene {
                     .min(t.batches.limit())
                     .min(t.tess_state.limit())
                     .min(t.producer_state.limit());
-                let entries = grown("producer entries", held, count, limit)?;
-                room.tables = Some(ProducerTables {
+                let entries = grown("producer entries", held, 1, limit)?;
+                tables = Some(ProducerTables {
                     entries,
                     producers: t.producers.room(device, entries)?,
                     batches: t.batches.room(device, entries)?,
@@ -1502,31 +1486,42 @@ impl Scene {
                 });
                 cpu.producer_entries.grow(held, entries);
                 cpu.producer_entries
-                    .alloc(count)
-                    .expect("the grown tables have a free run of `count`")
+                    .alloc(1)
+                    .expect("the grown tables have a free entry")
             }
         };
-        match cpu.ptlas.producer_room(device, room.first + count - 1) {
-            Ok(ptlas) => room.ptlas = Some(ptlas),
+        match cpu.ptlas.producer_room(device, entry) {
+            Ok(ptlas) => Ok(ProducerRoom {
+                entry,
+                held,
+                tables,
+                ptlas,
+            }),
             Err(e) => {
-                self.release_producers(cpu, room);
-                return Err(e);
+                self.release_producer(cpu, entry, held, tables.as_ref());
+                Err(e)
             }
         }
-        Ok(room)
     }
 
-    /// Gives back the run of `room`, from [`Self::producer_room`], which was not taken.
-    fn release_producers(&self, cpu: &mut SceneCpu, room: ProducerRoom) {
-        cpu.producer_entries.free(room.first, room.count);
-        if let Some(t) = &room.tables {
-            let taken = cpu.producer_entries.take(room.held, t.entries - room.held);
+    /// Gives back `entry`, held by [`Self::producer_room`] of tables of `held` entries that
+    /// were to grow to `tables`, and not taken.
+    fn release_producer(
+        &self,
+        cpu: &mut SceneCpu,
+        entry: u32,
+        held: u32,
+        tables: Option<&ProducerTables>,
+    ) {
+        cpu.producer_entries.free(entry, 1);
+        if let Some(t) = tables {
+            let taken = cpu.producer_entries.take(held, t.entries - held);
             assert!(taken, "the entries the tables did not grow by are free");
         }
     }
 
-    /// Takes `room`, from [`Self::producer_room`]; returns the first of its entries.
-    fn take_producers(&self, cpu: &mut SceneCpu, room: ProducerRoom) -> u32 {
+    /// Takes `room`, from [`Self::producer_room`]; returns its entry.
+    fn take_producer(&self, cpu: &mut SceneCpu, room: ProducerRoom) -> u32 {
         let t = &self.tables;
         let mut capacity = room.held;
         if let Some(grown) = room.tables {
@@ -1538,11 +1533,9 @@ impl Scene {
             t.producer_state.grow(grown.producer_state, capacity);
             cpu.producers.resize_with(capacity as usize, || None);
         }
-        if let Some(ptlas) = room.ptlas {
-            cpu.ptlas.take_room(ptlas);
-            cpu.ptlas.set_producers(cpu.producer_entries.end(capacity));
-        }
-        room.first
+        cpu.ptlas.take_room(room.ptlas);
+        cpu.ptlas.set_producers(cpu.producer_entries.end(capacity));
+        room.entry
     }
 
     /// Gives back `count` producer entries from `first`, which the PTLAS counts no more.
@@ -2892,9 +2885,9 @@ impl<'f> SceneWriter<'f> {
     /// extraordinary vertices and creases were refined to the cage's isolation level when
     /// it cooked; each patch dices like any other. Each diced cluster takes the class and alpha
     /// test of the material it binds. The copy ends with its model's pack or edit, and `id` then
-    /// names nothing until it is set again. Panics with materials for another section count, a palette for a cage
-    /// without skin or a model without a skeleton, or a transform or palette group that is
-    /// neither the null group nor one from `create_transform_group`.
+    /// names nothing until it is set again. Panics with materials for another section count, a
+    /// palette for a cage without skin or a model without a skeleton, or a transform or palette
+    /// group that is neither the null group nor one from `create_transform_group`.
     pub fn set_subd(&mut self, id: ProducerId, desc: Option<&SubdDesc<'_>>) -> Result<()> {
         let Some(d) = desc else {
             return self.set_entry(id, None, None);
@@ -2989,11 +2982,13 @@ impl<'f> SceneWriter<'f> {
                 )
             }
             None => {
-                let room = self.scene.producer_room(cpu, self.device, 1)?;
+                let room = self.scene.producer_room(cpu, self.device)?;
                 match self.scene.take_entries(cpu, self.device, 1) {
-                    Ok(emissive) => (self.scene.take_producers(cpu, room), emissive),
+                    Ok(emissive) => (self.scene.take_producer(cpu, room), emissive),
                     Err(e) => {
-                        self.scene.release_producers(cpu, room);
+                        let (entry, held) = (room.entry, room.held);
+                        self.scene
+                            .release_producer(cpu, entry, held, room.tables.as_ref());
                         return Err(e);
                     }
                 }
