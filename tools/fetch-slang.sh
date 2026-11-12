@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fetches the pinned third-party tools into .tools/ (ignored by git):
-#   slang-2026.22/   Slang release for the host (Linux, Windows or Apple silicon macOS),
-#                    checked against its sha256
+#   slang-VERSION/   the Slang release slang_version names, for the host (Linux, Windows or
+#                    Apple silicon macOS), checked against its sha256
 #   openpbr-bsdf/    adobe/openpbr-bsdf at a pinned commit
 #   glm/             GLM 1.0.1 at its tag commit
 #   display/gt7/     Polyphony Digital's GT7 tone-mapping sample (MIT), checked against its

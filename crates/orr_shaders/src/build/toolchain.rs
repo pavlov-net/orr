@@ -33,7 +33,7 @@ pub(super) const SLANGC_OPTIONS: &[&str] = &[
 ///
 /// `ORR_SLANGC` (absolute path to the slangc executable) wins when set. Otherwise the
 /// directories from `CARGO_MANIFEST_DIR` upward are searched for
-/// `.tools/slang-2026.22/bin/slangc`, where `tools/fetch-slang.sh` puts it. The library is
+/// `.tools/slang-<SLANG_VERSION>/bin/slangc`, where `tools/fetch-slang.sh` puts it. The library is
 /// loaded from the same release: `bin/` on Windows, `lib/` elsewhere.
 pub(super) fn load() -> Result<Arc<Library>, Error> {
     let start = env::var_os("CARGO_MANIFEST_DIR")
@@ -102,13 +102,18 @@ mod tests {
     #[test]
     fn version_must_match_exactly() {
         let path = Path::new("/sdk/bin/slang.dll");
-        assert!(check_version(path, "2026.22").is_ok());
-        assert!(check_version(path, "2026.22\r\n").is_ok());
-        for wrong in ["2026.1-52-gc8ddf20bb", "2026.221", "2026.2", ""] {
+        assert!(check_version(path, SLANG_VERSION).is_ok());
+        assert!(check_version(path, &format!("{SLANG_VERSION}\r\n")).is_ok());
+        let longer = format!("{SLANG_VERSION}1");
+        let prefix = &SLANG_VERSION[..SLANG_VERSION.len() - 1];
+        for wrong in ["2026.1-52-gc8ddf20bb", &longer, prefix, ""] {
             let message = check_version(path, wrong).unwrap_err().to_string();
             assert!(message.contains("/sdk/bin/slang.dll"), "{message}");
             assert!(message.contains(&format!("{wrong:?}")), "{message}");
-            assert!(message.contains("exactly 2026.22"), "{message}");
+            assert!(
+                message.contains(&format!("exactly {SLANG_VERSION}")),
+                "{message}"
+            );
         }
     }
 
