@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{self, BufWriter};
 use std::path::Path;
 
-use orr_color::{Chromaticity, PQ_MAX_NITS, Primaries, RgbPrimaries, pq_encode, srgb_encode};
+use orr_color::{Chromaticity, PQ_MAX_NITS, Primaries, RgbPrimaries, pq_encode, srgb8_encode};
 use orr_math::DVec3;
 
 /// A capture of one view, made in the frame that asks for it.
@@ -61,12 +61,7 @@ impl Screenshot {
     /// scene-referred capture.
     pub fn save_png_srgb(&self, path: &Path) -> io::Result<()> {
         self.display_only("sRGB PNG")?;
-        let data: Vec<u8> = self
-            .pixels()
-            .flat_map(|p| {
-                p.map(|c| quantize(srgb_encode(f64::from(c).clamp(0.0, 1.0)), 255.0) as u8)
-            })
-            .collect();
+        let data: Vec<u8> = self.pixels().flat_map(|p| p.map(srgb8_encode)).collect();
         let mut encoder = self.png_encoder(path, png::BitDepth::Eight, None)?;
         encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
         let mut writer = encoder.write_header().map_err(io::Error::other)?;
