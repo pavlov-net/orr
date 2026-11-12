@@ -3119,15 +3119,18 @@ impl Mounts {
         };
         w.cages[i] = None;
         self.owners.insert(id, (p.mount, p.mesh));
-        self.entry_owners.insert(
-            start,
-            EntryOwner {
-                mount: p.mount,
-                mesh: p.mesh,
-                pages: page_count,
-                nodes: 0,
-            },
-        );
+        // As a mesh without entries, an edit of one owns none.
+        if page_count > 0 {
+            self.entry_owners.insert(
+                start,
+                EntryOwner {
+                    mount: p.mount,
+                    mesh: p.mesh,
+                    pages: page_count,
+                    nodes: 0,
+                },
+            );
+        }
         let mirror = Arc::new(Mirror {
             entries: start,
             own,
@@ -3666,7 +3669,9 @@ impl Mounts {
             .partition(|(f, _)| *f <= completed);
         self.retired_edits = keep;
         for (_, e) in done {
-            if let Some(start) = e.ids.pages_at {
+            if let Some(start) = e.ids.pages_at
+                && e.ids.page_count > 0
+            {
                 self.entry_owners.remove(&start);
             }
             self.free_edit_ids(&e.ids);
@@ -3817,7 +3822,19 @@ impl Mounts {
             res.meshes.push(id);
             let n = m.page_addresses.len() as u32 + m.gpu.fine_cuts;
             let start = self.mesh_pages.alloc(w.device, n)?;
-            res.page_ranges.push((start, n));
+            // A mesh without entries owns none: its start names another mesh's.
+            if n > 0 {
+                res.page_ranges.push((start, n));
+                self.entry_owners.insert(
+                    start,
+                    EntryOwner {
+                        mount,
+                        mesh: res.meshes.len() as u32 - 1,
+                        pages: m.gpu.page_count,
+                        nodes: m.gpu.node_page_count,
+                    },
+                );
+            }
             w.put(self.mesh_pages.table.entry(start), &m.page_addresses)?;
             entries.push(start);
             let pinned = &m.all_pages[..m.gpu.pinned_pages as usize];
@@ -3849,15 +3866,6 @@ impl Mounts {
                 }),
                 skin: m.skin_record,
             });
-            self.entry_owners.insert(
-                start,
-                EntryOwner {
-                    mount,
-                    mesh: res.meshes.len() as u32 - 1,
-                    pages: gpu.page_count,
-                    nodes: gpu.node_page_count,
-                },
-            );
             mesh_ids.push(id);
         }
         for m in &models {
