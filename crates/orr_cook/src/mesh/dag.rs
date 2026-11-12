@@ -503,27 +503,42 @@ fn part_inputs(
         // A welded vertex in a second section of the stage, which seams protect.
         let mut more: FxHashMap<(u32, u16), u32> = FxHashMap::default();
         for (v, id, section) in part_corners(w, grid, pieces) {
-            let mut add = |input: &mut Input| {
-                let f = &mut first[id as usize];
-                let stands = (f.0 == si).then_some(f.1);
-                let lock = lod::vertex_flags(id, shared, seams).bits();
-                let l = input.push(v, grid.cells[v as usize], section, lock, stands);
-                if stands.is_none() {
-                    *f = (si, l);
+            // The stage's vertex of welded vertex `v` in the corner's section.
+            let mut vertex = |input: &mut Input, v: u32| {
+                let mut add = |input: &mut Input| {
+                    let f = &mut first[id as usize];
+                    let stands = (f.0 == si).then_some(f.1);
+                    let lock = lod::vertex_flags(id, shared, seams).bits();
+                    let l = input.push(v, grid.cells[v as usize], section, lock, stands);
+                    input.base.push(l);
+                    if stands.is_none() {
+                        *f = (si, l);
+                    }
+                    l
+                };
+                let at = &mut numbered[v as usize];
+                if at.0 != si {
+                    let l = add(input);
+                    *at = (si, section, l);
+                    l
+                } else if at.1 == section {
+                    at.2
+                } else {
+                    *more.entry((v, section)).or_insert_with(|| add(input))
                 }
-                l
             };
-            let at = &mut numbered[v as usize];
-            let l = if at.0 != si {
-                let l = add(&mut input);
-                *at = (si, section, l);
-                l
-            } else if at.1 == section {
-                at.2
-            } else {
-                *more.entry((v, section)).or_insert_with(|| add(&mut input))
-            };
+            // A vertex an earlier simplification added for a corner stands for the vertex it
+            // was placed as, which it adds first where it is missing ([`Welded::wedge`]).
+            let b = w.base(v);
+            let base = (b != v).then(|| vertex(&mut input, b));
+            let l = vertex(&mut input, v);
+            if let Some(b) = base {
+                input.base[l as usize] = b;
+            }
             input.indices.push(l);
+        }
+        if input.base.iter().enumerate().all(|(l, &b)| b == l as u32) {
+            input.base = Vec::new();
         }
         out.push(input);
     }
