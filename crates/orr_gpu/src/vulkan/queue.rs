@@ -228,24 +228,30 @@ impl Queue {
         };
         let d = &self.shared.device;
         // SAFETY: the resources are idle (their last submit completed) and owned by this list.
-        unsafe {
+        let begun = unsafe {
             d.reset_command_pool(res.pool, vk::CommandPoolResetFlags::empty())
-                .map_err(Error::vk("vkResetCommandPool"))?;
-            if res.timestamps != vk::QueryPool::null() {
-                d.reset_query_pool(res.timestamps, 0, 2 * MAX_PASSES);
-            }
-            if res.stats != vk::QueryPool::null() {
-                d.reset_query_pool(res.stats, 0, MAX_PASSES);
-            }
-            if res.compacted != vk::QueryPool::null() {
-                d.reset_query_pool(res.compacted, 0, MAX_PASSES);
-            }
-            d.begin_command_buffer(
-                res.cmd,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(Error::vk("vkBeginCommandBuffer"))?;
+                .map_err(Error::vk("vkResetCommandPool"))
+                .and_then(|()| {
+                    if res.timestamps != vk::QueryPool::null() {
+                        d.reset_query_pool(res.timestamps, 0, 2 * MAX_PASSES);
+                    }
+                    if res.stats != vk::QueryPool::null() {
+                        d.reset_query_pool(res.stats, 0, MAX_PASSES);
+                    }
+                    if res.compacted != vk::QueryPool::null() {
+                        d.reset_query_pool(res.compacted, 0, MAX_PASSES);
+                    }
+                    d.begin_command_buffer(
+                        res.cmd,
+                        &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                    )
+                    .map_err(Error::vk("vkBeginCommandBuffer"))
+                })
+        };
+        if let Err(e) = begun {
+            self.recycle(res);
+            return Err(e);
         }
         if self.shaders {
             self.shared.heaps().bind(&self.shared.heap_fn, res.cmd);
