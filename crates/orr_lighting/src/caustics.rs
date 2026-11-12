@@ -183,7 +183,8 @@ pub(crate) struct Caustics {
     source: Allocation<PhotonSourceGpu>,
     /// Held while the scene passes find a caster with photons on.
     grid: Option<Grid>,
-    /// The producer entries' caster lists' CDFs, for `pool_room` clusters.
+    /// The producer entries' caster lists' CDFs, for `pool_room` clusters: none without the
+    /// grid.
     pool: Allocation<u32>,
     pool_room: u32,
     /// For the scene's light tables at the last scene pass.
@@ -323,9 +324,10 @@ impl Caustics {
 
     /// The memory the caustics lack for a scene pass over light tables `tables`, for
     /// [`Self::follow`] to take once nothing else can fail: what they hold per entry and per
-    /// feedback id where `grown`, the producers' caster lists where the tables hold room for
-    /// other clusters, and the grid where the scene has come to hold `casters`. Fails without
-    /// device memory.
+    /// feedback id where `grown`, the producers' caster lists where they are to hold other
+    /// clusters, and the grid where the scene has come to hold `casters`. The lists hold what
+    /// the tables hold room for while the scene pass records the caustics and nothing
+    /// otherwise: only that pass writes them. Fails without device memory.
     pub(crate) fn room(
         &self,
         device: &Device,
@@ -334,7 +336,11 @@ impl Caustics {
         casters: bool,
     ) -> Result<Room, Error> {
         let per = grown.then(|| PerEntry::new(device, tables)).transpose()?;
-        let clusters = tables.producer_clusters;
+        let clusters = if self.casts(casters) {
+            tables.producer_clusters
+        } else {
+            0
+        };
         let pool = (clusters != self.pool_room)
             .then(|| device_local(device, u64::from(clusters), "producer caster cdf"))
             .transpose()?;
@@ -349,9 +355,10 @@ impl Caustics {
     }
 
     /// Takes `room`, from [`Self::room`] with the same `casters`, in the scene pass of `frame`,
-    /// and gives up the grid where the scene holds no caster: what the frames in flight read
-    /// goes to `retired`. Returns what the caustics held per entry before, which the next
-    /// [`Self::record`] takes the casters' yields from.
+    /// and gives up the grid where the scene holds no caster: what the frames in flight read,
+    /// of it and of the caster lists `room` replaces, goes to `retired`. Returns what the
+    /// caustics held per entry before, which the next [`Self::record`] takes the casters'
+    /// yields from.
     pub(crate) fn follow(
         &mut self,
         room: Room,
