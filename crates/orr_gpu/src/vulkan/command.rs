@@ -143,14 +143,23 @@ impl<'q> CommandList<'q> {
         &self.queue.shared.device
     }
 
-    /// Ends recording and hands the resources to the submit.
-    pub(super) fn finish(mut self) -> Result<Finished, Error> {
+    /// Panics unless the list can be submitted to `queue`.
+    pub(super) fn assert_submittable(&self, queue: &Queue) {
+        assert!(
+            std::ptr::eq(self.queue, queue),
+            "a command list was submitted to another queue"
+        );
         assert!(
             !self.open,
             "pass {:?} was not ended",
             self.passes.last().map(|p| p.name)
         );
         assert!(self.rendering.is_none(), "rendering was not ended");
+    }
+
+    /// Ends recording and hands the resources to the submit, which has checked
+    /// [`Self::assert_submittable`].
+    pub(super) fn finish(mut self) -> Result<Finished, Error> {
         let res = self.res.take().unwrap();
         // SAFETY: the buffer is recording and owned by this list.
         if let Err(e) = unsafe { self.device().end_command_buffer(res.cmd) } {

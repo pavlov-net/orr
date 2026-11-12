@@ -322,12 +322,13 @@ impl Queue {
         wait: &[TimelinePoint],
         binary: Option<(vk::Semaphore, vk::Semaphore)>,
     ) -> Result<TimelinePoint, Error> {
+        // Every check comes before the first list is finished: a list that is finished but
+        // neither submitted nor released would hold every later free.
+        for list in &lists {
+            list.assert_submittable(self);
+        }
         let mut finished: Vec<Finished> = Vec::with_capacity(lists.len());
         for list in lists {
-            assert!(
-                std::ptr::eq(list.queue(), self),
-                "a command list was submitted to another queue"
-            );
             match list.finish() {
                 Ok(f) => finished.push(f),
                 Err(e) => {
