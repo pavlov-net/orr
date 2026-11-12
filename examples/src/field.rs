@@ -6,8 +6,8 @@
 
 use orr::orr_gpu::{Allocation, Device, GpuPtr, MemoryKind};
 use orr::{
-    ClusterTopology, MaterialId, Opacity, PipelineId, ProducerDesc, ProducerId, ProducerUpdate,
-    SceneCompute, TransformGroupId,
+    ClusterTopology, InstanceFlags, MaterialId, Opacity, PipelineId, ProducerDesc, ProducerId,
+    ProducerUpdate, SceneCompute, TransformGroupId,
 };
 
 use crate::shaders::{grass, slab, terrain};
@@ -178,6 +178,8 @@ pub struct Grass {
     pub radius: f32,
     /// Clusters the entry holds.
     pub capacity: u32,
+    /// Rays trace the blades; without it they are only rastered.
+    pub traced: bool,
 }
 
 impl Grass {
@@ -198,6 +200,11 @@ impl Grass {
             transform,
             previous_positions: true,
             vertex_user: true,
+            flags: if self.traced {
+                InstanceFlags::RASTER | InstanceFlags::RAY
+            } else {
+                InstanceFlags::RASTER
+            },
             ..ProducerDesc::default()
         }
     }

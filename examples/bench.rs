@@ -232,6 +232,11 @@ fn script_report(script: Script, samples: &[Sample]) -> Value {
             "parts_refused": fig(&|s| s.rt.parts_refused.into()),
             "masks_refused": fig(&|s| s.rt.masks_refused.into()),
         },
+        "blades": {
+            "draw_items": figure(samples, |s| s.blades[0].into()),
+            "caster_items": figure(samples, |s| s.blades[1].into()),
+            "drawn": figure(samples, |s| s.blades[2].into()),
+        },
         "producers": {
             "clusters": fig(&|s| s.producers.clusters.into()),
             "cluster_capacity": fig(&|s| s.producers.cluster_capacity.into()),
@@ -296,6 +301,15 @@ fn write_report(settings: &Settings, r: &Run) -> PathBuf {
         "device": caps.device_name,
         "driver": caps.driver,
         "settings": format!("{settings:?}"),
+        "reconstruction": r.reconstruction,
+        "render_extent": r.render_extent,
+        "blade_capacity": r.blades.map(|(c, bytes)| json!({
+            "draw_items": c.items,
+            "caster_items": c.caster_items,
+            "caster_vertices": c.vertices,
+            "drawn_blades": c.blades,
+            "list_bytes": bytes,
+        })),
         "trees": r.tree_count,
         "terrain_patches": r.terrain_patches,
         "load_ms": r.load_ms,

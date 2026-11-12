@@ -23,6 +23,7 @@ use orr::{
 };
 
 pub mod average;
+pub mod blades;
 pub mod creature;
 pub mod field;
 pub mod mesh;
@@ -42,6 +43,12 @@ pub mod shaders {
 /// medium.
 pub mod linked {
     include!(concat!(env!("OUT_DIR"), "/linked/orr_kernels.rs"));
+}
+
+/// [`linked`]'s kernels with the blade field's `BladeGeometry` and `BladeSurface` linked too
+/// ([`blades`]).
+pub mod linked_blades {
+    include!(concat!(env!("OUT_DIR"), "/linked_blades/orr_kernels.rs"));
 }
 
 /// The examples' NGX project id.

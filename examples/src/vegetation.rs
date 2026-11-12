@@ -1,6 +1,6 @@
 //! The dense vegetation test scene: a 1 km heightfield tile of grid-patch producer clusters,
 //! a forest of trees with rigid parts and discrete levels swaying inside their animation
-//! range, procedural grass in a meadow, a wave-displaced dielectric pond, emissive particles
+//! range, grass in a meadow, a wave-displaced dielectric pond, emissive particles
 //! drawn at the transparency point, a low limb-darkened sun and a textured moon it lights, in
 //! `orr_atmosphere`'s sky and medium, all path traced through `render_view`. Trees come from
 //! cooked archives in `$ORR_CONTENT/cooked`, or with `--synthetic` from stand-in trees of four
@@ -11,7 +11,13 @@
 //!
 //! Switches (all optional):
 //! `--synthetic`, `--trees N`, `--species N`, `--grass-density D` (blades per m^2),
-//! `--grass-radius M`, `--parts all|trunk`, `--poses-per-variant N`, `--pose-stride`,
+//! `--grass-radius M`, `--grass producer|drawn|stored|none` (the grass as clusters a kernel
+//! emits every frame; as blades of [`crate::blades`] drawn from the opaque hook with nothing
+//! stored; as the same blades stored in a batch; or none), `--no-grass-rays` (the grass
+//! is only rastered), `--blade-full M`, `--blade-detail M`,
+//! `--exact-blades N`, `--cast-range M`, `--chords N`, `--cast-stretch S` (see
+//! [`crate::blades::BladeSettings`]), `--dlss` (ray reconstruction at the render size that
+//! suits the extent), `--parts all|trunk`, `--poses-per-variant N`, `--pose-stride`,
 //! `--no-part-animation`, `--rt-range M`, `--animation-range M`, `--directional-lights L,T`,
 //! `--sw-raster-px P`, `--lod0-only`, `--world-km K`, `--world-density N` (trees per km^2
 //! outside the tile), `--particles N`, `--stream-load`, `--no-chain`, `--extent WxH`,
@@ -25,9 +31,9 @@ use std::time::{Duration, Instant};
 
 use orr::orr_gpu::{
     Allocation, Blend, ColorAttachment, ColorLoad, ColorMask, ColorTarget, CompareOp,
-    CounterReport, DepthAttachment, DepthLoad, DepthTarget, Device, Format, Hazards, MemoryKind,
-    MeshPipeline, MeshPipelineDesc, QueueKind, RasterState, Rendering, ShaderStage, SpecData,
-    Stages, Texture, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
+    CounterReport, DepthAttachment, DepthLoad, DepthTarget, Device, Format, GpuPtr, Hazards,
+    MemoryKind, MeshPipeline, MeshPipelineDesc, QueueKind, RasterState, Rendering, ShaderStage,
+    SpecData, Stages, Texture, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
 };
 use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::mesh::MeshInfo;
@@ -37,8 +43,8 @@ use orr::{
     AffineRows, BoundTexture, ClusterTopology, CopyVariant, DirectionalLight, DiscProfile, Display,
     DisplayRequest, FrameDesc, FrameStats, FrameTime, GroupWriter, InstanceFlags, InstancesDesc,
     Lens, Light, LightId, LightingStats, LitView, LoadState, MaterialGpu, ModelId, MountId,
-    Opacity, PackSource, PipelineId, Pose, ProducerDesc, ProducerId, ProducerUpdate, Projection,
-    Renderer, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneLightingSettings,
+    Opacity, OpaquePass, PackSource, PipelineId, Pose, ProducerDesc, ProducerId, ProducerUpdate,
+    Projection, Renderer, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneLightingSettings,
     ScreenshotRequest, TextureFilter, TransformGroupDesc, TransformGroupId, TransparencyPass,
     ViewHistoryId, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
@@ -47,11 +53,13 @@ use orr_atmosphere::{Atmosphere, AtmosphereState, MAX_SKY_LIGHTS};
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source};
 use orr_cook::{TextureSettings, Usage};
 use orr_math::camera::rh::view;
-use orr_math::{Affine3, DVec3, Mat3, Vec3};
+use orr_math::{Affine3, DVec3, Mat3, Mat4, UVec2, Vec3};
 
+use crate::blades::{BladeSettings, Blades, Capacity, FIELD_COUNTS};
 use crate::field::{Grass, Heights, Slab, Terrain, blade_triangles, patch_triangles};
 use crate::linked::KERNELS;
 use crate::mesh::MeshBuilder;
+use crate::shaders::types::Field;
 use crate::shaders::{fireflies, glow, grass, slab, sway, terrain};
 use crate::window::Window;
 use crate::{Capture, Options, Workers, device, entry_head, fixed_time, gray_png};
@@ -181,6 +189,18 @@ impl Script {
     }
 }
 
+/// What the meadow's grass is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrassMode {
+    /// Clusters `shaders/grass.slang` emits around the camera every frame.
+    Producer,
+    /// [`crate::blades`], drawn from the opaque hook.
+    Drawn,
+    /// [`crate::blades`], every drawn blade stored in the entry's batch.
+    Stored,
+    None,
+}
+
 /// Which parts the animation kernel moves; deeper parts always ride on their parents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Parts {
@@ -198,6 +218,14 @@ pub struct Settings {
     pub species: u32,
     pub grass_density: f32,
     pub grass_radius: f32,
+    pub grass: GrassMode,
+    /// Rays trace the grass.
+    pub grass_rays: bool,
+    /// The blade field's, with `grass_density` as its density, `grass_radius` as its range
+    /// and `stored` from `grass`.
+    pub blades: BladeSettings,
+    /// Lit views go through DLSS ray reconstruction.
+    pub dlss: bool,
     pub parts: Parts,
     pub poses_per_variant: u32,
     pub pose_stride: bool,
@@ -231,6 +259,10 @@ impl Settings {
             species: 4,
             grass_density: 500.0,
             grass_radius: 75.0,
+            grass: GrassMode::Producer,
+            grass_rays: true,
+            blades: BladeSettings::default(),
+            dlss: false,
             parts: Parts::All,
             poses_per_variant: 8,
             pose_stride: false,
@@ -264,6 +296,23 @@ impl Settings {
                 "--species" => s.species = number(value()) as u32,
                 "--grass-density" => s.grass_density = number(value()),
                 "--grass-radius" => s.grass_radius = number(value()),
+                "--grass" => {
+                    s.grass = match value() {
+                        "producer" => GrassMode::Producer,
+                        "drawn" => GrassMode::Drawn,
+                        "stored" => GrassMode::Stored,
+                        "none" => GrassMode::None,
+                        v => panic!("--grass producer|drawn|stored|none, not {v}"),
+                    }
+                }
+                "--no-grass-rays" => s.grass_rays = false,
+                "--blade-full" => s.blades.full = number(value()),
+                "--blade-detail" => s.blades.detail = number(value()),
+                "--exact-blades" => s.blades.exact_blades = number(value()) as u32,
+                "--cast-range" => s.blades.cast_range = number(value()),
+                "--chords" => s.blades.chords = number(value()) as u32,
+                "--cast-stretch" => s.blades.cast_stretch = number(value()),
+                "--dlss" => s.dlss = true,
                 "--parts" => {
                     s.parts = match value() {
                         "all" => Parts::All,
@@ -303,6 +352,10 @@ impl Settings {
             s.species > 0 && s.poses_per_variant <= 256,
             "at least one species and at most 256 poses per variant"
         );
+        s.blades.density = s.grass_density;
+        s.blades.range = s.grass_radius;
+        s.blades.stored = s.grass == GrassMode::Stored;
+        s.blades.rays = s.grass_rays;
         s
     }
 }
@@ -750,6 +803,9 @@ struct DenseVegetation {
     far: Option<(Heights, Terrain)>,
     land: Terrain,
     grass: Grass,
+    blades: Option<Blades>,
+    /// This frame's blade field.
+    field: GpuPtr<Field>,
     water: Slab,
     poses: Vec<Poses>,
     kernels: Kernels,
@@ -864,7 +920,10 @@ const FIRST_FRAME: u64 = 1000;
 /// The renderer's settings for `settings`.
 fn renderer_desc(settings: &Settings) -> RendererDesc {
     RendererDesc {
-        kernels: &KERNELS,
+        kernels: match settings.grass {
+            GrassMode::Drawn | GrassMode::Stored => &crate::linked_blades::KERNELS,
+            GrassMode::Producer | GrassMode::None => &KERNELS,
+        },
         cell_log2: CELL_LOG2,
         software_raster_pixels: settings.sw_raster_px,
         raster_error_pixels: if settings.lod0_only {
@@ -984,6 +1043,7 @@ impl DenseVegetation {
             corner: MEADOW,
             radius: settings.grass_radius,
             capacity: reach.min(u64::from(cells) * u64::from(cells)).max(1) as u32,
+            traced: settings.grass_rays,
         };
         let water = Slab {
             patches: (POND_SIDE / TILE_PATCH) as u32,
@@ -1025,6 +1085,11 @@ impl DenseVegetation {
             fireflies: compute(renderer, &fireflies::MODULE),
             sway: compute(renderer, &sway::MODULE),
         };
+        let blade_field =
+            matches!(settings.grass, GrassMode::Drawn | GrassMode::Stored).then(|| {
+                let fif = renderer_desc(settings).frames_in_flight;
+                Blades::new(renderer, gpu, MEADOW, MEADOW_SIDE, settings.blades, fif)
+            });
         let glow = gpu
             .create_mesh_pipeline(
                 &MeshPipelineDesc {
@@ -1087,11 +1152,14 @@ impl DenseVegetation {
                     specular_roughness: 0.9,
                     ..Material::default()
                 }),
-                create(Material {
-                    base_color: [0.25, 0.45, 0.15],
-                    specular_roughness: 0.6,
-                    double_sided: 1,
-                    ..Material::default()
+                create(match blade_field {
+                    Some(_) => Blades::material(),
+                    None => Material {
+                        base_color: [0.25, 0.45, 0.15],
+                        specular_roughness: 0.6,
+                        double_sided: 1,
+                        ..Material::default()
+                    },
                 }),
                 create(Material {
                     base_color: [1.0; 3],
@@ -1247,11 +1315,15 @@ impl DenseVegetation {
                 )
                 .expect("far terrain");
             }
-            w.set_producer(
-                GRASS,
-                Some(&grass_field.desc(&blade_topologies, &blades, (world, 0))),
-            )
-            .expect("grass");
+            let field_topologies = blade_field.as_ref().map(Blades::topologies);
+            let grass = match (settings.grass, &blade_field, &field_topologies) {
+                (GrassMode::Producer, ..) => {
+                    Some(grass_field.desc(&blade_topologies, &blades, (world, 0)))
+                }
+                (_, Some(b), Some(t)) => Some(b.desc(t, &blades, (world, 0))),
+                _ => None,
+            };
+            w.set_producer(GRASS, grass.as_ref()).expect("grass");
             w.set_producer(WATER, Some(&water.desc(&patch_topology, &pond, (world, 0))))
                 .expect("pond");
             let clusters = settings.particles.div_ceil(PARTICLES_PER_CLUSTER);
@@ -1319,6 +1391,9 @@ impl DenseVegetation {
             stands.len(),
             grass_field.capacity
         );
+        if let Some(b) = &blade_field {
+            log::info!("blade field: {:?}, {:?}", b.capacity, b.traced);
+        }
 
         Self {
             scene,
@@ -1330,6 +1405,8 @@ impl DenseVegetation {
             far,
             land,
             grass: grass_field,
+            blades: blade_field,
+            field: GpuPtr::NULL,
             water,
             poses,
             kernels,
@@ -1343,15 +1420,20 @@ impl DenseVegetation {
     /// Records the scene's kernels for a camera at `eye` at times `t` and `previous`.
     fn record(&mut self, c: &mut SceneCompute<'_, '_>, eye: Vec3, t: f32, previous: f32) {
         self.sky.record(c, &[]).expect("sky passes");
-        self.grass.record(
-            c,
-            GRASS,
-            self.kernels.grass,
-            &self.heights,
-            [eye.x, eye.z],
-            t,
-            previous,
-        );
+        if self.settings.grass == GrassMode::Producer {
+            self.grass.record(
+                c,
+                GRASS,
+                self.kernels.grass,
+                &self.heights,
+                [eye.x, eye.z],
+                t,
+                previous,
+            );
+        }
+        if let Some(b) = &self.blades {
+            b.record(c, self.field);
+        }
         self.water.record(c, WATER, self.kernels.water, t);
         let clusters = self.settings.particles.div_ceil(PARTICLES_PER_CLUSTER);
         if clusters > 0 {
@@ -1455,6 +1537,12 @@ pub struct Run {
     pub memory: orr::orr_gpu::MemoryReport,
     /// The counter frame's report, when one was asked for and the device collects counters.
     pub counters: Option<CounterReport>,
+    /// The blade field's capacities and the bytes of its own lists, when the grass is one.
+    pub blades: Option<(Capacity, u64)>,
+    /// What ray reconstruction ran as in the last frame; `None` without it.
+    pub reconstruction: Option<String>,
+    /// The extent the last frame rendered at.
+    pub render_extent: [u32; 2],
 }
 
 /// One completed frame's figures.
@@ -1464,6 +1552,8 @@ pub struct Sample {
     pub lighting: Option<LightingStats>,
     /// `RasterView::counts`.
     pub counts: [u32; COUNTS],
+    /// The blade field's draw items, caster items and blades drawn; 0 without one.
+    pub blades: [u32; FIELD_COUNTS],
 }
 
 /// Words of `RasterView::counts` read back.
@@ -1488,6 +1578,12 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
         .expect("display")
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
+    if settings.dlss {
+        assert!(
+            crate::enable_dlss(&mut renderer),
+            "--dlss needs DLSS ray reconstruction"
+        );
+    }
     let workers = Workers::machine(renderer.loading());
     let started = Instant::now();
     let mut scene = DenseVegetation::load(&mut renderer, gpu, settings);
@@ -1529,6 +1625,8 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
     let render_queue = gpu.queue(QueueKind::Render).expect("render queue");
     let mut counter_frame = settings.counter_frame.filter(|_| gpu.caps().perf_counters);
     let mut counters = None;
+    let mut reconstruction = None;
+    let mut render_extent = [0; 2];
     for (si, &script) in settings.scripts.iter().enumerate() {
         collected.push((script, Vec::new()));
         let final_script = si + 1 == settings.scripts.len();
@@ -1598,24 +1696,49 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                 .expect("begin frame");
             let id = f.id();
             let point = 'frame: {
-                let view_target = match (&headless_target, f.display()) {
-                    (Some(t), _) => ViewTarget::Texture(t),
-                    (None, Some(_)) => ViewTarget::Display,
+                let (view_target, extent) = match (&headless_target, f.display()) {
+                    (Some(t), _) => (ViewTarget::Texture(t), settings.extent),
+                    (None, Some((_, extent))) => (ViewTarget::Display, extent),
                     (None, None) => break 'frame f.end().expect("end frame"),
                 };
-                f.scene(scene.scene)
-                    .expect("scene writer")
-                    .set_focus(eye.as_dvec3());
+                let projection = Projection {
+                    fov_y: FOV_Y,
+                    near: 0.1,
+                };
+                let view_from_world = view::look_at_quat(eye, target, Vec3::Y);
+                // The meadow's entry sits at the world's origin, so its space is the world's.
+                let clip_from_world = projection.clip_from_view(UVec2::from(extent))
+                    * Mat4::from_quat(view_from_world)
+                    * Mat4::from_translation(-eye);
+                let heights = &scene.heights;
+                let forward = view_from_world.inverse() * Vec3::NEG_Z;
+                let field = scene.blades.as_mut().map(|b| {
+                    let (t, previous) = (t as f32, previous as f32);
+                    b.write(
+                        id,
+                        heights,
+                        GRASS,
+                        eye,
+                        forward,
+                        clip_from_world,
+                        t,
+                        previous,
+                    )
+                });
+                scene.field = field.unwrap_or(GpuPtr::NULL);
+                let mut w = f.scene(scene.scene).expect("scene writer");
+                w.set_focus(eye.as_dvec3());
+                if let Some(field) = field {
+                    w.set_surface_data(field.address());
+                }
+                drop(w);
                 let output = ViewOutput::default();
                 let lit = LitView {
                     scene: scene.scene,
                     history: scene.history,
                     position: eye.as_dvec3(),
-                    rotation: view::look_at_quat(eye, target, Vec3::Y).inverse(),
-                    projection: Projection {
-                        fov_y: FOV_Y,
-                        near: 0.1,
-                    },
+                    rotation: view_from_world.inverse(),
+                    projection,
                     lens: Lens::default(),
                     camera_cut: i == 0,
                     not_rendering_scene: false,
@@ -1656,14 +1779,30 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                     .expect("particle draws");
                     pass.cmd.end_rendering();
                 };
+                let drawn = scene.blades.as_ref().filter(|b| !b.settings.stored);
+                let blade_draw = drawn.map(|b| f.mesh_pipeline(b.pipeline));
+                let mut blades = |pass: &mut OpaquePass<'_, '_>| {
+                    if let (Some(b), Some(draw), Some(field)) = (drawn, blade_draw, field) {
+                        b.draw(pass, draw, field);
+                    }
+                };
                 let mut hooks = ViewHooks {
+                    opaque: match drawn {
+                        Some(_) => Some(&mut blades),
+                        None => None,
+                    },
                     transparency: Some(&mut particles),
                     ..ViewHooks::default()
                 };
                 let rendered = f
                     .render_view(&lit, &lighting, &output, &mut hooks)
                     .expect("render view");
+                reconstruction = rendered.reconstruction.map(|r| format!("{r:?}"));
+                render_extent = rendered.render_extent;
                 let list = f.list().expect("frame list");
+                if let Some(b) = &scene.blades {
+                    b.read_counts(list, id);
+                }
                 list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
                 list.copy(
                     readback.gpu().offset(slot).cast(),
@@ -1752,6 +1891,9 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
         load_ms,
         memory,
         counters,
+        blades: scene.blades.as_ref().map(|b| (b.capacity, b.bytes())),
+        reconstruction,
+        render_extent,
     };
     if let Some(m) = scene.streaming.take() {
         renderer.unmount(m);
@@ -1787,6 +1929,10 @@ fn take_sample(
         stats: stats.clone(),
         lighting: renderer.lighting_stats(scene.scene, id),
         counts,
+        blades: scene
+            .blades
+            .as_ref()
+            .map_or([0; FIELD_COUNTS], |b| b.counts(id)),
     });
 }
 

@@ -123,6 +123,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         corner: [-TILE / 2.0; 2],
         radius: 16.0,
         capacity: 4096,
+        traced: true,
     };
     let water_slab = Slab {
         patches: 2,
