@@ -2999,14 +2999,18 @@ impl<'f> SceneWriter<'f> {
         let state = t.producer_state.entry(index).address().0;
         let blas = std::mem::offset_of!(ProducerStateGpu, blas) as u64;
         let clusters = std::mem::offset_of!(ProducerStateGpu, clusters) as u64;
+        let refused = std::mem::offset_of!(ProducerStateGpu, refused) as u64;
         // A tessellated entry's kernel emits against its patch batch's counts.
         let patch_counts =
             (producer.emit_counts != producer.counts).then_some(producer.emit_counts);
         let counts = std::iter::once(producer.counts).chain(patch_counts);
-        // The new entry has built nothing; its PTLAS instance follows from the record.
-        let zeroed = counts
-            .map(|c| (c.address().0, 4))
-            .chain([(state + blas, 2), (state + clusters, 1)]);
+        // The new entry has built and refused nothing; its PTLAS instance follows from the
+        // record.
+        let zeroed = counts.map(|c| (c.address().0, 4)).chain([
+            (state + blas, 2),
+            (state + clusters, 1),
+            (state + refused, 1),
+        ]);
         cpu.records.extend([
             Record::values(self.next_seq(), b.static_at, static_src, n),
             Record::values(self.next_seq(), t.producers.entry(index), record_src, 1),
