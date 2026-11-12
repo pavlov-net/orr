@@ -1,11 +1,12 @@
 //! Texel formats of raster layers, the 2x2 reductions and value ranges.
 
+use orr_color::{srgb8_decode, srgb8_decode_fixed, srgb8_encode_fixed};
 use orr_pack::raster::RasterLayer;
 use orr_pack::texture::vk;
 use serde::Deserialize;
 
 use crate::Result;
-use crate::texture::{Img, srgb_to_linear};
+use crate::texture::Img;
 
 /// Texel format of a raster input. RGB8 is stored as RGBA8 with alpha 255.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -119,13 +120,7 @@ impl Texel {
     /// Linear float texels for the BCn encoders; sRGB color is decoded when `srgb`.
     pub(super) fn to_img(self, srgb: bool, size: u32, bytes: &[u8]) -> Img {
         let unorm8 = |b: u8| f32::from(b) / 255.0;
-        let color = |b: u8| {
-            if srgb {
-                srgb_to_linear(unorm8(b))
-            } else {
-                unorm8(b)
-            }
-        };
+        let color = |b: u8| if srgb { srgb8_decode(b) } else { unorm8(b) };
         let px = bytes
             .chunks_exact(self.bytes())
             .map(|b| match self {
@@ -181,8 +176,8 @@ impl Reduction {
 pub(super) struct Cascade {
     t: Texel,
     r: Reduction,
-    /// Fixed-point linear light of each sRGB code, when color channels average in it.
-    lut: Option<Box<[u128; 256]>>,
+    /// Whether color channels are sRGB codes that average in fixed-point linear light.
+    linear: bool,
     /// By level, from the first coarser one: the upper row of the pair being formed.
     pending: Vec<Option<Row>>,
 }
@@ -195,20 +190,14 @@ enum Row {
 }
 
 /// Bits below the point of the fixed-point linear light that sRGB means sum.
-const LINEAR_BITS: i32 = 64;
+const LINEAR_BITS: u32 = 64;
 
 impl Cascade {
     pub(super) fn new(t: Texel, r: Reduction, srgb: bool, coarser: usize) -> Self {
-        let lut = (srgb && r == Reduction::Mean && t == Texel::Rgba8).then(|| {
-            let scale = 2f64.powi(LINEAR_BITS);
-            Box::new(std::array::from_fn(|b| {
-                (orr_color::srgb_decode(b as f64 / 255.0) * scale).round() as u128
-            }))
-        });
         Self {
             t,
             r,
-            lut,
+            linear: srgb && r == Reduction::Mean && t == Texel::Rgba8,
             pending: (0..coarser).map(|_| None).collect(),
         }
     }
@@ -268,9 +257,12 @@ impl Cascade {
             _ => texels
                 .iter()
                 .enumerate()
-                .map(|(i, &b)| match &self.lut {
-                    Some(lut) if i % 4 < 3 => lut[usize::from(b)],
-                    _ => u128::from(b),
+                .map(|(i, &b)| {
+                    if self.linear && i % 4 < 3 {
+                        srgb8_decode_fixed(b, LINEAR_BITS)
+                    } else {
+                        u128::from(b)
+                    }
                 })
                 .collect(),
         }
@@ -291,12 +283,12 @@ impl Cascade {
             _ => sums
                 .iter()
                 .enumerate()
-                .map(|(i, &s)| match &self.lut {
-                    Some(_) if i % 4 < 3 => {
-                        let linear = s as f64 * 2f64.powi(-LINEAR_BITS - shift as i32);
-                        (orr_color::srgb_encode(linear) * 255.0).round_ties_even() as u8
+                .map(|(i, &s)| {
+                    if self.linear && i % 4 < 3 {
+                        srgb8_encode_fixed(s, LINEAR_BITS + shift)
+                    } else {
+                        int(s) as u8
                     }
-                    _ => int(s) as u8,
                 })
                 .collect(),
         }
