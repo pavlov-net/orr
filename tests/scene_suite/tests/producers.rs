@@ -751,6 +751,53 @@ fn a_drawn_entry_shows_its_hook_s_blades_among_stored_ones_with_their_words_dept
     assert_clean();
 }
 
+/// The room a scene's light tables name for producer clusters follows the clusters its set
+/// producers' batches hold between them: a producer set again counts as it now is, a cleared
+/// one leaves the sum, and the room grows as a table does, once the sum passes it.
+#[test]
+fn the_room_for_producer_clusters_follows_the_producers_set_set_again_and_cleared() {
+    let mut field = Field::new(32.0);
+    let topology = [ClusterTopology {
+        vertex_count: 5,
+        triangles: &BLADE,
+    }];
+    let materials = [field.material];
+    let group = field.group;
+    let mut room = |id: u32, max_clusters: Option<u32>| {
+        let desc = max_clusters.map(|max_clusters| ProducerDesc {
+            max_clusters,
+            max_vertices: 5 * max_clusters,
+            ..blade_desc(group, &topology, &materials)
+        });
+        let list = [field.scene];
+        let mut f = field
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(field.frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        f.scene(field.scene)
+            .unwrap()
+            .set_producer(ProducerId(id), desc.as_ref())
+            .unwrap();
+        let mut room = 0;
+        f.update_scenes(&mut |c| room = c.light_tables.producer_clusters)
+            .unwrap();
+        field.frame += 1;
+        wait(f.end(&[]).unwrap());
+        room
+    };
+    assert_eq!(room(0, Some(10)), 10);
+    assert_eq!(room(1, Some(30)), 40);
+    assert_eq!(room(0, Some(5)), 40, "a producer set again counts twice");
+    assert_eq!(room(1, None), 40);
+    assert_eq!(room(2, Some(35)), 40, "a cleared producer still counts");
+    assert_eq!(room(3, Some(1)), 80, "the room grows as a table does");
+    assert_clean();
+}
+
 #[test]
 fn clusters_and_vertices_past_capacity_are_dropped_and_counted() {
     let mut field = Field::new(32.0);

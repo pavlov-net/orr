@@ -17,8 +17,8 @@ impl LightId {
     pub const NONE: Self = Self(u32::MAX);
 }
 
-/// What a scene's light tables hold room for in a frame, as its root says: state kept per
-/// light, per emissive list entry or per producer entry by whoever reads the tables is sized
+/// What a scene's light tables hold room for in a frame: state kept per light, per emissive
+/// list entry, per producer entry or per producer cluster by whoever reads the tables is sized
 /// from it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LightTables {
@@ -28,6 +28,9 @@ pub struct LightTables {
     pub entries: u32,
     /// Entries of the producer table, `SceneRoot::producer_capacity`.
     pub producers: u32,
+    /// Clusters the set producers' batches hold between them at most, and room to spare: it
+    /// grows as the tables do, and no frame's producers emit more.
+    pub producer_clusters: u32,
 }
 
 /// A light. Colors are linear Rec.709 and convert to Rec.2020 when written.

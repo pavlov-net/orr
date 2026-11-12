@@ -2088,7 +2088,7 @@ impl<'a> Frame<'a> {
                 t.root.gpu(),
                 t.batches.gpu(),
                 cpu.focus_detail(),
-                scene.light_tables(),
+                scene.light_tables(cpu),
                 core.scene_features(cpu, self.kernels.environment),
             ));
         }
@@ -2631,7 +2631,6 @@ impl<'a> Frame<'a> {
         };
         let root = scene.tables.root.gpu();
         let sky_stats = scene.tables.sky_stats.gpu();
-        let light_tables = scene.light_tables();
         let focus = WorldPos::new(focus, core.cell_log2)
             .relative_to(
                 WorldPos {
@@ -2641,7 +2640,7 @@ impl<'a> Frame<'a> {
                 core.cell_log2,
             )
             .to_array();
-        let (slots, slot_capacity, smoke, features, work, producers, sized) = {
+        let (slots, slot_capacity, smoke, features, light_tables, work, producers, sized) = {
             let cpu = &mut *scene.cpu.lock().unwrap();
             let features = core.scene_features(cpu, self.kernels.environment);
             let smoke = features.contains(SceneFeatures::SMOKE);
@@ -2656,6 +2655,7 @@ impl<'a> Frame<'a> {
                 cpu.slot_capacity(),
                 smoke,
                 features,
+                scene.light_tables(cpu),
                 cuts.candidate_capacity(),
                 producers,
                 cpu.sized.expect("an updated scene has sized its lists"),

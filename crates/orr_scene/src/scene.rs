@@ -742,6 +742,10 @@ pub(crate) struct SceneCpu {
     pub(crate) producers_removed: Vec<(u64, u32, u32)>,
     /// Memory of replaced or cleared producer entries, freed once that frame has completed.
     pub(crate) retired: Vec<(u64, Producer)>,
+    /// The clusters the set producers' batches hold at most, summed, and the clusters whoever
+    /// keeps a list per producer cluster holds room for, which grows as [`grown`] says.
+    pub(crate) producer_clusters: u32,
+    pub(crate) producer_cluster_room: u32,
     /// Producer figures copied back each frame; made at the first update.
     pub(crate) producer_readback: Option<producer::Readback>,
     /// Index = TransformGroupId; entry 0 is the null group.
@@ -1146,11 +1150,12 @@ impl Scene {
 
     /// What the root of the scene's next update says its light tables hold, and the root of
     /// its last once the frame's writes are over.
-    pub(crate) fn light_tables(&self) -> LightTables {
+    pub(crate) fn light_tables(&self, cpu: &SceneCpu) -> LightTables {
         LightTables {
             lights: self.tables.lights.capacity(),
             entries: self.tables.emissive.capacity(),
             producers: self.tables.producers.capacity(),
+            producer_clusters: cpu.producer_cluster_room,
         }
     }
 
@@ -1491,6 +1496,7 @@ impl Scene {
         if let Some(id) = old.id {
             cpu.producer_ids.remove(&id.0);
         }
+        cpu.producer_clusters -= old.max_clusters;
         cpu.emissive_removed.push((frame, old.emissive, 1));
         cpu.producers_removed.push((frame, at, 1));
         cpu.retired.push((frame, old));
@@ -1680,6 +1686,8 @@ impl Scene {
                 producer_ids: FxHashMap::default(),
                 producers_removed: Vec::new(),
                 retired: Vec::new(),
+                producer_clusters: 0,
+                producer_cluster_room: 0,
                 producer_readback: None,
                 groups: vec![None],
                 records,
@@ -3015,15 +3023,27 @@ impl<'f> SceneWriter<'f> {
         let tess = self.window.put(self.device, &TessStateGpu::zeroed())?;
         let t = &self.scene.tables;
         let cpu = &mut *self.scene.cpu.lock().unwrap();
-        let (index, emissive) = match cpu.producer_ids.get(&id.0) {
+        let held = cpu.producer_ids.get(&id.0).map(|&index| {
+            let held = cpu.producers[index as usize].as_ref();
+            let held = held.expect("a named entry holds a producer");
+            (index, held.emissive, held.max_clusters)
+        });
+        // The lists kept per producer cluster count the set producers' clusters in 32 bits.
+        let clusters = u64::from(cpu.producer_clusters) - held.map_or(0, |h| u64::from(h.2))
+            + u64::from(b.producer.max_clusters);
+        let clusters = u32::try_from(clusters).map_err(|_| Error::Capacity {
+            what: "producer clusters",
+            capacity: u32::MAX,
+        })?;
+        let room = cpu.producer_cluster_room;
+        let cluster_room = if clusters > room {
+            grown("producer clusters", room, clusters - room, u32::MAX)?
+        } else {
+            room
+        };
+        let (index, emissive) = match held {
             // A producer set again keeps its entries.
-            Some(&index) => {
-                let held = cpu.producers[index as usize].as_ref();
-                (
-                    index,
-                    held.expect("a named entry holds a producer").emissive,
-                )
-            }
+            Some((index, emissive, _)) => (index, emissive),
             None => {
                 let room = self.scene.producer_room(cpu, self.device)?;
                 match self.scene.take_entries(cpu, self.device, 1) {
@@ -3038,6 +3058,8 @@ impl<'f> SceneWriter<'f> {
             }
         };
         cpu.producer_ids.insert(id.0, index);
+        cpu.producer_clusters = clusters;
+        cpu.producer_cluster_room = cluster_room;
         record[0] = ProducerGpu {
             emissive,
             ..b.record
