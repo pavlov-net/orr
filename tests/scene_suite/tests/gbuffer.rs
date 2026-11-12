@@ -38,7 +38,7 @@ use orr_pack::skeleton::{SkeletonInfo, Trs};
 use orr_pack::{Archive, AssetId, Entry, Span, Target};
 use orr_scene::testing::{
     Image, Pixels, Tolerance, assert_clean, check, device, flip, mount_pending, read_buffer,
-    read_texture, visible_clusters, wait,
+    read_texture, table_entries, visible_clusters, wait,
 };
 use orr_scene::{
     AffineRows, BoundTexture, ClusterWork, CopyVariant, CutGpu, DebugLod, Decal, DecalChannels,
@@ -5266,19 +5266,19 @@ fn the_group_table_grows_under_frames_in_flight_and_a_hung_page_keeps_its_joint(
     let mut frame = 0;
     // Settled once the page's records have landed.
     let start = Instant::now();
-    let (settled, flight) = loop {
+    let settled = loop {
         let (settled, flight) = settled_hits(&mut w, &placed, view, &mut frame);
         wait(flight.point);
         let traced: &[trace::Traced] = bytemuck::cast_slice(&settled);
         if traced.iter().filter(|t| t.instance != 0).count() > 100 {
-            break (settled, flight);
+            break settled;
         }
         assert!(
             start.elapsed() < Duration::from_secs(60),
             "the page never landed"
         );
     };
-    let held: SceneRoot = read_buffer(flight.scene, 1)[0];
+    let held = table_entries(&w.scenes, placed.scene);
 
     let mut later = Vec::new();
     for count in [3, 9, 30] {
@@ -5301,8 +5301,11 @@ fn the_group_table_grows_under_frames_in_flight_and_a_hung_page_keeps_its_joint(
         later.push(shoot_later(&mut w, &placed, &shot));
     }
     wait(later.last().unwrap().point);
-    let grown: SceneRoot = read_buffer(flight.scene, 1)[0];
-    assert!(grown.groups != held.groups, "the group table never grew");
+    let grown = table_entries(&w.scenes, placed.scene);
+    assert!(
+        grown.groups > held.groups,
+        "the group table never grew: {held:?} to {grown:?}"
+    );
     for (i, l) in later.iter().enumerate() {
         let traced: Vec<u8> = bytemuck::cast_slice(&l.read().traced).to_vec();
         assert!(
@@ -5388,7 +5391,7 @@ fn a_page_s_cooked_material_set_reaches_its_copies_while_the_material_set_tables
         shown[usize::from(dressed)] += u32::from(t.material == section_0.0);
     }
     assert!(shown[0] > 100 && shown[1] > 100, "{shown:?} hits");
-    let held: SceneRoot = read_buffer(flight.scene, 1)[0];
+    let held = table_entries(&w.scenes, placed.scene);
 
     let mut later = vec![flight];
     for (i, at) in [16, 300, 5000].into_iter().enumerate() {
@@ -5413,11 +5416,11 @@ fn a_page_s_cooked_material_set_reaches_its_copies_while_the_material_set_tables
         later.push(next(&mut w, &mut |_| {}));
     }
     wait(later.last().unwrap().point);
-    let grown: SceneRoot = read_buffer(later[0].scene, 1)[0];
+    let grown = table_entries(&w.scenes, placed.scene);
     assert!(
-        grown.material_sets != held.material_sets
-            && grown.page_material_sets != held.page_material_sets,
-        "the tables of material sets never grew"
+        grown.material_sets > held.material_sets
+            && grown.page_material_sets > held.page_material_sets,
+        "the tables of material sets never grew: {held:?} to {grown:?}"
     );
     for (i, l) in later.iter().enumerate() {
         let traced: Vec<u8> = bytemuck::cast_slice(&l.read().traced).to_vec();
@@ -6030,7 +6033,7 @@ fn slot_tables_grow_under_frames_in_flight_and_writes_before_a_grow_land_in_them
     };
     let (shown, flight) = settle(&mut w, &mut |w| next(w, &mut |_| {}).0);
     wait(flight.point);
-    let held: SceneRoot = read_buffer(flight.scene, 1)[0];
+    let held = table_entries(&w.scenes, rigs.placed.scene);
     let [first, second] = [0, 1].map(|i| rigs.range.first + i);
     let hits = |traced: &[trace::Traced], slot: u32| {
         traced.iter().filter(|t| t.instance == slot + 1).count()
@@ -6050,11 +6053,12 @@ fn slot_tables_grow_under_frames_in_flight_and_writes_before_a_grow_land_in_them
     }
     let (hidden, flight) = settle(&mut w, &mut |w| next(w, &mut |_| {}).0);
     wait(flight.point);
-    let grown: SceneRoot = read_buffer(flight.scene, 1)[0];
+    let slots = table_entries(&w.scenes, rigs.placed.scene);
     assert!(
-        grown.instances != held.instances && grown.slot_state != held.slot_state,
-        "the slot tables never grew"
+        slots.slots > held.slots,
+        "the slot tables never grew: {held:?} to {slots:?}"
     );
+    let grown: SceneRoot = read_buffer(flight.scene, 1)[0];
     assert!(grown.part_base >= 66, "{} slots", grown.part_base);
     for (i, l) in later.iter().enumerate() {
         let traced = l.read().traced;
@@ -10188,18 +10192,19 @@ fn skinned_tables_grow_under_frames_in_flight_and_every_frame_stays_exact() {
     wait(flight.point);
     let traced: &[trace::Traced] = bytemuck::cast_slice(&settled);
     assert!(traced.iter().filter(|t| t.instance != 0).count() > 500);
-    let held: SceneRoot = read_buffer(flight.scene, 1)[0];
+    let held = table_entries(&w.scenes, worms.placed.scene);
 
     let mut later = vec![flight];
     for more in [2, 6, 20, 0, 0, 0] {
         later.push(next(&mut w, more));
     }
     wait(later.last().unwrap().point);
-    let grown: SceneRoot = read_buffer(later[0].scene, 1)[0];
+    let entries = table_entries(&w.scenes, worms.placed.scene);
     assert!(
-        grown.skinned != held.skinned && grown.skin_state != held.skin_state,
-        "the skinned tables never grew"
+        entries.skinned > held.skinned,
+        "the skinned tables never grew: {held:?} to {entries:?}"
     );
+    let grown: SceneRoot = read_buffer(later[0].scene, 1)[0];
     assert!(grown.skinned_capacity >= 30);
     for (i, l) in later.iter().enumerate() {
         let traced: Vec<u8> = bytemuck::cast_slice(&l.read().traced).to_vec();

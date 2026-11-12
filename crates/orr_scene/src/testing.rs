@@ -393,6 +393,23 @@ pub fn model_materials(scenes: &crate::Scenes) -> GpuPtr<u32> {
     scenes.model_materials()
 }
 
+/// Entries a scene's tables hold room for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableEntries {
+    pub slots: u32,
+    pub groups: u32,
+    /// The consumer's material sets, then the placed pages'.
+    pub material_sets: u32,
+    pub page_material_sets: u32,
+    pub skinned: u32,
+}
+
+/// What `scene`'s tables hold room for now. A test that grows a table tells by it: a table
+/// that moves more than once can come back to an address it left.
+pub fn table_entries(scenes: &crate::Scenes, scene: crate::SceneId) -> TableEntries {
+    scenes.table_entries(scene).expect("the scene")
+}
+
 /// The texture of cooked texture `id` in a ready mount.
 pub fn mounted_texture(
     scenes: &crate::Scenes,

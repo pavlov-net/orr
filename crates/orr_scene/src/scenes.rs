@@ -1116,6 +1116,18 @@ impl Scenes {
     }
 
     #[cfg(feature = "testing")]
+    pub(crate) fn table_entries(&self, scene: SceneId) -> Result<crate::testing::TableEntries> {
+        let t = &self.core.scene(scene)?.tables;
+        Ok(crate::testing::TableEntries {
+            slots: t.instances.capacity(),
+            groups: t.groups.capacity(),
+            material_sets: t.material_sets.capacity(),
+            page_material_sets: t.page_sets.capacity(),
+            skinned: t.skinned.capacity(),
+        })
+    }
+
+    #[cfg(feature = "testing")]
     pub(crate) fn tables(
         &self,
     ) -> (
