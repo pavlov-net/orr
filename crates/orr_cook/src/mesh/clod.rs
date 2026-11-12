@@ -48,9 +48,8 @@ impl Cluster {
 pub(super) struct Mesh<'a> {
     pub(super) indices: &'a [u32],
     pub(super) normals: Vec<f32>,
-    /// Per vertex, its normal's class ([`lod::Welded::classes`]) and its uvs.
-    pub(super) classes: Vec<u32>,
-    pub(super) uvs: Vec<Uvs>,
+    /// Vertex `v`'s normal class ([`lod::Welded::classes`]) and uvs.
+    pub(super) shading: &'a (dyn Fn(u32) -> (u32, Uvs) + Sync),
     pub(crate) weights: &'a [f32],
     pub(super) lock: Vec<u8>,
     pub(super) remap: &'a [u32],
@@ -89,12 +88,11 @@ impl Sources {
 
 /// What `build` keeps per vertex: the mesh's vertices, then the wedges it adds, each placed as
 /// one vertex is and shaded as another, with a normal and uvs of its own ([`lod::fit`]).
-struct Vertices {
+struct Vertices<'a> {
     positions: Vec<f32>,
     normals: Vec<f32>,
-    /// Per vertex, its normal's class and its uvs.
-    classes: Vec<u32>,
-    uvs: Vec<Uvs>,
+    /// The normal class and uvs of the mesh's vertices, then the wedges'.
+    shading: Shading<'a>,
     /// The mesh's lock bits.
     lock: Vec<u8>,
     remap: Vec<u32>,
@@ -104,7 +102,7 @@ struct Vertices {
     base: Vec<u32>,
 }
 
-impl Vertices {
+impl Vertices<'_> {
     /// Adds a vertex placed as `at` is, by its position and lock bits, shaded as `from` is,
     /// with its normal's class, and with normal `normal` and uvs `uvs`; returns it.
     fn wedge(&mut self, at: u32, from: u32, normal: [f32; 3], uvs: Uvs) -> u32 {
@@ -114,12 +112,29 @@ impl Vertices {
         let at = at as usize;
         self.positions.extend_from_within(3 * at..3 * at + 3);
         self.normals.extend_from_slice(&normal);
-        self.classes.push(self.classes[from as usize]);
-        self.uvs.push(uvs);
+        let class = self.shading.of(from).0;
+        self.shading.wedges.push((class, uvs));
         self.lock.push(self.lock[at]);
         self.remap.push(self.remap[at]);
         self.base.push(self.base[at]);
         new
+    }
+}
+
+/// The normal class and uvs of each vertex of `build`: the mesh's by `mesh`, below `count`,
+/// and the wedges' held.
+pub(super) struct Shading<'a> {
+    count: u32,
+    mesh: &'a (dyn Fn(u32) -> (u32, Uvs) + Sync),
+    wedges: Vec<(u32, Uvs)>,
+}
+
+impl Shading<'_> {
+    pub(super) fn of(&self, v: u32) -> (u32, Uvs) {
+        match v.checked_sub(self.count) {
+            Some(w) => self.wedges[w as usize],
+            None => (self.mesh)(v),
+        }
     }
 }
 
@@ -750,8 +765,7 @@ pub(super) struct Emitted<'a> {
     pub(super) indices: &'a [u32],
     pub(super) positions: &'a [f32],
     pub(super) normals: &'a [f32],
-    pub(super) classes: &'a [u32],
-    pub(super) uvs: &'a [Uvs],
+    pub(super) shading: &'a Shading<'a>,
     pub(super) sources: &'a Sources,
     pub(super) base: &'a [u32],
 }
@@ -775,8 +789,7 @@ pub(super) fn build<G: Send>(
     let Mesh {
         indices,
         normals,
-        classes,
-        uvs,
+        shading,
         weights,
         lock,
         remap,
@@ -793,8 +806,11 @@ pub(super) fn build<G: Send>(
     let mut vx = Vertices {
         positions,
         normals,
-        classes,
-        uvs,
+        shading: Shading {
+            count: vertex_count as u32,
+            mesh: shading,
+            wedges: Vec::new(),
+        },
         lock,
         remap: remap.to_vec(),
         sources: Sources {
@@ -843,7 +859,7 @@ pub(super) fn build<G: Send>(
         drop(lock);
         let base = out.len() as i32;
         let positions = Positions(vx.positions.as_mut_ptr(), vx.positions.len());
-        let (normals, classes, uvs) = (&vx.normals, &vx.classes, &vx.uvs);
+        let (normals, shading) = (&vx.normals, &vx.shading);
         let (remap, sources, bases) = (&vx.remap, &vx.sources, &vx.base);
         let groups: Vec<(G, Option<Simplified>)> = offsets
             .par_windows(2)
@@ -883,8 +899,7 @@ pub(super) fn build<G: Send>(
                         indices: &cluster_indices,
                         positions: positions.read(),
                         normals,
-                        classes,
-                        uvs,
+                        shading,
                         sources,
                         base: bases,
                     })
@@ -911,8 +926,8 @@ pub(super) fn build<G: Send>(
                 let _z = crate::profile::zone!("clod.fit");
                 let at = |v: u32| Vec3::from(positions.get(v as usize)).as_dvec3();
                 let normal = |v: u32| Vec3::from_slice(&normals[3 * v as usize..]).as_dvec3();
-                let class = |v: u32| classes[v as usize];
-                let uv = |v: u32| uvs[v as usize];
+                let class = |v: u32| shading.of(v).0;
+                let uv = |v: u32| shading.of(v).1;
                 let section = |v: u32| sections[sources.shading(v) as usize];
                 let position = |v: u32| remap[v as usize];
                 let locked = |v: u32| locks[v as usize] & LOCK != 0;
@@ -996,8 +1011,7 @@ pub(super) fn build<G: Send>(
             indices: &cluster_indices,
             positions: &vx.positions,
             normals: &vx.normals,
-            classes: &vx.classes,
-            uvs: &vx.uvs,
+            shading: &vx.shading,
             sources: &vx.sources,
             base: &vx.base,
         }));

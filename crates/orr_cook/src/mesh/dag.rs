@@ -701,10 +701,13 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
         .iter()
         .flat_map(|c| c.map(|v| (f64::from(v) * snap.step) as f32))
         .collect();
-    let shades: Vec<Shade> = (0..input.welded.len() as u32)
-        .map(|v| input.shade(w, v))
+    let normals: Vec<f32> = (0..input.welded.len() as u32)
+        .flat_map(|v| input.shade(w, v).0)
         .collect();
-    let normals: Vec<f32> = shades.iter().flat_map(|n| n.0).collect();
+    let shading = |v: u32| {
+        let (_, class, uvs) = input.shade(w, v);
+        (class, uvs)
+    };
     drop(attributes);
     let weights = [0.5f32; 3];
     let mut config = meshopt::clod_default_config_rt(usize::from(o.limits.max_triangles));
@@ -725,8 +728,7 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
     let mesh = super::clod::Mesh {
         indices: &input.indices,
         normals,
-        classes: shades.iter().map(|n| n.1).collect(),
-        uvs: shades.iter().map(|n| n.2).collect(),
+        shading: &shading,
         weights: &weights,
         lock: lock.into_owned(),
         remap: &input.remap,
@@ -866,9 +868,8 @@ fn group_of(
             let n = &e.normals[3 * v as usize..3 * v as usize + 3];
             [n[0], n[1], n[2]]
         }));
-        out.classes
-            .extend(used.iter().map(|&v| e.classes[v as usize]));
-        out.uvs.extend(used.iter().map(|&v| e.uvs[v as usize]));
+        out.classes.extend(used.iter().map(|&v| e.shading.of(v).0));
+        out.uvs.extend(used.iter().map(|&v| e.shading.of(v).1));
         out.base.extend(
             used.iter()
                 .map(|&v| input.welded[e.base[v as usize] as usize]),
