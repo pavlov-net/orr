@@ -33,6 +33,17 @@ pub(crate) fn grown(what: &'static str, capacity: u32, count: u32, limit: u32) -
     Ok(wanted.max(capacity.saturating_mul(2).min(limit)))
 }
 
+/// The entries a table of `capacity`, which holds no entry `id`, grows to for it, as [`grown`]
+/// says. Fails when `limit` holds no entry `id`.
+pub(crate) fn grown_to_hold(what: &'static str, capacity: u32, id: u32, limit: u32) -> Result<u32> {
+    // The entries up to the highest id of an empty table pass 32 bits.
+    let more = (id - capacity).checked_add(1).ok_or(Error::Capacity {
+        what,
+        capacity: limit,
+    })?;
+    grown(what, capacity, more, limit)
+}
+
 /// 32-bit words of one `T`.
 fn entry_words<T>() -> u32 {
     (size_of::<T>() / 4) as u32
@@ -306,5 +317,10 @@ mod tests {
         assert_eq!(g(6, 5, 10), None);
         assert_eq!(g(u32::MAX - 1, 1, u32::MAX), Some(u32::MAX));
         assert_eq!(g(u32::MAX - 1, 2, u32::MAX), None);
+        let h = |capacity, id, limit| grown_to_hold("entries", capacity, id, limit).ok();
+        assert_eq!(h(0, 5, u32::MAX), Some(6));
+        assert_eq!(h(6, 6, u32::MAX), Some(12));
+        assert_eq!(h(6, 10, 10), None);
+        assert_eq!(h(0, u32::MAX, u32::MAX), None);
     }
 }

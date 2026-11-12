@@ -504,8 +504,7 @@ impl Ptlas {
     /// now, beside the cell partitions made; unbounded on a device without one, which builds
     /// none.
     pub(crate) fn global_room(&self, device: &Device) -> u32 {
-        self.partition_room(device)
-            .saturating_sub(self.partitions.len() as u32)
+        self.partition_room(device) - self.partitions.len() as u32
     }
 
     /// Cell partitions the device's PTLAS takes beside the most the global partition can

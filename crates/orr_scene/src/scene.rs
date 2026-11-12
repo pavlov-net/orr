@@ -23,7 +23,7 @@ use crate::ptlas::{CopyRuns, Ptlas, run_class};
 use crate::shaders::instance_page::{PageEntriesGpu, PagePrototypeGpu};
 use crate::skin::{CopyArrays, SkinFrame, SkinnedDesc};
 use crate::subd::{self, ModelCage, SubdBuild, SubdDesc};
-use crate::table::{Column, Table, TableCopy, grown};
+use crate::table::{Column, Table, TableCopy, grown, grown_to_hold};
 use crate::tessellate::Patterns;
 use crate::traverse::Cuts;
 use crate::upload::{Op, Record};
@@ -65,7 +65,7 @@ const GROUP_QUANTIZED_PAGE: u32 = 1;
 pub struct SceneId(pub u32);
 
 /// Table sizes of a scene, fixed at creation. Its instance slots, transform groups, material
-/// sets and decals take what the scene's content needs.
+/// sets, decals, skinned copies and medium proxies take what the scene's content needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SceneDesc {
     pub light_capacity: u32,
@@ -2886,13 +2886,8 @@ impl<'f> SceneWriter<'f> {
             if decal.is_none() {
                 return Ok(());
             }
-            let limit = table.limit();
-            // The entries up to the highest id of an empty table pass 32 bits.
-            let more = (id.0 - held).checked_add(1).ok_or(Error::Capacity {
-                what: "decals",
-                capacity: limit,
-            })?;
-            table.reserve(self.device, grown("decals", held, more, limit)?)?;
+            let entries = grown_to_hold("decals", held, id.0, table.limit())?;
+            table.reserve(self.device, entries)?;
         }
         let record = decal.map_or_else(DecalGpu::zeroed, |d| decal_gpu(d, self.cell_log2));
         let copy = self.staged(table.entry(id.0), &record)?;
@@ -2925,12 +2920,7 @@ impl<'f> SceneWriter<'f> {
             }
             let room = cpu.ptlas.global_room(self.device);
             let limit = held.saturating_add(room).min(table.limit());
-            // The entries up to the highest id of an empty table pass 32 bits.
-            let more = (id.0 - held).checked_add(1).ok_or(Error::Capacity {
-                what: "medium proxies",
-                capacity: limit,
-            })?;
-            let entries = grown("medium proxies", held, more, limit)?;
+            let entries = grown_to_hold("medium proxies", held, id.0, limit)?;
             table.reserve(self.device, entries)?;
             cpu.ptlas.hold_proxies(entries);
         }
