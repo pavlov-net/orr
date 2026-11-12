@@ -2708,11 +2708,10 @@ impl<'a> Frame<'a> {
         };
         let mut short = None;
         if history.lists.is_none() {
-            // Lists of nothing where the device lacks the memory, until it has it.
+            // Lists of nothing where the device lacks the memory: the resize below says so and
+            // tries again.
             let made = match ViewLists::new(device, want) {
                 Err(e) if e.is_out_of_memory() => {
-                    history.lists_retry = self.id + response_period(core.fif);
-                    short = Some(e);
                     let none = ListSizes {
                         visible_clusters: 0,
                         work: 0,
