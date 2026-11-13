@@ -364,6 +364,21 @@ impl<T: Send + 'static> Late<T> {
         self.get().is_none() && self.job.lock().unwrap().is_some()
     }
 
+    /// The urgency its job is queued or running at, where it is.
+    fn queued(&self) -> Option<Urgency> {
+        if self.get().is_some() {
+            return None;
+        }
+        let job = self.job.lock().unwrap();
+        job.as_ref().map(|queued| *queued.0.lock().unwrap())
+    }
+
+    /// Whether its job is queued or running at [`Urgency::Needed`]: one queued for later only
+    /// saves time.
+    pub(crate) fn needed(&self) -> bool {
+        self.queued() == Some(Urgency::Needed)
+    }
+
     /// Starts `compile` unless the pipeline is ready, compiling or failed: as a job on
     /// `loading`, or without one here. A job queued less urgently than this asks moves up to
     /// where it asks.
@@ -671,13 +686,39 @@ impl StagedKernels {
         Ok(covering.is_some())
     }
 
-    /// How many pipelines asked for are still compiling.
-    pub(crate) fn outstanding(&self) -> u32 {
+    /// How many pipelines a frame or a caller waits for are still compiling: those asked for as
+    /// needed of sets no ready set stands in for. A set holding more, with every stage the other
+    /// was asked for ready and nothing of its own still compiling, runs that one's frames as
+    /// [`Self::covering`] takes it, so the other's compiles only save time once they finish;
+    /// but where `exact`, a caller that waits takes pipelines made for exactly its view
+    /// ([`Self::wait_exact`]), and those queued for later are its as well.
+    pub(crate) fn outstanding(&self, exact: bool) -> u32 {
         let sets = self.sets.lock().unwrap();
-        sets.iter()
-            .flat_map(|s| s.stages.iter())
-            .filter(|l| l.pending())
-            .count() as u32
+        let covered = |s: &StageSet| {
+            !exact
+                && sets.iter().any(|t| {
+                    t.may & s.may == s.may
+                        && !t.stages.iter().any(Late::pending)
+                        && s.stages
+                            .iter()
+                            .zip(&t.stages)
+                            .all(|(own, other)| !own.started() || other.get().is_some())
+                })
+        };
+        let awaited = |s: &StageSet| {
+            if covered(s) {
+                return 0;
+            }
+            s.stages
+                .iter()
+                .filter(|l| match l.queued() {
+                    Some(Urgency::Needed) => true,
+                    Some(Urgency::Idle) => exact,
+                    _ => false,
+                })
+                .count()
+        };
+        sets.iter().map(|s| awaited(s)).sum::<usize>() as u32
     }
 
     /// Waits for the pipelines made for exactly `may` that hold `stages`, running queued jobs

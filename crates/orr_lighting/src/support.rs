@@ -323,12 +323,17 @@ impl MaskedSupport {
         Ok(())
     }
 
-    /// How many pipelines asked for are still compiling.
-    pub(crate) fn outstanding(&self) -> u32 {
+    /// How many pipelines a frame or a caller waits for are still compiling: those asked for as
+    /// needed that no pipeline that may meet everything stands in for ([`Self::take`]), but
+    /// where `exact` (a caller that waits takes those made for its mask, [`Self::wait_exact`]).
+    pub(crate) fn outstanding(&self, exact: bool) -> u32 {
         let sets = self.sets.lock().unwrap();
+        let general = sets.iter().find(|s| s.may == MAY_ALL).filter(|_| !exact);
+        let awaited = |s: &SupportSet, k: Masked| {
+            s.late(k).needed() && !general.is_some_and(|g| g.get(k).is_some())
+        };
         sets.iter()
-            .flat_map(|s| s.pipelines.iter())
-            .filter(|p| p.pending())
-            .count() as u32
+            .map(|s| MASKED.into_iter().filter(|&k| awaited(s, k)).count())
+            .sum::<usize>() as u32
     }
 }

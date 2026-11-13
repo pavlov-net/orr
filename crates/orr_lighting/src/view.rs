@@ -1169,9 +1169,10 @@ impl CompilingKernels {
         Ok(())
     }
 
-    /// How many pipelines asked for through [`Self::prepare_paths`] are still compiling.
-    pub fn paths_outstanding(&self) -> u32 {
-        self.paths.stages.outstanding() + self.masked.outstanding()
+    /// How many pipelines asked for through [`Self::prepare_paths`] that a frame or a caller
+    /// waits for are still compiling ([`LightingKernels::outstanding`]).
+    pub fn paths_outstanding(&self, exact: bool) -> u32 {
+        self.paths.stages.outstanding(exact) + self.masked.outstanding(exact)
     }
 
     /// Whether a thread has started any job.
@@ -1766,9 +1767,12 @@ impl LightingKernels {
         Ok(WaitedPaths { _set: waited })
     }
 
-    /// How many pipelines asked for are still compiling.
-    pub fn outstanding(&self) -> u32 {
-        self.paths.stages.outstanding() + self.support.masked.outstanding()
+    /// How many pipelines a frame or a caller waits for are still compiling: not those made for
+    /// exactly a view's mask while ones that hold more stand in for them, which only save time
+    /// later, but where `exact`, which says the caller takes those made for exactly its view
+    /// ([`Self::wait_paths`]).
+    pub fn outstanding(&self, exact: bool) -> u32 {
+        self.paths.stages.outstanding(exact) + self.support.masked.outstanding(exact)
     }
 
     /// Records the froxel passes of `pass` after the scene's [`SceneLighting::record`], the

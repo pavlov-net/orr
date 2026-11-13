@@ -750,11 +750,15 @@ impl Renderer {
         matches!(self.lighting.paths, Paths::Ready(_))
     }
 
-    /// How many of the path tracing kernels' compile jobs have not finished.
+    /// How many of the path tracing kernels' compile jobs that a view's image waits for have
+    /// not finished. Compiles that only make later frames faster, of pipelines made for exactly
+    /// what a view meets while ones that hold more already render it, are not counted, but
+    /// after [`Self::wait_paths`], whose renders wait for those.
     pub fn paths_outstanding(&self) -> u32 {
+        let exact = self.lighting.waits;
         match &self.lighting.paths {
-            Paths::Compiling { jobs, .. } => jobs.outstanding() + jobs.paths_outstanding(),
-            Paths::Ready(kernels) => kernels.outstanding(),
+            Paths::Compiling { jobs, .. } => jobs.outstanding() + jobs.paths_outstanding(exact),
+            Paths::Ready(kernels) => kernels.outstanding(exact),
             _ => 0,
         }
     }
