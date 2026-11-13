@@ -520,11 +520,17 @@ uint neural_finest_mip(NeuralSetGpu* n, uint latent)
 // Texel `i` of an axis of `n` texels under address mode `mode`; -1 past a TEXTURE_BORDER edge.
 int texel_wrapped(int i, int n, uint mode)
 {
+    // Texels counted out from the edge on i's side, texel -1 - k being k out, so each mode
+    // takes one unsigned remainder; REPEAT counts a negative i's result back from n - 1.
+    uint away = uint(i < 0 ? -1 - i : i);
     if (mode == TEXTURE_REPEAT)
-        return ((i % n) + n) % n;
+    {
+        int r = int(away % uint(n));
+        return i < 0 ? n - 1 - r : r;
+    }
     if (mode == TEXTURE_MIRROR)
     {
-        int m = ((i % (2 * n)) + 2 * n) % (2 * n);
+        int m = int(away % uint(2 * n));
         return m < n ? m : 2 * n - 1 - m;
     }
     if (mode == TEXTURE_BORDER && (i < 0 || i >= n))
@@ -617,7 +623,7 @@ float4 neural_footprint(NeuralTextureGpu* t, uint modes, UvFootprint f, TextureS
         int2 at = int2(texel_wrapped(texel.x + o.x, mip_size.x, modes & TEXTURE_WRAP_MASK),
                        texel_wrapped(texel.y + o.y, mip_size.y, (modes >> TEXTURE_V_SHIFT) & TEXTURE_WRAP_MASK));
         if (at.x >= 0 && at.y >= 0)
-            v += weight * neural_texel(n, at, mip, t.first, t.count);
+            v += weight * neural_texel(n, uint2(at), mip, t.first, t.count);
     }
     return v;
 }

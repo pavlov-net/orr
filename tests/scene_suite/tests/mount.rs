@@ -6193,8 +6193,12 @@ fn neural_taps_follow_the_wrap_and_filter_of_their_binding() {
         f
     };
     let plain = neural_taps(&mut scenes, base, &centers, 1);
-    let cases: [(u8, &dyn Fn(f32) -> f32); 2] =
-        [(wrap::REPEAT, &|u| u + 3.0), (wrap::MIRROR, &|u| 2.0 - u)];
+    let cases: [(u8, &dyn Fn(f32) -> f32); 4] = [
+        (wrap::REPEAT, &|u| u + 3.0),
+        (wrap::REPEAT, &|u| u - 3.0),
+        (wrap::MIRROR, &|u| 2.0 - u),
+        (wrap::MIRROR, &|u| -u),
+    ];
     for (mode, to) in cases {
         let got = bound_taps(&mut scenes, base, &moved(to), 1, &bound(mode, 0));
         let (max, mean) = differences(&got, &plain);

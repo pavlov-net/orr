@@ -48,13 +48,12 @@ Vector<NEURAL_WIDTH> neural_activation(Vector<NEURAL_WIDTH> x)
     return min(x, V(half(NEURAL_ACTIVATION_MAX))) * clamp(x * V(half(1.0 / 3.0)) + V(half(0.5)), V(half(0.0)), V(half(1.0)));
 }
 
-// The network's outputs at `texel` (wrapped into the mip) of color mip `mip` of `n`, sRGB
-// channels decoded to linear, into the invocation's cache.
-void neural_decode(NeuralSetGpu* n, int2 texel, uint mip)
+// The network's outputs at `texel` of color mip `mip` of `n`, sRGB channels decoded to linear,
+// into the invocation's cache.
+void neural_decode(NeuralSetGpu* n, uint2 texel, uint mip)
 {
     NeuralMipGpu c = n.color_mips[mip];
-    int2 size = int2(max(n.size >> mip, uint2(1)));
-    texel = ((texel % size) + size) % size;
+    uint2 size = max(n.size >> mip, uint2(1));
     float2 uv = (float2(texel) + 0.5) / float2(size);
     Texture2DArray<float4> latents = n.latents.get<Texture2DArray<float4>>();
     SamplerState s = n.sampler.get();
@@ -114,16 +113,14 @@ void neural_decode(NeuralSetGpu* n, int2 texel, uint mip)
         cached[ch] = (n.srgb >> ch & 1) != 0 ? srgb_decode(float3(saturate(v))).x : v;
     }
     cached_set = (uint64_t)n;
-    cached_texel = uint3(uint2(texel), mip);
+    cached_texel = uint3(texel, mip);
 }
 
-// Channels `first` to `first + count - 1` (count 1 to 4) of `n`'s texel `texel` of color mip
-// `mip`, wrapped; channels past `count` read 0, and 1 in w, as a texture with fewer channels
-// reads.
-public float4 neural_texel(NeuralSetGpu* n, int2 texel, uint mip, uint first, uint count)
+// Channels `first` to `first + count - 1` (count 1 to 4) of `n`'s texel `texel`, within color
+// mip `mip`; channels past `count` read 0, and 1 in w, as a texture with fewer channels reads.
+public float4 neural_texel(NeuralSetGpu* n, uint2 texel, uint mip, uint first, uint count)
 {
-    int2 size = int2(max(n.size >> mip, uint2(1)));
-    uint3 key = uint3(uint2(((texel % size) + size) % size), mip);
+    uint3 key = uint3(texel, mip);
     if (cached_set != (uint64_t)n || any(cached_texel != key))
         neural_decode(n, texel, mip);
     float4 v = float4(0.0, 0.0, 0.0, 1.0);
