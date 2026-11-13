@@ -94,10 +94,6 @@ pub struct ViewLighting {
     /// Whether each stage of the staged path loop records in a pass of its own ("view trace",
     /// "view shade" and so on), so pass timings tell the stages apart.
     pub stage_passes: bool,
-    /// Whether the later rounds of a pass, which few paths reach, run in one lane per path
-    /// once the pipeline for that has compiled, behind everything else. It changes no result
-    /// and saves those rounds' time.
-    pub rest_stage: bool,
 }
 
 impl Default for ViewLighting {
@@ -119,7 +115,6 @@ impl Default for ViewLighting {
             reference: None,
             specialize: true,
             stage_passes: false,
-            rest_stage: true,
         }
     }
 }
@@ -1250,7 +1245,9 @@ impl PathsRan {
 
 /// The path pipelines [`LightingKernels::wait_paths`] waited for, which stay while this does.
 #[must_use = "the pipelines waited for stay only while this is held"]
-pub struct WaitedPaths(Arc<StageSet>);
+pub struct WaitedPaths {
+    _set: Arc<StageSet>,
+}
 
 /// What decides the path pipelines of a view's frame, known before the view is rastered.
 #[derive(Clone, Copy, Debug)]
@@ -1754,14 +1751,7 @@ impl LightingKernels {
         let particle_lighting = needs.particle_lighting || masked.particle_lighting();
         let runs = support_runs(masked, needs.features, particle_lighting, lighting);
         masked.wait_exact(may, runs)?;
-        Ok(WaitedPaths(waited))
-    }
-
-    /// Waits for the pipeline that runs the later rounds of `waited`'s paths in one lane each,
-    /// which otherwise compiles behind everything else and changes no result: the frames of a
-    /// caller that times or compares them then run it from the first.
-    pub fn wait_rest(&self, waited: &WaitedPaths) -> Result<(), Error> {
-        self.paths.stages.wait_rest(&waited.0)
+        Ok(WaitedPaths { _set: waited })
     }
 
     /// How many pipelines asked for are still compiling.
@@ -2148,7 +2138,6 @@ impl LightingKernels {
                 rounds: path_rounds(&path_root),
                 passes: if pass.frosted_glass { 2 } else { 1 },
                 update,
-                rest: lighting.rest_stage,
             },
             lighting.stage_passes,
         )?;
@@ -2173,7 +2162,6 @@ impl LightingKernels {
                     rounds: path_rounds(&background_root),
                     passes: 1,
                     update: 0,
-                    rest: lighting.rest_stage,
                 },
                 lighting.stage_passes,
             )?;
@@ -2301,7 +2289,6 @@ impl LightingKernels {
                 rounds: path_rounds(&photon_root),
                 passes: 1,
                 update: 0,
-                rest: lighting.rest_stage,
             },
             lighting.stage_passes,
         )?;

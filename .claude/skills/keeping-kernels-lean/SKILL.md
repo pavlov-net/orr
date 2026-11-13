@@ -24,8 +24,9 @@ support kernels it reads, so kernel compile time is something a user sees.
   itself compiles several times slower than one with the code removed.
 - A plain scene's stage should be much smaller than the stage that may meet everything. If it
   isn't, a gate isn't folding.
-- A dispatch costs the same however few paths it holds, so the late rounds, when few paths
-  remain, run in one looping rest stage.
+- Every round of a pass runs as stages, however few paths reach it: a late round pays its
+  dispatches and barriers even when its queues are empty. Keep that fixed cost small rather
+  than folding rounds into a looping kernel, which holds every stage it loops over.
 - The pipeline store fills with the number of distinct pipelines more than with their code size,
   so each new axis of specialization multiplies it.
 
@@ -84,9 +85,10 @@ These change the SPIR-V, so they should hold on any driver:
 
 These depend on the driver, so measure again on other hardware:
 
-- **One looping kernel for the whole path:** faster per frame, but it takes minutes to compile
-  where a stage takes seconds. The rest stage loops too, but it compiles per mask in the
-  background, after the first lit frame.
+- **One looping kernel for the whole path, or for a pass's late rounds:** faster per frame, but
+  it takes minutes to compile where a stage takes seconds. A rest stage that ran the rounds
+  from the fifth on in one lane saved about a tenth of a small bed's frame and compiled
+  seven to twelve times as long as the slowest stage.
 - **One entry point per module:** no gain in the driver, and longer builds.
 - **Shade stages as ray-generation entries** (for reordering): about twice as slow as compute
   with no reordering, cause unknown.
@@ -100,7 +102,7 @@ or an older build don't transfer. Compile times of the same module vary a lot be
 processes, so trust only differences measured in the same run, or of several times.
 
 - **Size:** `python -I ${CLAUDE_SKILL_DIR}/scripts/spv_size.py --stage trace` reports the newest
-  build of a stage module (`primary`, `shade_opaque`, `shade_other`, `trace`, `walk`, `rest`,
+  build of a stage module (`primary`, `shade_opaque`, `shade_other`, `trace`, `walk`,
   `sources`, `reset`) and prints its path; it also accepts module paths. It reads the module as
   emitted, before the fold, so the size is the same for every mask and every GPU. With `--lines`
   on a build made with `ORR_SHADER_DEBUG_INFO=lines`, it lists instructions by source file and

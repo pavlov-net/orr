@@ -7,7 +7,6 @@ use orr_gpu::{
     SpecData, Stage, Stages,
 };
 use orr_scene::testing::{assert_clean, device, wait};
-use orr_shaders::abi::SpecEntry;
 use orr_shaders::bytemuck::Pod;
 use orr_shaders::{KernelSet, Mismatch};
 use shader_link::renderer::types::{DisplacementInput, HitContext, SurfaceInput};
@@ -252,7 +251,6 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
             "media/froxel_light",
             "media/particle_draw",
             "path/staged/primary",
-            "path/staged/rest",
             "path/staged/shade_opaque",
             "path/staged/shade_other",
             "path/staged/sources",
@@ -263,34 +261,11 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
     if let Some(e) = renderer_error(&orr_linked::KERNELS) {
         panic!("{e}");
     }
-    // The linked modules create pipelines as orr's own do. orr makes the rest stage's only for
-    // what a scene's paths may meet, as it holds every other stage's code: here for a view's
-    // paths that meet nothing more (`path_may`'s view bit, and no bit of `path_may2`).
-    let view = 8u64.to_le_bytes();
-    let masks = [
-        SpecEntry {
-            constant_id: 110,
-            offset: 0,
-            size: 4,
-        },
-        SpecEntry {
-            constant_id: 111,
-            offset: 4,
-            size: 4,
-        },
-    ];
+    // The linked modules create pipelines as orr's own do.
     for &m in orr_linked::KERNELS.modules {
-        let spec = if m.kernel == "path/staged/rest" {
-            SpecData {
-                entries: &masks,
-                bytes: &view,
-            }
-        } else {
-            SpecData::default()
-        };
         for e in m.entry_points.iter().filter(|e| e.stage == Stage::Compute) {
             let name = e.name.to_str().unwrap();
-            let stage = ShaderStage::new(m, name, spec).unwrap();
+            let stage = ShaderStage::new(m, name, SpecData::default()).unwrap();
             device().create_compute_pipeline(&stage, m.name).unwrap();
         }
     }

@@ -13,7 +13,7 @@ use orr_scene::{JobResult, Loading, SceneFeatures, Urgency};
 use orr_shaders::abi::SpecEntry;
 
 use crate::shaders::path::staged::{
-    primary, reset, rest, shade_opaque, shade_other, sources, trace, walk,
+    primary, reset, shade_opaque, shade_other, sources, trace, walk,
 };
 use crate::shaders::types::{PathRoot, PathStages, StageQueue};
 use crate::{Error, KernelSet, module};
@@ -46,11 +46,6 @@ const MAX_SLOTS: u32 = 65535 * STAGE_GROUP;
 /// in the 24 bits beside its flags (`SHADOW_DEPTH_SHIFT`). The queues of that many rounds take
 /// more memory than a device has, so no root gets there.
 pub(crate) const MAX_ROUNDS: u32 = 1 << 24;
-/// The round of a pass from which its rest stage runs the paths still going, each in one lane
-/// to its end. A stage takes as long as its slowest lane however few lanes it has, so every
-/// round costs about the same once paths are few; before that the stages are faster, which run
-/// a round's rays and each kind of vertex together.
-const REST_ROUND: u32 = 5;
 
 /// `PathRoot.source`.
 pub(crate) const PATH_SOURCE_VIEW: u32 = 0;
@@ -192,11 +187,9 @@ pub(crate) enum Stage {
     Finish,
     /// The opaque shade stage with every lobe the set may meet, over QUEUE_RICH.
     Rich,
-    /// The trace, shade and walk stages of a path's later rounds in one lane.
-    Rest,
 }
 
-const STAGES: usize = 12;
+const STAGES: usize = 11;
 
 impl Stage {
     /// Its module, entry point and name.
@@ -221,7 +214,6 @@ impl Stage {
                 "rich_main",
                 "staged rich opaque shade",
             ),
-            Self::Rest => (&rest::MODULE, "main", "staged rest"),
         }
     }
 
@@ -467,7 +459,6 @@ impl StageSet {
                 late(Stage::Walk),
                 late(Stage::Finish),
                 late(Stage::Rich),
-                late(Stage::Rest),
             ],
         }
     }
@@ -731,9 +722,7 @@ impl StagedKernels {
     /// passes of `rounds` rounds, each round the trace stage, the shade stages and, where a
     /// material walks, the walk stage, over the workgroups their queues gathered; a pass ends
     /// in the finish stage. `rounds` is at least one more than the traces a path of the source
-    /// takes, and a view's pixels with a frosted-glass path take a second pass. From
-    /// [`REST_ROUND`] on a pass's rounds run in the rest stage instead, once its pipeline is
-    /// ready ([`Self::rest`]).
+    /// takes, and a view's pixels with a frosted-glass path take a second pass.
     ///
     /// A view's update paths ride in its stages, the paths of `update` blocks shared out over
     /// its slices: a stage waits for the one before it and takes as long as its slowest path
@@ -773,43 +762,6 @@ impl StagedKernels {
         Ok(())
     }
 
-    /// The round of a pass of `rounds` from which `set`'s rest stage runs the paths still
-    /// going, or none while its pipeline is not ready. It compiles behind everything else once
-    /// a frame runs the set, as it only saves time: it holds the trace stage and every shade
-    /// stage, and takes several times as long to compile as the largest of them. The set that
-    /// may meet everything has none: it stands in while a view's own compiles.
-    fn rest(&self, set: &Arc<StageSet>, rounds: u32) -> Option<u32> {
-        if rounds <= REST_ROUND || set.may == MAY_ALL {
-            return None;
-        }
-        self.start_rest(set, Urgency::Idle);
-        set.stage(Stage::Rest).get().map(|_| REST_ROUND)
-    }
-
-    /// Starts the compile of `set`'s rest stage unless it has started, as a job where the loop
-    /// has a loading side.
-    fn start_rest(&self, set: &Arc<StageSet>, urgency: Urgency) {
-        let Some(loading) = self.loading() else {
-            return;
-        };
-        let (kernels, rays, may) = (self.kernels, self.rays, set.may);
-        set.stage(Stage::Rest)
-            .start(self.device(), Some((loading, urgency)), move |d| {
-                compile_stage(d, &kernels, Stage::Rest, may, rays)
-            });
-    }
-
-    /// Waits for the rest stage of `set`, which a caller waited for, running queued jobs on
-    /// this thread meanwhile: its frames then run their later rounds in it from the first.
-    /// Nothing to wait for with the set that may meet everything, which has none.
-    pub(crate) fn wait_rest(&self, set: &Arc<StageSet>) -> Result<(), Error> {
-        if set.may == MAY_ALL || self.loading().is_none() {
-            return Ok(());
-        }
-        self.start_rest(set, Urgency::Needed);
-        set.stage(Stage::Rest).wait(self.loading()).map(|_| ())
-    }
-
     /// The pipelines `paths` run and their stages in order, each after a wait for the one
     /// before it.
     fn steps(&self, paths: &SourcePaths<'_>) -> Result<(Arc<StageSet>, Vec<Step>), Error> {
@@ -822,7 +774,6 @@ impl StagedKernels {
             rounds,
             passes,
             update,
-            rest,
         } = paths;
         assert!(
             memory.rows > rounds * passes,
@@ -854,7 +805,6 @@ impl StagedKernels {
             );
         }
         memory.hold(&set);
-        let rest = rest.then(|| self.rest(&set, rounds)).flatten();
         let mut root = PathRoot {
             stages: memory.header.gpu(),
             source: source.id(),
@@ -897,14 +847,6 @@ impl StagedKernels {
                     (root.round, root.round_first, root.round_next) =
                         (round, first, first + rounds);
                     let queue = |queue| Groups::Queue(memory.groups(round, queue));
-                    if rest == Some(round - first) {
-                        steps.push(Step {
-                            root,
-                            pass: 5,
-                            runs: vec![(Stage::Rest, queue(QUEUE_TRACE))],
-                        });
-                        break;
-                    }
                     steps.push(Step {
                         root,
                         pass: 1,
@@ -957,8 +899,6 @@ pub(crate) struct SourcePaths<'a> {
     pub(crate) rounds: u32,
     pub(crate) passes: u32,
     pub(crate) update: u32,
-    /// Whether a pass's later rounds run in the rest stage once it is ready.
-    pub(crate) rest: bool,
 }
 
 /// The workgroups a stage runs over: a count, or those a queue gathered.
@@ -1059,32 +999,23 @@ impl Slots {
 }
 
 /// With `on`, ends the open pass and opens one named for `source`'s stage `stage` (start,
-/// trace, shade, walk, finish, rest), so the pass results time the stages apart.
+/// trace, shade, walk, finish), so the pass results time the stages apart.
 fn stage_pass(list: &mut CommandList<'_>, on: bool, source: Source, stage: usize) {
-    const NAMES: [[&str; 6]; 4] = [
+    const NAMES: [[&str; 5]; 4] = [
         [
             "view start",
             "view trace",
             "view shade",
             "view walk",
             "view finish",
-            "view rest",
         ],
-        [
-            "bg start",
-            "bg trace",
-            "bg shade",
-            "bg walk",
-            "bg finish",
-            "bg rest",
-        ],
+        ["bg start", "bg trace", "bg shade", "bg walk", "bg finish"],
         [
             "update start",
             "update trace",
             "update shade",
             "update walk",
             "update finish",
-            "update rest",
         ],
         [
             "photon start",
@@ -1092,7 +1023,6 @@ fn stage_pass(list: &mut CommandList<'_>, on: bool, source: Source, stage: usize
             "photon shade",
             "photon walk",
             "photon finish",
-            "photon rest",
         ],
     ];
     if on {

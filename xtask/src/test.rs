@@ -51,7 +51,6 @@ const SLOW: &[&str] = &[
     "shader_link.gpu",
     "lighting_suite.media",
     "lighting_suite.subsurface",
-    "lighting_suite.rest",
     "lighting_suite.world_cache",
     "atmosphere_suite.rendered_medium",
     "lighting_suite.path",
