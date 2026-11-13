@@ -3,7 +3,6 @@
 //! its present follows in order with the queue's submits.
 
 use std::cell::Cell;
-use std::convert::Infallible;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -66,7 +65,7 @@ fn layer_metadata(f: OutputFormat, hdr: Option<HdrMetadata>) -> Option<HdrMetada
 /// Low latency for one swapchain; Metal has none, so [`Swapchain::latency`] returns `None`.
 #[derive(Clone)]
 pub struct LowLatency {
-    never: Infallible,
+    never: !,
 }
 
 impl LowLatency {

@@ -4,7 +4,6 @@
 //! Vulkan backend's; the calls fail, panic, or take handles no call creates.
 
 use std::alloc::Layout;
-use std::convert::Infallible;
 use std::path::Path;
 
 use super::command::CommandList;
@@ -38,7 +37,7 @@ impl Device {
 /// Host memory imported for the GPU to read in place; not on Metal yet, where
 /// `newBufferWithBytesNoCopy` would wrap the pages.
 pub struct ImportedMemory {
-    never: Infallible,
+    never: !,
 }
 
 impl ImportedMemory {
@@ -77,7 +76,7 @@ impl Device {
 
 /// Pipelines that GPU-written sequences pick by index; not on Metal yet.
 pub struct ExecutionSet {
-    never: Infallible,
+    never: !,
 }
 
 impl ExecutionSet {
@@ -157,7 +156,7 @@ impl CommandList<'_> {
 
 /// A ray-dispatch pipeline; Metal has none.
 pub struct RayDispatchPipeline {
-    never: Infallible,
+    never: !,
 }
 
 impl RayDispatchPipeline {

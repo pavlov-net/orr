@@ -142,7 +142,7 @@ impl Drop for ClassicAs {
 
 /// An opacity micromap; Metal has none, so [`Device::create_micromap`] fails.
 pub struct Micromap {
-    never: std::convert::Infallible,
+    never: !,
 }
 
 /// As the Vulkan backend's, which releases the micromap.
