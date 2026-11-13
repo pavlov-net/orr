@@ -1,11 +1,11 @@
-use std::alloc::Layout;
+use std::alloc::{AllocError, Layout};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{MTLAllocation, MTLDevice, MTLHeap, MTLHeapDescriptor, MTLHeapType};
 
-use crate::{AllocError, VirtualAllocation, VirtualBlock};
+use crate::{VirtualAllocation, VirtualBlock};
 
 type Heap = ProtocolObject<dyn MTLHeap>;
 

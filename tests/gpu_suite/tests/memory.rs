@@ -1,7 +1,7 @@
 //! Sub-allocation and transient arenas. In its own process so the device-memory counts it
 //! reads are its own.
 
-use std::alloc::Layout;
+use std::alloc::{Allocator, Layout};
 use std::ptr::NonNull;
 use std::time::Duration;
 

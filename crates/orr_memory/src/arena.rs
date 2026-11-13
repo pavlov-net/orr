@@ -1,6 +1,4 @@
-use std::alloc::Layout;
-
-use crate::AllocError;
+use std::alloc::{AllocError, Layout};
 
 /// Bump allocation of ranges in `[base, base + size)`, usually device addresses. Ranges are
 /// never freed one by one; [`Arena::reset`] frees them all.
@@ -34,6 +32,21 @@ impl Arena {
         Ok(start)
     }
 
+    /// Resizes the last range allocated, at `start` with `size` bytes, to `layout.size()`
+    /// bytes in place. Fails when another range follows it, `start` is not a multiple of
+    /// `layout.align()`, or the rest of the arena is too small.
+    pub fn resize_last(&mut self, start: u64, size: u64, layout: Layout) -> Result<(), AllocError> {
+        if start + size != self.base + self.used || !start.is_multiple_of(layout.align() as u64) {
+            return Err(AllocError);
+        }
+        let end = start.checked_add(layout.size() as u64).ok_or(AllocError)?;
+        if end > self.base + self.size {
+            return Err(AllocError);
+        }
+        self.used = end - self.base;
+        Ok(())
+    }
+
     /// Frees every range.
     pub fn reset(&mut self) {
         self.used = 0;
@@ -50,10 +63,9 @@ impl Arena {
 
 #[cfg(test)]
 mod tests {
-    use std::alloc::Layout;
+    use std::alloc::{AllocError, Layout};
 
     use super::Arena;
-    use crate::AllocError;
 
     fn layout(size: usize, align: usize) -> Layout {
         Layout::from_size_align(size, align).unwrap()

@@ -83,7 +83,6 @@ pub use memory::{
     HeapReport, LabelUsage, MemoryBreakdown, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage,
     PoolUsage,
 };
-pub use orr_memory::AllocError;
 pub use orr_shaders::abi::*;
 pub use orr_shaders::{
     DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM, EntryPoint, KernelSet, ShaderModule, Stage,

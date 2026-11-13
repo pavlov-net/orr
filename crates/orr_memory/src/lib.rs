@@ -11,8 +11,8 @@
 //! - [`Arena`] bump-allocates device-address ranges and frees them all in one step.
 //!
 //! Requests for a size and an alignment take a [`Layout`](std::alloc::Layout), and a request
-//! that finds no room fails with [`AllocError`], as with `std`'s allocators. Calls that reach
-//! Vulkan fail with `Error`, which carries the Vulkan result.
+//! that finds no room fails with [`AllocError`](std::alloc::AllocError), as with `std`'s
+//! allocators. Calls that reach Vulkan fail with `Error`, which carries the Vulkan result.
 //!
 //! Allocations still live when an `Allocator` is dropped are reported to `log` at error level
 //! with the target [`LOG_TARGET`], or to stderr if the logger doesn't take them. Each gets a line,
@@ -42,18 +42,6 @@ pub use vulkan_memory_allocator_sys::LOG_TARGET;
 
 #[cfg(not(target_vendor = "apple"))]
 use ash::vk;
-
-/// No free range fits the requested layout.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct AllocError;
-
-impl std::fmt::Display for AllocError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("memory allocation failed")
-    }
-}
-
-impl std::error::Error for AllocError {}
 
 /// A failure.
 #[cfg(not(target_vendor = "apple"))]

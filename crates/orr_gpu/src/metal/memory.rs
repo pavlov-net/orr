@@ -1,4 +1,4 @@
-use std::alloc::Layout;
+use std::alloc::{AllocError, Layout};
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -13,7 +13,7 @@ use objc2_metal::{
     MTLBuffer, MTLCPUCacheMode, MTLDevice, MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor,
     MTLResidencySet, MTLResource, MTLResourceOptions, MTLSharedEvent, MTLStorageMode,
 };
-use orr_memory::{AllocError, Arena, HeapAllocation, HeapPool};
+use orr_memory::{Arena, HeapAllocation, HeapPool};
 
 use super::device::{Device, Shared};
 use super::sparse::SPARSE_PAGE;
@@ -600,13 +600,13 @@ impl Drop for Ring {
 /// of linear arenas, one per frame in flight on the render queue or one per loading batch in
 /// flight on the loading queue.
 ///
-/// The allocation methods have the signatures and meaning of `std`'s `Allocator` trait.
-/// Allocation bumps a pointer in the current arena. [`HostArenas::deallocate`] does nothing:
-/// unlike `std`'s allocators, the memory comes back only once the GPU is done with it, when
-/// the ring returns to the arena through [`HostArenas::reset`]. Memory from an arena is valid
-/// on the CPU until that return, whether or not `deallocate` was called; `reset` takes
-/// `&mut self`, so no container borrowing the ring outlives it. The GPU may use the memory
-/// until the point given to the `reset` that closed the arena has completed.
+/// The ring is a `std` [`Allocator`](std::alloc::Allocator), so containers can live in it
+/// through `&HostArenas`, as in `Vec::new_in(&arenas)`. Allocation bumps a pointer in the
+/// current arena and deallocation does nothing: the memory comes back only once the GPU is
+/// done with it, when the ring returns to the arena through [`HostArenas::reset`]. `reset`
+/// takes `&mut self`, so it ends every block allocated before it, and no container borrowing
+/// the ring outlives it. The GPU may use the memory until the point given to the `reset`
+/// that closed the arena has completed.
 ///
 /// One thread owns the ring. Dropping it frees the blocks once the GPU is done with the
 /// work submitted before the drop and with the command lists open at it.
@@ -614,13 +614,90 @@ pub struct HostArenas {
     ring: Ring,
 }
 
-impl HostArenas {
+// SAFETY: blocks lie in the mapping of the current arena, disjoint from every other block
+// allocated since the last `reset`. Only `reset` returns the ring to an arena, and it takes
+// `&mut self`, which the trait counts as invalidating the blocks; the mappings last until the
+// ring drops. The ring touches a block only to copy or zero it in `grow` and `shrink`, and
+// no call holds the arena's `RefCell` borrow across another.
+unsafe impl std::alloc::Allocator for HostArenas {
     /// `layout.size()` bytes from the current arena at a multiple of `layout.align()`; up to
     /// 256 bytes of alignment the device address is aligned the same. Fails when the arena
     /// has no room left.
-    pub fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let (ptr, _) = self.place(layout)?;
         Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
+    }
+
+    /// Does nothing. The memory comes back once the GPU is done with it, after a
+    /// [`HostArenas::reset`].
+    unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {}
+
+    /// In place when `ptr` is the last block allocated and the arena has room.
+    unsafe fn grow(
+        &self,
+        ptr: NonNull<u8>,
+        old: Layout,
+        new: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        if self.resize_last(ptr, old.size(), new) {
+            return Ok(NonNull::slice_from_raw_parts(ptr, new.size()));
+        }
+        self.moved(ptr, old, new)
+    }
+
+    unsafe fn grow_zeroed(
+        &self,
+        ptr: NonNull<u8>,
+        old: Layout,
+        new: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: the caller's contract for `grow_zeroed` is the one for `grow`.
+        let block = unsafe { self.grow(ptr, old, new)? };
+        // SAFETY: the bytes past `old.size()` lie in the block.
+        unsafe {
+            let tail = block.cast::<u8>().add(old.size());
+            tail.write_bytes(0, new.size() - old.size());
+        }
+        Ok(block)
+    }
+
+    /// In place when `ptr` meets the new alignment; the last block allocated gives its tail
+    /// back to the arena.
+    unsafe fn shrink(
+        &self,
+        ptr: NonNull<u8>,
+        old: Layout,
+        new: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        if !ptr.addr().get().is_multiple_of(new.align()) {
+            return self.moved(ptr, old, new);
+        }
+        self.resize_last(ptr, old.size(), new);
+        Ok(NonNull::slice_from_raw_parts(ptr, new.size()))
+    }
+}
+
+impl HostArenas {
+    /// Resizes the block at `ptr` of `size` bytes to `layout` in place, if it is the last
+    /// block allocated, the arena has room and `ptr` meets `layout.align()`.
+    fn resize_last(&self, ptr: NonNull<u8>, size: usize, layout: Layout) -> bool {
+        let start = ptr.addr().get() as u64;
+        let mut arena = self.ring.arena.borrow_mut();
+        arena.resize_last(start, size as u64, layout).is_ok()
+    }
+
+    /// A new block for `new` holding the start of `old`'s block at `ptr`.
+    fn moved(
+        &self,
+        ptr: NonNull<u8>,
+        old: Layout,
+        new: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        let (to, _) = self.place(new)?;
+        // SAFETY: `ptr` holds `old.size()` bytes and the new block `new.size()`, and blocks
+        // allocated since the last reset are disjoint.
+        unsafe { ptr.copy_to_nonoverlapping(to, old.size().min(new.size())) };
+        Ok(NonNull::slice_from_raw_parts(to, new.size()))
     }
 
     /// The mapped and device addresses of `layout` in the current arena.
@@ -630,22 +707,6 @@ impl HostArenas {
         let ptr = unsafe { block.mapped.unwrap().add(offset as usize) };
         Ok((ptr, block.address + offset))
     }
-
-    /// As [`HostArenas::allocate`], with the bytes zeroed.
-    pub fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let ptr = self.allocate(layout)?;
-        // SAFETY: the range was just allocated and nothing else uses it.
-        unsafe { ptr.cast::<u8>().write_bytes(0, layout.size()) };
-        Ok(ptr)
-    }
-
-    /// Does nothing. The memory comes back once the GPU is done with it, after a
-    /// [`HostArenas::reset`].
-    ///
-    /// # Safety
-    ///
-    /// `ptr` came from these arenas with `layout`.
-    pub unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {}
 
     /// The device address of `ptr`. Panics if `ptr` is not in the arenas; the end of an
     /// arena counts, where an empty allocation can land.

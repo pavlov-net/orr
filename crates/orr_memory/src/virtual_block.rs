@@ -1,7 +1,7 @@
-use std::alloc::Layout;
+use std::alloc::{AllocError, Layout};
 use std::ptr;
 
-use crate::{AllocError, sys};
+use crate::sys;
 
 /// Places ranges inside a space of `size` units that the caller owns: a buffer, a heap of
 /// slots, a file. It touches no memory and needs no device.
