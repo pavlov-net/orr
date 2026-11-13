@@ -755,7 +755,7 @@ public void froxel_light<S : ISurfaces, M : IMedium>(FroxelRoot r, uint3 f)
     // through.
     float from_eye = length(x - eye);
     Interior around = Interior();
-    if (from_eye > eye_column.start && from_eye < eye_column.end)
+    if (may(MAY_INTERIORS) && from_eye > eye_column.start && from_eye < eye_column.end)
     {
         // The jitter carries `x` off the column's ray, and can carry it across the interior's
         // surface: the surfaces between the ray's point at its distance and `x` flip the column's

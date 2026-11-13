@@ -12,7 +12,8 @@
 //! and proxies off screen. Smoke: its opacity on the camera ray, a column across a shaft against
 //! the reference march, and sheets past the froxels. The eye under water: a turbid view per channel
 //! against the reference's distance samples, also past the froxels and with shafts, a waterline at
-//! the near plane from either side, a body in the water, flicker, and particles under water.
+//! the near plane from either side, a body in the water, a light in the water, flicker, and
+//! particles under water.
 
 use bytemuck::{Pod, Zeroable};
 use lighting_suite::bed::{
@@ -879,14 +880,24 @@ fn water_view(medium: Option<MaterialId>, reference: bool) -> ViewLighting {
     }
 }
 
-/// Turbid water around the origin, top at 4 m, and `more`; no fog above it.
-fn turbid(eye: Vec3, target: Vec3, more: Vec<Item>) -> (Bed, Allocation<FogGpu>, MaterialId) {
+/// Turbid water around the origin, top at 4 m, and `more`, lit by `lights`; no fog above it.
+fn turbid_lit(
+    lights: Vec<Light>,
+    eye: Vec3,
+    target: Vec3,
+    more: Vec<Item>,
+) -> (Bed, Allocation<FogGpu>, MaterialId) {
     let mut copies = vec![at(TURBID_WATER, Vec3::ZERO)];
     copies.extend(more);
-    let sun = vec![directional(60.0, 30.0, 1_000.0)];
-    let (bed, fog) = foggy(&CLEAR, copies, sun, None, eye, target);
+    let (bed, fog) = foggy(&CLEAR, copies, lights, None, eye, target);
     let water = bed.material(TURBID_WATER);
     (bed, fog, water)
+}
+
+/// [`turbid_lit`] under a high sun.
+fn turbid(eye: Vec3, target: Vec3, more: Vec<Item>) -> (Bed, Allocation<FogGpu>, MaterialId) {
+    let sun = vec![directional(60.0, 30.0, 1_000.0)];
+    turbid_lit(sun, eye, target, more)
 }
 
 fn assert_matches(what: &str, a: &Accumulated, reference: &Accumulated, tolerance: f64) {
@@ -916,6 +927,32 @@ fn an_underwater_view_matches_the_reference() {
     let blocks = block_rgb(&lit);
     let [r, g, b] = blocks[blocks.len() / 2];
     assert!(b > g && g > r, "the water's color {r:.3} {g:.3} {b:.3}");
+    assert_clean();
+}
+
+/// A sphere light in turbid water beside the view, with no surface between it and the froxels it
+/// lights: what reaches them crosses the water they lie in, so the view's mean luminance matches
+/// the reference's.
+#[test]
+fn a_light_in_the_water_lights_it_through_the_water() {
+    let light = Light::Sphere {
+        position: DVec3::new(4.0, 0.0, 1.0),
+        radius: 0.1,
+        intensity: Vec3::splat(2000.0),
+        cone: None,
+    };
+    let (mut bed, _fog, water) = turbid_lit(
+        vec![light],
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, 0.0, -10.0),
+        vec![at(FLOOR, Vec3::new(0.0, -4.0, 0.0))],
+    );
+    let lit = mean_luminance(&shown(&mut bed, water_view(Some(water), false), 64));
+    let reference = mean_luminance(&shown(&mut bed, water_view(Some(water), true), 768));
+    assert!(
+        (lit - reference).abs() < 0.05 * reference,
+        "the froxels' view is {lit:.4}, the reference's {reference:.4}"
+    );
     assert_clean();
 }
 
