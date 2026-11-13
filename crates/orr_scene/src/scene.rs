@@ -19,7 +19,9 @@ use crate::medium_proxy::{MediumProxy, MediumProxyId, proxy_gpu};
 use crate::memory::{RangeAllocator, UploadWindow};
 use crate::mount::{InstancePage, Mounts, PageId, PagePrototype};
 use crate::producer::{self, Opacity, Producer, ProducerDesc, ProducerId, ProducerUpdate};
+use crate::producer_blocks::ClusterBlocks;
 use crate::ptlas::{CopyRuns, Ptlas, run_class};
+use crate::shaders::emissive::EmissiveBlock;
 use crate::shaders::instance_page::{PageEntriesGpu, PagePrototypeGpu};
 use crate::skin::{CopyArrays, SkinFrame, SkinnedDesc};
 use crate::subd::{self, ModelCage, SubdBuild, SubdDesc};
@@ -800,6 +802,9 @@ pub(crate) struct SceneCpu {
     pub(crate) decals_changed: bool,
     pub(crate) decal_bin_slots: u32,
     pub(crate) decal_globals: u32,
+    /// The traced producer entries' clusters in blocks for the emissive pass, which sums each
+    /// block's power.
+    pub(crate) emissive_blocks: ClusterBlocks<EmissiveBlock>,
     /// The last frame `update_scenes` updated the scene.
     pub(crate) last_update: u64,
     /// Cooked pages placed in the scene.
@@ -1721,6 +1726,11 @@ impl Scene {
                 decals_changed: false,
                 decal_bin_slots: 0,
                 decal_globals: 0,
+                emissive_blocks: ClusterBlocks::new(
+                    device,
+                    LightTables::default(),
+                    "emissive cluster blocks",
+                )?,
                 last_update: 0,
                 pages: Vec::new(),
                 pages_removed: Vec::new(),

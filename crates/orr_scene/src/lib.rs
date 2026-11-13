@@ -62,6 +62,7 @@ mod pattern;
 mod pipelines;
 mod probe;
 mod producer;
+mod producer_blocks;
 mod ptlas;
 mod raster;
 #[cfg(feature = "hot-reload")]
@@ -111,6 +112,7 @@ pub use probe::{
 pub use producer::{
     ClusterTopology, Opacity, OriginPolicy, ProducerDesc, ProducerId, ProducerStats, ProducerUpdate,
 };
+pub use producer_blocks::{BLOCK_CLUSTERS, ClusterBlocks};
 pub use ptlas::RtStats;
 pub use residency::{ClassStats, RequestSource, ResidencyClass, ResidencyStats};
 pub use scene::{

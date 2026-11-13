@@ -745,7 +745,7 @@ fn producer_power_follows_emitted_clusters_every_frame() {
     };
     w.set_producer(
         ProducerId(1),
-        Some(&producer(ProducerUpdate::EveryFrame, 100, 0)),
+        Some(&producer(ProducerUpdate::EveryFrame, 600, 0)),
     )
     .unwrap();
     w.set_producer(
@@ -781,6 +781,7 @@ fn producer_power_follows_emitted_clusters_every_frame() {
         (7, 1.0),
         (64, 0.25),
         (99, 2.0),
+        (520, 0.5),
         (3, 0.125),
         (0, 1.0),
     ] {
@@ -799,12 +800,12 @@ fn producer_power_follows_emitted_clusters_every_frame() {
         assert_eq!(all.iter().filter(|e| e.kind != 0).count(), 2);
     }
 
-    // Past capacity the batch keeps 100 clusters and drops the rest.
-    let root = run(&mut scenes, &mut |_| {}, &[(ProducerId(1), 150, 1.0)]);
+    // Past capacity the batch keeps 600 clusters and drops the rest.
+    let root = run(&mut scenes, &mut |_| {}, &[(ProducerId(1), 900, 1.0)]);
     let all = entries(&root);
-    let full = expected(m, 150, 1.0);
+    let full = expected(m, 900, 1.0);
     let e = producer_entry(&all, every).unwrap();
-    assert!(e.cluster_count <= 100 && e.cluster_count >= 50);
+    assert!(e.cluster_count <= 600 && e.cluster_count >= 300);
     assert!(f64::from(e.area) < full.0 && e.area > 0.0);
 
     // Moving the entry's transform changes its power with no write to the list.

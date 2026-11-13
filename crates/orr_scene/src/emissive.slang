@@ -9,7 +9,20 @@ import orr_shaders.sampling;
 import orr_scene.lights;
 import orr_scene.material;
 import orr_scene.producer;
+import orr_scene.producer_blocks;
+import orr_scene.visibility;
 import orr_scene.tables;
+
+// What one block of producer clusters sums: their emitted power and area, and the clusters
+// that emit.
+struct EmissiveBlock
+{
+    float4 sum;
+    uint count;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+}
 
 struct Root
 {
@@ -18,6 +31,10 @@ struct Root
     uint4* jobs;
     uint job_count;
     uint _pad0;
+    // The traced producer entries' clusters in blocks (`producer_blocks`), and what each
+    // block sums.
+    uint* block_layout;
+    EmissiveBlock* blocks;
     uint64_t _pad1;
 }
 ORR_ROOT(Root);
@@ -149,56 +166,59 @@ void instances(uint3 id: SV_DispatchThreadID)
     e.area = area;
 }
 
-groupshared float4 sums[GROUP];
-groupshared uint counts[GROUP];
+static const uint LAYOUT_GROUP = 1024;
 
-// One group per producer entry its PTLAS instance traces: sums its emitted clusters' triangle
-// areas, transformed by the entry's transform, times each cluster's emission from both sides
-// of a surface with a back.
+groupshared uint scan[LAYOUT_GROUP];
+groupshared float4 sums[BLOCK_CLUSTERS];
+groupshared uint counts[BLOCK_CLUSTERS];
+
+// The clusters of producer entry `p` that light sampling weighs: none of an entry rays do not
+// trace, nor of one without an emissive list entry.
+uint traced_clusters(SceneRoot* s, uint p)
+{
+    uint held;
+    if (!producer_emissive(s, p, held))
+        return 0;
+    ProducerGpu q = s.producers[p];
+    if ((q.flags & INSTANCE_RAY) == 0 || (s.producer_state[p].rt_flags & PRODUCER_RT_WRITTEN) == 0)
+        return 0;
+    return emitted_clusters(s.batches[p]);
+}
+
+// The layout of the traced producer entries' clusters in blocks, one workgroup.
 [shader("compute")]
-[numthreads(GROUP, 1, 1)]
-void producers(uint3 entry: SV_GroupID, uint3 thread: SV_GroupThreadID)
+[numthreads(LAYOUT_GROUP, 1, 1)]
+void layout_blocks(uint lane: SV_GroupIndex)
 {
     SceneRoot* s = root.scene;
-    uint id = entry.x;
-    uint t = thread.x;
-    uint held;
-    if (!producer_emissive(s, id, held))
-        return;
-    EmissiveGpu* e = s.emissive + held;
-    ProducerGpu p = s.producers[id];
-    ProducerBatch b = s.batches[id];
-    float3x3 m = linear_part(s, p.group, p.group_index);
-    // An entry rays do not trace emits nothing light sampling could weigh against them.
-    bool traced = (p.flags & INSTANCE_RAY) != 0 && (s.producer_state[id].rt_flags & PRODUCER_RT_WRITTEN) != 0;
-    uint n = traced ? min(*b.cluster_count, b.max_clusters) : 0;
-    float4 sum = 0.0;
-    uint count = 0;
-    for (uint c = t; c < n; c += GROUP)
+    uint carry = 0;
+    for (uint base = 0; base < s.producer_capacity; base += LAYOUT_GROUP)
     {
-        ProducerClusterGpu k = b.clusters[c];
-        if (k.material >= p.material_count)
-            continue;
-        float3 l = sides_emission(s, p.materials[k.material]);
-        if (all(l == 0.0))
-            continue;
-        float a = 0.0;
-        for (uint i = 0; i < k.tri_count; i++)
+        uint p = base + lane;
+        uint n = p < s.producer_capacity ? cluster_blocks(traced_clusters(s, p)) : 0;
+        scan[lane] = n;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint off = 1; off < LAYOUT_GROUP; off <<= 1)
         {
-            float3 p0, p1, p2;
-            cluster_triangle(b, k, i, p0, p1, p2);
-            float3 e1 = mul(m, p1 - p0);
-            float3 e2 = mul(m, p2 - p0);
-            float size = unit_factor(max(abs(e1), abs(e2)));
-            a += 0.5 * unit_length(cross(e1 * size, e2 * size)) / size / size;
+            uint add = lane >= off ? scan[lane - off] : 0;
+            GroupMemoryBarrierWithGroupSync();
+            scan[lane] += add;
+            GroupMemoryBarrierWithGroupSync();
         }
-        sum += float4(l * a, a);
-        count++;
+        if (p < s.producer_capacity)
+            set_first_block(root.block_layout, p, carry + scan[lane] - n);
+        carry += scan[LAYOUT_GROUP - 1];
+        GroupMemoryBarrierWithGroupSync();
     }
-    sums[t] = sum;
-    counts[t] = count;
+    if (lane == 0)
+        close_layout(root.block_layout, s.producer_capacity, carry);
+}
+
+// Sums over the workgroup's lanes of `sums` and `counts` into lane 0's.
+void reduce(uint t)
+{
     GroupMemoryBarrierWithGroupSync();
-    for (uint step = GROUP / 2; step > 0; step /= 2)
+    for (uint step = BLOCK_CLUSTERS / 2; step > 0; step /= 2)
     {
         if (t < step)
         {
@@ -207,8 +227,72 @@ void producers(uint3 entry: SV_GroupID, uint3 thread: SV_GroupThreadID)
         }
         GroupMemoryBarrierWithGroupSync();
     }
+}
+
+// One thread per cluster of the layout's blocks: its triangle areas, transformed by its entry's
+// transform, times its emission from both sides of a surface with a back, summed per block.
+[shader("compute")]
+[numthreads(BLOCK_CLUSTERS, 1, 1)]
+void sum_blocks(uint3 group: SV_GroupID, uint t: SV_GroupIndex)
+{
+    SceneRoot* s = root.scene;
+    uint b = grid_index(group);
+    uint id, j;
+    if (!block_entry(root.block_layout, s.producer_capacity, b, id, j))
+        return;
+    ProducerGpu p = s.producers[id];
+    ProducerBatch batch = s.batches[id];
+    uint c = j * BLOCK_CLUSTERS + t;
+    float4 sum = 0.0;
+    uint count = 0;
+    if (c < emitted_clusters(batch))
+    {
+        ProducerClusterGpu k = batch.clusters[c];
+        float3 l = k.material < p.material_count ? sides_emission(s, p.materials[k.material]) : 0.0;
+        if (any(l != 0.0))
+        {
+            float a = cluster_area(batch, k, linear_part(s, p.group, p.group_index));
+            sum = float4(l * a, a);
+            count = 1;
+        }
+    }
+    sums[t] = sum;
+    counts[t] = count;
+    reduce(t);
     if (t == 0)
     {
+        EmissiveBlock e = (EmissiveBlock)0;
+        e.sum = sums[0];
+        e.count = counts[0];
+        root.blocks[b] = e;
+    }
+}
+
+// One workgroup per producer entry with an emissive list entry: the sums of its blocks.
+[shader("compute")]
+[numthreads(BLOCK_CLUSTERS, 1, 1)]
+void producers(uint3 entry: SV_GroupID, uint t: SV_GroupIndex)
+{
+    SceneRoot* s = root.scene;
+    uint held;
+    if (!producer_emissive(s, entry.x, held))
+        return;
+    uint first, end;
+    entry_blocks(root.block_layout, entry.x, first, end);
+    float4 sum = 0.0;
+    uint count = 0;
+    for (uint b = first + t; b < end; b += BLOCK_CLUSTERS)
+    {
+        EmissiveBlock k = root.blocks[b];
+        sum += k.sum;
+        count += k.count;
+    }
+    sums[t] = sum;
+    counts[t] = count;
+    reduce(t);
+    if (t == 0)
+    {
+        EmissiveGpu* e = s.emissive + held;
         e.power = sums[0].xyz;
         e.area = sums[0].w;
         e.cluster_count = counts[0];

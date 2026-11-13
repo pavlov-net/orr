@@ -274,6 +274,24 @@ public void cluster_triangle(ProducerBatch b, ProducerClusterGpu k, uint i, out 
     p2 = b.positions[k.first_vertex + c.z];
 }
 
+// Area of cluster `k` of batch `b` with its positions taken through `linear`. Each triangle's
+// edges scale by a power of two to unit size first, so the cross product of neither a tiny nor
+// a huge triangle leaves the float range.
+public float cluster_area(ProducerBatch b, ProducerClusterGpu k, float3x3 linear)
+{
+    float area = 0.0;
+    for (uint i = 0; i < k.tri_count; i++)
+    {
+        float3 p0, p1, p2;
+        cluster_triangle(b, k, i, p0, p1, p2);
+        float3 e1 = mul(linear, p1 - p0);
+        float3 e2 = mul(linear, p2 - p0);
+        float size = unit_factor(max(abs(e1), abs(e2)));
+        area += 0.5 * unit_length(cross(e1 * size, e2 * size)) / size / size;
+    }
+    return area;
+}
+
 // Segments per raster cluster of a strand entry: raster cluster g draws segments
 // 64 g to 64 g + 63 as two ribbon triangles each.
 public static const uint STRAND_GROUP = 64;

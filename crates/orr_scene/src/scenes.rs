@@ -39,6 +39,7 @@ use crate::pipelines::{MeshPipelineId, MeshStages, PipelineId, Pipelines, Reload
 use crate::producer::{
     self, Job, ProducerId, ProducerKernels, ProducerStats, ProducerUpdate, Readback,
 };
+use crate::producer_blocks::ClusterBlocks;
 use crate::ptlas::{FrameInputs, PtlasPipelines, RtStats};
 use crate::raster::{self, ListSizes, RasterPipelines, TargetSizes, ViewLists, ViewTargets};
 #[cfg(feature = "hot-reload")]
@@ -2270,6 +2271,8 @@ impl<'a> Frame<'a> {
                     jobs: src.cast(),
                     job_count: jobs.len() as u32,
                     _pad0: 0,
+                    block_layout: GpuPtr::NULL,
+                    blocks: GpuPtr::NULL,
                     _pad1: 0,
                 });
             }
@@ -2544,23 +2547,49 @@ impl<'a> Frame<'a> {
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
             let _zone = orr_gpu::zone!("emissive");
             list.begin_pass("emissive", false);
-            for &(_, scene, _, _, tables, _) in &roots {
-                let r = emissive::Root {
+            let mut producers = Vec::new();
+            for &(id, scene, _, _, tables, _) in &roots {
+                let mut r = emissive::Root {
                     scene,
                     jobs: GpuPtr::NULL,
                     job_count: 0,
                     _pad0: 0,
+                    block_layout: GpuPtr::NULL,
+                    blocks: GpuPtr::NULL,
                     _pad1: 0,
                 };
-                let ptr = window.put_root(device, &r)?;
+                let mut groups = None;
                 if tables.producers > 0 {
-                    let p = self.pipelines.get(own.emissive_producers);
-                    list.dispatch(p, ptr, [tables.producers, 1, 1]);
+                    let held = core.scene(id)?;
+                    let cpu = &mut *held.cpu.lock().unwrap();
+                    if !cpu.emissive_blocks.holds(tables) {
+                        cpu.emissive_blocks =
+                            ClusterBlocks::new(device, tables, "emissive cluster blocks")?;
+                    }
+                    r.block_layout = cpu.emissive_blocks.layout();
+                    r.blocks = cpu.emissive_blocks.records();
+                    groups = Some(cpu.emissive_blocks.groups());
+                }
+                let ptr = window.put_root(device, &r)?;
+                if let Some(groups) = groups {
+                    list.dispatch(self.pipelines.get(own.emissive_layout), ptr, [1, 1, 1]);
+                    producers.push((ptr, groups, tables.producers));
                 }
                 if tables.entries > 0 {
                     let groups = tables.entries.div_ceil(64);
                     let p = self.pipelines.get(own.emissive_instances);
                     list.dispatch(p, ptr, [groups, 1, 1]);
+                }
+            }
+            // Each scene's layout before its blocks, and its blocks before their sums.
+            if !producers.is_empty() {
+                list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
+                for &(ptr, groups, _) in &producers {
+                    list.dispatch_indirect(self.pipelines.get(own.emissive_blocks), ptr, groups);
+                }
+                list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+                for &(ptr, _, n) in &producers {
+                    list.dispatch(self.pipelines.get(own.emissive_producers), ptr, [n, 1, 1]);
                 }
             }
             list.end_pass();
