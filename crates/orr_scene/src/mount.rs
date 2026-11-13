@@ -18,7 +18,10 @@ use orr_io::{AlignedBuf, Read, SECTOR};
 use orr_math::{DVec3, IVec3, Vec3};
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
 use orr_pack::material::{Material, slot};
-use orr_pack::mesh::{Cluster, Group, MeshHeader, MeshInfo, NodePage, PageHeader, PageView, Part};
+use orr_pack::mesh::{
+    Cluster, Group, MeshHeader, MeshInfo, NodePage, PageHeader, PageView, Part, Section,
+    SurfaceClass,
+};
 use orr_pack::model::ModelInfo;
 use orr_pack::neural::{Constants, Fp8Network, NeuralInfo, NeuralTexture};
 use orr_pack::subd::{Page as SubdPage, SubdInfo};
@@ -153,6 +156,8 @@ struct PlacedMesh {
     header: MeshHeader,
     /// The ranks of its emissive and caster sets.
     ranks: [u32; 2],
+    /// A caster section of the opaque class.
+    opaque_casters: bool,
     /// Whether copies of the mesh trace cached cuts for each purpose's sets: a cut can hold more
     /// clusters of one section than a gathered list keeps.
     cached_only: [bool; 2],
@@ -1182,6 +1187,10 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             sections: info.sections.len() as u32,
             header,
             ranks: [info.emissive.rank_count(), info.casters.rank_count()],
+            opaque_casters: info
+                .sections
+                .iter()
+                .any(|s| s.flags & Section::CASTER != 0 && s.class() == Some(SurfaceClass::Opaque)),
             cached_only: [&info.emissive, &info.casters].map(|t| t.widest > GATHERED_CLUSTERS),
             level_ranges,
             clusters: Vec::new(),
@@ -1611,6 +1620,8 @@ struct ResolvedMesh {
     /// A skinned mesh's skin table.
     skin_record: Option<SkinMeshGpu>,
     sections: u32,
+    /// A caster section of the opaque class.
+    opaque_casters: bool,
     header: MeshHeader,
     levels: Vec<(f32, u32, u32)>,
     /// The clusters of its pinned pages, which come first, by mesh cluster index.
@@ -1883,6 +1894,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                 page_addresses,
                 skin_record: None,
                 sections: m.sections,
+                opaque_casters: m.opaque_casters,
                 header: m.header,
                 levels: m.level_ranges,
                 clusters,
@@ -4034,6 +4046,7 @@ impl Mounts {
                 edit: false,
                 chained: false,
                 casts: mesh.gpu.casters.count > 0,
+                opaque_casts: mesh.opaque_casters,
                 work: mesh.copy_work(),
             };
         }

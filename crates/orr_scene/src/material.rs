@@ -370,6 +370,12 @@ impl MaterialTable {
         self.features.lock().unwrap().casts()
     }
 
+    /// Whether any of `ids` casts caustics.
+    pub(crate) fn any_casts<'a>(&self, ids: impl IntoIterator<Item = &'a MaterialId>) -> bool {
+        let features = self.features.lock().unwrap();
+        features.casts() && ids.into_iter().any(|id| features.casting(id.0))
+    }
+
     /// Whether any of `ids` displaces by a world length.
     pub(crate) fn any_world_length(&self, ids: &[MaterialId]) -> bool {
         let set = self.world_lengths.lock().unwrap();

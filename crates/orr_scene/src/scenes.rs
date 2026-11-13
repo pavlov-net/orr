@@ -1612,6 +1612,15 @@ impl Core {
         if work.caster_copies > 0 || (traced && self.materials.casts()) {
             features |= SceneFeatures::CASTERS;
         }
+        let opaque_producer = self.materials.any_casts(
+            cpu.producers
+                .iter()
+                .flatten()
+                .flat_map(|p| &p.opaque_materials),
+        );
+        if work.opaque_caster_copies > 0 || opaque_producer {
+            features |= SceneFeatures::OPAQUE_CASTERS;
+        }
         // The default map without data is black.
         if environment != DEFAULT_ENVIRONMENT || cpu.environment.is_some_and(|data| data != 0) {
             features |= SceneFeatures::ENVIRONMENT;

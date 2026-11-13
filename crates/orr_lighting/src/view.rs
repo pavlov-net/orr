@@ -331,8 +331,19 @@ const DIELECTRIC_DEBUG_LAYER: u32 = 2;
 const DIELECTRIC_DISPERSION: u32 = 4;
 const DIELECTRIC_FROST: u32 = 8;
 
-/// Opaque vertices a photon meets at most: the mirrors of its chain and the surface after them.
+/// Opaque vertices a photon goes on from at most, the mirrors of its chain: as a path's bounces,
+/// it meets one more, the surface after them (`iteration_runs`).
 const PHOTON_BOUNCES: u32 = 16;
+
+/// [`PHOTON_BOUNCES`] in a scene that may hold `features`: none where no caster lies at an
+/// opaque vertex, so a photon meets only the surface after its chain.
+fn photon_bounces(features: SceneFeatures) -> u32 {
+    if features.contains(SceneFeatures::OPAQUE_CASTERS) {
+        PHOTON_BOUNCES
+    } else {
+        0
+    }
+}
 
 /// The reference photon map's cell offset in frame `index` of sample set `seed`, in [0, 1)^3 of
 /// a cell.
@@ -2262,7 +2273,7 @@ impl LightingKernels {
             light_flags: 0,
             cache_flags: 0,
             roulette_depth: REFERENCE_ROULETTE_DEPTH,
-            max_bounces: PHOTON_BOUNCES,
+            max_bounces: photon_bounces(pass.scene_features),
             dof_background: StorageImageIndex::NONE,
             dielectric_flags: path.dielectric_flags
                 & (DIELECTRIC_DISPERSION | DIELECTRIC_REFERENCE),
@@ -2278,7 +2289,9 @@ impl LightingKernels {
         // As many slots as the photons of a frame at its default count: more photons
         // than that run in slices that each hold as many.
         let slots = photons.min(PHOTON_SLOTS);
-        let queues = path_rounds(&photon_root, may) + 1;
+        // Photons do not walk, whatever pipelines they run.
+        let rounds = path_rounds(&photon_root, may & !MAY_WALK);
+        let queues = rounds + 1;
         if own.holds(slots, parts, queues) {
             view.staged_photons = None;
         } else if !view
@@ -2308,7 +2321,7 @@ impl LightingKernels {
                 source: Source::Photon,
                 may,
                 items: photons,
-                rounds: path_rounds(&photon_root, may),
+                rounds,
                 passes: 1,
                 update: 0,
             },

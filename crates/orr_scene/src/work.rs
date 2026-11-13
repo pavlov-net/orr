@@ -75,6 +75,8 @@ pub(crate) struct Work {
     /// Copies of a model whose mesh, or a step of whose chain, has a caster section: the
     /// scene's caustics start photons from them.
     pub(crate) caster_copies: u64,
+    /// Those of them with a caster section of the opaque class.
+    pub(crate) opaque_caster_copies: u64,
 }
 
 impl Work {

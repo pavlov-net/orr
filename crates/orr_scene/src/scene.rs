@@ -536,6 +536,8 @@ pub(crate) struct ModelCpu {
     pub(crate) chained: bool,
     /// Its mesh has a caster section.
     pub(crate) casts: bool,
+    /// One of those is of the opaque class: a photon's chain goes on at an opaque vertex.
+    pub(crate) opaque_casts: bool,
     /// The most a copy of it alone asks of the work lists.
     pub(crate) work: CopyWork,
 }
@@ -906,14 +908,19 @@ impl SceneCpu {
             let mut n = 1;
             // A copy holds a caster entry for the step of its chain it traces.
             let mut casts = models[model as usize].casts;
+            let mut opaque_casts = models[model as usize].opaque_casts;
             for step in chains.get(&ModelId(model)).into_iter().flatten() {
                 steps[n] = models[step.0 as usize].work;
                 casts |= models[step.0 as usize].casts;
+                opaque_casts |= models[step.0 as usize].opaque_casts;
                 n += 1;
             }
             work.add(CopyWork::fading(&steps[..n]), c.count);
             if casts {
                 work.caster_copies += u64::from(c.count);
+            }
+            if opaque_casts {
+                work.opaque_caster_copies += u64::from(c.count);
             }
         }
         self.work = Some(work);

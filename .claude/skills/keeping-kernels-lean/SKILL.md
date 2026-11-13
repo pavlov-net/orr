@@ -27,7 +27,8 @@ support kernels it reads, so kernel compile time is something a user sees.
 - Every round of a pass runs as stages, however few paths reach it: a late round pays its
   dispatches and barriers even when its queues are empty. Keep that fixed cost small rather
   than folding rounds into a looping kernel, which holds every stage it loops over, and give a
-  pass only the rounds its paths may take (`rounds` in `view.rs`).
+  pass only the rounds its paths may take (`rounds` in `view.rs`; a photon meets one opaque
+  vertex where no caster lies at one, `SceneFeatures::OPAQUE_CASTERS`).
 - The pipeline store fills with the number of distinct pipelines more than with their code size,
   so each new axis of specialization multiplies it.
 
@@ -96,6 +97,15 @@ These depend on the driver, so measure again on other hardware:
   queue's workgroup count or a round's trace count): no faster on empty rounds, whose cost is
   mostly barriers, and per dispatch it serialized a shade step's dispatches and made a frame
   about 40% slower.
+- **Device-generated commands over late rounds** (`VK_EXT_device_generated_commands`, or the
+  NV compute one): not built. Sequences of one execute are unordered and none waits for
+  another, so each round keeps its recorded barriers, and only the zero-group dispatches could
+  go, which conditional rendering already removed for no gain. An empty round costs about 7 us,
+  mostly its two barriers.
+- **A round count from earlier frames' readback:** not built. A path that needs more rounds
+  can finish in its frame only through a host wait at a submit boundary, whose round trip,
+  with the queue idle behind it, stands against all the empty rounds save (about 0.25 ms for a
+  photon pass's 33).
 - **One entry point per module:** no gain in the driver, and longer builds.
 - **Shade stages as ray-generation entries** (for reordering): about twice as slow as compute
   with no reordering, cause unknown.

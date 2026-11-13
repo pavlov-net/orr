@@ -5,8 +5,8 @@
 
 use lighting_suite::assert_clean;
 use lighting_suite::bed::{
-    Accumulated, Bed, EMITTER, GLASS_SPHERE, Item, Particle, Paths, SKY, SUN, Spec, TINTED_SLAB,
-    WHITE_FLOOR, WHITE_FLOOR_ALBEDO, fresnel, pixel_of, reference,
+    Accumulated, Bed, EMITTER, GLASS_SPHERE, Item, MIRROR, Particle, Paths, SKY, SUN, Spec,
+    TINTED_SLAB, WHITE_FLOOR, WHITE_FLOOR_ALBEDO, fresnel, pixel_of, reference,
 };
 use lighting_suite::welch::{assert_mean, assert_same_mean};
 use orr_gpu::KernelSet;
@@ -454,5 +454,48 @@ fn photons_reflect_off_a_producer_set_as_the_producer_table_alone_grows() {
     let full = patch_means(&mut bed, &full_paths, lit, 16, 8, 1);
     let bsdf = patch_means(&mut bed, &bsdf_paths, lit, 16, 32, 2);
     assert_same_mean("full against BSDF", &full, &bsdf);
+    assert_clean();
+}
+
+/// A photon's chain goes on at opaque mirrors: the sun off one mirror, level to a second and
+/// down from it lights the floor where nothing else throws it, so a scene with a mirror among
+/// its copies gives its photons the rounds of a chain of opaque vertices.
+#[test]
+fn photons_chain_through_two_mirrors() {
+    let sun = -SUN.direction_to_light.normalize();
+    // A [`MIRROR`] of edge `edge` at `center`, facing `normal`.
+    let mirror = |center: Vec3, normal: Vec3, edge: f32| {
+        let x = Vec3::Y.cross(normal).normalize();
+        Item {
+            model: MIRROR,
+            linear: Mat3::from_cols(x, normal.cross(x), normal) * (0.5 * edge),
+            at: center,
+        }
+    };
+    let first = Vec3::new(-1.5, 1.0, -1.0);
+    let level = Vec3::X;
+    let second = first + 2.0 * level;
+    let patch = Vec3::new(1.5, 0.0, -0.5);
+    let down = (patch - second).normalize();
+    let spec = Spec {
+        copies: vec![
+            at(WHITE_FLOOR, Vec3::ZERO),
+            mirror(first, (level - sun).normalize(), 0.8),
+            mirror(second, (down - level).normalize(), 0.8),
+        ],
+        lights: vec![Light::Directional(SUN)],
+        environment: None,
+        eye: Vec3::new(0.0, 3.0, 4.0),
+        target: Vec3::new(0.5, 0.0, -0.5),
+        fov_y: 0.9,
+        focus: None,
+    };
+    let lit = pixel_of(&spec, patch);
+    let mut bed = Bed::with(spec);
+    let image = render_paths(&mut bed, &paths(gathered()), 8, 1);
+    assert!(
+        image.around(lit, 4)[1] > 0.0,
+        "no photon reached the floor by both mirrors"
+    );
     assert_clean();
 }

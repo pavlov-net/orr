@@ -74,6 +74,11 @@ impl SceneFeatures {
     /// The scene may hold a caustic caster: a copy of a model with a caster section, or a
     /// producer entry of clusters that rays trace while a material casts.
     pub const CASTERS: Self = Self(1 << 26);
+    /// A photon may meet a caster at an opaque vertex, where its chain goes on: a copy of a
+    /// model with a caster section of the opaque class, or a producer entry that rays trace as
+    /// geometry other than a layer while one of its materials casts. Without one a photon
+    /// meets at most one opaque vertex, the surface it deposits on.
+    pub const OPAQUE_CASTERS: Self = Self(1 << 29);
     /// The scene's environment may radiate: the scene's kernels link one that is not the
     /// default map, or its map is set.
     pub const ENVIRONMENT: Self = Self(1 << 27);
@@ -242,6 +247,13 @@ impl MaterialFeatures {
     /// Whether any record has the caster flag.
     pub(crate) fn casts(&self) -> bool {
         self.counts[SceneFeatures::CASTING.0.trailing_zeros() as usize] > 0
+    }
+
+    /// Whether material `id`'s record has the caster flag.
+    pub(crate) fn casting(&self, id: u32) -> bool {
+        self.held
+            .get(&id)
+            .is_some_and(|&f| f & SceneFeatures::CASTING.0 != 0)
     }
 }
 
