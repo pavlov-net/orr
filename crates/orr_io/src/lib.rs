@@ -132,68 +132,73 @@ impl AlignedBuf {
 /// Physical memory in bytes; 16 GiB when the system does not say.
 pub fn physical_memory() -> u64 {
     const FALLBACK: u64 = 16 << 30;
-    #[cfg(windows)]
-    return windows::physical_memory().unwrap_or(FALLBACK);
-    #[cfg(unix)]
-    {
-        // SAFETY: sysconf has no preconditions.
-        let (pages, size) = unsafe {
-            (
-                libc::sysconf(libc::_SC_PHYS_PAGES),
-                libc::sysconf(libc::_SC_PAGESIZE),
-            )
-        };
-        if pages > 0 && size > 0 {
-            pages as u64 * size as u64
-        } else {
-            FALLBACK
+    cfg_select! {
+        windows => windows::physical_memory().unwrap_or(FALLBACK),
+        unix => {
+            // SAFETY: sysconf has no preconditions.
+            let (pages, size) = unsafe {
+                (
+                    libc::sysconf(libc::_SC_PHYS_PAGES),
+                    libc::sysconf(libc::_SC_PAGESIZE),
+                )
+            };
+            if pages > 0 && size > 0 {
+                pages as u64 * size as u64
+            } else {
+                FALLBACK
+            }
         }
+        _ => FALLBACK,
     }
-    #[cfg(not(any(windows, unix)))]
-    FALLBACK
 }
 
 /// Opens `path` for reading so that it can be deleted, or replaced by a rename, while open.
 /// The handle keeps reading the file as it was when opened.
 pub fn open_shared(path: &Path) -> io::Result<File> {
-    #[cfg(windows)]
-    return windows::open_shared(path);
-    #[cfg(not(windows))]
-    File::open(path)
-}
-
-#[cfg(any(windows, target_os = "linux"))]
-use crate::sys::open_unbuffered;
-
-/// Opens with the buffer cache off (`F_NOCACHE`), so that archive reads, each read once,
-/// neither go through it nor push out what it holds. The reads stay free to start and end
-/// anywhere, so the file reads as buffered.
-#[cfg(target_vendor = "apple")]
-fn open_unbuffered(path: &Path) -> io::Result<(File, bool)> {
-    use std::os::fd::AsRawFd;
-    let file = File::open(path)?;
-    // SAFETY: `F_NOCACHE` takes an int and changes only the descriptor's caching.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
-        return Err(io::Error::last_os_error());
+    cfg_select! {
+        windows => windows::open_shared(path),
+        _ => File::open(path),
     }
-    Ok((file, false))
 }
 
-#[cfg(not(any(windows, target_os = "linux", target_vendor = "apple")))]
-fn open_unbuffered(path: &Path) -> io::Result<(File, bool)> {
-    Ok((File::open(path)?, false))
+cfg_select! {
+    any(windows, target_os = "linux") => {
+        use crate::sys::open_unbuffered;
+    }
+    target_vendor = "apple" => {
+        /// Opens with the buffer cache off (`F_NOCACHE`), so that archive reads, each read once,
+        /// neither go through it nor push out what it holds. The reads stay free to start and
+        /// end anywhere, so the file reads as buffered.
+        fn open_unbuffered(path: &Path) -> io::Result<(File, bool)> {
+            use std::os::fd::AsRawFd;
+            let file = File::open(path)?;
+            // SAFETY: `F_NOCACHE` takes an int and changes only the descriptor's caching.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok((file, false))
+        }
+    }
+    _ => {
+        fn open_unbuffered(path: &Path) -> io::Result<(File, bool)> {
+            Ok((File::open(path)?, false))
+        }
+    }
 }
 
-#[cfg(windows)]
-use crate::windows::same_file;
-
-/// Whether `a` and `b` name one file. True where the system cannot tell.
-#[cfg(unix)]
-fn same_file(a: &File, b: &File) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (a.metadata(), b.metadata()) {
-        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
-        _ => true,
+cfg_select! {
+    windows => {
+        use crate::windows::same_file;
+    }
+    unix => {
+        /// Whether `a` and `b` name one file. True where the system cannot tell.
+        fn same_file(a: &File, b: &File) -> bool {
+            use std::os::unix::fs::MetadataExt;
+            match (a.metadata(), b.metadata()) {
+                (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+                _ => true,
+            }
+        }
     }
 }
 
@@ -210,15 +215,17 @@ pub fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()>
 /// A read that runs off the end of a file that does not end on a sector fails on an unbuffered
 /// `File`; [`ReadFile`] reads those.
 pub fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-    #[cfg(unix)]
-    use std::os::unix::fs::FileExt;
-    #[cfg(windows)]
-    use std::os::windows::fs::FileExt;
     read_all(offset, buf, false, |at, dst| {
-        #[cfg(windows)]
-        return file.seek_read(dst, at);
-        #[cfg(unix)]
-        file.read_at(dst, at)
+        cfg_select! {
+            windows => {
+                use std::os::windows::fs::FileExt;
+                file.seek_read(dst, at)
+            }
+            unix => {
+                use std::os::unix::fs::FileExt;
+                file.read_at(dst, at)
+            }
+        }
     })
 }
 
@@ -226,11 +233,15 @@ pub fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
 #[cfg(unix)]
 fn pread(file: &File, offset: u64, dst: &mut [MaybeUninit<u8>]) -> io::Result<usize> {
     use std::os::fd::AsRawFd;
-    // On 32-bit glibc `off_t` is 32 bits, too narrow for large files.
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    use libc::{off_t, pread};
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    use libc::{off64_t as off_t, pread64 as pread};
+    cfg_select! {
+        // On 32-bit glibc `off_t` is 32 bits, too narrow for large files.
+        any(target_os = "linux", target_os = "android") => {
+            use libc::{off64_t as off_t, pread64 as pread};
+        }
+        _ => {
+            use libc::{off_t, pread};
+        }
+    }
     let offset = off_t::try_from(offset).map_err(|_| io::ErrorKind::InvalidInput)?;
     // SAFETY: `dst` is writable for its length, and the call writes only within it.
     let n = unsafe { pread(file.as_raw_fd(), dst.as_mut_ptr().cast(), dst.len(), offset) };
@@ -316,10 +327,10 @@ impl ReadFile {
             buf.spare_capacity_mut(),
             self.unbuffered,
             |at, dst| {
-                #[cfg(windows)]
-                return windows::read_overlapped(&self.handle, at, dst);
-                #[cfg(unix)]
-                pread(&self.handle, at, dst)
+                cfg_select! {
+                    windows => windows::read_overlapped(&self.handle, at, dst),
+                    unix => pread(&self.handle, at, dst),
+                }
             },
         )?;
         // SAFETY: the reads wrote the first `n` bytes, within the capacity.
@@ -360,14 +371,15 @@ impl Ring {
     /// missing or refused, as on old Linux kernels or where seccomp blocks io_uring. Reads go
     /// into `buffers`, whose arena it registers with the system where it can.
     pub fn native(buffers: &ReadBuffers) -> Option<Self> {
-        #[cfg(any(windows, target_os = "linux"))]
-        let backend = native::Native::new(buffers).map(|r| Backend::Native(Box::new(r)));
-        #[cfg(not(any(windows, target_os = "linux")))]
-        let backend = {
-            let _ = buffers;
-            None
-        };
-        backend.map(|backend| Self { backend })
+        cfg_select! {
+            any(windows, target_os = "linux") => native::Native::new(buffers).map(|r| Self {
+                backend: Backend::Native(Box::new(r)),
+            }),
+            _ => {
+                let _ = buffers;
+                None
+            }
+        }
     }
 
     /// A ring that runs each read as a positioned read into `buffers` on the thread calling
@@ -457,12 +469,14 @@ impl Default for Wake {
 
 impl Wake {
     pub fn set(&self) {
-        #[cfg(any(windows, target_os = "linux"))]
-        self.event.set();
-        #[cfg(not(any(windows, target_os = "linux")))]
-        {
-            *self.set.lock().unwrap() = true;
-            self.cv.notify_one();
+        cfg_select! {
+            any(windows, target_os = "linux") => {
+                self.event.set();
+            }
+            _ => {
+                *self.set.lock().unwrap() = true;
+                self.cv.notify_one();
+            }
         }
     }
 
@@ -470,19 +484,21 @@ impl Wake {
     /// while a positioned ring has queued reads, and may return early otherwise.
     pub fn wait(&self, ring: Option<&Ring>) {
         let ring = ring.filter(|r| r.busy());
-        #[cfg(any(windows, target_os = "linux"))]
-        match ring.map(|r| &r.backend) {
-            Some(Backend::Native(r)) => sys::wait_any(&[&self.event, &**r.ring.event()]),
-            Some(Backend::Positioned(..)) => {}
-            None => sys::wait_any(&[&self.event]),
-        }
-        #[cfg(not(any(windows, target_os = "linux")))]
-        if ring.is_none() {
-            let mut set = self.set.lock().unwrap();
-            while !*set {
-                set = self.cv.wait(set).unwrap();
+        cfg_select! {
+            any(windows, target_os = "linux") => match ring.map(|r| &r.backend) {
+                Some(Backend::Native(r)) => sys::wait_any(&[&self.event, &**r.ring.event()]),
+                Some(Backend::Positioned(..)) => {}
+                None => sys::wait_any(&[&self.event]),
+            },
+            _ => {
+                if ring.is_none() {
+                    let mut set = self.set.lock().unwrap();
+                    while !*set {
+                        set = self.cv.wait(set).unwrap();
+                    }
+                    *set = false;
+                }
             }
-            *set = false;
         }
     }
 }

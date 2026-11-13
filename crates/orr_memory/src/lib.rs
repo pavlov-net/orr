@@ -22,46 +22,48 @@
 //! inside VMA's calls, so it must not use an `Allocator` or [`VirtualBlock`], and a panic in it
 //! aborts the process.
 
-#[cfg(not(target_vendor = "apple"))]
-mod allocator;
 mod arena;
-#[cfg(target_vendor = "apple")]
-mod heap;
 mod sys;
 mod virtual_block;
 
-#[cfg(not(target_vendor = "apple"))]
-pub use allocator::{
-    Allocation, AllocationFlags, Allocator, AllocatorDesc, HeapBudget, Pool, PoolDesc, PoolStats,
-};
 pub use arena::Arena;
-#[cfg(target_vendor = "apple")]
-pub use heap::{HeapAllocation, HeapPool, HeapPoolStats};
 pub use virtual_block::{VirtualAllocation, VirtualBlock, VirtualStats};
 pub use vulkan_memory_allocator_sys::LOG_TARGET;
 
-#[cfg(not(target_vendor = "apple"))]
-use ash::vk;
+cfg_select! {
+    target_vendor = "apple" => {
+        mod heap;
 
-/// A failure.
-#[cfg(not(target_vendor = "apple"))]
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// A VMA or Vulkan call failed.
-    #[error("{call} failed: {result}")]
-    Vulkan {
-        call: &'static str,
-        result: vk::Result,
-    },
-}
+        pub use heap::{HeapAllocation, HeapPool, HeapPoolStats};
+    }
+    _ => {
+        mod allocator;
 
-#[cfg(not(target_vendor = "apple"))]
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+        pub use allocator::{
+            Allocation, AllocationFlags, Allocator, AllocatorDesc, HeapBudget, Pool, PoolDesc,
+            PoolStats,
+        };
 
-#[cfg(not(target_vendor = "apple"))]
-fn check(call: &'static str, result: sys::VkResult) -> Result<()> {
-    match vk::Result::from_raw(result) {
-        vk::Result::SUCCESS => Ok(()),
-        result => Err(Error::Vulkan { call, result }),
+        use ash::vk;
+
+        /// A failure.
+        #[derive(Debug, thiserror::Error)]
+        pub enum Error {
+            /// A VMA or Vulkan call failed.
+            #[error("{call} failed: {result}")]
+            Vulkan {
+                call: &'static str,
+                result: vk::Result,
+            },
+        }
+
+        pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+        fn check(call: &'static str, result: sys::VkResult) -> Result<()> {
+            match vk::Result::from_raw(result) {
+                vk::Result::SUCCESS => Ok(()),
+                result => Err(Error::Vulkan { call, result }),
+            }
+        }
     }
 }

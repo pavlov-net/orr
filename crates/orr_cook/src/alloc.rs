@@ -51,18 +51,17 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Metered<A> {
 /// threads do not contend on the Windows heap. meshoptimizer frees in reverse order of
 /// allocation, which the arena relies on. A thread's arena outlives the jobs it serves, so
 /// the meter charges a job the arena bytes it holds rather than the blocks.
-#[cfg(windows)]
 pub(crate) fn install_meshopt_arena() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    // SAFETY: runs once, before the cook calls meshoptimizer; both callbacks keep its
-    // stack-order contract.
-    ONCE.call_once(|| unsafe {
-        meshopt::ffi::meshopt_setAllocator(Some(arena::allocate), Some(arena::deallocate));
-    });
+    #[cfg(windows)]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        // SAFETY: runs once, before the cook calls meshoptimizer; both callbacks keep its
+        // stack-order contract.
+        ONCE.call_once(|| unsafe {
+            meshopt::ffi::meshopt_setAllocator(Some(arena::allocate), Some(arena::deallocate));
+        });
+    }
 }
-
-#[cfg(not(windows))]
-pub(crate) fn install_meshopt_arena() {}
 
 #[cfg(windows)]
 mod arena {

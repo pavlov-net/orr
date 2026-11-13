@@ -38,10 +38,16 @@ mod texture;
 #[cfg(all(feature = "nsight-perf", target_vendor = "apple"))]
 compile_error!("the nsight-perf feature needs the Vulkan backend; Apple targets have none");
 
-#[cfg(target_vendor = "apple")]
-mod metal;
-#[cfg(not(target_vendor = "apple"))]
-mod vulkan;
+cfg_select! {
+    target_vendor = "apple" => {
+        mod metal;
+        use metal as backend;
+    }
+    _ => {
+        mod vulkan;
+        use vulkan as backend;
+    }
+}
 
 /// Raw Vulkan handles, for SDKs that work on them.
 #[cfg(not(target_vendor = "apple"))]
@@ -109,15 +115,7 @@ pub use texture::{
 #[cfg(all(feature = "nsight-perf", not(target_vendor = "apple")))]
 pub use vulkan::CounterSession;
 
-#[cfg(target_vendor = "apple")]
-pub use metal::{
-    Allocation, ClassicAs, CommandList, ComputePipeline, Device, DeviceArenas, DeviceHooks,
-    Diagnostics, ExecutionSet, HostArenas, HostTimeline, ImportedMemory, LowLatency, MeshPipeline,
-    Micromap, Queue, RayDispatchPipeline, ShaderStage, SparseAllocation, SparseBinds, Swapchain,
-    SwapchainFrame, Texture, WindowExtent,
-};
-#[cfg(not(target_vendor = "apple"))]
-pub use vulkan::{
+pub use backend::{
     Allocation, ClassicAs, CommandList, ComputePipeline, Device, DeviceArenas, DeviceHooks,
     Diagnostics, ExecutionSet, HostArenas, HostTimeline, ImportedMemory, LowLatency, MeshPipeline,
     Micromap, Queue, RayDispatchPipeline, ShaderStage, SparseAllocation, SparseBinds, Swapchain,

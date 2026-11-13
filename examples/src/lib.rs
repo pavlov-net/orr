@@ -161,18 +161,17 @@ fn diagnostics() -> Diagnostics<'static> {
 }
 
 /// Gives `renderer` DLSS ray reconstruction where NGX offers it; returns whether it does.
-#[cfg(not(dlss))]
-pub fn enable_dlss(_renderer: &mut Renderer) -> bool {
-    false
-}
-
-/// Gives `renderer` DLSS ray reconstruction where NGX offers it; returns whether it does.
-#[cfg(dlss)]
 pub fn enable_dlss(renderer: &mut Renderer) -> bool {
-    match DlssSdk::new(device(), PROJECT_ID) {
-        Ok(sdk) => renderer.set_reconstruction(sdk),
-        Err(e) => {
-            log::warn!("no DLSS: {e}");
+    cfg_select! {
+        dlss => match DlssSdk::new(device(), PROJECT_ID) {
+            Ok(sdk) => renderer.set_reconstruction(sdk),
+            Err(e) => {
+                log::warn!("no DLSS: {e}");
+                false
+            }
+        },
+        _ => {
+            let _ = renderer;
             false
         }
     }

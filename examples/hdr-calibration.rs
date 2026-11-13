@@ -11,11 +11,8 @@
 //!
 //! Built with `--features pcl-stats`, the NVIDIA overlay and FrameView report its PC latency.
 
-#[cfg(not(windows))]
-fn main() {}
-
-#[cfg(windows)]
 fn main() {
+    #[cfg(windows)]
     run::main();
 }
 

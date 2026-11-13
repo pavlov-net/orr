@@ -174,28 +174,30 @@ impl FrameGenerationFeature for FrameGeneration {
 
 /// Whether Windows schedules the device's GPU in hardware, which frame generation needs.
 /// `None` when it cannot tell; always true off Windows.
-#[cfg(windows)]
 fn hardware_scheduling(gpu: &Device) -> Option<bool> {
-    use orr_scene::orr_gpu::interop::{self, ash::vk};
-    use vk::TaggedStructure as _;
+    cfg_select! {
+        windows => {
+            use orr_scene::orr_gpu::interop::{self, ash::vk};
+            use vk::TaggedStructure as _;
 
-    let raw = interop::raw_device(gpu);
-    let mut id = vk::PhysicalDeviceIDProperties::default();
-    let mut props = vk::PhysicalDeviceProperties2::default().push(&mut id);
-    // SAFETY: a query on the device's live physical device.
-    unsafe {
-        raw.instance
-            .get_physical_device_properties2(raw.physical_device, &mut props);
+            let raw = interop::raw_device(gpu);
+            let mut id = vk::PhysicalDeviceIDProperties::default();
+            let mut props = vk::PhysicalDeviceProperties2::default().push(&mut id);
+            // SAFETY: a query on the device's live physical device.
+            unsafe {
+                raw.instance
+                    .get_physical_device_properties2(raw.physical_device, &mut props);
+            }
+            if id.device_luid_valid == vk::FALSE {
+                return None;
+            }
+            orr_window::hardware_scheduling(id.device_luid)
+        }
+        _ => {
+            let _ = gpu;
+            Some(true)
+        }
     }
-    if id.device_luid_valid == vk::FALSE {
-        return None;
-    }
-    orr_window::hardware_scheduling(id.device_luid)
-}
-
-#[cfg(not(windows))]
-fn hardware_scheduling(_gpu: &Device) -> Option<bool> {
-    Some(true)
 }
 
 /// The far plane frame generation is told; orr's projections have none.

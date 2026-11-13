@@ -1686,10 +1686,10 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
         loop {
             // The counter frame repeats frame `i` of the first script until its counters are
             // complete; its replays are not samples.
-            #[cfg(feature = "nsight-perf")]
-            let counting = si == 0 && counter_frame == Some(i);
-            #[cfg(not(feature = "nsight-perf"))]
-            let counting = false;
+            let counting = cfg_select! {
+                feature = "nsight-perf" => si == 0 && counter_frame == Some(i),
+                _ => false,
+            };
             #[cfg(feature = "nsight-perf")]
             let (replay_previous_t, replay_clock) = (previous_t, clock);
             if frames_per_script.is_some_and(|n| i >= n) || closed {

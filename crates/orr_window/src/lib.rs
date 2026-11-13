@@ -7,22 +7,21 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use raw_window_handle::RawWindowHandle;
 
-#[cfg(windows)]
-mod win32;
-#[cfg(windows)]
-use win32 as imp;
-#[cfg(windows)]
-pub use win32::{hardware_scheduling, set_message_hook};
-
-#[cfg(target_os = "macos")]
-mod appkit;
-#[cfg(target_os = "macos")]
-use appkit as imp;
-
-#[cfg(not(any(windows, target_os = "macos")))]
-mod none;
-#[cfg(not(any(windows, target_os = "macos")))]
-use none as imp;
+cfg_select! {
+    windows => {
+        mod win32;
+        use win32 as imp;
+        pub use win32::{hardware_scheduling, set_message_hook};
+    }
+    target_os = "macos" => {
+        mod appkit;
+        use appkit as imp;
+    }
+    _ => {
+        mod none;
+        use none as imp;
+    }
+}
 
 /// A screen's extended dynamic range, as multiples of the OS's SDR white. That white moves with
 /// the brightness setting and has no known luminance, so these don't convert to nits.

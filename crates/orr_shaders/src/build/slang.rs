@@ -259,19 +259,19 @@ pub(super) struct Library {
 
 impl Library {
     pub(super) fn load(path: &Path) -> Result<Arc<Self>, libloading::Error> {
-        #[cfg(windows)]
-        // SAFETY: loading the Slang library runs no initializers with preconditions;
-        // altered search path makes its sibling DLLs resolve from its own directory.
-        let library: libloading::Library = unsafe {
-            libloading::os::windows::Library::load_with_flags(
-                path,
-                libloading::os::windows::LOAD_WITH_ALTERED_SEARCH_PATH,
-            )?
-        }
-        .into();
-        #[cfg(not(windows))]
-        // SAFETY: as above.
-        let library = unsafe { libloading::Library::new(path)? };
+        let library: libloading::Library = cfg_select! {
+            // SAFETY: loading the Slang library runs no initializers with preconditions;
+            // altered search path makes its sibling DLLs resolve from its own directory.
+            windows => unsafe {
+                libloading::os::windows::Library::load_with_flags(
+                    path,
+                    libloading::os::windows::LOAD_WITH_ALTERED_SEARCH_PATH,
+                )?
+            }
+            .into(),
+            // SAFETY: as above.
+            _ => unsafe { libloading::Library::new(path)? },
+        };
         // SAFETY: the symbols are declared with the signatures of the release's slang.h.
         let api = unsafe { sys::SlangLib::from_library(library)? };
         let dir = path.parent().unwrap_or_else(|| Path::new("."));

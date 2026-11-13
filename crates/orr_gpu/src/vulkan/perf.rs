@@ -52,10 +52,10 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RANGE_NAME: u32 = 256;
 const SUCCESS: sys::NVPA_Status = sys::NVPA_Status_NVPA_STATUS_SUCCESS;
 
-#[cfg(windows)]
-const LIBRARY: &str = "nvperf_grfx_host.dll";
-#[cfg(not(windows))]
-const LIBRARY: &str = "libnvperf_grfx_host.so";
+const LIBRARY: &str = cfg_select! {
+    windows => "nvperf_grfx_host.dll",
+    _ => "libnvperf_grfx_host.so",
+};
 
 /// A struct with its `structSize` set and every other field zero unless named.
 macro_rules! params {

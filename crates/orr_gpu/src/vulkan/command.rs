@@ -987,10 +987,10 @@ impl<'q> CommandList<'q> {
             .perf
             .as_ref()
             .and_then(|p| p.push_range(self.queue.kind, cmd, name));
-        #[cfg(feature = "nsight-perf")]
-        let counted = counters.is_some();
-        #[cfg(not(feature = "nsight-perf"))]
-        let counted = false;
+        let counted = cfg_select! {
+            feature = "nsight-perf" => counters.is_some(),
+            _ => false,
+        };
         let exact = self.res().timestamps.is_some() && (self.exact || counted);
         if exact {
             self.drain(name);

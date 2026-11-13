@@ -123,14 +123,14 @@ impl GpuZones {
     /// context. A pass without CPU times is left out: its ticks have no place on the profiler's
     /// clock.
     pub(crate) fn passes(&self, kind: QueueKind, passes: &[PassResult]) {
-        #[cfg(feature = "tracy")]
-        gpu::passes(
-            &mut self.contexts.lock().unwrap()[kind.index()],
-            kind,
-            passes,
-        );
-        #[cfg(not(feature = "tracy"))]
-        let _ = (kind, passes);
+        cfg_select! {
+            feature = "tracy" => {
+                gpu::passes(&mut self.contexts.lock().unwrap()[kind.index()], kind, passes);
+            }
+            _ => {
+                let _ = (kind, passes);
+            }
+        }
     }
 }
 

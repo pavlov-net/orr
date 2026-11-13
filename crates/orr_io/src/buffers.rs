@@ -257,12 +257,16 @@ impl Pages {
 
 impl Drop for Pages {
     fn drop(&mut self) {
-        #[cfg(windows)]
-        crate::windows::free_pages(self.ptr);
-        // SAFETY: the mapping `new` made, unmapped once.
-        #[cfg(unix)]
-        unsafe {
-            libc::munmap(self.ptr.as_ptr().cast(), self.len);
+        cfg_select! {
+            windows => {
+                crate::windows::free_pages(self.ptr);
+            }
+            unix => {
+                // SAFETY: the mapping `new` made, unmapped once.
+                unsafe {
+                    libc::munmap(self.ptr.as_ptr().cast(), self.len);
+                }
+            }
         }
     }
 }
