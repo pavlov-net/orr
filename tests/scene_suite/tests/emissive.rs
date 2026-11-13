@@ -735,6 +735,7 @@ fn producer_power_follows_emitted_clusters_every_frame() {
         max_vertices: 4 * max_clusters,
         update,
         topologies: &topology,
+        max_direct_clusters: max_clusters,
         materials: &materials,
         transform: (group, transform),
         previous_positions: false,

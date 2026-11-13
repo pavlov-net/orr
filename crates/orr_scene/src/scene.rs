@@ -2985,6 +2985,7 @@ impl<'f> SceneWriter<'f> {
             max_segments: 0,
             update: ProducerUpdate::EveryFrame,
             topologies: &[],
+            max_direct_clusters: 0,
             tessellated: true,
             max_patch_clusters: cage.shape.clusters,
             max_patch_vertices: cage.shape.vertices,

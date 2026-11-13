@@ -82,7 +82,9 @@ ProducerFigures entry_figures(SceneRoot* s, uint i)
     f.entries = 1;
     f.clusters = min(clusters, b.max_clusters);
     f.cluster_capacity = b.max_clusters;
-    f.dropped_clusters = clusters - f.clusters;
+    // Direct clusters past their room took no cluster of the batch.
+    uint direct = b.direct_count != nullptr ? b.direct_count[0] : 0;
+    f.dropped_clusters = clusters - f.clusters + direct - min(direct, b.max_direct_clusters);
     f.vertices = min(vertices, b.max_vertices);
     f.vertex_capacity = b.max_vertices;
     f.dropped_vertices = vertices - f.vertices;

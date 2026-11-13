@@ -63,10 +63,13 @@ public struct ProducerBatch
     public uint* segment_user;   // per segment: the producer's word
     public float* radii;         // per vertex of a strand entry: the strand's radius, m, relative to the entry's transform
     public uint* segment_count;
+    public uint* direct_count;   // clusters `emit_direct_cluster` asked for; null where it takes any number
     public uint max_clusters;
     public uint max_vertices;
     public uint topology_count;
     public uint max_segments;
+    public uint max_direct_clusters; // of `max_clusters`, the most `emit_direct_cluster` takes
+    public uint _pad0;
 }
 
 // A producer entry. An unset entry is all zero.
@@ -213,10 +216,18 @@ public uint emit_template_cluster(ProducerBatch b, uint topology, uint first_ver
 }
 
 // A cluster with its own triangles (u8x3 per triangle, at most 128), which stay valid
-// until the frame completes: its index, or NO_ROOM.
+// until the frame completes: its index, or NO_ROOM past the batch's `max_clusters` or its
+// `max_direct_clusters`.
 public uint emit_direct_cluster(ProducerBatch b, uint tri_count, uint vertex_count,
                                uint first_vertex, uint8_t* triangles, uint material, uint user)
 {
+    if (b.direct_count != nullptr)
+    {
+        uint direct;
+        InterlockedAdd(*b.direct_count, 1, direct);
+        if (direct >= b.max_direct_clusters)
+            return NO_ROOM;
+    }
     ProducerClusterGpu c;
     c.triangles = triangles;
     c.first_vertex = first_vertex;
@@ -236,12 +247,14 @@ public uint emitted_clusters(ProducerBatch b)
 }
 
 // Whether cluster `k` of `b` can draw and build: 1 to 128 triangles, 1 to 256 vertices, all
-// inside the batch, and triangles to read. Clusters that fail are neither drawn nor traced.
+// inside the batch, triangles to read, and a topology of the batch or its own triangles.
+// Clusters that fail are neither drawn nor traced.
 public bool producer_cluster_valid(ProducerBatch b, ProducerClusterGpu k)
 {
     uint vertices = min(*b.vertex_count, b.max_vertices);
     return k.tri_count > 0 && k.tri_count <= 128 && k.vertex_count > 0 && k.vertex_count <= 256
-        && uint(k.first_vertex) + uint(k.vertex_count) <= vertices && k.triangles != nullptr;
+        && uint(k.first_vertex) + uint(k.vertex_count) <= vertices && k.triangles != nullptr
+        && (uint(k.topology) == DIRECT_CLUSTER || uint(k.topology) < b.topology_count);
 }
 
 // The entry-relative box of cluster `k`'s vertices.

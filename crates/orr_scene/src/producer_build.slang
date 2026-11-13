@@ -60,9 +60,9 @@ public struct ProducerBuildGpu
     public uint* swept_indices;     // a swept-sphere entry's per-segment first vertex, the BLAS's index list
     public uint64_t swept_blas;     // a swept-sphere entry's BLAS
     public uint topology_count;
+    public uint direct_capacity;    // the direct records' room: clusters past it are refused
     public uint geometry_flags;     // rtas GEOMETRY_* of every triangle, 0 for PRODUCER_SECTIONS
     public uint strands;            // STRANDS_*
-    public uint _pad;
 }
 
 public struct BuildRoot
@@ -321,8 +321,15 @@ void records(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
         }
         if (group_refused != 0)
             InterlockedAdd(st.refused, group_refused);
+        // Direct clusters past the entry's room are refused, and the build takes no more
+        // records than the room holds.
         uint first;
         InterlockedAdd(b.counts[BUILD_DIRECT], group_direct, first);
+        if (group_direct != 0 && first + group_direct > b.direct_capacity)
+        {
+            InterlockedMin(b.counts[BUILD_DIRECT], b.direct_capacity);
+            InterlockedAdd(st.refused, min(first + group_direct - b.direct_capacity, group_direct));
+        }
         group_direct = first;
         InterlockedAdd(b.counts[BUILD_INSTANTIATED], group_instantiated, first);
         group_instantiated = first;
@@ -349,6 +356,11 @@ void records(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
     if (k.topology == DIRECT_CLUSTER)
     {
         uint index = group_direct + local;
+        if (index >= b.direct_capacity)
+        {
+            b.refs[c] = REF_NONE;
+            return;
+        }
         ClasBuild r = (ClasBuild)0;
         r.cluster_id = c;
         r.tri_count = k.tri_count;

@@ -370,6 +370,7 @@ fn blade_desc<'a>(
         max_vertices: 5 * MAX_BLADES,
         update: ProducerUpdate::EveryFrame,
         topologies,
+        max_direct_clusters: MAX_BLADES,
         materials,
         transform: (group, 0),
         vertex_user: true,
@@ -842,6 +843,38 @@ fn clusters_and_vertices_past_capacity_are_dropped_and_counted() {
         assert_eq!(stats.built, 64 + 40);
     }
     assert!(clusters.iter().all(|c| c.cluster < 64));
+    assert_clean();
+}
+
+#[test]
+fn direct_clusters_past_their_room_are_dropped_and_counted() {
+    let mut field = Field::new(32.0);
+    let topology = [ClusterTopology {
+        vertex_count: 5,
+        triangles: &BLADE,
+    }];
+    let materials = [field.material];
+    let desc = ProducerDesc {
+        max_direct_clusters: 20,
+        ..blade_desc(field.group, &topology, &materials)
+    };
+    field.set(ProducerId(0), &desc);
+    let emit = Emit {
+        id: ProducerId(0),
+        count: 100,
+        time: 0.0,
+        z: -1.0,
+        base: FIELD_WORD,
+    };
+    field.frame(&[emit], None);
+    let stats = field.stats();
+    // The odd blades build directly: 50 of them, into room for 20.
+    assert_eq!(stats.clusters, 50 + 20);
+    assert_eq!(stats.dropped_clusters, 30);
+    assert_eq!(stats.refused, 0);
+    if traced(true) {
+        assert_eq!(stats.built, 50 + 20);
+    }
     assert_clean();
 }
 

@@ -171,8 +171,14 @@ pub struct ProducerDesc<'a> {
     pub update: ProducerUpdate,
     /// Indexed by `emit_template_cluster`'s `topology`; at most 255. Their templates build
     /// in the frame of `set_producer`. Clusters may also build directly from their own
-    /// triangles (`emit_direct_cluster`).
+    /// triangles (`emit_direct_cluster`), up to `max_direct_clusters`.
     pub topologies: &'a [ClusterTopology<'a>],
+    /// Of `max_clusters`, the most a frame's kernel emits with `emit_direct_cluster`; those
+    /// past it are dropped. Rays need room for each to build from 128 triangles over 256
+    /// vertices, so an entry whose clusters all instantiate its topologies leaves it at 0. A
+    /// strand or tessellated entry leaves it at 0: a tessellated entry's patches, which build
+    /// nothing themselves, take any number of direct clusters up to `max_patch_clusters`.
+    pub max_direct_clusters: u32,
     /// The entry's kernel emits patches into `SceneRoot.patches`, a batch of
     /// `max_patch_clusters` clusters over `max_patch_vertices` vertices, and orr's
     /// tessellator dices their triangles once per frame into the clusters raster and ray
@@ -230,6 +236,7 @@ impl Default for ProducerDesc<'_> {
             max_segments: 0,
             update: ProducerUpdate::EveryFrame,
             topologies: &[],
+            max_direct_clusters: 0,
             tessellated: false,
             max_patch_clusters: 0,
             max_patch_vertices: 0,
@@ -367,7 +374,7 @@ pub(crate) struct Producer {
     pub(crate) templates_built: bool,
     /// A `Static` entry has built.
     pub(crate) built: bool,
-    /// Cluster, vertex and segment count of its batch, and a spare word.
+    /// Cluster, vertex, segment and direct cluster count of its batch.
     pub(crate) counts: GpuPtr<[u32; 4]>,
     /// The counts its kernel emits against: the patch batch's for a tessellated entry.
     pub(crate) emit_counts: GpuPtr<[u32; 4]>,
@@ -526,6 +533,10 @@ pub(crate) fn build(
         desc.materials.len()
     );
     let strands = desc.max_segments > 0;
+    assert!(
+        desc.max_direct_clusters == 0 || !(strands || desc.tessellated),
+        "a strand or tessellated entry builds no clusters directly"
+    );
     if strands {
         assert!(
             desc.max_clusters == 0 && desc.topologies.is_empty() && !desc.tessellated,
@@ -612,6 +623,9 @@ pub(crate) fn build(
     // An untessellated entry builds its own topologies' templates.
     let own_templates = traced && !tessellated && n_topo > 0;
     let clusters = u64::from(built_clusters);
+    let instantiated = traced && built_topologies > 0;
+    let direct_clusters = desc.max_direct_clusters.min(desc.max_clusters);
+    let direct = traced && direct_clusters > 0;
     let segments = u64::from(desc.max_segments);
     let triangles_at = take(triangles.len() as u64);
     let topologies_at = take(size_of::<TopologyGpu>() as u64 * n_topo);
@@ -667,14 +681,17 @@ pub(crate) fn build(
     let counts_at = take(only(traced, 4 * BUILD_COUNTS));
     let template_records_at = take(only(own_templates, stride(RtasOp::BuildTemplates) * n_topo));
     let instantiate_records_at = take(only(
-        traced,
+        instantiated,
         stride(RtasOp::InstantiateTemplates) * clusters,
     ));
-    let direct_records_at = take(only(traced, stride(RtasOp::BuildClas) * clusters));
+    let direct_records_at = take(only(
+        direct,
+        stride(RtasOp::BuildClas) * u64::from(direct_clusters),
+    ));
     let blas_record_at = take(only(traced, stride(RtasOp::BuildClusterBlas)));
     let templates_at = take(only(own_templates, 8 * n_topo));
-    let instantiated_at = take(only(traced, 8 * clusters));
-    let direct_at = take(only(traced, 8 * clusters));
+    let instantiated_at = take(only(instantiated, 8 * clusters));
+    let direct_at = take(only(direct, 8 * u64::from(direct_clusters)));
     let clas_at = take(only(traced, 8 * clusters));
     let blas_at = take(only(traced, 8));
     let len = take(0);
@@ -733,6 +750,7 @@ pub(crate) fn build(
         swept_indices: at(swept_indices_at).cast(),
         swept_blas: swept.as_ref().map_or(0, |s| s.blas.address().0),
         topology_count: built_topologies as u32,
+        direct_capacity: direct_clusters,
         geometry_flags: if opaque { GEOMETRY_OPAQUE } else { 0 },
         strands: if swept.is_some() {
             STRANDS_SWEPT
@@ -741,7 +759,6 @@ pub(crate) fn build(
         } else {
             0
         },
-        _pad: 0,
     });
     let copy = subd.map(|s| {
         let (group, first, joints) = s.palette.unwrap_or((0, 0, 0));
@@ -842,7 +859,7 @@ pub(crate) fn build(
                     )
                 })
                 .transpose()?,
-            instantiate: (built_topologies > 0)
+            instantiate: instantiated
                 .then(|| {
                     op(
                         topology_op(RtasOp::InstantiateTemplates, built_clusters),
@@ -853,10 +870,10 @@ pub(crate) fn build(
                     )
                 })
                 .transpose()?,
-            direct: (!tubes)
+            direct: direct
                 .then(|| {
                     op(
-                        cluster_desc(RtasOp::BuildClas, desc.max_clusters, 128, 256),
+                        cluster_desc(RtasOp::BuildClas, direct_clusters, 128, 256),
                         direct_records_at,
                         BUILD_DIRECT,
                         direct_at,
@@ -905,6 +922,8 @@ pub(crate) fn build(
         ..ProducerBatch::zeroed()
     };
     let mut drawn_batch = batch_gpu(&drawn, counts, desc.max_clusters, desc.max_vertices);
+    drawn_batch.direct_count = counts.offset(3);
+    drawn_batch.max_direct_clusters = direct_clusters;
     if strands {
         // The clusters belong to the tube batch.
         drawn_batch.clusters = GpuPtr::NULL;
@@ -1219,7 +1238,8 @@ pub struct ProducerStats {
     /// Clusters emitted within capacity.
     pub clusters: u32,
     pub cluster_capacity: u32,
-    /// Clusters emitted past `max_clusters`, dropped.
+    /// Clusters emitted past `max_clusters`, and direct clusters emitted past
+    /// `max_direct_clusters`, dropped.
     pub dropped_clusters: u32,
     /// Vertices allocated within capacity.
     pub vertices: u32,
@@ -1234,7 +1254,9 @@ pub struct ProducerStats {
     /// Emitted clusters the builds of traced entries refused: more than 128 triangles or 256
     /// vertices, vertices outside the batch, or an unknown topology; and emitted segments with
     /// a vertex outside the batch or a position or radius that is not finite or a negative
-    /// radius. They are neither drawn nor traced.
+    /// radius, which are neither drawn nor traced; and direct clusters past an entry's
+    /// `max_direct_clusters` that its kernel wrote into the batch without `emit_direct_cluster`,
+    /// which are drawn but not traced.
     pub refused: u32,
     /// CLAS in the entries' BLAS, and segments of strand entries' BLAS.
     pub built: u32,
