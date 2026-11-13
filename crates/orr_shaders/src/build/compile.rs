@@ -886,6 +886,9 @@ pub(super) struct ManifestModule {
 pub(super) struct LinkFile {
     pub(super) module: String,
     pub(super) path: PathBuf,
+    pub(super) point: LinkPoint,
+    /// The linked types, each with the canonical path of its module.
+    pub(super) types: Vec<(String, PathBuf)>,
 }
 
 /// One compiled module as the build remembers it between runs.
@@ -1312,6 +1315,8 @@ fn compile_one(
             .map(|l| LinkFile {
                 module: l.module.clone(),
                 path: l.path.clone(),
+                point: l.point,
+                types: l.types.clone(),
             })
             .collect(),
         model: compiled.model,
@@ -1363,6 +1368,9 @@ pub(super) fn compile_kernel(
         .load(&unit.name.replace('/', "."), unit.path, unit.source)
         .map_err(compile_err)?;
     let extra = link_modules(session, settings, unit.links).map_err(compile_err)?;
+    for l in unit.links {
+        link::check_overrides(session, l).map_err(|message| Error::Link { message })?;
+    }
     let program = session
         .link(&module, &extra, |e| Some(entry_symbol(unit.module, e)))
         .map_err(compile_err)?;

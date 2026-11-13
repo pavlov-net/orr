@@ -161,6 +161,7 @@ impl CpuLibrary {
             let module = session
                 .load(&m.module, &m.path, &m.source)
                 .map_err(compile_err)?;
+            link::check_overrides(&session, &m).map_err(|message| Error::Link { message })?;
             inputs.extend(module.dependencies());
             modules.push(module);
         }

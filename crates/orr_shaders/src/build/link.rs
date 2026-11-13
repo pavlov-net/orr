@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use super::Error;
 use super::lint::tokens;
+use super::model;
 use super::roots::Root;
+use super::slang::Session;
+use super::sys;
 
 /// A link-time extension point of orr's kernels. A kernel uses a point when its source
 /// declares `extern struct <Name> : I<Point> = <Default>;`.
@@ -352,6 +355,9 @@ pub(super) struct LinkModule {
     pub(super) module: String,
     pub(crate) path: PathBuf,
     pub(super) source: String,
+    pub(super) point: LinkPoint,
+    /// The linked types, each with the canonical path of its module.
+    pub(super) types: Vec<(String, PathBuf)>,
 }
 
 /// Writes the link module for `decl` under `dir` and returns it; `None` when nothing links
@@ -373,6 +379,11 @@ pub(super) fn write_module(
         module,
         path,
         source,
+        point: decl.point,
+        types: linked
+            .iter()
+            .map(|l| (l.ty.clone(), l.module.clone()))
+            .collect(),
     }))
 }
 
@@ -446,6 +457,148 @@ fn source(decl: &Declared, linked: &[&Link], key_bits: u32) -> String {
         let _ = writeln!(out, "\nexport static const uint KEY_BITS = {key_bits};");
     }
     out
+}
+
+/// Checks that where a linked type of `m` declares methods under the name of an optional method
+/// of its interface, one of them overrides it. One with another signature is a method of its
+/// own: Slang takes it without a word, and the switch calls the interface's default in its
+/// place. `session` has loaded `m` and the modules it imports.
+pub(super) fn check_overrides(session: &Session, m: &LinkModule) -> Result<(), String> {
+    use sys::SlangDeclKind as K;
+    let Some(switch) = m.point.switch() else {
+        return Ok(());
+    };
+    if !switch.methods.iter().any(|x| x.optional) {
+        return Ok(());
+    }
+    let api = &session.lib.api;
+    let mut wrong = Vec::new();
+    let mut stack: Vec<*mut sys::SlangReflectionDecl> = session
+        .loaded_modules()
+        .iter()
+        .map(super::slang::Module::reflection)
+        .filter(|d| !d.is_null())
+        .collect();
+    // SAFETY: decls come from modules owned by the live session.
+    unsafe {
+        while let Some(decl) = stack.pop() {
+            for i in 0..api.spReflectionDecl_getChildrenCount(decl) {
+                let child = api.spReflectionDecl_getChild(decl, i);
+                if child.is_null() {
+                    continue;
+                }
+                let kind = api.spReflectionDecl_getKind(child);
+                if kind == K::SLANG_DECL_KIND_NAMESPACE {
+                    stack.push(child);
+                }
+                if kind != K::SLANG_DECL_KIND_STRUCT {
+                    continue;
+                }
+                // A linked type is the struct of its name in its own module.
+                let ty = model::text(api.spReflectionDecl_getName(child));
+                let linked = m.types.iter().any(|(t, module)| {
+                    *t == ty
+                        && session.decl_location(child).is_some_and(|(file, _)| {
+                            super::compile::canonical_lossy(&file) == *module
+                        })
+                });
+                if !linked {
+                    continue;
+                }
+                // The signatures the type declares under each optional method's name.
+                let mut declared: Vec<(&Method, String)> = Vec::new();
+                for j in 0..api.spReflectionDecl_getChildrenCount(child) {
+                    let f = api.spReflectionDecl_getChild(child, j);
+                    if f.is_null() || api.spReflectionDecl_getKind(f) != K::SLANG_DECL_KIND_FUNC {
+                        continue;
+                    }
+                    let f = api.spReflectionDecl_castToFunction(f);
+                    let name = model::text(api.spReflectionFunction_GetName(f));
+                    if let Some(method) =
+                        switch.methods.iter().find(|x| x.optional && x.name == name)
+                    {
+                        declared.push((method, signature(api, f)));
+                    }
+                }
+                for method in switch.methods.iter().filter(|x| x.optional) {
+                    let wanted = declared_signature(method.decl);
+                    let found = declared.iter().filter(|(x, _)| x.name == method.name);
+                    if found.clone().any(|(_, s)| *s == wanted) {
+                        continue;
+                    }
+                    for (_, s) in found {
+                        wrong.push(format!(
+                            "{ty}.{} is `{s}`, where {} declares `{wanted}`",
+                            method.name, switch.linked
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if wrong.is_empty() {
+        return Ok(());
+    }
+    wrong.sort();
+    wrong.dedup();
+    Err(format!(
+        "linked {} types declare methods named as the interface's of which none overrides it, \
+         so the switch calls the interface's default: {}",
+        m.point.label(),
+        wrong.join("; ")
+    ))
+}
+
+/// `f`'s signature as `ret name(modifier type, ...)`, without parameter names.
+///
+/// # Safety
+/// `f` is a live function reflection of a session `api` belongs to.
+unsafe fn signature(api: &sys::SlangLib, f: *mut sys::SlangReflectionFunction) -> String {
+    use sys::SlangModifierID as M;
+    // SAFETY: the caller's.
+    unsafe {
+        let ret =
+            model::text(api.spReflectionType_GetName(api.spReflectionFunction_GetResultType(f)));
+        let name = model::text(api.spReflectionFunction_GetName(f));
+        let params: Vec<String> = (0..api.spReflectionFunction_GetParameterCount(f))
+            .map(|k| {
+                let p = api.spReflectionFunction_GetParameter(f, k);
+                let modifier = if !api
+                    .spReflectionVariable_FindModifier(p, M::SLANG_MODIFIER_INOUT)
+                    .is_null()
+                {
+                    "inout "
+                } else if !api
+                    .spReflectionVariable_FindModifier(p, M::SLANG_MODIFIER_OUT)
+                    .is_null()
+                {
+                    "out "
+                } else {
+                    ""
+                };
+                let ty =
+                    model::text(api.spReflectionType_GetName(api.spReflectionVariable_GetType(p)));
+                format!("{modifier}{ty}")
+            })
+            .collect();
+        format!("{ret} {name}({})", params.join(", "))
+    }
+}
+
+/// A method table declaration's signature as [`signature`] gives it.
+fn declared_signature(decl: &str) -> String {
+    let (head, params) = decl.split_once('(').expect("a declaration has parameters");
+    let params: Vec<&str> = params
+        .trim_end_matches(')')
+        .split(',')
+        .map(|p| {
+            p.trim()
+                .rsplit_once(' ')
+                .expect("a declared parameter has a name")
+                .0
+        })
+        .collect();
+    format!("{head}({})", params.join(", "))
 }
 
 /// The directories of the linked modules imported by their file stems, as import roots.

@@ -204,6 +204,8 @@ fn recompile(
                 module: l.module.clone(),
                 path: l.path.clone(),
                 source: read(&l.path)?,
+                point: l.point,
+                types: l.types.clone(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

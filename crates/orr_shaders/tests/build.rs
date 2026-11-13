@@ -623,6 +623,20 @@ fn link_calls_are_checked() {
     assert!(message(undeclared).contains("no kernel"));
     let name = consumer(&dir, &renderer).link(LinkPoint::Surface, "Ground", &ground, "Ground");
     assert!(message(name).contains("lower-case"));
+    // A method named as an optional one of the interface but declared otherwise overrides
+    // nothing, so the switch would call the interface's default in its place.
+    let stale = dir.join("consumer/stale.slang");
+    fs::write(
+        &stale,
+        "import orr_scene.surface;\nstruct Stale : ISurface { static GSurface surface(SurfaceInput i, out float d) { d = 0; return { float4(1) }; } }\n",
+    )
+    .unwrap();
+    let stale = consumer(&dir, &renderer).link(LinkPoint::Surface, "stale", &stale, "Stale");
+    let stale = message(stale);
+    assert!(
+        stale.contains("Stale.surface is `GSurface surface(SurfaceInput, out float)`"),
+        "{stale}"
+    );
 }
 
 #[test]
