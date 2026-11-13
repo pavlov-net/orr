@@ -600,6 +600,12 @@ impl SceneLighting {
         self.set.gpu()
     }
 
+    /// The count of shadow rays past `SHADOW_CANDIDATES` non-opaque candidates, which the light
+    /// set names as `shadow_overflows`.
+    pub(crate) fn shadow_overflows(&self) -> GpuPtr<u32> {
+        self.shadow_overflows.gpu()
+    }
+
     /// The baked environment, for sampling and miss lookups.
     pub fn environment(&self) -> GpuPtr<EnvironmentGpu> {
         self.environment.environment()

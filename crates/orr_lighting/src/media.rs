@@ -13,10 +13,12 @@ use orr_scene::{MaterialId, SceneFeatures};
 use crate::scene::{FRAME_SLOTS, Ring};
 use crate::shaders::media::{aerial, froxel, smoke};
 use crate::shaders::types::{
-    EyeColumn, FroxelLights, FroxelQueue, FroxelRoot, FroxelVolume, LayerGuide, MediaApplyRoot,
-    MediaStatsGpu, ParticleLighting,
+    EyeColumn, EyeInterior, FroxelLights, FroxelQueue, FroxelRays, FroxelRoot, FroxelVolume,
+    LayerGuide, MediaApplyRoot, ParticleLighting, RayJob, RayList, ShadowFull, ShadowResult,
+    ShadowTraceRoot,
 };
-use crate::support::{Masked, MaskedFrame};
+use crate::staged::MAY_INTERIORS;
+use crate::support::{FROXEL_LIGHT, Masked, MaskedFrame};
 use crate::view::{LightingDebugView, LightingView, NO_MATERIAL, ViewLighting, ViewPass};
 use crate::{CompilePipeline, Error, KernelSet, SceneLighting, pipeline};
 
@@ -101,6 +103,8 @@ pub struct MediaStats {
     pub active_froxels: u32,
     /// Rays the froxels traced.
     pub froxel_rays: u32,
+    /// Of those, the rays the thin tracer left to the full handling, which traced them again.
+    pub froxel_flagged_rays: u32,
     /// Medium proxies in the view's frustum.
     pub visible_proxies: u32,
     /// Froxel columns whose near-plane point lies in a dielectric's interior.
@@ -120,6 +124,8 @@ struct Shape {
     grid: [u32; 3],
     /// Shadowed lights past the first, which take `visibility` channels.
     extra: u32,
+    /// Shadow rays per froxel at most: the local winner's and the shadowed lights'.
+    rays: u32,
     chromatic: bool,
     /// The scene holds a smoke entry.
     smoke: bool,
@@ -130,7 +136,8 @@ struct Shape {
 
 /// A view's froxel targets: `froxel_material`, `froxel_incident` and `froxel_visibility`
 /// with their histories, `froxel_integrated`; `eye_depth` with its history and the columns' plane
-/// stacks; its `aerial` LUT; and the list of froxels the light pass lights.
+/// stacks; its `aerial` LUT; and the list of froxels the light pass lights, with its records and
+/// shadow rays.
 struct Volumes {
     device: Device,
     shape: Shape,
@@ -149,8 +156,40 @@ struct Volumes {
     eye_depth: Option<[Volume; 2]>,
     /// `froxels`' `STACK_KEYS` per shadowed light per column.
     stacks: Option<Allocation<u64>>,
+    /// The light pass's records, from the first frame that runs it on.
+    light: Option<LightRecords>,
+}
+
+/// A view's froxel light pass's list, records and shadow rays.
+struct LightRecords {
     /// The froxels the light pass lights, as `froxels`' `froxel_index`, with room for all.
     lit: Allocation<u32>,
+    /// Per listed froxel, the interiors around its sample point and the light pass's record.
+    around: Allocation<EyeInterior>,
+    rays: Allocation<FroxelRays>,
+    /// Per shadow ray, with room for `Shape::rays` per froxel: its job, its result and its full
+    /// handling's, and the list of those the thin tracer flagged.
+    jobs: Allocation<RayJob>,
+    results: Allocation<ShadowResult>,
+    full: Allocation<ShadowFull>,
+    flagged: Allocation<u32>,
+}
+
+impl LightRecords {
+    fn new(device: &Device, shape: Shape) -> Result<Self, Error> {
+        let froxels: u64 = shape.grid.iter().map(|&n| u64::from(n)).product();
+        let rays = froxels * u64::from(shape.rays);
+        let kind = MemoryKind::DeviceLocal;
+        Ok(Self {
+            lit: device.gpu_malloc(kind, froxels, "lit froxels")?,
+            around: device.gpu_malloc(kind, froxels, "froxel interiors")?,
+            rays: device.gpu_malloc(kind, froxels, "froxel rays")?,
+            jobs: device.gpu_malloc(kind, rays, "froxel ray jobs")?,
+            results: device.gpu_malloc(kind, rays, "froxel ray results")?,
+            full: device.gpu_malloc(kind, rays, "froxel full ray results")?,
+            flagged: device.gpu_malloc(kind, rays, "froxel flagged rays")?,
+        })
+    }
 }
 
 impl Volumes {
@@ -251,11 +290,7 @@ impl Volumes {
             } else {
                 None
             },
-            lit: device.gpu_malloc(
-                MemoryKind::DeviceLocal,
-                shape.grid.iter().map(|&n| u64::from(n)).product(),
-                "lit froxels",
-            )?,
+            light: None,
             device: device.clone(),
             shape,
             slots,
@@ -321,13 +356,14 @@ pub(crate) struct MediaView {
     lights: Allocation<FroxelLights>,
     /// The first value of `lights`, until the first record copies it there.
     lights_start: Option<Allocation<FroxelLights>>,
-    /// This frame's light pass dispatch and counts, which the passes add to; a shader's atomics
-    /// on `stats`, in host memory, would each cross the bus.
+    /// This frame's light pass dispatches, lists and counts, which the passes add to; a shader's
+    /// atomics on `stats`, in host memory, would each cross the bus.
     queue: Allocation<FroxelQueue>,
-    /// Each slot's frame's counts, copied from `queue`.
-    stats: Allocation<MediaStatsGpu>,
+    /// Each slot's frame's `queue`, copied from it.
+    stats: Allocation<FroxelQueue>,
     recorded: [Option<Recorded>; FRAME_SLOTS],
     roots: Ring<FroxelRoot>,
+    trace_roots: Ring<ShadowTraceRoot>,
     apply_roots: Ring<MediaApplyRoot>,
     volume_roots: Ring<FroxelVolume>,
     particles: Ring<ParticleLighting>,
@@ -362,6 +398,7 @@ impl MediaView {
             stats: device.gpu_malloc(MemoryKind::Readback, FRAME_SLOTS as u64, "media stats")?,
             recorded: [None; FRAME_SLOTS],
             roots: Ring::new(device, "froxel roots")?,
+            trace_roots: Ring::new(device, "froxel trace roots")?,
             apply_roots: Ring::new(device, "media apply roots")?,
             volume_roots: Ring::new(device, "froxel volumes")?,
             particles: Ring::new(device, "particle lighting")?,
@@ -374,17 +411,23 @@ impl MediaView {
         self.recorded[(frame % FRAME_SLOTS as u64) as usize].filter(|r| r.frame == frame)
     }
 
+    /// The list in `queue` at byte `offset`.
+    fn list(&self, offset: usize) -> GpuPtr<RayList> {
+        self.queue.gpu().cast::<u8>().offset(offset as u64).cast()
+    }
+
     /// Froxel counts of `frame`, once its submit has completed.
     pub(crate) fn stats(&self, frame: u64) -> Option<MediaStats> {
         let slot = (frame % FRAME_SLOTS as u64) as usize;
         self.recorded(frame).map(|_| {
-            let s = self.stats.as_slice().unwrap()[slot];
+            let q = self.stats.as_slice().unwrap()[slot];
             MediaStats {
                 frame,
-                active_froxels: s.active,
-                froxel_rays: s.rays,
-                visible_proxies: s.proxies,
-                eye_columns: s.eye_columns,
+                active_froxels: q.froxels.count,
+                froxel_rays: q.jobs.count,
+                froxel_flagged_rays: q.flagged.count,
+                visible_proxies: q.counts.proxies,
+                eye_columns: q.counts.eye_columns,
             }
         })
     }
@@ -550,9 +593,11 @@ impl MediaKernels {
         scene: &SceneLighting,
         pass: &ViewPass,
         lighting: &ViewLighting,
+        trace: GpuPtr<ShadowTraceRoot>,
     ) -> FroxelRoot {
         let settings = &lighting.media;
         let v = media.volumes.as_ref();
+        let light = v.and_then(|v| v.light.as_ref());
         let [columns, rows, slices] = v.map_or_default(|v| v.shape.grid);
         let (cur, prev) = (media.current, 1 - media.current);
         let pair = |t: Option<&Volume>| {
@@ -622,7 +667,26 @@ impl MediaKernels {
                 .and_then(|v| v.stacks.as_ref())
                 .map_or(GpuPtr::NULL, Allocation::gpu),
             queue: media.queue.gpu(),
-            lit: v.map_or(GpuPtr::NULL, |v| v.lit.gpu()),
+            lit: light.map_or(GpuPtr::NULL, |l| l.lit.gpu()),
+            around: light.map_or(GpuPtr::NULL, |l| l.around.gpu()),
+            rays: light.map_or(GpuPtr::NULL, |l| l.rays.gpu()),
+            trace,
+            winners: media.list(offset_of!(FroxelQueue, winners)),
+        }
+    }
+
+    /// The thin shadow tracer's root over `media`'s shadow rays.
+    fn trace_root(media: &MediaView, scene: &SceneLighting, pass: &ViewPass) -> ShadowTraceRoot {
+        let light = media.volumes.as_ref().and_then(|v| v.light.as_ref());
+        ShadowTraceRoot {
+            scene: pass.scene,
+            view: pass.view,
+            overflows: scene.shadow_overflows(),
+            jobs: light.map_or(GpuPtr::NULL, |l| l.jobs.gpu()),
+            results: light.map_or(GpuPtr::NULL, |l| l.results.gpu()),
+            full: light.map_or(GpuPtr::NULL, |l| l.full.gpu()),
+            flagged: light.map_or(GpuPtr::NULL, |l| l.flagged.gpu()),
+            lists: media.list(offset_of!(FroxelQueue, jobs)),
         }
     }
 
@@ -707,7 +771,7 @@ impl MediaKernels {
         // The light pass's pipeline is made for what the scene may hold; a view that did not ask
         // for it ahead waits for it here.
         let light = if masked.runs.froxel_light {
-            Some(masked.take(Masked::FroxelLight)?)
+            Some(masked.take_all(&FROXEL_LIGHT)?)
         } else {
             None
         };
@@ -720,7 +784,7 @@ impl MediaKernels {
         media.eye = media.eye
             || lighting.camera_medium.is_some()
             || (media.recorded[slot].is_some()
-                && media.stats.as_slice().unwrap()[slot].eye_columns > 0);
+                && media.stats.as_slice().unwrap()[slot].counts.eye_columns > 0);
         let near_range = scene.settings().near_range;
         let mut grid = [0; 3];
         if readers.any() {
@@ -731,6 +795,7 @@ impl MediaKernels {
                     settings.slices.max(1),
                 ],
                 extra: shadowed.saturating_sub(1),
+                rays: 1 + shadowed,
                 chromatic: settings.chromatic_transmittance,
                 smoke: pass.smoke_args.is_some(),
                 eye: media.eye,
@@ -740,6 +805,13 @@ impl MediaKernels {
                 let device = scene.device();
                 media.volumes = Some(Volumes::new(device, list, shape)?);
                 fresh = true;
+            }
+            // A view whose frames never light its froxels holds none of the light pass's records.
+            if light.is_some()
+                && let Some(v) = media.volumes.as_mut()
+                && v.light.is_none()
+            {
+                v.light = Some(LightRecords::new(scene.device(), shape)?);
             }
             if fresh
                 || reset
@@ -759,7 +831,10 @@ impl MediaKernels {
             frame: pass.frame,
             readers,
         });
-        let root = self.root(media, scene, pass, lighting);
+        let trace = media
+            .trace_roots
+            .write(slot, Self::trace_root(media, scene, pass));
+        let root = self.root(media, scene, pass, lighting, trace);
         if readers.fogged {
             media.volume_roots.write(
                 slot,
@@ -822,16 +897,38 @@ impl MediaKernels {
             }
         }
         if let Some(set) = &light {
-            let light = set.get(Masked::FroxelLight).expect("taken above");
+            let kernel = |k| set.get(k).expect("taken above");
+            let args = |offset: usize| media.list(offset).cast();
+            let lists = |list: &mut CommandList<'_>| {
+                list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
+            };
+            let froxels = args(offset_of!(FroxelQueue, froxels));
             stage(list, "froxel list");
             list.dispatch(
                 &self.list,
                 root,
                 [columns.div_ceil(8), rows.div_ceil(4), slices],
             );
-            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
-            stage(list, "froxel light");
-            list.dispatch_indirect(light, root, media.queue.gpu().cast());
+            lists(list);
+            // Only interiors change what a listed froxel's point lies in.
+            if set.may() & MAY_INTERIORS != 0 {
+                stage(list, "froxel walk");
+                list.dispatch_indirect(kernel(Masked::FroxelWalk), root, froxels);
+                step(list);
+            }
+            stage(list, "froxel sample");
+            list.dispatch_indirect(kernel(Masked::FroxelSample), root, froxels);
+            lists(list);
+            stage(list, "froxel trace");
+            let jobs = args(offset_of!(FroxelQueue, jobs));
+            list.dispatch_indirect(kernel(Masked::ShadowTrace), trace, jobs);
+            lists(list);
+            stage(list, "froxel retrace");
+            let flagged = args(offset_of!(FroxelQueue, flagged));
+            list.dispatch_indirect(kernel(Masked::FroxelRetrace), root, flagged);
+            step(list);
+            stage(list, "froxel accumulate");
+            list.dispatch_indirect(kernel(Masked::FroxelAccumulate), root, froxels);
             step(list);
             media.history = (media.history + 1).min(MAX_HISTORY);
         } else {
@@ -849,12 +946,8 @@ impl MediaKernels {
         list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
         list.copy(
             media.stats.gpu().offset(slot as u64).cast(),
-            media
-                .queue
-                .gpu()
-                .cast::<u8>()
-                .offset(offset_of!(FroxelQueue, counts) as u64),
-            size_of::<MediaStatsGpu>() as u64,
+            media.queue.gpu().cast(),
+            size_of::<FroxelQueue>() as u64,
         );
         list.end_pass();
         list.begin_pass("aerial perspective", false);

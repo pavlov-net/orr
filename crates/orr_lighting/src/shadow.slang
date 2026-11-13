@@ -244,16 +244,10 @@ public struct ShadowCandidates<S : ISurfaces, M : IMedium, let MODE : uint> : IC
     // n)))^2 and 1 for a light at infinity.
     public float3 optical_depth(Interior start, out float scale, out float3 straight)
     {
-        scale = 1.0;
         straight = float3(1.0);
-        if (MODE != SHADOW_UNBENT)
-        {
-            uint m = start.innermost();
-            float3 sigma = interior_medium(scene, m, start.point(m)).sigma_t;
-            return select(sigma > 0.0, sigma * t_max, float3(0.0));
-        }
-        if (crossed == 0 && start.count == 0)
-            return float3(0.0);
+        if (MODE != SHADOW_UNBENT || crossed == 0)
+            return straight_depth(scene, start, t_max, MODE == SHADOW_UNBENT, scale);
+        scale = 1.0;
         Interior inside = start;
         Interior walked = start;
         for (uint k = 0; k < crossed; k++)
@@ -306,12 +300,11 @@ public struct ShadowCandidates<S : ISurfaces, M : IMedium, let MODE : uint> : IC
     {
         float3 o = c.object_origin;
         float3 d = c.object_direction;
+        float3 beer;
         float t0, t1;
-        if (!proxy_span(o, d, t_max, t0, t1))
-            return float3(1.0);
-        MediumProxyGpu p = scene_proxy(scene, c.instance_index);
-        if (p.volume == nullptr)
-            return exp(-max(p.extinction, 0.0) * (t1 - t0));
+        MediumProxyGpu p;
+        if (proxy_unmarched(scene, c, t_max, beer, p, t0, t1))
+            return beer;
         uint3 key = uint3(asuint(origin.x) ^ (c.instance_index * 0x9E3779B9u), asuint(origin.y) ^ (c.primitive_index * 0x85EBCA6Bu), asuint(origin.z) ^ scene.frame_index);
         float jitter = unit_float(pcg3d(key).x);
         float h = max(proxy_voxel_step(p, d), (t1 - t0) / float(PROXY_STEPS));
@@ -319,6 +312,50 @@ public struct ShadowCandidates<S : ISurfaces, M : IMedium, let MODE : uint> : IC
         proxy_march(t0, t1, h, jitter, depth);
         return exp(-max(depth.tau, 0.0));
     }
+}
+
+// What medium proxy candidate `c` of a ray reaching `t_max` lets through, in `t`, where that
+// needs no march: where the ray misses its box, and Beer's law over the ray's span inside a proxy
+// without a volume. False for a span that a volume's march takes, with the span in `t0` and `t1`
+// and the proxy in `p`.
+public bool proxy_unmarched(SceneRoot* s, Candidate c, float t_max, out float3 t, out MediumProxyGpu p, out float t0, out float t1)
+{
+    t = float3(1.0);
+    p = (MediumProxyGpu)0;
+    if (!proxy_span(c.object_origin, c.object_direction, t_max, t0, t1))
+        return true;
+    p = scene_proxy(s, c.instance_index);
+    if (p.volume != nullptr)
+        return false;
+    t = exp(-max(p.extinction, 0.0) * (t1 - t0));
+    return true;
+}
+
+// The interiors' optical depth along a ray from `t_max` that crosses no interior surface, inside
+// the list `start` at its origin, as `ShadowCandidates.optical_depth` takes it: in mode
+// SHADOW_UNBENT where `unbent`, with in `scale` the radiance scale of a light at `t_max`, else in
+// the other modes, whose scale is 1.
+public float3 straight_depth(SceneRoot* s, Interior start, float t_max, bool unbent, out float scale)
+{
+    scale = 1.0;
+    uint m = start.innermost();
+    if (!unbent)
+    {
+        float3 sigma = interior_medium(s, m, start.point(m)).sigma_t;
+        return select(sigma > 0.0, sigma * t_max, float3(0.0));
+    }
+    if (start.count == 0)
+        return float3(0.0);
+    float3 sigma = interior_medium(s, m, start.point(m)).sigma_t;
+    float ior = interior_ior(s, m);
+    float3 depth = select(sigma > 0.0, sigma * t_max, float3(0.0));
+    float reduced = t_max / ior;
+    if (isfinite(t_max))
+    {
+        float k = t_max / max(ior * reduced, 1e-30);
+        scale = k * k;
+    }
+    return depth;
 }
 
 // Sums a proxy's optical depth over the steps of its march.

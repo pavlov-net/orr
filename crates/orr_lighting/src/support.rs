@@ -1,7 +1,8 @@
 //! The support kernels made for what a scene may hold: the guide resolve, the layer guides, the
-//! froxels' light pass and media apply. Each inlines hit resolution, surface evaluation and
-//! shadow rays, so like the staged path kernels it compiles for a mask (`specialize.slang`) when
-//! a view first needs it, and a view renders lit once the ones its frame runs are ready.
+//! froxels' light pass with the thin shadow tracer, and media apply. Each inlines hit
+//! resolution, surface evaluation or shadow rays, so like the staged path kernels it compiles for
+//! a mask (`specialize.slang`) when a view first needs it, and a view renders lit once the ones
+//! its frame runs are ready.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -15,6 +16,7 @@ use crate::media::links_medium;
 use crate::shaders::dielectric::layer_guides;
 use crate::shaders::guides::resolve;
 use crate::shaders::media::{apply, froxel_light};
+use crate::shaders::rays::shadow;
 use crate::staged::{Late, MAY_ALL, PATH_MAY_ID};
 use crate::{Error, KernelSet, module};
 
@@ -23,51 +25,86 @@ use crate::{Error, KernelSet, module};
 pub(crate) enum Masked {
     Guides,
     LayerGuides,
-    FroxelLight,
+    FroxelWalk,
+    FroxelSample,
+    ShadowTrace,
+    FroxelRetrace,
+    FroxelAccumulate,
     MediaApply,
 }
 
-const MASKED: [Masked; 4] = [
+const MASKED: [Masked; 8] = [
     Masked::Guides,
     Masked::LayerGuides,
-    Masked::FroxelLight,
+    Masked::FroxelWalk,
+    Masked::FroxelSample,
+    Masked::ShadowTrace,
+    Masked::FroxelRetrace,
+    Masked::FroxelAccumulate,
     Masked::MediaApply,
 ];
 
+/// The froxels' light pass, which runs from one set.
+pub(crate) const FROXEL_LIGHT: [Masked; 5] = [
+    Masked::FroxelWalk,
+    Masked::FroxelSample,
+    Masked::ShadowTrace,
+    Masked::FroxelRetrace,
+    Masked::FroxelAccumulate,
+];
+
+/// A masked kernel's module, the layout of the module's specialization constants and their
+/// default bytes, its entry point and its name.
+type Source = (
+    &'static ShaderModule,
+    &'static [SpecEntry],
+    Vec<u8>,
+    &'static str,
+    &'static str,
+);
+
 impl Masked {
-    /// Its module, the layout of the module's specialization constants and their default
-    /// bytes, and its name.
-    fn source(
-        self,
-    ) -> (
-        &'static ShaderModule,
-        &'static [SpecEntry],
-        Vec<u8>,
-        &'static str,
-    ) {
+    fn source(self) -> Source {
+        let froxel = |entry, name| {
+            (
+                &froxel_light::MODULE,
+                froxel_light::Spec::ENTRIES,
+                froxel_light::Spec::default().bytes().to_vec(),
+                entry,
+                name,
+            )
+        };
         match self {
             Self::Guides => (
                 &resolve::MODULE,
                 resolve::Spec::ENTRIES,
                 resolve::Spec::default().bytes().to_vec(),
+                "main",
                 "guide resolve",
             ),
             Self::LayerGuides => (
                 &layer_guides::MODULE,
                 layer_guides::Spec::ENTRIES,
                 layer_guides::Spec::default().bytes().to_vec(),
+                "main",
                 "layer guides",
             ),
-            Self::FroxelLight => (
-                &froxel_light::MODULE,
-                froxel_light::Spec::ENTRIES,
-                froxel_light::Spec::default().bytes().to_vec(),
-                "froxel light",
+            Self::FroxelWalk => froxel("walk_main", "froxel walk"),
+            Self::FroxelSample => froxel("sample_main", "froxel sample"),
+            Self::ShadowTrace => (
+                &shadow::MODULE,
+                shadow::Spec::ENTRIES,
+                shadow::Spec::default().bytes().to_vec(),
+                "main",
+                "shadow trace",
             ),
+            Self::FroxelRetrace => froxel("retrace_main", "froxel retrace"),
+            Self::FroxelAccumulate => froxel("accumulate_main", "froxel accumulate"),
             Self::MediaApply => (
                 &apply::MODULE,
                 apply::Spec::ENTRIES,
                 apply::Spec::default().bytes().to_vec(),
+                "main",
                 "media apply",
             ),
         }
@@ -81,7 +118,7 @@ fn compile(
     kernel: Masked,
     may: u64,
 ) -> Result<ComputePipeline, Error> {
-    let (own, entries, mut bytes, name) = kernel.source();
+    let (own, entries, mut bytes, entry, name) = kernel.source();
     // The mask's low word is `path_may`, which every masked kernel takes, and its high word
     // `path_may2`, which a kernel takes where it evaluates surfaces or resolves hits.
     let word = |id| entries.iter().find(|e| e.constant_id == id);
@@ -95,7 +132,7 @@ fn compile(
         bytes: &bytes,
     };
     let started = Instant::now();
-    let stage = ShaderStage::new(module(kernels, own)?, "main", spec)?;
+    let stage = ShaderStage::new(module(kernels, own)?, entry, spec)?;
     let pipeline = device.create_compute_pipeline(&stage, &format!("{name} {may:#x}"))?;
     log::debug!(
         "{name} for {may:#x} made in {:.1} s",
@@ -124,7 +161,11 @@ impl Runs {
         MASKED.into_iter().filter(move |k| match k {
             Masked::Guides => true,
             Masked::LayerGuides => self.layer_guides,
-            Masked::FroxelLight => self.froxel_light,
+            Masked::FroxelWalk
+            | Masked::FroxelSample
+            | Masked::ShadowTrace
+            | Masked::FroxelRetrace
+            | Masked::FroxelAccumulate => self.froxel_light,
             Masked::MediaApply => self.media_apply,
         })
     }
@@ -141,21 +182,26 @@ pub(crate) struct MaskedFrame<'a> {
 impl MaskedFrame<'_> {
     /// [`MaskedSupport::take`] for the frame's mask.
     pub(crate) fn take(self, kernel: Masked) -> Result<Arc<SupportSet>, Error> {
-        self.kernels.take(self.may, kernel)
+        self.kernels.take(self.may, &[kernel])
+    }
+
+    /// [`MaskedSupport::take`] of `kernels` together, for the frame's mask.
+    pub(crate) fn take_all(self, kernels: &[Masked]) -> Result<Arc<SupportSet>, Error> {
+        self.kernels.take(self.may, kernels)
     }
 }
 
 /// The masked kernels' pipelines for one mask, each made when a view first runs it.
 pub(crate) struct SupportSet {
     may: u64,
-    pipelines: [Late<ComputePipeline>; 4],
+    pipelines: [Late<ComputePipeline>; 8],
 }
 
 impl SupportSet {
     fn new(may: u64) -> Self {
         Self {
             may,
-            pipelines: MASKED.map(|k| Late::new(k.source().3)),
+            pipelines: MASKED.map(|k| Late::new(k.source().4)),
         }
     }
 
@@ -166,6 +212,11 @@ impl SupportSet {
     /// `kernel`'s pipeline once it has compiled.
     pub(crate) fn get(&self, kernel: Masked) -> Option<&ComputePipeline> {
         self.late(kernel).get()
+    }
+
+    /// What the set's pipelines may meet.
+    pub(crate) fn may(&self) -> u64 {
+        self.may
     }
 
     fn holds(&self, runs: Runs) -> bool {
@@ -278,13 +329,14 @@ impl MaskedSupport {
         }
     }
 
-    /// The set whose `kernel` a frame that may meet `may` runs: the one made for `may` once its
-    /// pipeline is ready, else the one that may meet everything where that is, else the one
-    /// made for `may` after waiting for it, running queued loading jobs on this thread
-    /// meanwhile.
-    pub(crate) fn take(&self, may: u64, kernel: Masked) -> Result<Arc<SupportSet>, Error> {
+    /// The set whose `kernels` a frame that may meet `may` runs, all from one set: the one made
+    /// for `may` once their pipelines are ready, else the one that may meet everything where
+    /// they are, else the one made for `may` after waiting for them, running queued loading jobs
+    /// on this thread meanwhile.
+    pub(crate) fn take(&self, may: u64, kernels: &[Masked]) -> Result<Arc<SupportSet>, Error> {
+        let holds = |set: &SupportSet| kernels.iter().all(|&k| set.get(k).is_some());
         let exact = self.set(may);
-        if exact.get(kernel).is_some() {
+        if holds(&exact) {
             return Ok(exact);
         }
         let all = self
@@ -294,10 +346,12 @@ impl MaskedSupport {
             .iter()
             .find(|s| s.may == MAY_ALL)
             .cloned();
-        if let Some(all) = all.filter(|all| all.get(kernel).is_some()) {
+        if let Some(all) = all.filter(|all| holds(all)) {
             return Ok(all);
         }
-        self.wait(&exact, kernel)?;
+        for &kernel in kernels {
+            self.wait(&exact, kernel)?;
+        }
         Ok(exact)
     }
 

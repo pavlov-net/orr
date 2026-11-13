@@ -120,6 +120,7 @@ const STATED: &[(&str, Follows)] = &[
     ("blur neighbors", Extent),
     ("frosted glass roots", Fixed),
     ("froxel roots", Fixed),
+    ("froxel trace roots", Fixed),
     ("froxel volumes", Fixed),
     ("guide roots", Fixed),
     ("layer tile roots", Fixed),
