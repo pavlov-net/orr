@@ -349,6 +349,7 @@ impl Device {
     /// last wrote it. Safe to call from several threads and processes at once: each writes a
     /// whole file and the last one stays.
     pub fn save_pipeline_cache(&self) -> Result<(), Error> {
+        let _zone = crate::zone!("save pipeline cache");
         let cache = &self.shared.pipeline_cache;
         let (Some(path), Some(serializer)) = (&cache.path, &cache.serializer) else {
             return Ok(());

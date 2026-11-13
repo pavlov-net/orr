@@ -28,6 +28,7 @@ mod format;
 mod generated;
 mod memory;
 mod present;
+pub mod profile;
 mod queue;
 mod raster;
 pub mod rtas;

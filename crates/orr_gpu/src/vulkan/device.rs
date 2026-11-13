@@ -308,6 +308,7 @@ impl Device {
     /// synchronization checks are then on, and its messages are logged and counted
     /// ([`Device::validation_messages`]).
     pub fn new(desc: &DeviceDesc<'_>) -> Result<Device, Error> {
+        let _zone = crate::zone!("create device");
         if let Diagnostics::Aftermath { dump_dir } = desc.diagnostics {
             super::aftermath::enable(dump_dir, desc.name).map_err(Error::Aftermath)?;
         }

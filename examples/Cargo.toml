@@ -15,6 +15,8 @@ dlss = ["orr/dlss"]
 pcl-stats = ["orr/pcl-stats"]
 # orr's `nsight-perf`: bench adds per-pass Nsight Perf SDK counters to its report.
 nsight-perf = ["orr/nsight-perf"]
+# orr's and orr_cook's `tracy`, with the Tracy client's default features.
+tracy = ["orr/tracy", "orr_cook/tracy", "dep:tracy-client"]
 
 [dependencies]
 orr.workspace = true
@@ -28,6 +30,7 @@ env_logger.workspace = true
 log.workspace = true
 png.workspace = true
 winit = "0.30.13"
+tracy-client = { workspace = true, optional = true, features = ["default"] }
 
 [target.'cfg(windows)'.dependencies]
 orr_egui.workspace = true

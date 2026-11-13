@@ -1023,7 +1023,14 @@ impl Renderer {
     /// Step 1: waits until the frame `frames_in_flight` back has completed, sleeps on the
     /// display's low latency handle, opens the next frame and the display's slot for it.
     pub fn begin_frame<'a>(&'a mut self, desc: FrameDesc<'a>) -> Result<Frame<'a>> {
+        let _zone = orr_gpu::zone!("begin_frame");
+        let poll = orr_gpu::zone!("poll path kernels");
         self.lighting.paths.poll();
+        drop(poll);
+        orr_gpu::plot!(
+            "orr path pipelines compiling",
+            f64::from(self.paths_outstanding())
+        );
         let scenes = self.scenes.begin_frame(&orr_scene::FrameDesc {
             time: desc.time,
             scenes: desc.scenes,
@@ -1379,11 +1386,14 @@ impl<'a> Frame<'a> {
         output: &ViewOutput,
         hooks: &mut ViewHooks<'_>,
     ) -> Result<RenderedView> {
+        let _zone = orr_gpu::zone!("render_view");
         if let Paths::Failed(e) = &self.lighting.paths {
             return Err(Error::PathKernels(Arc::clone(e)));
         }
         let (extent, render) = self.resolve_view(view, lighting, output)?;
+        let ask = orr_gpu::zone!("ask for path pipelines");
         let lit = self.ask_paths(view, lighting, hooks.transparency.is_some(), true)?;
+        drop(ask);
         let Paths::Ready(kernels) = &self.lighting.paths else {
             return self.render_view_black(view, output, hooks, extent, render);
         };
@@ -1579,6 +1589,7 @@ impl<'a> Frame<'a> {
                 arena.enter(ViewStep::Rr, list);
                 let target = arena.texture(RECONSTRUCTED).expect("requested above");
                 list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
+                let _zone = orr_gpu::zone!("record ray reconstruction");
                 list.begin_pass("ray_reconstruction", false);
                 let recorded = r.feature.record(
                     list,
@@ -1642,6 +1653,7 @@ impl<'a> Frame<'a> {
             _ => None,
         };
         let kernels = &self.output.kernels;
+        let passes = orr_gpu::zone!("record output passes");
         let inputs = kernels.hook_inputs(
             list,
             &mut state.output,
@@ -1659,6 +1671,7 @@ impl<'a> Frame<'a> {
             field.as_deref_mut(),
         )?;
         if let (Some(inputs), Some(hook)) = (inputs, hooks.scene_referred.as_mut()) {
+            let _zone = orr_gpu::zone!("scene_referred hook");
             inputs.run(
                 list,
                 HookPoint::SceneReferred,
@@ -1758,8 +1771,10 @@ impl<'a> Frame<'a> {
             field.as_deref_mut(),
         );
         list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
+        drop(passes);
         arena.enter(ViewStep::DisplayLinear, list);
         if let (Some(inputs), Some(hook)) = (inputs, hooks.display_linear.as_mut()) {
+            let _zone = orr_gpu::zone!("display_linear hook");
             inputs.run(list, HookPoint::DisplayLinear, &chain, field, &mut **hook);
         }
         finish_view(
@@ -1799,6 +1814,7 @@ impl<'a> Frame<'a> {
         extent: [u32; 2],
         render: [u32; 2],
     ) -> Result<RenderedView> {
+        let _zone = orr_gpu::zone!("render_view while compiling");
         let id = self.scenes.id();
         let sdr = DisplayRequest::default().resolve(&[OutputFormat::Sdr], None, false);
         let frame = self.display.as_deref_mut().and_then(Display::frame);
@@ -2060,6 +2076,7 @@ impl<'a> Frame<'a> {
     /// display's slot is free, hands it to the present thread without waiting, and returns
     /// the point its last submit signals, after which all its work has completed.
     pub fn end(mut self) -> Result<TimelinePoint> {
+        let zone = orr_gpu::zone!("end");
         let wait = self
             .display
             .as_deref_mut()
@@ -2088,6 +2105,8 @@ impl<'a> Frame<'a> {
         if let Some(d) = self.display {
             d.present(&submits)?;
         }
+        drop(zone);
+        orr_gpu::frame_mark!();
         Ok(last.expect("a frame submits"))
     }
 }
@@ -2120,6 +2139,7 @@ fn finish_view(
         extent,
         display,
     } = end;
+    let _zone = orr_gpu::zone!("finish view");
     let id = scenes.id();
     let delta = scenes.time().delta;
     let (list, arena) = scenes.output_list_and_arena(view.history)?;
@@ -2188,6 +2208,7 @@ fn paint_ui(
         let layer = frame.ui_layer(list, presented);
         index = layer.index();
         list.begin_pass(UI_PASS, false);
+        let _zone = orr_gpu::zone!("ui hook");
         hook(&mut UiPass {
             cmd: list,
             layer: layer.texture(),

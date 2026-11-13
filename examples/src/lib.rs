@@ -529,13 +529,19 @@ impl Workers {
     pub fn new(loading: Arc<Loading>, count: usize) -> Self {
         let (running, ended) = mpsc::channel();
         let threads = (0..count)
-            .map(|_| {
+            .map(|i| {
                 let l = Arc::clone(&loading);
                 let running = running.clone();
-                std::thread::spawn(move || {
-                    l.run_worker();
-                    drop(running);
-                })
+                std::thread::Builder::new()
+                    .name(format!("loading worker {i}"))
+                    .spawn(move || {
+                        // The profiler reads no OS thread name on macOS, and Linux cuts one at
+                        // 15 bytes.
+                        orr::orr_scene::orr_gpu::name_thread!(&format!("loading worker {i}"));
+                        l.run_worker();
+                        drop(running);
+                    })
+                    .expect("spawning a loading worker")
             })
             .collect();
         Workers {

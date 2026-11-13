@@ -1750,6 +1750,7 @@ impl LightingKernels {
         needs: PathNeeds,
         lighting: &ViewLighting,
     ) -> Result<WaitedPaths, Error> {
+        let _zone = orr_scene::orr_gpu::zone!("wait for path pipelines");
         // The masked support kernels compile beside the path pipelines waited for first.
         ask_support(&self.support.masked, needs, lighting)?;
         let (wanted, stages) = self.paths.wanted(scene, needs, lighting);
@@ -1803,6 +1804,7 @@ impl LightingKernels {
         pass: &ViewPass,
         lighting: &ViewLighting,
     ) -> Result<(), Error> {
+        let _zone = orr_scene::orr_gpu::zone!("record media");
         let masked = self.masked_frame(pass, lighting);
         self.support
             .media
@@ -1831,6 +1833,7 @@ impl LightingKernels {
         pass: &ViewPass,
         lighting: &ViewLighting,
     ) -> Result<(), Error> {
+        let _zone = orr_scene::orr_gpu::zone!("record media apply");
         let masked = self.masked_frame(pass, lighting);
         self.support
             .media
@@ -1871,6 +1874,7 @@ impl LightingKernels {
         pass: &ViewPass,
         lighting: &ViewLighting,
     ) -> Result<(), Error> {
+        let _zone = orr_scene::orr_gpu::zone!("record paths");
         let (roulette_depth, lens) = match lighting.reference {
             Some(r) => (REFERENCE_ROULETTE_DEPTH, r.lens),
             None => (ROULETTE_DEPTH, None),
@@ -2424,6 +2428,7 @@ impl LightingKernels {
         pass: &ViewPass,
         lighting: &ViewLighting,
     ) -> Result<(), Error> {
+        let _zone = orr_scene::orr_gpu::zone!("record guides");
         let masked = self.masked_frame(pass, lighting);
         let set = masked.take(Masked::Guides)?;
         let guides = set.get(Masked::Guides).expect("taken above");

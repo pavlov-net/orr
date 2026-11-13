@@ -99,6 +99,7 @@ impl Device {
         s: &ShaderStage<'_>,
         name: &str,
     ) -> Result<RayDispatchPipeline, Error> {
+        let _zone = crate::zone!("create pipeline", name);
         let shared = &self.shared;
         let (Some(rt), Some(records)) = (&shared.rt_fn, shared.records.get()) else {
             return Err(Error::Unsupported {

@@ -228,6 +228,7 @@ impl Device {
         d: &MeshPipelineDesc<'_>,
         name: &str,
     ) -> Result<MeshPipeline, Error> {
+        let _zone = crate::zone!("create pipeline", name);
         Ok(MeshPipeline {
             raw: self.shared.create_mesh(d, self.creation_flags, name)?,
             shared: Arc::clone(&self.shared),

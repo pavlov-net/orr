@@ -32,6 +32,18 @@ impl QueueKind {
     pub(crate) fn index(self) -> usize {
         self as usize
     }
+
+    /// The queue's name in the profiler.
+    #[cfg(feature = "tracy")]
+    pub(crate) fn profile_name(self) -> &'static str {
+        match self {
+            QueueKind::Render => "orr Render queue",
+            QueueKind::Compute => "orr Compute queue",
+            QueueKind::Loading => "orr Loading queue",
+            QueueKind::Copy => "orr Copy queue",
+            QueueKind::Present => "orr Present queue",
+        }
+    }
 }
 
 impl Queue {

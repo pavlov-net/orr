@@ -988,6 +988,7 @@ impl Perf {
         let service = std::thread::Builder::new()
             .name("nvperf service".into())
             .spawn(move || {
+                crate::name_thread!("nvperf service");
                 let mut p = params!(NVPW_VK_Queue_ServicePendingGpuOperations_Params {
                     queue: queue_raw as _,
                     // Until the session ends.

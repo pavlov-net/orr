@@ -553,7 +553,10 @@ impl Shared {
             key.update(&(extra & !cached_only).as_raw().to_le_bytes());
             key.finalize()
         });
-        let guard = key.filter(|_| compiles).map(|k| cache.begin_compile(k));
+        let guard = {
+            let _zone = crate::zone!("wait for the same compile");
+            key.filter(|_| compiles).map(|k| cache.begin_compile(k))
+        };
         let start = Instant::now();
         let attempt = |handle: vk::PipelineCache, only_cached: bool| {
             let mut feedback = vk::PipelineCreationFeedback::default();
@@ -576,11 +579,14 @@ impl Shared {
                     .contains(vk::PipelineCreationFeedbackFlags::APPLICATION_PIPELINE_CACHE_HIT);
             Ok(Created { pipeline, hit })
         };
-        let created = match (&cache.store, key) {
-            (Some(dir), Some(key)) => {
-                cache.create_stored(&self.device, dir, key, compiles, attempt)?
+        let created = {
+            let _zone = crate::zone!("compile in the driver");
+            match (&cache.store, key) {
+                (Some(dir), Some(key)) => {
+                    cache.create_stored(&self.device, dir, key, compiles, attempt)?
+                }
+                _ => attempt(cache.cache, false)?,
             }
-            _ => attempt(cache.cache, false)?,
         };
         let raw = created.pipeline;
         if cache.cache != vk::PipelineCache::null() {
@@ -605,6 +611,7 @@ impl Device {
     /// the device opened it or last wrote it. Safe to call from several threads and
     /// processes at once: each writes a whole file and the last one stays.
     pub fn save_pipeline_cache(&self) -> Result<(), Error> {
+        let _zone = crate::zone!("save pipeline cache");
         let cache = &self.shared.pipeline_cache;
         let Some(path) = &cache.path else {
             return Ok(());

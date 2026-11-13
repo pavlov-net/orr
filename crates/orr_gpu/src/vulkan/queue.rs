@@ -288,6 +288,7 @@ impl Queue {
             while pools.pending.front().is_some_and(|p| p.value <= completed) {
                 let p = pools.pending.pop_front().unwrap();
                 if !p.passes.is_empty() {
+                    let _zone = crate::zone!("read pass results");
                     let results = self.read_passes(&p.res, &p.passes);
                     self.shared.store_results(self.point(p.value), results);
                 }
@@ -392,6 +393,7 @@ impl Queue {
         wait: &[TimelinePoint],
         binary: Option<(vk::Semaphore, vk::Semaphore)>,
     ) -> Result<TimelinePoint, Error> {
+        let _zone = crate::zone!("submit", self.kind.profile_name());
         // Every check comes before the first list is finished: a list that is finished but
         // neither submitted nor released would hold every later free.
         for list in &lists {
@@ -543,6 +545,7 @@ impl Queue {
         images: &[vk::SparseImageMemoryBindInfo<'_>],
         wait: bool,
     ) -> Result<Option<TimelinePoint>, Error> {
+        let _zone = crate::zone!("bind sparse");
         assert!(
             self.sparse,
             "the {:?} queue cannot bind sparse memory",
@@ -947,6 +950,7 @@ impl Device {
 
     /// Destroys objects whose deferred-free points have completed. Call once a frame.
     pub fn collect_garbage(&self) {
+        let _zone = crate::zone!("collect garbage");
         self.shared.collect();
     }
 }

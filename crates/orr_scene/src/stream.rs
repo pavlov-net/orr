@@ -3619,6 +3619,7 @@ fn build_clas(
     loads: &mut [Landed],
     points: &mut Vec<TimelinePoint>,
 ) -> Result<Option<PoolBatch>> {
+    let _zone = orr_gpu::zone!("build CLAS");
     let mut side = pool.side();
     let pages: Vec<usize> = (0..loads.len())
         .filter(|&i| loads[i].result.is_ok() && loads[i].mesh.is_some())
@@ -3684,6 +3685,7 @@ fn decode_pages(
     task: &StreamTask,
     points: &mut Vec<TimelinePoint>,
 ) -> Result<Option<PageDecodes>> {
+    let _zone = orr_gpu::zone!("decode pages");
     let pages = std::mem::take(&mut *task.decodes.lock().unwrap());
     if pages.is_empty() {
         return Ok(None);

@@ -177,6 +177,7 @@ impl Eq for Device {}
 impl Device {
     /// The system's default GPU, which must support Metal 4 and filter 32-bit floats.
     pub fn new(desc: &DeviceDesc<'_>) -> Result<Device, Error> {
+        let _zone = crate::zone!("create device");
         let device = MTLCreateSystemDefaultDevice().ok_or(Error::NoDevice)?;
         let name = device.name().to_string();
         if !device.supportsFamily(MTLGPUFamily::Metal4) {

@@ -1293,7 +1293,10 @@ impl Scenes {
             if !due && !self.device.is_complete(last) {
                 break;
             }
+            let wait = orr_gpu::zone!("wait for frame");
             render.wait_while_completing(last, Duration::from_secs(10))?;
+            drop(wait);
+            let _zone = orr_gpu::zone!("read frame results");
             let mut f = core.in_flight.pop_front().unwrap();
             f.stats.gpu = f
                 .points
@@ -1359,10 +1362,12 @@ impl Scenes {
             core.stats = f.stats;
         }
         if let Some(latency) = desc.low_latency {
+            let _zone = orr_gpu::zone!("low latency sleep");
             latency.sleep();
         }
         core.next_frame += 1;
         let completed = core.completed_frame;
+        let retire = orr_gpu::zone!("retire");
         for scene in core.scenes.iter().flatten() {
             let cpu = &mut *scene.cpu.lock().unwrap();
             cpu.removed.retain(|&(frame, range)| {
@@ -1421,6 +1426,7 @@ impl Scenes {
         core.mounts.retire(completed, &core.materials);
         core.materials.table.retire(completed);
         core.mounts.streaming.retire(completed);
+        drop(retire);
         self.device.collect_garbage();
         let slot = (frame % u64::from(core.fif)) as usize;
         core.windows[slot].reset();
@@ -1455,6 +1461,7 @@ impl Scenes {
             model_cpu: &mut core.model_cpu,
             cages: &mut core.cages,
         };
+        let landing = orr_gpu::zone!("land loading batches");
         let mut loading_points = Vec::new();
         for batch in self.loading.take_batches(&self.device) {
             loading_points.extend(batch.point);
@@ -1465,6 +1472,8 @@ impl Scenes {
             core.mounts.land_edit(batch);
         }
         core.mounts.step_edits(&mut apply);
+        drop(landing);
+        let streaming = orr_gpu::zone!("streaming step");
         loading_points.extend(core.mounts.streaming.step(
             frame,
             settled,
@@ -1474,7 +1483,10 @@ impl Scenes {
             &self.loading,
             &mut apply,
         )?);
+        drop(streaming);
+        let binding = orr_gpu::zone!("bind clusters");
         loading_points.extend(core.mounts.clusters().bind(&self.device)?);
+        drop(binding);
         core.mounts.begin_edits(core.budgets.edit_triangles);
         let events = core.mounts.streaming.take_page_events();
         for (page, records) in events {
@@ -1486,11 +1498,14 @@ impl Scenes {
             }
         }
         #[cfg(feature = "hot-reload")]
-        let reloads = self
-            .reloader
-            .poll(&mut self.pipelines, &self.loading, &self.device);
+        let reloads = {
+            let _zone = orr_gpu::zone!("hot reload");
+            self.reloader
+                .poll(&mut self.pipelines, &self.loading, &self.device)
+        };
         #[cfg(not(feature = "hot-reload"))]
         let reloads = Vec::new();
+        let moves = orr_gpu::zone!("record moves");
         let mut list = render.command_list()?;
         // Work from earlier frames on this queue finishes before this frame's writes.
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
@@ -1527,6 +1542,7 @@ impl Scenes {
             }
             list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
         }
+        drop(moves);
         let now = Instant::now();
         Ok(Frame {
             device: &self.device,
@@ -1886,6 +1902,7 @@ impl<'a> Frame<'a> {
     ) -> Result<()> {
         assert!(!self.updated, "update_scenes runs once a frame");
         self.step("write");
+        let _zone = orr_gpu::zone!("update_scenes");
         self.marker(LatencyMarker::RenderSubmitStart);
         self.updated = true;
         let device = self.device;
@@ -1900,6 +1917,7 @@ impl<'a> Frame<'a> {
         let mut masks = Vec::new();
         // Cut tables that found no memory to grow.
         let mut short = Vec::new();
+        let tables = orr_gpu::zone!("scene tables");
         for &id in &self.listed {
             let scene = core.scene(id)?;
             let cpu = &mut *scene.cpu.lock().unwrap();
@@ -2108,8 +2126,10 @@ impl<'a> Frame<'a> {
         for e in &short {
             core.mounts.streaming.out_of_memory(e);
         }
+        drop(tables);
 
         if !masks.is_empty() {
+            let _zone = orr_gpu::zone!("masks");
             list.begin_pass("masks", false);
             self.masks_refused += core.mounts.build_masks(
                 device,
@@ -2122,6 +2142,7 @@ impl<'a> Frame<'a> {
             )?;
             list.end_pass();
         }
+        let upload = orr_gpu::zone!("upload");
         list.begin_pass("upload", true);
         // Tables that grew move before the records that write them.
         let mut moves = Vec::new();
@@ -2148,6 +2169,7 @@ impl<'a> Frame<'a> {
         let scatter_pipeline = self.pipelines.get(own.scatter);
         self.scatter = scatter(device, window, &mut list, scatter_pipeline, records)?;
         list.end_pass();
+        drop(upload);
         list.barrier(
             Stages::COMPUTE | Stages::TRANSFER,
             Stages::ALL,
@@ -2169,6 +2191,7 @@ impl<'a> Frame<'a> {
             list.end_pass();
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         }
+        let pages = orr_gpu::zone!("instance pages");
         let mut expansions = Vec::new();
         let mut entry_jobs = Vec::new();
         for &id in &self.listed {
@@ -2303,6 +2326,7 @@ impl<'a> Frame<'a> {
             list.end_pass();
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         }
+        drop(pages);
         core.mounts.record_edit_history(&mut list);
         for &(scene, root, batches, focus, light_tables, features) in &roots {
             let entries = core.scene(scene)?;
@@ -2320,9 +2344,12 @@ impl<'a> Frame<'a> {
                 pipelines: self.pipelines,
                 entries,
             };
+            let consumer = orr_gpu::zone!("scene compute");
             compute(&mut sc);
+            drop(consumer);
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         }
+        let edits = orr_gpu::zone!("edits and producers");
         core.mounts.record_edits(device, window, &mut list)?;
         record_producers(
             device,
@@ -2333,6 +2360,8 @@ impl<'a> Frame<'a> {
             self.pipelines,
             self.id,
         )?;
+        drop(edits);
+        let animate = orr_gpu::zone!("animate and skin");
         list.begin_pass("animate", false);
         for &(id, root, _, focus, ..) in &roots {
             let slots = core.scene(id)?.cpu.lock().unwrap().ptlas.high_water;
@@ -2386,6 +2415,8 @@ impl<'a> Frame<'a> {
                 (self.id % u64::from(core.fif)) as usize,
             )?;
         }
+        drop(animate);
+        let cuts = orr_gpu::zone!("cuts");
         let hierarchy = core.mounts.hierarchy();
         for &(id, root, _, focus, ..) in &roots {
             let scene = core.scene(id)?;
@@ -2428,7 +2459,9 @@ impl<'a> Frame<'a> {
                 &inputs,
             )?;
         }
+        drop(cuts);
         if !traced.is_empty() {
+            let _zone = orr_gpu::zone!("ptlas");
             let proxies = traced.iter().any(|&(id, _)| {
                 core.scene(id)
                     .is_ok_and(|s| s.cpu.lock().unwrap().ptlas.has_proxy_work())
@@ -2494,6 +2527,7 @@ impl<'a> Frame<'a> {
         if !roots.is_empty() {
             // The PTLAS kernels write the cuts this pass reads.
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+            let _zone = orr_gpu::zone!("emissive");
             list.begin_pass("emissive", false);
             for &(_, scene, _, _, tables, _) in &roots {
                 let r = emissive::Root {
@@ -2530,6 +2564,7 @@ impl<'a> Frame<'a> {
         let Some(previous) = self.core.output.filter(|p| !self.device.is_complete(*p)) else {
             return Ok(());
         };
+        let _zone = orr_gpu::zone!("submit scene update");
         let render = self.device.queue(QueueKind::Render).expect("render queue");
         let list = self.list.take().expect("frame list");
         self.submits.push(render.submit(vec![list], &self.loading)?);
@@ -2640,6 +2675,7 @@ impl<'a> Frame<'a> {
         opaque: Option<&mut OpaqueHook<'_>>,
     ) -> Result<RasterView> {
         self.ensure_updated()?;
+        let _zone = orr_gpu::zone!("raster_view");
         if !self.listed.contains(&view.scene) {
             return Err(Error::NotListed(view.scene));
         }
@@ -2764,6 +2800,7 @@ impl<'a> Frame<'a> {
         let targets = &*targets;
         let seen = constants;
         let constants = window.put(device, &constants)?;
+        let record = orr_gpu::zone!("record raster");
         let draws = raster::record(
             device,
             &core.raster,
@@ -2781,6 +2818,7 @@ impl<'a> Frame<'a> {
             preprocess,
             opaque,
         )?;
+        drop(record);
         let raster = draws[0];
         let slot = (self.id % u64::from(core.fif)) as usize;
         let wanted = history.readback.gpu().offset(slot as u64);
@@ -2867,6 +2905,7 @@ impl<'a> Frame<'a> {
         hook: &mut dyn FnMut(&mut TransparencyPass<'_, '_>),
     ) -> Result<(Arc<orr_gpu::Texture>, TextureIndex)> {
         self.ensure_updated()?;
+        let _zone = orr_gpu::zone!("transparency");
         let device = self.device;
         let composite = self.pipelines.get(self.pipelines.own.composite);
         let core = &mut *self.core;
@@ -2899,6 +2938,7 @@ impl<'a> Frame<'a> {
         });
         list.end_rendering();
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
+        let consumer = orr_gpu::zone!("transparency hook");
         hook(&mut TransparencyPass {
             cmd: list,
             overlay: &overlay_texture,
@@ -2912,6 +2952,7 @@ impl<'a> Frame<'a> {
             device,
             window,
         });
+        drop(consumer);
         if let Some(radiance) = radiance {
             list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
             let root = window.put_root(
@@ -2986,6 +3027,7 @@ impl<'a> Frame<'a> {
     /// after the others.
     pub fn end_submits(mut self, wait: &[TimelinePoint]) -> Result<Vec<TimelinePoint>> {
         self.ensure_updated()?;
+        let _zone = orr_gpu::zone!("submit frame");
         let render = self.device.queue(QueueKind::Render).expect("render queue");
         let mut list = self.list.take().expect("frame list");
         self.core
@@ -3014,6 +3056,7 @@ impl<'a> Frame<'a> {
         render.mark_frame_end(self.id)?;
         self.step("end");
         let used = self.core.windows[self.window].used();
+        orr_gpu::plot!("orr upload bytes", used as f64);
         self.core.high_water = self.core.high_water.max(used);
         let stats = FrameStats {
             frame: self.id,

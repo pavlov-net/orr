@@ -181,6 +181,7 @@ impl Queue {
         wait: &[TimelinePoint],
         drawable: Option<Obj<ProtocolObject<dyn CAMetalDrawable>>>,
     ) -> Result<TimelinePoint, Error> {
+        let _zone = crate::zone!("submit", self.kind.profile_name());
         let mut finished: Vec<_> = lists.into_iter().map(CommandList::finish).collect();
         let passes: Vec<(&'static str, u64)> = finished
             .iter_mut()
@@ -220,6 +221,7 @@ impl Queue {
                     let queue = queue;
                     // SAFETY: the queue outlives the thread (`QueueRef`).
                     let q = unsafe { &*queue.0 };
+                    crate::name_thread!(&format!("orr {:?} queue steps", q.kind));
                     let _release = ReleaseWaiters(q);
                     for job in receive {
                         autoreleasepool(|_| job(q));
@@ -592,6 +594,7 @@ impl Device {
 
     /// Releases what dropped objects held once the GPU is done with them.
     pub fn collect_garbage(&self) {
+        let _zone = crate::zone!("collect garbage");
         self.shared.collect();
     }
 }

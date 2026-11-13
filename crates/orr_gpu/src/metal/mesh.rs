@@ -47,6 +47,7 @@ impl Device {
         d: &MeshPipelineDesc<'_>,
         name: &str,
     ) -> Result<MeshPipeline, Error> {
+        let _zone = crate::zone!("create pipeline", name);
         if d.raster.conservative {
             return Err(Error::NotImplemented("conservative rasterization"));
         }

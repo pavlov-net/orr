@@ -105,9 +105,18 @@ impl Jobs {
 
     /// The front job of the first queue up to `last` that holds one.
     fn pop_through(&mut self, last: Queue) -> Option<Job> {
-        self.queues[..=last as usize]
+        let job = self.queues[..=last as usize]
             .iter_mut()
-            .find_map(VecDeque::pop_front)
+            .find_map(VecDeque::pop_front)?;
+        self.plot();
+        Some(job)
+    }
+
+    fn plot(&self) {
+        orr_gpu::plot!(
+            "orr loading jobs queued",
+            self.queues.iter().map(VecDeque::len).sum::<usize>() as f64
+        );
     }
 }
 
@@ -493,6 +502,7 @@ impl Loading {
             match jobs.pop() {
                 Some(job) => {
                     drop(jobs);
+                    let _zone = orr_gpu::zone!("loading job");
                     job();
                     jobs = self.jobs.lock().unwrap();
                 }
@@ -516,7 +526,11 @@ impl Loading {
 
     fn run_one_through(&self, last: Queue) -> bool {
         let job = self.jobs.lock().unwrap().pop_through(last);
-        job.map(|job| job()).is_some()
+        job.map(|job| {
+            let _zone = orr_gpu::zone!("loading job");
+            job();
+        })
+        .is_some()
     }
 
     /// Makes every [`Loading::run_worker`] return after its current job; later calls return
@@ -532,7 +546,10 @@ impl Loading {
     }
 
     pub(crate) fn queue(&self, queue: Queue, job: impl FnOnce() + Send + 'static) {
-        self.jobs.lock().unwrap().queues[queue as usize].push_back(Box::new(job));
+        let mut jobs = self.jobs.lock().unwrap();
+        jobs.queues[queue as usize].push_back(Box::new(job));
+        jobs.plot();
+        drop(jobs);
         self.job_ready.notify_one();
         let signal = self.signal.lock().unwrap().clone();
         if let Some(signal) = signal {
@@ -744,6 +761,7 @@ impl Lane<'_> {
         let mut cx = Context::from_waker(Waker::noop());
         while let Some(item) = self.items.front_mut() {
             UNTIL.set(None);
+            let _zone = orr_gpu::zone!("resume loading work");
             if item.as_mut().poll(&mut cx).is_pending() {
                 self.until = Some(UNTIL.take().expect("loading work waits only on the GPU"));
                 return;
@@ -784,6 +802,7 @@ impl Watch {
     /// [`WAIT`] passes, until [`Watch::stop`]. Its wait starts after the [`Completion`] of that
     /// point was made, so it ends no sooner than that one's time runs out.
     fn run(&self, watcher: usize, device: &Device, wake: &Wake) {
+        orr_gpu::name_thread!(&format!("orr loading watch {watcher}"));
         let render = device.queue(QueueKind::Render).expect("render queue");
         let mut state = self.state.lock().unwrap();
         loop {
@@ -1101,6 +1120,7 @@ pub(crate) fn spawn(loading: &Arc<Loading>, device: &Device) -> std::io::Result<
 }
 
 fn run(loading: &Arc<Loading>, device: &Device, watch: &Watch) {
+    orr_gpu::name_thread!("orr loading");
     let mut ring = if loading.positioned {
         None
     } else {
@@ -1141,6 +1161,7 @@ fn run(loading: &Arc<Loading>, device: &Device, watch: &Watch) {
             match msg {
                 Msg::Stop => return,
                 Msg::Mount(task, source) => {
+                    let _zone = orr_gpu::zone!("start mount");
                     placing.push(Arc::clone(&task));
                     start(loading, ring.is_some(), task, source);
                 }
@@ -1150,16 +1171,19 @@ fn run(loading: &Arc<Loading>, device: &Device, watch: &Watch) {
                     None => unreachable!("reads go to the ring only when there is one"),
                 },
                 Msg::Done(task) => {
+                    let _zone = orr_gpu::zone!("finish mount");
                     placing.retain(|t| !Arc::ptr_eq(t, &task));
                     copies.items.extend(submit_staged(device, &task));
                     mounts.items.push_back(finish(loading, device, task));
                 }
                 Msg::Stream(task) => {
+                    let _zone = orr_gpu::zone!("start stream");
                     stream::start(loading, &task);
                     streams.push_back(task);
                 }
                 Msg::StreamDone => {
                     while let Some(task) = streams.pop_front_if(|t| t.read()) {
+                        let _zone = orr_gpu::zone!("finish stream");
                         stream::finish(loading, device, &task);
                     }
                 }
@@ -1201,12 +1225,15 @@ fn run(loading: &Arc<Loading>, device: &Device, watch: &Watch) {
                 copies: (copies.items.len(), copies.until),
             };
         }
+        orr_gpu::plot!("orr loading streams", streams.len() as f64);
+        orr_gpu::plot!("orr loading mount reads", reads.len() as f64);
         if waits {
             // Both build lanes wait on points of the one queue their builds submit, which
             // complete in order.
             let until = mounts.until.into_iter().chain(cuts.until);
             watch.until(BUILDS, until.min_by_key(|p| p.value()));
             watch.until(COPIES, copies.until);
+            let _zone = orr_gpu::zone!("loading idle");
             loading.wake.wait(ring.as_ref());
             // A round that then stalls reports as running, not as waiting.
             loading.status.lock().unwrap().waiting = false;

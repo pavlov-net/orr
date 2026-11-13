@@ -19,6 +19,8 @@ pcl-stats = ["orr_output/pcl-stats"]
 # orr_gpu's `nsight-perf`: per-pass hardware counters (needs the Nsight Perf SDK at
 # `NVPERF_SDK_PATH`).
 nsight-perf = ["orr_gpu/nsight-perf"]
+# orr_gpu's `tracy`: profiling with Tracy.
+tracy = ["orr_gpu/tracy"]
 
 [dependencies]
 orr_scene.workspace = true

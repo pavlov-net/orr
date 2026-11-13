@@ -576,6 +576,7 @@ impl Display {
     /// has no area, or on Metal is covered; the frame then draws nothing into the display and
     /// `present` does nothing.
     pub fn begin_frame(&mut self, frame: u64) -> Result<Option<DisplayFrame<'_>>> {
+        let _zone = orr_gpu::zone!("display begin_frame");
         self.begun = None;
         let slot = (frame % self.slots.len() as u64) as usize;
         if self
@@ -588,6 +589,7 @@ impl Display {
         let info = self.feed.as_ref().map(|f| f.latest().1);
         let fg_on = self.fg.is_some();
         let (wait, display, refresh, compose) = {
+            let _zone = orr_gpu::zone!("wait for present slot");
             let mut state = self.shared.lock();
             while state.pending[slot] {
                 state = self
@@ -772,6 +774,7 @@ impl Display {
         let (Some(b), Some(fg)) = (&self.begun, &mut self.fg) else {
             return Ok(());
         };
+        let _zone = orr_gpu::zone!("record frame generation");
         let (slot, previous_slot) =
             slot_and_previous(&mut self.slots, b.slot, fg.prev.map(|(_, slot)| slot));
         let view = slot.view.take();
@@ -882,6 +885,7 @@ impl Display {
     /// wait the frame's `submits` (in order, the last completing after the others), and
     /// returns without waiting. Reports an error the present thread hit since the last call.
     pub fn present(&mut self, submits: &[TimelinePoint]) -> Result<()> {
+        let _zone = orr_gpu::zone!("hand to present thread");
         let after = *submits.last().expect("a frame submits");
         if let Some(e) = self.shared.lock().error.take() {
             return Err(e.into());
@@ -930,6 +934,7 @@ impl Display {
 
     /// Waits until the present thread has submitted every frame handed to it.
     pub fn wait_idle(&self) {
+        let _zone = orr_gpu::zone!("wait for present thread");
         let mut state = self.shared.lock();
         while state.pending.contains(&true) {
             state = self
@@ -1035,6 +1040,7 @@ struct Presenter {
 
 impl Presenter {
     fn run(mut self, jobs: &Receiver<Job>, shared: &Shared) {
+        orr_gpu::name_thread!("orr present");
         while let Ok(job) = jobs.recv() {
             let result = self.present(&job);
             let refresh = self.swapchain.refresh();
@@ -1065,6 +1071,7 @@ impl Presenter {
 
     /// The present path of one frame, bracketed by `PresentStart` and `PresentEnd`.
     fn present(&mut self, job: &Job) -> Result<(Presented, Vec<TimelinePoint>), orr_gpu::Error> {
+        let _zone = orr_gpu::zone!("present frame", &format!("frame {}", job.frame));
         self.mark(job.frame, LatencyMarker::PresentStart);
         let result = self.compose_and_present(job);
         self.mark(job.frame, LatencyMarker::PresentEnd);
@@ -1106,6 +1113,7 @@ impl Presenter {
 
         let mut interpolated = true;
         if let Some((check, flag)) = &job.flag {
+            let _zone = orr_gpu::zone!("wait for interpolation check");
             // The frame's evaluates set the flag.
             queue.wait(job.after, ROOT_TIMEOUT)?;
             interpolated = !check(flag);
@@ -1125,12 +1133,15 @@ impl Presenter {
         {
             // Everything that can fail before the submit runs before the acquire.
             if let Some(p) = last.take() {
+                let _zone = orr_gpu::zone!("wait for compose root");
                 queue.wait(p, ROOT_TIMEOUT)?;
             }
             let mut list = queue.command_list()?;
+            let acquire = orr_gpu::zone!("acquire");
             let Some(image) = self.swapchain.acquire()? else {
                 break;
             };
+            drop(acquire);
             self.compose.record(
                 &mut list,
                 root,
@@ -1156,7 +1167,10 @@ impl Presenter {
             presented.encoding = image.format();
             presented.extent = image.extent();
             let metered = (k == 0 && batch > 1).then_some(batch);
+            let present = orr_gpu::zone!("present");
             let id = self.swapchain.present(image, metered)?;
+            drop(present);
+            orr_gpu::frame_mark!("presented image");
             if (k as u32) < generated {
                 presented.generated += 1;
             } else {

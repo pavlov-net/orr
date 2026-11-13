@@ -198,6 +198,7 @@ impl<'a> StageParts<'a> {
         let code = if s.spec.entries.is_empty() {
             code
         } else {
+            let _zone = crate::zone!("specialize");
             let started = Instant::now();
             let folded = specialize::specialize(
                 &code,
@@ -355,6 +356,7 @@ impl Device {
         s: &ShaderStage<'_>,
         name: &str,
     ) -> Result<ComputePipeline, Error> {
+        let _zone = crate::zone!("create pipeline", name);
         Ok(ComputePipeline {
             raw: self.shared.create_compute(s, self.creation_flags, name)?,
             inline_root_bytes: s.inline_root_bytes,

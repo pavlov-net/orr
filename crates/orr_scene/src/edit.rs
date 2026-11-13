@@ -247,6 +247,7 @@ fn stretches(c: &Cluster, reach: &[[i64; 3]; 2]) -> bool {
 
 /// Starts an edit's page reads on the loading thread.
 pub(crate) fn start(task: &Arc<EditTask>) {
+    let _zone = orr_gpu::zone!("start edit");
     let s = &task.stream;
     let step = f64::from(s.header.step());
     let b = &task.bounds;
@@ -320,6 +321,7 @@ pub(crate) fn start(task: &Arc<EditTask>) {
 
 /// Ends an edit on the loading thread: submits its copies and builds its pages' micromaps.
 pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<EditTask>) {
+    let _zone = orr_gpu::zone!("finish edit");
     let done = std::mem::take(&mut *task.done.lock().unwrap());
     let EditDone {
         pages,

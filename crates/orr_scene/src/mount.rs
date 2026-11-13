@@ -670,6 +670,7 @@ pub(crate) fn start(loading: &Arc<Loading>, ring: bool, task: Arc<MountTask>, so
 
 /// The head read, then the index read, on the ring; the parse runs as a job.
 fn read_head(loading: &Arc<Loading>, task: Arc<MountTask>, file: Arc<ArchiveFile>, path: PathBuf) {
+    let _zone = orr_gpu::zone!("read mount head");
     let l = Arc::downgrade(loading);
     let f = Arc::clone(&file);
     let head = Read {
@@ -819,6 +820,7 @@ fn neural_sets(archive: &Archive, decode: bool) -> Result<(Vec<DecodedSet>, Hash
 /// read in place of the texture, and the set's latents stream like the textures materials
 /// bind. Latents of sets the mount does not decode stay out of it.
 fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
+    let _zone = orr_gpu::zone!("plan mount");
     let archive = Arc::new(archive);
     let _ = t.archive.set(Arc::clone(&archive));
     let mut bound = material_textures(&archive)?;
@@ -894,6 +896,7 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
 /// A neural texture set's decoder weights, converted into the device's layout in a block of
 /// their own that also holds the set's record.
 fn place_neural(t: &Arc<MountTask>, s: &DecodedSet, blob: &[u8]) -> Result<()> {
+    let _zone = orr_gpu::zone!("place neural set");
     let p = t.neural.expect("sets are read with neural decoding");
     let net = Fp8Network::parse(blob)?;
     let mut w = neural::device_weights(&t.device, &s.info, &s.constants, &net, p)?;
@@ -921,6 +924,7 @@ fn place_neural(t: &Arc<MountTask>, s: &DecodedSet, blob: &[u8]) -> Result<()> {
 /// A volume's blob 0, then its majorants and every page, into one block laid out by
 /// `VolumeInfo::resident_layout`.
 fn place_volume(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Result<()> {
+    let _zone = orr_gpu::zone!("place volume");
     let info = VolumeInfo::parse(blob0)?;
     let layout = info.resident_layout();
     let block = t.block(layout.size, "volume")?;
@@ -967,6 +971,7 @@ fn place_volume(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> 
 /// A subdivision cage's blob 0, then every page; the last page read builds the cage's
 /// tables into a block of its own.
 fn place_subd(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Result<()> {
+    let _zone = orr_gpu::zone!("place subdivision cage");
     struct Pending {
         info: SubdInfo,
         pages: Vec<Option<SubdPage>>,
@@ -1064,6 +1069,7 @@ fn place_clip(t: &Arc<MountTask>, entry: usize, id: AssetId, head: &[u8]) -> Res
 /// pages stream where the mesh pages do and join the block otherwise: a resident page's groups
 /// are drawn, so their leaves are resident too.
 fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Result<()> {
+    let _zone = orr_gpu::zone!("place mesh");
     let mut info = MeshInfo::parse(blob0)?;
     let header = info.header;
     let streams = streams_pages(&info, t.accel.limits.mesh_resident_max);
@@ -1337,6 +1343,7 @@ fn place_texture(
     stream: bool,
     neural: Option<(AssetId, NeuralTexture)>,
 ) -> Result<()> {
+    let _zone = orr_gpu::zone!("place texture");
     let info = Arc::new(TextureInfo::parse(blob0)?);
     let h = info.header;
     let format = gpu_format(h.vk_format).ok_or(Error::TextureFormat(h.vk_format))?;
@@ -1558,6 +1565,7 @@ fn place_streamed(
 
 /// An instance page: blob 0 stays on the CPU; its records stream.
 fn place_page(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Result<()> {
+    let _zone = orr_gpu::zone!("place instance page");
     let info = InstancePageInfo::parse(blob0)?;
     let a = t.archive();
     let blobs = a.blobs(&a.entries()[entry]);
@@ -1720,6 +1728,7 @@ struct Resolved {
 }
 
 fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
+    let _zone = orr_gpu::zone!("resolve mount");
     let missing = |id| Error::Pack(orr_pack::Error::Missing(id));
     let mut textures: HashMap<AssetId, BoundTexture> = p
         .textures

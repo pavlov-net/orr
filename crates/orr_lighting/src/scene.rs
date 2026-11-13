@@ -371,6 +371,7 @@ impl SceneLighting {
     /// without device memory for any of it, recording nothing and leaving the scene's lighting
     /// as it was.
     pub fn record(&mut self, list: &mut CommandList<'_>, pass: &ScenePass) -> Result<(), Error> {
+        let _zone = orr_scene::orr_gpu::zone!("record scene lighting");
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         // A frame's slot is written again `FRAME_SLOTS` frames on, when its work has completed.
         self.replaced

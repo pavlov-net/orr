@@ -286,6 +286,7 @@ impl Device {
         s: &ShaderStage<'_>,
         name: &str,
     ) -> Result<ComputePipeline, Error> {
+        let _zone = crate::zone!("create pipeline", name);
         if s.entry.stage != crate::Stage::Compute {
             return Err(Error::Shader(format!(
                 "{name}: {:?} is a {:?} entry",

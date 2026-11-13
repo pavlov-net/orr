@@ -12,6 +12,8 @@ links = "orr_gpu"
 # Per-pass hardware counters through NVIDIA's Nsight Perf SDK, whose headers the build reads
 # from `NVPERF_SDK_PATH`. Vulkan only: Apple targets refuse it.
 nsight-perf = ["dep:bindgen"]
+# Profiling with Tracy across orr's crates.
+tracy = ["dep:tracy-client", "dep:tracy-client-sys"]
 
 [dependencies]
 orr_shaders.workspace = true
@@ -22,6 +24,8 @@ blake3.workspace = true
 bytemuck.workspace = true
 log.workspace = true
 thiserror.workspace = true
+tracy-client = { workspace = true, optional = true, features = ["enable"] }
+tracy-client-sys = { workspace = true, optional = true }
 
 # The Vulkan backend; Apple targets have none.
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
