@@ -290,7 +290,7 @@ fn check_fixture(scale: f32, translation: [f32; 3], k: i32) -> usize {
         src.iter()
             .flatten()
             .flatten()
-            .map(|&x| cell(x, k).abs())
+            .map(|&x| cell(x, k).unsigned_abs())
             .max()
             .unwrap()
     };
@@ -299,10 +299,7 @@ fn check_fixture(scale: f32, translation: [f32; 3], k: i32) -> usize {
     let step = 2f64.powi(k);
     let snap = |v: [f32; 3]| v.map(|x| (cell(x, k) as f64 * step) as f32);
     let max_cell = max_cell(k);
-    assert_eq!(
-        u32::from(h.clas_truncate_bits),
-        24 - (64 - max_cell.leading_zeros())
-    );
+    assert_eq!(u32::from(h.clas_truncate_bits), 24 - max_cell.bit_width());
     // An edit without bounds of its own keeps the bits of the model's box.
     assert_eq!(
         h.clas_truncate_bits_within(&model.header.bounds),

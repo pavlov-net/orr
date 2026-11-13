@@ -345,7 +345,7 @@ fn key_bits(links: &[Link]) -> u32 {
         .iter()
         .filter(|l| l.point == LinkPoint::Surface)
         .count() as u32;
-    3 + (u32::BITS - surfaces.leading_zeros())
+    3 + surfaces.bit_width()
 }
 
 /// A generated link module: one per point and declared name.

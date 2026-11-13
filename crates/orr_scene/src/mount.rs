@@ -3612,8 +3612,8 @@ impl Mounts {
         let mut owner: Option<(u32, EntryOwner)> = None;
         for (w, &word) in feedback.touched.iter().enumerate() {
             let mut bits = word;
-            while bits != 0 {
-                let entry = 32 * w as u32 + bits.trailing_zeros();
+            while let Some(bit) = bits.lowest_one() {
+                let entry = 32 * w as u32 + bit;
                 bits &= bits - 1;
                 while let Some((&start, &o)) = owners.next_if(|&(&start, _)| start <= entry) {
                     owner = Some((start, o));

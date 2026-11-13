@@ -1741,7 +1741,7 @@ impl Grid {
         );
         Self {
             k,
-            truncate_bits: (24 - (32 - max_abs.leading_zeros())) as u8,
+            truncate_bits: (24 - max_abs.bit_width()) as u8,
             cells,
             lo,
             hi,

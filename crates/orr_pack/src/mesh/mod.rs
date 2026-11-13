@@ -155,7 +155,7 @@ impl MeshHeader {
             .chain(&b.max)
             .map(|&x| (f64::from(x).abs() * inverse + 0.5).floor() as u32)
             .fold(0, u32::max);
-        24u32.saturating_sub(32 - largest.leading_zeros()) as u8
+        24u32.saturating_sub(largest.bit_width()) as u8
     }
 }
 

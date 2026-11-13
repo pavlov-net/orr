@@ -243,7 +243,7 @@ pub fn mip_size(width: u32, height: u32, mip: u32) -> [u32; 2] {
 
 /// Mips down to 1x1.
 pub fn full_mip_count(width: u32, height: u32) -> u32 {
-    32 - width.max(height).max(1).leading_zeros()
+    width.max(height).max(1).bit_width()
 }
 
 /// The first mip smaller than one tile in either axis, or `mips` when there is none.

@@ -276,7 +276,7 @@ fn tiles_exact_by_staged_copy() {
     for (i, format) in formats.into_iter().enumerate() {
         for (j, (w, h)) in sizes.into_iter().enumerate() {
             let mut desc = TextureDesc::d2(format, w, h, TextureUsage::SAMPLED);
-            desc.mips = 32 - w.max(h).leading_zeros();
+            desc.mips = w.max(h).bit_width();
             tiles_round_trip(&desc, 1 + (i * 4 + j) as u64);
         }
     }

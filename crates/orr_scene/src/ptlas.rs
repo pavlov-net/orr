@@ -308,11 +308,7 @@ impl PartDemand {
 
 /// The class of a run of `n` part instances, as `ptlas.slang` `run_class`.
 pub(crate) fn run_class(n: u32) -> u8 {
-    if n <= 1 {
-        0
-    } else {
-        (32 - (n - 1).leading_zeros()) as u8
-    }
+    n.saturating_sub(1).bit_width() as u8
 }
 
 /// The part runs a copy may hold: the class of its body run while posed, and a far instance

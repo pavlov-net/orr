@@ -227,7 +227,7 @@ impl GlareKernels {
 pub(crate) fn levels(extent: [u32; 2], first_level: u32) -> Vec<[u32; 2]> {
     let first = extent.map(|n| (n >> first_level).max(1));
     let max = LAST_LEVEL + 1 - first_level;
-    let fit = 32 - first[0].min(first[1]).leading_zeros();
+    let fit = first[0].min(first[1]).bit_width();
     (0..max.min(fit))
         .map(|m| first.map(|n| (n >> m).max(1)))
         .collect()

@@ -35,7 +35,7 @@ const CHAIN_BYTES_PER_TEXEL: u64 = 16 + 16 + 16 + 8;
 /// Texels a side of the octahedral map of an environment under `max_size`.
 fn map_side(max_size: Option<u32>) -> u32 {
     let n = max_size.unwrap_or(1024).max(4);
-    1 << (31 - n.leading_zeros())
+    n.isolate_highest_one()
 }
 
 /// Estimated peak bytes of cooking an environment source of `file` bytes and `texels` texels,

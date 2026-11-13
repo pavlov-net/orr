@@ -298,7 +298,7 @@ fn check(desc: &TextureDesc, sparse: bool, caps: &crate::Caps) -> Result<(), Err
         return bad("cube textures are square with a multiple of 6 layers");
     }
     let largest = desc.extent.iter().copied().max().unwrap_or(1);
-    if desc.mips > 32 - largest.leading_zeros() {
+    if desc.mips > largest.bit_width() {
         return bad("more mips than the extent allows");
     }
     let host = desc.usage.contains(TextureUsage::HOST_COPY);

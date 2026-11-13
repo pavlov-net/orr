@@ -428,7 +428,11 @@ fn tiles(extent: [u32; 2]) -> [u32; 2] {
 }
 
 fn hzb_mips(extent: [u32; 2]) -> u32 {
-    (32 - extent[0].max(extent[1]).max(1).leading_zeros()).min(MAX_HZB_MIPS)
+    extent[0]
+        .max(extent[1])
+        .max(1)
+        .bit_width()
+        .min(MAX_HZB_MIPS)
 }
 
 /// The visibility of `slots` instance slots.

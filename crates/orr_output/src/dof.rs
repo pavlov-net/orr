@@ -385,7 +385,7 @@ impl DofTargets {
             let desc = TextureDesc::d2(Format::Rgba16Float, half[0], half[1], usage);
             Image::with_desc(gpu, &desc, name)
         };
-        let mip_count = MIPS.min(32 - half[0].min(half[1]).leading_zeros());
+        let mip_count = MIPS.min(half[0].min(half[1]).bit_width());
         let chain = Image::with_desc(
             gpu,
             &TextureDesc {

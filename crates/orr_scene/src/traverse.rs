@@ -94,7 +94,7 @@ const ADMIT_WORDS: u32 = 4 * ADMIT_BUCKETS + 8;
 /// Digits of an admission key in a scene of `slots` instance slots (`traverse.slang`
 /// `admit_levels`): the admission takes a pass per digit.
 fn admit_levels(slots: u32) -> u32 {
-    let slot_bits = u32::BITS - slots.saturating_sub(1).leading_zeros();
+    let slot_bits = slots.saturating_sub(1).bit_width();
     (31 + slot_bits).div_ceil(ADMIT_BITS)
 }
 /// Passes of one traversal over a hierarchy whose depth is not known at mount.
