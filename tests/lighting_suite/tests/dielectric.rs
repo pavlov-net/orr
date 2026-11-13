@@ -1050,7 +1050,8 @@ fn a_model_reaching_the_eye_marks_no_tile_without_a_layer_cluster_there() {
 /// entries, into views of their own in the same frame. The radiance of a traced tile, which both
 /// views take from one build, matches bit for bit too, and that of any other within
 /// [`BUILD_STEPS`]; the frosted-glass term, which blurs that radiance, within 1%. The reference's
-/// paths read no cache, so they repeat exactly within a frame.
+/// paths read no cache, and with no photons no map, whose lists take each view's deposits in
+/// the order its atomics ran, so they repeat exactly within a frame.
 #[test]
 fn layer_tiles_trace_what_every_tile_traces() {
     const TILES: u64 = (EXTENT[0].div_ceil(8) * EXTENT[1].div_ceil(8)) as u64;
@@ -1091,7 +1092,14 @@ fn layer_tiles_trace_what_every_tile_traces() {
     }
     for entry in entries {
         let paths = |every_tile| {
-            let mut p = Paths::new(&KernelSet::default(), entry, reference(2));
+            let lighting = ViewLighting {
+                reference: Some(ReferenceSettings {
+                    photons: 0,
+                    ..ReferenceSettings::default()
+                }),
+                ..reference(2)
+            };
+            let mut p = Paths::new(&KernelSet::default(), entry, lighting);
             p.frost_guide = Some(FrostGuide::new(0.25));
             p.every_tile = every_tile;
             // Pipelines that hold more than the scene round differently, and a view takes
