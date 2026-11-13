@@ -1,6 +1,8 @@
 //! Per-view participating media: the froxel volume to the scene's `near_range`, the
 //! aerial-perspective LUT past it, and media apply.
 
+use std::mem::offset_of;
+
 use orr_scene::orr_gpu::{
     self, AddressMode, Allocation, CommandList, ComputePipeline, DEFAULT_MEDIUM, Device, Filter,
     Format, GpuPtr, Hazards, MemoryKind, SamplerDesc, SamplerIndex, Stages, StorageImageIndex,
@@ -11,8 +13,8 @@ use orr_scene::{MaterialId, SceneFeatures};
 use crate::scene::{FRAME_SLOTS, Ring};
 use crate::shaders::media::{aerial, froxel, smoke};
 use crate::shaders::types::{
-    EyeColumn, FroxelLights, FroxelRoot, FroxelVolume, LayerGuide, MediaApplyRoot, MediaStatsGpu,
-    ParticleLighting,
+    EyeColumn, FroxelLights, FroxelQueue, FroxelRoot, FroxelVolume, LayerGuide, MediaApplyRoot,
+    MediaStatsGpu, ParticleLighting,
 };
 use crate::support::{Masked, MaskedFrame};
 use crate::view::{LightingDebugView, LightingView, NO_MATERIAL, ViewLighting, ViewPass};
@@ -34,6 +36,9 @@ pub const MAX_PROXY_RAYS: u32 = 8;
 
 /// `froxels`' `SMOKE_WORDS`.
 const SMOKE_WORDS: u32 = 7;
+
+/// `froxels`' `STACK_KEYS`.
+const STACK_KEYS: u32 = 3;
 
 /// `camera_media`'s `MEDIA_*`.
 const MEDIA_COMPOSE: u32 = 0;
@@ -124,8 +129,8 @@ struct Shape {
 }
 
 /// A view's froxel targets: `froxel_material`, `froxel_incident` and `froxel_visibility`
-/// with their histories, `froxel_integrated`; `eye_depth` with its history; and its `aerial`
-/// LUT.
+/// with their histories, `froxel_integrated`; `eye_depth` with its history and the columns' plane
+/// stacks; its `aerial` LUT; and the list of froxels the light pass lights.
 struct Volumes {
     device: Device,
     shape: Shape,
@@ -142,6 +147,10 @@ struct Volumes {
     smoke: Option<Allocation<u32>>,
     eye: Allocation<EyeColumn>,
     eye_depth: Option<[Volume; 2]>,
+    /// `froxels`' `STACK_KEYS` per shadowed light per column.
+    stacks: Option<Allocation<u64>>,
+    /// The froxels the light pass lights, as `froxels`' `froxel_index`, with room for all.
+    lit: Allocation<u32>,
 }
 
 impl Volumes {
@@ -235,6 +244,18 @@ impl Volumes {
                 u64::from(shape.grid[0] * shape.grid[1]),
                 "froxel eye columns",
             )?,
+            stacks: if shape.eye {
+                let keys = STACK_KEYS * MAX_FROXEL_SHADOWED_LIGHTS;
+                let words = u64::from(keys) * u64::from(shape.grid[0] * shape.grid[1]);
+                Some(device.gpu_malloc(MemoryKind::DeviceLocal, words, "froxel plane stacks")?)
+            } else {
+                None
+            },
+            lit: device.gpu_malloc(
+                MemoryKind::DeviceLocal,
+                shape.grid.iter().map(|&n| u64::from(n)).product(),
+                "lit froxels",
+            )?,
             device: device.clone(),
             shape,
             slots,
@@ -300,10 +321,10 @@ pub(crate) struct MediaView {
     lights: Allocation<FroxelLights>,
     /// The first value of `lights`, until the first record copies it there.
     lights_start: Option<Allocation<FroxelLights>>,
-    /// This frame's counts, which the passes add to; a shader's atomics on `stats`, in host
-    /// memory, would each cross the bus.
-    counts: Allocation<MediaStatsGpu>,
-    /// Each slot's frame's counts, copied from `counts`.
+    /// This frame's light pass dispatch and counts, which the passes add to; a shader's atomics
+    /// on `stats`, in host memory, would each cross the bus.
+    queue: Allocation<FroxelQueue>,
+    /// Each slot's frame's counts, copied from `queue`.
     stats: Allocation<MediaStatsGpu>,
     recorded: [Option<Recorded>; FRAME_SLOTS],
     roots: Ring<FroxelRoot>,
@@ -337,7 +358,7 @@ impl MediaView {
             eye: false,
             lights: device.gpu_malloc(MemoryKind::DeviceLocal, 1, "froxel shadowed lights")?,
             lights_start: Some(start),
-            counts: device.gpu_malloc(MemoryKind::DeviceLocal, 1, "media counts")?,
+            queue: device.gpu_malloc(MemoryKind::DeviceLocal, 1, "froxel queue")?,
             stats: device.gpu_malloc(MemoryKind::Readback, FRAME_SLOTS as u64, "media stats")?,
             recorded: [None; FRAME_SLOTS],
             roots: Ring::new(device, "froxel roots")?,
@@ -462,6 +483,7 @@ pub(crate) struct MediaKernels {
     eye_reach: ComputePipeline,
     inject: ComputePipeline,
     smoke: ComputePipeline,
+    list: ComputePipeline,
     integrate: ComputePipeline,
     aerial: ComputePipeline,
     sampler: SamplerIndex,
@@ -471,12 +493,13 @@ pub(crate) struct MediaKernels {
 
 impl MediaKernels {
     /// Its pipelines, in the order [`Self::new`] takes them.
-    pub(crate) const PIPELINES: [CompilePipeline; 7] = [
+    pub(crate) const PIPELINES: [CompilePipeline; 8] = [
         |d, k| pipeline(d, k, &froxel::MODULE, "order"),
         |d, k| pipeline(d, k, &froxel::MODULE, "eye_column"),
         |d, k| pipeline(d, k, &froxel::MODULE, "eye_reach"),
         |d, k| pipeline(d, k, &froxel::MODULE, "inject"),
         |d, k| pipeline(d, k, &smoke::MODULE, "main"),
+        |d, k| pipeline(d, k, &froxel::MODULE, "list"),
         |d, k| pipeline(d, k, &froxel::MODULE, "integrate"),
         |d, k| pipeline(d, k, &aerial::MODULE, "main"),
     ];
@@ -495,6 +518,7 @@ impl MediaKernels {
             eye_reach: next(),
             inject: next(),
             smoke: next(),
+            list: next(),
             integrate: next(),
             aerial: next(),
             sampler: device.sampler(&SamplerDesc {
@@ -559,7 +583,6 @@ impl MediaKernels {
             set: scene.light_set(),
             cache: scene.world_cache(pass.frame),
             lights: media.lights.gpu(),
-            stats: media.counts.gpu(),
             raster: pass.raster,
             smoke: v
                 .and_then(|v| v.smoke.as_ref())
@@ -595,6 +618,11 @@ impl MediaKernels {
             camera_medium: lighting.camera_medium.map_or(NO_MATERIAL, |m| m.0),
             eye_depth,
             eye_depth_history,
+            stacks: v
+                .and_then(|v| v.stacks.as_ref())
+                .map_or(GpuPtr::NULL, Allocation::gpu),
+            queue: media.queue.gpu(),
+            lit: v.map_or(GpuPtr::NULL, |v| v.lit.gpu()),
         }
     }
 
@@ -624,6 +652,9 @@ impl MediaKernels {
             cache: scene.world_cache(pass.frame),
             lights: media.lights.gpu(),
             eye: held.map_or(GpuPtr::NULL, |v| v.eye.gpu()),
+            stacks: v
+                .and_then(|v| v.stacks.as_ref())
+                .map_or(GpuPtr::NULL, Allocation::gpu),
             layers,
             overlay_front,
             incident: v.map_or(TextureIndex::NONE, |v| current(&v.incident)),
@@ -781,8 +812,13 @@ impl MediaKernels {
         }
         if let Some(set) = &light {
             let light = set.get(Masked::FroxelLight).expect("taken above");
-            let [light_group, ..] = light.workgroup();
-            list.dispatch(light, root, [columns.div_ceil(light_group), rows, 1]);
+            list.dispatch(
+                &self.list,
+                root,
+                [columns.div_ceil(8), rows.div_ceil(4), slices],
+            );
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
+            list.dispatch_indirect(light, root, media.queue.gpu().cast());
             step(list);
             media.history = (media.history + 1).min(MAX_HISTORY);
         } else {
@@ -798,8 +834,12 @@ impl MediaKernels {
         list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
         list.copy(
             media.stats.gpu().offset(slot as u64).cast(),
-            media.counts.gpu().cast(),
-            media.counts.size(),
+            media
+                .queue
+                .gpu()
+                .cast::<u8>()
+                .offset(offset_of!(FroxelQueue, counts) as u64),
+            size_of::<MediaStatsGpu>() as u64,
         );
         list.end_pass();
         list.begin_pass("aerial perspective", false);

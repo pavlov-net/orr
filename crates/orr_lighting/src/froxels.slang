@@ -1,8 +1,9 @@
 // A view's froxel volume (`media`'s layout): each frame `froxel_inject` writes the linked
-// medium per froxel, `froxel_light` the light reaching the froxels in front of the view's
-// surfaces, blended over frames, and `froxel_integrate` the in-scatter and transmittance
-// from the eye along each column; media apply (`camera_media`) composes them with every
-// pixel's radiance.
+// medium per froxel, `froxel_list` lists the froxels in front of the view's surfaces and
+// carries the others' light over from the last frame, `froxel_light` lights each listed froxel
+// in a lane of its own, blended over frames, and `froxel_integrate` the in-scatter and
+// transmittance from the eye along each column; media apply (`camera_media`) composes them with
+// every pixel's radiance.
 //
 // A smoke entry's triangles add to `FroxelRoot.smoke`, kept apart from the linked medium because
 // they scatter with their own phase function and because the integrate alone reads them: other
@@ -26,6 +27,7 @@
 module froxels;
 
 import orr_shaders.abi;
+import orr_shaders.atomic;
 import orr_shaders.math;
 import orr_color.luminance;
 import orr_shaders.random;
@@ -50,7 +52,7 @@ public static const uint FROXEL_STREAM = 0x85EBCA6B;
 // A froxel's history keeps at least this share of each frame's sample.
 public static const float FROXEL_BLEND = 1.0 / 16.0;
 
-// Froxel columns per workgroup in the light pass, one per lane.
+// Froxels per workgroup in the light pass, one per lane.
 public static const uint FROXEL_LIGHT_GROUP = 32;
 
 // Resampled tile-light candidates per froxel, beside one directional candidate.
@@ -81,6 +83,20 @@ public struct MediaStatsGpu
     public uint eye_columns;
 }
 
+// The light pass's workgroups this frame, the indirect dispatch's arguments in rows of GRID_X
+// workgroups, and the frame's counts, whose `active` froxels it lights.
+public struct FroxelQueue
+{
+    public uint groups_x;
+    public uint groups_y;
+    public uint groups_z;
+    public MediaStatsGpu counts;
+}
+
+// Keys per shadowed light of a column's plane stack in `FroxelRoot.stacks`, one per component of
+// its normal.
+public static const uint STACK_KEYS = 3;
+
 public struct FroxelRoot
 {
     public SceneRoot* scene;
@@ -89,7 +105,6 @@ public struct FroxelRoot
     public LightSetGpu* set;
     public WorldCacheGpu* cache;
     public FroxelLights* lights;
-    public MediaStatsGpu* stats;
     public RasterGpu* raster;
     public uint* smoke;                         // SMOKE_WORDS per froxel; null without smoke entries
     public EyeColumn* eye;                      // per column
@@ -121,6 +136,9 @@ public struct FroxelRoot
     public uint camera_medium;                  // the view's, MATERIAL_NONE for none
     public StorageImageIndex eye_depth;         // per shadowed light, m its ray spends in the column's interior, times its visibility; NONE until the view needs it
     public TextureIndex eye_depth_history;
+    public uint64_t* stacks;                    // per column, the plane stacks of its shadowed lights (`offer_stack`); null without `eye_depth`
+    public FroxelQueue* queue;
+    public uint* lit;                           // the froxels the light pass lights, `queue.counts.active` of them, as `froxel_index`
 }
 
 // The view-space ray through point `p` of the view's unjittered image, in render pixels,
@@ -314,7 +332,6 @@ public void froxel_order(FroxelRoot r)
         out.ids[j] = j < count ? ids[j] : NO_LIGHT;
     out.count = count;
     out.changed = changed ? 1 : 0;
-    *r.stats = (MediaStatsGpu)0;
     uint proxies = 0;
     for (uint i = 0; i < r.scene.proxy_capacity; i++)
     {
@@ -323,9 +340,12 @@ public void froxel_order(FroxelRoot r)
             proxies++;
     }
     out.proxies = proxies;
-    r.stats.proxies = proxies;
     out.far_smoke = 0;
     out.eye = 0;
+    FroxelQueue q = (FroxelQueue)0;
+    q.groups_z = 1;
+    q.counts.proxies = proxies;
+    *r.queue = q;
 }
 
 // Most surfaces a column's ray passes looking for the one leaving its interior.
@@ -387,10 +407,16 @@ public void froxel_eye_column<S : ISurfaces>(FroxelRoot r, uint2 column)
         if (list.count > 0)
         {
             InterlockedOr(r.lights.eye, 1u);
-            InterlockedAdd(r.stats.eye_columns, 1u);
+            InterlockedAdd(r.queue.counts.eye_columns, 1u);
         }
     }
-    r.eye[column.y * r.columns + column.x] = out;
+    uint index = column.y * r.columns + column.x;
+    r.eye[index] = out;
+    if (r.stacks != nullptr)
+    {
+        for (uint i = 0; i < STACK_KEYS * MAX_FROXEL_SHADOWED_LIGHTS; i++)
+            r.stacks[STACK_KEYS * MAX_FROXEL_SHADOWED_LIGHTS * index + i] = 0;
+    }
 }
 
 // Sets column `column`'s `slices`. A pixel's own surface may lie past its neighbors', so a
@@ -429,7 +455,7 @@ bool eye_holds(EyeColumn c, uint k, uint slices, float near_range)
 // The first of froxel `f`'s words in `FroxelRoot.smoke`.
 public uint smoke_index(FroxelRoot r, uint3 f)
 {
-    return SMOKE_WORDS * (f.x + r.columns * (f.y + r.rows * f.z));
+    return SMOKE_WORDS * froxel_index(r, f);
 }
 
 // Writes froxel `f`'s medium and clears its smoke.
@@ -589,150 +615,232 @@ FroxelLocal froxel_local(FroxelRoot r, uint3 f, float3 x, inout Sampler rng)
     return local;
 }
 
-// The light pass over column `column`. Froxels behind their tiles' surfaces carry their history
-// unchanged.
-public void froxel_light<S : ISurfaces, M : IMedium>(FroxelRoot r, uint2 column)
+// The index of froxel `f` in the volume, x fastest.
+uint froxel_index(FroxelRoot r, uint3 f)
 {
-    float far = farthest_surface(r, column);
+    return f.x + r.columns * (f.y + r.rows * f.z);
+}
+
+// The froxel of index `i`.
+uint3 indexed_froxel(FroxelRoot r, uint i)
+{
+    uint plane = r.columns * r.rows;
+    return uint3(i % r.columns, (i % plane) / r.columns, i / plane);
+}
+
+// The light froxel `f` held in the last frame where its center lay then: isotropic incident light
+// with the first of the view's `lights` shadowed lights' visibility, the others' visibility and
+// their distance in the column's interior. False where the history holds none, with no light,
+// every light visible and no distance.
+bool froxel_held(FroxelRoot r, uint3 f, uint lights, out float4 incident, out float4 more, out float4 depth)
+{
+    incident = float4(0.0, 0.0, 0.0, 1.0);
+    more = float4(1.0);
+    depth = float4(0.0);
+    float3 center = r.view.eye_render.xyz + column_direction(r, f.xy) * froxel_distance(float(f.z) + 0.5, r.slices, r.scene.near_range);
+    float3 coord;
+    if (r.history == 0 || !froxel_history_coord(r, center, coord))
+        return false;
+    SamplerState s = r.sampler.get();
+    if (r.eye_depth.index != IMAGE_NONE)
+        depth = r.eye_depth_history.get<Texture3D<float4>>().SampleLevel(s, coord, 0.0);
+    incident = r.incident_history.get<Texture3D<float4>>().SampleLevel(s, coord, 0.0);
+    if (lights > 1)
+        more = r.visibility_history.get<Texture3D<float4>>().SampleLevel(s, coord, 0.0);
+    return true;
+}
+
+// Writes froxel `f`'s light, as `froxel_held` reads it, for `lights` shadowed lights.
+void froxel_store(FroxelRoot r, uint3 f, uint lights, float4 incident, float4 more, float4 depth)
+{
+    r.incident.get<RWTexture3D<float4>>()[f] = incident;
+    if (lights > 1)
+        r.visibility.get<RWTexture3D<float4>>()[f] = more;
+    if (r.eye_depth.index != IMAGE_NONE)
+        r.eye_depth.get<RWTexture3D<float4>>()[f] = depth;
+}
+
+// Lists froxel `f` for the light pass where it lies in front of the farthest surface that the
+// pixels whose lookups read its column see, and carries any other's light over from the last
+// frame unchanged. Every lane of a wave takes part, those past the volume with `valid` false.
+public void froxel_list(FroxelRoot r, uint3 f, bool valid)
+{
+    bool lit = false;
+    if (valid)
+    {
+        lit = froxel_distance(float(f.z), r.slices, r.scene.near_range) < farthest_surface(r, f.xy);
+        if (!lit)
+        {
+            uint lights = r.lights.count;
+            float4 incident, more, depth;
+            froxel_held(r, f, lights, incident, more, depth);
+            froxel_store(r, f, lights, incident, more, depth);
+        }
+    }
+    uint one = lit ? 1u : 0u;
+    uint n = WaveActiveSum(one);
+    uint base = 0;
+    if (WaveIsFirstLane() && n > 0)
+    {
+        InterlockedAdd(r.queue.counts.active, n, base);
+        // Both grow with the count, so each one's largest is the final count's.
+        uint groups = (base + n + FROXEL_LIGHT_GROUP - 1) / FROXEL_LIGHT_GROUP;
+        InterlockedMax(r.queue.groups_x, min(groups, GRID_X));
+        InterlockedMax(r.queue.groups_y, (groups - 1) / GRID_X + 1);
+    }
+    // The other lanes' base stays 0, so the largest is the first lane's.
+    uint at = WaveActiveMax(base) + WavePrefixSum(one);
+    if (lit)
+        r.lit[at] = froxel_index(r, f);
+}
+
+// The froxel that lane `lane` of workgroup `group` of the light pass lights; false past the list.
+public bool lit_froxel(FroxelRoot r, uint3 group, uint lane, out uint3 f)
+{
+    f = uint3(0);
+    uint i = grid_index(group) * FROXEL_LIGHT_GROUP + lane;
+    if (i >= r.queue.counts.active)
+        return false;
+    f = indexed_froxel(r, r.lit[i]);
+    return true;
+}
+
+// Offers `normal`, the plane stack that froxel `f`'s ray toward its column's shadowed light `j`
+// came through, for the column. The column keeps its nearest slice's: each of the light's keys
+// holds a component of the normal under the slice, nearer slices higher, so the largest key of
+// each component is that slice's.
+void offer_stack(FroxelRoot r, uint3 f, uint j, float3 normal)
+{
+    uint64_t* keys = r.stacks + STACK_KEYS * (MAX_FROXEL_SHADOWED_LIGHTS * (f.y * r.columns + f.x) + j);
+    uint64_t slice = uint64_t(~f.z) << 32;
+    for (uint c = 0; c < STACK_KEYS; c++)
+        atomic_max_u64(keys + c, slice | uint64_t(asuint(normal[c])));
+}
+
+// The plane stack each shadowed light of column `index` comes into the column's interior through,
+// from `stacks` (`FroxelRoot.stacks`, null for none): its unit normal, w 1, or 0 where the light
+// keeps its direction.
+public void column_stacks(uint64_t* stacks, uint index, out float4 planes[MAX_FROXEL_SHADOWED_LIGHTS])
+{
+    for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
+        planes[j] = float4(0.0);
+    if (stacks == nullptr)
+        return;
+    for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
+    {
+        uint64_t* keys = stacks + STACK_KEYS * (MAX_FROXEL_SHADOWED_LIGHTS * index + j);
+        if (keys[0] != 0)
+            planes[j] = float4(asfloat(uint(keys[0])), asfloat(uint(keys[1])), asfloat(uint(keys[2])), 1.0);
+    }
+}
+
+// The light pass over froxel `f`, which lies in front of its tile's surfaces: one sample of the
+// light reaching it, blended into its history.
+public void froxel_light<S : ISurfaces, M : IMedium>(FroxelRoot r, uint3 f)
+{
     float near_range = r.scene.near_range;
     float3 eye = r.view.eye_render.xyz;
-    float3 dir = column_direction(r, column);
+    float3 dir = column_direction(r, f.xy);
     FroxelLights lights = *r.lights;
-    float blend = r.history == 0 ? 1.0 : max(FROXEL_BLEND, 1.0 / float(r.history + 1));
-    EyeColumn eye_column = r.eye[column.y * r.columns + column.x];
+    EyeColumn eye_column = r.eye[f.y * r.columns + f.x];
     float3 eye_sigma = interior_medium(r.scene, eye_column.interior.innermost()).sigma_t;
     bool keep_depth = r.eye_depth.index != IMAGE_NONE;
-    float4 stacks[MAX_FROXEL_SHADOWED_LIGHTS];
-    for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
-        stacks[j] = float4(0.0);
-    uint active = 0;
     uint rays = 0;
-    for (uint k = 0; k < r.slices; k++)
+    Sampler rng = froxel_sampler(r, f);
+    float3 x = froxel_sample(r, f, rng);
+    float3 to_eye = normalize(eye - x);
+    float3 l = particle_irradiance(r.cache, r.scene, x, to_eye, rng) * (0.5 * INV_PI);
+    // A light at a finite distance can lie in the interiors around `x` with no surface between
+    // to name them. Past those the walk finds what holds `x` from the back faces its rays leave
+    // through.
+    float from_eye = length(x - eye);
+    Interior around = Interior();
+    if (from_eye > eye_column.start && from_eye < eye_column.end)
     {
-        uint3 f = uint3(column, k);
-        float3 center = eye + dir * froxel_distance(float(k) + 0.5, r.slices, near_range);
-        float3 coord;
-        bool held = r.history > 0 && froxel_history_coord(r, center, coord);
-        float4 incident = float4(0.0, 0.0, 0.0, 1.0);
-        float4 more = float4(1.0);
-        float4 depth = float4(0.0);
-        if (held)
-        {
-            if (keep_depth)
-                depth = r.eye_depth_history.get<Texture3D<float4>>().SampleLevel(r.sampler.get(), coord, 0.0);
-            incident = r.incident_history.get<Texture3D<float4>>().SampleLevel(r.sampler.get(), coord, 0.0);
-            if (lights.count > 1)
-                more = r.visibility_history.get<Texture3D<float4>>().SampleLevel(r.sampler.get(), coord, 0.0);
-        }
-        if (froxel_distance(float(k), r.slices, near_range) < far)
-        {
-            active++;
-            Sampler rng = froxel_sampler(r, f);
-            float3 x = froxel_sample(r, f, rng);
-            float3 to_eye = normalize(eye - x);
-            float3 l = particle_irradiance(r.cache, r.scene, x, to_eye, rng) * (0.5 * INV_PI);
-            // A light at a finite distance can lie in the interiors around `x` with no surface
-            // between to name them. Past those the walk finds what holds `x` from the back faces
-            // its rays leave through.
-            float from_eye = length(x - eye);
-            Interior around = Interior();
-            if (from_eye > eye_column.start && from_eye < eye_column.end)
-            {
-                // The jitter carries `x` off the column's ray, and can carry it across the
-                // interior's surface: the surfaces between the ray's point at its distance and `x`
-                // flip the column's list into its own.
-                around = Interior(eye_column.interior);
-                float3 on_ray = eye + dir * from_eye;
-                float lateral = length(x - on_ray);
-                if (lateral > 0.0)
-                    surface_crossings<S>(r.scene, r.view, on_ray, (x - on_ray) / lateral, lateral, around);
-            }
-            FroxelLocal local = froxel_local(r, f, x, rng);
-            float a = held ? blend : 1.0;
-            float a_vis = held && lights.changed == 0 ? blend : 1.0;
-            bool inside = keep_depth && eye_holds(eye_column, k, r.slices, near_range);
-            float vis[MAX_FROXEL_SHADOWED_LIGHTS];
-            float4 depth_now = float4(0.0);
-            for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
-                vis[j] = 1.0;
-            // One trace site: ray 0 is the local winner's, the rest the shadowed lights'.
-            for (uint ray = 0; ray <= MAX_FROXEL_SHADOWED_LIGHTS; ray++)
-            {
-                bool winner = ray == 0;
-                uint j = ray - 1;
-                if (winner ? !local.traced : j >= lights.count)
-                    continue;
-                float3 to_light = local.chosen.dir;
-                float t_max = local.t_max;
-                // The baked environment carries the medium, as next-event estimation takes it.
-                bool environment = local.chosen.kind == LIGHT_SAMPLE_ENVIRONMENT;
-                if (!winner)
-                {
-                    float2 u = rng.next2();
-                    float cone_pdf;
-                    to_light = directional_sample(r.scene.lights[lights.ids[j]], u, cone_pdf);
-                    t_max = positive_infinity();
-                    environment = false;
-                }
-                RayCone cone = { 0.0, 0.0 };
-                rays++;
-                float3 tau;
-                StackLight stack;
-                float3 t = froxel_shadow<S, M>(r.scene, r.view, x, to_light, t_max, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), environment, around, !winner && r.set.stack_entries != 0, r.set.shadow_overflows, tau, stack);
-                if (winner)
-                {
-                    // `visibility` of the ray: the interiors' depth and the linked medium in it.
-                    if (!all(t == 0.0))
-                    {
-                        t *= exp(-tau);
-                        if (!environment)
-                            t *= medium_transmittance<M>(r.scene.medium, x, to_light, t_max);
-                    }
-                    if (local.chosen.view && any(t > 0.0))
-                        t *= emitter_view_layer<S>(r.set, local.chosen, interior_ior(r.scene, around.innermost()));
-                    l += local.radiance * t * local.scale * INV_FOUR_PI;
-                    continue;
-                }
-                t *= stack.jacobian;
-                if (inside && stack.jacobian != 1.0 && stacks[j].w == 0.0)
-                    stacks[j] = float4(stack.normal, 1.0);
-                // The column's interior takes its share of the optical depth as a distance. A
-                // blocked ray's depth can run to infinity, and weighs nothing.
-                float d = 0.0;
-                if (any(t > 0.0))
-                {
-                    if (inside && any(eye_sigma > 0.0))
-                    {
-                        d = dot(tau, eye_sigma) / dot(eye_sigma, eye_sigma);
-                        tau = max(tau - eye_sigma * d, 0.0);
-                    }
-                    t *= exp(-tau);
-                }
-                vis[j] = (t.x + t.y + t.z) / 3.0;
-                depth_now[j] = vis[j] * d;
-            }
-            incident.rgb = lerp(incident.rgb, limit_incident(l), a);
-            incident.a = lerp(incident.a, vis[0], a_vis);
-            more = lerp(more, float4(vis[1], vis[2], vis[3], 1.0), a_vis);
-            depth = lerp(depth, depth_now, a_vis);
-        }
-        else if (!held)
-            incident = float4(0.0, 0.0, 0.0, 1.0);
-        r.incident.get<RWTexture3D<float4>>()[f] = incident;
-        if (lights.count > 1)
-            r.visibility.get<RWTexture3D<float4>>()[f] = more;
-        if (keep_depth)
-            r.eye_depth.get<RWTexture3D<float4>>()[f] = depth;
+        // The jitter carries `x` off the column's ray, and can carry it across the interior's
+        // surface: the surfaces between the ray's point at its distance and `x` flip the column's
+        // list into its own.
+        around = Interior(eye_column.interior);
+        float3 on_ray = eye + dir * from_eye;
+        float lateral = length(x - on_ray);
+        if (lateral > 0.0)
+            surface_crossings<S>(r.scene, r.view, on_ray, (x - on_ray) / lateral, lateral, around);
     }
-    if (keep_depth)
-        r.eye[column.y * r.columns + column.x].stacks = stacks;
-    uint wave_active = WaveActiveSum(active);
+    FroxelLocal local = froxel_local(r, f, x, rng);
+    bool inside = keep_depth && eye_holds(eye_column, f.z, r.slices, near_range);
+    float vis[MAX_FROXEL_SHADOWED_LIGHTS];
+    float4 depth_now = float4(0.0);
+    for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
+        vis[j] = 1.0;
+    // One trace site: ray 0 is the local winner's, the rest the shadowed lights'.
+    for (uint ray = 0; ray <= MAX_FROXEL_SHADOWED_LIGHTS; ray++)
+    {
+        bool winner = ray == 0;
+        uint j = ray - 1;
+        if (winner ? !local.traced : j >= lights.count)
+            continue;
+        float3 to_light = local.chosen.dir;
+        float t_max = local.t_max;
+        // The baked environment carries the medium, as next-event estimation takes it.
+        bool environment = local.chosen.kind == LIGHT_SAMPLE_ENVIRONMENT;
+        if (!winner)
+        {
+            float2 u = rng.next2();
+            float cone_pdf;
+            to_light = directional_sample(r.scene.lights[lights.ids[j]], u, cone_pdf);
+            t_max = positive_infinity();
+            environment = false;
+        }
+        RayCone cone = { 0.0, 0.0 };
+        rays++;
+        float3 tau;
+        StackLight stack;
+        float3 t = froxel_shadow<S, M>(r.scene, r.view, x, to_light, t_max, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), environment, around, !winner && r.set.stack_entries != 0, r.set.shadow_overflows, tau, stack);
+        if (winner)
+        {
+            // `visibility` of the ray: the interiors' depth and the linked medium in it.
+            if (!all(t == 0.0))
+            {
+                t *= exp(-tau);
+                if (!environment)
+                    t *= medium_transmittance<M>(r.scene.medium, x, to_light, t_max);
+            }
+            if (local.chosen.view && any(t > 0.0))
+                t *= emitter_view_layer<S>(r.set, local.chosen, interior_ior(r.scene, around.innermost()));
+            l += local.radiance * t * local.scale * INV_FOUR_PI;
+            continue;
+        }
+        t *= stack.jacobian;
+        if (inside && stack.jacobian != 1.0)
+            offer_stack(r, f, j, stack.normal);
+        // The column's interior takes its share of the optical depth as a distance. A blocked
+        // ray's depth can run to infinity, and weighs nothing.
+        float d = 0.0;
+        if (any(t > 0.0))
+        {
+            if (inside && any(eye_sigma > 0.0))
+            {
+                d = dot(tau, eye_sigma) / dot(eye_sigma, eye_sigma);
+                tau = max(tau - eye_sigma * d, 0.0);
+            }
+            t *= exp(-tau);
+        }
+        vis[j] = (t.x + t.y + t.z) / 3.0;
+        depth_now[j] = vis[j] * d;
+    }
+    float4 incident, more, depth;
+    bool held = froxel_held(r, f, lights.count, incident, more, depth);
+    float blend = r.history == 0 ? 1.0 : max(FROXEL_BLEND, 1.0 / float(r.history + 1));
+    float a = held ? blend : 1.0;
+    float a_vis = held && lights.changed == 0 ? blend : 1.0;
+    incident.rgb = lerp(incident.rgb, limit_incident(l), a);
+    incident.a = lerp(incident.a, vis[0], a_vis);
+    more = lerp(more, float4(vis[1], vis[2], vis[3], 1.0), a_vis);
+    depth = lerp(depth, depth_now, a_vis);
+    froxel_store(r, f, lights.count, incident, more, depth);
     uint wave_rays = WaveActiveSum(rays);
     if (WaveIsFirstLane())
-    {
-        InterlockedAdd(r.stats.active, wave_active);
-        InterlockedAdd(r.stats.rays, wave_rays);
-    }
+        InterlockedAdd(r.queue.counts.rays, wave_rays);
 }
 
 // Light point `x` of a froxel, sampled as `m`, emits and scatters back along unit `dir` per
@@ -878,7 +986,10 @@ public void froxel_integrate<M : IMedium>(FroxelRoot r, uint2 column)
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
     bool chromatic = r.chromatic != 0;
     FroxelLights lights = *r.lights;
-    EyeColumn eye_column = r.eye[column.y * r.columns + column.x];
+    uint index = column.y * r.columns + column.x;
+    EyeColumn eye_column = r.eye[index];
+    float4 stacks[MAX_FROXEL_SHADOWED_LIGHTS];
+    column_stacks(r.stacks, index, stacks);
     InteriorMedium im = interior_medium(r.scene, eye_column.interior.innermost());
     bool keep_rgb = r.integrated_rgb.index != IMAGE_NONE;
     float3 inscatter = float3(0.0);
@@ -912,7 +1023,7 @@ public void froxel_integrate<M : IMedium>(FroxelRoot r, uint2 column)
             float4 incident = r.incident.get<RWTexture3D<float4>>()[f];
             float4 more = lights.count > 1 ? r.visibility.get<RWTexture3D<float4>>()[f] : float4(1.0);
             float4 depth = inside && r.eye_depth.index != IMAGE_NONE ? r.eye_depth.get<RWTexture3D<float4>>()[f] : float4(0.0);
-            source = froxel_source<M>(set, lights, m, smoke_scatter, r.smoke_anisotropy, incident, more, x, dir, inside, im, depth, eye_column.stacks, interior_ior(r.scene, eye_column.interior.innermost()));
+            source = froxel_source<M>(set, lights, m, smoke_scatter, r.smoke_anisotropy, incident, more, x, dir, inside, im, depth, stacks, interior_ior(r.scene, eye_column.interior.innermost()));
         }
         march_step(m.sigma_t, source, dt, inscatter, transmittance);
         r.integrated.get<RWTexture3D<float4>>()[f] = float4(apply_hdr_ceiling(inscatter * pre_exposure), luminance_rec2020(transmittance));

@@ -11,9 +11,10 @@ ORR_ROOT(FroxelRoot);
 
 [shader("compute")]
 [numthreads(FROXEL_LIGHT_GROUP, 1, 1)]
-void main(uint3 id: SV_DispatchThreadID)
+void main(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
 {
     ORR_OMM(main);
-    if (all(id.xy < uint2(root.columns, root.rows)))
-        froxel_light<StandardSurface, StockFog>(root, id.xy);
+    uint3 f;
+    if (lit_froxel(root, group, lane, f))
+        froxel_light<StandardSurface, StockFog>(root, f);
 }

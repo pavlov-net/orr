@@ -1,4 +1,5 @@
-// A view's froxel light pass: the light reaching each froxel in front of the view's surfaces.
+// A view's froxel light pass: the light reaching each froxel in front of the view's surfaces, one
+// froxel per lane over those the `list` pass found.
 #include "orr_root.h"
 import orr_lighting.media;
 import orr_scene.surface;
@@ -12,9 +13,10 @@ ORR_ROOT(FroxelRoot);
 
 [shader("compute")]
 [numthreads(FROXEL_LIGHT_GROUP, 1, 1)]
-void main(uint3 id: SV_DispatchThreadID)
+void main(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
 {
     ORR_OMM(main);
-    if (all(id.xy < uint2(root.columns, root.rows)))
-        froxel_light<Surface, Medium>(root, id.xy);
+    uint3 f;
+    if (lit_froxel(root, group, lane, f))
+        froxel_light<Surface, Medium>(root, f);
 }

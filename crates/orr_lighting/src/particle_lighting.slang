@@ -34,6 +34,7 @@ public struct ParticleLighting
     public WorldCacheGpu* cache;
     public FroxelLights* lights;        // the froxels' shadowed directional lights
     public EyeColumn* eye;              // per froxel column; null without froxels
+    public uint64_t* stacks;            // per froxel column, the plane stacks of its shadowed lights (`column_stacks`); null without `eye_depth`
     public LayerGuide* layers;          // the view's layer memory, null for none
     public uint64_t* overlay_front;     // per pixel of the view, its front layer; null for none
     public TextureIndex incident;       // froxel_incident; NONE without froxels
@@ -80,16 +81,19 @@ public float3 particle_ambient(ParticleLighting* l, float3 x, float3 to_eye, ino
     if (l.eye_depth.index != IMAGE_NONE && l.lights.eye != 0)
     {
         uint2 column = min(uint2(coord.xy * float2(l.columns, l.rows)), uint2(l.columns, l.rows) - 1u);
-        EyeColumn eye = l.eye[column.y * l.columns + column.x];
+        uint index = column.y * l.columns + column.x;
+        EyeColumn eye = l.eye[index];
         if (uint(coord.z * float(l.slices)) < eye.slices)
         {
+            float4 stacks[MAX_FROXEL_SHADOWED_LIGHTS];
+            column_stacks(l.stacks, index, stacks);
             uint m = eye.interior.innermost();
             float3 sigma_t = interior_medium(s, m).sigma_t;
             float4 depth = l.eye_depth.get<Texture3D<float4>>().SampleLevel(ss, coord, 0.0);
             for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
             {
                 vis[j] *= vis[j].x > 0.0 ? beer(sigma_t, depth[j] / vis[j].x) : float3(1.0);
-                if (eye.stacks[j].w > 0.0 && !stack_direction(arrives[j], eye.stacks[j].xyz, interior_ior(s, m), arrives[j]))
+                if (stacks[j].w > 0.0 && !stack_direction(arrives[j], stacks[j].xyz, interior_ior(s, m), arrives[j]))
                     vis[j] = float3(0.0);
             }
         }

@@ -42,6 +42,16 @@ void inject(uint3 id: SV_DispatchThreadID)
         froxel_inject<StockFog>(root, id);
 }
 
+// Each wave appends the froxels of neighboring columns in one slice together, which the light
+// pass's waves then mostly light together.
+[shader("compute")]
+[numthreads(8, 4, 1)]
+void list(uint3 id: SV_DispatchThreadID)
+{
+    ORR_OMM(list);
+    froxel_list(root, id, all(id < uint3(root.columns, root.rows, root.slices)));
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void integrate(uint3 id: SV_DispatchThreadID)

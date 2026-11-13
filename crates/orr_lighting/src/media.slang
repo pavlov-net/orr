@@ -217,9 +217,6 @@ public struct EyeColumn
     public float start;     // m from the eye where the innermost begins
     public float end;       // m from the eye of the surface leaving it, +inf for none before `near_range`
     public uint slices;     // the slices from the eye it holds: those before the farthest `end` of the columns beside this one in the same interior
-    // Per shadowed light, the unit normal of the plane stack its light comes into the interior
-    // through, w 1; w 0 for none, where the light keeps its direction.
-    public float4 stacks[MAX_FROXEL_SHADOWED_LIGHTS];
 }
 
 // One frame's froxel volume of a view, for passes that read it after its integration.
