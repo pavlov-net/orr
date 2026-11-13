@@ -11,7 +11,6 @@ use super::debug::name_object;
 use super::device::{Device, Shared};
 use super::garbage::{Item, RawBuffer};
 use super::memory::Allocation;
-use super::queue::MAX_PASSES;
 use crate::{
     Caps, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance, ClassicKind, Error,
     GpuAddress, GpuPtr, Hazards, LssEndCaps, LssIndexing, MemoryKind, MicromapDesc,
@@ -289,19 +288,17 @@ impl CommandList<'_> {
     /// built and visible ([`CommandList::build_classic`] makes it so).
     pub fn classic_compacted_size(&mut self, a: &ClassicAs, dst: GpuPtr<u64>) {
         let index = self.compact_queries;
-        let pool = self.res().compacted;
-        assert!(
-            pool != vk::QueryPool::null(),
-            "compaction queries need a graphics or compute queue"
-        );
-        assert!(
-            index < MAX_PASSES,
-            "more than {MAX_PASSES} compacted sizes in one list"
-        );
         self.compact_queries += 1;
-        let shared = &self.queue().shared;
+        let queue = self.queue();
+        let (pool, index) = self
+            .res_mut()
+            .compacted
+            .as_mut()
+            .expect("compaction queries need a graphics or compute queue")
+            .slot(&queue.shared.device, index);
+        let shared = &queue.shared;
         let flags = vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT;
-        // SAFETY: recording; the query was reset when the list was created and `a` is built.
+        // SAFETY: recording; the query is reset and `a` is built.
         unsafe {
             shared
                 .accel_fn

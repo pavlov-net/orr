@@ -9,7 +9,7 @@ use super::diagnostics::next_pass_id;
 use super::garbage::Item;
 use super::mesh::MeshPipeline;
 use super::pipeline::ComputePipeline;
-use super::queue::{ListResources, MAX_PASSES, Queue};
+use super::queue::{ListResources, Queue};
 use super::ray::RayDispatchPipeline;
 use super::texture::{Texture, indirect_copy_format, vk_extent, vk_offset};
 use crate::{
@@ -107,6 +107,10 @@ impl<'q> CommandList<'q> {
 
     pub(super) fn res(&self) -> &ListResources {
         self.res.as_ref().expect("command list already finished")
+    }
+
+    pub(super) fn res_mut(&mut self) -> &mut ListResources {
+        self.res.as_mut().expect("command list already finished")
     }
 
     /// Upload memory holding `bytes`, alive until the list's submit completes.
@@ -958,40 +962,33 @@ impl<'q> CommandList<'q> {
     /// marked for [`crate::Device::diagnostics_report`] and crash dumps.
     pub fn begin_pass(&mut self, name: &'static str, stats: bool) {
         assert!(!self.open, "pass {name} begun inside another pass");
-        assert!(
-            (self.passes.len() as u32) < MAX_PASSES,
-            "more than {MAX_PASSES} passes in one list"
-        );
         let index = self.passes.len() as u32;
-        let res = self.res.as_ref().unwrap();
-        let (cmd, timestamps, stats_pool) = (res.cmd, res.timestamps, res.stats);
+        let d = &self.queue.shared.device;
+        let res = self.res.as_mut().unwrap();
+        let cmd = res.cmd;
+        let timestamp = res.timestamps.as_mut().map(|q| q.slot(d, 2 * index));
+        let stats = res
+            .stats
+            .as_mut()
+            .filter(|_| stats)
+            .map(|q| q.slot(d, index));
         let label = CString::new(name).unwrap_or_default();
         let id = next_pass_id();
-        // SAFETY: recording; the queries were reset when the list was created.
+        // SAFETY: recording; the queries are reset.
         unsafe {
             self.queue.shared.debug_fn.cmd_begin_debug_utils_label(
                 cmd,
                 &vk::DebugUtilsLabelEXT::default().label_name(&label),
             );
             self.queue.shared.mark_pass(cmd, id, false);
-            if timestamps != vk::QueryPool::null() {
-                self.device().cmd_write_timestamp2(
-                    cmd,
-                    vk::PipelineStageFlags2::ALL_COMMANDS,
-                    timestamps,
-                    2 * index,
-                );
+            if let Some((pool, query)) = timestamp {
+                d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, pool, query);
             }
-            if stats && stats_pool != vk::QueryPool::null() {
-                self.device().cmd_begin_query(
-                    cmd,
-                    stats_pool,
-                    index,
-                    vk::QueryControlFlags::empty(),
-                );
+            if let Some((pool, query)) = stats {
+                d.cmd_begin_query(cmd, pool, query, vk::QueryControlFlags::empty());
             }
         }
-        let stats = stats && stats_pool != vk::QueryPool::null();
+        let stats = stats.is_some();
         let range = self
             .queue
             .shared
@@ -1010,20 +1007,22 @@ impl<'q> CommandList<'q> {
     pub fn end_pass(&mut self) {
         assert!(self.open, "end_pass without begin_pass");
         let index = self.passes.len() as u32 - 1;
-        let res = self.res.as_ref().unwrap();
-        let (cmd, timestamps, stats_pool) = (res.cmd, res.timestamps, res.stats);
+        let d = &self.queue.shared.device;
+        let res = self.res.as_mut().unwrap();
+        let cmd = res.cmd;
+        let stats = res
+            .stats
+            .as_mut()
+            .filter(|_| self.passes[index as usize].stats)
+            .map(|q| q.slot(d, index));
+        let timestamp = res.timestamps.as_mut().map(|q| q.slot(d, 2 * index + 1));
         // SAFETY: recording; the pass's queries were begun in this list.
         unsafe {
-            if self.passes[index as usize].stats {
-                self.device().cmd_end_query(cmd, stats_pool, index);
+            if let Some((pool, query)) = stats {
+                d.cmd_end_query(cmd, pool, query);
             }
-            if timestamps != vk::QueryPool::null() {
-                self.device().cmd_write_timestamp2(
-                    cmd,
-                    vk::PipelineStageFlags2::ALL_COMMANDS,
-                    timestamps,
-                    2 * index + 1,
-                );
+            if let Some((pool, query)) = timestamp {
+                d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, pool, query);
             }
             let pass = &self.passes[index as usize];
             if pass.range

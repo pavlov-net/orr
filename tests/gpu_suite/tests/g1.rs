@@ -432,6 +432,41 @@ fn lists_recorded_on_two_threads() {
     assert_clean();
 }
 
+/// A list records more passes than one query pool holds, and each pass reads its own time and
+/// invocation count.
+#[test]
+fn many_passes_keep_their_own_results() {
+    const PASSES: u32 = 1100;
+    let out = readback::<u32>(256, "out");
+    let root = upload(
+        &[pattern::Root {
+            out: out.gpu(),
+            count: 256,
+            seed: 3,
+        }],
+        "root",
+    );
+    let p = pipeline(&pattern::MODULE, "main");
+    let groups = |i: u32| i % 4 + 1;
+    let queue = render();
+    let mut list = queue.command_list().unwrap();
+    for i in 0..PASSES {
+        list.begin_pass("pattern", true);
+        list.dispatch(&p, root.gpu(), [groups(i), 1, 1]);
+        list.end_pass();
+    }
+    let point = queue.submit(vec![list], &[]).unwrap();
+    queue.wait(point, Duration::from_secs(10)).unwrap();
+    let results = device().pass_results(point).expect("completed");
+    assert_eq!(results.len(), PASSES as usize);
+    for (i, r) in (0..PASSES).zip(&results) {
+        assert!(r.gpu_ms > 0.0, "pass {i}: {} ms", r.gpu_ms);
+        let stats = r.stats.expect("statistics were asked for");
+        assert_eq!(stats.compute, u64::from(groups(i)) * 64, "pass {i}");
+    }
+    assert_clean();
+}
+
 /// 16x16 weights converted into the inference layout, on the GPU and on the host, multiply
 /// FP16 vectors through `orr_shaders.coopvec` as a CPU matmul does, at every 64-byte placement of
 /// the matrix and with a bias. FP16 weights always; E4M3 and E5M2 weights where the device

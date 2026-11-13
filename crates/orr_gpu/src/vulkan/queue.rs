@@ -15,8 +15,8 @@ use super::garbage::{After, MAX_TIMELINES};
 use super::swapchain::SwapchainFrame;
 use crate::{Error, PassResult, PipelineStats, QueueKind, TimelinePoint};
 
-/// Passes one command list can time.
-pub(super) const MAX_PASSES: u32 = 256;
+/// The queries of one query pool; a list that needs more takes another pool.
+const POOL_QUERIES: u32 = 512;
 
 /// The stages that may write an acquired swapchain image; the acquire wait blocks them.
 pub(super) const SWAPCHAIN_WRITE_STAGES: vk::PipelineStageFlags2 =
@@ -37,10 +37,88 @@ pub(super) struct Timeline {
 pub(crate) struct ListResources {
     pool: vk::CommandPool,
     pub(super) cmd: vk::CommandBuffer,
-    pub(super) timestamps: vk::QueryPool,
-    pub(super) stats: vk::QueryPool,
+    /// Two per pass; on queues with timestamps.
+    pub(super) timestamps: Option<Queries>,
+    /// One per pass; on graphics and compute queues.
+    pub(super) stats: Option<Queries>,
     /// Compacted sizes of classic acceleration structures; on graphics and compute queues.
-    pub(super) compacted: vk::QueryPool,
+    pub(super) compacted: Option<Queries>,
+}
+
+/// Queries of one kind, numbered from 0 across as many pools as the lists that recorded with
+/// them needed. The pools stay with the list's resources, so a list that records as many
+/// again creates none.
+pub(crate) struct Queries {
+    ty: vk::QueryType,
+    statistics: vk::QueryPipelineStatisticFlags,
+    pools: Vec<vk::QueryPool>,
+    /// The leading pools reset since the resources began recording; the rest may hold an
+    /// earlier recording's queries.
+    ready: usize,
+}
+
+impl Queries {
+    fn new(ty: vk::QueryType, statistics: vk::QueryPipelineStatisticFlags) -> Self {
+        Self {
+            ty,
+            statistics,
+            pools: Vec::new(),
+            ready: 0,
+        }
+    }
+
+    /// The pool and index in it of query `index`, after creating and resetting the pools up to
+    /// it. Panics when the device cannot create a pool.
+    pub(super) fn slot(&mut self, d: &ash::Device, index: u32) -> (vk::QueryPool, u32) {
+        let pool = (index / POOL_QUERIES) as usize;
+        while self.ready <= pool {
+            if self.ready == self.pools.len() {
+                let info = vk::QueryPoolCreateInfo::default()
+                    .query_type(self.ty)
+                    .query_count(POOL_QUERIES)
+                    .pipeline_statistics(self.statistics);
+                // SAFETY: valid create info for this device.
+                let created = unsafe { d.create_query_pool(&info, None) }
+                    .unwrap_or_else(|e| panic!("vkCreateQueryPool: {e}"));
+                self.pools.push(created);
+            }
+            // SAFETY: the pool is idle: the submit that last used it completed, and this
+            // recording has not used it yet.
+            unsafe { d.reset_query_pool(self.pools[self.ready], 0, POOL_QUERIES) };
+            self.ready += 1;
+        }
+        self.at(index)
+    }
+
+    /// The pool and index in it of query `index`, which [`Self::slot`] made.
+    fn at(&self, index: u32) -> (vk::QueryPool, u32) {
+        (
+            self.pools[(index / POOL_QUERIES) as usize],
+            index % POOL_QUERIES,
+        )
+    }
+
+    /// Results of queries `0..out.len()`, which a completed submit wrote.
+    fn read(&self, d: &ash::Device, out: &mut [u64]) {
+        for (pool, chunk) in self.pools.iter().zip(out.chunks_mut(POOL_QUERIES as usize)) {
+            // SAFETY: every query in range was written by the completed submit.
+            let _ =
+                unsafe { d.get_query_pool_results(*pool, 0, chunk, vk::QueryResultFlags::TYPE_64) };
+        }
+    }
+
+    /// Before the resources record again: [`Self::slot`] resets each pool as a recording first
+    /// reaches it.
+    fn begin(&mut self) {
+        self.ready = 0;
+    }
+
+    fn destroy(self, d: &ash::Device) {
+        for pool in self.pools {
+            // SAFETY: the pool is idle and owned by these resources alone.
+            unsafe { d.destroy_query_pool(pool, None) };
+        }
+    }
 }
 
 struct Pending {
@@ -148,38 +226,18 @@ impl Queue {
         // SAFETY: the pool is ours alone.
         let cmd = unsafe { d.allocate_command_buffers(&alloc) }
             .map_err(Error::vk("vkAllocateCommandBuffers"))?[0];
-        let query_pool = |info: &vk::QueryPoolCreateInfo<'_>| {
-            // SAFETY: valid create info for this device.
-            unsafe { d.create_query_pool(info, None) }.map_err(Error::vk("vkCreateQueryPool"))
-        };
-        let timestamps = if self.timestamp_mask != 0 {
-            query_pool(
-                &vk::QueryPoolCreateInfo::default()
-                    .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count(2 * MAX_PASSES),
-            )?
-        } else {
-            vk::QueryPool::null()
-        };
-        let stats = if self.shaders {
-            query_pool(
-                &vk::QueryPoolCreateInfo::default()
-                    .query_type(vk::QueryType::PIPELINE_STATISTICS)
-                    .query_count(MAX_PASSES)
-                    .pipeline_statistics(self.stat_flags()),
-            )?
-        } else {
-            vk::QueryPool::null()
-        };
-        let compacted = if self.shaders {
-            query_pool(
-                &vk::QueryPoolCreateInfo::default()
-                    .query_type(vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR)
-                    .query_count(MAX_PASSES),
-            )?
-        } else {
-            vk::QueryPool::null()
-        };
+        let none = vk::QueryPipelineStatisticFlags::empty();
+        let timestamps =
+            (self.timestamp_mask != 0).then(|| Queries::new(vk::QueryType::TIMESTAMP, none));
+        let stats = self
+            .shaders
+            .then(|| Queries::new(vk::QueryType::PIPELINE_STATISTICS, self.stat_flags()));
+        let compacted = self.shaders.then(|| {
+            Queries::new(
+                vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+                none,
+            )
+        });
         Ok(ListResources {
             pool,
             cmd,
@@ -192,17 +250,9 @@ impl Queue {
     fn destroy_resources(&self, r: ListResources) {
         let d = &self.shared.device;
         // SAFETY: the resources are idle and owned by this queue alone.
-        unsafe {
-            d.destroy_command_pool(r.pool, None);
-            if r.timestamps != vk::QueryPool::null() {
-                d.destroy_query_pool(r.timestamps, None);
-            }
-            if r.stats != vk::QueryPool::null() {
-                d.destroy_query_pool(r.stats, None);
-            }
-            if r.compacted != vk::QueryPool::null() {
-                d.destroy_query_pool(r.compacted, None);
-            }
+        unsafe { d.destroy_command_pool(r.pool, None) };
+        for queries in [r.timestamps, r.stats, r.compacted].into_iter().flatten() {
+            queries.destroy(d);
         }
     }
 
@@ -222,25 +272,22 @@ impl Queue {
             }
             pools.free.pop()
         };
-        let res = match reused {
+        let mut res = match reused {
             Some(r) => r,
             None => self.create_resources()?,
         };
+        for queries in [&mut res.timestamps, &mut res.stats, &mut res.compacted]
+            .into_iter()
+            .flatten()
+        {
+            queries.begin();
+        }
         let d = &self.shared.device;
         // SAFETY: the resources are idle (their last submit completed) and owned by this list.
         let begun = unsafe {
             d.reset_command_pool(res.pool, vk::CommandPoolResetFlags::empty())
                 .map_err(Error::vk("vkResetCommandPool"))
                 .and_then(|()| {
-                    if res.timestamps != vk::QueryPool::null() {
-                        d.reset_query_pool(res.timestamps, 0, 2 * MAX_PASSES);
-                    }
-                    if res.stats != vk::QueryPool::null() {
-                        d.reset_query_pool(res.stats, 0, MAX_PASSES);
-                    }
-                    if res.compacted != vk::QueryPool::null() {
-                        d.reset_query_pool(res.compacted, 0, MAX_PASSES);
-                    }
                     d.begin_command_buffer(
                         res.cmd,
                         &vk::CommandBufferBeginInfo::default()
@@ -534,25 +581,18 @@ impl Queue {
     fn read_passes(&self, res: &ListResources, passes: &[PassRecord]) -> Vec<PassResult> {
         let d = &self.shared.device;
         let mut ticks = vec![0u64; 2 * passes.len()];
-        if res.timestamps != vk::QueryPool::null() && !passes.is_empty() {
-            // SAFETY: every query in range was written by the completed submit.
-            let _ = unsafe {
-                d.get_query_pool_results(
-                    res.timestamps,
-                    0,
-                    &mut ticks,
-                    vk::QueryResultFlags::TYPE_64,
-                )
-            };
+        if let Some(timestamps) = &res.timestamps {
+            timestamps.read(d, &mut ticks);
         }
         // Values come in flag-bit order: FRAGMENT (7), COMPUTE (10), TASK (11), MESH (12).
         let read_stats = |index: u32| {
             let flags = vk::QueryResultFlags::TYPE_64;
+            let (pool, index) = res.stats.as_ref().expect("passes with stats").at(index);
             // SAFETY: the query was begun and ended in the completed submit.
             unsafe {
                 if self.graphics {
                     let mut v = [[0u64; 4]];
-                    let _ = d.get_query_pool_results(res.stats, index, &mut v, flags);
+                    let _ = d.get_query_pool_results(pool, index, &mut v, flags);
                     let [pixel, compute, task, mesh] = v[0];
                     PipelineStats {
                         compute,
@@ -562,7 +602,7 @@ impl Queue {
                     }
                 } else {
                     let mut v = [[0u64; 1]];
-                    let _ = d.get_query_pool_results(res.stats, index, &mut v, flags);
+                    let _ = d.get_query_pool_results(pool, index, &mut v, flags);
                     PipelineStats {
                         compute: v[0][0],
                         ..Default::default()
