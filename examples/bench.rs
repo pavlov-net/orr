@@ -8,8 +8,9 @@
 //! prints and reports their times beside the others', with each kind of frame's GPU span. Built
 //! with the `nsight-perf` feature, on a device with `Caps::perf_counters`, it also collects
 //! per-pass Nsight Perf SDK counters for one frame of the first script (the middle one unless
-//! `--counter-frame N` says, rendered once more for each replay the default metrics need),
-//! prints them as a table and adds them to the report.
+//! `--counter-frame N` says, rendered once more for each replay its metrics need; the default
+//! metrics unless `--counter-metrics` names others), prints them as a table and adds them to the
+//! report.
 //!
 //! `bench [--synthetic] [--script NAME] [--script-frames N] [--headless] [scene switches...]`
 //! (see `orr_examples::vegetation`). It runs all four scripts for 600 frames each unless told

@@ -24,9 +24,11 @@
 //! `--script NAME` (walk, turn, overview, flythrough, flyout), `--script-frames N`,
 //! `--exact-frame N` and `--exact-frames K` (the first of the first script's frames whose
 //! passes are timed exactly, with `Renderer::set_exact_timing`, and how many, 3 unless given;
-//! they are not samples) and `--counter-frame N` (with the `nsight-perf` feature: the frame of
+//! they are not samples), `--stage-passes` (`ViewLighting::stage_passes`: each stage of the path
+//! loop in a pass of its own), `--counter-frame N` (with the `nsight-perf` feature: the frame of
 //! the first script whose per-pass Nsight Perf SDK counters the run collects, when the device
-//! has `Caps::perf_counters`).
+//! has `Caps::perf_counters`) and `--counter-metrics A,B,...` (the metrics it collects, by the
+//! SDK's names, `DEFAULT_COUNTER_METRICS` unless given).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -253,9 +255,14 @@ pub struct Settings {
     pub exact_frame: Option<u64>,
     /// How many frames from `exact_frame` on are timed exactly.
     pub exact_frames: u64,
+    /// `ViewLighting::stage_passes`.
+    pub stage_passes: bool,
     /// The frame of the first script that is replayed as a counter frame.
     #[cfg(feature = "nsight-perf")]
     pub counter_frame: Option<u64>,
+    /// The counter frame's metrics, by the SDK's names.
+    #[cfg(feature = "nsight-perf")]
+    pub counter_metrics: Vec<String>,
 }
 
 impl Settings {
@@ -290,8 +297,14 @@ impl Settings {
             script_frames: None,
             exact_frame: None,
             exact_frames: 3,
+            stage_passes: false,
             #[cfg(feature = "nsight-perf")]
             counter_frame: None,
+            #[cfg(feature = "nsight-perf")]
+            counter_metrics: orr::orr_gpu::DEFAULT_COUNTER_METRICS
+                .iter()
+                .map(|&m| m.to_owned())
+                .collect(),
         };
         let mut args = rest.iter();
         while let Some(a) = args.next() {
@@ -357,8 +370,19 @@ impl Settings {
                 "--script-frames" => s.script_frames = Some(number(value()) as u64),
                 "--exact-frame" => s.exact_frame = Some(number(value()) as u64),
                 "--exact-frames" => s.exact_frames = number(value()) as u64,
+                "--stage-passes" => s.stage_passes = true,
                 #[cfg(feature = "nsight-perf")]
                 "--counter-frame" => s.counter_frame = Some(number(value()) as u64),
+                #[cfg(feature = "nsight-perf")]
+                "--counter-metrics" => {
+                    s.counter_metrics = value()
+                        .split(',')
+                        .map(|m| match m.trim() {
+                            "" => panic!("--counter-metrics A,B,..., with no empty name"),
+                            m => m.to_owned(),
+                        })
+                        .collect();
+                }
                 _ => panic!("unknown argument {a}"),
             }
         }
@@ -1709,8 +1733,13 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
             #[cfg(feature = "nsight-perf")]
             let counting = counting && {
                 if session.is_none() {
+                    let metrics: Vec<&str> = settings
+                        .counter_metrics
+                        .iter()
+                        .map(String::as_str)
+                        .collect();
                     session = render_queue
-                        .start_counters(orr::orr_gpu::DEFAULT_COUNTER_METRICS)
+                        .start_counters(&metrics)
                         .inspect_err(|e| log::warn!("no counter session: {e}"))
                         .ok();
                 }
@@ -1801,7 +1830,10 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                     texture_filter: TextureFilter::Hardware,
                     target: view_target,
                 };
-                let lighting = ViewLighting::default();
+                let lighting = ViewLighting {
+                    stage_passes: settings.stage_passes,
+                    ..ViewLighting::default()
+                };
                 f.prepare_view(&lit, &lighting, &output)
                     .expect("prepare view");
                 f.update_scenes(&mut |c| scene.record(c, eye, t as f32, previous as f32))

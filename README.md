@@ -151,6 +151,9 @@ name `NVPERF_SDK_PATH`'s. `bench` then adds one frame's counters to its table an
 cargo run --release -p orr_examples --features nsight-perf --example bench -- --headless
 ```
 
+Its `--counter-metrics` takes other metrics, comma-separated, by the names the SDK lists under
+`NvPerf/doc/metrics`, and `--stage-passes` times each stage of the path loop as a pass of its own.
+
 A program loads the SDK with `DeviceDesc::perf_counters`, opens a `CounterSession` for the
 metrics it wants with `Queue::start_counters`, and puts each frame it counts between the
 session's `begin_frame` and `end_frame`. Each pass's `PassResult::counters` then sits beside its
