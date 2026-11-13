@@ -161,6 +161,39 @@ SDK's range work, so its rates and percentages say little. For numbers that comp
 to run, keep the scene, camera, resolution, settings and frame the same, and lock the GPU's
 clocks as the SDK's guide describes under "Ensuring Stable Measurements".
 
+CPU and GPU timelines come from the [Tracy](https://github.com/wolfpld/tracy) profiler, with
+orr_gpu's `tracy` feature, which `orr` forwards; off by default, and without it nothing is
+compiled in. orr's steps get zones (`begin_frame`, `update_scenes`, `render_view`, `end` and the
+work inside each, such as the wait for an earlier frame, streaming, uploads and the recording of
+each part of a view), as do submits, presents, the loading thread's work and loading jobs, and
+pipeline creation, whose zone shows the pipeline's name (a path stage's with its mask). orr names
+the threads it starts, marks a frame at `Frame::end` and a `presented image` frame at each
+present, and plots the path pipelines compiling, the loading jobs queued, the streams and mount
+reads in flight and each frame's upload bytes. Each pass is a zone on its queue's GPU context,
+placed on the CPU timeline by its `PassResult::cpu` times, so GPU zones need
+`Caps::calibrated_timestamps`, arrive a few frames late, and share the pass timestamps' early
+ends described above. In Tracy a GPU zone's CPU-side times are when orr read its result, not
+when it was recorded. Metal has no GPU zones. `orr_cook` has a `tracy` feature of its own.
+
+The examples' `tracy` feature turns on orr's and the cook's, with the Tracy client's default
+features. tracy-client's `only-localhost` keeps the client off the network:
+
+```sh
+cargo run --profile profiling -p orr_examples --features tracy,tracy-client/only-localhost --example bench -- --headless
+tracy-capture -a 127.0.0.1 -o bench.tracy
+```
+
+A program built on orr turns on `orr`'s `tracy` feature and links the same Tracy client: it
+depends on `tracy-client` `=0.19.0` and `tracy-client-sys` `=0.30.1`, the versions orr pins,
+which speak the protocol of Tracy 0.14.1, so capture with that release's tools. orr asks only for
+the client's `enable` feature; the program chooses the rest (`only-localhost`, `ondemand`,
+sampling and so on) on its own dependency. orr never starts the client: it runs from process start
+by default, and under `manual-lifetime` orr records nothing until the program starts it. The
+program's own zones around orr's calls hold orr's zones in the same capture. orr marks the frames,
+so the program marks none of its own, or marks secondary frames under names of its own. With the
+feature, a zone costs a timestamp and a queue write whether or not a profiler is connected, and
+without `ondemand` the client keeps every event in memory until one connects.
+
 ## Contributing
 
 Install the pre-commit hook, which runs fmt, clippy and typos:
