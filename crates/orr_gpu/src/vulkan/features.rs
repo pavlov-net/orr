@@ -22,6 +22,7 @@ const REQUIRED_EXTENSIONS: &[&CStr] = &[
     ash::nv::partitioned_acceleration_structure::NAME,
     ash::ext::memory_budget::NAME,
     ash::khr::maintenance8::NAME,
+    ash::khr::shader_maximal_reconvergence::NAME,
 ];
 
 /// Required on devices that present (`QueueRequest::present`).
@@ -123,6 +124,7 @@ pub(crate) struct FeatureChain {
     cluster: vk::PhysicalDeviceClusterAccelerationStructureFeaturesNV<'static>,
     ptlas: vk::PhysicalDevicePartitionedAccelerationStructureFeaturesNV<'static>,
     maintenance8: vk::PhysicalDeviceMaintenance8FeaturesKHR<'static>,
+    reconvergence: vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR<'static>,
     omm: vk::PhysicalDeviceOpacityMicromapFeaturesKHR<'static>,
     address_commands: vk::PhysicalDeviceDeviceAddressCommandsFeaturesKHR<'static>,
     indirect_copy: vk::PhysicalDeviceCopyMemoryIndirectFeaturesKHR<'static>,
@@ -175,6 +177,7 @@ impl FeatureChain {
             ptr(&mut self.cluster),
             ptr(&mut self.ptlas),
             ptr(&mut self.maintenance8),
+            ptr(&mut self.reconvergence),
         ]);
         if opt.ray_dispatch {
             chain.push(ptr(&mut self.ray_pipeline));
@@ -441,7 +444,7 @@ pub(super) fn select(
     };
 
     let c = &q.core.features;
-    let required: [(&str, vk::Bool32); 45] = [
+    let required: [(&str, vk::Bool32); 46] = [
         ("shaderInt64", c.shader_int64),
         // Slang declares the Geometry capability for SV_PrimitiveID in mesh and pixel stages.
         ("geometryShader", c.geometry_shader),
@@ -520,6 +523,12 @@ pub(super) fn select(
         // Without it OpSRem and OpSMod of a negative operand are poison (Vulkan SPIR-V
         // environment, "Precision and Operation of SPIR-V Instructions").
         ("maintenance8", q.maintenance8.maintenance8),
+        // The software raster declares MaximallyReconvergesKHR: its shuffles read other lanes
+        // after branches that split its lanes and subgroups.
+        (
+            "shaderMaximalReconvergence",
+            q.reconvergence.shader_maximal_reconvergence,
+        ),
     ];
     if let Some((name, _)) = required.iter().find(|(_, v)| *v == vk::FALSE) {
         return Err((*name).to_owned());
@@ -650,6 +659,7 @@ pub(super) fn select(
     e.cluster.cluster_acceleration_structure = 1;
     e.ptlas.partitioned_acceleration_structure = 1;
     e.maintenance8.maintenance8 = 1;
+    e.reconvergence.shader_maximal_reconvergence = 1;
     e.ray_pipeline.ray_tracing_pipeline = 1;
     e.ray_pipeline.ray_tracing_pipeline_trace_rays_indirect = 1;
     e.reorder.ray_tracing_invocation_reorder = 1;

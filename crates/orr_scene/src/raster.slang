@@ -539,9 +539,12 @@ int2 soft_span(SoftTriangle t, int y)
 
 // One workgroup per software cluster: corners to snapped pixels, one triangle set up per
 // thread, then each wave rasters its triangles with the rows of wide ones spread over its
-// lanes.
+// lanes. Its waves leave the loop over units apart and its lanes split inside it, so without
+// maximal reconvergence the shuffles may read lanes outside their tangle, which are poison
+// (SPIR-V OpGroupNonUniformShuffle).
 [shader("compute")]
 [numthreads(128, 1, 1)]
+[MaximallyReconverges]
 void software(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
 {
     RasterGpu* r = root.raster;
