@@ -19,8 +19,8 @@ public struct BladeGeometry : IDrawn
         uint index = item_slice(item) * SLICE + window + i.primitive / per;
         Blade b = field_blade(f, item_tile(item), index);
         float widen = blade_widen(blade_keep(f, distance(field_eye(f), b.root))) * (far ? CHORD_WIDTH : 1.0);
-        float2 sway = blade_sway(f, b, f.time);
-        float2 before = blade_sway(f, b, f.previous_time);
+        float2 sway = blade_sway(f, b, false);
+        float2 before = blade_sway(f, b, true);
         uint3 corners = far ? uint3(0, 1, 2) : full_triangle(i.primitive % per);
         DrawnTriangle t;
         for (uint j = 0; j < 3; j++)
@@ -33,8 +33,11 @@ public struct BladeGeometry : IDrawn
         }
         t.cluster_user = 0;
         t.vertex_user = uint3(blade_color(b));
-        // An exact cell traces this blade, and a far blade's chord lies in its plane.
-        t.error = far || cell_exact(f, item_tile(item), index % CELL_COUNT) ? 0.0 : blade_sag(b, sway);
+        // An exact cell traces this blade as drawn where it is drawn no wider, and a far blade's
+        // chord lies in its plane.
+        bool exact = !far && widen <= 1.0 && cell_exact(f, item_tile(item), index % CELL_COUNT)
+            && blade_traced(f, b, cast_distance(f, b.root.xz));
+        t.error = far || exact ? 0.0 : blade_sag(b, sway);
         return t;
     }
 }

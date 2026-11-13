@@ -2,7 +2,9 @@
 // each of CELL_COUNT cells in Morton order. A tile's candidate blades come in ranks, one blade
 // a cell: candidate `index` is rank `index / CELL_COUNT` of cell `index % CELL_COUNT`. The
 // ranks below a share that falls with distance from the eye are drawn, so thinning leaves
-// every cell its share, and consecutive candidates stand side by side. Every stage that needs
+// every cell its share, and consecutive candidates stand side by side. A cell's blades stand
+// in `strata` x `strata` squares of it, consecutive ranks in squares far apart, so any run of
+// ranks spreads over the cell and the ranks of one residue stand together. Every stage that needs
 // a blade derives it again from its tile and index: the draw's task stage, the caster kernel,
 // and the material resolve through `BladeGeometry`. Nothing is kept per blade.
 //
@@ -14,11 +16,15 @@
 // and the triangle in the blade, so a pixel leads back to its blade without the stages'
 // culling.
 //
-// Rays trace less: the blades themselves in the cells nearer than `exact`, each caster item one
-// cell's CASTER_SLICE_EXACT ranks, and elsewhere a chord for every `cast_stride`th rank, as
-// many times as wide, each item four such ranks of a block of 16 cells. Both ranges measure a
-// distance that grows faster outside the view cone (`cast_distance`), so most of what is
-// traced lies where the camera looks.
+// Rays trace fewer, whatever the draw keeps: the blades themselves in the cells nearer than
+// `exact`, and elsewhere a chord for every block's stride of ranks, a stride that grows with
+// the block's distance past the exact cells (`chord_keep`), each chord wider for the ranks it
+// stands for. Each caster item is one cluster, and a cluster's triangles stand close together,
+// so rays meet few clusters at once: an exact item holds one square of a cell's strata
+// (`rank_square`), and a chord item the largest square of cells whose chords fit in
+// CASTER_SLICE_CHORD. They thin out at random from `cast_fade` to none at `cast_range`.
+// Both ranges measure a distance that grows faster outside the view cone (`cast_distance`), so
+// most of what is traced lies where the camera looks. A stored field traces what it draws.
 module blades;
 
 import orr_shaders.math;
@@ -76,7 +82,7 @@ public struct Field
     public float* heights;      // side x side samples, spacing m apart from (origin_x, origin_z)
     public uint* items;         // this frame's draw items
     public uint* item_state;    // per draw item: 1 where the draw's first pass found it occluded
-    public uint* caster_items;  // this frame's caster items: an exact one's slice is its cell and 256 times its run of ranks, a chord one's its block and 16 times its run
+    public uint* caster_items;  // this frame's caster items: an exact one's slice is its cell and 256 times its residue (`caster_candidate`), a chord one's as CHORD_*_SHIFT say
     public uint* counts;        // FIELD_*
     public uint* draw_args;     // the draw's task workgroups x, y, z; then the caster kernel's; then 1
     public float4 planes[5];    // the view's frustum in the entry's space: inside where dot(xyz, p) + w >= 0
@@ -89,21 +95,27 @@ public struct Field
     public uint tiles;          // per side
     public float tile_size;     // m
     public uint ranks;          // candidate blades per cell
+    public uint strata;         // a cell's blades stand in `strata` x `strata` squares (`rank_square`)
+    public uint strata_step;    // coprime to strata^2: how far apart consecutive ranks' squares lie
     public uint item_capacity;
     public uint caster_capacity;
     public float full;          // m from the eye: every candidate is drawn nearer
     public float range;         // m: none past it
     public float detail;        // m: tiles nearer draw full blades
-    public float exact;         // m of `cast_distance`: cells nearer, of tiles that draw full blades, trace the blades they draw
+    public float exact;         // m of `cast_distance`: cells nearer, of tiles that draw full blades, trace their blades as drawn
+    public float cast_fade;     // m of `cast_distance`: past it the blades traced thin out, to none at `cast_range`
     public float cast_range;    // m of `cast_distance`: no blade past it is traced
-    public uint cast_stride;    // elsewhere a chord stands for this many ranks
+    public float cast_budget;   // the chords' budget term (`chord_keep`)
+    public uint stored;         // 1: rays trace what the draw keeps, as the batch is what the raster draws
     public float forward_x;     // the view's direction on the ground plane, unit
     public float forward_z;
     public float cast_cone;     // the cosine of the angle from it within which `cast_distance` is the distance
     public float cast_stretch;  // how many times the distance it is directly behind the eye
     public float wind;          // tip sway as a share of height
-    public float time;          // s
-    public float previous_time;
+    public float wave;          // rad, under 2 pi: the sway's slow phase this frame
+    public float ripple;        // and its fast one
+    public float wave_before;   // and both last frame
+    public float ripple_before;
     public float eye_x;         // entry space
     public float eye_y;
     public float eye_z;
@@ -235,11 +247,23 @@ public bool cell_exact(Field* f, uint tile, uint cell)
     return cast_distance(f, cell_center(f, tile, cell)) < f.exact;
 }
 
+// The square of its cell, of `Field.strata` a side, that rank `rank` stands in. A cell's ranks
+// cycle through every square in an order `offset` turns.
+uint2 rank_square(Field* f, uint rank, uint offset)
+{
+    uint count = f.strata * f.strata;
+    uint k = ((rank % count) * f.strata_step + offset % count) % count;
+    return uint2(k % f.strata, k / f.strata);
+}
+
 // Candidate blade `index` of `tile`.
 public Blade field_blade(Field* f, uint tile, uint index)
 {
-    uint s = pcg(pcg(tile) + index * 0x9e3779b9u);
-    float2 cell = float2(cell_place(index % CELL_COUNT)) + float2(pcg_float(s), pcg_float(s + 1));
+    uint base = pcg(tile);
+    uint s = pcg(base + index * 0x9e3779b9u);
+    uint at = index % CELL_COUNT;
+    float2 square = float2(rank_square(f, index / CELL_COUNT, pcg(base + at * 0x85ebca6bu)));
+    float2 cell = float2(cell_place(at)) + (square + float2(pcg_float(s), pcg_float(s + 1))) / float(f.strata);
     float2 xz = tile_corner(f, tile) + cell * (f.tile_size / float(CELLS));
     Blade b;
     b.root = float3(xz.x, height_at(field_heights(f), xz.x, xz.y), xz.y);
@@ -281,11 +305,14 @@ public uint kept_ranks(Field* f, float keep)
     return min(uint(ceil(keep * float(f.ranks))), f.ranks);
 }
 
-// The tip's sideways sway at wind time `time`, in x and z.
-public float2 blade_sway(Field* f, Blade b, float time)
+// The tip's sideways sway this frame or `before`, in x and z. The field's phases follow the
+// wind's clock and keep f32's precision however long it runs.
+public float2 blade_sway(Field* f, Blade b, bool before)
 {
     float3 r = b.root;
-    float gust = sin(time * 1.7 + r.x * 0.35 + r.z * 0.21) * 0.6 + sin(time * 3.1 + r.x * 0.9 + float(b.seed & 255) * 0.03) * 0.2;
+    float wave = before ? f.wave_before : f.wave;
+    float ripple = before ? f.ripple_before : f.ripple;
+    float gust = sin(wave + r.x * 0.35 + r.z * 0.21) * 0.6 + sin(ripple + r.x * 0.9 + float(b.seed & 255) * 0.03) * 0.2;
     return f.wind * b.height * gust * float2(1.0, 0.4);
 }
 
@@ -318,13 +345,14 @@ public float3 blade_point(Blade b, float scale, float2 sway, float2 at)
         + float3(sway.x, 0.0, sway.y) * bend + float3(0.0, b.height * at.y, 0.0);
 }
 
-// The unit normal of blade `b` there: its face's, turned outward toward its edges.
+// The unit normal of blade `b` there: its face's, on the side `full_triangle` and the
+// one-triangle blade wind toward, turned outward toward its edges.
 public float3 blade_normal(Blade b, float2 sway, float2 at)
 {
     float3 across = float3(cos(b.yaw), 0.0, sin(b.yaw));
     float3 forward = float3(-across.z, 0.0, across.x);
     float3 along = forward * (2.0 * b.lean * b.height * at.y) + float3(sway.x, 0.0, sway.y) * (2.0 * at.y) + float3(0.0, b.height, 0.0);
-    return normalize(normalize(cross(along, across)) + across * (0.5 * at.x));
+    return normalize(normalize(cross(across, along)) + across * (0.5 * at.x));
 }
 
 // How far the middle of full blade `b` stands off the triangle of its root and tip.
@@ -334,40 +362,128 @@ public float blade_sag(Blade b, float2 sway)
     return 0.25 * length(forward * (b.lean * b.height) + sway);
 }
 
-// The blade's color, linear Rec.2020, as its vertices' word for the surface: 8 bits a channel.
+// The blade's color, linear Rec.2020, as its vertices' word for the surface: 8 bits a channel
+// of its square root, which holds dark colors about as finely as sRGB does.
 public uint blade_color(Blade b)
 {
     float dry = pcg_float(b.seed + 6);
     float3 c = lerp(float3(0.16, 0.36, 0.08), float3(0.42, 0.44, 0.14), dry * dry);
-    uint3 q = uint3(round(saturate(c) * 255.0));
+    uint3 q = uint3(round(sqrt(saturate(c)) * 255.0));
     return q.x | (q.y << 8) | (q.z << 16);
 }
 
 public float3 blade_color_from(uint word)
 {
-    return float3(word & 255, (word >> 8) & 255, (word >> 16) & 255) / 255.0;
+    float3 s = float3(word & 255, (word >> 8) & 255, (word >> 16) & 255) / 255.0;
+    return s * s;
 }
 
 // The candidates a caster item covers, which emits one cluster of those it keeps: full blades
 // (at most 154 vertices and 126 triangles) or chords (192 and 64).
 public static const uint CASTER_SLICE_EXACT = 14;
 public static const uint CASTER_SLICE_CHORD = 64;
-// A chord item's cells, and the strided ranks it takes of each.
+// A chord block's cells, which share a stride.
 public static const uint CHORD_BLOCK = 16;
-public static const uint CHORD_RUN = CASTER_SLICE_CHORD / CHORD_BLOCK;
+// A chord item's slice: its block in the low four bits, then the cells of its square a side,
+// as a power of 2 (0, 1 or 2), then the square in the block, then its run of the chords of
+// each of the square's cells.
+public static const uint CHORD_SIDE_SHIFT = 4;
+public static const uint CHORD_SQUARE_SHIFT = 6;
+public static const uint CHORD_RUN_SHIFT = 10;
 
-// Candidate `lane` of caster item `item`: its index in the tile.
-public uint caster_candidate(Field* f, uint item, uint lane)
+// The share of the blades past the exact cells that chords stand for at `cast` m by
+// `cast_distance`: all of them at the exact cells' reach, then a share that falls as the
+// square of the distance past it, under a budget term that keeps their number within the
+// field's chords. The item and caster kernels must agree, so each operation rounds alone.
+public float chord_keep(Field* f, float cast)
 {
-    uint slice = item_slice(item);
-    if ((item & ITEM_EXACT) != 0)
-        return ((slice / CELL_COUNT) * CASTER_SLICE_EXACT + lane) * CELL_COUNT + slice % CELL_COUNT;
-    uint rank = ((slice / CHORD_BLOCK) * CHORD_RUN + lane / CHORD_BLOCK) * f.cast_stride;
-    return rank * CELL_COUNT + (slice % CHORD_BLOCK) * CHORD_BLOCK + lane % CHORD_BLOCK;
+    if (cast <= f.exact)
+        return 1.0;
+    precise float beyond = cast - f.exact;
+    precise float square = beyond * beyond;
+    precise float term = f.cast_budget / square;
+    precise float keep = 1.0 - exp(-term);
+    return keep;
 }
 
-// How wide a chord is for a blade drawn `widen` times as wide.
-public float chord_width(Field* f, float widen)
+// The ranks one chord of a block whose center lies `cast` m away by `cast_distance` stands for.
+public uint chord_stride(Field* f, float cast)
 {
-    return min(widen * CHORD_WIDTH * float(f.cast_stride), WIDEN_MAX * CHORD_WIDTH);
+    precise float blades = 1.0 / max(chord_keep(f, cast), 1e-6);
+    return clamp(uint(round(blades)), 1u, f.ranks);
+}
+
+// The center of chord block `block` of `tile` on the ground plane. The item and caster kernels
+// must agree on its stride, so each operation rounds alone.
+public float2 block_center(Field* f, uint tile, uint block)
+{
+    precise float cell = f.tile_size / float(CELLS);
+    precise float2 corner = float2(f.corner_x, f.corner_z) + float2(tile % f.tiles, tile / f.tiles) * f.tile_size;
+    precise float2 center = corner + (float2(cell_place(block * CHORD_BLOCK)) + 2.0) * cell;
+    return center;
+}
+
+// The stride of chord block `block` of `tile`.
+public uint block_stride(Field* f, uint tile, uint block)
+{
+    return chord_stride(f, cast_distance(f, block_center(f, tile, block)));
+}
+
+// The cells of the squares a block's chord items cover, when each of its cells has `chords`
+// chords: as many as hold up to CASTER_SLICE_CHORD of them.
+public uint chord_square_cells(uint chords)
+{
+    return chords > 16 ? 1 : chords > 4 ? 4 : 16;
+}
+
+// The block of chord item slice `slice`.
+public uint chord_item_block(uint slice)
+{
+    return slice & (CHORD_BLOCK - 1);
+}
+
+// Candidate `lane` of caster item `item` of `tile`: its index in the tile. An exact item's
+// slice is its cell and 256 times its residue: its ranks are the residue's, one square of the
+// cell's strata. A chord item's lanes run its square's cells in order, a run of each one's
+// chords. Chord `j` of a cell stands for the stride of ranks from `j` strides and is one of
+// them at random: a stride that shares a factor with the strata's squares would leave every
+// chord in a few squares. One past the cell's ranks traces nothing, so a last stride that the
+// ranks do not fill is traced in proportion. `stride` is the ranks the candidate stands for.
+public uint caster_candidate(Field* f, uint tile, uint item, uint lane, out uint stride)
+{
+    uint slice = item_slice(item);
+    stride = 1;
+    if ((item & ITEM_EXACT) != 0)
+        return (slice / CELL_COUNT + lane * f.strata * f.strata) * CELL_COUNT + slice % CELL_COUNT;
+    uint block = chord_item_block(slice);
+    uint cells = 1u << (2 * ((slice >> CHORD_SIDE_SHIFT) & 3));
+    uint run = CASTER_SLICE_CHORD / cells;
+    uint cell = block * CHORD_BLOCK + ((slice >> CHORD_SQUARE_SHIFT) & 15) * cells + lane / run;
+    uint chord = (slice >> CHORD_RUN_SHIFT) * run + lane % run;
+    stride = block_stride(f, tile, block);
+    uint pick = pcg(pcg(tile * CELL_COUNT + cell) + chord) % stride;
+    return (chord * stride + pick) * CELL_COUNT + cell;
+}
+
+// How much wider than its blade a chord is that stands for `blades` blades, or for a blade drawn
+// that many times as wide.
+public float chord_width(float blades)
+{
+    return min(blades, WIDEN_MAX) * CHORD_WIDTH;
+}
+
+// The share of a drawn field's blades rays trace `cast` m away by `cast_distance`: all of them
+// to `cast_fade`, none from `cast_range`, falling smoothly between.
+public float cast_share(Field* f, float cast)
+{
+    if (cast <= f.cast_fade)
+        return 1.0;
+    float t = saturate((cast - f.cast_fade) / (f.cast_range - f.cast_fade));
+    return 1.0 - t * t * (3.0 - 2.0 * t);
+}
+
+// Whether rays trace blade `b` of a drawn field, whose distance by `cast_distance` is `cast`.
+public bool blade_traced(Field* f, Blade b, float cast)
+{
+    return cast < f.cast_range && pcg_float(b.seed + 9) < cast_share(f, cast);
 }

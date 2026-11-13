@@ -15,7 +15,7 @@
 //! emits every frame; as blades of [`crate::grass`] drawn from the opaque hook with nothing
 //! stored; as the same blades stored in a batch; or none), `--no-grass-rays` (the grass
 //! is only rastered), `--blade-full M`, `--blade-detail M`,
-//! `--exact-blades N`, `--cast-range M`, `--chords N`, `--cast-stretch S` (see
+//! `--exact-blades N`, `--cast-fade M`, `--cast-range M`, `--chords N`, `--cast-stretch S` (see
 //! [`crate::grass::BladeSettings`]), `--dlss` (ray reconstruction at the render size that
 //! suits the extent), `--parts all|trunk`, `--poses-per-variant N`, `--pose-stride`,
 //! `--no-part-animation`, `--rt-range M`, `--animation-range M`, `--directional-lights L,T`,
@@ -333,6 +333,7 @@ impl Settings {
                 "--blade-full" => s.blades.full = number(value()),
                 "--blade-detail" => s.blades.detail = number(value()),
                 "--exact-blades" => s.blades.exact_blades = number(value()) as u32,
+                "--cast-fade" => s.blades.cast_fade = number(value()),
                 "--cast-range" => s.blades.cast_range = number(value()),
                 "--chords" => s.blades.chords = number(value()) as u32,
                 "--cast-stretch" => s.blades.cast_stretch = number(value()),
@@ -1796,7 +1797,6 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                 let forward = view_from_world.inverse() * Vec3::NEG_Z;
                 let grass = f.producer_entry(scene.scene, GRASS).expect("scene");
                 let field = scene.blades.as_mut().zip(grass).map(|(b, grass)| {
-                    let (t, previous) = (t as f32, previous as f32);
                     b.write(
                         id,
                         heights,

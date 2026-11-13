@@ -145,7 +145,7 @@ void task(uint3 group: SV_GroupID, uint lane: SV_GroupThreadID)
             k.width = b.width * widen * (far ? CHORD_WIDTH : 1.0);
             k.lean = b.lean;
             k.lane = lane;
-            k.sway = blade_sway(f, b, f.time);
+            k.sway = blade_sway(f, b, false);
             InterlockedOr(alive[lane >> 5], 1u << (lane & 31));
         }
     }

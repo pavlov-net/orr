@@ -1,9 +1,9 @@
 //! A field of blades with nothing stored per blade (`blades.slang`): a drawn producer
 //! entry whose blades a task and mesh pipeline derives and draws from the view's opaque hook,
 //! which the material resolve derives again per pixel through the linked `BladeGeometry`, and
-//! whose batch holds only what rays trace: the drawn blades near the eye and fewer, wider
-//! one-triangle chords past that. `stored` puts every drawn blade in the batch instead, to
-//! compare against.
+//! whose batch holds only what rays trace: the blades near the eye and fewer, wider
+//! one-triangle chords past that, in clusters of blades that stand together. `stored` puts
+//! every drawn blade in the batch instead, to compare against.
 
 use orr::orr_gpu::{
     Allocation, CommandList, Device, GpuPtr, Hazards, MemoryKind, MeshPipeline, SpecData, Stages,
@@ -25,8 +25,8 @@ pub mod shaders {
     include!(concat!(env!("OUT_DIR"), "/grass/orr_shaders.rs"));
 }
 
-/// `blades.slang`: the side of a tile, m, its cells, and the candidates of a draw item and of
-/// the two kinds of caster item.
+/// `blades.slang`: the side of a tile, m, its cells, the candidates of a draw item and of the
+/// two kinds of caster item, and the cells of a chord block.
 const TILE: f32 = 8.0;
 const CELLS: u32 = 16;
 const CELL_COUNT: u32 = CELLS * CELLS;
@@ -34,7 +34,6 @@ const SLICE: u32 = 128;
 const CASTER_SLICE_EXACT: u32 = 14;
 const CASTER_SLICE_CHORD: u32 = 64;
 const CHORD_BLOCK: u32 = 16;
-const CHORD_RUN: u32 = CASTER_SLICE_CHORD / CHORD_BLOCK;
 const FULL_VERTICES: u32 = 11;
 const FULL_TRIANGLES: u32 = 9;
 /// How far a tile's box reaches past its square, at most (`blade_reach_max`).
@@ -57,14 +56,17 @@ pub struct BladeSettings {
     /// The blades rays trace as they are drawn, at most: the cells nearest the eye, as far as
     /// this many reach among the tiles that draw full blades.
     pub exact_blades: u32,
+    /// Past this the blades traced thin out at random, to none at `cast_range`.
+    pub cast_fade: f32,
     /// No blade past this is traced; 0 traces none.
     pub cast_range: f32,
-    /// The chords that stand for the other drawn blades in that range, at most: one for as
-    /// many of a cell's blades as keeps their number under it.
+    /// The chords that stand for the other blades in that range, at most: one for as many of a
+    /// cell's blades as keeps their number under it, fewer with distance.
     pub chords: u32,
     /// Both ranges count a blade outside the view farther than it is, so most of what is
     /// traced lies where the camera looks: the half angle of the cone around the view's
-    /// direction, on the ground plane, within which a blade counts at its distance,
+    /// direction, on the ground plane, within which a blade counts at its distance (a half
+    /// turn or more counts every direction alike),
     pub cast_cone: f32,
     /// and how many times its distance one directly behind the eye counts at; 1 counts every
     /// direction alike.
@@ -87,6 +89,7 @@ impl Default for BladeSettings {
             range: 100.0,
             detail: 40.0,
             exact_blades: 16_384,
+            cast_fade: 40.0,
             cast_range: 50.0,
             chords: 131_072,
             cast_cone: 1.05,
@@ -101,12 +104,14 @@ impl Default for BladeSettings {
 /// What rays trace of a field, as the kernels read it.
 #[derive(Clone, Copy, Debug)]
 pub struct Traced {
-    /// Cells nearer, by `cast_distance`, trace the blades they draw.
+    /// Cells nearer, by `cast_distance`, trace their blades as drawn.
     pub exact: f32,
-    /// No blade past this, by `cast_distance`, is traced.
+    /// Past this, by `cast_distance`, the blades traced thin out,
+    pub fade: f32,
+    /// to none past this.
     pub range: f32,
-    /// Elsewhere a chord stands for this many of a cell's blades.
-    pub stride: u32,
+    /// The chords' budget term (`chord_keep`).
+    pub budget: f32,
     /// `Field.cast_cone` and `Field.cast_stretch`.
     pub cone: f32,
     pub stretch: f32,
@@ -136,56 +141,157 @@ impl Traced {
     fn slope(&self) -> f32 {
         self.stretch + (self.stretch - 1.0) / (self.cone + 1.0)
     }
+
+    /// `blades.slang` `chord_keep`.
+    fn chord_keep(&self, cast: f32) -> f32 {
+        if cast <= self.exact {
+            return 1.0;
+        }
+        let beyond = cast - self.exact;
+        1.0 - (-self.budget / (beyond * beyond)).exp()
+    }
+
+    /// `blades.slang` `chord_stride` in a field of `ranks` candidate ranks.
+    fn chord_stride(&self, cast: f32, ranks: u32) -> u32 {
+        ((1.0 / self.chord_keep(cast).max(1e-6)).round() as u32).clamp(1, ranks)
+    }
+
+    /// `blades.slang` `cast_share`.
+    fn share(&self, cast: f32) -> f32 {
+        if cast <= self.fade {
+            return 1.0;
+        }
+        let t = ((cast - self.fade) / (self.range - self.fade)).clamp(0.0, 1.0);
+        1.0 - t * t * (3.0 - 2.0 * t)
+    }
+}
+
+/// `blades.slang` `chord_square_cells`.
+fn chord_square_cells(chords: u32) -> u32 {
+    match chords {
+        17.. => 1,
+        5.. => 4,
+        _ => 16,
+    }
+}
+
+/// `Field.strata` for `ranks` candidate ranks a cell: the squares a side that a cell's blades
+/// stand in, enough that one square's ranks fit an exact caster item.
+fn strata(ranks: u32) -> u32 {
+    let squares = ranks.div_ceil(CASTER_SLICE_EXACT);
+    let side = squares.isqrt();
+    if side * side < squares {
+        side + 1
+    } else {
+        side
+    }
+}
+
+/// `Field.strata_step` for `strata`: coprime to its squares and near their golden share, so
+/// consecutive ranks stand in squares far apart.
+fn strata_step(strata: u32) -> u32 {
+    let count = strata * strata;
+    let gcd = |mut a: u32, mut b: u32| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    let near = (count as f32 * 0.618).round() as u32;
+    (near..)
+        .find(|&step| gcd(step, count) == 1)
+        .expect("count + 1 is coprime to count")
 }
 
 impl BladeSettings {
+    /// Candidate blades per cell.
+    fn ranks(&self) -> u32 {
+        let cell = TILE / CELLS as f32;
+        (self.density * cell * cell).round().max(1.0) as u32
+    }
+
     /// What the kernels read. A stored field traces what it draws, everywhere; a drawn one
-    /// fits the reach of its exact cells and its chords' stride to their budgets, with every
-    /// blade in reach drawn.
+    /// fits the reach of its exact cells and its chords' budget term to their budgets, with
+    /// every blade in reach traced.
     fn traced(&self) -> Traced {
+        // A cone of a half turn or more holds every direction, which nothing stretches. Its
+        // cosine is -1 already short of a half turn in f32, where `cast_distance` divides by 0.
+        let cone = self.cast_cone.cos();
+        let every = self.cast_cone >= std::f32::consts::PI || cone <= -1.0;
         let mut t = Traced {
             exact: 0.0,
+            fade: 0.0,
             range: 0.0,
-            stride: 1,
-            cone: self.cast_cone.cos(),
-            stretch: self.cast_stretch.max(1.0),
+            budget: f32::INFINITY,
+            cone: if every { 1.0 } else { cone },
+            stretch: if every {
+                1.0
+            } else {
+                self.cast_stretch.max(1.0)
+            },
         };
         if self.stored {
             t.exact = f32::MAX.sqrt();
             t.range = self.range;
+            t.fade = self.range;
             t.stretch = 1.0;
         } else if self.rays {
             t.range = self.cast_range;
+            t.fade = self.cast_fade.min(self.cast_range);
             // The reach whose blades fit the budget: their number grows with it.
             let (mut lo, mut hi) = (0.0, self.detail.min(self.cast_range));
             for _ in 0..24 {
                 let mid = 0.5 * (lo + hi);
-                if self.drawn_within(&t, mid) <= f64::from(self.exact_blades) {
+                if self.traced_within(&t, mid, false) <= f64::from(self.exact_blades) {
                     lo = mid;
                 } else {
                     hi = mid;
                 }
             }
             t.exact = lo;
-            let rest = self.drawn_within(&t, t.range) - self.drawn_within(&t, t.exact);
-            t.stride = (rest / f64::from(self.chords.max(1))).ceil().max(1.0) as u32;
+            // The largest budget term whose chords fit theirs, by halves of its log. Chords
+            // within the exact cells' reach stand for one blade each, whatever the term.
+            let exact = self.traced_within(&t, t.exact, true);
+            let chords = |t: &Traced| self.traced_within(t, t.range, true) - exact;
+            if chords(&t) > f64::from(self.chords) {
+                let (mut lo, mut hi) = ((1.0f32 / 4096.0).log2(), 1.0e6f32.log2());
+                for _ in 0..32 {
+                    let mid = 0.5 * (lo + hi);
+                    t.budget = mid.exp2();
+                    if chords(&t) <= f64::from(self.chords) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                t.budget = lo.exp2();
+            }
         }
         t
     }
 
-    /// The blades drawn within `reach` m of the eye by `cast_distance`, on flat ground.
-    fn drawn_within(&self, t: &Traced, reach: f32) -> f64 {
+    /// The blades traced within `reach` m of the eye by `cast_distance`, on flat ground: all
+    /// of them to the fade, thinning to none at the cast range (`blade_traced`), or with
+    /// `chords` the chords that stand for them (`chord_stride`).
+    fn traced_within(&self, t: &Traced, reach: f32, chords: bool) -> f64 {
         const ANGLES: u32 = 256;
         const STEP: f32 = 0.125;
+        let ranks = self.ranks();
         let mut blades = 0.0;
         for a in 0..ANGLES {
             let angle = (a as f32 + 0.5) / ANGLES as f32 * std::f32::consts::TAU;
-            let radius = t.radius(reach, angle.cos());
+            let cos = angle.cos();
+            let radius = t.radius(reach, cos);
             let rings = (radius / STEP).ceil() as u32;
             for k in 0..rings {
                 let r = (k as f32 + 0.5) * radius / rings as f32;
                 let area = r * (radius / rings as f32) * std::f32::consts::TAU / ANGLES as f32;
-                blades += f64::from(self.density * self.keep(r) * area);
+                let cast = t.distance(r, cos);
+                let mut share = t.share(cast);
+                if chords {
+                    share /= t.chord_stride(cast, ranks) as f32;
+                }
+                blades += f64::from(self.density * share * area);
             }
         }
         blades
@@ -214,6 +320,9 @@ pub struct Blades {
     tiles: u32,
     /// Candidate blades per cell.
     ranks: u32,
+    /// `Field.strata` and `Field.strata_step`.
+    strata: u32,
+    strata_step: u32,
     pub traced: Traced,
     pub capacity: Capacity,
     items: Allocation<u32>,
@@ -255,14 +364,16 @@ impl Blades {
         frames_in_flight: u32,
     ) -> Self {
         let tiles = (side / TILE).ceil() as u32;
-        let cell = TILE / CELLS as f32;
-        let ranks = (settings.density * cell * cell).round().max(1.0) as u32;
+        let ranks = settings.ranks();
+        let strata = strata(ranks);
+        // Every slice is below the exact items': a draw item's of ranks * CELL_COUNT / SLICE and
+        // a chord item's of up to 16 runs of 64 chords, with no more ranks than the strata hold.
         assert!(
-            tiles * tiles <= 1 << 16 && ranks.div_ceil(CASTER_SLICE_EXACT) * CELL_COUNT <= 1 << 14,
+            tiles * tiles <= 1 << 16 && strata * strata * CELL_COUNT <= 1 << 14,
             "an item names its tile in 16 bits and its slice in 14"
         );
         let traced = settings.traced();
-        let capacity = capacity(&settings, &traced, tiles, ranks);
+        let capacity = capacity(&settings, &traced, tiles, ranks, strata);
         assert!(
             capacity.items <= gpu.caps().limits.max_mesh_draw_groups,
             "one mesh draw covers the field's items"
@@ -307,6 +418,8 @@ impl Blades {
             corner,
             tiles,
             ranks,
+            strata,
+            strata_step: strata_step(strata),
             traced,
             capacity,
             items: buffer(capacity.items, "blade items"),
@@ -355,7 +468,7 @@ impl Blades {
     }
 
     /// The entry: drawn through `BladeGeometry` unless the field is stored, with room for
-    /// what rays trace of it.
+    /// what rays trace of it, and last frame's positions where the raster draws its batch.
     pub fn desc<'a>(
         &self,
         topologies: &'a [ClusterTopology<'a>],
@@ -370,7 +483,7 @@ impl Blades {
             topologies,
             materials,
             transform,
-            previous_positions: true,
+            previous_positions: self.settings.stored,
             vertex_user: true,
             flags: if traced {
                 InstanceFlags::RASTER | InstanceFlags::RAY
@@ -387,8 +500,9 @@ impl Blades {
     }
 
     /// Writes frame `frame`'s field for producer entry `producer` on `heights`, seen from `eye`
-    /// along `forward` through `clip_from_entry` at wind times `time` and `previous_time`, and
-    /// returns it: the scene's surface data and what [`Self::record`] and [`Self::draw`] take.
+    /// along `forward` through `clip_from_entry` at wind times `time` and `previous_time` in s,
+    /// and returns it: the scene's surface data and what [`Self::record`] and [`Self::draw`]
+    /// take.
     #[allow(clippy::too_many_arguments)]
     pub fn write(
         &mut self,
@@ -398,8 +512,8 @@ impl Blades {
         eye: Vec3,
         forward: Vec3,
         clip_from_entry: Mat4,
-        time: f32,
-        previous_time: f32,
+        time: f64,
+        previous_time: f64,
     ) -> GpuPtr<Field> {
         let s = self.settings;
         let t = self.traced;
@@ -414,6 +528,8 @@ impl Blades {
             m.row(3) - m.row(2),
         ]
         .map(|p| p.to_array());
+        // `blade_sway`'s phases: rad per s of its slow wave and its fast ripple.
+        let phase = |rate: f64, t: f64| (rate * t).rem_euclid(std::f64::consts::TAU) as f32;
         let slot = frame % self.fields.len();
         self.fields.as_mut_slice().expect("upload is mapped")[slot as usize] = Field {
             heights: heights.samples(),
@@ -432,21 +548,27 @@ impl Blades {
             tiles: self.tiles,
             tile_size: TILE,
             ranks: self.ranks,
+            strata: self.strata,
+            strata_step: self.strata_step,
             item_capacity: self.capacity.items,
             caster_capacity: self.capacity.caster_items,
             full: s.full,
             range: s.range,
             detail: s.detail,
             exact: t.exact,
+            cast_fade: t.fade,
             cast_range: t.range,
-            cast_stride: t.stride,
+            cast_budget: t.budget,
+            stored: u32::from(s.stored),
             forward_x: ahead.x,
             forward_z: ahead.y,
             cast_cone: t.cone,
             cast_stretch: t.stretch,
             wind: s.wind,
-            time,
-            previous_time,
+            wave: phase(1.7, time),
+            ripple: phase(3.1, time),
+            wave_before: phase(1.7, previous_time),
+            ripple_before: phase(3.1, previous_time),
             eye_x: eye.x,
             eye_y: eye.y,
             eye_z: eye.z,
@@ -544,7 +666,7 @@ impl Blades {
 
 /// What the lists and the batch hold at most: the kernels' sums over the tiles, from the eye
 /// at the field's center, where the most tiles are near.
-fn capacity(s: &BladeSettings, t: &Traced, tiles: u32, ranks: u32) -> Capacity {
+fn capacity(s: &BladeSettings, t: &Traced, tiles: u32, ranks: u32, strata: u32) -> Capacity {
     let center = tiles as f32 * TILE / 2.0;
     // `cast_distance` of the point at (x, z) from the first tile's corner, looking along x.
     let cast = |x: f32, z: f32| {
@@ -553,51 +675,63 @@ fn capacity(s: &BladeSettings, t: &Traced, tiles: u32, ranks: u32) -> Capacity {
         t.distance(d, if d > 0.0 { dx / d } else { 1.0 })
     };
     let cell = TILE / CELLS as f32;
-    let mut c = Capacity::default();
+    let (mut items, mut caster_items, mut vertices, mut blades) = (0_u64, 0_u64, 0_u64, 0_u64);
     for tile in 0..tiles * tiles {
         let lo = [(tile % tiles) as f32 * TILE, (tile / tiles) as f32 * TILE];
         let gap = |lo: f32| (lo - center).max(center - lo - TILE).max(0.0);
         let d = (gap(lo[0]).hypot(gap(lo[1])) - REACH).max(0.0);
         let kept = ((s.keep(d) * ranks as f32).ceil() as u32).min(ranks);
-        if kept == 0 {
+        blades += u64::from(kept * CELL_COUNT);
+        items += u64::from(kept * CELL_COUNT / SLICE);
+        // Rays trace every rank of a drawn field and the kept ones of a stored field.
+        let traced = if s.stored { kept } else { ranks };
+        if d >= t.range || traced == 0 {
             continue;
         }
-        c.blades += u64::from(kept * CELL_COUNT);
-        c.items += kept * CELL_COUNT / SLICE;
-        if d >= t.range {
-            continue;
+        // Per block of 4 x 4 cells, the cells of the tile that trace their blades as drawn.
+        let mut exact = [0_u32; (CELL_COUNT / CHORD_BLOCK) as usize];
+        if d < s.detail.min(t.exact) {
+            for i in 0..CELL_COUNT {
+                let (x, z) = (i % CELLS, i / CELLS);
+                let at = |lo: f32, k: u32| lo + (k as f32 + 0.5) * cell;
+                if cast(at(lo[0], x), at(lo[1], z)) < t.exact {
+                    exact[(z / 4 * 4 + x / 4) as usize] += 1;
+                }
+            }
         }
-        // Squares of `side` cells of the tile whose centers `test` holds for.
-        let squares = |side: u32, test: &dyn Fn(f32) -> bool| {
-            let count = CELLS / side;
-            let at = |lo: f32, k: u32| lo + (k as f32 + 0.5) * side as f32 * cell;
-            (0..count * count)
-                .filter(|&i| test(cast(at(lo[0], i % count), at(lo[1], i / count))))
-                .count() as u32
-        };
-        let exact_cells = if d < s.detail.min(t.exact) {
-            squares(1, &|d| d < t.exact)
-        } else {
-            0
-        };
+        let exact_cells: u32 = exact.iter().sum();
+        caster_items += u64::from(exact_cells * (strata * strata).min(traced));
+        vertices += u64::from(exact_cells * traced * FULL_VERTICES);
         // A block's blades stand within half its diagonal of its center.
         let reach = 2.0 * cell * std::f32::consts::SQRT_2 * t.slope();
-        let blocks = squares(4, &|d| d - reach < t.range);
-        let chords = kept.div_ceil(t.stride);
-        c.caster_items +=
-            exact_cells * kept.div_ceil(CASTER_SLICE_EXACT) + blocks * chords.div_ceil(CHORD_RUN);
-        c.vertices += exact_cells * kept * FULL_VERTICES + blocks * CHORD_BLOCK * chords * 3;
+        let side = CELLS / 4;
+        for b in 0..side * side {
+            let at = |lo: f32, k: u32| lo + (k as f32 + 0.5) * 4.0 * cell;
+            let d = cast(at(lo[0], b % side), at(lo[1], b / side));
+            // A block of exact cells has no chords.
+            if exact[b as usize] == CHORD_BLOCK || d - reach >= t.range {
+                continue;
+            }
+            let chords = traced.div_ceil(t.chord_stride(d, ranks));
+            let cells = chord_square_cells(chords);
+            let run = CASTER_SLICE_CHORD / cells;
+            caster_items += u64::from(CHORD_BLOCK / cells * chords.div_ceil(run));
+            vertices += u64::from(CHORD_BLOCK * chords * 3);
+        }
     }
     // The eye off the center of a tile, and turned, shifts which tiles and squares count.
-    let grow = |n: u32| n + n / 8 + tiles;
+    let grow = |n: u64, what| {
+        u32::try_from(n + n / 8 + u64::from(tiles))
+            .unwrap_or_else(|_| panic!("a frame's {what} are counted in 32 bits"))
+    };
     Capacity {
-        items: grow(c.items),
-        caster_items: if c.caster_items == 0 {
+        items: grow(items, "draw items"),
+        caster_items: if caster_items == 0 {
             0
         } else {
-            grow(c.caster_items)
+            grow(caster_items, "caster items")
         },
-        vertices: grow(c.vertices),
-        blades: c.blades,
+        vertices: grow(vertices, "caster vertices"),
+        blades,
     }
 }
