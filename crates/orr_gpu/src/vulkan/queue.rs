@@ -647,7 +647,12 @@ impl Queue {
             }
         };
         let period = f64::from(self.shared.caps.limits.timestamp_period_ns);
-        let calibration = self.shared.calibration(self.timestamp_mask);
+        // A queue without timestamps read no ticks to place.
+        let calibration = res
+            .timestamps
+            .as_ref()
+            .and_then(|_| self.shared.calibration());
+        let mask = self.timestamp_mask;
         passes
             .iter()
             .enumerate()
@@ -658,7 +663,8 @@ impl Queue {
                 PassResult {
                     name: p.name,
                     gpu_ms: span as f64 * period * 1e-6,
-                    cpu: calibration.and_then(|c| Some((c.to_instant(begin)?, c.to_instant(end)?))),
+                    cpu: calibration
+                        .and_then(|c| Some((c.to_instant(begin, mask)?, c.to_instant(end, mask)?))),
                     stats,
                     #[cfg(feature = "nsight-perf")]
                     counters: p
@@ -706,18 +712,19 @@ pub(super) struct Calibration {
     ticks: u64,
     at: Instant,
     period_ns: f64,
-    mask: u64,
 }
 
 impl Calibration {
-    fn to_instant(self, ticks: u64) -> Option<Instant> {
-        let ahead = ticks.wrapping_sub(self.ticks) & self.mask;
+    /// The instant of `ticks`, a timestamp whose arithmetic wraps at `mask`, its queue's valid
+    /// timestamp bits.
+    fn to_instant(self, ticks: u64, mask: u64) -> Option<Instant> {
+        let ahead = ticks.wrapping_sub(self.ticks) & mask;
         // Ticks before the calibration wrap to the top half of the mask.
-        if ahead <= self.mask / 2 {
+        if ahead <= mask / 2 {
             self.at
                 .checked_add(Duration::from_nanos((ahead as f64 * self.period_ns) as u64))
         } else {
-            let behind = self.ticks.wrapping_sub(ticks) & self.mask;
+            let behind = self.ticks.wrapping_sub(ticks) & mask;
             self.at.checked_sub(Duration::from_nanos(
                 (behind as f64 * self.period_ns) as u64,
             ))
@@ -725,8 +732,9 @@ impl Calibration {
     }
 }
 
-/// Recalibrates when the last calibration is older than this.
-const CALIBRATION_AGE: Duration = Duration::from_secs(1);
+/// Recalibrates when the last calibration is older than this: the GPU's clock drifts from the
+/// CPU's.
+const CALIBRATION_AGE: Duration = Duration::from_millis(50);
 
 impl Shared {
     pub(super) fn timeline(&self, index: u32) -> &Timeline {
@@ -814,8 +822,8 @@ impl Shared {
         .map_err(|e| self.vk_error("vkWaitSemaphores", e))
     }
 
-    /// A calibration whose tick arithmetic wraps at `mask`, the caller's valid timestamp bits.
-    fn calibration(&self, mask: u64) -> Option<Calibration> {
+    /// A calibration of the device's timestamps, which every queue shares.
+    fn calibration(&self) -> Option<Calibration> {
         let calibrated = self.calibrated_fn.as_ref()?;
         let mut slot = self.calibration.lock().unwrap();
         if let Some(c) = *slot
@@ -833,7 +841,6 @@ impl Shared {
             ticks: ticks[0],
             at: before + (after - before) / 2,
             period_ns: f64::from(self.caps.limits.timestamp_period_ns),
-            mask,
         };
         *slot = Some(c);
         Some(c)

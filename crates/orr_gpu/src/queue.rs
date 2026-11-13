@@ -147,7 +147,8 @@ pub struct QueueRequest {
 pub struct PassResult {
     pub name: &'static str,
     pub gpu_ms: f64,
-    /// Begin and end on the CPU clock; `None` without `Caps::calibrated_timestamps`.
+    /// Begin and end on the CPU clock; `None` without `Caps::calibrated_timestamps` and on a
+    /// queue without timestamps.
     pub cpu: Option<(Instant, Instant)>,
     /// Shader invocations; `None` unless the pass asked for statistics and the backend
     /// counts them (Metal does not).
