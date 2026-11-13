@@ -1094,6 +1094,9 @@ fn layer_tiles_trace_what_every_tile_traces() {
             let mut p = Paths::new(&KernelSet::default(), entry, reference(2));
             p.frost_guide = Some(FrostGuide::new(0.25));
             p.every_tile = every_tile;
+            // Pipelines that hold more than the scene round differently, and a view takes
+            // them while its own compile: both views wait for the scene's.
+            p.specialize = true;
             p
         };
         let (tiled, every) = (paths(false), paths(true));
