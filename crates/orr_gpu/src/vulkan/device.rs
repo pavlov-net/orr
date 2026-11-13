@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
-use std::mem::ManuallyDrop;
+use std::mem::{DropGuard, ManuallyDrop};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
@@ -328,58 +328,40 @@ impl Device {
             perf_instance.as_deref().unwrap_or_default(),
             &messages,
         )?;
+        // Each guard destroys its handle if creation fails or panics before `Shared` owns it;
+        // locals drop in reverse, so children go before their parents.
+        // SAFETY: nothing else uses the instance.
+        let instance = DropGuard::new(instance, |i| unsafe { i.destroy_instance(None) });
         let debug_instance = ash::ext::debug_utils::Instance::load(&entry, &instance);
         // SAFETY: the count outlives the messenger (both live in `Shared`).
         let messenger = unsafe {
             debug_instance.create_debug_utils_messenger(&messenger_info(&messages), None)
-        };
-        let messenger = match messenger {
-            Ok(m) => m,
-            Err(e) => {
-                // SAFETY: nothing else uses the instance.
-                unsafe { instance.destroy_instance(None) };
-                return Err(Error::vk("vkCreateDebugUtilsMessengerEXT")(e));
-            }
-        };
-        let destroy_instance = || {
-            // SAFETY: nothing else uses the instance or messenger.
-            unsafe {
-                debug_instance.destroy_debug_utils_messenger(messenger, None);
-                instance.destroy_instance(None);
-            }
-        };
-        let picked = pick_device(
+        }
+        .map_err(Error::vk("vkCreateDebugUtilsMessengerEXT"))?;
+        let messenger = DropGuard::new((debug_instance, messenger), |(d, m)| {
+            // SAFETY: nothing else uses the messenger.
+            unsafe { d.destroy_debug_utils_messenger(m, None) }
+        });
+        let (physical, selection) = pick_device(
             &instance,
             desc.skip_extensions,
             desc.queues.present,
             desc.diagnostics,
-        );
-        let (physical, selection) = match picked {
-            Ok(p) => p,
-            Err(e) => {
-                destroy_instance();
-                return Err(e);
-            }
-        };
+        )?;
         #[cfg(feature = "nsight-perf")]
         let (perf_library, perf_device) = perf_library
             .and_then(|l| l.device_extensions(&entry, &instance, physical, |e| selection.offers(e)))
             .unzip();
-        let created = create_device(
+        let (device, plans, optional, extensions) = create_device(
             &instance,
             physical,
             desc,
             selection,
             #[cfg(feature = "nsight-perf")]
             perf_device.as_deref().unwrap_or_default(),
-        );
-        let (device, plans, optional, extensions) = match created {
-            Ok(c) => c,
-            Err(e) => {
-                destroy_instance();
-                return Err(e);
-            }
-        };
+        )?;
+        // SAFETY: nothing else uses the device.
+        let device = DropGuard::new(device, |d| unsafe { d.destroy_device(None) });
 
         // SAFETY: the physical device belongs to the instance.
         let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
@@ -460,26 +442,24 @@ impl Device {
         family_list.sort_unstable();
         family_list.dedup();
         let usage = buffer_usage(optional.ray_dispatch);
-        let memory = select_memory(
+        let (memory, rebar) = select_memory(
             &device,
             memory_props,
             &family_list,
             usage,
             !desc.force_staging,
         )
-        .map_err(|m| features::unsupported(&device_name, m));
-        let (memory, rebar) = match memory {
-            Ok(m) => m,
-            Err(e) => {
-                // SAFETY: nothing else uses the device.
-                unsafe { device.destroy_device(None) };
-                destroy_instance();
-                return Err(e);
-            }
-        };
+        .map_err(|m| features::unsupported(&device_name, m))?;
 
         #[cfg(feature = "nsight-perf")]
-        let perf = perf_library.and_then(|l| Perf::new(l, &entry, &instance, physical, &device));
+        let perf = DropGuard::new(
+            perf_library.and_then(|l| Perf::new(l, &entry, &instance, physical, &device)),
+            |p| {
+                if let Some(p) = p {
+                    p.shut_down();
+                }
+            },
+        );
         let p = &heap_props;
         let caps = Caps {
             device_name,
@@ -589,7 +569,15 @@ impl Device {
             },
         };
 
-        let mut timelines: [Option<Timeline>; MAX_TIMELINES] = Default::default();
+        let mut timelines = DropGuard::new(
+            <[Option<Timeline>; MAX_TIMELINES]>::default(),
+            |timelines| {
+                for t in timelines.iter().flatten() {
+                    // SAFETY: nothing else uses the semaphore.
+                    unsafe { device.destroy_semaphore(t.semaphore, None) };
+                }
+            },
+        );
         for plan in &plans {
             let mut ty = vk::SemaphoreTypeCreateInfo::default()
                 .semaphore_type(vk::SemaphoreType::TIMELINE)
@@ -597,21 +585,8 @@ impl Device {
             // SAFETY: valid create info.
             let semaphore = unsafe {
                 device.create_semaphore(&vk::SemaphoreCreateInfo::default().push(&mut ty), None)
-            };
-            let semaphore = match semaphore {
-                Ok(s) => s,
-                Err(e) => {
-                    // SAFETY: nothing else uses the device or the semaphores made so far.
-                    unsafe {
-                        for t in timelines.iter().flatten() {
-                            device.destroy_semaphore(t.semaphore, None);
-                        }
-                        device.destroy_device(None);
-                    }
-                    destroy_instance();
-                    return Err(Error::vk("vkCreateSemaphore")(e));
-                }
-            };
+            }
+            .map_err(Error::vk("vkCreateSemaphore"))?;
             timelines[plan.kind.index()] = Some(Timeline {
                 semaphore,
                 submitted: AtomicU64::new(0),
@@ -634,23 +609,12 @@ impl Device {
         );
         // SAFETY: the handles are live, buffer device address and the named extensions are
         // enabled, and `Shared` drops the pools before the device.
-        let pools = match unsafe { Pools::new(&allocator, &memory, placement) } {
-            Ok(p) => p,
-            Err(e) => {
-                // SAFETY: nothing else uses the device or the semaphores.
-                unsafe {
-                    for t in timelines.iter().flatten() {
-                        device.destroy_semaphore(t.semaphore, None);
-                    }
-                    device.destroy_device(None);
-                }
-                destroy_instance();
-                return Err(e);
-            }
-        };
+        let pools = unsafe { Pools::new(&allocator, &memory, placement) }?;
 
-        let pipeline_cache =
-            PipelineCache::open(&device, &props, desc.pipeline_cache, desc.pipeline_store);
+        let pipeline_cache = DropGuard::new(
+            PipelineCache::open(&device, &props, desc.pipeline_cache, desc.pipeline_store),
+            |mut c| c.destroy(&device),
+        );
         let mut queue_handles = [None; MAX_TIMELINES];
         let mut families_by_kind = [0; MAX_TIMELINES];
         for plan in &plans {
@@ -670,6 +634,13 @@ impl Device {
         } else {
             None
         };
+        let pipeline_cache = DropGuard::dismiss(pipeline_cache);
+        let timelines = DropGuard::dismiss(timelines);
+        #[cfg(feature = "nsight-perf")]
+        let perf = DropGuard::dismiss(perf);
+        let device = DropGuard::dismiss(device);
+        let messenger = DropGuard::dismiss(messenger);
+        let instance = DropGuard::dismiss(instance);
         let shared = Arc::new(Shared {
             heap_fn: ash::ext::descriptor_heap::Device::load(&instance, &device),
             accel_fn: ash::khr::acceleration_structure::Device::load(&instance, &device),
@@ -725,7 +696,7 @@ impl Device {
                     .present_timing
                     .then(|| ash::ext::present_timing::Device::load(&instance, &device)),
             }),
-            messenger: (debug_instance, messenger),
+            messenger,
             messages,
             caps,
             pipeline_cache,

@@ -3,6 +3,7 @@
 //! loading side, failures, the archive handles, hierarchy pages streamed on request and on
 //! the traversal's feedback, and textures decoded from neural texture sets.
 
+use std::mem::DropGuard;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -22,8 +23,8 @@ use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, ArchiveWriter, AssetId, BlobIn, Class, Codec, Entry, Span, Target};
 use orr_scene::PageId;
 use orr_scene::orr_gpu::{
-    Device, DeviceDesc, GpuAddress, GpuPtr, Hazards, HostTimeline, QueueKind, QueueRequest, Stages,
-    Texture, TextureIndex, TextureRegion,
+    Device, DeviceDesc, GpuAddress, GpuPtr, Hazards, QueueKind, QueueRequest, Stages, Texture,
+    TextureIndex, TextureRegion,
 };
 use orr_scene::testing::{
     assert_clean, assert_clean_on, device, global_tables, mesh_page_tables, mount_pending,
@@ -3861,15 +3862,6 @@ fn requested_blobs_land_in_consumer_buffers_and_images_under_their_budget() {
     assert_clean();
 }
 
-/// Holds the loading queue behind a host timeline until dropped.
-struct Gate(HostTimeline);
-
-impl Drop for Gate {
-    fn drop(&mut self) {
-        self.0.signal(1);
-    }
-}
-
 #[test]
 fn a_requested_blob_lands_while_a_mount_build_waits_on_the_loading_queue() {
     use orr_scene::BlobTarget;
@@ -3897,10 +3889,13 @@ fn a_requested_blob_lands_while_a_mount_build_waits_on_the_loading_queue() {
     let tiled = scenes.mount(PackSource::Memory(Arc::clone(tiled_pack())));
     ready(&mut scenes, tiled);
 
-    // The loading thread is idle, so nothing else submits its queue meanwhile.
-    let gate = Gate(dev.create_host_timeline("loading gate").unwrap());
+    // The loading thread is idle, so nothing else submits its queue meanwhile. The gate holds
+    // the queue until dropped.
+    let gate = DropGuard::new(dev.create_host_timeline("loading gate").unwrap(), |gate| {
+        gate.signal(1);
+    });
     let list = loading.command_list().unwrap();
-    loading.submit(vec![list], &[gate.0.point(1)]).unwrap();
+    loading.submit(vec![list], &[gate.point(1)]).unwrap();
     // Without textures it stages no copies, which would hold the copy queue behind the gate.
     let meshes = scenes.mount(PackSource::Memory(Arc::clone(sheet_pack())));
     // Time for the mount's reads and decodes, so its build reaches the gate first.

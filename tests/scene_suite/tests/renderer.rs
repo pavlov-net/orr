@@ -6,7 +6,8 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::mem::DropGuard;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -121,18 +122,6 @@ fn empty_frames_and_scene_frames_submit_in_order() {
     assert_clean();
 }
 
-/// Writes a file's original text back when dropped.
-struct Restore {
-    path: PathBuf,
-    text: String,
-}
-
-impl Drop for Restore {
-    fn drop(&mut self) {
-        fs::write(&self.path, &self.text).unwrap();
-    }
-}
-
 const FILLED: u64 = 64;
 
 /// One frame that dispatches `fill` into `out`: what hot reload applied at its step 1 and
@@ -196,10 +185,9 @@ fn edit(
 fn editing_a_kernel_body_swaps_its_pipeline_and_bad_edits_keep_the_old_one() {
     let path = Path::new(scene_suite::HOT_SRC).join("fill.slang");
     let original = fs::read_to_string(&path).unwrap();
-    let _restore = Restore {
-        path: path.clone(),
-        text: original.clone(),
-    };
+    let _restore = DropGuard::new((path.clone(), original.clone()), |(path, text)| {
+        fs::write(path, text).unwrap();
+    });
     let mut r = Renderer::new(device(), RendererDesc::default()).unwrap();
     let loading = r.loading();
     let worker = std::thread::spawn({

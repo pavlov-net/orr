@@ -2,6 +2,7 @@
 
 use std::alloc::Layout;
 use std::any::Any;
+use std::mem::DropGuard;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -239,19 +240,16 @@ impl Device {
         // SAFETY: valid create info.
         let buffer =
             unsafe { d.create_buffer(&info, None) }.map_err(Error::vk("vkCreateBuffer"))?;
-        let destroy = |e: Error| {
-            // SAFETY: nothing else holds the buffer.
-            unsafe { d.destroy_buffer(buffer, None) };
-            e
-        };
+        // SAFETY: nothing else holds the buffer until it is returned.
+        let buffer = DropGuard::new(buffer, |b| unsafe { d.destroy_buffer(b, None) });
         // SAFETY: the buffer is live.
-        let required = unsafe { d.get_buffer_memory_requirements(buffer) };
+        let required = unsafe { d.get_buffer_memory_requirements(*buffer) };
         // A buffer may need more memory than its size, which the import cannot grow.
         if required.size > len {
-            return Err(destroy(Error::ImportRefused(format!(
+            return Err(Error::ImportRefused(format!(
                 "{name}: a buffer of {len} bytes needs {} bytes of memory",
                 required.size
-            ))));
+            )));
         }
         let bits = pointer.memory_type_bits & required.memory_type_bits;
         let props = &s.memory.properties;
@@ -269,11 +267,11 @@ impl Device {
             .or_else(|| pick(coherent))
             .or_else(|| pick(visible))
             .ok_or_else(|| {
-                destroy(Error::ImportRefused(format!(
+                Error::ImportRefused(format!(
                     "{name}: no memory type with a heap of {len} bytes imports it (pointer types \
                      {:#x}, buffer types {:#x})",
                     pointer.memory_type_bits, required.memory_type_bits
-                )))
+                ))
             })?;
         let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
             .handle_type(handle)
@@ -287,27 +285,26 @@ impl Device {
             .push(&mut address_flags);
         // SAFETY: valid allocate info naming memory the caller keeps.
         let memory = unsafe { d.allocate_memory(&alloc, None) }
-            .map_err(|e| destroy(refused(name, "vkAllocateMemory")(e)))?;
-        let free = |e: Error| {
-            // SAFETY: nothing else holds the memory.
-            unsafe { d.free_memory(memory, None) };
-            destroy(e)
-        };
+            .map_err(refused(name, "vkAllocateMemory"))?;
+        // SAFETY: nothing else holds the memory until it is returned.
+        let memory = DropGuard::new(memory, |m| unsafe { d.free_memory(m, None) });
         // SAFETY: fresh buffer and memory of a type it takes, big enough for it.
-        unsafe { d.bind_buffer_memory(buffer, memory, 0) }
-            .map_err(|e| free(Error::vk("vkBindBufferMemory")(e)))?;
+        unsafe { d.bind_buffer_memory(*buffer, *memory, 0) }
+            .map_err(Error::vk("vkBindBufferMemory"))?;
         let atom = if flags(ty).contains(coherent) {
             None
         } else {
             // SAFETY: host-visible memory, mapped once for the flushes.
-            unsafe { d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }
-                .map_err(|e| free(Error::vk("vkMapMemory")(e)))?;
+            unsafe { d.map_memory(*memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }
+                .map_err(Error::vk("vkMapMemory"))?;
             Some(s.non_coherent_atom)
         };
         // SAFETY: the buffer has device-address usage and bound memory.
         let address = unsafe {
-            d.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
+            d.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(*buffer))
         };
+        let memory = DropGuard::dismiss(memory);
+        let buffer = DropGuard::dismiss(buffer);
         name_object(&s.debug_fn, buffer, name);
         s.register_range(address, len, buffer, name);
         log::info!(

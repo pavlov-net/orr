@@ -3,6 +3,7 @@ use crate::sys::*;
 use crate::{DlssError, Mode, Support, Uuid};
 use ash::vk::{self, Handle, TaggedStructure};
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::mem::DropGuard;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Mutex;
@@ -297,16 +298,20 @@ impl Ngx {
             )
         };
         check("NVSDK_NGX_VULKAN_Init_with_ProjectID", r)?;
+        let device = DropGuard::new(device, |d| {
+            // SAFETY: NGX is initialized on `d` and nothing else uses it yet.
+            unsafe { NVSDK_NGX_VULKAN_Shutdown1(d.as_raw() as usize as VkDevice) };
+        });
         let mut caps = ptr::null_mut();
         // SAFETY: NGX is initialized.
-        let r = unsafe { NVSDK_NGX_VULKAN_GetCapabilityParameters(&mut caps) };
-        let this = Self {
-            device,
+        check("NVSDK_NGX_VULKAN_GetCapabilityParameters", unsafe {
+            NVSDK_NGX_VULKAN_GetCapabilityParameters(&mut caps)
+        })?;
+        Ok(Self {
+            device: DropGuard::dismiss(device),
             caps,
             _setup: setup,
-        };
-        check("NVSDK_NGX_VULKAN_GetCapabilityParameters", r)?;
-        Ok(this)
+        })
     }
 
     fn get_i(&self, name: &[u8]) -> i32 {
@@ -557,14 +562,18 @@ impl Upscale {
         check("NVSDK_NGX_VULKAN_AllocateParameters", unsafe {
             NVSDK_NGX_VULKAN_AllocateParameters(&mut params)
         })?;
+        let params = DropGuard::new(params, |p| {
+            // SAFETY: allocated above and not shared.
+            unsafe { NVSDK_NGX_VULKAN_DestroyParameters(p) };
+        });
         let flags = NVSDK_NGX_DLSS_Feature_Flags_NVSDK_NGX_DLSS_Feature_Flags_IsHDR
             | NVSDK_NGX_DLSS_Feature_Flags_NVSDK_NGX_DLSS_Feature_Flags_MVLowRes
             | NVSDK_NGX_DLSS_Feature_Flags_NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
         let mut handle = ptr::null_mut();
         // SAFETY: `params` is a live map; `cmd` is recording on NGX's device (caller).
         let r = unsafe {
-            let ui = |name: &[u8], v: u32| NVSDK_NGX_Parameter_SetUI(params, key(name), v);
-            let i = |name: &[u8], v: i32| NVSDK_NGX_Parameter_SetI(params, key(name), v);
+            let ui = |name: &[u8], v: u32| NVSDK_NGX_Parameter_SetUI(*params, key(name), v);
+            let i = |name: &[u8], v: i32| NVSDK_NGX_Parameter_SetI(*params, key(name), v);
             ui(NVSDK_NGX_Parameter_CreationNodeMask, 1);
             ui(NVSDK_NGX_Parameter_VisibilityNodeMask, 1);
             ui(NVSDK_NGX_Parameter_Width, render[0]);
@@ -596,19 +605,15 @@ impl Upscale {
                 ngx.device.as_raw() as usize as VkDevice,
                 cmd.as_raw() as usize as VkCommandBuffer,
                 feature,
-                params,
+                *params,
                 &mut handle,
             )
         };
-        if let Err(e) = check("NVSDK_NGX_VULKAN_CreateFeature1", r) {
-            // SAFETY: allocated above and not shared.
-            unsafe { NVSDK_NGX_VULKAN_DestroyParameters(params) };
-            return Err(e);
-        }
+        check("NVSDK_NGX_VULKAN_CreateFeature1", r)?;
         Ok(Self {
             upscaler,
             handle,
-            params,
+            params: DropGuard::dismiss(params),
             // SAFETY: plain C structs; each is written before NGX reads it.
             resources: unsafe { std::mem::zeroed() },
         })
@@ -826,10 +831,14 @@ impl Fg {
         check("NVSDK_NGX_VULKAN_AllocateParameters", unsafe {
             NVSDK_NGX_VULKAN_AllocateParameters(&mut params)
         })?;
+        let params = DropGuard::new(params, |p| {
+            // SAFETY: allocated above and not shared.
+            unsafe { NVSDK_NGX_VULKAN_DestroyParameters(p) };
+        });
         let mut handle = ptr::null_mut();
         // SAFETY: `params` is a live map; `cmd` is recording on NGX's device (caller).
         let r = unsafe {
-            let ui = |name: &[u8], v: u32| NVSDK_NGX_Parameter_SetUI(params, key(name), v);
+            let ui = |name: &[u8], v: u32| NVSDK_NGX_Parameter_SetUI(*params, key(name), v);
             ui(NVSDK_NGX_Parameter_CreationNodeMask, 1);
             ui(NVSDK_NGX_Parameter_VisibilityNodeMask, 1);
             ui(NVSDK_NGX_Parameter_Width, output[0]);
@@ -851,18 +860,14 @@ impl Fg {
                 ngx.device.as_raw() as usize as VkDevice,
                 cmd.as_raw() as usize as VkCommandBuffer,
                 NVSDK_NGX_Feature_NVSDK_NGX_Feature_FrameGeneration,
-                params,
+                *params,
                 &mut handle,
             )
         };
-        if let Err(e) = check("NVSDK_NGX_VULKAN_CreateFeature1", r) {
-            // SAFETY: allocated above and not shared.
-            unsafe { NVSDK_NGX_VULKAN_DestroyParameters(params) };
-            return Err(e);
-        }
+        check("NVSDK_NGX_VULKAN_CreateFeature1", r)?;
         Ok(Self {
             handle,
-            params,
+            params: DropGuard::dismiss(params),
             // SAFETY: plain C structs; each is written before NGX reads it.
             resources: unsafe { std::mem::zeroed() },
             matrices: [IDENTITY; 5],

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::mem::DropGuard;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -1213,16 +1214,12 @@ fn spawn_with_tokens<'scope>(
     max: usize,
     work: impl FnOnce() + Copy + Send + 'scope,
 ) {
-    /// Tells the dispatcher that a worker found the queue empty, also when it panics.
-    struct Done(mpsc::Sender<Option<Acquired>>);
-    impl Drop for Done {
-        fn drop(&mut self) {
-            let _ = self.0.send(None);
-        }
-    }
     let (tx, rx) = mpsc::channel();
     let spawn = |token: Option<Acquired>| {
-        let done = Done(tx.clone());
+        // Tells the dispatcher that a worker found the queue empty, also when it panics.
+        let done = DropGuard::new(tx.clone(), |tx: mpsc::Sender<Option<Acquired>>| {
+            let _ = tx.send(None);
+        });
         scope.spawn(move || {
             let _done = done;
             let _token = token;

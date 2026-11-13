@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::mem::DropGuard;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
@@ -272,21 +273,22 @@ pub(crate) fn save(
         files: stats,
         sources,
     };
+    let bytes = serde_json::to_vec(&state).expect("cookstate serializes");
     let path = state_path(archive);
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let write = |p: &Path, b: &[u8]| {
-        fs::write(p, b).map_err(|source| Error::Write {
-            path: p.to_owned(),
-            source,
-        })
-    };
-    write(
-        &tmp,
-        &serde_json::to_vec(&state).expect("cookstate serializes"),
-    )?;
-    fs::rename(&tmp, &path).map_err(|source| Error::Write { path, source })
+    // A failed write or rename leaves no partial file behind; the error being returned is the
+    // one that matters, so a failed removal is not reported.
+    let tmp = DropGuard::new(PathBuf::from(tmp), |t| {
+        let _ = fs::remove_file(t);
+    });
+    fs::write(&*tmp, bytes).map_err(|source| Error::Write {
+        path: tmp.to_path_buf(),
+        source,
+    })?;
+    fs::rename(&*tmp, &path).map_err(|source| Error::Write { path, source })?;
+    DropGuard::dismiss(tmp);
+    Ok(())
 }
 
 mod hex_hash {

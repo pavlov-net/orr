@@ -1,6 +1,7 @@
 //! Ray-dispatch pipelines: one raygen stage with a raygen-only shader table, for kernels that
 //! reorder invocations at coherence points.
 
+use std::mem::DropGuard;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
@@ -143,21 +144,18 @@ impl Device {
                 .map_err(|(_, e)| e)
             },
         )?;
-        let destroy = |e: Error| {
-            // SAFETY: the pipeline was never used.
-            unsafe { shared.device.destroy_pipeline(raw, None) };
-            e
-        };
+        // SAFETY: nothing uses the pipeline until it is returned.
+        let raw = DropGuard::new(raw, |p| unsafe { shared.device.destroy_pipeline(p, None) });
         // SAFETY: the pipeline has one group.
         let handle =
-            unsafe { rt.get_ray_tracing_shader_group_handles(raw, 0, 1, records.handle_bytes) }
-                .map_err(|e| destroy(Error::vk("vkGetRayTracingShaderGroupHandlesKHR")(e)))?;
+            unsafe { rt.get_ray_tracing_shader_group_handles(*raw, 0, 1, records.handle_bytes) }
+                .map_err(Error::vk("vkGetRayTracingShaderGroupHandlesKHR"))?;
         let slot = records
             .slots
             .lock()
             .unwrap()
             .take(RECORDS)
-            .ok_or_else(|| destroy(Error::HeapFull("raygen record")))?;
+            .ok_or(Error::HeapFull("raygen record"))?;
         let offset = u64::from(slot) * records.stride;
         // SAFETY: the record lies inside the mapped block, and its slot is this pipeline's
         // alone; the GPU stopped reading it before the slot was freed.
@@ -170,7 +168,7 @@ impl Device {
         }
         Ok(RayDispatchPipeline {
             inline_root_bytes: s.inline_root_bytes,
-            raw,
+            raw: DropGuard::dismiss(raw),
             raygen: vk::StridedDeviceAddressRegionKHR {
                 device_address: records.raw.address + offset,
                 stride: records.stride,

@@ -2,6 +2,7 @@
 //! TLAS builds on `VK_NV_cluster_acceleration_structure` and
 //! `VK_NV_partitioned_acceleration_structure`.
 
+use std::mem::DropGuard;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -411,21 +412,18 @@ impl RtasCheck {
         )?;
         let pipeline =
             shared.create_compute(&stage, vk::PipelineCreateFlags2::empty(), "orr PTLAS check")?;
-        let made = shared.create_buffer(
+        // SAFETY: nothing uses the pipeline until it is returned.
+        let pipeline = DropGuard::new(pipeline, |p| unsafe {
+            shared.device.destroy_pipeline(p, None);
+        });
+        let (failures, mapped) = shared.create_buffer(
             MemoryKind::Readback,
             4,
             shared.buffer_usage,
             4,
             "orr PTLAS check failures",
-        );
-        let (failures, mapped) = match made {
-            Ok(m) => m,
-            Err(e) => {
-                // SAFETY: the pipeline was never used.
-                unsafe { shared.device.destroy_pipeline(pipeline, None) };
-                return Err(e);
-            }
-        };
+        )?;
+        let pipeline = DropGuard::dismiss(pipeline);
         let counter = mapped.expect("Readback memory is mapped").cast::<u32>();
         assert!(
             counter.is_aligned(),

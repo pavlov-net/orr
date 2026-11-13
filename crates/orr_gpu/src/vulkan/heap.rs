@@ -1,5 +1,6 @@
 //! The resource heap (image descriptors only) and the sampler heap (contracts.md 9).
 
+use std::mem::DropGuard;
 use std::ptr::NonNull;
 use std::sync::Mutex;
 
@@ -198,6 +199,7 @@ impl Heaps {
                 max: p.max_resource_heap_size,
             },
         )?;
+        let resource = DropGuard::new(resource, |r| shared.destroy(Item::Buffer(r.raw)));
         let sampler = HeapBuffer::new(
             shared,
             "orr sampler heap",
@@ -209,16 +211,9 @@ impl Heaps {
                 reserved: p.min_sampler_heap_reserved_range,
                 max: p.max_sampler_heap_size,
             },
-        );
-        let sampler = match sampler {
-            Ok(s) => s,
-            Err(e) => {
-                shared.destroy(Item::Buffer(resource.raw));
-                return Err(e);
-            }
-        };
+        )?;
         Ok(Heaps {
-            resource,
+            resource: DropGuard::dismiss(resource),
             sampler,
             slots: Mutex::new(SlotAllocator::images()),
             shared_samplers: Mutex::default(),
