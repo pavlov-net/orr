@@ -428,7 +428,7 @@ public uint path_key(SceneRoot* s, Hit h)
 }
 
 // Alpha-tested candidates through the linked surface's coverage.
-public struct Alpha<S : ISurface> : IAnyHit
+public struct Alpha<S : ISurfaces> : IAnyHit
 {
     public SceneRoot* scene;
     public ViewConstants* view;
@@ -601,7 +601,7 @@ public struct NeeDraw
 // of the share outside the vertex's diffuse lobes, the caustic photons' to give. Draws one
 // sampler dimension and six per candidate. Where `f` is `specular_only` no candidate has a value,
 // so it takes the dimensions and draws none.
-public NeeDraw nee_draw<S : ISurface, F : IScatter>(PathRoot r, PathVertex x, F f, uint2 pixel, LocalLights* local, uint candidates, float3 keep, bool chain, inout Sampler rng, bool no_environment)
+public NeeDraw nee_draw<S : ISurfaces, F : IScatter>(PathRoot r, PathVertex x, F f, uint2 pixel, LocalLights* local, uint candidates, float3 keep, bool chain, inout Sampler rng, bool no_environment)
 {
     LightSetGpu* set = r.set;
     NeeDraw d = (NeeDraw)0;
@@ -721,7 +721,7 @@ public BsdfParams walk_params(BsdfParams p, bool walks)
 
 // Walk steps through the scene: every face of opaque and alpha-tested geometry, forced
 // 2-state opacity micromaps, on instance `instance`.
-public struct WalkTrace<S : ISurface> : IWalkTrace
+public struct WalkTrace<S : ISurfaces> : IWalkTrace
 {
     public SceneRoot* scene;
     public ViewConstants* view;
@@ -802,7 +802,7 @@ public Walk walk_from(PathVertex x, BsdfParams p, float3 wi, inout Sampler rng)
 
 // What traces a walk on instance `instance` from a vertex at path depth `depth`, reporting
 // texture feedback with `feedback` (`HitContext.feedback`).
-public WalkTrace<S> walk_tracer<S : ISurface>(PathRoot r, uint instance, uint depth, bool feedback)
+public WalkTrace<S> walk_tracer<S : ISurfaces>(PathRoot r, uint instance, uint depth, bool feedback)
 {
     RayCone cone = { 0.0, 0.0 };
     WalkTrace<S> tracer = { r.scene, r.view, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0, float2(-1.0), feedback), instance };
@@ -894,7 +894,7 @@ public bool is_layer(Hit h)
 // Shadow rays of a vertex: it arrived with interior list `arrived`, on the surface of material
 // `surface` (MATERIAL_NONE elsewhere) with outward geometric normal `normal` (zero inside a medium).
 // A ray into the surface starts inside its interior.
-public struct PathShadow<S : ISurface, M : IMedium> : IShadow
+public struct PathShadow<S : ISurfaces, M : IMedium> : IShadow
 {
     public SceneRoot* scene;
     public ViewConstants* view;
@@ -1244,7 +1244,7 @@ public float wavelength_sample(PathRoot r, uint2 pixel)
 }
 
 // The shadow of vertex `l` against the interior list it was reached with.
-public PathShadow<S, M> vertex_shadow<S : ISurface, M : IMedium>(PathRoot r, LayerVertex l, Interior interior, bool dispersion)
+public PathShadow<S, M> vertex_shadow<S : ISurfaces, M : IMedium>(PathRoot r, LayerVertex l, Interior interior, bool dispersion)
 {
     PathShadow<S, M> shadow;
     shadow.dispersion = dispersion;
@@ -1282,7 +1282,7 @@ public float3 interior_ambient(PathRoot r, float3 p, float3 dir, inout Sampler r
 // Steps of an interior's walk through the scene: every face of opaque geometry and layers.
 // Faces of its own material seen from behind reflect it back or let it out by Fresnel on their
 // plane, the walk's `ior` times the outside's; any other surface ends the walk there.
-public struct InteriorWalk<S : ISurface> : IWalkTrace
+public struct InteriorWalk<S : ISurfaces> : IWalkTrace
 {
     public SceneRoot* scene;
     public ViewConstants* view;
@@ -1338,7 +1338,7 @@ public Walk walk_interior(float3 from, float3 dir, InteriorMedium im, float ior,
 
 // What traces a walk in interior `medium`, its surface `ior` times the outside's, reporting
 // texture feedback with `feedback` (`HitContext.feedback`).
-public InteriorWalk<S> interior_tracer<S : ISurface>(PathRoot r, uint medium, float ior, uint seed, uint depth, bool feedback)
+public InteriorWalk<S> interior_tracer<S : ISurfaces>(PathRoot r, uint medium, float ior, uint seed, uint depth, bool feedback)
 {
     RayCone cone = { 0.0, 0.0 };
     InteriorWalk<S> tracer = { r.scene, r.view, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0, float2(-1.0), feedback), seed, medium, ior };
@@ -1701,7 +1701,7 @@ public struct PathStack
 // reaches a directional light along `dir` through the plane stack `stack` the path crossed: its
 // probe meets a face parallel to the stack's first. The probe's alpha tests report texture
 // feedback with `feedback` (`HitContext.feedback`).
-public bool stack_owns<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, PathStack stack, uint depth, bool dispersion, bool feedback)
+public bool stack_owns<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, PathStack stack, uint depth, bool dispersion, bool feedback)
 {
     if (!stack.valid || stack.crossed == 0)
         return false;
@@ -1762,7 +1762,7 @@ public PathStart lens_start(PathRoot r, uint2 pixel, float aperture, float focus
 
 // The interiors at `origin`, a point of the lens: `camera_medium`, flipped at each surface between
 // the eye and it.
-public Interior lens_interior<S : ISurface>(PathRoot r, float3 origin)
+public Interior lens_interior<S : ISurfaces>(PathRoot r, float3 origin)
 {
     ViewConstants* v = r.view;
     Interior interior = Interior();
@@ -1797,7 +1797,7 @@ public PathStart pinhole_start(ViewConstants* v, GBufferGpu* gb, uint2 pixel, bo
 // reaches, from this frame's layer memory `layers` (null for none): on a tile the layer
 // guides traced, those at its near-plane point flipped at each surface the ray crosses before
 // it; elsewhere none, since no layer lies before the surface and the eye lies in no medium.
-public Interior gbuffer_interior<S : ISurface>(SceneRoot* s, ViewConstants* v, LayerGuide* layers, uint2 extent, uint2 pixel, PathStart start)
+public Interior gbuffer_interior<S : ISurfaces>(SceneRoot* s, ViewConstants* v, LayerGuide* layers, uint2 extent, uint2 pixel, PathStart start)
 {
     if (layers == nullptr || traced_tiles(layers, extent)[layer_tile(extent, pixel)] == 0)
         return Interior();
@@ -1815,7 +1815,7 @@ public bool runs_path(PathRoot r, uint2 pixel)
 }
 
 // A debug view of `pixel`'s G-buffer surface alone.
-public void first_vertex_view<S : ISurface>(PathRoot r, uint2 pixel, inout Sampler rng)
+public void first_vertex_view<S : ISurfaces>(PathRoot r, uint2 pixel, inout Sampler rng)
 {
     ViewConstants* v = r.view;
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
@@ -1912,7 +1912,7 @@ struct PhotonReceiver : IPhotonReceiver
 // a walk's exit (`exit_scatter`) by its own; `width` m is its footprint. The grid's irradiance
 // takes the lobes' albedo, a thin wall's diffuse transmission that of the side behind it; the
 // reference's map evaluates them per photon. Draws eight sampler dimensions.
-public float3 caustic_gather<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, bool exit, WalkExitScatter exit_scatter, float width, inout Sampler rng)
+public float3 caustic_gather<S : ISurfaces>(PathRoot r, LayerVertex l, Bsdf b, bool exit, WalkExitScatter exit_scatter, float width, inout Sampler rng)
 {
     CausticsGpu* g = r.caustics;
     float4 u = rng.next4();
@@ -1958,7 +1958,7 @@ public struct PhotonStart
 // before it by its own start. A presence layer's point takes its opacity of the flux, and an
 // alpha test's hole none. The flux is the light's radiance x the point's cosine to it over
 // both densities and the frame's photon count. False for a photon that starts with no flux.
-public bool photon_start<S : ISurface, M : IMedium>(PathRoot r, uint index, inout Sampler rng, out PhotonStart p)
+public bool photon_start<S : ISurfaces, M : IMedium>(PathRoot r, uint index, inout Sampler rng, out PhotonStart p)
 {
     p = (PhotonStart)0;
     SceneRoot* s = r.scene;

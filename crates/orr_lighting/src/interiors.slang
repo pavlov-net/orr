@@ -193,7 +193,7 @@ public static const uint PRESENCE_NONE = 0;      // never: rays that look for di
 public static const uint PRESENCE_ANY = 1;       // wherever its opacity is above 0
 public static const uint PRESENCE_DRAWN = 2;     // where a hashed draw from `seed` falls below its opacity
 
-public struct LayerAccept<S : ISurface> : IAnyHit
+public struct LayerAccept<S : ISurfaces> : IAnyHit
 {
     public SceneRoot* scene;
     public ViewConstants* view;
@@ -221,7 +221,7 @@ public struct LayerAccept<S : ISurface> : IAnyHit
 // ray meets its front, and its material where it is a dielectric's with an interior, else
 // MATERIAL_NONE. Only a dielectric keeps its front; any other surface faces the ray. False for
 // none.
-public bool next_surface<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, out float t, out uint material, out bool front)
+public bool next_surface<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, out float t, out uint material, out bool front)
 {
     t = 0.0;
     material = MATERIAL_NONE;
@@ -246,7 +246,7 @@ public bool next_surface<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 or
 }
 
 // The surfaces a ray from `origin` along `dir` crosses before `t_max`, flipped into `interior`.
-public void surface_crossings<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, inout Interior interior)
+public void surface_crossings<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, inout Interior interior)
 {
     float at = 0.0;
     for (uint k = 0; k < SURFACE_CROSSINGS && at < t_max; k++)

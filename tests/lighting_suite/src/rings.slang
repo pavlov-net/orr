@@ -51,26 +51,18 @@ public static const float VEIL_COVERAGE = 0.25;
 
 public struct Rings : ISurface
 {
-    public static GSurface surface(SurfaceInput i, out float depth_offset)
+    public override static bool coverage(SurfaceInput i, out float coverage)
     {
-        return StandardSurface.surface(i, depth_offset);
-    }
-
-    public override static float coverage(SurfaceInput i)
-    {
-        return rings_coverage(i.uv[0].uv);
+        coverage = rings_coverage(i.uv[0].uv);
+        return true;
     }
 }
 
 public struct Veil : ISurface
 {
-    public static GSurface surface(SurfaceInput i, out float depth_offset)
+    public override static bool coverage(SurfaceInput i, out float coverage)
     {
-        return StandardSurface.surface(i, depth_offset);
-    }
-
-    public override static float coverage(SurfaceInput i)
-    {
-        return VEIL_COVERAGE;
+        coverage = VEIL_COVERAGE;
+        return true;
     }
 }

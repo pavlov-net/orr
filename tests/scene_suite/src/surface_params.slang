@@ -75,7 +75,7 @@ void main(uint3 id: SV_DispatchThreadID)
     i.scene = root.scene;
     i.view_direction = float3(0.0, 0.0, -1.0);
     float offset;
-    GSurface s = StandardSurface.surface(i, offset);
+    GSurface s = StandardSurface.surface(i, offset, false);
     BsdfParams p = s.bsdf;
     Params o = (Params)0;
     o.base_color = p.base_color;

@@ -53,10 +53,10 @@ fn run<R: Pod, O: Pod>(
 const PRIMARY: u32 = 0;
 const SECONDARY: u32 = 1;
 
-/// Every surface id 0-3 with each hit kind and depths 0 and 3.
+/// Every surface id 0-4 with each hit kind and depths 0 and 3.
 fn surface_inputs() -> Vec<SurfaceInput> {
     let mut v = Vec::new();
-    for surface in 0..4 {
+    for surface in 0..5 {
         for kind in [PRIMARY, SECONDARY] {
             for depth in [0, 3] {
                 v.push(SurfaceInput {
@@ -93,7 +93,7 @@ fn resolve_on_gpu(set: &KernelSet) -> Vec<(SurfaceInput, resolve::SurfaceOut)> {
 
 #[test]
 fn every_surface_method_reaches_the_type_linked_for_its_id() {
-    use linked::surface::{GRASS, GROUND};
+    use linked::surface::{GRASS, GROUND, MOSS};
     for (i, o) in resolve_on_gpu(&linked::KERNELS) {
         let c = i.context;
         let (kind, depth) = (c.kind as f32, c.depth as f32);
@@ -103,12 +103,14 @@ fn every_surface_method_reaches_the_type_linked_for_its_id() {
                 0.125,
                 if c.kind == PRIMARY { 0.75 } else { 0.5 },
             ),
-            // Grass omits coverage, so the interface's body answers.
+            // Grass leaves coverage to StandardSurface.
             s if s == u32::from(GRASS) => (
                 [2.0, kind, depth, c.cone_spread],
                 if c.depth == 0 { 0.5 } else { 0.0 },
-                1.0,
+                0.25,
             ),
+            // Moss adjusts StandardSurface past depth 0.
+            s if s == u32::from(MOSS) && c.depth > 0 => ([0.5, 0.5, 0.5, c.cone_width], 0.25, 0.25),
             // StandardSurface, for id 0 and for an id nothing links to.
             _ => ([0.5, 0.5, 0.5, 1.0], 0.0, 0.25),
         };

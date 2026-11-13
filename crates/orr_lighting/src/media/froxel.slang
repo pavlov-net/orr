@@ -7,7 +7,7 @@ import orr_lighting.media;
 import orr_scene.surface;
 import orr_lighting.froxels;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 extern struct Medium : IMedium = NoMedium;
 
 ORR_ROOT(FroxelRoot);

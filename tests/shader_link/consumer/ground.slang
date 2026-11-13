@@ -1,16 +1,18 @@
-// A surface that overrides coverage and echoes its hit context.
+// A surface that replaces the standard one, has its own coverage and echoes its hit context.
 import orr_scene.surface;
 
 struct GroundBlend : ISurface
 {
-    static GSurface surface(SurfaceInput i, out float depth_offset)
+    override static bool surface(SurfaceInput i, out GSurface g, out float depth_offset)
     {
         depth_offset = 0.125;
-        return { float4(1.0, float(i.context.kind), float(i.context.depth), i.context.cone_width) };
+        g = { float4(1.0, float(i.context.kind), float(i.context.depth), i.context.cone_width) };
+        return true;
     }
 
-    override static float coverage(SurfaceInput i)
+    override static bool coverage(SurfaceInput i, out float coverage)
     {
-        return i.context.kind == HIT_PRIMARY ? 0.75 : 0.5;
+        coverage = i.context.kind == HIT_PRIMARY ? 0.75 : 0.5;
+        return true;
     }
 }

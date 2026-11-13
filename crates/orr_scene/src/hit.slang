@@ -905,7 +905,7 @@ void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bo
 // the unit render-space ray direction `d`, and the caller's context. `previous` places the
 // hit with the previous frame's transforms. `v` is passed on to the surface and may be null.
 // On a strand entry the surface's `cluster` is the segment and its `primitive` 0.
-public SurfaceHit resolve_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], bool previous, HitContext context)
+public SurfaceHit resolve_hit<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], bool previous, HitContext context)
 {
     SurfaceHit hit = (SurfaceHit)0;
     Corners t;
@@ -914,7 +914,7 @@ public SurfaceHit resolve_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, true, previous, true, context, h))
         return hit;
     float offset;
-    GSurface g = S.surface(h.input, offset);
+    GSurface g = S.surface(h.input, offset, false);
     offset = max(offset, 0.0);
     // The back of a single-sided material emits nothing.
     if (h.input.back_face && (s.materials[h.section].flags & MATERIAL_DOUBLE_SIDED) == 0)
@@ -954,7 +954,7 @@ bool fade_present(SceneRoot* s, float3 d, uint instance_index)
 // `resolve_alpha` as 1 or 0 with `alpha`, else `resolve_coverage`. A candidate handler that
 // takes both calls this once with the choice, so its kernel holds one copy of the hit's
 // reconstruction.
-public float resolve_presence<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, bool alpha)
+public float resolve_presence<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, bool alpha)
 {
     uint section;
     return resolve_presence_section<S>(s, v, d, instance_index, cluster_id, primitive, bary, context, alpha, section);
@@ -962,7 +962,7 @@ public float resolve_presence<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
 
 // `resolve_presence`, and in `section` the material of the triangle's section, MATERIAL_NONE
 // where nothing is present.
-public float resolve_presence_section<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, bool alpha, out uint section)
+public float resolve_presence_section<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, bool alpha, out uint section)
 {
     section = MATERIAL_NONE;
     if (!fade_present(s, d, instance_index))
@@ -977,7 +977,7 @@ public float resolve_presence_section<S : ISurface>(SceneRoot* s, ViewConstants*
     // the fade.
     if (alpha && (flags & MATERIAL_ALPHA_TESTED) == 0)
         return 1.0;
-    float coverage = !alpha && (flags & MATERIAL_PRESENCE) != 0 ? S.presence(h.input) : S.coverage(h.input);
+    float coverage = S.coverage(h.input, !alpha && (flags & MATERIAL_PRESENCE) != 0, false);
     if (!alpha)
         return coverage;
     uint3 key = uint3(asuint(bary.x) ^ (instance_index * 0x9E3779B9u), asuint(bary.y) ^ (primitive * 0x85EBCA6Bu), s.frame_index ^ cluster_id);
@@ -989,15 +989,15 @@ public float resolve_presence_section<S : ISurface>(SceneRoot* s, ViewConstants*
 // probability the surface's coverage (the material's alpha test unless a linked surface has
 // its own), against a draw hashed from the candidate and the frame. Coverage is the section
 // material's on both sides, as the raster's alpha test and the opacity micromaps are.
-public bool resolve_alpha<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context)
+public bool resolve_alpha<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context)
 {
     return resolve_presence<S>(s, v, d, instance_index, cluster_id, primitive, bary, context, true) > 0.0;
 }
 
 // How much of a non-opaque triangle candidate is present, 0 to 1: a presence material's
-// opacity (`ISurface.presence`), else the linked surface's coverage or the material's alpha
+// opacity, else the linked surface's coverage or the material's alpha
 // test. Presence layers pass rays through by it.
-public float resolve_coverage<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context)
+public float resolve_coverage<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context)
 {
     return resolve_presence<S>(s, v, d, instance_index, cluster_id, primitive, bary, context, false);
 }

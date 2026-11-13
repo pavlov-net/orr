@@ -18,7 +18,7 @@ import orr_scene.producer;
 import orr_scene.surface;
 import orr_scene.visibility;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 
 ORR_ROOT(RasterRoot);
 
@@ -363,7 +363,7 @@ bool alpha_keeps(VisibleCluster vc, uint triangle, float2 pixel_center)
     PrimaryHit hit = primary_hit(s, root.view, vc, triangle, pixel_center);
     hit.input.context.feedback = texture_feedback_drawn(uint2(pixel_center), root.view.frame_index);
     float noise = unit_float(pcg3d(uint3(uint2(pixel_center), s.frame_index)).x);
-    return CoverageFeedback<Surface>.coverage(hit.input) > noise;
+    return CoverageFeedback<Surface>.coverage(hit.input, false, false) > noise;
 }
 
 [shader("pixel")]

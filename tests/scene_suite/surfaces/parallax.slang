@@ -22,22 +22,21 @@ float3 behind(SurfaceInput i, out float t)
 
 public struct Parallax : ISurface
 {
-    public static GSurface surface(SurfaceInput i, out float depth_offset)
+    public override static void adjust(SurfaceInput i, inout GSurface g, inout float depth_offset)
     {
-        GSurface s = StandardSurface.surface(i, depth_offset);
         float t;
         behind(i, t);
         depth_offset = max(t, 0.0);
         float3 n = normalize(mul(transpose(linear_inverse(i.object_to_render)), float3(SLOPE, 0.0, 1.0)));
-        s.normal = n;
-        s.geometric_normal = n;
-        return s;
+        g.normal = n;
+        g.geometric_normal = n;
     }
 
-    public override static float coverage(SurfaceInput i)
+    public override static bool coverage(SurfaceInput i, out float coverage)
     {
         float t;
         float3 h = behind(i, t);
-        return t >= 0.0 && all(abs(h.xy) <= HALF) ? 1.0 : 0.0;
+        coverage = t >= 0.0 && all(abs(h.xy) <= HALF) ? 1.0 : 0.0;
+        return true;
     }
 }

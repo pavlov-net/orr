@@ -212,7 +212,7 @@ ProxySpans camera_spans(FroxelRoot f, float3 dir, float t_max)
 // A camera ray's march through the linked medium and its proxies, front to back: between
 // steps it adds the linked medium's in-scatter over the distance covered, seen through the
 // proxies so far.
-struct ProxyMarch<S : ISurface, M : IMedium> : IProxyStep
+struct ProxyMarch<S : ISurfaces, M : IMedium> : IProxyStep
 {
     MediaApplyRoot root;
     FroxelRoot froxels;
@@ -339,7 +339,7 @@ struct ProxyMarch<S : ISurface, M : IMedium> : IProxyStep
 // The camera segment over `t` m (+inf on sky pixels) along unit `dir`, through the proxies of
 // `spans`. A sky pixel's environment holds the linked medium past `near_range`, so its
 // stretches in front of a proxy past `near_range` come back out of what the proxy lets through.
-Fog proxy_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 pixel, float3 dir, float t, ProxySpans spans)
+Fog proxy_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 pixel, float3 dir, float t, ProxySpans spans)
 {
     ViewConstants* v = f.view;
     bool sky = isinf(t);
@@ -453,7 +453,7 @@ SmokeSheet next_sheet(FroxelRoot f, float3 dir, float after, float t_max)
 // stretch, each lit by one next-event candidate with its shadow ray and by the linked
 // medium's multiple scattering, with the smoke triangles between them lit the same way and
 // seen through by what their opacity lets through; the linked medium's transmittance exactly.
-Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 pixel, float3 dir, float t, ProxySpans spans)
+Fog reference_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 pixel, float3 dir, float t, ProxySpans spans)
 {
     SceneRoot* s = f.scene;
     LightSetGpu* set = f.set;
@@ -596,7 +596,7 @@ struct FarSmoke : ICandidate
 // The camera segment's in-scatter (pre-exposed) and transmittance over `t` m along unit `dir`,
 // the ray through `pixel`: `linked_fog`, or through the proxies of `spans` where it crosses
 // any. Sky pixels (`t` infinite) take the froxels alone; the environment carries the rest.
-Fog camera_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 pixel, float3 dir, float t, ProxySpans spans)
+Fog camera_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 pixel, float3 dir, float t, ProxySpans spans)
 {
     if (may(MAY_REFERENCE) && r.reference != 0)
         return reference_fog<S, M>(r, f, pixel, dir, t, spans);
@@ -610,7 +610,7 @@ Fog camera_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 
 // the layer what lies behind it. The reference takes that smoke in its own march. On sky pixels
 // the fog ends at `near_range` and the environment holds the medium past it, so the difference of
 // the two fogs puts back what the layer must not take from the stretch in front of it.
-Fog smoky_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 pixel, float3 dir, float t, ProxySpans spans)
+Fog smoky_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 pixel, float3 dir, float t, ProxySpans spans)
 {
     float near_range = f.scene.near_range;
     FarSmoke smoke = { f.scene };
@@ -645,7 +645,7 @@ Fog smoky_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 p
 // pixels whose path carried the segment through an interior nothing. Marked pixels of the
 // background layer take the same over the segment to their layer's depth. One ray finds the
 // pixel's proxy spans for both.
-public void media_apply<S : ISurface, M : IMedium>(MediaApplyRoot r, uint2 pixel)
+public void media_apply<S : ISurfaces, M : IMedium>(MediaApplyRoot r, uint2 pixel)
 {
     FroxelRoot f = *r.froxels;
     ViewConstants* v = f.view;

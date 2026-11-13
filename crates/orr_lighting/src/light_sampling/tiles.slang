@@ -17,7 +17,7 @@ import orr_lighting.environment;
 import orr_lighting.light_sampling;
 import orr_lighting.shadow;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 
 struct Root
 {

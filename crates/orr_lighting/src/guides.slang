@@ -239,7 +239,7 @@ public struct LayerChain
 // `depth` layers. `exposure` scales emission to pre-exposed units. Each rough interface widens
 // the chain by its roughness squared per m beyond it (half the cone spread a rough lobe gives a
 // path).
-public LayerChain layer_chain<S : ISurface>(SceneRoot* s, ViewConstants* v, LayerVertex l, Bsdf b, float3 dir, Interior interior, uint depth, RayCone cone, float exposure)
+public LayerChain layer_chain<S : ISurfaces>(SceneRoot* s, ViewConstants* v, LayerVertex l, Bsdf b, float3 dir, Interior interior, uint depth, RayCone cone, float exposure)
 {
     LobeAlbedo a = b.albedo();
     Guides own = surface_guides(l.x.surface, b, exposure);
@@ -326,7 +326,7 @@ public LayerChain layer_chain<S : ISurface>(SceneRoot* s, ViewConstants* v, Laye
 // distance plus every bounce's length, and past a dielectric whose refraction chain carries
 // more than its reflection, plus that chain's length or at infinity, as a pixel's first layer
 // takes it.
-public Reflection mirror_chain<S : ISurface>(GuideRoot r, uint2 pixel, PathVertex x1, Guides g1, bool chain)
+public Reflection mirror_chain<S : ISurfaces>(GuideRoot r, uint2 pixel, PathVertex x1, Guides g1, bool chain)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
@@ -409,7 +409,7 @@ public Reflection mirror_chain<S : ISurface>(GuideRoot r, uint2 pixel, PathVerte
 }
 
 // The guide resolve's body for `pixel`, hits shading through linked surface `S`.
-public void guide_body<S : ISurface>(GuideRoot r, uint2 pixel)
+public void guide_body<S : ISurfaces>(GuideRoot r, uint2 pixel)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;

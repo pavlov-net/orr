@@ -8,7 +8,7 @@ import orr_scene.surface;
 import orr_lighting.path;
 import orr_lighting.path.stages;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 extern struct Environment : IEnvironment = EnvironmentMap;
 extern struct Medium : IMedium = NoMedium;
 export static const bool PATH_SPECIALIZES = true;

@@ -342,7 +342,7 @@ bool eye_may_be_inside(FroxelRoot r)
 // Finds what of column `column` the interior at its near-plane point holds: rays from the eye,
 // to the near plane until they are inside an interior and on to `near_range` from there. A body
 // of another material inside that interior does not end it.
-public void froxel_eye_column<S : ISurface>(FroxelRoot r, uint2 column)
+public void froxel_eye_column<S : ISurfaces>(FroxelRoot r, uint2 column)
 {
     EyeColumn out = (EyeColumn)0;
     out.interior = EyeInterior();
@@ -469,7 +469,7 @@ float3 limit_incident(float3 c)
 // one holds, else `surface_visibility`'s, without the linked medium and with the interiors'
 // optical depth apart in `depth`. `stack` holds the stack's bent direction and densities, or a
 // straight ray's.
-float3 froxel_shadow<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, bool bend, uint* overflows, out float3 depth, out StackLight stack)
+float3 froxel_shadow<S : ISurfaces, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, bool bend, uint* overflows, out float3 depth, out StackLight stack)
 {
     if (may(MAY_STACK) && bend && path_light<S, M>(s, v, origin, origin, dir, positive_infinity(), flags, context, false, inside, true, false, false, overflows, stack) != STACK_BROKEN)
     {
@@ -591,7 +591,7 @@ FroxelLocal froxel_local(FroxelRoot r, uint3 f, float3 x, inout Sampler rng)
 
 // The light pass over column `column`. Froxels behind their tiles' surfaces carry their history
 // unchanged.
-public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column)
+public void froxel_light<S : ISurfaces, M : IMedium>(FroxelRoot r, uint2 column)
 {
     float far = farthest_surface(r, column);
     float near_range = r.scene.near_range;

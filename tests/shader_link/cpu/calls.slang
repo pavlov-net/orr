@@ -6,7 +6,7 @@ import orr_lighting.environment;
 import orr_lighting.media;
 import orr_shaders.coherence;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 extern struct Displace : IDisplacement = TextureDisplacement;
 extern struct Environment : IEnvironment = EnvironmentMap;
 extern struct Medium : IMedium = NoMedium;
@@ -21,13 +21,13 @@ export __extern_cpp void link_surface(uint id, uint kind, uint depth, float cone
     i.context.cone_spread = cone_spread;
     i.surface = id;
     float depth_offset;
-    float4 a = Surface.surface(i, depth_offset).albedo;
+    float4 a = Surface.surface(i, depth_offset, false).albedo;
     out[0] = a.x;
     out[1] = a.y;
     out[2] = a.z;
     out[3] = a.w;
     out[4] = depth_offset;
-    out[5] = Surface.coverage(i);
+    out[5] = Surface.coverage(i, false, false);
 }
 
 export __extern_cpp void link_displace(uint id, float* position, float* normal, float* out)

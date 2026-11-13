@@ -12,7 +12,7 @@ import orr_lighting.shadow;
 import orr_lighting.path;
 import orr_lighting.traced_debug;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 
 // `TracedRoot.mode`.
 static const uint TRACED_DISTANCE = 0;

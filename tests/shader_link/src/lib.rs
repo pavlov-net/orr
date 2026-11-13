@@ -1,6 +1,7 @@
 //! Link points through `orr_shaders::build`. `renderer/` stands in for a renderer crate:
-//! its kernels declare every link point. The build links two surfaces (one overriding
-//! `coverage`, one omitting it), a displacement, an environment and a medium into them, and
+//! its kernels declare every link point. The build links three surfaces (two replacing the
+//! standard one, one of them with its own `coverage`, and one adjusting it), a displacement,
+//! an environment and a medium into them, and
 //! `cpu/calls.slang` calls the same linked types on the CPU. The same environment and medium
 //! also link into orr's own kernels.
 

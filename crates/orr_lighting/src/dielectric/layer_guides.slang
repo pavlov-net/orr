@@ -5,7 +5,7 @@ import orr_lighting.path;
 import orr_lighting.dielectric;
 import orr_scene.surface;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 export static const bool PATH_SPECIALIZES = true;
 
 ORR_ROOT_INLINE(PathRoot);

@@ -14,7 +14,7 @@ import orr_scene.tables;
 import orr_scene.view;
 import orr_scene.visibility;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 
 static const uint MODE_SHADED = 0;
 static const uint MODE_CLUSTERS = 1;

@@ -55,12 +55,14 @@ support kernels it reads, so kernel compile time is something a user sees.
    the test doesn't reach the feature. When one of these tests fails, look at a single path
    first: the same decisions with last-bit differences mean the driver rounded the two pipelines
    differently, not that a bit is wrong.
-5. **Count the call sites of large bodies.** A surface evaluation, `bsdf_prepare`, a hit resolve
-   or a shadow trace with candidates is thousands of instructions per site, and a site brings
+5. **Count the call sites of large bodies.** A surface evaluation, `bsdf_prepare`, a hit resolve or
+   a shadow trace with candidates is thousands of instructions per site, and a site brings
    everything it can reach: a shadow candidate that can be a dielectric pulls a hit resolve and a
-   surface evaluation into every shadow-ray site. Code repeated per case, such as per material
-   slot, multiplies the same way. Feed an existing site instead of adding one, with a loop over
-   cases or in the stage that already has it. Small bodies copied a few times are rarely worth
+   surface evaluation into every shadow-ray site. Code repeated per case, such as per material slot
+   or per linked surface, multiplies the same way: `Surfaces` (`orr_scene.surface`) calls the
+   standard surface once per site for every linked type that leaves a hit to it, so a type that
+   computes it itself adds a copy per site. Feed an existing site instead of adding one, with a loop
+   over cases or in the stage that already has it. Small bodies copied a few times are rarely worth
    cutting.
 6. **Keep per-path state small.** Every stage reads and writes it every round, so its size shows
    directly in frame time. What costs is the words a stage loads and keeps live, not the

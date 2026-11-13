@@ -15,7 +15,8 @@ use super::roots::Root;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkPoint {
-    /// `ISurface`: one switch on the surface id, `StandardSurface` for id 0.
+    /// `ISurface`: one switch on the surface id, `NoSurface` for id 0, which the kernels'
+    /// `ISurfaces` takes through `Surfaces`.
     Surface,
     /// `IDisplacement`: one switch on the displacement id, `TextureDisplacement` for id 0.
     Displacement,
@@ -27,7 +28,7 @@ pub enum LinkPoint {
     Medium,
 }
 
-/// One interface method the generated switch forwards.
+/// One method of the linked types' interface that the generated switch forwards.
 struct Method {
     /// The declaration without `static`.
     decl: &'static str,
@@ -42,27 +43,39 @@ struct Method {
 struct Switch {
     /// The expression that reads the id; every method's first parameter is `i`.
     id: &'static str,
+    /// The type for id 0 and every id nothing links.
     default: &'static str,
+    /// The interface the linked types implement, with the methods the switch forwards.
+    linked: &'static str,
     methods: &'static [Method],
+    /// The generic over the switch that the kernels' interface takes, where the kernels use
+    /// another interface than the linked types.
+    wrap: Option<&'static str>,
 }
 
-/// The interface's methods as contracts.md 6 defines them. A link-point interface change
-/// edits this table in the same change. `ISurface.presence` stays out: a presence layer's
-/// opacity is its material's whatever the surface.
+/// The surface interface's methods, every one optional: `Surfaces` over the switch calls the
+/// standard surface once at a site for every linked type that leaves a hit to it.
 const SURFACE: Switch = Switch {
     id: "i.surface",
-    default: "StandardSurface",
+    default: "NoSurface",
+    linked: "ISurface",
     methods: &[
         Method {
-            decl: "GSurface surface(SurfaceInput i, out float depth_offset)",
+            decl: "bool surface(SurfaceInput i, out GSurface g, out float depth_offset)",
             name: "surface",
-            args: "i, depth_offset",
-            optional: false,
+            args: "i, g, depth_offset",
+            optional: true,
         },
         Method {
-            decl: "float coverage(SurfaceInput i)",
+            decl: "void adjust(SurfaceInput i, inout GSurface g, inout float depth_offset)",
+            name: "adjust",
+            args: "i, g, depth_offset",
+            optional: true,
+        },
+        Method {
+            decl: "bool coverage(SurfaceInput i, out float coverage)",
             name: "coverage",
-            args: "i",
+            args: "i, coverage",
             optional: true,
         },
         Method {
@@ -78,28 +91,33 @@ const SURFACE: Switch = Switch {
             optional: true,
         },
     ],
+    wrap: Some("Surfaces"),
 };
 
 const DISPLACEMENT: Switch = Switch {
     id: "i.displacement",
     default: "TextureDisplacement",
+    linked: "IDisplacement",
     methods: &[Method {
         decl: "float3 displace(DisplacementInput i)",
         name: "displace",
         args: "i",
         optional: false,
     }],
+    wrap: None,
 };
 
 const DRAWN: Switch = Switch {
     id: "i.drawn",
     default: "NoDrawn",
+    linked: "IDrawn",
     methods: &[Method {
         decl: "DrawnTriangle triangle(DrawnInput i)",
         name: "triangle",
         args: "i",
         optional: false,
     }],
+    wrap: None,
 };
 
 impl LinkPoint {
@@ -111,9 +129,10 @@ impl LinkPoint {
         Self::Medium,
     ];
 
+    /// The interface of the kernels' `extern struct`.
     fn interface(self) -> &'static str {
         match self {
-            Self::Surface => "ISurface",
+            Self::Surface => "ISurfaces",
             Self::Displacement => "IDisplacement",
             Self::Drawn => "IDrawn",
             Self::Environment => "IEnvironment",
@@ -379,12 +398,12 @@ fn source(decl: &Declared, linked: &[&Link], key_bits: u32) -> String {
         );
         return out;
     };
-    let _ = writeln!(
-        out,
-        "\nexport struct {} : {}\n{{",
-        decl.name,
-        point.interface()
-    );
+    // The switch is the kernels' type, or with `wrap` the type the kernels' type wraps.
+    let (ty, export) = match switch.wrap {
+        Some(_) => (format!("{}Links", decl.name), ""),
+        None => (decl.name.clone(), "export "),
+    };
+    let _ = writeln!(out, "\n{export}struct {ty} : {}\n{{", switch.linked);
     for m in switch.methods {
         let modifier = if m.optional { "override " } else { "" };
         // A void method's cases call, then return: `return` takes no void expression.
@@ -415,6 +434,14 @@ fn source(decl: &Declared, linked: &[&Link], key_bits: u32) -> String {
         );
     }
     out.push_str("}\n");
+    if let Some(wrap) = switch.wrap {
+        let _ = writeln!(
+            out,
+            "\nexport struct {} : {} = {wrap}<{ty}>;",
+            decl.name,
+            point.interface()
+        );
+    }
     if point == LinkPoint::Surface {
         let _ = writeln!(out, "\nexport static const uint KEY_BITS = {key_bits};");
     }
@@ -451,8 +478,8 @@ mod tests {
 
     #[test]
     fn declared_points_skip_comments() {
-        let src = "// extern struct Old : ISurface = StandardSurface;\n\
-                   import orr_scene.surface;\nextern struct Surface : ISurface = StandardSurface;\n\
+        let src = "// extern struct Old : ISurfaces = StandardSurface;\n\
+                   import orr_scene.surface;\nextern struct Surface : ISurfaces = StandardSurface;\n\
                    extern struct Medium : IMedium = NoMedium;\n";
         assert_eq!(
             declared(src),

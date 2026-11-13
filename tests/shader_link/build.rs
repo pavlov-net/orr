@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 
 use orr_shaders::build::{Build, CpuLibrary, Error, LinkPoint, Output};
 
-/// Two surfaces, one overriding `coverage` and one omitting it, a displacement, an
-/// environment and a medium.
-const LINKS: [(LinkPoint, &str, &str, &str); 5] = [
+/// Three surfaces: two that replace the standard one, one with its own `coverage` and one
+/// without, and one that adjusts it; a displacement, an environment and a medium.
+const LINKS: [(LinkPoint, &str, &str, &str); 6] = [
     (
         LinkPoint::Surface,
         "ground",
@@ -22,6 +22,7 @@ const LINKS: [(LinkPoint, &str, &str, &str); 5] = [
         "GroundBlend",
     ),
     (LinkPoint::Surface, "grass", "consumer/grass.slang", "Grass"),
+    (LinkPoint::Surface, "moss", "consumer/moss.slang", "Moss"),
     (
         LinkPoint::Displacement,
         "waves",

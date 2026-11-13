@@ -810,7 +810,7 @@ public bool list_cluster(SceneRoot* s, EmissiveSelection e, uint entry, uint p, 
 // the surface emits there, in the share a presence layer shows and none where an alpha test
 // leaves a hole, which only the triangles traversal tests take, and the share of a chain fade
 // the copy's nearer step shows.
-LightSample emissive_sample<S : ISurface>(LightSetGpu* set, uint entry, uint first, uint count, uint2 bits, float2 u, float probability)
+LightSample emissive_sample<S : ISurfaces>(LightSetGpu* set, uint entry, uint first, uint count, uint2 bits, float2 u, float probability)
 {
     SceneRoot* s = set.scene;
     EmissiveSelection e = set.emissive[entry];
@@ -863,10 +863,12 @@ LightSample emissive_sample<S : ISurface>(LightSetGpu* set, uint entry, uint fir
     c.material = t.material;
     c.surface = section.surface;
     c.data = section.data != 0 ? section.data : s.surface_data;
-    if ((section.flags & MATERIAL_PRESENCE) != 0)
-        emitted *= saturate(material_opacity(c));
-    else if (tested)
-        emitted *= S.coverage(c);
+    bool presence = (section.flags & MATERIAL_PRESENCE) != 0;
+    if (presence || tested)
+    {
+        float present = S.coverage(c, presence, false);
+        emitted *= presence ? saturate(present) : present;
+    }
     float pdf = probability * list_step(e, p) / float(triangles) / area * side;
     LightSample r = light_sample(LIGHT_SAMPLE_EMISSIVE, s.light_capacity + entry, i.position, facing, emitted, pdf);
     r.position = p;
@@ -882,7 +884,7 @@ LightSample emissive_sample<S : ISurface>(LightSetGpu* set, uint entry, uint fir
 // vertex, whose medium has IOR `exterior_ior`: the share `Bsdf.emission` of a BSDF ray along
 // `c.dir` keeps. The point's barycentrics come back from the traced corners it was drawn
 // from, to rounding.
-public float3 emitter_view_layer<S : ISurface>(LightSetGpu* set, ResolvedLightSample c, float exterior_ior)
+public float3 emitter_view_layer<S : ISurfaces>(LightSetGpu* set, ResolvedLightSample c, float exterior_ior)
 {
     // No sample is drawn with LIGHT_SAMPLE_VIEW where no emitter has a coat or fuzz.
     if (!may2(MAY2_COATED_EMITTERS))
@@ -911,7 +913,7 @@ public float3 emitter_view_layer<S : ISurface>(LightSetGpu* set, ResolvedLightSa
     float2 bary = float2(d22 * v1 - d12 * v2, d11 * v2 - d12 * v1) / det;
     SurfaceInput i = emitter_input(s, t, c.triangle, bary, c.dir);
     float offset;
-    GSurface g = S.surface(i, offset);
+    GSurface g = S.surface(i, offset, false);
     return bsdf_emission_layer(g.bsdf, g.normal, -c.dir, exterior_ior);
 }
 
@@ -1063,7 +1065,7 @@ public float light_selection(LightSetGpu* set, LocalLights* local, uint id, uint
 
 // Sample of the light with feedback id `id` from `bits` and `u`, the light chosen with
 // `probability`; an emissive entry draws from its list positions `first`..`first + count`.
-LightSample tile_light_sample<S : ISurface>(LightSetGpu* set, uint id, uint first, uint count, uint2 bits, float4 u, float probability)
+LightSample tile_light_sample<S : ISurfaces>(LightSetGpu* set, uint id, uint first, uint count, uint2 bits, float4 u, float probability)
 {
     if (id == feedback_environment(set))
     {
@@ -1085,7 +1087,7 @@ LightSample tile_light_sample<S : ISurface>(LightSetGpu* set, uint id, uint firs
 }
 
 // Tile sample `index` of `frame`, drawn from the light set's selection.
-public LightSample presample_light<S : ISurface>(LightSetGpu* set, uint index, uint frame)
+public LightSample presample_light<S : ISurfaces>(LightSetGpu* set, uint index, uint frame)
 {
     uint4 h0 = pcg4d(uint4(index, frame, 0x6c69u, 1u));
     uint4 h1 = pcg4d(uint4(index, frame, 0x6c69u, 2u));
@@ -1111,7 +1113,7 @@ public LightSample presample_light<S : ISurface>(LightSetGpu* set, uint index, u
 // The local sampler candidate of a vertex at `x`: a slot by its fixed-point step from `pick`,
 // then a sample of its range, with the density of its point alone (the light chosen with
 // probability 1).
-ResolvedLightSample local_candidate<S : ISurface>(LightSetGpu* set, LocalLights* local, float3 x, uint pick, uint2 bits, float4 u)
+ResolvedLightSample local_candidate<S : ISurfaces>(LightSetGpu* set, LocalLights* local, float3 x, uint pick, uint2 bits, float4 u)
 {
     uint n = min(local.count, LOCAL_LIGHTS);
     uint target = mulhi(pick, 0xffffffffu);
@@ -1267,7 +1269,7 @@ ResolvedLightSample directional_candidate(LightSetGpu* set, float3 normal, float
 // light chosen by weight x n.l and a direction in its cone; otherwise a light candidate
 // (`light_candidate`). The density is the candidate's in the vertex's whole mixture. Draws five
 // sampler dimensions.
-public ResolvedLightSample nee_candidate<S : ISurface>(LightSetGpu* set, NeeVertex v, inout Sampler rng)
+public ResolvedLightSample nee_candidate<S : ISurfaces>(LightSetGpu* set, NeeVertex v, inout Sampler rng)
 {
     float choice = rng.next();
     if (choice < v.share)
@@ -1288,13 +1290,13 @@ public ResolvedLightSample nee_directional_candidate(LightSetGpu* set, NeeVertex
 // `nee_candidate` given that it draws no directional light, its density still the whole
 // mixture's: with the local sampler's share, a slot it holds and a sample of its range, or
 // else a sample at a random offset in the vertex's tile. Draws five sampler dimensions.
-public ResolvedLightSample nee_light_candidate<S : ISurface>(LightSetGpu* set, NeeVertex v, inout Sampler rng)
+public ResolvedLightSample nee_light_candidate<S : ISurfaces>(LightSetGpu* set, NeeVertex v, inout Sampler rng)
 {
     return light_candidate<S>(set, v, rng.next(), rng);
 }
 
 // A light candidate from local sampler or tile by `choice` in [0, 1); four sampler dimensions.
-ResolvedLightSample light_candidate<S : ISurface>(LightSetGpu* set, NeeVertex v, float choice, inout Sampler rng)
+ResolvedLightSample light_candidate<S : ISurfaces>(LightSetGpu* set, NeeVertex v, float choice, inout Sampler rng)
 {
     uint pick = rng.next_bits();
     uint2 bits = uint2(rng.next_bits(), rng.next_bits());
@@ -1327,7 +1329,7 @@ ResolvedLightSample light_candidate<S : ISurface>(LightSetGpu* set, NeeVertex v,
 // or emissive light drawn from the light set's selection itself rather than a tile. The density
 // is the candidate's in that conditioned mixture; none where the scene has no such light.
 // Draws five sampler dimensions.
-public ResolvedLightSample owned_light_candidate<S : ISurface>(LightSetGpu* set, float3 x, inout Sampler rng)
+public ResolvedLightSample owned_light_candidate<S : ISurfaces>(LightSetGpu* set, float3 x, inout Sampler rng)
 {
     float total;
     float share = directional_share(set, float3(0.0), total);

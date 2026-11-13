@@ -9,7 +9,7 @@ import orr_shaders.trace;
 import orr_scene.hit;
 import orr_scene.visibility;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 
 struct Traced
 {
@@ -70,7 +70,7 @@ ORR_ROOT(Root);
 
 // Candidates through surface `S`: presence layers wherever their opacity (`resolve_coverage`) is
 // above 0, the rest through `resolve_alpha`.
-struct Alpha<S : ISurface> : IAnyHit
+struct Alpha<S : ISurfaces> : IAnyHit
 {
     SceneRoot* s;
     ViewConstants* v;
@@ -94,7 +94,7 @@ struct Found
 }
 
 // The nearest hit along `d` of the geometry in `mask`.
-Found trace<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 d, float t_max, HitContext context, uint mask = MASK_OPAQUE)
+Found trace<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 origin, float3 d, float t_max, HitContext context, uint mask = MASK_OPAQUE)
 {
     RayDesc ray;
     ray.Origin = origin;
@@ -189,7 +189,7 @@ void same_point(uint3 id: SV_DispatchThreadID)
         VisibleCluster vc = g.clusters[visibility_cluster(w)];
         PrimaryHit p = primary_hit(s, v, vc, visibility_triangle(w), float2(pixel) + 0.5);
         float offset;
-        GSurface a = Surface.surface(p.input, offset);
+        GSurface a = Surface.surface(p.input, offset, false);
         a.position = p.input.position;
         o.position[0] = a.position;
         o.normal[0] = a.normal;

@@ -7,7 +7,7 @@ import orr_scene.surface;
 import orr_scene.particles;
 import orr_lighting.particle_lighting;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 extern struct Medium : IMedium = NoMedium;
 
 public struct ParticleRoot

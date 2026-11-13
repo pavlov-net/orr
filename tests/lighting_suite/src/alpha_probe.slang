@@ -9,24 +9,20 @@ import orr_lighting.path;
 import orr_lighting.shadow;
 import lighting_suite.rings;
 
-// The kernel's surface switch as a build linking `Rings` as surface 2 and `Veil` as 3
-// makes it.
-struct ProbeSurface : ISurface
+// The kernel's surfaces as a build linking `Rings` as surface 2 and `Veil` as 3 makes them.
+struct ProbeLinks : ISurface
 {
-    static GSurface surface(SurfaceInput i, out float depth_offset)
-    {
-        return StandardSurface.surface(i, depth_offset);
-    }
-
-    override static float coverage(SurfaceInput i)
+    override static bool coverage(SurfaceInput i, out float coverage)
     {
         if (i.surface == 2)
-            return Rings.coverage(i);
+            return Rings.coverage(i, coverage);
         if (i.surface == 3)
-            return Veil.coverage(i);
-        return material_coverage(i);
+            return Veil.coverage(i, coverage);
+        return NoSurface.coverage(i, coverage);
     }
 }
+
+typealias ProbeSurface = Surfaces<ProbeLinks>;
 
 // `Alpha`, counting its calls.
 struct Counted : IAnyHit

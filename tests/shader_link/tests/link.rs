@@ -7,7 +7,7 @@ const SECONDARY: u32 = 1;
 
 #[test]
 fn every_surface_method_reaches_the_type_linked_for_its_id() {
-    use linked::surface::{GRASS, GROUND};
+    use linked::surface::{GRASS, GROUND, MOSS};
     for kind in [PRIMARY, SECONDARY] {
         for depth in [0, 3] {
             let call = |id| shader_link::surface(id, kind, depth, 0.01, 0.002);
@@ -19,18 +19,27 @@ fn every_surface_method_reaches_the_type_linked_for_its_id() {
             let grass = call(GRASS);
             assert_eq!(grass.albedo, [2.0, kind as f32, depth as f32, 0.002]);
             assert_eq!(grass.depth_offset, if depth == 0 { 0.5 } else { 0.0 });
-            // Grass omits coverage, so the interface's body answers.
-            assert_eq!(grass.coverage, 1.0);
+            // Grass leaves coverage to StandardSurface.
+            assert_eq!(grass.coverage, 0.25);
 
             let standard = call(0);
             assert_eq!(standard.albedo, [0.5, 0.5, 0.5, 1.0]);
             assert_eq!(standard.depth_offset, 0.0);
             assert_eq!(standard.coverage, 0.25);
             assert_eq!(
-                call(3),
+                call(4),
                 standard,
                 "an id nothing links to falls back to the default"
             );
+
+            // Moss adjusts StandardSurface past depth 0.
+            let moss = call(MOSS);
+            if depth == 0 {
+                assert_eq!(moss, standard);
+            } else {
+                assert_eq!(moss.albedo, [0.5, 0.5, 0.5, 0.01]);
+                assert_eq!((moss.depth_offset, moss.coverage), (0.25, 0.25));
+            }
         }
     }
 }
@@ -67,7 +76,7 @@ fn displacement_environment_and_medium_reach_the_linked_types() {
 
 #[test]
 fn coherence_key_widens_with_the_highest_surface_id() {
-    // Two surfaces: 3 + bit length of 2.
+    // Three surfaces: 3 + bit length of 3.
     assert_eq!(shader_link::key_bits(), 5);
 }
 

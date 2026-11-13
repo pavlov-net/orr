@@ -79,7 +79,7 @@ public void layer_args_body(LayerTilesRoot r)
 // the mirror reflection's virtual point. Where transmission dominates, `frost` gets the blur
 // the chain's rough interfaces give what it reaches, the widths adding in quadrature.
 // `front` is the layer's overlay front word where the dominant layer lies behind it, else 0.
-public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, Hit h, float3 dir, Interior interior, float coverage, out uint64_t front)
+public LayerGuide layer_guides<S : ISurfaces>(PathRoot r, LayerVertex l, Bsdf b, Hit h, float3 dir, Interior interior, float coverage, out uint64_t front)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
@@ -160,7 +160,7 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
 // surface between the eye and the near-plane point where a layer may lie there, so a near plane
 // straddling a surface works; the camera ray up to the opaque depth; and the guide of its first
 // layer. Opaque hits on the way name no layer.
-public void layer_guide_body<S : ISurface>(PathRoot r, uint2 pixel)
+public void layer_guide_body<S : ISurfaces>(PathRoot r, uint2 pixel)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;

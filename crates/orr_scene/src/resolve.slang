@@ -17,7 +17,7 @@ import orr_scene.visibility;
 export static const bool TEXTURE_FEEDBACK = true;
 export static const bool NEURAL_TEXTURES = true;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 extern struct Drawn : IDrawn = NoDrawn;
 
 ORR_ROOT(RasterRoot);
@@ -137,7 +137,7 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
         return;
     material_prepare(m, hit.input.uv);
     float offset = 0.0;
-    GSurface g = Surface.surface(hit.input, offset);
+    GSurface g = Surface.surface(hit.input, offset, false);
     offset = max(offset, 0.0);
 
     float3 relative = hit.relative + hit.direction * offset;

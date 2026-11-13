@@ -14,7 +14,7 @@ import orr_lighting.shadow;
 import orr_lighting.path;
 import orr_lighting.traced_debug;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 
 // `OriginProbeGpu.hit`.
 public static const uint ORIGIN_PROBE_SKY = 0;

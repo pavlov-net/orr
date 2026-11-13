@@ -1,4 +1,4 @@
-// The surface link point as contracts.md 6 shapes it, cut down to what the tests read.
+// The surface link point as orr_scene shapes it, cut down to what the tests read.
 module surface;
 
 public static const uint HIT_PRIMARY = 0;
@@ -27,10 +27,19 @@ public struct GSurface
 
 public interface ISurface
 {
-    static GSurface surface(SurfaceInput i, out float depth_offset);
-    static float coverage(SurfaceInput i)
+    static bool surface(SurfaceInput i, out GSurface g, out float depth_offset)
     {
-        return 1.0;
+        g = (GSurface)0;
+        depth_offset = 0.0;
+        return false;
+    }
+    static void adjust(SurfaceInput i, inout GSurface g, inout float depth_offset)
+    {
+    }
+    static bool coverage(SurfaceInput i, out float coverage)
+    {
+        coverage = 0.0;
+        return false;
     }
     static void feedback(SurfaceInput i)
     {
@@ -40,16 +49,37 @@ public interface ISurface
     }
 }
 
-public struct StandardSurface : ISurface
+public struct NoSurface : ISurface
 {
-    public static GSurface surface(SurfaceInput i, out float depth_offset)
+}
+
+public interface ISurfaces
+{
+    static GSurface surface(SurfaceInput i, out float depth_offset, bool report);
+    static float coverage(SurfaceInput i, bool presence, bool report);
+}
+
+public struct Surfaces<L : ISurface> : ISurfaces
+{
+    public static GSurface surface(SurfaceInput i, out float depth_offset, bool report)
     {
-        depth_offset = 0.0;
-        return { float4(0.5, 0.5, 0.5, 1.0) };
+        GSurface g;
+        if (!L.surface(i, g, depth_offset))
+        {
+            depth_offset = 0.0;
+            g = { float4(0.5, 0.5, 0.5, 1.0) };
+            L.adjust(i, g, depth_offset);
+        }
+        return g;
     }
 
-    public override static float coverage(SurfaceInput i)
+    public static float coverage(SurfaceInput i, bool presence, bool report)
     {
-        return 0.25;
+        float coverage;
+        if (presence || !L.coverage(i, coverage))
+            coverage = 0.25;
+        return coverage;
     }
 }
+
+public typealias StandardSurface = Surfaces<NoSurface>;

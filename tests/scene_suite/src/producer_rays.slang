@@ -7,7 +7,7 @@ import orr_shaders.trace;
 import orr_scene.hit;
 import orr_scene.visibility;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 extern struct Drawn : IDrawn = NoDrawn;
 
 struct Seen
@@ -73,7 +73,7 @@ void main(uint3 id: SV_DispatchThreadID)
             {
                 PrimaryHit p = primary_hit<Drawn>(s, v, vc, visibility_triangle(w), float2(pixel) + 0.5);
                 float offset;
-                GSurface g = Surface.surface(p.input, offset);
+                GSurface g = Surface.surface(p.input, offset, false);
                 o.raster_entry = entry + 1;
                 o.raster_cluster = vc.cluster;
                 o.raster_words = g.bsdf.base_color;

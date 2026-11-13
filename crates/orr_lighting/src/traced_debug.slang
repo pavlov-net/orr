@@ -36,7 +36,7 @@ public struct TracedHit
 // The closest hit along `dir` from `origin` within `t_max` of the geometry in `mask`, its
 // alpha-tested candidates decided by the surface's coverage, opacity micromaps forced to two
 // states, as the path rays trace.
-public TracedHit traced_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint mask)
+public TracedHit traced_hit<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint mask)
 {
     RayCone cone = { 0.0, 0.0 };
     HitContext context = hit_context(HIT_SECONDARY, 1, cone, 0.0);

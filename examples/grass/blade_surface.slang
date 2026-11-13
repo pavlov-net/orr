@@ -41,13 +41,11 @@ public struct BladeGeometry : IDrawn
 
 public struct BladeSurface : ISurface
 {
-    public static GSurface surface(SurfaceInput i, out float depth_offset)
+    public override static void adjust(SurfaceInput i, inout GSurface g, inout float depth_offset)
     {
-        GSurface g = StandardSurface.surface(i, depth_offset);
         // Darker toward the root, where less light reaches.
         float3 color = blade_color_from(i.vertex_user.x) * lerp(0.35, 1.0, saturate(i.uv[0].uv.y));
         g.bsdf.base_color = color;
         g.bsdf.subsurface_color = color;
-        return g;
     }
 }

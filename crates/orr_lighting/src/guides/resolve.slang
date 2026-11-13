@@ -3,7 +3,7 @@
 import orr_scene.surface;
 import orr_lighting.guides;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 export static const bool PATH_SPECIALIZES = true;
 
 ORR_ROOT(GuideRoot);

@@ -5,7 +5,7 @@ import orr_shaders.trace;
 import orr_scene.hit;
 import orr_scene.visibility;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 
 struct Depths
 {

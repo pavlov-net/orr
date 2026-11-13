@@ -485,24 +485,40 @@ fn omm_builds_declare_the_mode_on_every_ray_query_entry() {
     }
 }
 
-/// The surface interface in the shape the build's method table forwards.
+/// The surface interfaces in the shape the build's switch calls.
 const SURFACE: &str = "module surface;\n\
     public struct SurfaceInput { public uint surface; public float x; }\n\
     public struct GSurface { public float4 albedo; }\n\
     public interface ISurface {\n\
-        static GSurface surface(SurfaceInput i, out float depth_offset);\n\
-        static float coverage(SurfaceInput i) { return 1; }\n\
+        static bool surface(SurfaceInput i, out GSurface g, out float d) { g = (GSurface)0; d = 0; return false; }\n\
+        static void adjust(SurfaceInput i, inout GSurface g, inout float d) {}\n\
+        static bool coverage(SurfaceInput i, out float c) { c = 0; return false; }\n\
         static void feedback(SurfaceInput i) {}\n\
         static void coverage_feedback(SurfaceInput i) {}\n\
     }\n\
-    public struct StandardSurface : ISurface {\n\
-        public static GSurface surface(SurfaceInput i, out float d) { d = 0; return { float4(0) }; }\n\
-    }\n";
+    public struct NoSurface : ISurface {}\n\
+    public interface ISurfaces {\n\
+        static GSurface surface(SurfaceInput i, out float d, bool report);\n\
+        static float coverage(SurfaceInput i, bool presence, bool report);\n\
+    }\n\
+    public struct Surfaces<L : ISurface> : ISurfaces {\n\
+        public static GSurface surface(SurfaceInput i, out float d, bool report) {\n\
+            GSurface g;\n\
+            if (!L.surface(i, g, d)) { d = 0; g = { float4(0) }; L.adjust(i, g, d); }\n\
+            return g;\n\
+        }\n\
+        public static float coverage(SurfaceInput i, bool presence, bool report) {\n\
+            float c;\n\
+            if (presence || !L.coverage(i, c)) c = 1;\n\
+            return c;\n\
+        }\n\
+    }\n\
+    public typealias StandardSurface = Surfaces<NoSurface>;\n";
 
 /// A consumer surface returning `value`.
 fn consumer_surface(ty: &str, value: &str) -> String {
     format!(
-        "import orr_scene.surface;\nstruct {ty} : ISurface {{ static GSurface surface(SurfaceInput i, out float d) {{ d = 0; return {{ float4({value}) }}; }} }}\n"
+        "import orr_scene.surface;\nstruct {ty} : ISurface {{ override static bool surface(SurfaceInput i, out GSurface g, out float d) {{ d = 0; g = {{ float4({value}) }}; return true; }} }}\n"
     )
 }
 
@@ -514,9 +530,9 @@ const MEDIA: &str = "module media;\n\
 /// once; returns the fixture and the renderer's output.
 fn link_fixture(name: &str) -> (PathBuf, Output) {
     let surface_kernel = format!(
-        "import orr_scene.surface;\nextern struct Surface : ISurface = StandardSurface;\n{}",
+        "import orr_scene.surface;\nextern struct Surface : ISurfaces = StandardSurface;\n{}",
         kernel(
-            "SurfaceInput i = { root.count, 1.0 }; float d; root.out[id.x] = Surface.surface(i, d).albedo * Surface.coverage(i) + d;"
+            "SurfaceInput i = { root.count, 1.0 }; float d; root.out[id.x] = Surface.surface(i, d, false).albedo * Surface.coverage(i, false, false) + d;"
         )
     );
     let medium_kernel = format!(

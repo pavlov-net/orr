@@ -21,7 +21,7 @@ import orr_lighting.light_sampling;
 import orr_lighting.media;
 import orr_lighting.world_cache;
 
-extern struct Surface : ISurface = StandardSurface;
+extern struct Surface : ISurfaces = StandardSurface;
 
 struct Root
 {

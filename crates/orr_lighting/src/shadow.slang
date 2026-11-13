@@ -146,7 +146,7 @@ struct ShadowCrossing
 static ShadowCrossing crossings[SHADOW_CANDIDATES];
 
 // The candidates of one shadow ray from `origin` along unit `dir` to `t_max`.
-public struct ShadowCandidates<S : ISurface, M : IMedium, let MODE : uint> : ICandidate
+public struct ShadowCandidates<S : ISurfaces, M : IMedium, let MODE : uint> : ICandidate
 {
     public SceneRoot* scene;
     public ViewConstants* view;
@@ -348,7 +348,7 @@ struct ProxyDepth : IProxyStep
 // it unless the ray goes to the `environment`, whose map holds that medium. A ray past
 // SHADOW_CANDIDATES non-opaque candidates in one of its traces keeps the product so far and adds
 // 1 to `overflows` (null: not counted).
-public float3 visibility<S : ISurface, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows)
+public float3 visibility<S : ISurfaces, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows)
 {
     float3 depth;
     float3 product = surface_visibility<S, M, MODE>(s, v, origin, dir, t_max, flags, context, environment, inside, overflows, depth);
@@ -362,7 +362,7 @@ public float3 visibility<S : ISurface, M : IMedium, let MODE : uint>(SceneRoot* 
 
 // `visibility` without the linked medium, with the dielectric interiors' optical depth over the
 // segment left out of the product and returned in `depth`.
-public float3 surface_visibility<S : ISurface, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows, out float3 depth)
+public float3 surface_visibility<S : ISurfaces, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows, out float3 depth)
 {
     uint committed;
     float committed_t;
@@ -372,7 +372,7 @@ public float3 surface_visibility<S : ISurface, M : IMedium, let MODE : uint>(Sce
 // As above, and in `committed` and `committed_t` the CLASS_* and distance of an opaque hit the AS
 // committed, which made the product 0, or ~0 and +inf for none: the first one found, not the
 // nearest. A SHADOW_PATH ray ending at solid glass commits CLASS_DIELECTRIC.
-public float3 surface_visibility<S : ISurface, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows, out float3 depth, out uint committed, out float committed_t)
+public float3 surface_visibility<S : ISurfaces, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows, out float3 depth, out uint committed, out float committed_t)
 {
     ShadowCandidates<S, M, MODE> h;
     h.scene = s;
@@ -593,7 +593,7 @@ public bool stack_direction(float3 dir, float3 normal, float ior, out float3 ben
 // Commits the opaque and alpha-tested candidates that are present and cooked solid glass that a
 // fading copy keeps non-opaque: what ends a stack's leg beside the AS's opaque geometry and solid
 // glass.
-struct StackAccept<S : ISurface> : IAnyHit
+struct StackAccept<S : ISurfaces> : IAnyHit
 {
     SceneRoot* scene;
     ViewConstants* view;
@@ -618,7 +618,7 @@ struct StackAccept<S : ISurface> : IAnyHit
 }
 
 // The nearest opaque surface or solid glass from `origin` along unit `dir` within `t_max`.
-public Hit stack_trace<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context)
+public Hit stack_trace<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context)
 {
     StackAccept<S> a = { s, v, dir, context };
     RayDesc ray;
@@ -631,7 +631,7 @@ public Hit stack_trace<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 orig
 
 // Whether a plane stack's probe from `origin` along unit `dir` toward a directional light meets a
 // stack face first, and its unit shading normal.
-public bool stack_probe<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, uint flags, HitContext context, bool dispersion, out float3 normal)
+public bool stack_probe<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, uint flags, HitContext context, bool dispersion, out float3 normal)
 {
     StackFace f;
     bool face = stack_face(s, stack_trace<S>(s, v, origin, dir, positive_infinity(), flags, context), dispersion, f);
@@ -648,7 +648,7 @@ public bool stack_probe<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 ori
 // with `dispersion` dispersive faces end a stack. Returns STACK_LIGHT for light through a stack,
 // STACK_BROKEN for a ray ending at solid glass that no stack takes on to the light, its light 0,
 // and STACK_NONE for the straight ray's light.
-public uint path_light<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 start, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, bool bend, bool dispersion, bool medium, uint* overflows, out StackLight light)
+public uint path_light<S : ISurfaces, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 start, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, bool bend, bool dispersion, bool medium, uint* overflows, out StackLight light)
 {
     light = straight_light(dir);
     Interior in = inside;
