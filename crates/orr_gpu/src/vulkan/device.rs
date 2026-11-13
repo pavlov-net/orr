@@ -113,6 +113,7 @@ pub(crate) struct Shared {
     #[cfg(feature = "nsight-perf")]
     pub(super) perf: Option<Perf>,
     pub(super) calibration: Mutex<Option<Calibration>>,
+    pub(super) gpu_zones: crate::profile::GpuZones,
     pub(super) checkpoint_fn: Option<ash::nv::device_diagnostic_checkpoints::Device>,
     pub(super) fault_fn: Option<FaultFns>,
     /// With `Caps::breadcrumbs`.
@@ -750,6 +751,7 @@ impl Device {
             #[cfg(feature = "nsight-perf")]
             perf,
             calibration: Mutex::default(),
+            gpu_zones: crate::profile::GpuZones::default(),
             checkpoint_fn: optional
                 .checkpoints
                 .then(|| ash::nv::device_diagnostic_checkpoints::Device::load(&instance, &device)),

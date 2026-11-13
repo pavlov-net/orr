@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use ash::vk;
@@ -256,6 +256,37 @@ impl Queue {
         })
     }
 
+    /// Frees the lists of submits up to `completed`, storing their passes' results and sending
+    /// them to the profiler, and returns the pools still locked.
+    fn retire(&self, completed: u64) -> MutexGuard<'_, Pools> {
+        let mut pools = self.pools.lock().unwrap();
+        // A counter frame's submits stay pending until it decides their counters.
+        #[cfg(feature = "nsight-perf")]
+        let completed = self
+            .shared
+            .perf
+            .iter()
+            .flat_map(|_| &pools.pending)
+            .filter(|p| {
+                p.passes
+                    .iter()
+                    .any(|r| r.counters.as_ref().is_some_and(|c| c.slot.get().is_none()))
+            })
+            .map(|p| p.value - 1)
+            .fold(completed, u64::min);
+        while pools.pending.front().is_some_and(|p| p.value <= completed) {
+            let p = pools.pending.pop_front().unwrap();
+            if !p.passes.is_empty() {
+                let _zone = crate::zone!("read pass results");
+                let results = self.read_passes(&p.res, &p.passes);
+                self.shared.gpu_zones.passes(self.kind, &results);
+                self.shared.store_results(self.point(p.value), results);
+            }
+            pools.free.push(p.res);
+        }
+        pools
+    }
+
     fn destroy_resources(&self, r: ListResources) {
         let d = &self.shared.device;
         // SAFETY: the resources are idle and owned by this queue alone.
@@ -269,33 +300,7 @@ impl Queue {
     /// owner thread to submit.
     pub fn command_list(&self) -> Result<CommandList<'_>, Error> {
         let completed = self.completed();
-        let reused = {
-            let mut pools = self.pools.lock().unwrap();
-            // A counter frame's submits stay pending until it decides their counters.
-            #[cfg(feature = "nsight-perf")]
-            let completed = self
-                .shared
-                .perf
-                .iter()
-                .flat_map(|_| &pools.pending)
-                .filter(|p| {
-                    p.passes
-                        .iter()
-                        .any(|r| r.counters.as_ref().is_some_and(|c| c.slot.get().is_none()))
-                })
-                .map(|p| p.value - 1)
-                .fold(completed, u64::min);
-            while pools.pending.front().is_some_and(|p| p.value <= completed) {
-                let p = pools.pending.pop_front().unwrap();
-                if !p.passes.is_empty() {
-                    let _zone = crate::zone!("read pass results");
-                    let results = self.read_passes(&p.res, &p.passes);
-                    self.shared.store_results(self.point(p.value), results);
-                }
-                pools.free.push(p.res);
-            }
-            pools.free.pop()
-        };
+        let reused = self.retire(completed).free.pop();
         let mut res = match reused {
             Some(r) => r,
             None => self.create_resources()?,
@@ -937,7 +942,7 @@ impl Device {
         if !self.is_complete(point) {
             return None;
         }
-        // `command_list` moves results from pending to the store under the pools lock, so
+        // `Queue::retire` moves results from pending to the store under the pools lock, so
         // pending is read first: a submit found in neither has no passes.
         let queue = self.queue(*QueueKind::ALL.get(point.timeline as usize)?)?;
         if let Some(r) = queue.take_results(point.value) {
@@ -948,9 +953,14 @@ impl Device {
         Some(found.map(|(_, r)| r.clone()).unwrap_or_default())
     }
 
-    /// Destroys objects whose deferred-free points have completed. Call once a frame.
+    /// Destroys objects whose deferred-free points have completed and frees every queue's lists
+    /// of completed submits, so a queue that records nothing new still delivers its passes'
+    /// results. Call once a frame.
     pub fn collect_garbage(&self) {
         let _zone = crate::zone!("collect garbage");
         self.shared.collect();
+        for queue in QueueKind::ALL.iter().filter_map(|&k| self.queue(k)) {
+            drop(queue.retire(queue.completed()));
+        }
     }
 }
