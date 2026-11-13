@@ -15,9 +15,9 @@
 use orr_gpu::rtas::consts::GEOMETRY_OPAQUE;
 use orr_gpu::{
     Allocation, BlasLimits, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicKind,
-    ClusterLimits, ClusterVertexFormat, CommandList, Device, GpuAddress, GpuPtr, Hazards,
-    LssEndCaps, LssIndexing, MemoryKind, MemoryPriority, RtasFlags, RtasIo, RtasLimits, RtasMode,
-    RtasOp, RtasOpDesc, Stages,
+    ClusterLimits, ClusterVertexFormat, CommandList, Device, DispatchArgs, GpuAddress, GpuPtr,
+    Hazards, LssEndCaps, LssIndexing, MemoryKind, MemoryPriority, RtasFlags, RtasIo, RtasLimits,
+    RtasMode, RtasOp, RtasOpDesc, Stages,
 };
 
 use crate::material::MaterialId;
@@ -40,7 +40,8 @@ const BUILD_DIRECT: u64 = 2;
 const BUILD_BLAS: u64 = 3;
 const BUILD_TUBE_CLUSTERS: u64 = 5;
 const BUILD_TUBE_VERTICES: u64 = 6;
-const BUILD_COUNTS: u64 = 8;
+const BUILD_GRID: u64 = 8;
+const BUILD_COUNTS: u64 = 12;
 /// `producer_build.slang` `STRANDS_*`.
 const STRANDS_SWEPT: u32 = 1;
 const STRANDS_TUBES: u32 = 2;
@@ -336,6 +337,8 @@ impl Swept {
 /// alone; a tube entry builds through its one template.
 struct Accel {
     record: GpuPtr<ProducerBuildGpu>,
+    /// The workgroups of the cluster kernels, which `begin` or `strands` writes.
+    grid: GpuPtr<DispatchArgs>,
     strands: bool,
     templates: Option<Op>,
     instantiate: Option<Op>,
@@ -802,6 +805,7 @@ pub(crate) fn build(
     let accel = if swept.is_some() {
         Some(Accel {
             record: at(build_at).cast(),
+            grid: GpuPtr::NULL,
             strands,
             templates: None,
             instantiate: None,
@@ -825,6 +829,7 @@ pub(crate) fn build(
             |op_kind, args| cluster_desc(op_kind, args, topology_tris, topology_verts);
         Some(Accel {
             record: at(build_at).cast(),
+            grid: count(BUILD_GRID).cast(),
             strands,
             templates: own_templates
                 .then(|| {
@@ -995,6 +1000,7 @@ pub(crate) struct ProducerKernels {
     strands: PipelineId,
     records: PipelineId,
     gather: PipelineId,
+    seal: PipelineId,
     finish: PipelineId,
     figures: PipelineId,
 }
@@ -1013,6 +1019,7 @@ impl ProducerKernels {
             strands: c("strands")?,
             records: c("records")?,
             gather: c("gather")?,
+            seal: c("seal")?,
             finish: c("finish")?,
             figures: p.create(
                 device,
@@ -1147,22 +1154,22 @@ pub(crate) fn record(
     for &r in &roots {
         list.dispatch(p.get(k.begin), r, [1, 1, 1]);
     }
-    list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+    list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
     if jobs.iter().any(|j| j.accel().strands) {
         for (j, &r) in jobs.iter().zip(&roots) {
             if j.accel().strands {
                 list.dispatch(p.get(k.strands), r, [1, 1, 1]);
             }
         }
-        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
     }
     let clustered = || {
         jobs.iter()
             .zip(&roots)
             .filter(|(j, _)| j.accel().swept.is_none())
     };
-    for (_, &r) in clustered() {
-        list.dispatch(p.get(k.records), r, [1, 1, 1]);
+    for (j, &r) in clustered() {
+        list.dispatch_indirect(p.get(k.records), r, j.accel().grid);
     }
     to_build(list);
     let mut s = scratch();
@@ -1173,8 +1180,12 @@ pub(crate) fn record(
         }
     }
     to_compute(list);
+    for (j, &r) in clustered() {
+        list.dispatch_indirect(p.get(k.gather), r, j.accel().grid);
+    }
+    list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
     for (_, &r) in clustered() {
-        list.dispatch(p.get(k.gather), r, [1, 1, 1]);
+        list.dispatch(p.get(k.seal), r, [1, 1, 1]);
     }
     to_build(list);
     let mut s = scratch();

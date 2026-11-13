@@ -1,12 +1,13 @@
 // The acceleration structures of producer entries, built on the frame's list after scene
 // compute. `templates` writes an entry's template builds the frame it is set; `begin`
-// clears what an entry's build counts; `strands` checks a strand entry's segments, bounds
-// them and writes either the index list of its swept-sphere BLAS or its tube batch;
-// `records` checks each cluster of the batch the entry builds from, writes its box and the
-// entry's, and writes an instantiation of its topology's template or a direct CLAS build;
-// `gather` lists the built CLAS and writes the entry's cluster BLAS record; `finish` keeps
-// the BLAS in the entry's state. One root per entry; every kernel runs one workgroup per
-// entry, so work follows the emitted counts.
+// clears what an entry's build counts and sizes the cluster kernels' grid to the batch they
+// read; `strands` checks a strand entry's segments, bounds them and writes either the index
+// list of its swept-sphere BLAS or its tube batch and that grid; `records` checks each
+// cluster of the batch the entry builds from, writes its box and the entry's, and writes an
+// instantiation of its topology's template or a direct CLAS build; `gather` lists the built
+// CLAS; `seal` writes the entry's cluster BLAS record; `finish` keeps the BLAS in the entry's
+// state. One root per entry. `records` and `gather` run one thread per emitted cluster over
+// the grid; the others run one workgroup per entry.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.atomic;
@@ -17,6 +18,7 @@ import orr_scene.hit;
 import orr_shaders.trace;
 import orr_gpu.rtas;
 import orr_scene.tables;
+import orr_scene.visibility;
 
 // `ProducerBuildGpu.counts`.
 public static const uint BUILD_TEMPLATES = 0;
@@ -26,7 +28,8 @@ public static const uint BUILD_BLAS = 3;
 public static const uint BUILD_CLAS = 4;
 public static const uint BUILD_TUBE_CLUSTERS = 5;  // the tube batch's cluster count
 public static const uint BUILD_TUBE_VERTICES = 6;  // the tube batch's vertex count
-public static const uint BUILD_COUNTS = 8;
+public static const uint BUILD_GRID = 8;           // three words: `records`' and `gather`'s workgroups
+public static const uint BUILD_COUNTS = 12;
 
 // `ProducerBuildGpu.refs`: a cluster's build record, DIRECT_REF for the direct array.
 public static const uint REF_NONE = 0xffffffff;
@@ -106,17 +109,26 @@ void templates(uint t: SV_GroupThreadID)
     }
 }
 
+// The workgroups of `records` and `gather` over `clusters` clusters.
+void write_cluster_grid(ProducerBuildGpu* b, uint clusters)
+{
+    write_grid(b.counts + BUILD_GRID, (clusters + GROUP - 1) / GROUP);
+}
+
 [shader("compute")]
 [numthreads(GROUP, 1, 1)]
 void begin(uint t: SV_GroupThreadID)
 {
     ProducerBuildGpu* b = root.build;
-    if (t >= BUILD_COUNTS)
+    if (t >= BUILD_GRID)
         return;
     if (t != BUILD_TEMPLATES)
         b.counts[t] = 0;
     if (t == 0)
     {
+        // A tube entry's batch is written by `strands`, which sizes the grid to it.
+        if (b.strands == STRANDS_NONE)
+            write_cluster_grid(b, emitted_clusters(built_batch()));
         ProducerStateGpu* st = root.scene.producer_state + root.entry;
         st.lo = uint3(0xffffffff);
         st.hi = uint3(0);
@@ -187,6 +199,7 @@ void strands(uint t: SV_GroupThreadID)
     {
         b.counts[BUILD_TUBE_CLUSTERS] = tube_count;
         b.counts[BUILD_TUBE_VERTICES] = tube_count * TUBE_VERTICES;
+        write_cluster_grid(b, tube_count);
     }
     ProducerBatch tubes = built_batch();
     for (uint k = t; k < listed; k += GROUP)
@@ -232,102 +245,177 @@ void strands(uint t: SV_GroupThreadID)
     }
 }
 
+// The workgroup's box of its clusters, as `ordered` bits, its refused clusters, and its
+// records: the slots its lanes take within the workgroup, then the first of the entry's that
+// the workgroup takes.
+groupshared uint group_lo[3];
+groupshared uint group_hi[3];
+groupshared uint group_refused;
+groupshared uint group_direct;
+groupshared uint group_instantiated;
+
+// One thread per cluster.
 [shader("compute")]
 [numthreads(GROUP, 1, 1)]
-void records(uint t: SV_GroupThreadID)
+void records(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
 {
     SceneRoot* s = root.scene;
     ProducerBuildGpu* b = root.build;
     ProducerBatch batch = built_batch();
     ProducerStateGpu* st = s.producer_state + root.entry;
-    uint n = emitted_clusters(batch);
-    for (uint c = t; c < n; c += GROUP)
+    uint c = grid_index(group) * GROUP + t;
+    if (t < 3)
     {
-        ProducerClusterGpu k = batch.clusters[c];
-        if (!producer_cluster_valid(batch, k))
+        group_lo[t] = 0xffffffff;
+        group_hi[t] = 0;
+    }
+    if (t == 0)
+    {
+        group_direct = 0;
+        group_instantiated = 0;
+        group_refused = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    ProducerClusterGpu k = (ProducerClusterGpu)0;
+    bool valid = false;
+    if (c < emitted_clusters(batch))
+    {
+        k = batch.clusters[c];
+        valid = producer_cluster_valid(batch, k);
+        if (!valid)
         {
             b.refs[c] = REF_NONE;
-            InterlockedAdd(st.refused, 1);
-            continue;
+            InterlockedAdd(group_refused, 1);
         }
+    }
+    uint local = 0;
+    if (valid)
+    {
         // A tube batch takes its bounds from its segments; invalid segments' tubes are NaN.
         if (b.strands == STRANDS_NONE)
         {
             float3 lo, hi;
             producer_cluster_box(batch, k, lo, hi);
-            grow_bounds(st, lo, hi);
+            for (uint j = 0; j < 3; j++)
+            {
+                InterlockedMin(group_lo[j], ordered(lo[j]));
+                InterlockedMax(group_hi[j], ordered(hi[j]));
+            }
         }
-        uint64_t vertices = (uint64_t)(batch.positions + k.first_vertex);
-        // An entry of mixed sections decides class and opacity per cluster; its templates hold
-        // every pattern's opaque set, then its non-opaque set.
-        uint class_id = 0;
-        uint geometry_flags = b.geometry_flags;
-        uint topology = k.topology;
-        ProducerGpu p = s.producers[root.entry];
-        if (p.opacity == PRODUCER_SECTIONS)
-        {
-            MaterialGpu* m = s.materials + producer_material(p, k);
-            class_id = material_class(m);
-            if (class_id == CLASS_OPAQUE && (m.flags & MATERIAL_ALPHA_TESTED) == 0)
-                geometry_flags = GEOMETRY_OPAQUE;
-            else
-                topology += PATTERNS;
-        }
-        uint index;
         if (k.topology == DIRECT_CLUSTER)
-        {
-            InterlockedAdd(b.counts[BUILD_DIRECT], 1, index);
-            ClasBuild r = (ClasBuild)0;
-            r.cluster_id = c;
-            r.tri_count = k.tri_count;
-            r.vertex_count = k.vertex_count;
-            r.index_format = 1;
-            r.base_geometry_and_flags = geometry_index_and_flags(class_id, geometry_flags);
-            r.omm_index_format = 4;
-            r.vertices = vertices;
-            r.indices = (uint64_t)k.triangles;
-            store((uint64_t)b.direct_records, index, r);
-            b.refs[c] = index | DIRECT_REF;
-        }
+            InterlockedAdd(group_direct, 1, local);
         else
+            InterlockedAdd(group_instantiated, 1, local);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (t == 0)
+    {
+        if (b.strands == STRANDS_NONE)
         {
-            InterlockedAdd(b.counts[BUILD_INSTANTIATED], 1, index);
-            Instantiate r;
-            r.cluster_id_offset = c;
-            r.geometry_index_offset = class_id;
-            r.template_address = b.templates[topology];
-            r.vertices = vertices;
-            store((uint64_t)b.instantiate_records, index, r);
-            b.refs[c] = index;
+            atomic_min_at(st.lo, 0, group_lo[0]);
+            atomic_min_at(st.lo, 1, group_lo[1]);
+            atomic_min_at(st.lo, 2, group_lo[2]);
+            atomic_max_at(st.hi, 0, group_hi[0]);
+            atomic_max_at(st.hi, 1, group_hi[1]);
+            atomic_max_at(st.hi, 2, group_hi[2]);
         }
+        if (group_refused != 0)
+            InterlockedAdd(st.refused, group_refused);
+        uint first;
+        InterlockedAdd(b.counts[BUILD_DIRECT], group_direct, first);
+        group_direct = first;
+        InterlockedAdd(b.counts[BUILD_INSTANTIATED], group_instantiated, first);
+        group_instantiated = first;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (!valid)
+        return;
+    uint64_t vertices = (uint64_t)(batch.positions + k.first_vertex);
+    // An entry of mixed sections decides class and opacity per cluster; its templates hold
+    // every pattern's opaque set, then its non-opaque set.
+    uint class_id = 0;
+    uint geometry_flags = b.geometry_flags;
+    uint topology = k.topology;
+    ProducerGpu p = s.producers[root.entry];
+    if (p.opacity == PRODUCER_SECTIONS)
+    {
+        MaterialGpu* m = s.materials + producer_material(p, k);
+        class_id = material_class(m);
+        if (class_id == CLASS_OPAQUE && (m.flags & MATERIAL_ALPHA_TESTED) == 0)
+            geometry_flags = GEOMETRY_OPAQUE;
+        else
+            topology += PATTERNS;
+    }
+    if (k.topology == DIRECT_CLUSTER)
+    {
+        uint index = group_direct + local;
+        ClasBuild r = (ClasBuild)0;
+        r.cluster_id = c;
+        r.tri_count = k.tri_count;
+        r.vertex_count = k.vertex_count;
+        r.index_format = 1;
+        r.base_geometry_and_flags = geometry_index_and_flags(class_id, geometry_flags);
+        r.omm_index_format = 4;
+        r.vertices = vertices;
+        r.indices = (uint64_t)k.triangles;
+        store((uint64_t)b.direct_records, index, r);
+        b.refs[c] = index | DIRECT_REF;
+    }
+    else
+    {
+        uint index = group_instantiated + local;
+        Instantiate r;
+        r.cluster_id_offset = c;
+        r.geometry_index_offset = class_id;
+        r.template_address = b.templates[topology];
+        r.vertices = vertices;
+        store((uint64_t)b.instantiate_records, index, r);
+        b.refs[c] = index;
     }
 }
 
-groupshared uint built;
+// The workgroup's built CLAS: the slots its lanes take within it, then its first in the list.
+groupshared uint group_built;
 
+// One thread per cluster.
 [shader("compute")]
 [numthreads(GROUP, 1, 1)]
-void gather(uint t: SV_GroupThreadID)
+void gather(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
+{
+    ProducerBuildGpu* b = root.build;
+    ProducerBatch batch = built_batch();
+    uint c = grid_index(group) * GROUP + t;
+    if (t == 0)
+        group_built = 0;
+    GroupMemoryBarrierWithGroupSync();
+    uint64_t clas = 0;
+    if (c < emitted_clusters(batch))
+    {
+        uint r = b.refs[c];
+        if (r != REF_NONE)
+            clas = (r & DIRECT_REF) != 0 ? b.direct[r & ~DIRECT_REF] : b.instantiated[r];
+    }
+    uint local = 0;
+    if (clas != 0)
+        InterlockedAdd(group_built, 1, local);
+    GroupMemoryBarrierWithGroupSync();
+    if (t == 0)
+    {
+        uint first;
+        InterlockedAdd(b.counts[BUILD_CLAS], group_built, first);
+        group_built = first;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (clas != 0)
+        b.clas[group_built + local] = clas;
+}
+
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void seal()
 {
     SceneRoot* s = root.scene;
     ProducerBuildGpu* b = root.build;
-    ProducerBatch batch = built_batch();
-    uint n = emitted_clusters(batch);
-    for (uint c = t; c < n; c += GROUP)
-    {
-        uint r = b.refs[c];
-        if (r == REF_NONE)
-            continue;
-        uint64_t clas = (r & DIRECT_REF) != 0 ? b.direct[r & ~DIRECT_REF] : b.instantiated[r];
-        if (clas == 0)
-            continue;
-        uint slot;
-        InterlockedAdd(b.counts[BUILD_CLAS], 1, slot);
-        b.clas[slot] = clas;
-    }
-    AllMemoryBarrierWithGroupSync();
-    if (t != 0)
-        return;
     uint count = b.counts[BUILD_CLAS];
     // A tube entry's state counts its segments.
     if (b.strands == STRANDS_NONE)
