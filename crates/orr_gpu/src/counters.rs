@@ -2,18 +2,20 @@
 
 use std::path::Path;
 
-/// Metrics that say why a pass is slow, chosen to fit in one frame on Blackwell GPUs (another
-/// GPU's count is [`CounterSession::replays`](crate::CounterSession::replays)), by the SDK's
-/// names: GPU time; how much of the time the SMs hold work; their instruction issue against
-/// its peak; occupancy, the warps in flight against the most the SMs hold while active; the
-/// L2 hit rate; DRAM throughput; and RT core throughput. The SDK's `sm__throughput` (each SM
-/// unit against its peak) and `l1tex__t_sector_hit_rate` don't fit with them, and with
-/// `sm__throughput` the frame is replayed dozens of times.
+/// Metrics that say why a pass is slow, by the SDK's names: GPU time; how much of the time the
+/// SMs hold work; their instruction issue against its peak; occupancy, the warps in flight
+/// against the most the SMs hold while active; the L1 and L2 hit rates; DRAM throughput; and
+/// RT core throughput. They take two frames on Blackwell GPUs
+/// ([`CounterSession::replays`](crate::CounterSession::replays) gives another GPU's count), so
+/// a program counting them renders the same frame twice under the rules for replays that
+/// [`CounterSession`](crate::CounterSession) gives. The SDK's `sm__throughput` (each SM unit
+/// against its peak) takes dozens.
 pub const DEFAULT_COUNTER_METRICS: &[&str] = &[
     "gpu__time_duration.sum",
     "sm__cycles_active.avg.pct_of_peak_sustained_elapsed",
     "sm__inst_executed_realtime.avg.pct_of_peak_sustained_elapsed",
     "sm__warps_active_realtime.avg.pct_of_peak_sustained_active",
+    "l1tex__t_sector_hit_rate.pct",
     "lts__average_t_sector_hit_rate_realtime.pct",
     "dram__throughput.avg.pct_of_peak_sustained_elapsed",
     "rtcore__throughput_realtime.avg.pct_of_peak_sustained_elapsed",

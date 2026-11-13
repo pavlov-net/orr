@@ -155,14 +155,14 @@ A program loads the SDK with `DeviceDesc::perf_counters`, opens a `CounterSessio
 metrics it wants with `Queue::start_counters`, and puts each frame it counts between the
 session's `begin_frame` and `end_frame`. Each pass's `PassResult::counters` then sits beside its
 time in `Device::pass_results` and `FrameStats::gpu`, one value per metric under the SDK's name
-and unit, `None` for a metric the GPU doesn't expose. `DEFAULT_COUNTER_METRICS` (pass time, SM
-activity and instruction issue, occupancy, L2 hit rate, DRAM and RT core throughput) fit in one
-frame on Blackwell GPUs, so every counted frame has its own counters. Metrics that don't fit
-together, such as the SDK's `sm__throughput`, take several frames (`CounterSession::replays`),
-each counting a part: the program renders the same frame again, the same passes from the same
-scene, view and settings, and holds still whatever state it carries from frame to frame
-(accumulation, history, animation, random sequences); otherwise each metric describes a
-slightly different frame.
+and unit, `None` for a metric the GPU doesn't expose. Metrics that don't fit together take
+several frames (`CounterSession::replays`), each counting a part: the program renders the same
+frame again, the same passes from the same scene, view and settings, and holds still whatever
+state it carries from frame to frame (accumulation, history, animation, random sequences);
+otherwise each metric describes a slightly different frame. Only the last frame of a collection
+carries counters. `DEFAULT_COUNTER_METRICS` (pass time, SM activity and instruction issue,
+occupancy, L1 and L2 hit rates, DRAM and RT core throughput) take two frames on Blackwell GPUs,
+so these rules hold for the default; the SDK's `sm__throughput` takes dozens.
 
 While it counts, the SDK drains the GPU before and after every pass. A counted frame's passes
 don't overlap and are timed exactly, its pass times include the SDK's few microseconds of range

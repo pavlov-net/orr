@@ -379,11 +379,11 @@ struct Frame {
 /// discards the frame.
 ///
 /// When the metrics fit in one frame ([`CounterSession::replays`] is 1), every counted frame
-/// carries its own counters. Otherwise a collection takes that many frames, each counting a
-/// different part of the metrics, and its counters land on the last one: the frames must be
-/// the same work, so a renderer with temporal state (accumulation, history, animation, random
-/// sequences) holds that state still across them, or each metric describes a slightly
-/// different frame.
+/// carries its own counters. Otherwise, as with [`crate::DEFAULT_COUNTER_METRICS`] on Blackwell
+/// GPUs, a collection takes that many frames, each counting a different part of the metrics,
+/// and its counters land on the last one: the frames must be the same work, so a renderer with
+/// temporal state (accumulation, history, animation, random sequences) holds that state still
+/// across them, or each metric describes a slightly different frame.
 ///
 /// Every pass a counter frame counts is timed exactly
 /// ([`CommandList::set_exact_timing`](crate::CommandList::set_exact_timing)): the SDK

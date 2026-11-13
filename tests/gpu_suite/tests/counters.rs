@@ -16,7 +16,7 @@ const TIME: &str = "gpu__time_duration.sum";
 const ACTIVE: &str = "sm__cycles_active.avg.pct_of_peak_sustained_elapsed";
 const ISSUE: &str = "sm__inst_executed_realtime.avg.pct_of_peak_sustained_elapsed";
 const DRAM: &str = "dram__throughput.avg.pct_of_peak_sustained_elapsed";
-/// Doesn't fit in one frame with the defaults.
+/// Without it the default metrics fit in one frame.
 const L1_HITS: &str = "l1tex__t_sector_hit_rate.pct";
 
 /// A short and a long `alu` pass around a `stream` pass, and an empty pass.
@@ -101,10 +101,10 @@ impl<'d> Bench<'d> {
 }
 
 /// Each pass's counted GPU time is its own and agrees with its exact timestamps, `alu` keeps
-/// the SMs busy and DRAM idle and `stream` the reverse, in one frame with the default metrics,
-/// twice in a row in one session, and across the replays a metric set needs. A replay whose
-/// passes differ from its collection's first frame fails it, and a session dropped inside a
-/// frame leaves the next session free to count.
+/// the SMs busy and DRAM idle and `stream` the reverse, in one frame with the default metrics
+/// but the L1 hit rate, twice in a row in one session, and across the replays the default
+/// metrics need. A replay whose passes differ from its collection's first frame fails it, and a
+/// session dropped inside a frame leaves the next session free to count.
 #[test]
 fn counters_land_on_their_pass_and_metric() {
     gpu_suite::log_to_stderr();
@@ -131,12 +131,17 @@ fn counters_land_on_their_pass_and_metric() {
         "{plain:?}"
     );
 
-    let mut s = queue.start_counters(DEFAULT_COUNTER_METRICS).unwrap();
+    let one: Vec<&str> = DEFAULT_COUNTER_METRICS
+        .iter()
+        .copied()
+        .filter(|m| *m != L1_HITS)
+        .collect();
+    let mut s = queue.start_counters(&one).unwrap();
     assert_eq!(s.replays(), 1);
     let metrics = s.metrics().to_vec();
     assert!(metrics.iter().all(|m| m.available), "{metrics:?}");
     let names: Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
-    assert_eq!(names, DEFAULT_COUNTER_METRICS);
+    assert_eq!(names, one);
     let at = |name: &str| names.iter().position(|n| *n == name).unwrap();
     assert_eq!(metrics[at(TIME)].unit, "nanosecond");
     assert_eq!(metrics[at(DRAM)].unit, "percent");
@@ -146,9 +151,8 @@ fn counters_land_on_their_pass_and_metric() {
     }
     drop(s);
 
-    let mut metrics = DEFAULT_COUNTER_METRICS.to_vec();
-    metrics.push(L1_HITS);
-    let mut s = queue.start_counters(&metrics).unwrap();
+    let metrics = DEFAULT_COUNTER_METRICS;
+    let mut s = queue.start_counters(metrics).unwrap();
     assert!(s.replays() > 1, "{metrics:?} fit in one frame");
     s.begin_frame().unwrap();
     bench.frame(true);
@@ -161,7 +165,7 @@ fn counters_land_on_their_pass_and_metric() {
     let point = bench.count(&mut s);
     let passes = d.pass_results(point).unwrap();
     check(&passes, &|m| metrics.iter().position(|n| *n == m).unwrap());
-    let l1 = metrics.len() - 1;
+    let l1 = metrics.iter().position(|m| *m == L1_HITS).unwrap();
     for p in &passes[..3] {
         assert!(values(p)[l1].is_some(), "{p:?}");
     }
