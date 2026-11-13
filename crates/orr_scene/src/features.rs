@@ -60,6 +60,8 @@ impl SceneFeatures {
     /// A texture has streamed: one may read no finer than its resident tiles and report the
     /// level it wants.
     pub const STREAMED_TEXTURES: Self = Self(1 << 25);
+    /// A neural texture set has stood in for a texture: the material resolve may decode one.
+    pub const NEURAL_TEXTURES: Self = Self(1 << 30);
     /// The scene holds a producer entry, and one of strands.
     pub const PRODUCERS: Self = Self(1 << 19);
     pub const STRANDS: Self = Self(1 << 20);
@@ -110,6 +112,7 @@ impl SceneFeatures {
             (Self::SKINNING, 1 << 7),
             (Self::COATED_EMITTERS, 1 << 8),
             (Self::THIN_DIELECTRICS, 1 << 9),
+            (Self::NEURAL_TEXTURES, 1 << 10),
         ] {
             if !self.contains(feature) {
                 ruled_out |= bit;
@@ -300,18 +303,18 @@ mod tests {
         let solid = record(|m| m.flags = f::DIELECTRIC);
         assert!(!solid.contains(SceneFeatures::THIN_DIELECTRICS));
         // A plain scene rules every surface feature out; each one found sets its bit alone.
-        assert_eq!(plain.surface_may(), !0b11_1110_1111);
-        assert_eq!(vertex.surface_may(), !0b11_1110_1110);
-        assert_eq!(tiled.surface_may(), !0b11_1110_1101);
-        assert_eq!(thin.surface_may() & 0b11_1110_1111, 1 << 9);
+        assert_eq!(plain.surface_may(), !0b111_1110_1111);
+        assert_eq!(vertex.surface_may(), !0b111_1110_1110);
+        assert_eq!(tiled.surface_may(), !0b111_1110_1101);
+        assert_eq!(thin.surface_may() & 0b111_1110_1111, 1 << 9);
         let scene = SceneFeatures::DECALS | SceneFeatures::PRODUCERS | SceneFeatures::STRANDS;
-        assert_eq!(scene.surface_may() & 0b11_1110_1111, 0b0110_1000);
+        assert_eq!(scene.surface_may() & 0b111_1110_1111, 0b0110_1000);
         assert_eq!(
-            SceneFeatures::SKINNING.surface_may() & 0b11_1110_1111,
+            SceneFeatures::SKINNING.surface_may() & 0b111_1110_1111,
             1 << 7
         );
         assert_eq!(
-            SceneFeatures::COATED_EMITTERS.surface_may() & 0b11_1110_1111,
+            SceneFeatures::COATED_EMITTERS.surface_may() & 0b111_1110_1111,
             1 << 8
         );
     }

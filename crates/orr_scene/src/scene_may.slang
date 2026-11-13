@@ -43,6 +43,9 @@ public static const uint MAY2_COATED_EMITTERS = 1 << 8;
 // A triangle of the dielectric class may show a material that bounds no interior: a
 // thin-walled dielectric, or a record rewritten under a mesh built as solid glass.
 public static const uint MAY2_THIN_DIELECTRICS = 1 << 9;
+// A neural texture set may stand in for a texture a kernel that exports `NEURAL_TEXTURES` reads:
+// a texture's record names one (`TextureStreamGpu.neural`).
+public static const uint MAY2_NEURAL_TEXTURES = 1 << 10;
 
 public bool may2(uint bit)
 {

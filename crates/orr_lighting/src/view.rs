@@ -1108,23 +1108,6 @@ fn runs_rays(entry: PathEntry) -> bool {
 
 const SUPPORT: &str = "lighting compute kernels";
 
-/// Queues `compile` at `urgency`, which writes the device's pipeline cache file when it finishes.
-pub(crate) fn compile_job<T: Send + 'static>(
-    device: &Device,
-    loading: &Loading,
-    urgency: Urgency,
-    compile: impl FnOnce(&Device) -> Result<T, Error> + Send + 'static,
-) -> JobResult<Result<T, Error>> {
-    let device = device.clone();
-    loading.spawn_result_at(urgency, move || {
-        let compiled = compile(&device);
-        if let Err(e) = device.save_pipeline_cache() {
-            log::warn!("pipeline cache not saved: {e}");
-        }
-        compiled
-    })
-}
-
 /// A compile job's result, or how it failed. Call once it finished.
 fn compiled<T>(job: &JobResult<Result<T, Error>>, kernel: &'static str) -> Result<T, Error> {
     match job.take().expect("the job has finished") {
@@ -1344,7 +1327,9 @@ fn features_may(features: u32) -> u64 {
 /// the low word's bits the scene decides, and the high word, what its surface evaluations and
 /// hits may meet.
 fn scene_may(features: SceneFeatures) -> u64 {
-    u64::from(features.surface_may()) << 32
+    // No path or support kernel decodes neural textures, so their masks keep that bit set rather
+    // than make new pipelines of the same code when a scene gains one.
+    u64::from((features | SceneFeatures::NEURAL_TEXTURES).surface_may()) << 32
         | bit(features.contains(SceneFeatures::COAT), MAY_COAT)
         | bit(features.contains(SceneFeatures::FUZZ), MAY_FUZZ)
         | bit(features.contains(SceneFeatures::THIN_FILM), MAY_FILM)
@@ -1687,9 +1672,7 @@ impl LightingKernels {
             masked,
             support: SupportKernels::pipelines()
                 .map(|compile| {
-                    compile_job(device, loading, Urgency::Needed, move |d| {
-                        compile(d, kernels)
-                    })
+                    loading.compile_job(device, Urgency::Needed, move |d| compile(d, kernels))
                 })
                 .collect(),
             tables: tables.clone(),

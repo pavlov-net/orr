@@ -1966,6 +1966,9 @@ impl Bed {
         let d = device();
         let permit = ScenePermit::take();
         let mut scenes = Scenes::new(d, renderer).unwrap();
+        // Beds compare images bit for bit, so every frame runs the resolve made for its scene
+        // rather than the one made for everything until that has compiled.
+        scenes.wait_resolves();
         let workers = Workers::start(&scenes);
         let mut frame = 0;
         let mut mounted = |scenes: &mut Scenes, pack: &Arc<[u8]>| {

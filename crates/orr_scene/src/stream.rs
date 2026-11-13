@@ -601,6 +601,8 @@ pub(crate) struct Streaming {
     nulls: Vec<u32>,
     /// A texture has streamed: a record with a residency map has been written.
     streamed: bool,
+    /// A neural texture set has stood in for a texture: a neural record has been written.
+    neural: bool,
     /// The memory kinds on a device-local heap, whose pressure the residency budgets follow.
     governed: Vec<MemoryKind>,
     /// Instance pages that landed (their records' address) or left (0) since the last take.
@@ -615,6 +617,11 @@ impl Streaming {
     /// Whether a texture has streamed since the renderer was made.
     pub(crate) fn streamed(&self) -> bool {
         self.streamed
+    }
+
+    /// Whether a neural texture set has stood in for a texture since the renderer was made.
+    pub(crate) fn neural(&self) -> bool {
+        self.neural
     }
 
     pub(crate) fn new(
@@ -740,6 +747,7 @@ impl Streaming {
             fragmented: BTreeMap::new(),
             nulls: Vec::new(),
             streamed: false,
+            neural: false,
             page_events: Vec::new(),
             window_events: Vec::new(),
             blobs: Vec::new(),
@@ -892,6 +900,7 @@ impl Streaming {
         let mut linked = Vec::with_capacity(neural.len());
         for &(index, n) in neural {
             w.put(n.record, &[n.gpu])?;
+            self.neural = true;
             let own = n.own.address().0 != 0;
             if own {
                 let record = TextureStreamGpu {

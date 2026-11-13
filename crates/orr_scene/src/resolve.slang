@@ -16,6 +16,8 @@ import orr_scene.visibility;
 // Its taps drive texture streaming and decode the neural sets that stand in for textures.
 export static const bool TEXTURE_FEEDBACK = true;
 export static const bool NEURAL_TEXTURES = true;
+// Its pipelines are made for what a scene's surfaces and hits may meet (`path_may2`).
+export static const bool PATH_SPECIALIZES = true;
 
 extern struct Surface : ISurfaces = StandardSurface;
 extern struct Drawn : IDrawn = NoDrawn;

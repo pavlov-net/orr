@@ -581,6 +581,24 @@ impl Loading {
         JobResult { slot }
     }
 
+    /// Queues `compile` at `urgency`, which writes `device`'s pipeline cache file when it
+    /// finishes.
+    pub fn compile_job<T: Send + 'static, E: Send + 'static>(
+        &self,
+        device: &Device,
+        urgency: Urgency,
+        compile: impl FnOnce(&Device) -> std::result::Result<T, E> + Send + 'static,
+    ) -> JobResult<std::result::Result<T, E>> {
+        let device = device.clone();
+        self.spawn_result_at(urgency, move || {
+            let compiled = compile(&device);
+            if let Err(e) = device.save_pipeline_cache() {
+                log::warn!("pipeline cache not saved: {e}");
+            }
+            compiled
+        })
+    }
+
     /// Calls `signal` each time a job is queued, so a consumer's own thread pool can call
     /// [`Loading::run_one`] when there is work instead of polling. Replaces any earlier
     /// signal.

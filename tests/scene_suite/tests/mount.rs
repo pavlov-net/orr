@@ -5947,6 +5947,8 @@ fn the_resolve_writes_the_color_a_neural_set_decodes() {
     const EXTENT: u32 = 128;
     let _serial = serial();
     let (mut scenes, _workers, m) = mount_neural(NeuralTextures::Fp16);
+    // The resolve made for the scene, which decodes only while the scene may hold a neural set.
+    scenes.wait_resolves();
     let mesh = MeshInput {
         positions: vec![
             Vec3::new(-1.0, -1.0, 0.0),

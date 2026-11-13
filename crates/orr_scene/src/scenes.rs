@@ -467,6 +467,9 @@ struct Core {
     software_raster_pixels: f32,
     alias_view_targets: bool,
     raster: RasterPipelines,
+    /// A view's raster waits for the material resolve made for exactly its scene
+    /// ([`Scenes::wait_resolves`]).
+    wait_resolves: bool,
     cuts: CutPipelines,
     materials: MaterialTable,
     /// Sections and animated parts by `ModelId`.
@@ -628,6 +631,7 @@ impl Scenes {
                 rt_merge_pixels: desc.rt_merge_pixels,
                 software_raster_pixels: desc.software_raster_pixels,
                 alias_view_targets: desc.alias_view_targets,
+                wait_resolves: false,
                 raster,
                 cuts,
                 materials,
@@ -703,6 +707,13 @@ impl Scenes {
         self.reloader
             .watch(self.pipelines.recipes.last().expect("just created").module);
         Ok(id)
+    }
+
+    /// From this call on a view's raster waits for the material resolve made for exactly what
+    /// its scene may hold, running queued loading jobs on this thread meanwhile, where it would
+    /// otherwise run one made for more while that compiles. For tests and headless runs.
+    pub fn wait_resolves(&mut self) {
+        self.core.wait_resolves = true;
     }
 
     /// The loading side's job queue, for the threads the consumer lends to it.
@@ -1559,6 +1570,7 @@ impl Scenes {
             device: &self.device,
             kernels: self.kernels,
             pipelines: &self.pipelines,
+            jobs: &self.loading,
             core: &mut self.core,
             id: frame,
             time: desc.time,
@@ -1587,8 +1599,8 @@ impl Core {
     }
 
     /// What any scene may hold by the tables every scene shares: what a material may show,
-    /// candidates on every triangle of a copy fading between the steps of a chain, and textures
-    /// that have streamed.
+    /// candidates on every triangle of a copy fading between the steps of a chain, textures
+    /// that have streamed and neural sets that have stood in for textures.
     fn features(&self) -> SceneFeatures {
         let fades = if self.chained {
             SceneFeatures::COVERAGE
@@ -1600,7 +1612,12 @@ impl Core {
         } else {
             SceneFeatures::NONE
         };
-        self.materials.features() | fades | streams
+        let neural = if self.mounts.streaming.neural() {
+            SceneFeatures::NEURAL_TEXTURES
+        } else {
+            SceneFeatures::NONE
+        };
+        self.materials.features() | fades | streams | neural
     }
 
     /// What the scene of `cpu` may hold now, under kernels that link `environment`: what any
@@ -1763,6 +1780,8 @@ pub struct Frame<'a> {
     device: &'a Device,
     kernels: &'static KernelSet,
     pipelines: &'a Pipelines,
+    /// The loading side, where the material resolves made per mask compile.
+    jobs: &'a Loading,
     core: &'a mut Core,
     id: u64,
     time: FrameTime,
@@ -2771,7 +2790,15 @@ impl<'a> Frame<'a> {
             extended: core.materials.any_extended(),
             bins: core.raster.bins,
         };
-        let preprocess = match core.raster.preprocess_layout(self.pipelines) {
+        let resolve = core.raster.choose_resolve(
+            device,
+            self.pipelines,
+            self.jobs,
+            features.surface_may(),
+            core.wait_resolves,
+        );
+        let run = core.raster.resolve_run(resolve, self.pipelines);
+        let preprocess = match run.preprocess_layout(core.raster.bins) {
             Some(layout) => Some(core.preprocess.allocate(device, layout)?),
             None => None,
         };
@@ -2853,6 +2880,7 @@ impl<'a> Frame<'a> {
             device,
             &core.raster,
             self.pipelines,
+            run,
             window,
             list,
             targets,

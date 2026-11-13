@@ -6,25 +6,27 @@
 
 use std::alloc::Layout;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytemuck::Zeroable;
 use orr_gpu::{
-    Allocation, ColorTarget, CommandList, CompareOp, DepthAttachment, DepthLoad, DepthTarget,
-    Device, DispatchArgs, Format, Generated, GpuPtr, Hazards, KernelSet, MemoryKind,
-    MemoryPriority, MeshArgs, MeshPipeline, MeshPipelineDesc, ROOT_ALIGN, RasterState, Rendering,
-    Sequence, ShaderStage, SpecData, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex,
-    TextureMemory, TextureUsage, ViewDesc,
+    Allocation, ColorTarget, CommandList, CompareOp, ComputePipeline, DepthAttachment, DepthLoad,
+    DepthTarget, Device, DispatchArgs, ExecutionSet, Format, Generated, GpuPtr, Hazards, KernelSet,
+    MemoryKind, MemoryPriority, MeshArgs, MeshPipeline, MeshPipelineDesc, ROOT_ALIGN, RasterState,
+    Rendering, Sequence, ShaderModule, ShaderStage, SpecData, SpecEntry, Stages, StorageImageIndex,
+    Texture, TextureDesc, TextureIndex, TextureMemory, TextureUsage, ViewDesc,
 };
 
 use crate::arena::{ArenaBuffer, ArenaRequest, ArenaTexture, Span, ViewArena, ViewStep};
 use crate::drawn::{OpaqueHook, OpaquePass};
+use crate::loading::{JobResult, Loading, Urgency};
 use crate::memory::UploadWindow;
-use crate::pipelines::{PipelineId, Pipelines};
+use crate::pipelines::{Code, Made, PipelineId, Pipelines, Recipe};
 use crate::shaders::{cull, hzb, raster, resolve};
 use crate::transparency::ParticleDraws;
 use crate::{
-    ClusterWork, GBufferGpu, RasterGpu, RasterRoot, Result, SceneId, SceneRoot, ViewConstants,
-    VisibleCluster,
+    ClusterWork, GBufferGpu, RasterGpu, RasterRoot, Result, SceneFeatures, SceneId, SceneRoot,
+    ViewConstants, VisibleCluster,
 };
 
 /// `RasterGpu.flags` (`visibility.slang`).
@@ -50,6 +52,7 @@ const MAX_HZB_MIPS: u32 = 16;
 const TILE: u32 = 8;
 
 /// How the material resolve runs its bins.
+#[derive(Clone, Copy)]
 enum Resolve {
     /// One indirect dispatch per bin, empty or not.
     Recorded(PipelineId),
@@ -61,7 +64,78 @@ enum Resolve {
     },
 }
 
-/// The compute kernels are hot-reloadable [`Pipelines`]; the mesh pipelines are not.
+/// The resolve a view's raster runs: one dispatch of its pipeline per bin, or `sequences`
+/// writing the device-generated sequences that run its execution set.
+#[derive(Clone, Copy)]
+pub(crate) enum ResolveRun<'a> {
+    Recorded(&'a ComputePipeline),
+    Generated {
+        sequences: &'a ComputePipeline,
+        set: &'a ExecutionSet,
+    },
+}
+
+impl ResolveRun<'_> {
+    /// Preprocess memory one view's resolve over `bins` bins takes from
+    /// [`orr_gpu::DeviceArenas`], when it runs as device-generated commands.
+    pub(crate) fn preprocess_layout(self, bins: u32) -> Option<Layout> {
+        match self {
+            Self::Recorded(_) => None,
+            Self::Generated { set, .. } => Some(set.preprocess_layout(bins)),
+        }
+    }
+}
+
+/// Which of [`RasterPipelines`]' resolves a view runs: the one made for everything, or one of
+/// those made per mask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolveChoice {
+    General,
+    Masked(usize),
+}
+
+/// The resolve's specialization constant: `scene_may.slang`'s `path_may2`.
+const RESOLVE_SPEC: [SpecEntry; 1] = [SpecEntry {
+    constant_id: SceneFeatures::SURFACE_MAY_ID,
+    offset: 0,
+    size: 4,
+}];
+
+/// How long a compile no view asks for stays queued: one no thread has started is then
+/// canceled, and one running finishes.
+const RESOLVE_IDLE: Duration = Duration::from_secs(1);
+/// How long a resolve no view asks for is kept: a view that pauses finds it again.
+const RESOLVE_KEEP: Duration = Duration::from_secs(10);
+
+/// The material resolve made for one value of `path_may2`, compiled as a job on the loading
+/// side.
+struct MaskedResolve {
+    may2: u32,
+    /// The hot reload of the resolve's module it compiles from; none for the build's.
+    code: Option<Arc<Code>>,
+    job: Option<JobResult<Result<Made>>>,
+    made: Option<Made>,
+    /// When a view last asked for it or ran it.
+    seen: Instant,
+}
+
+impl MaskedResolve {
+    /// Keeps what its job made, once the job has finished.
+    fn settle(&mut self) {
+        let Some(result) = self.job.as_ref().and_then(JobResult::take) else {
+            return;
+        };
+        self.job = None;
+        match result {
+            Ok(Ok(made)) => self.made = Some(made),
+            Ok(Err(e)) => log::warn!("resolve for {:#x} failed to compile: {e}", self.may2),
+            Err(message) => log::warn!("resolve for {:#x} panicked: {message}", self.may2),
+        }
+    }
+}
+
+/// The compute kernels are hot-reloadable [`Pipelines`]; the mesh pipelines are not. The
+/// material resolves made per mask compile again from their module's latest reload.
 pub(crate) struct RasterPipelines {
     clear: PipelineId,
     instances: PipelineId,
@@ -74,7 +148,11 @@ pub(crate) struct RasterPipelines {
     coverage: MeshPipeline,
     software: PipelineId,
     classify: PipelineId,
+    /// The resolve that may meet everything, which runs any view.
     resolve: Resolve,
+    /// The resolve's module, which those made per mask compile from.
+    resolve_module: &'static ShaderModule,
+    masked: Vec<MaskedResolve>,
     seed: PipelineId,
     reduce: PipelineId,
     depth: MeshPipeline,
@@ -106,6 +184,11 @@ impl RasterPipelines {
             Ok::<_, crate::Error>(device.create_mesh_pipeline(&desc, mesh)?)
         };
         let none = SpecData::default;
+        let all = u32::MAX.to_le_bytes();
+        let everything = SpecData {
+            entries: &RESOLVE_SPEC,
+            bytes: &all,
+        };
         let resolve = if generated {
             Resolve::Generated {
                 sequences: pipelines.create(
@@ -115,7 +198,13 @@ impl RasterPipelines {
                     "sequences",
                     none(),
                 )?,
-                set: pipelines.create_set(device, kernels, &resolve::MODULE, "resolve")?,
+                set: pipelines.create_set(
+                    device,
+                    kernels,
+                    &resolve::MODULE,
+                    "resolve",
+                    everything,
+                )?,
             }
         } else {
             Resolve::Recorded(pipelines.create(
@@ -123,7 +212,7 @@ impl RasterPipelines {
                 kernels,
                 &resolve::MODULE,
                 "resolve",
-                none(),
+                everything,
             )?)
         };
         let mut compute = |own, entry| pipelines.create(device, kernels, own, entry, none());
@@ -140,6 +229,8 @@ impl RasterPipelines {
             software: compute(&raster::MODULE, "software")?,
             classify: compute(&resolve::MODULE, "classify")?,
             resolve,
+            resolve_module: kernels.module(&resolve::MODULE)?,
+            masked: Vec::new(),
             seed: compute(&hzb::MODULE, "seed")?,
             reduce: compute(&hzb::MODULE, "reduce")?,
             depth: mesh(
@@ -155,12 +246,110 @@ impl RasterPipelines {
         })
     }
 
-    /// Preprocess memory one view's resolve takes from [`orr_gpu::DeviceArenas`], when it
-    /// runs as device-generated commands.
-    pub(crate) fn preprocess_layout(&self, pipelines: &Pipelines) -> Option<Layout> {
-        match self.resolve {
-            Resolve::Recorded(_) => None,
-            Resolve::Generated { set, .. } => Some(pipelines.set(set).preprocess_layout(self.bins)),
+    /// The material resolve a view runs whose scene's surfaces and hits may meet `may2`
+    /// ([`SceneFeatures::surface_may`]): of those ready, the one made for the least beyond it,
+    /// which the one made for everything always is. Starts the compile of the one made for
+    /// exactly `may2`, unless that is everything, where none has started or its module has
+    /// reloaded since, as a job behind everything else on `loading`; with `wait`, waits for it,
+    /// running queued jobs on this thread meanwhile. Lets go of the compiles and resolves no
+    /// view has asked for or run for a while.
+    pub(crate) fn choose_resolve(
+        &mut self,
+        device: &Device,
+        pipelines: &Pipelines,
+        loading: &Loading,
+        may2: u32,
+        wait: bool,
+    ) -> ResolveChoice {
+        let now = Instant::now();
+        let code = pipelines.code_of(self.resolve_module);
+        let current = |c: &Option<Arc<Code>>| match (c, &code) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        };
+        self.masked.retain_mut(|m| {
+            m.settle();
+            let keep = if m.made.is_some() {
+                RESOLVE_KEEP
+            } else {
+                RESOLVE_IDLE
+            };
+            let running = m.job.as_ref().is_some_and(JobResult::started);
+            current(&m.code) && (m.may2 == may2 || running || now.duration_since(m.seen) <= keep)
+        });
+        if may2 == u32::MAX {
+            return ResolveChoice::General;
+        }
+        let exact = match self.masked.iter().position(|m| m.may2 == may2) {
+            Some(i) => i,
+            None => {
+                let generated = matches!(self.resolve, Resolve::Generated { .. });
+                let bytes = may2.to_le_bytes();
+                let spec = SpecData {
+                    entries: &RESOLVE_SPEC,
+                    bytes: &bytes,
+                };
+                let recipe = Recipe::compute(self.resolve_module, "resolve", spec, generated);
+                let from = code.clone();
+                let job = loading.compile_job(device, Urgency::Idle, move |d| {
+                    recipe.create(d, from.as_deref())
+                });
+                self.masked.push(MaskedResolve {
+                    may2,
+                    code,
+                    job: Some(job),
+                    made: None,
+                    seen: now,
+                });
+                self.masked.len() - 1
+            }
+        };
+        let m = &mut self.masked[exact];
+        m.seen = now;
+        if wait && let Some(job) = &m.job {
+            job.raise(loading, Urgency::Needed);
+            job.wait_at(loading, Urgency::Needed);
+            m.settle();
+        }
+        let chosen = self
+            .masked
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.made.is_some() && m.may2 & may2 == may2)
+            .min_by_key(|(_, m)| m.may2.count_ones())
+            .map(|(i, _)| i);
+        match chosen {
+            Some(i) => {
+                self.masked[i].seen = now;
+                ResolveChoice::Masked(i)
+            }
+            None => ResolveChoice::General,
+        }
+    }
+
+    /// The resolve `choice` names, of those [`Self::choose_resolve`] last kept.
+    pub(crate) fn resolve_run<'a>(
+        &'a self,
+        choice: ResolveChoice,
+        pipelines: &'a Pipelines,
+    ) -> ResolveRun<'a> {
+        let made = match choice {
+            ResolveChoice::General => None,
+            ResolveChoice::Masked(i) => self.masked[i].made.as_ref(),
+        };
+        match (self.resolve, made) {
+            (Resolve::Recorded(general), None) => ResolveRun::Recorded(pipelines.get(general)),
+            (Resolve::Generated { sequences, set }, None) => ResolveRun::Generated {
+                sequences: pipelines.get(sequences),
+                set: pipelines.set(set),
+            },
+            (Resolve::Recorded(_), Some(Made::Pipeline(p))) => ResolveRun::Recorded(p),
+            (Resolve::Generated { sequences, .. }, Some(Made::Set(set))) => ResolveRun::Generated {
+                sequences: pipelines.get(sequences),
+                set,
+            },
+            _ => unreachable!("a resolve made per mask is made as the general one is"),
         }
     }
 }
@@ -730,16 +919,17 @@ fn bin_root(roots: GpuPtr<RasterRoot>, bin: u32) -> GpuPtr<RasterRoot> {
 }
 
 /// Records one view's raster half into `list`. With `occlusion` the first pass tests the
-/// previous frame's HZB, which the view's previous render left. `preprocess` is memory of
-/// [`RasterPipelines::preprocess_layout`], when it gives one. `producers` are the entries
-/// whose clusters the raster culls, each with the most it holds. `opaque` draws in each pass
-/// after the lists' draws. Returns the raster record of each mesh draw over a list, the
-/// first of which every other pass takes.
+/// previous frame's HZB, which the view's previous render left. `resolve` runs the material
+/// resolve, and `preprocess` is memory of its [`ResolveRun::preprocess_layout`], when it gives
+/// one. `producers` are the entries whose clusters the raster culls, each with the most it
+/// holds. `opaque` draws in each pass after the lists' draws. Returns the raster record of each
+/// mesh draw over a list, the first of which every other pass takes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record(
     device: &Device,
     p: &RasterPipelines,
     pipelines: &Pipelines,
+    resolve: ResolveRun<'_>,
     window: &UploadWindow,
     list: &mut CommandList<'_>,
     targets: &ViewTargets,
@@ -900,17 +1090,17 @@ pub(crate) fn record(
 
     list.begin_pass("resolve", false);
     list.dispatch(pipelines.get(p.classify), r0, [tx * ty, 1, 1]);
-    match p.resolve {
-        Resolve::Recorded(resolve) => {
+    match resolve {
+        ResolveRun::Recorded(resolve) => {
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
             for bin in 0..s.bins {
                 let args = targets.bin_args(bin);
-                list.dispatch_indirect(pipelines.get(resolve), bin_root(roots, bin), args);
+                list.dispatch_indirect(resolve, bin_root(roots, bin), args);
             }
         }
-        Resolve::Generated { sequences, set } => {
+        ResolveRun::Generated { sequences, set } => {
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-            list.dispatch(pipelines.get(sequences), r0, [s.bins.div_ceil(64), 1, 1]);
+            list.dispatch(sequences, r0, [s.bins.div_ceil(64), 1, 1]);
             list.barrier(
                 Stages::COMPUTE,
                 Stages::PREPROCESS | Stages::COMPUTE,
@@ -918,7 +1108,7 @@ pub(crate) fn record(
             );
             let (sequences, count) = targets.sequences();
             let g = Generated {
-                set: pipelines.set(set),
+                set,
                 sequences,
                 count,
                 max: s.bins,

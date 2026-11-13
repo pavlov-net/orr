@@ -37,10 +37,11 @@ public struct NeuralSetGpu
 }
 
 // The last texel decoded by this invocation, which the texture slots of one material
-// sharing a set and footprint read again.
+// sharing a set and footprint read again. `cached` is read only once `cached_set` names a set,
+// which a decode that wrote it set, so it takes no initializer.
 static uint64_t cached_set = 0;
 static uint3 cached_texel = uint3(0);
-static float cached[NEURAL_OUTPUTS] = {};
+static float cached[NEURAL_OUTPUTS];
 
 Vector<NEURAL_WIDTH> neural_activation(Vector<NEURAL_WIDTH> x)
 {

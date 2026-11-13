@@ -767,9 +767,12 @@ impl Renderer {
     /// thread so it needs no workers, and returns [`Error::PathKernels`] if they failed. For
     /// tests and headless runs; returns at once when they are ready or never started. From
     /// this call on [`Frame::render_view`] also waits for the path pipelines a view's scene and
-    /// settings first ask for, where it would otherwise hold the view black while they compile.
+    /// settings first ask for, where it would otherwise hold the view black while they compile,
+    /// and a view's raster for the material resolve made for its scene
+    /// ([`Scenes::wait_resolves`]).
     pub fn wait_paths(&mut self) -> Result<()> {
         self.lighting.waits = true;
+        self.scenes.wait_resolves();
         if let Paths::Compiling { jobs, .. } = &self.lighting.paths {
             jobs.wait(&self.scenes.loading());
         }

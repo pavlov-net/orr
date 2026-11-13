@@ -1500,6 +1500,9 @@ impl World {
     /// A world that mounts `bytes` in place of [`pack`].
     fn with_pack(desc: &RendererDesc, bytes: &Arc<[u8]>) -> Self {
         let mut scenes = Scenes::new(device(), desc).unwrap();
+        // Tests compare frames bit for bit, so every frame runs the resolve made for its scene
+        // rather than the one made for everything until that has compiled.
+        scenes.wait_resolves();
         let workers = Workers::start(&scenes, 2);
         let mount = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
         let start = Instant::now();

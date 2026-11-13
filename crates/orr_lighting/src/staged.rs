@@ -404,7 +404,7 @@ impl<T: Send + 'static> Late<T> {
         }
         match loading {
             Some((loading, urgency)) => {
-                let queued = crate::view::compile_job(device, loading, urgency, compile);
+                let queued = loading.compile_job(device, urgency, compile);
                 *job = Some(Arc::new((Mutex::new(urgency), queued)));
             }
             None => self.settle(compile(device)),

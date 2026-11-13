@@ -249,9 +249,9 @@ public extern static const bool TEXTURE_FEEDBACK = false;
 
 // Whether kernels decode the neural sets that stand in for textures. A kernel that exports
 // `NEURAL_TEXTURES = true` decodes them in `texture_prepare` (or `material_prepare`), which
-// holds the decoder once; its later taps of those textures at the prepared uv read the
-// decoded values. Every other tap reads the texture's own entry, so the decoder stays out of
-// the tap sites of large kernels.
+// holds the decoder once, wherever MAY2_NEURAL_TEXTURES is set; its later taps of those textures
+// at the prepared uv read the decoded values. Every other tap reads the texture's own entry, so
+// the decoder stays out of the tap sites of large kernels.
 public extern static const bool NEURAL_TEXTURES = false;
 
 // The record of heap index `t` in `streams`, or null when the texture neither streams nor has
@@ -628,12 +628,16 @@ float4 neural_footprint(NeuralTextureGpu* t, uint modes, UvFootprint f, TextureS
     return v;
 }
 
-// Texture slots this invocation decoded with `texture_prepare`: heap index, uv and value.
+// Texture slots this invocation decoded with `texture_prepare`: heap index, uv and value. Only
+// the first `prepared_count` entries are read, each after `texture_prepare` wrote it, so the
+// arrays take no initializer: one would write every entry at the start of every invocation.
 static const uint PREPARED_MAX = TEXTURE_SLOTS;
 static uint prepared_count = 0;
-static uint prepared_index[PREPARED_MAX] = {};
-static float2 prepared_uv[PREPARED_MAX] = {};
-static float4 prepared_value[PREPARED_MAX] = {};
+#if defined(ORR_NEURAL_BUILD)
+static uint prepared_index[PREPARED_MAX];
+static float2 prepared_uv[PREPARED_MAX];
+static float4 prepared_value[PREPARED_MAX];
+#endif
 
 // Forgets what `texture_prepare` decoded.
 public void texture_unprepare()
@@ -648,7 +652,7 @@ public void texture_prepare(TextureIndex t, uint modes, UvFootprint f, TextureSt
 {
 #if defined(ORR_NEURAL_BUILD)
     TextureStreamGpu* record = texture_record(streams, t);
-    if (!NEURAL_TEXTURES || record == nullptr || record.neural == nullptr || prepared_count == PREPARED_MAX)
+    if (!NEURAL_TEXTURES || !may2(MAY2_NEURAL_TEXTURES) || record == nullptr || record.neural == nullptr || prepared_count == PREPARED_MAX)
         return;
     prepared_index[prepared_count] = t.index;
     prepared_uv[prepared_count] = f.uv;
@@ -693,7 +697,8 @@ public void texture_feedback(TextureIndex t, TextureSamplerGpu s, UvFootprint f,
 // invocation prepared at `f.uv` (`texture_prepare`) reads its decoded value.
 public float4 texture_footprint(TextureIndex t, TextureSamplerGpu s, UvFootprint f, TextureStreamGpu** streams)
 {
-    if (NEURAL_TEXTURES)
+#if defined(ORR_NEURAL_BUILD)
+    if (NEURAL_TEXTURES && may2(MAY2_NEURAL_TEXTURES))
     {
         for (uint k = 0; k < prepared_count; k++)
         {
@@ -701,6 +706,7 @@ public float4 texture_footprint(TextureIndex t, TextureSamplerGpu s, UvFootprint
                 return prepared_value[k];
         }
     }
+#endif
     TextureStreamGpu* stream = texture_stream(streams, t);
     Texture2D<float4> texture = t.get<Texture2D<float4>>();
     bool one_mip = (s.modes & TEXTURE_ONE_MIP) != 0;
@@ -860,7 +866,7 @@ public float material_texel_direction(MaterialGpu* m, uint slot, float2 v)
 public void material_prepare(MaterialGpu* m, UvFootprint uv[2])
 {
     texture_unprepare();
-    if (!NEURAL_TEXTURES)
+    if (!NEURAL_TEXTURES || !may2(MAY2_NEURAL_TEXTURES))
         return;
     for (uint slot = 0; slot < TEXTURE_SLOTS; slot++)
     {

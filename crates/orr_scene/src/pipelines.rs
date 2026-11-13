@@ -109,6 +109,25 @@ pub(crate) struct Recipe {
 }
 
 impl Recipe {
+    /// `module`'s compute `entry` specialized by `spec`, or with `set` an execution set holding
+    /// it alone.
+    pub(crate) fn compute(
+        module: &'static ShaderModule,
+        entry: &str,
+        spec: SpecData<'_>,
+        set: bool,
+    ) -> Self {
+        Self {
+            module,
+            kind: Kind::Compute {
+                entry: entry.to_owned(),
+                spec_entries: spec.entries.to_vec(),
+                spec_bytes: spec.bytes.to_vec(),
+                set,
+            },
+        }
+    }
+
     /// The pipeline or set, from `code` in place of the module's SPIR-V when given.
     pub(crate) fn create(&self, device: &Device, code: Option<&Code>) -> Result<Made> {
         let stage = |entry: &str, spec| -> Result<ShaderStage<'_>> {
@@ -252,8 +271,9 @@ impl Pipelines {
         kernels: &KernelSet,
         own: &'static ShaderModule,
         entry: &str,
+        spec: SpecData<'_>,
     ) -> Result<PipelineId> {
-        self.add(device, kernels, own, entry, SpecData::default(), true)
+        self.add(device, kernels, own, entry, spec, true)
     }
 
     fn add(
@@ -265,13 +285,8 @@ impl Pipelines {
         spec: SpecData<'_>,
         set: bool,
     ) -> Result<PipelineId> {
-        let kind = Kind::Compute {
-            entry: entry.to_owned(),
-            spec_entries: spec.entries.to_vec(),
-            spec_bytes: spec.bytes.to_vec(),
-            set,
-        };
-        Ok(PipelineId(self.make(device, kernels, own, kind)?))
+        let recipe = Recipe::compute(kernels.module(own)?, entry, spec, set);
+        Ok(PipelineId(self.make(device, recipe)?))
     }
 
     /// The mesh pipeline of `own`'s `stages`, from `kernels`' module of the same kernel file
@@ -292,22 +307,16 @@ impl Pipelines {
             raster: stages.raster,
             samples: stages.samples,
         };
-        Ok(MeshPipelineId(self.make(device, kernels, own, kind)?))
-    }
-
-    /// Makes `kind` of `own` and returns its place in the list.
-    fn make(
-        &mut self,
-        device: &Device,
-        kernels: &KernelSet,
-        own: &'static ShaderModule,
-        kind: Kind,
-    ) -> Result<u32> {
         let recipe = Recipe {
             module: kernels.module(own)?,
             kind,
         };
-        let made = recipe.create(device, self.code_of(recipe.module))?;
+        Ok(MeshPipelineId(self.make(device, recipe)?))
+    }
+
+    /// Makes `recipe` and returns its place in the list.
+    fn make(&mut self, device: &Device, recipe: Recipe) -> Result<u32> {
+        let made = recipe.create(device, self.code_of(recipe.module).as_deref())?;
         self.recipes.push(Arc::new(recipe));
         self.list.push(made);
         Ok(self.list.len() as u32 - 1)
@@ -350,10 +359,11 @@ impl Pipelines {
         }
     }
 
-    fn code_of(&self, module: &'static ShaderModule) -> Option<&Code> {
+    /// The SPIR-V `module` last reloaded to; none while it runs the build's.
+    pub(crate) fn code_of(&self, module: &'static ShaderModule) -> Option<Arc<Code>> {
         self.code
             .iter()
             .find(|(m, _)| ptr::eq(*m, module))
-            .map(|(_, c)| &**c)
+            .map(|(_, c)| Arc::clone(c))
     }
 }
