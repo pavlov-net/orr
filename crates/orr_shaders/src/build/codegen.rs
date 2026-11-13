@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-use super::compile::MetalLibs;
+use super::compile::{MetalLibs, entry_symbol};
 use super::layout::{Plan, Slot};
 use super::link::{self, Link, LinkPoint};
 use super::model::{Model, Scalar, SpecConstant, StructDef, Ty};
@@ -23,6 +23,8 @@ pub(super) enum Owner {
 /// One kernel module, ready to emit.
 pub(super) struct Kernel<'a> {
     pub(crate) name: &'a str,
+    /// The kernel's module name as dependents import it.
+    pub(super) module: &'a str,
     pub(super) spv: &'a Path,
     pub(super) debug_info: Option<&'a Path>,
     pub(super) hash: u64,
@@ -198,8 +200,9 @@ fn emit_module(out: &mut String, item: &str, k: &Kernel<'_>, manifest: &Path) {
     for e in &k.model.entries {
         let _ = writeln!(
             out,
-            "        ::orr_shaders::EntryPoint {{ name: c{:?}, metal_name: c{:?}, stage: ::orr_shaders::Stage::{:?}, workgroup: {:?}, interface: {:#018x} }},",
+            "        ::orr_shaders::EntryPoint {{ name: c{:?}, spirv_name: c{:?}, metal_name: c{:?}, stage: ::orr_shaders::Stage::{:?}, workgroup: {:?}, interface: {:#018x} }},",
             e.name,
+            entry_symbol(k.module, &e.name),
             k.metallib.names.get(&e.name).map_or("", String::as_str),
             e.stage,
             e.workgroup,

@@ -167,7 +167,7 @@ impl CpuLibrary {
         let Some((first, rest)) = modules.split_first() else {
             return Err(slang_err("no sources".to_owned()));
         };
-        let program = session.link(first, rest, |_| false).map_err(compile_err)?;
+        let program = session.link(first, rest, |_| None).map_err(compile_err)?;
         let cpp = program.text().map_err(compile_err)?;
         if cpp.contains("KernelContext") {
             return Err(slang_err(

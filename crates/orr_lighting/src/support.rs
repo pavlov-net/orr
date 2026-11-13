@@ -96,7 +96,7 @@ fn compile(
     };
     let started = Instant::now();
     let stage = ShaderStage::new(module(kernels, own)?, "main", spec)?;
-    let pipeline = device.create_compute_pipeline(&stage, name)?;
+    let pipeline = device.create_compute_pipeline(&stage, &format!("{name} {may:#x}"))?;
     log::debug!(
         "{name} for {may:#x} made in {:.1} s",
         started.elapsed().as_secs_f64()

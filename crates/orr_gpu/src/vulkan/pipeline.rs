@@ -191,7 +191,7 @@ impl<'a> StageParts<'a> {
             )));
         }
         let code = if matches!(want, Stage::Task | Stage::Mesh) {
-            spirv::payload_first(s.spirv, s.entry.name.to_bytes())
+            spirv::payload_first(s.spirv, s.entry.spirv_name.to_bytes())
         } else {
             Cow::Borrowed(s.spirv)
         };
@@ -201,7 +201,7 @@ impl<'a> StageParts<'a> {
             let started = Instant::now();
             let folded = specialize::specialize(
                 &code,
-                s.entry.name.to_bytes(),
+                s.entry.spirv_name.to_bytes(),
                 s.spec.entries,
                 s.spec.bytes,
             );
@@ -237,7 +237,7 @@ impl<'a> StageParts<'a> {
         }
         Ok(Self {
             code,
-            entry: s.entry.name,
+            entry: s.entry.spirv_name,
             mappings: if s.inline_root_bytes > 0 {
                 Vec::new()
             } else {

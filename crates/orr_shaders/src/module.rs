@@ -41,9 +41,15 @@ impl ShaderModule {
 /// One entry point of a [`ShaderModule`].
 #[derive(Clone, Copy, Debug)]
 pub struct EntryPoint {
+    /// The entry's function in the kernel source, which [`ShaderModule::entry_point`] finds it by.
     pub name: &'static CStr,
-    /// The entry's function in the module's Metal library, which Slang may have renamed
-    /// (`main` is `main_0`); empty without a library and for ray-generation entries.
+    /// The entry's name in `spirv`, which pipelines select it by and profilers show for it: the
+    /// kernel's module name as dependents import it (`orr_lighting.path.staged.trace`) for
+    /// `main`, followed by `.<name>` for any other entry.
+    pub spirv_name: &'static CStr,
+    /// The entry's function in the module's Metal library: `spirv_name` with `_` for `.`, which
+    /// Slang may rename further (with a `_0` suffix); empty without a library and for
+    /// ray-generation entries.
     pub metal_name: &'static CStr,
     pub stage: Stage,
     /// The workgroup size; `[1, 1, 1]` for ray-generation and pixel entries.

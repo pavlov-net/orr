@@ -325,6 +325,52 @@ fn metal_check_compares_layouts_and_finds_invalid_msl() {
     }
 }
 
+#[test]
+fn entry_points_are_named_for_their_module() {
+    const OP_ENTRY_POINT: u32 = 15;
+    let two = format!(
+        "{ROOT}[shader(\"compute\")] [numthreads(32, 1, 1)] void main(uint3 id: SV_DispatchThreadID) {{ root.out[id.x] = 1; }}\n\
+         [shader(\"compute\")] [numthreads(32, 1, 1)] void clear(uint3 id: SV_DispatchThreadID) {{ root.out[id.x] = 0; }}\n"
+    );
+    let dir = fixture(
+        "entry-names",
+        &[
+            ("src/a.slang", &kernel("root.out[id.x] = 2;")),
+            ("src/sub/b.slang", &two),
+        ],
+    );
+    build(&dir)
+        .metal_check(true)
+        .compile()
+        .unwrap_or_else(|e| panic!("{e}"));
+    let entries = |spv: &str| {
+        let mut names: Vec<String> = instructions(&read_words(&dir.join("out").join(spv)))
+            .into_iter()
+            .filter(|(op, _)| *op == OP_ENTRY_POINT)
+            .map(|(_, a)| literal(&a[2..]))
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(entries("a.spv"), ["fixture.a"]);
+    assert_eq!(
+        entries("sub/b.spv"),
+        ["fixture.sub.b", "fixture.sub.b.clear"]
+    );
+    let rust = fs::read_to_string(dir.join("out/orr_shaders.rs")).unwrap();
+    assert!(
+        rust.contains("name: c\"clear\", spirv_name: c\"fixture.sub.b.clear\""),
+        "{rust}"
+    );
+    let msl = fs::read_to_string(dir.join("out/sub/b.metal")).unwrap();
+    for function in ["fixture_sub_b(", "fixture_sub_b_clear("] {
+        assert!(
+            msl.contains(&format!("[[kernel]] void {function}")),
+            "{msl}"
+        );
+    }
+}
+
 /// Instructions of a SPIR-V module as (opcode, operands).
 fn instructions(words: &[u32]) -> Vec<(u32, &[u32])> {
     let mut out = Vec::new();

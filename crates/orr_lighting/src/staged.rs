@@ -274,12 +274,13 @@ fn compile_stage(
         bytes: &bytes,
     };
     let started = Instant::now();
+    let label = format!("{name} {may:#x}");
     let pipeline = if rays && stage.reorders() {
         let stage = ShaderStage::new(m, &entry.replace("main", "rays"), spec)?;
-        StagePipeline::Rays(device.create_ray_dispatch_pipeline(&stage, name)?)
+        StagePipeline::Rays(device.create_ray_dispatch_pipeline(&stage, &label)?)
     } else {
         let stage = ShaderStage::new(m, entry, spec)?;
-        StagePipeline::Compute(device.create_compute_pipeline(&stage, name)?)
+        StagePipeline::Compute(device.create_compute_pipeline(&stage, &label)?)
     };
     log::debug!(
         "{name} for {may:#x} made in {:.1} s",

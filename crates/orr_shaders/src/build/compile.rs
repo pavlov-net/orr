@@ -385,6 +385,7 @@ impl Build {
             .map(|(name, path)| Job {
                 record: records.join(format!("{name}.json")),
                 spv: out_dir.join(format!("{name}.spv")),
+                module: qualified(prefix.as_deref(), &name),
                 name,
                 path,
                 links: Vec::new(),
@@ -546,6 +547,7 @@ impl Build {
             let model = &models[name];
             kernels_out.push(Kernel {
                 name,
+                module: &record.module,
                 spv: &record.spv,
                 debug_info: record.debug_info.as_deref(),
                 hash: record.hash,
@@ -565,6 +567,7 @@ impl Build {
             .iter()
             .map(|(name, record)| Kernel {
                 name,
+                module: &record.module,
                 spv: &record.spv,
                 debug_info: record.debug_info.as_deref(),
                 hash: record.hash,
@@ -602,6 +605,7 @@ impl Build {
                 .chain(linked_modules.iter().map(|(name, r)| (name, r, true)))
                 .map(|(name, r, linked)| ManifestModule {
                     name: name.clone(),
+                    module: r.module.clone(),
                     kernel: r.kernel.clone(),
                     linked,
                     spv: r.spv.clone(),
@@ -809,6 +813,7 @@ fn linked_jobs(links: &[Link], listed: &LinkPoints, out_dir: &Path) -> Result<Ve
         }
         jobs.push(Job {
             name: k.name.clone(),
+            module: qualified(k.root.prefix.as_deref(), &k.name),
             path: k.path.clone(),
             record: records.join(format!("{}.json", k.name)),
             spv: out_dir.join("linked").join(format!("{}.spv", k.name)),
@@ -858,6 +863,8 @@ pub(super) struct Manifest {
 #[derive(Serialize, Deserialize)]
 pub(super) struct ManifestModule {
     pub(super) name: String,
+    /// The kernel's module name as dependents import it.
+    pub(super) module: String,
     pub(super) kernel: PathBuf,
     /// Compiled with this build's linked types; goes into `KERNELS`.
     pub(super) linked: bool,
@@ -882,6 +889,7 @@ pub(super) struct LinkFile {
 struct Record {
     key: String,
     kernel: PathBuf,
+    module: String,
     inputs: Vec<PathBuf>,
     spv: PathBuf,
     debug_info: Option<PathBuf>,
@@ -948,9 +956,27 @@ impl Settings<'_> {
     }
 }
 
+/// `name` (`a/b`) as a module name under `prefix`: `<prefix>.a.b`.
+fn qualified(prefix: Option<&str>, name: &str) -> String {
+    let path = name.replace('/', ".");
+    prefix.map_or_else(|| path.clone(), |p| format!("{p}.{path}"))
+}
+
+/// The name the entry point `entry` of the kernel module `module` has in the compiled code,
+/// which profilers and capture tools show for it: `module` for `main`, else `<module>.<entry>`.
+pub(super) fn entry_symbol(module: &str, entry: &str) -> String {
+    if entry == "main" {
+        module.to_owned()
+    } else {
+        format!("{module}.{entry}")
+    }
+}
+
 /// The work of compiling one kernel file.
 struct Job {
     name: String,
+    /// The kernel's module name as dependents import it, `<prefix>.<path>`.
+    module: String,
     path: PathBuf,
     record: PathBuf,
     spv: PathBuf,
@@ -1101,7 +1127,8 @@ fn load_record(settings: &Settings<'_>, job: &Job) -> Option<Record> {
         .into_iter()
         .flatten()
         .all(|p| p.is_file());
-    (record.key == key && record.kernel == job.path && outputs_exist).then_some(record)
+    (record.key == key && record.kernel == job.path && record.module == job.module && outputs_exist)
+        .then_some(record)
 }
 
 fn compile_all(
@@ -1228,6 +1255,7 @@ fn compile_one(
     let source = read(path)?;
     let unit = Unit {
         name,
+        module: &job.module,
         path,
         source: &source,
         links: &job.links,
@@ -1269,6 +1297,7 @@ fn compile_one(
     Ok(Record {
         key,
         kernel: path.to_path_buf(),
+        module: job.module.clone(),
         inputs: compiled.inputs,
         spv: job.spv.clone(),
         debug_info,
@@ -1290,6 +1319,9 @@ fn compile_one(
 /// One kernel file to compile: its source and the link modules composed with it.
 pub(super) struct Unit<'a> {
     pub(super) name: &'a str,
+    /// The kernel's module name as dependents import it, which names its entry points in the
+    /// compiled code.
+    pub(super) module: &'a str,
     pub(super) path: &'a Path,
     pub(super) source: &'a str,
     pub(super) links: &'a [LinkModule],
@@ -1328,7 +1360,7 @@ pub(super) fn compile_kernel(
         .map_err(compile_err)?;
     let extra = link_modules(session, settings, unit.links).map_err(compile_err)?;
     let program = session
-        .link(&module, &extra, |_| true)
+        .link(&module, &extra, |e| Some(entry_symbol(unit.module, e)))
         .map_err(compile_err)?;
     // A stripped module has no names, which the model reads; the sidecar is the whole
     // module.
@@ -1340,10 +1372,20 @@ pub(super) fn compile_kernel(
     };
     let layout = program.layout().map_err(compile_err)?;
     let named = debug.as_deref().unwrap_or(&words);
-    let model = model::extract(session, layout, named).map_err(|message| Error::Reflection {
-        module: unit.name.to_owned(),
-        message,
-    })?;
+    let mut model =
+        model::extract(session, layout, named).map_err(|message| Error::Reflection {
+            module: unit.name.to_owned(),
+            message,
+        })?;
+    // The SPIR-V names entries by their symbols; the lint names them as the source does.
+    for name in &mut model.no_omm_mode {
+        let e = model
+            .entries
+            .iter()
+            .find(|e| entry_symbol(unit.module, &e.name) == *name)
+            .expect("link names every entry by its symbol");
+        name.clone_from(&e.name);
+    }
 
     let mut inputs: Vec<PathBuf> = module
         .dependencies()
@@ -1430,7 +1472,11 @@ pub(super) fn metal_issues(
         groups
             .iter()
             .map(|(extension, entries)| {
-                let program = session.link(&module, &extra, |e| entries.contains(e))?;
+                let program = session.link(&module, &extra, |e| {
+                    entries
+                        .contains(e)
+                        .then(|| metal::symbol(&entry_symbol(unit.module, e)))
+                })?;
                 Ok::<_, String>((*extension, program.text()?, program))
             })
             .collect::<Result<Vec<_>, String>>()
@@ -1465,7 +1511,7 @@ pub(super) fn metal_issues(
     let mut libs = MetalLibs::default();
     for (_, entries) in &groups {
         for &entry in entries {
-            match metal::metal_name(entry, &declared) {
+            match metal::metal_name(&metal::symbol(&entry_symbol(unit.module, entry)), &declared) {
                 Some(name) => {
                     libs.names.insert(entry.to_owned(), name.to_owned());
                 }

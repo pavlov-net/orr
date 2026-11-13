@@ -94,8 +94,12 @@ struct ComponentTypeVtbl {
     // getSpecializationParamCount .. specialize
     _unused1: [usize; 5],
     link: unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void) -> Result_,
-    // getEntryPointHostCallable, renameEntryPoint, linkWithOptions
-    _unused2: [usize; 3],
+    // getEntryPointHostCallable
+    _unused2: usize,
+    rename_entry_point:
+        unsafe extern "system" fn(*mut c_void, *const c_char, *mut *mut c_void) -> Result_,
+    // linkWithOptions
+    _unused3: usize,
     get_target_code: unsafe extern "system" fn(
         *mut c_void,
         sys::SlangInt,
@@ -103,7 +107,7 @@ struct ComponentTypeVtbl {
         *mut *mut c_void,
     ) -> Result_,
     // getTargetMetadata, getEntryPointMetadata
-    _unused3: [usize; 2],
+    _unused4: [usize; 2],
 }
 
 #[repr(C)]
@@ -436,13 +440,14 @@ impl Session {
         }
     }
 
-    /// Composes the module, the entry points it defines whose names `keep` accepts, and
-    /// `extra` modules, and links the result.
+    /// Composes the module, the entry points it defines that `name` names, each under the name
+    /// it gives, and `extra` modules, and links the result. `name` returns `None` for an entry
+    /// left out.
     pub(crate) fn link(
         &self,
         module: &Module,
         extra: &[Module],
-        keep: impl Fn(&str) -> bool,
+        name: impl Fn(&str) -> Option<String>,
     ) -> Result<Program, String> {
         let mut parts = vec![module.com.as_ptr()];
         parts.extend(extra.iter().map(|m| m.com.as_ptr()));
@@ -458,10 +463,25 @@ impl Session {
                     .filter(|_| !failed(r))
                     .ok_or("getDefinedEntryPoint failed")?;
                 let function = (ep.vtbl::<EntryPointVtbl>().get_function_reflection)(ep.as_ptr());
-                let name = c_str(self.lib.api.spReflectionFunction_GetName(function)).unwrap_or("");
-                if !keep(name) {
+                let source =
+                    c_str(self.lib.api.spReflectionFunction_GetName(function)).unwrap_or("");
+                let Some(symbol) = name(source) else {
                     continue;
-                }
+                };
+                let ep = if symbol == source {
+                    ep
+                } else {
+                    let symbol = CString::new(symbol).expect("entry names have no nul");
+                    let mut renamed = ptr::null_mut();
+                    let r = (ep.vtbl::<ComponentTypeVtbl>().rename_entry_point)(
+                        ep.as_ptr(),
+                        symbol.as_ptr(),
+                        &mut renamed,
+                    );
+                    Com::from_raw(renamed)
+                        .filter(|_| !failed(r))
+                        .ok_or_else(|| format!("renameEntryPoint({symbol:?}) failed: {r:#x}"))?
+                };
                 parts.push(ep.as_ptr());
                 entries.push(ep);
             }

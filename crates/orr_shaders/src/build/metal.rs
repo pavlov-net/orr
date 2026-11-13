@@ -232,6 +232,11 @@ pub(super) fn entry_names(msl: &str) -> Vec<String> {
         .collect()
 }
 
+/// The Metal form of an entry point's compiled name: an MSL function name, with `_` for `.`.
+pub(super) fn symbol(spirv: &str) -> String {
+    spirv.replace('.', "_")
+}
+
 /// The Metal function name of the entry `name` among `declared`.
 pub(super) fn metal_name<'a>(name: &str, declared: &'a [String]) -> Option<&'a str> {
     let renamed = format!("{name}_0");

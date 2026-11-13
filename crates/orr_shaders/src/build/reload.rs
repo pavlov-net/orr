@@ -218,6 +218,7 @@ fn recompile(
     };
     let unit = Unit {
         name: &entry.name,
+        module: &entry.module,
         path: &entry.kernel,
         source: &source,
         links: &links,
