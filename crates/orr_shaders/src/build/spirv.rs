@@ -7,6 +7,9 @@ const MAGIC: u32 = 0x0723_0203;
 const HEADER_WORDS: usize = 5;
 
 pub(super) mod op {
+    pub(crate) const SOURCE_CONTINUED: u16 = 2;
+    pub(crate) const SOURCE: u16 = 3;
+    pub(crate) const SOURCE_EXTENSION: u16 = 4;
     pub(crate) const NAME: u16 = 5;
     pub(crate) const MEMBER_NAME: u16 = 6;
     pub(crate) const STRING: u16 = 7;
@@ -33,6 +36,7 @@ pub(super) mod op {
     pub(crate) const VARIABLE: u16 = 59;
     pub(crate) const DECORATE: u16 = 71;
     pub(crate) const MEMBER_DECORATE: u16 = 72;
+    pub(crate) const MODULE_PROCESSED: u16 = 330;
     pub(crate) const EXECUTION_MODE_ID: u16 = 331;
     pub(crate) const ATOMIC_LOAD: u16 = 227;
     pub(crate) const ATOMIC_STORE: u16 = 228;
@@ -51,12 +55,14 @@ pub(super) mod op {
 
 pub(super) mod decoration {
     pub(crate) const SPEC_ID: u32 = 1;
+    pub(crate) const BLOCK: u32 = 2;
     pub(crate) const ROW_MAJOR: u32 = 4;
     pub(crate) const ARRAY_STRIDE: u32 = 6;
     pub(crate) const MATRIX_STRIDE: u32 = 7;
     pub(crate) const BINDING: u32 = 33;
     pub(crate) const DESCRIPTOR_SET: u32 = 34;
     pub(crate) const OFFSET: u32 = 35;
+    pub(crate) const HIT_OBJECT_SHADER_RECORD_BUFFER: u32 = 5389;
 }
 
 const STORAGE_UNIFORM: u32 = 2;
@@ -381,6 +387,70 @@ fn takes_literals(o: u16) -> bool {
             | op::DECORATE
             | op::MEMBER_DECORATE
     )
+}
+
+/// The name of `orr_shaders.pipeline`'s wrapper of the record data a hit object names.
+const HIT_OBJECT_RECORD: &str = "HitObjectShaderRecordData";
+
+/// `words` with every struct type `named` names after `orr_shaders.pipeline`'s hit object
+/// record wrapper decorated `Block` and `HitObjectShaderRecordBufferEXT`, as glslang decorates
+/// a `hitobjectshaderrecordext` buffer reference: a load through a pointer from
+/// `OpHitObjectGetShaderRecordBufferHandleEXT` reads the record only through such a type, and
+/// Slang emits neither. `debug` is the debug info of a stripped `words`, which names its ids.
+pub(super) fn mark_hit_object_records(words: Vec<u32>, debug: Option<&[u32]>) -> Vec<u32> {
+    let wrappers: HashSet<u32> = instructions(debug.unwrap_or(&words))
+        .filter(|(_, i)| i.op == op::NAME && string(&i.args[1..]).0.starts_with(HIT_OBJECT_RECORD))
+        .map(|(_, i)| i.args[0])
+        .collect();
+    let structs: Vec<u32> = instructions(&words)
+        .filter(|(_, i)| i.op == op::TYPE_STRUCT && wrappers.contains(&i.args[0]))
+        .map(|(_, i)| i.args[0])
+        .collect();
+    if structs.is_empty() {
+        return words;
+    }
+    let decorated: HashSet<(u32, u32)> = instructions(&words)
+        .filter(|(_, i)| i.op == op::DECORATE && i.args.len() >= 2)
+        .map(|(_, i)| (i.args[0], i.args[1]))
+        .collect();
+    let mut added = Vec::new();
+    for id in structs {
+        for d in [
+            decoration::BLOCK,
+            decoration::HIT_OBJECT_SHADER_RECORD_BUFFER,
+        ] {
+            if !decorated.contains(&(id, d)) {
+                added.extend_from_slice(&[(3 << 16) | u32::from(op::DECORATE), id, d]);
+            }
+        }
+    }
+    // Annotations open the section after the debug instructions.
+    let at = instructions(&words)
+        .find(|(_, i)| {
+            !matches!(
+                i.op,
+                op::CAPABILITY
+                    | op::EXTENSION
+                    | op::EXT_INST_IMPORT
+                    | op::MEMORY_MODEL
+                    | op::ENTRY_POINT
+                    | op::EXECUTION_MODE
+                    | op::EXECUTION_MODE_ID
+                    | op::SOURCE_CONTINUED
+                    | op::SOURCE
+                    | op::SOURCE_EXTENSION
+                    | op::NAME
+                    | op::MEMBER_NAME
+                    | op::STRING
+                    | op::MODULE_PROCESSED
+            )
+        })
+        .map_or(words.len(), |(at, _)| at);
+    let mut out = Vec::with_capacity(words.len() + added.len());
+    out.extend_from_slice(&words[..at]);
+    out.extend(added);
+    out.extend_from_slice(&words[at..]);
+    out
 }
 
 /// `stripped` with the strings of `full` that its instructions still name. Slang's

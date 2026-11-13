@@ -110,7 +110,7 @@ fn every_lint_has_a_failing_fixture() {
                 .into(),
         ),
         (
-            Lint::Reorder,
+            Lint::Pipeline,
             format!("{ROOT}[shader(\"raygeneration\")] void main() {{ ReorderThread(DispatchRaysIndex().x, 1); root.out[DispatchRaysIndex().x] = 1; }}\n"),
         ),
         (

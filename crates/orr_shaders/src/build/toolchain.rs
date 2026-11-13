@@ -16,7 +16,7 @@ pub(super) const SLANGC_OPTIONS: &[&str] = &[
     "spirv_1_6",
     "-emit-spirv-directly",
     "-capability",
-    "spvDescriptorHeapEXT+spvRayQueryKHR+spvMeshShadingEXT+spvShaderInvocationReorderEXT+spvAbort+spvCooperativeVectorNV+spvRayQueryPositionFetchKHR+spvGroupNonUniform+spvGroupNonUniformArithmetic+spvGroupNonUniformShuffle",
+    "spvDescriptorHeapEXT+spvRayQueryKHR+spvMeshShadingEXT+spvShaderInvocationReorderEXT+spvAbort+spvCooperativeVectorNV+spvRayQueryPositionFetchKHR+spvRayTracingPositionFetchKHR+spvGroupNonUniform+spvGroupNonUniformArithmetic+spvGroupNonUniformShuffle",
     "-fvk-use-c-layout",
     "-matrix-layout-row-major",
     "-fvk-use-entrypoint-name",

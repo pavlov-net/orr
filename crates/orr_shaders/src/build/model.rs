@@ -191,6 +191,9 @@ pub(crate) struct Entry {
     pub(crate) name: String,
     pub(super) stage: Stage,
     pub(super) workgroup: [u32; 3],
+    /// The bytes of shader record data a ray tracing entry reads: the extent of its `uniform`
+    /// parameters, which Slang places in the shader record after the group handle.
+    pub(super) record_bytes: u32,
 }
 
 /// A global parameter other than the root and specialization constants, or an entry-point
@@ -378,6 +381,11 @@ impl Extract<'_> {
                     S::SLANG_STAGE_MESH => Stage::Mesh,
                     S::SLANG_STAGE_FRAGMENT => Stage::Pixel,
                     S::SLANG_STAGE_RAY_GENERATION => Stage::RayGen,
+                    S::SLANG_STAGE_CLOSEST_HIT => Stage::ClosestHit,
+                    S::SLANG_STAGE_ANY_HIT => Stage::AnyHit,
+                    S::SLANG_STAGE_INTERSECTION => Stage::Intersection,
+                    S::SLANG_STAGE_MISS => Stage::Miss,
+                    S::SLANG_STAGE_CALLABLE => Stage::Callable,
                     other => {
                         return Err(format!(
                             "entry point {name} has stage {}, which orr does not create pipelines for",
@@ -392,16 +400,28 @@ impl Extract<'_> {
                 } else {
                     [1, 1, 1]
                 };
+                let mut record_bytes = 0;
                 for p in 0..api.spReflectionEntryPoint_getParameterCount(ep) {
                     let vl = api.spReflectionEntryPoint_getParameterByIndex(ep, p);
                     let tl = api.spReflectionVariableLayout_GetTypeLayout(vl);
                     use sys::SlangParameterCategory as C;
                     let category = api.spReflectionTypeLayout_GetParameterCategory(tl);
-                    if !matches!(
+                    let uniform = C::SLANG_PARAMETER_CATEGORY_UNIFORM;
+                    let record = stage.ray_tracing()
+                        && matches!(category, C::SLANG_PARAMETER_CATEGORY_UNIFORM)
+                        || matches!(category, C::SLANG_PARAMETER_CATEGORY_SHADER_RECORD);
+                    if record {
+                        let end = api.spReflectionVariableLayout_GetOffset(vl, uniform)
+                            + api.spReflectionTypeLayout_GetSize(tl, uniform);
+                        record_bytes = record_bytes.max(end as u32);
+                    } else if !matches!(
                         category,
                         C::SLANG_PARAMETER_CATEGORY_NONE
                             | C::SLANG_PARAMETER_CATEGORY_VARYING_INPUT
                             | C::SLANG_PARAMETER_CATEGORY_VARYING_OUTPUT
+                            | C::SLANG_PARAMETER_CATEGORY_RAY_PAYLOAD
+                            | C::SLANG_PARAMETER_CATEGORY_HIT_ATTRIBUTES
+                            | C::SLANG_PARAMETER_CATEGORY_CALLABLE_PAYLOAD
                     ) {
                         let var = api.spReflectionVariableLayout_GetVariable(vl);
                         stray_params.push(StrayParam {
@@ -415,6 +435,7 @@ impl Extract<'_> {
                     name,
                     stage,
                     workgroup,
+                    record_bytes,
                 });
             }
 

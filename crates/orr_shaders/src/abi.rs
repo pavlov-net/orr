@@ -118,6 +118,33 @@ pub struct SamplerIndex(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Pod, Zeroable)]
 pub struct Tlas(pub u64);
 
+/// A ray hit as a pipeline shader's body reads it (`orr_shaders.pipeline`'s `HitInputs`): what a
+/// compute stand-in of a closest-hit or any-hit body loads in place of the built-ins.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
+pub struct HitInputs {
+    pub launch: [u32; 3],
+    pub instance_index: u32,
+    pub custom_index: u32,
+    pub geometry_index: u32,
+    pub primitive_index: u32,
+    /// -1 outside cluster geometry.
+    pub cluster_id: i32,
+    pub barycentrics: [f32; 2],
+    pub t: f32,
+    pub front_face: u32,
+    pub world_origin: [f32; 3],
+    pub pad0: u32,
+    pub world_direction: [f32; 3],
+    pub pad1: u32,
+    pub object_origin: [f32; 3],
+    pub pad2: u32,
+    pub object_direction: [f32; 3],
+    pub pad3: u32,
+    pub corners: [[f32; 3]; 3],
+    pub pad4: u32,
+}
+
 /// One specialization constant's place in a [`SpecData`] byte block.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Pod, Zeroable)]

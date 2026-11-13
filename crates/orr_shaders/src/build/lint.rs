@@ -15,7 +15,8 @@ use crate::abi::MAX_INLINE_ROOT_BYTES;
 #[non_exhaustive]
 pub enum Lint {
     /// `root` is the only shader parameter besides specialization constants and the Metal
-    /// bindings of `orr_shaders.abi`: no other globals, no entry-point uniforms.
+    /// bindings of `orr_shaders.abi`: no other globals, and no entry-point uniforms but a ray
+    /// tracing entry's, which are its shader record.
     SingleRoot,
     /// Root size is a multiple of 16; members are 32/64-bit scalars, 4-vectors, matrices
     /// with 4-wide rows, heap slots, TLAS addresses and pointers, each at its native
@@ -33,8 +34,9 @@ pub enum Lint {
     HeapTokens,
     /// `RayQuery` appears only in `orr_shaders.trace`.
     RayQuery,
-    /// `ReorderThread` and `HitObject` appear only in `orr_shaders.coherence`.
-    Reorder,
+    /// `TraceRay`, `CallShader`, `HitObject` and `ReorderThread` appear only in
+    /// `orr_shaders.pipeline`.
+    Pipeline,
     /// Cooperative-vector names appear only in `orr_shaders.coopvec`.
     CoopVec,
     /// Every 64-bit atomic is a max whose result is unused.
@@ -45,8 +47,8 @@ pub enum Lint {
     /// A struct is generated only by the crate whose shader root declares it; others map
     /// it with [`Build::extern_type`](super::Build::extern_type).
     Ownership,
-    /// A kernel with a raygen entry declares its root with `ORR_ROOT_INLINE`, whose kernels have
-    /// only compute and raygen entries and a root of at most
+    /// A kernel with a ray tracing entry declares its root, if any, with `ORR_ROOT_INLINE`, whose
+    /// kernels have only compute and ray tracing entries and a root of at most
     /// [`MAX_INLINE_ROOT_BYTES`](crate::abi::MAX_INLINE_ROOT_BYTES).
     InlineRoot,
     /// In builds with micromaps ([`Build::omm`](super::Build::omm)), every entry point of a
@@ -107,11 +109,11 @@ const TOKEN_RULES: &[TokenRule] = &[
         home: Some("trace"),
     },
     TokenRule {
-        lint: Lint::Reorder,
+        lint: Lint::Pipeline,
         exact: &["ReorderThread", "HitObject"],
         prefixes: &[],
-        calls: &[],
-        home: Some("coherence"),
+        calls: &["TraceRay", "CallShader"],
+        home: Some("pipeline"),
     },
     TokenRule {
         lint: Lint::CoopVec,
@@ -244,7 +246,7 @@ pub(super) fn model_lints(
     }
     if model.inline_root {
         for e in &model.entries {
-            if !matches!(e.stage, Stage::Compute | Stage::RayGen) {
+            if !(e.stage == Stage::Compute || e.stage.ray_tracing()) {
                 push(
                     Lint::InlineRoot,
                     format!(
@@ -254,12 +256,16 @@ pub(super) fn model_lints(
                 );
             }
         }
-    } else if let Some(e) = model.entries.iter().find(|e| e.stage == Stage::RayGen) {
+    } else if let Some(e) = model
+        .entries
+        .iter()
+        .find(|e| model.root.is_some() && e.stage.ray_tracing())
+    {
         push(
             Lint::InlineRoot,
             format!(
-                "raygen entry point {}: a ray-dispatch kernel declares its root with ORR_ROOT_INLINE",
-                e.name
+                "{:?} entry point {}: a kernel with ray tracing entries declares its root with ORR_ROOT_INLINE",
+                e.stage, e.name
             ),
         );
     }

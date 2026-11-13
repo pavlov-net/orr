@@ -7,6 +7,8 @@
 // restores a lane's live state whether or not it has work left, so finished lanes leave first.
 module coherence;
 
+import orr_shaders.pipeline;
+
 // The bits of a coherence key: hit or miss, the 2-bit cost class, then the linked surface id.
 // A build that links surfaces sets it to 3 plus the bit length of its highest surface id.
 public extern static const uint KEY_BITS = 3;
@@ -29,7 +31,7 @@ public struct Reorder : ICoherence
     [ForceInline]
     public static void point(uint key, uint bits)
     {
-        ReorderThread(key, bits);
+        reorder(key, bits);
     }
 }
 

@@ -120,7 +120,10 @@ impl Build {
             prefix: None,
             includes: Vec::new(),
             deps: Vec::new(),
-            externs: BTreeMap::new(),
+            externs: BTreeMap::from([(
+                "HitInputs".to_owned(),
+                "::orr_shaders::abi::HitInputs".to_owned(),
+            )]),
             debug_info: match env::var("ORR_SHADER_DEBUG_INFO").as_deref() {
                 Err(_) if env::var("DEBUG").is_ok_and(|d| d == "true") => DebugInfo::Lines,
                 Err(_) | Ok("off") => DebugInfo::Off,
@@ -920,7 +923,7 @@ pub(super) struct MetalLibs {
     pub(super) lib: Option<PathBuf>,
     /// The pixel entries'.
     pub(super) fragment: Option<PathBuf>,
-    /// Entry name to Metal function name, for every non-raygen entry.
+    /// Entry name to Metal function name, for every entry but the ray tracing ones.
     pub(super) names: BTreeMap<String, String>,
 }
 
@@ -1381,6 +1384,7 @@ pub(super) fn compile_kernel(
     } else {
         (program.spirv().map_err(compile_err)?, None)
     };
+    let words = spirv::mark_hit_object_records(words, debug.as_deref());
     let layout = program.layout().map_err(compile_err)?;
     let named = debug.as_deref().unwrap_or(&words);
     let mut model =
@@ -1439,7 +1443,7 @@ fn link_modules(
     Ok(out)
 }
 
-/// Loads `unit` once more into the Metal `session`, compiles its non-raygen entries to MSL
+/// Loads `unit` once more into the Metal `session`, compiles its non-ray-tracing entries to MSL
 /// and returns what the MSL check finds, with the Metal libraries when `settings.metal_sdk`
 /// asks for them and nothing was found. Writes the MSL beside `spv` as `.metal`, and the
 /// pixel entries apart as `.fragment.metal`: a fragment function that reads a global gets
@@ -1455,9 +1459,7 @@ pub(super) fn metal_issues(
         model
             .entries
             .iter()
-            .filter(|e| {
-                e.stage != crate::Stage::RayGen && (e.stage == crate::Stage::Pixel) == pixel
-            })
+            .filter(|e| !e.stage.ray_tracing() && (e.stage == crate::Stage::Pixel) == pixel)
             .map(|e| e.name.as_str())
             .collect()
     };
@@ -1469,7 +1471,7 @@ pub(super) fn metal_issues(
     if groups.is_empty() {
         return Ok((Vec::new(), MetalLibs::default()));
     }
-    let text = metal::without_raygen(unit.source);
+    let text = metal::without_ray_tracing(unit.source);
     let compiled = (|| {
         let mut sources = vec![(unit.path, text.as_ref())];
         sources.extend(
@@ -1555,8 +1557,9 @@ pub(super) fn no_omm_mode(entry: &str) -> String {
     )
 }
 
-/// The interface of a module's entry points: the root's layout, through pointees, and the
-/// specialization constants' ids and types. Names do not count.
+/// The interface of a module's entry points: the root's layout, through pointees, the
+/// specialization constants' ids and types, and each entry's shader record size. Names do not
+/// count.
 pub(super) fn interface_hash(model: &Model) -> u64 {
     fn walk(ty: &Ty, model: &Model, seen: &mut Vec<String>, out: &mut String) {
         match ty {
@@ -1595,6 +1598,9 @@ pub(super) fn interface_hash(model: &Model) -> u64 {
     }
     for s in &model.spec {
         text.push_str(&format!("|{}:{:?}", s.id, s.scalar));
+    }
+    for e in model.entries.iter().filter(|e| e.record_bytes > 0) {
+        text.push_str(&format!("|record {}", e.record_bytes));
     }
     hash64(text.as_bytes())
 }

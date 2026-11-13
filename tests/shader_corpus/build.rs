@@ -12,7 +12,7 @@ fn main() {
         b.kernels(&src)
             .allow(Lint::HeapTokens)
             .allow(Lint::RayQuery)
-            .allow(Lint::Reorder)
+            .allow(Lint::Pipeline)
             .allow(Lint::CoopVec)
             .allow(Lint::ImplicitPadding)
             .allow(Lint::RootLayout)

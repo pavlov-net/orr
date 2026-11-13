@@ -283,7 +283,7 @@ fn recompile(
             if !issues.is_empty() {
                 return Err(format!("{}: {}", module.name, issues.join("\n")));
             }
-            // Raygen entries have no Metal function in either.
+            // Ray tracing entries have no Metal function in either.
             let renamed = module.entry_points.iter().find(|e| {
                 let name = e.name.to_str().unwrap_or("");
                 libs.names

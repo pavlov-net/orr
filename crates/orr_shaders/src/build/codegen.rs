@@ -200,12 +200,13 @@ fn emit_module(out: &mut String, item: &str, k: &Kernel<'_>, manifest: &Path) {
     for e in &k.model.entries {
         let _ = writeln!(
             out,
-            "        ::orr_shaders::EntryPoint {{ name: c{:?}, spirv_name: c{:?}, metal_name: c{:?}, stage: ::orr_shaders::Stage::{:?}, workgroup: {:?}, interface: {:#018x} }},",
+            "        ::orr_shaders::EntryPoint {{ name: c{:?}, spirv_name: c{:?}, metal_name: c{:?}, stage: ::orr_shaders::Stage::{:?}, workgroup: {:?}, record_bytes: {}, interface: {:#018x} }},",
             e.name,
             entry_symbol(k.module, &e.name),
             k.metallib.names.get(&e.name).map_or_default(String::as_str),
             e.stage,
             e.workgroup,
+            e.record_bytes,
             k.interface
         );
     }

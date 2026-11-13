@@ -49,13 +49,17 @@ pub struct EntryPoint {
     pub spirv_name: &'static CStr,
     /// The entry's function in the module's Metal library: `spirv_name` with `_` for `.`, which
     /// Slang may rename further (with a `_0` suffix); empty without a library and for
-    /// ray-generation entries.
+    /// ray tracing entries.
     pub metal_name: &'static CStr,
     pub stage: Stage,
-    /// The workgroup size; `[1, 1, 1]` for ray-generation and pixel entries.
+    /// The workgroup size; `[1, 1, 1]` for ray tracing and pixel entries.
     pub workgroup: [u32; 3],
-    /// A hash of the root type's layout and the specialization constants. Two builds whose
-    /// hashes match can swap SPIR-V without rebuilding the Rust that fills the root.
+    /// The bytes of shader record data a ray tracing entry reads after its group handle: the
+    /// extent of the entry's `uniform` parameters. 0 for other entries.
+    pub record_bytes: u32,
+    /// A hash of the root type's layout, the specialization constants and the entries' record
+    /// sizes. Two builds whose hashes match can swap SPIR-V without rebuilding the Rust that
+    /// fills the root and the records.
     pub interface: u64,
 }
 
@@ -68,6 +72,26 @@ pub enum Stage {
     Mesh,
     Pixel,
     RayGen,
+    ClosestHit,
+    AnyHit,
+    Intersection,
+    Miss,
+    Callable,
+}
+
+impl Stage {
+    /// A stage of a ray tracing pipeline.
+    pub const fn ray_tracing(self) -> bool {
+        matches!(
+            self,
+            Self::RayGen
+                | Self::ClosestHit
+                | Self::AnyHit
+                | Self::Intersection
+                | Self::Miss
+                | Self::Callable
+        )
+    }
 }
 
 /// Which entry point runs of a kernel with a raygen and a compute entry over one body.

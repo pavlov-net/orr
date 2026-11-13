@@ -198,17 +198,28 @@ pub(super) fn msl_issues(msl: &str) -> Vec<String> {
     out
 }
 
-/// `source` with its `[shader("raygeneration")]` attributes blanked out, so a Metal session,
-/// which rejects raygen entries when it loads a module, sees those entries as plain
+/// The `[shader(...)]` stage names of ray tracing entries.
+const RAY_TRACING_STAGES: [&str; 6] = [
+    "\"raygeneration\"",
+    "\"closesthit\"",
+    "\"anyhit\"",
+    "\"intersection\"",
+    "\"miss\"",
+    "\"callable\"",
+];
+
+/// `source` with the `[shader(...)]` attributes of its ray tracing entries blanked out, so a
+/// Metal session, which rejects those entries when it loads a module, sees them as plain
 /// functions. Line and column numbers stay the same.
-pub(super) fn without_raygen(source: &str) -> String {
+pub(super) fn without_ray_tracing(source: &str) -> String {
     let mut out = source.to_owned();
     let mut from = 0;
     while let Some(i) = out[from..].find("[shader(").map(|i| i + from) {
         let rest = &out[i + "[shader(".len()..];
         let trimmed = rest.trim_start();
-        let after_stage = trimmed
-            .strip_prefix("\"raygeneration\"")
+        let after_stage = RAY_TRACING_STAGES
+            .iter()
+            .find_map(|stage| trimmed.strip_prefix(stage))
             .map(str::trim_start)
             .and_then(|r| r.strip_prefix(")]"));
         match after_stage {
@@ -498,15 +509,18 @@ struct Other_0
     }
 
     #[test]
-    fn raygen_attributes_blank_out_in_place() {
+    fn ray_tracing_attributes_blank_out_in_place() {
         let src = "[shader(\"compute\")]
 void a() {}
 [shader( \"raygeneration\" )]
 void b() {}
+[shader(\"closesthit\")]
+void c() {}
 ";
-        let out = without_raygen(src);
+        let out = without_ray_tracing(src);
         assert_eq!(out.len(), src.len());
         assert!(out.contains("[shader(\"compute\")]") && !out.contains("raygeneration"));
+        assert!(!out.contains("closesthit"));
         assert_eq!(out.lines().nth(3), Some("void b() {}"));
     }
 }
