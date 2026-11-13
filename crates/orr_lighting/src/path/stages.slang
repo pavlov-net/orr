@@ -2321,9 +2321,13 @@ bool shade_vertex<S : ISurfaces, M : IMedium, let X : uint>(PathRoot r, PathFixe
 // a ray or a shadow ray to trace, else to the finish stage.
 void leave_shade(PathRoot r, uint slot, PathFixed f, inout PathLoop p, ShadeState c, bool alive, bool shadow, uint next)
 {
-    PathStages* st = r.stages;
-    set_flag(p.flags, LOOP_SHADOW, shadow);
-    set_flag(p.flags, LOOP_ENDED, !alive);
+    store_shade(r, slot, c, alive, shadow);
+    leave_loop(r, slot, f, p, alive, shadow, next);
+}
+
+// The part of `leave_shade` that stores the path's state but its loop.
+void store_shade(PathRoot r, uint slot, ShadeState c, bool alive, bool shadow)
+{
     if (alive)
     {
         store_ray(r, slot, c.ray);
@@ -2334,6 +2338,14 @@ void leave_shade(PathRoot r, uint slot, PathFixed f, inout PathLoop p, ShadeStat
     if (alive || shadow)
         store_interior(r, slot, c.interior);
     store_spectral(r, slot, c.spectral);
+}
+
+// The rest of `leave_shade`, once `store_shade` has run: the loop, and the path's next stage or
+// its end.
+void leave_loop(PathRoot r, uint slot, PathFixed f, inout PathLoop p, bool alive, bool shadow, uint next)
+{
+    set_flag(p.flags, LOOP_SHADOW, shadow);
+    set_flag(p.flags, LOOP_ENDED, !alive);
     if (!alive && !shadow)
     {
         finish_path(r, slot, f, p);
@@ -2437,17 +2449,10 @@ void shade_slot<S : ISurfaces, M : IMedium, let K : uint>(PathRoot r, uint slot,
     // A walk takes the place of the vertex's ray, and its stage resolves the vertex again from
     // the hit the span holds: the vertex's shadow ray, which would take the span, is traced
     // here, as one that `ShadeNee.here` names is.
-    if (nee.traced && (nee.here || walks))
-    {
-        StackLight stack;
-        float3 vis = shadow_trace<S, M>(r, nee.q, stack);
-        float scatter_pdf;
-        float3 e = nee_bent(nee.d, nee.scatter, vis, stack, nee.keep, nee.chain, scatter_pdf);
-        float mis = nee.weight_one ? 1.0 : mis_balance(nee.run * nee.d.chosen.pdf, scatter_pdf);
-        float3 added = nee.throughput * (e * emitter_view<CoverageFeedback<S>>(r, nee.d.chosen, nee.exterior_ior, vis) * (nee.d.W * mis / nee.run));
-        shadow_add(nee.q, nee.spectral.color(added), p, record);
-        nee.traced = false;
-    }
+    bool here = nee.traced && (nee.here || walks);
+    bool deferred = nee.traced && !here;
+    // The path's state but its loop is stored before a shadow ray traced here, which then holds
+    // the ray and what weighs its light alone.
     if (walks)
     {
         reached.wi = wi;
@@ -2456,15 +2461,32 @@ void shade_slot<S : ISurfaces, M : IMedium, let K : uint>(PathRoot r, uint slot,
         // has stored for a vertex the primary stage shades. The walk's exit leaves the next ray.
         store_interior(r, slot, c.interior);
         store_stack(r, slot, c.stack);
-        set_flag(p.flags, LOOP_SHADOW, false);
         store_spectral(r, slot, c.spectral);
+    }
+    else
+    {
+        if (deferred)
+            store_shadow(r, slot, nee.q);
+        store_shade(r, slot, c, alive, deferred);
+    }
+    if (here)
+    {
+        StackLight stack;
+        float3 vis = shadow_trace<S, M>(r, nee.q, stack);
+        float scatter_pdf;
+        float3 e = nee_bent(nee.d, nee.scatter, vis, stack, nee.keep, nee.chain, scatter_pdf);
+        float mis = nee.weight_one ? 1.0 : mis_balance(nee.run * nee.d.chosen.pdf, scatter_pdf);
+        float3 added = nee.throughput * (e * emitter_view<CoverageFeedback<S>>(r, nee.d.chosen, nee.exterior_ior, vis) * (nee.d.W * mis / nee.run));
+        shadow_add(nee.q, nee.spectral.color(added), p, record);
+    }
+    if (walks)
+    {
+        set_flag(p.flags, LOOP_SHADOW, false);
         store_loop(r, slot, p);
         append(r, QUEUE_WALK, round_now(r), slot);
         return;
     }
-    if (nee.traced)
-        store_shadow(r, slot, nee.q);
-    leave_shade(r, slot, f, p, c, alive, nee.traced, next);
+    leave_loop(r, slot, f, p, alive, deferred, next);
 }
 
 // The walk stage: the subsurface walk an opaque vertex started, its exit vertex and that

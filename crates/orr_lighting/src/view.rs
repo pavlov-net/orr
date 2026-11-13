@@ -1299,8 +1299,8 @@ fn path_features(features: SceneFeatures, lighting: &ViewLighting) -> u32 {
     let bounded = features.contains(SceneFeatures::INTERIORS);
     // The eye's interior is one whatever the materials say.
     let interiors = bounded || lighting.camera_medium.is_some();
-    // A stack face bounds an interior, and a stack bends directional lights alone.
-    let stack = bounded && features.contains(SceneFeatures::DIRECTIONAL_LIGHTS);
+    // A stack bends directional lights alone.
+    let stack = features.contains(SceneFeatures::PLANE_STACKS | SceneFeatures::DIRECTIONAL_LIGHTS);
     // The walk stage runs a subsurface walk an opaque vertex starts; an interior's walk is the
     // trace stage's.
     let walk =

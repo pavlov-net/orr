@@ -1629,6 +1629,15 @@ impl Core {
         if work.caster_copies > 0 || (traced && self.materials.casts()) {
             features |= SceneFeatures::CASTERS;
         }
+        // The light set counts a stack entry for a caster section or a producer entry that can
+        // show a stack face, the entries of producers replaced this frame among them, which
+        // PRODUCERS holds too.
+        let producers = features.contains(SceneFeatures::PRODUCERS);
+        // Decal bins a changed list remakes in this frame's update count once it has run.
+        let decals = !cpu.decals_changed && (cpu.decal_globals > 0 || cpu.decal_bin_slots > 0);
+        if self.materials.stack_faces() && (work.caster_copies > 0 || producers) && !decals {
+            features |= SceneFeatures::PLANE_STACKS;
+        }
         let opaque_producer = self.materials.any_casts(
             cpu.producers
                 .iter()

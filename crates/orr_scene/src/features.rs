@@ -3,14 +3,20 @@
 use std::collections::HashMap;
 use std::ops::{BitOr, BitOrAssign};
 
+use orr_gpu::TextureIndex;
+
 use crate::MaterialGpu;
 use crate::material::{TILED, material_flags as f};
+
+/// `bsdf.slang`'s MIRROR_ROUGHNESS: the specular roughness below which a smooth surface is an
+/// ideal mirror and window.
+const MIRROR_ROUGHNESS: f32 = 0.01;
 
 /// What a scene may hold in a frame. A bit is set wherever the scene cannot rule its feature
 /// out: from the records in the material table, which every scene shares, and from what the
 /// scene itself holds. A kernel compiled without a feature runs only while its bit is clear.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct SceneFeatures(pub u32);
+pub struct SceneFeatures(pub u64);
 
 impl SceneFeatures {
     pub const NONE: Self = Self(0);
@@ -90,6 +96,14 @@ impl SceneFeatures {
     /// A record has the caster flag, which with a producer entry that rays trace makes
     /// [`Self::CASTERS`].
     const CASTING: Self = Self(1 << 28);
+    /// A plane stack face may bend a directional light's ray: a record could be one, a copy
+    /// holds a caster entry or the scene a producer entry, either of which can show it
+    /// (`tiles.slang`'s `stack_entry`), and the scene lists no decal, which any face may show
+    /// (`shadow.slang`'s `stack_material`).
+    pub const PLANE_STACKS: Self = Self(1 << 31);
+    /// A record could be a plane stack face, which with a caster or producer entry makes
+    /// [`Self::PLANE_STACKS`].
+    const STACK_FACES: Self = Self(1 << 32);
     /// What a mesh keeps from the material it was built with, whatever the record holds now:
     /// once a record has shown one of these, the table keeps it.
     const BUILT: Self = Self(Self::LAYERS.0 | Self::COVERAGE.0);
@@ -166,6 +180,7 @@ impl SceneFeatures {
                 m.flags & (f::DIELECTRIC | f::THIN_WALLED) == f::DIELECTRIC | f::THIN_WALLED,
                 Self::THIN_DIELECTRICS,
             ),
+            (stack_material(m), Self::STACK_FACES),
         ] {
             if on {
                 out |= bit;
@@ -173,6 +188,31 @@ impl SceneFeatures {
         }
         out
     }
+}
+
+/// Whether record `m` could be a plane stack face: what `shadow.slang`'s `stack_material` asks
+/// of a record, a solid dielectric of one BSDF at every point that transmits and is an ideal
+/// mirror and window. The shader squares the roughness in f32 and compares it with a square
+/// it folds itself, so the bound here takes a part in 10^4 more, which no rounding of either
+/// reaches.
+fn stack_material(m: &MaterialGpu) -> bool {
+    let varies = f::THIN_WALLED
+        | f::VERTEX
+        | f::MORE_TEXTURES
+        | f::ANISOTROPY
+        | f::HAS_BACK
+        | f::DISPLACED
+        | f::MEDIUM_TEXTURED;
+    let r = m.specular_roughness;
+    m.surface == 0
+        && m.flags & varies == 0
+        && m.flags & f::DIELECTRIC != 0
+        && m.coat_weight == 0.0
+        && m.fuzz_weight == 0.0
+        && m.thin_film_weight == 0.0
+        && m.textures.iter().all(|&t| t == TextureIndex::NONE)
+        && (1.0 - m.metalness) * m.transmission_weight > 0.0
+        && r * r < MIRROR_ROUGHNESS * MIRROR_ROUGHNESS * 1.0001
 }
 
 impl BitOr for SceneFeatures {
@@ -189,14 +229,23 @@ impl BitOrAssign for SceneFeatures {
 }
 
 /// The features of each record of the material table, and how many records hold each.
-#[derive(Default)]
 pub(crate) struct MaterialFeatures {
-    held: HashMap<u32, u32>,
-    counts: [u32; 32],
+    held: HashMap<u32, u64>,
+    counts: [u32; 64],
     /// The [`SceneFeatures::BUILT`] features any record has held, and
     /// [`SceneFeatures::THIN_DIELECTRICS`] once a record that was a dielectric has been
     /// rewritten as one that is none.
-    built: u32,
+    built: u64,
+}
+
+impl Default for MaterialFeatures {
+    fn default() -> Self {
+        Self {
+            held: HashMap::new(),
+            counts: [0; 64],
+            built: 0,
+        }
+    }
 }
 
 impl MaterialFeatures {
@@ -218,7 +267,7 @@ impl MaterialFeatures {
     }
 
     /// Counts `features` for `id` in place of what it held, which it returns.
-    fn replace(&mut self, id: u32, features: SceneFeatures) -> u32 {
+    fn replace(&mut self, id: u32, features: SceneFeatures) -> u64 {
         let was = if features.0 == 0 {
             self.held.remove(&id)
         } else {
@@ -244,7 +293,13 @@ impl MaterialFeatures {
         if out & layered != 0 && out & emissive != 0 {
             out |= SceneFeatures::COATED_EMITTERS.0;
         }
-        SceneFeatures((out & !(layered | SceneFeatures::CASTING.0)) | self.built)
+        let private = layered | SceneFeatures::CASTING.0 | SceneFeatures::STACK_FACES.0;
+        SceneFeatures((out & !private) | self.built)
+    }
+
+    /// Whether any record could be a plane stack face.
+    pub(crate) fn stack_faces(&self) -> bool {
+        self.counts[SceneFeatures::STACK_FACES.0.trailing_zeros() as usize] > 0
     }
 
     /// Whether any record has the caster flag.

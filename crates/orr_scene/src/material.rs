@@ -370,6 +370,11 @@ impl MaterialTable {
         self.features.lock().unwrap().casts()
     }
 
+    /// Whether any material could be a plane stack face.
+    pub(crate) fn stack_faces(&self) -> bool {
+        self.features.lock().unwrap().stack_faces()
+    }
+
     /// Whether any of `ids` casts caustics.
     pub(crate) fn any_casts<'a>(&self, ids: impl IntoIterator<Item = &'a MaterialId>) -> bool {
         let features = self.features.lock().unwrap();

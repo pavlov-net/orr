@@ -5,8 +5,9 @@
 
 use lighting_suite::assert_clean;
 use lighting_suite::bed::{
-    Accumulated, Bed, EMITTER, GLASS_SPHERE, Item, MIRROR, Particle, Paths, SKY, SUN, Spec,
-    TINTED_SLAB, WHITE_FLOOR, WHITE_FLOOR_ALBEDO, fresnel, pixel_of, reference,
+    Accumulated, BLACK_SPHERE, Bed, EMITTER, FloorDecal, GLASS_SPHERE, Item, MIRROR, Particle,
+    Paths, SKY, SUN, Spec, TINTED_SLAB, WHITE_FLOOR, WHITE_FLOOR_ALBEDO, fresnel, pixel_of,
+    reference,
 };
 use lighting_suite::welch::{assert_mean, assert_same_mean};
 use orr_gpu::KernelSet;
@@ -116,6 +117,65 @@ fn a_slab_passes_the_sun_to_the_floor_by_fresnel_and_beer_law() {
             stats.overflows,
             stats.deposits
         );
+    }
+    assert_clean();
+}
+
+/// Pipelines compiled for what a scene may hold bend the sun through a plane stack: next-event
+/// estimation reaches the floor under the slab through it by the pipelines that hold everything,
+/// and by the scene's own alike. With a decal listed anywhere no face is a stack's, and both
+/// render the floor under the slab alike again.
+#[test]
+fn specialized_pipelines_bend_the_sun_through_a_plane_stack() {
+    let sun = SUN.direction_to_light.normalize();
+    let height = 1.0f32;
+    let spec = Spec {
+        copies: vec![
+            at(WHITE_FLOOR, Vec3::ZERO),
+            at(TINTED_SLAB, Vec3::new(0.0, height, 0.0)),
+        ],
+        lights: vec![Light::Directional(SUN)],
+        environment: None,
+        eye: Vec3::new(6.0, 4.0, 0.01),
+        target: Vec3::ZERO,
+        fov_y: 0.3,
+        focus: None,
+    };
+    let through_at = Vec3::new(0.4, height, 0.27);
+    let patch = pixel_of(&spec, through_at - sun * (through_at.y / sun.y));
+    let mut paths = paths(ViewLighting {
+        debug_view: LightingDebugView::NeeOnly,
+        max_bounces: 0,
+        ..ViewLighting::default()
+    });
+    let decal = FloorDecal {
+        material: BLACK_SPHERE,
+        center: Vec3::new(-3.0, 0.0, -3.0),
+        half_extent: Vec3::splat(0.3),
+    };
+    let mut render = |specialize, decals: &[FloorDecal]| {
+        paths.specialize = specialize;
+        let mut bed = Bed::with_features(spec.clone(), decals);
+        render_paths(&mut bed, &paths, 8, 1).around(patch, 4)
+    };
+    for decals in [&[][..], &[decal]] {
+        let general = render(false, decals);
+        assert!(
+            decals.is_empty() == (general[1] > 0.0),
+            "{} decals: {} under the slab",
+            decals.len(),
+            general[1]
+        );
+        let specialized = render(true, decals);
+        for c in 0..3 {
+            assert!(
+                (specialized[c] - general[c]).abs() <= 1e-3 * general[c],
+                "{} decals, channel {c}: the scene's own pipelines bring {} under the slab, the general ones {}",
+                decals.len(),
+                specialized[c],
+                general[c]
+            );
+        }
     }
     assert_clean();
 }
