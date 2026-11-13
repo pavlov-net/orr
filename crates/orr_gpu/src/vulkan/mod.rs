@@ -17,6 +17,7 @@ mod host_memory;
 mod interop;
 mod memory;
 mod mesh;
+#[cfg(feature = "nsight-perf")]
 mod perf;
 mod pipeline;
 mod queue;
@@ -48,6 +49,8 @@ pub use interop::{
 };
 pub use memory::{Allocation, DeviceArenas, HostArenas};
 pub use mesh::MeshPipeline;
+#[cfg(feature = "nsight-perf")]
+pub use perf::CounterSession;
 pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{HostTimeline, Queue};
 pub use ray::RayDispatchPipeline;

@@ -13,6 +13,8 @@ default = ["dlss"]
 dlss = ["orr/dlss"]
 # orr's `pcl-stats`: hdr-calibration reports PC latency to the NVIDIA overlay and FrameView.
 pcl-stats = ["orr/pcl-stats"]
+# orr's `nsight-perf`: bench adds per-pass Nsight Perf SDK counters to its report.
+nsight-perf = ["orr/nsight-perf"]
 
 [dependencies]
 orr.workspace = true

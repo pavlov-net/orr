@@ -38,9 +38,9 @@ pub struct DeviceDesc<'a> {
     /// without resizable BAR.
     pub force_staging: bool,
     /// Loads the Nsight Perf SDK and enables the extensions its range profiler needs, for
-    /// counter frames ([`crate::Caps::perf_counters`]). Builds without `NSIGHT_PERF_SDK`
-    /// ignore it. Vulkan only.
-    pub perf_counters: bool,
+    /// counter sessions ([`crate::Caps::perf_counters`]).
+    #[cfg(feature = "nsight-perf")]
+    pub perf_counters: Option<crate::CounterDesc<'a>>,
     /// Image heap slots for sampled and storage image views.
     pub image_heap_slots: u32,
     pub sampler_heap_slots: u32,
@@ -60,7 +60,8 @@ impl Default for DeviceDesc<'_> {
             pipeline_store: None,
             skip_extensions: &[],
             force_staging: false,
-            perf_counters: false,
+            #[cfg(feature = "nsight-perf")]
+            perf_counters: None,
             image_heap_slots: 262_144,
             sampler_heap_slots: 1024,
             max_partitions: None,

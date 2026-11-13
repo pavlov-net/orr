@@ -22,8 +22,9 @@
 //! `--sw-raster-px P`, `--lod0-only`, `--world-km K`, `--world-density N` (trees per km^2
 //! outside the tile), `--particles N`, `--stream-load`, `--no-chain`, `--extent WxH`,
 //! `--script NAME` (walk, turn, overview, flythrough, flyout), `--script-frames N` and
-//! `--counter-frame N` (the frame of the first script whose per-pass Nsight Perf SDK counters
-//! the run collects, when the device has `Caps::perf_counters`).
+//! `--counter-frame N` (with the `nsight-perf` feature: the frame of the first script whose
+//! per-pass Nsight Perf SDK counters the run collects, when the device has
+//! `Caps::perf_counters`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,9 +32,9 @@ use std::time::{Duration, Instant};
 
 use orr::orr_gpu::{
     Allocation, Blend, ColorAttachment, ColorLoad, ColorMask, ColorTarget, CompareOp,
-    CounterReport, DepthAttachment, DepthLoad, DepthTarget, Device, Format, GpuPtr, Hazards,
-    MemoryKind, MeshPipeline, MeshPipelineDesc, QueueKind, RasterState, Rendering, ShaderStage,
-    SpecData, Stages, Texture, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
+    DepthAttachment, DepthLoad, DepthTarget, Device, Format, GpuPtr, Hazards, MemoryKind,
+    MeshPipeline, MeshPipelineDesc, QueueKind, RasterState, Rendering, ShaderStage, SpecData,
+    Stages, Texture, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
 };
 use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::mesh::MeshInfo;
@@ -247,6 +248,7 @@ pub struct Settings {
     /// Frames per script; `None` runs the window's script until it closes.
     pub script_frames: Option<u64>,
     /// The frame of the first script that is replayed as a counter frame.
+    #[cfg(feature = "nsight-perf")]
     pub counter_frame: Option<u64>,
 }
 
@@ -280,6 +282,7 @@ impl Settings {
             extent: [1920, 1080],
             scripts: vec![Script::Walk],
             script_frames: None,
+            #[cfg(feature = "nsight-perf")]
             counter_frame: None,
         };
         let mut args = rest.iter();
@@ -344,6 +347,7 @@ impl Settings {
                 }
                 "--script" => s.scripts = vec![Script::parse(value())],
                 "--script-frames" => s.script_frames = Some(number(value()) as u64),
+                #[cfg(feature = "nsight-perf")]
                 "--counter-frame" => s.counter_frame = Some(number(value()) as u64),
                 _ => panic!("unknown argument {a}"),
             }
@@ -1528,8 +1532,13 @@ pub struct Run {
     /// Cook, mounts and scene setup, ms.
     pub load_ms: f64,
     pub memory: orr::orr_gpu::MemoryReport,
-    /// The counter frame's report, when one was asked for and the device collects counters.
-    pub counters: Option<CounterReport>,
+    /// The metrics of the counter frame and its passes, with their counters, when one was
+    /// asked for and the device collects counters.
+    #[cfg(feature = "nsight-perf")]
+    pub counters: Option<(
+        Vec<orr::orr_gpu::CounterMetric>,
+        Vec<orr::orr_gpu::PassResult>,
+    )>,
     /// The blade field's capacities and the bytes of its own lists, when the grass is one.
     pub blades: Option<(Capacity, u64)>,
     /// What ray reconstruction ran as in the last frame; `None` without it.
@@ -1615,9 +1624,16 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
     let mut clock = 0u64;
     let wall = Instant::now();
     let mut previous_t = 0.0f64;
+    #[cfg(feature = "nsight-perf")]
     let render_queue = gpu.queue(QueueKind::Render).expect("render queue");
+    #[cfg(feature = "nsight-perf")]
     let mut counter_frame = settings.counter_frame.filter(|_| gpu.caps().perf_counters);
-    let mut counters = None;
+    #[cfg(feature = "nsight-perf")]
+    let mut session = None;
+    // The frame whose counters completed with its metrics, and its passes once its figures
+    // are in.
+    #[cfg(feature = "nsight-perf")]
+    let (mut counted, mut counters) = (None, None);
     let mut reconstruction = None;
     let mut render_extent = [0; 2];
     for (si, &script) in settings.scripts.iter().enumerate() {
@@ -1625,10 +1641,14 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
         let final_script = si + 1 == settings.scripts.len();
         let mut i = 0;
         loop {
-            // The counter frame repeats frame `i` of the first script until its report is
+            // The counter frame repeats frame `i` of the first script until its counters are
             // complete; its replays are not samples.
+            #[cfg(feature = "nsight-perf")]
             let counting = si == 0 && counter_frame == Some(i);
-            let replay_previous_t = previous_t;
+            #[cfg(not(feature = "nsight-perf"))]
+            let counting = false;
+            #[cfg(feature = "nsight-perf")]
+            let (replay_previous_t, replay_clock) = (previous_t, clock);
             if frames_per_script.is_some_and(|n| i >= n) || closed {
                 break;
             }
@@ -1648,6 +1668,8 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                 &mut frame_ids,
                 &mut collected,
             );
+            #[cfg(feature = "nsight-perf")]
+            take_counters(&renderer, &mut counted, &mut counters);
             let t = if options.headless || frames_per_script.is_some() {
                 i as f64 / 60.0
             } else {
@@ -1665,13 +1687,30 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
             let previous = if i == 0 { t } else { previous_t };
             previous_t = t;
             let (eye, target) = script.camera(&scene.heights, t as f32);
-            let counting = counting
-                && render_queue
-                    .begin_counter_frame()
-                    .inspect_err(|e| log::warn!("no counter frame: {e}"))
-                    .is_ok();
+            #[cfg(feature = "nsight-perf")]
+            let counting = counting && {
+                if session.is_none() {
+                    session = render_queue
+                        .start_counters(orr::orr_gpu::DEFAULT_COUNTER_METRICS)
+                        .inspect_err(|e| log::warn!("no counter session: {e}"))
+                        .ok();
+                }
+                let begun = session.as_mut().is_some_and(|s| {
+                    s.begin_frame()
+                        .inspect_err(|e| log::warn!("no counter frame: {e}"))
+                        .is_ok()
+                });
+                if !begun {
+                    session = None;
+                    counter_frame = None;
+                }
+                begun
+            };
 
-            if let Some(source) = scene.stream_pack.as_ref()
+            // A counter frame's replays record the same passes, so none of them mounts or
+            // unmounts.
+            if !counting
+                && let Some(source) = scene.stream_pack.as_ref()
                 && clock.is_multiple_of(20)
             {
                 match scene.streaming.take() {
@@ -1814,15 +1853,23 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                 i += 1;
                 continue;
             }
-            match render_queue.end_counter_frame(point) {
-                Ok(None) => previous_t = replay_previous_t,
-                done => {
-                    counters = done
-                        .inspect_err(|e| log::warn!("no counter frame: {e}"))
-                        .ok()
-                        .flatten();
-                    counter_frame = None;
-                    i += 1;
+            #[cfg(feature = "nsight-perf")]
+            {
+                let s = session.as_mut().expect("a counting frame's session");
+                match s.end_frame() {
+                    Ok(orr::orr_gpu::CounterFrame::Replay) => {
+                        previous_t = replay_previous_t;
+                        clock = replay_clock;
+                    }
+                    done => {
+                        match done {
+                            Ok(_) => counted = Some((id, s.metrics().to_vec())),
+                            Err(e) => log::warn!("no counter frame: {e}"),
+                        }
+                        session = None;
+                        counter_frame = None;
+                        i += 1;
+                    }
                 }
             }
         }
@@ -1847,6 +1894,8 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
             &mut frame_ids,
             &mut collected,
         );
+        #[cfg(feature = "nsight-perf")]
+        take_counters(&renderer, &mut counted, &mut counters);
         clock += 1;
         let f = renderer
             .begin_frame(FrameDesc {
@@ -1872,6 +1921,8 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
         &mut frame_ids,
         &mut collected,
     );
+    #[cfg(feature = "nsight-perf")]
+    take_counters(&renderer, &mut counted, &mut counters);
     let capture = last
         .filter(|_| options.headless)
         .and_then(|(id, _)| renderer.screenshots(scene.history, id).pop())
@@ -1884,6 +1935,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
         terrain_patches: scene.terrain_patches(),
         load_ms,
         memory,
+        #[cfg(feature = "nsight-perf")]
         counters,
         blades: scene.blades.as_ref().map(|b| (b.capacity, b.bytes())),
         reconstruction,
@@ -1928,6 +1980,24 @@ fn take_sample(
             .as_ref()
             .map_or([0; FIELD_COUNTS], |b| b.counts(id)),
     });
+}
+
+/// The counter frame's metrics and passes, once `counted` is the frame whose figures the
+/// renderer reports.
+#[cfg(feature = "nsight-perf")]
+fn take_counters(
+    renderer: &Renderer,
+    counted: &mut Option<(u64, Vec<orr::orr_gpu::CounterMetric>)>,
+    counters: &mut Option<(
+        Vec<orr::orr_gpu::CounterMetric>,
+        Vec<orr::orr_gpu::PassResult>,
+    )>,
+) {
+    let stats = renderer.stats();
+    if counted.as_ref().is_some_and(|(id, _)| *id == stats.frame) {
+        let (_, metrics) = counted.take().unwrap();
+        *counters = Some((metrics, stats.gpu.clone()));
+    }
 }
 
 /// The samples of a script past its warm-up.

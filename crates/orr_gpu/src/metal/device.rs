@@ -367,7 +367,6 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
         cooperative_vector: Vec::new(),
         shader_float8: false,
         calibrated_timestamps: false,
-        perf_counters: false,
         frame_boundary: false,
         pipeline_executable_info: false,
         conservative_raster: false,

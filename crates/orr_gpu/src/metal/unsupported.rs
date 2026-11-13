@@ -11,10 +11,9 @@ use super::command::CommandList;
 use super::device::Device;
 use super::not_implemented;
 use super::pipeline::ShaderStage;
-use super::queue::Queue;
 use crate::{
-    CounterReport, DiagnosticsReport, Error, Generated, GpuAddress, MatrixConversion, MatrixFormat,
-    MeshPipelineDesc, TimelinePoint,
+    DiagnosticsReport, Error, Generated, GpuAddress, MatrixConversion, MatrixFormat,
+    MeshPipelineDesc,
 };
 
 /// What a device records for crash diagnosis. Metal records nothing yet, whatever the mode.
@@ -153,17 +152,6 @@ impl CommandList<'_> {
     pub fn convert_matrix(&mut self, c: &MatrixConversion, src: GpuAddress, dst: GpuAddress) {
         let _ = (c, src, dst);
         not_implemented("cooperative vectors")
-    }
-}
-
-impl Queue {
-    pub fn begin_counter_frame(&self) -> Result<(), Error> {
-        Err(Error::NotImplemented("counter frames"))
-    }
-
-    pub fn end_counter_frame(&self, last: TimelinePoint) -> Result<Option<CounterReport>, Error> {
-        let _ = last;
-        Err(Error::NotImplemented("counter frames"))
     }
 }
 

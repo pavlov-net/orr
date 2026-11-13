@@ -152,6 +152,12 @@ pub struct PassResult {
     /// Shader invocations; `None` unless the pass asked for statistics and the backend
     /// counts them (Metal does not).
     pub stats: Option<PipelineStats>,
+    /// Hardware counters, on the passes of a counter frame that completed its collection
+    /// ([`crate::CounterFrame::Complete`]) once
+    /// [`CounterSession::end_frame`](crate::CounterSession::end_frame) has returned: a read
+    /// before has `None`, as does every other pass.
+    #[cfg(feature = "nsight-perf")]
+    pub counters: Option<crate::PassCounters>,
 }
 
 /// Shader invocation counts of a pass.

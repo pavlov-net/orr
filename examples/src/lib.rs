@@ -2,6 +2,7 @@
 //! captures, and the examples' kernels.
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "nsight-perf")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, OnceLock};
@@ -56,11 +57,15 @@ pub mod linked_blades {
 #[cfg(dlss)]
 pub const PROJECT_ID: Uuid = Uuid::from_u128(0x5d1e_7a40_c2b9_4f86_9e3d_61a0_b8f2_47c5);
 
-/// Asks [`device`] for counter frames (`DeviceDesc::perf_counters`); call before its first use.
+/// Asks [`device`] for counter sessions (`DeviceDesc::perf_counters`), loading the Nsight Perf
+/// SDK's host library from the SDK `NVPERF_SDK_PATH` names when it is set, else by the system's
+/// library search; call before its first use.
+#[cfg(feature = "nsight-perf")]
 pub fn request_perf_counters() {
     PERF_COUNTERS.store(true, Ordering::Relaxed);
 }
 
+#[cfg(feature = "nsight-perf")]
 static PERF_COUNTERS: AtomicBool = AtomicBool::new(false);
 
 /// The most the examples' pipeline store keeps. A device loads the whole store at creation, at
@@ -112,6 +117,8 @@ pub fn device() -> &'static Device {
         let mut name = exe.file_stem().expect("the executable's name").to_owned();
         name.push(".cache");
         let cache = store.join(name);
+        #[cfg(feature = "nsight-perf")]
+        let perf_sdk = std::env::var_os("NVPERF_SDK_PATH").map(PathBuf::from);
         let desc = DeviceDesc {
             name: "orr-examples",
             pipeline_cache: Some(&cache),
@@ -124,7 +131,12 @@ pub fn device() -> &'static Device {
                 copy: true,
                 present: true,
             },
-            perf_counters: PERF_COUNTERS.load(Ordering::Relaxed),
+            #[cfg(feature = "nsight-perf")]
+            perf_counters: PERF_COUNTERS.load(Ordering::Relaxed).then_some(
+                orr::orr_gpu::CounterDesc {
+                    sdk: perf_sdk.as_deref(),
+                },
+            ),
             diagnostics: diagnostics(),
             ..DeviceDesc::default()
         };

@@ -16,9 +16,13 @@ dlss = ["orr_output/dlss"]
 hot-reload = ["orr_scene/hot-reload"]
 # PCL Stats for every display (orr_output's `pcl-stats`; needs the Reflex SDK at `REFLEX_SDK`).
 pcl-stats = ["orr_output/pcl-stats"]
+# orr_gpu's `nsight-perf`: per-pass hardware counters (needs the Nsight Perf SDK at
+# `NVPERF_SDK_PATH`).
+nsight-perf = ["orr_gpu/nsight-perf"]
 
 [dependencies]
 orr_scene.workspace = true
+orr_gpu.workspace = true
 orr_lighting.workspace = true
 orr_output.workspace = true
 orr_math.workspace = true

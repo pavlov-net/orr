@@ -2297,6 +2297,7 @@ name = "orr"
 version = "0.0.1"
 dependencies = [
  "log",
+ "orr_gpu",
  "orr_lighting",
  "orr_math",
  "orr_output",

@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# Runs the counters target, which needs the Nsight Perf SDK at `NVPERF_SDK_PATH`.
+nsight-perf = ["orr_gpu/nsight-perf"]
+
 [dependencies]
 orr_gpu.workspace = true
 orr_math.workspace = true
@@ -35,6 +39,10 @@ orr_shaders = { workspace = true, features = ["build"] }
 [[test]]
 name = "present"
 harness = false
+
+[[test]]
+name = "counters"
+required-features = ["nsight-perf"]
 
 [lints]
 workspace = true

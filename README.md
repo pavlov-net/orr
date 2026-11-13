@@ -128,6 +128,39 @@ kernels with them keep some locals in memory and are about a percent larger: a p
 build's numbers are close to a release build's but not identical. Release and profiling builds
 also leave out shader asserts.
 
+Per-pass hardware counters come from NVIDIA's Nsight Perf SDK, with orr_gpu's `nsight-perf`
+feature, off by default and Vulkan only. The build reads the SDK's headers from
+`NVPERF_SDK_PATH`. At run time the host library loads from the SDK a program names in
+`CounterDesc::sdk`, else from beside the program or the system's library path; the examples
+name `NVPERF_SDK_PATH`'s. `bench` then adds one frame's counters to its table and report:
+
+```sh
+cargo run --release -p orr_examples --features nsight-perf --example bench -- --headless
+```
+
+A program loads the SDK with `DeviceDesc::perf_counters`, opens a `CounterSession` for the
+metrics it wants with `Queue::start_counters`, and puts each frame it counts between the
+session's `begin_frame` and `end_frame`. Each pass's `PassResult::counters` then sits beside its
+time in `Device::pass_results` and `FrameStats::gpu`, one value per metric under the SDK's name
+and unit, `None` for a metric the GPU doesn't expose. `DEFAULT_COUNTER_METRICS` (pass time, SM
+activity and instruction issue, occupancy, L2 hit rate, DRAM and RT core throughput) fit in one
+frame on Blackwell GPUs, so every counted frame has its own counters. Metrics that don't fit
+together, such as the SDK's `sm__throughput`, take several frames (`CounterSession::replays`),
+each counting a part: the program renders the same frame again, the same passes from the same
+scene, view and settings, and holds still whatever state it carries from frame to frame
+(accumulation, history, animation, random sequences); otherwise each metric describes a
+slightly different frame.
+
+While it counts, the SDK drains the GPU before and after every pass. A counted frame's passes
+don't overlap, its pass times include the SDK's few microseconds of range work, and collecting
+costs the CPU a few milliseconds per frame; frames outside `begin_frame` and `end_frame` cost
+nothing more. Counters are the whole GPU's, other queues' and programs' work included. Pass
+timestamps can end before a pass's last workgroup finishes, so for a pass with a long tail the
+counted `gpu__time_duration` is the truer time. A pass of a few microseconds is mostly the
+SDK's range work, so its rates and percentages say little. For numbers that compare from run
+to run, keep the scene, camera, resolution, settings and frame the same, and lock the GPU's
+clocks as the SDK's guide describes under "Ensuring Stable Measurements".
+
 ## Contributing
 
 Install the pre-commit hook, which runs fmt, clippy and typos:

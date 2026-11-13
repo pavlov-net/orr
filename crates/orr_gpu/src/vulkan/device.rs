@@ -21,6 +21,7 @@ use super::heap::Heaps;
 use super::host_memory;
 use super::interop::ClassicBind;
 use super::memory::{MemoryTypes, Pools, Range, buffer_usage, sharing};
+#[cfg(feature = "nsight-perf")]
 use super::perf::{self, Perf};
 use super::queue::{Calibration, Queue, Timeline};
 use super::ray::RecordBlock;
@@ -109,6 +110,7 @@ pub(crate) struct Shared {
     pub(super) sparse_binding: Mutex<()>,
     pub(super) results: Mutex<VecDeque<(TimelinePoint, Vec<PassResult>)>>,
     /// With `Caps::perf_counters`.
+    #[cfg(feature = "nsight-perf")]
     pub(super) perf: Option<Perf>,
     pub(super) calibration: Mutex<Option<Calibration>>,
     pub(super) checkpoint_fn: Option<ash::nv::device_diagnostic_checkpoints::Device>,
@@ -159,6 +161,7 @@ impl Drop for Shared {
         // and is destroyed once.
         unsafe {
             let _ = self.device.device_wait_idle();
+            #[cfg(feature = "nsight-perf")]
             if let Some(p) = self.perf.take() {
                 p.shut_down();
             }
@@ -311,10 +314,15 @@ impl Device {
         // SAFETY: loading the system Vulkan loader.
         let entry = unsafe { ash::Entry::load() }.map_err(|e| Error::Loader(e.to_string()))?;
         let messages = Box::<MessageCount>::default();
-        let (perf_library, perf_instance) = perf::Library::load(desc.perf_counters, &entry).unzip();
+        #[cfg(feature = "nsight-perf")]
+        let (perf_library, perf_instance) = desc
+            .perf_counters
+            .and_then(|c| perf::Library::load(&c, &entry))
+            .unzip();
         let instance = create_instance(
             &entry,
             desc,
+            #[cfg(feature = "nsight-perf")]
             perf_instance.as_deref().unwrap_or_default(),
             &messages,
         )?;
@@ -351,6 +359,7 @@ impl Device {
                 return Err(e);
             }
         };
+        #[cfg(feature = "nsight-perf")]
         let (perf_library, perf_device) = perf_library
             .and_then(|l| l.device_extensions(&entry, &instance, physical, |e| selection.offers(e)))
             .unzip();
@@ -359,6 +368,7 @@ impl Device {
             physical,
             desc,
             selection,
+            #[cfg(feature = "nsight-perf")]
             perf_device.as_deref().unwrap_or_default(),
         );
         let (device, plans, optional, extensions) = match created {
@@ -466,6 +476,7 @@ impl Device {
             }
         };
 
+        #[cfg(feature = "nsight-perf")]
         let perf = perf_library.and_then(|l| Perf::new(l, &entry, &instance, physical, &device));
         let p = &heap_props;
         let caps = Caps {
@@ -506,6 +517,7 @@ impl Device {
             cooperative_vector: coop,
             shader_float8: optional.shader_float8,
             calibrated_timestamps: optional.calibrated_timestamps,
+            #[cfg(feature = "nsight-perf")]
             perf_counters: perf.is_some(),
             frame_boundary: optional.frame_boundary,
             pipeline_executable_info: optional.executable_info,
@@ -734,6 +746,7 @@ impl Device {
             lists: Mutex::default(),
             sparse_binding: Mutex::default(),
             results: Mutex::default(),
+            #[cfg(feature = "nsight-perf")]
             perf,
             calibration: Mutex::default(),
             checkpoint_fn: optional
@@ -886,7 +899,7 @@ impl Device {
 fn create_instance(
     entry: &ash::Entry,
     desc: &DeviceDesc<'_>,
-    perf_extensions: &[CString],
+    #[cfg(feature = "nsight-perf")] perf_extensions: &[CString],
     messages: &MessageCount,
 ) -> Result<ash::Instance, Error> {
     // SAFETY: plain query.
@@ -916,11 +929,12 @@ fn create_instance(
             ext_names.push(name.as_ptr());
         }
     }
-    let mut hooked = desc
+    let hooked = desc
         .hooks
         .map(|h| h.instance_extensions(entry))
         .unwrap_or_default();
-    hooked.extend_from_slice(perf_extensions);
+    #[cfg(feature = "nsight-perf")]
+    let hooked = [hooked, perf_extensions.to_vec()].concat();
     for name in &hooked {
         if !exts
             .iter()
@@ -1007,7 +1021,7 @@ fn create_device(
     physical: vk::PhysicalDevice,
     desc: &DeviceDesc<'_>,
     mut selection: Selection,
-    perf_extensions: &[CString],
+    #[cfg(feature = "nsight-perf")] perf_extensions: &[CString],
 ) -> Result<
     (
         ash::Device,
@@ -1036,6 +1050,7 @@ fn create_device(
         })
         .collect();
     let mut extensions: Vec<CString> = selection.extensions.iter().map(|&n| n.to_owned()).collect();
+    #[cfg(feature = "nsight-perf")]
     for ext in perf_extensions {
         if !extensions.contains(ext) {
             extensions.push(ext.clone());

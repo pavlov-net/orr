@@ -35,8 +35,9 @@ pub(super) struct PassRecord {
     pub(super) id: u32,
     pub(super) name: &'static str,
     pub(super) stats: bool,
-    /// The pass opened a counter-frame range.
-    range: bool,
+    /// The pass's counters, when it was recorded in a counter frame.
+    #[cfg(feature = "nsight-perf")]
+    pub(super) counters: Option<super::perf::Counted>,
 }
 
 /// What a finished list hands to its submit.
@@ -956,8 +957,7 @@ impl<'q> CommandList<'q> {
 
     /// Opens a named pass: a debug label and GPU timestamps, and with `stats` shader
     /// invocation counts. Passes do not nest; [`crate::Device::pass_results`] reads them.
-    /// Inside a counter frame on this list's queue ([`crate::Queue::begin_counter_frame`])
-    /// the pass is also a counter range.
+    /// Inside a counter frame on this list's queue the pass is also a counter range.
     /// With `Caps::breadcrumbs` and `Caps::checkpoints` the pass's begin and end are also
     /// marked for [`crate::Device::diagnostics_report`] and crash dumps.
     pub fn begin_pass(&mut self, name: &'static str, stats: bool) {
@@ -989,17 +989,19 @@ impl<'q> CommandList<'q> {
             }
         }
         let stats = stats.is_some();
-        let range = self
+        #[cfg(feature = "nsight-perf")]
+        let counters = self
             .queue
             .shared
             .perf
             .as_ref()
-            .is_some_and(|p| p.push_range(self.queue.kind, cmd, &label));
+            .and_then(|p| p.push_range(self.queue.kind, cmd, name));
         self.passes.push(PassRecord {
             id,
             name,
             stats,
-            range,
+            #[cfg(feature = "nsight-perf")]
+            counters,
         });
         self.open = true;
     }
@@ -1025,7 +1027,8 @@ impl<'q> CommandList<'q> {
                 d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, pool, query);
             }
             let pass = &self.passes[index as usize];
-            if pass.range
+            #[cfg(feature = "nsight-perf")]
+            if pass.counters.as_ref().is_some_and(|c| c.ranged)
                 && let Some(p) = &self.queue.shared.perf
             {
                 p.pop_range(cmd);

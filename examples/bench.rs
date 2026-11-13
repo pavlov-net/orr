@@ -1,10 +1,10 @@
 //! The dense vegetation test scene's camera scripts with per-pass timings: renders each
 //! script, prints the median and 90th percentile GPU time of every pass and the render
 //! thread's time per step, and writes every figure the frames report to
-//! `target/orr-reports/dense_vegetation-<git rev>.json`. On a device with
-//! `Caps::perf_counters` (orr_gpu built with `NSIGHT_PERF_SDK`) it also collects per-pass
-//! Nsight Perf SDK counters for one frame of the first script (the middle one unless
-//! `--counter-frame N` says) and adds them to the report.
+//! `target/orr-reports/dense_vegetation-<git rev>.json`. Built with the `nsight-perf` feature,
+//! on a device with `Caps::perf_counters`, it also collects per-pass Nsight Perf SDK counters
+//! for one frame of the first script (the middle one unless `--counter-frame N` says), prints
+//! them as a table and adds them to the report.
 //!
 //! `bench [--synthetic] [--script NAME] [--script-frames N] [--headless] [scene switches...]`
 //! (see `orr_examples::vegetation`). It runs all four scripts for 600 frames each unless told
@@ -14,15 +14,20 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use orr::orr_gpu::{COUNTER_METRICS, CounterReport, MemoryKind};
+use orr::orr_gpu::MemoryKind;
+#[cfg(feature = "nsight-perf")]
+use orr::orr_gpu::{CounterMetric, PassCounters, PassResult};
 use orr::{FrameStats, LightingStats};
+#[cfg(feature = "nsight-perf")]
+use orr_examples::request_perf_counters;
 use orr_examples::vegetation::{Run, Sample, Script, Settings, run, settled};
-use orr_examples::{Options, assert_clean, device, git_rev, report_dir, request_perf_counters};
+use orr_examples::{Options, assert_clean, device, git_rev, report_dir};
 use serde_json::{Map, Value, json};
 
 const SCRIPT_FRAMES: u64 = 600;
 
 fn main() {
+    #[cfg(feature = "nsight-perf")]
     request_perf_counters();
     let options = Options::from_args();
     let mut settings = Settings::parse(&options.rest);
@@ -30,18 +35,22 @@ fn main() {
         settings.scripts = Script::ALL.to_vec();
     }
     settings.script_frames = settings.script_frames.or(Some(SCRIPT_FRAMES));
-    let frames = options
-        .frames
-        .or(settings.script_frames)
-        .unwrap_or(SCRIPT_FRAMES);
-    settings.counter_frame = settings.counter_frame.or(Some(frames / 2));
+    #[cfg(feature = "nsight-perf")]
+    {
+        let frames = options
+            .frames
+            .or(settings.script_frames)
+            .unwrap_or(SCRIPT_FRAMES);
+        settings.counter_frame = settings.counter_frame.or(Some(frames / 2));
+    }
     let r = run(&options, &settings);
     for (script, samples) in &r.scripts {
         print_script(*script, settled(samples));
     }
+    #[cfg(feature = "nsight-perf")]
     match &r.counters {
-        Some(c) => print_counters(c),
-        None => println!("\nno counter report: the device collects no counters"),
+        Some((metrics, passes)) => print_counters(metrics, passes),
+        None => println!("\nno counters: the log says why"),
     }
     let path = write_report(&settings, &r);
     println!("\nwrote {}", path.display());
@@ -121,40 +130,71 @@ fn print_script(script: Script, samples: &[Sample]) {
     }
 }
 
-fn print_counters(c: &CounterReport) {
-    println!("\ncounters ({}), one row per pass:", c.chip);
-    print!("{:>36}", "pass");
-    for (i, _) in COUNTER_METRICS.iter().enumerate() {
+/// The counter frame's passes, one row each: GPU ms and each metric's value, `-` for a metric
+/// the device doesn't expose, then the metrics by column.
+#[cfg(feature = "nsight-perf")]
+fn print_counters(metrics: &[CounterMetric], passes: &[PassResult]) {
+    println!("\ncounters, one row per pass:");
+    print!("{:>36} {:>9}", "pass", "gpu ms");
+    for i in 0..metrics.len() {
         print!(" {:>9}", format!("[{i}]"));
     }
     println!();
-    for r in &c.ranges {
-        print!("{:>36}", r.name);
-        for v in &r.values {
-            print!(" {v:>9.3}");
+    for p in passes {
+        print!("{:>36} {:>9.3}", p.name, p.gpu_ms);
+        match &p.counters {
+            Some(PassCounters::Values(values)) => {
+                for v in values {
+                    match v {
+                        Some(v) => print!(" {v:>9.3}"),
+                        None => print!(" {:>9}", "-"),
+                    }
+                }
+            }
+            Some(PassCounters::Dropped) => print!(" dropped"),
+            None => print!(" none"),
         }
         println!();
     }
-    for (i, m) in COUNTER_METRICS.iter().enumerate() {
-        println!("  [{i}] {m}");
+    for (i, m) in metrics.iter().enumerate() {
+        let unit = if m.available {
+            m.unit.as_str()
+        } else {
+            "not available"
+        };
+        println!("  [{i}] {} ({unit})", m.name);
     }
 }
 
-/// The counter frame's rows, one per pass, with each metric by name.
-fn counter_report(c: &CounterReport) -> Value {
-    let rows: Vec<Value> = c
-        .ranges
+/// The counter frame's metrics and its passes, one row each with every metric by name; a
+/// metric the device doesn't expose is `null`, and a pass whose range the SDK dropped says so.
+#[cfg(feature = "nsight-perf")]
+fn counter_report(metrics: &[CounterMetric], passes: &[PassResult]) -> Value {
+    let rows: Vec<Value> = passes
         .iter()
-        .map(|r| {
+        .map(|p| {
             let mut row = Map::new();
-            row.insert("pass".into(), r.name.clone().into());
-            for (m, v) in COUNTER_METRICS.iter().zip(&r.values) {
-                row.insert((*m).into(), (*v).into());
+            row.insert("pass".into(), p.name.into());
+            row.insert("gpu_ms".into(), p.gpu_ms.into());
+            match &p.counters {
+                Some(PassCounters::Values(values)) => {
+                    for (m, v) in metrics.iter().zip(values) {
+                        row.insert(m.name.clone(), (*v).into());
+                    }
+                }
+                Some(PassCounters::Dropped) => {
+                    row.insert("dropped".into(), true.into());
+                }
+                None => {}
             }
             Value::Object(row)
         })
         .collect();
-    json!({ "chip": c.chip, "passes": rows })
+    let metrics: Vec<Value> = metrics
+        .iter()
+        .map(|m| json!({ "name": m.name, "unit": m.unit, "available": m.available }))
+        .collect();
+    json!({ "metrics": metrics, "passes": rows })
 }
 
 /// Median, 90th percentile and maximum of `v`.
@@ -314,8 +354,18 @@ fn write_report(settings: &Settings, r: &Run) -> PathBuf {
         "load_ms": r.load_ms,
         "memory": memory,
         "scripts": scripts,
-        "counters": r.counters.as_ref().map(counter_report),
     });
+    #[cfg(feature = "nsight-perf")]
+    let report = {
+        let mut report = report;
+        report["counters"] = r
+            .counters
+            .as_ref()
+            .map_or(Value::Null, |(metrics, passes)| {
+                counter_report(metrics, passes)
+            });
+        report
+    };
     let path = report_dir().join(format!("dense_vegetation-{rev}.json"));
     let text = serde_json::to_string_pretty(&report).expect("report")
         + "

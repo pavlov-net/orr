@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 links = "orr_gpu"
 
+[features]
+# Per-pass hardware counters through NVIDIA's Nsight Perf SDK, whose headers the build reads
+# from `NVPERF_SDK_PATH`. Vulkan only: Apple targets refuse it.
+nsight-perf = ["dep:bindgen"]
+
 [dependencies]
 orr_shaders.workspace = true
 orr_memory.workspace = true
@@ -38,7 +43,7 @@ dispatch2.workspace = true
 
 [build-dependencies]
 orr_shaders = { workspace = true, features = ["build"] }
-bindgen.workspace = true
+bindgen = { workspace = true, optional = true }
 
 [lints]
 workspace = true

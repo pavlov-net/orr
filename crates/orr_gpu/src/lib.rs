@@ -19,6 +19,7 @@ mod cache_file;
 mod caps;
 mod command;
 mod coopvec;
+#[cfg(feature = "nsight-perf")]
 mod counters;
 mod device;
 mod diagnostics;
@@ -32,6 +33,9 @@ mod raster;
 pub mod rtas;
 mod sync;
 mod texture;
+
+#[cfg(all(feature = "nsight-perf", target_vendor = "apple"))]
+compile_error!("the nsight-perf feature needs the Vulkan backend; Apple targets have none");
 
 #[cfg(target_vendor = "apple")]
 mod metal;
@@ -60,7 +64,11 @@ pub use cache_file::PipelineCacheReport;
 pub use caps::{Caps, ComponentType, CooperativeVectorCombination, Limits};
 pub use command::{DecompressRegion, DispatchArgs, MemoryCopy, MeshArgs, TextureCopy};
 pub use coopvec::{MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout};
-pub use counters::{COUNTER_METRICS, CounterRange, CounterReport};
+#[cfg(feature = "nsight-perf")]
+pub use counters::{
+    CounterDesc, CounterFrame, CounterMetric, DEFAULT_COUNTER_METRICS, MAX_COUNTER_PASSES,
+    PassCounters,
+};
 pub use device::{DeviceDesc, trim_pipeline_store};
 pub use diagnostics::{
     Checkpoint, DeviceFault, DiagnosticsReport, FaultAccess, FaultAddress, QueueProgress,
@@ -98,6 +106,8 @@ pub use texture::{
     AddressMode, CompareOp, Filter, PageBind, SamplerDesc, SparseLayout, TextureDesc, TextureKind,
     TextureLayers, TextureMemory, TextureRegion, TextureUsage, TileBind, ViewDesc, ViewKind,
 };
+#[cfg(all(feature = "nsight-perf", not(target_vendor = "apple")))]
+pub use vulkan::CounterSession;
 
 #[cfg(target_vendor = "apple")]
 pub use metal::{

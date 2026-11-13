@@ -183,15 +183,24 @@ impl Queue {
         }
     }
 
+    #[cfg(feature = "nsight-perf")]
     pub(super) fn kind(&self) -> QueueKind {
         self.kind
     }
 
+    #[cfg(feature = "nsight-perf")]
     pub(super) fn raw(&self) -> vk::Queue {
         self.raw
     }
 
+    /// The point everything submitted to this queue so far signals.
+    #[cfg(feature = "nsight-perf")]
+    pub(super) fn submitted_point(&self) -> TimelinePoint {
+        self.point(self.timeline().submitted.load(Ordering::Acquire))
+    }
+
     /// Held around every call that uses the raw queue.
+    #[cfg(feature = "nsight-perf")]
     pub(super) fn lock_submits(&self) -> std::sync::MutexGuard<'_, bool> {
         self.submit_lock.lock().unwrap()
     }
@@ -262,6 +271,20 @@ impl Queue {
         let completed = self.completed();
         let reused = {
             let mut pools = self.pools.lock().unwrap();
+            // A counter frame's submits stay pending until it decides their counters.
+            #[cfg(feature = "nsight-perf")]
+            let completed = self
+                .shared
+                .perf
+                .iter()
+                .flat_map(|_| &pools.pending)
+                .filter(|p| {
+                    p.passes
+                        .iter()
+                        .any(|r| r.counters.as_ref().is_some_and(|c| c.slot.get().is_none()))
+                })
+                .map(|p| p.value - 1)
+                .fold(completed, u64::min);
             while pools.pending.front().is_some_and(|p| p.value <= completed) {
                 let p = pools.pending.pop_front().unwrap();
                 if !p.passes.is_empty() {
@@ -399,6 +422,19 @@ impl Queue {
             .collect();
         let timeline = self.timeline();
         let mut after_bind = self.submit_lock.lock().unwrap();
+        // A counter frame closes under the submit lock, so its end waits for every list
+        // recorded in it.
+        #[cfg(feature = "nsight-perf")]
+        if finished
+            .iter()
+            .flat_map(|f| &f.passes)
+            .filter_map(|p| p.counters.as_ref())
+            .any(|c| c.ranged && !c.open.load(Ordering::Acquire))
+        {
+            drop(after_bind);
+            self.release(finished);
+            panic!("a list recorded in a counter frame was submitted after the frame ended");
+        }
         let value = timeline.submitted.load(Ordering::Acquire) + 1;
         if *after_bind {
             waits.push(
@@ -624,6 +660,11 @@ impl Queue {
                     gpu_ms: span as f64 * period * 1e-6,
                     cpu: calibration.and_then(|c| Some((c.to_instant(begin)?, c.to_instant(end)?))),
                     stats,
+                    #[cfg(feature = "nsight-perf")]
+                    counters: p
+                        .counters
+                        .as_ref()
+                        .and_then(|c| c.slot.get().cloned().flatten()),
                 }
             })
             .collect()

@@ -84,9 +84,10 @@ pub struct Caps {
     pub shader_float8: bool,
     /// Pass timings carry CPU-clock spans.
     pub calibrated_timestamps: bool,
-    /// Counter frames ([`crate::Queue::begin_counter_frame`]) collect Nsight Perf SDK
-    /// counters per pass; with [`crate::DeviceDesc::perf_counters`] on a build that found
-    /// the SDK.
+    /// Counter sessions ([`crate::Queue::start_counters`]) collect Nsight Perf SDK counters
+    /// per pass: the device asked for them ([`crate::DeviceDesc::perf_counters`]), loaded the
+    /// SDK, and the GPU and driver support its range profiler.
+    #[cfg(feature = "nsight-perf")]
     pub perf_counters: bool,
     /// Submits can carry frame boundaries for capture tools.
     pub frame_boundary: bool,

@@ -1,11 +1,11 @@
 //! Compiles orr_gpu's own kernels, publishes its shader root, which holds the `rtas` and
 //! `sequence` libraries, and the Rust types of the `rtas` records, sets `cfg(orr_omm)` when the
-//! shaders are built with micromaps, and generates the Nsight Perf SDK bindings that counter
-//! frames use when the SDK is found. Publishes `vulkan` for targets with the Vulkan backend, for
-//! crates built on its interop.
+//! shaders are built with micromaps, and with the `nsight-perf` feature generates the Nsight
+//! Perf SDK bindings that counter frames use. Publishes `vulkan` for targets with the Vulkan
+//! backend, for crates built on its interop.
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use orr_shaders::build::Build;
 
@@ -46,74 +46,95 @@ fn main() {
         }
         Err(e) => panic!("{e}"),
     }
+    #[cfg(feature = "nsight-perf")]
     perf_bindings();
 }
 
+/// Bindings to the Nsight Perf SDK's headers at `NVPERF_SDK_PATH` (the SDK or its `NvPerf`
+/// folder), and each struct's `NVPA_STRUCT_SIZE` as its `StructSize::SIZE`, which the SDK
+/// reads as the struct's version.
+#[cfg(feature = "nsight-perf")]
 fn perf_bindings() {
-    println!("cargo::rustc-check-cfg=cfg(nvperf)");
-    println!("cargo::rerun-if-env-changed=NSIGHT_PERF_SDK");
-    println!("cargo::rerun-if-env-changed=VULKAN_SDK");
-    let Some(sdk) = env::var_os("NSIGHT_PERF_SDK")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-    else {
-        return;
-    };
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        println!(
-            "cargo::warning=NSIGHT_PERF_SDK is set, but orr_gpu loads the Perf SDK on Windows only"
-        );
+    const HEADERS: [&str; 6] = [
+        "nvperf_common.h",
+        "nvperf_host.h",
+        "nvperf_target.h",
+        "nvperf_device_target.h",
+        "nvperf_vulkan_host.h",
+        "nvperf_vulkan_target.h",
+    ];
+    println!("cargo::rerun-if-env-changed=NVPERF_SDK_PATH");
+    if env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple") {
         return;
     }
-    let find = |name: &str| {
-        find_file(&sdk, name)
-            .unwrap_or_else(|| panic!("NSIGHT_PERF_SDK is {} but holds no {name}", sdk.display()))
-    };
-    let library = find("nvperf_grfx_host.dll");
-    let include = find("nvperf_host.h");
-    let include = include.parent().unwrap();
+    let sdk = env::var_os("NVPERF_SDK_PATH")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!("the nsight-perf feature needs NVPERF_SDK_PATH set to the Nsight Perf SDK")
+        });
+    let include = [sdk.join("include"), sdk.join("NvPerf").join("include")]
+        .into_iter()
+        .find(|d| d.join("nvperf_host.h").is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "NVPERF_SDK_PATH is {}, which holds neither include/nvperf_host.h nor \
+                 NvPerf/include/nvperf_host.h",
+                sdk.display()
+            )
+        });
+    let mut source = String::new();
+    let mut sized = std::collections::BTreeMap::new();
+    for h in HEADERS {
+        let path = include.join(h);
+        println!("cargo::rerun-if-changed={}", path.display());
+        source += &format!("#include <{h}>\n");
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        // `#define <NAME> NVPA_STRUCT_SIZE(<struct>, <last field>)`
+        for line in text.lines() {
+            let Some((head, rest)) = line.split_once("NVPA_STRUCT_SIZE(") else {
+                continue;
+            };
+            let head = head.trim();
+            if !head.starts_with("#define ") || head == "#define" {
+                continue;
+            }
+            let args = rest
+                .split_once(')')
+                .expect("NVPA_STRUCT_SIZE's arguments")
+                .0;
+            let ty = args.split(',').next().unwrap().trim();
+            sized
+                .entry(ty.to_owned())
+                .or_insert_with(|| args.to_owned());
+        }
+    }
+    source += "enum orr_struct_size {\n";
+    for (ty, args) in &sized {
+        source += &format!("    ORR_SIZE_{ty} = NVPA_STRUCT_SIZE({args}),\n");
+    }
+    source += "};\n";
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let mut builder = bindgen::Builder::default()
-        .header_contents(
-            "nvperf.h",
-            "#include <vulkan/vulkan.h>\n#include <nvperf_host.h>\n#include <nvperf_target.h>\n\
-             #include <nvperf_vulkan_host.h>\n#include <nvperf_vulkan_target.h>\n",
-        )
+    bindgen::Builder::default()
+        .header_contents("nvperf.h", &source)
         .clang_arg(format!("-I{}", include.display()))
         .allowlist_type("NV(PW|PA)_.*")
         .allowlist_var("NV(PW|PA)_.*")
-        .layout_tests(false);
-    if let Some(include) = vulkan_include() {
-        builder = builder.clang_arg(format!("-I{}", include.display()));
-    }
-    builder
+        .allowlist_type("orr_struct_size")
+        .constified_enum_module("orr_struct_size")
+        .layout_tests(false)
         .generate()
-        .expect("Nsight Perf SDK bindings (needs clang and the Vulkan SDK headers at VULKAN_SDK)")
+        .expect("Nsight Perf SDK bindings (bindgen needs libclang)")
         .write_to_file(out.join("nvperf.rs"))
         .expect("write Nsight Perf SDK bindings");
-    println!("cargo::rustc-env=ORR_NVPERF_LIBRARY={}", library.display());
-    println!("cargo::rustc-cfg=nvperf");
-}
-
-/// The first file called `name` under `dir`, depth first.
-fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
-    let mut entries: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().collect();
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    entries.iter().find_map(|e| {
-        let path = e.path();
-        if path.is_dir() {
-            find_file(&path, name)
-        } else {
-            (e.file_name() == name).then_some(path)
-        }
-    })
-}
-
-/// The Windows SDK names it `Include`; the Linux SDK and Vulkan-Headers name it `include`.
-fn vulkan_include() -> Option<PathBuf> {
-    let sdk = PathBuf::from(env::var_os("VULKAN_SDK").filter(|s| !s.is_empty())?);
-    ["Include", "include"]
-        .into_iter()
-        .map(|d| sdk.join(d))
-        .find(|d| d.is_dir())
+    let impls: String = sized
+        .keys()
+        .map(|ty| {
+            format!(
+                "impl StructSize for {ty} {{ const SIZE: usize = orr_struct_size::ORR_SIZE_{ty} as usize; }}\n"
+            )
+        })
+        .collect();
+    std::fs::write(out.join("nvperf_sizes.rs"), impls).expect("write Nsight Perf SDK sizes");
 }
