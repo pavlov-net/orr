@@ -384,6 +384,10 @@ struct Frame {
 /// the same work, so a renderer with temporal state (accumulation, history, animation, random
 /// sequences) holds that state still across them, or each metric describes a slightly
 /// different frame.
+///
+/// Every pass a counter frame counts is timed exactly
+/// ([`CommandList::set_exact_timing`](crate::CommandList::set_exact_timing)): the SDK
+/// serializes them anyway.
 pub struct CounterSession<'q> {
     queue: &'q Queue,
     metrics: Vec<CounterMetric>,
@@ -437,8 +441,9 @@ impl CounterSession<'_> {
     /// before the end.
     ///
     /// The SDK's profiler isolates each range: a pass starts once the one before has drained,
-    /// so passes that overlap in other frames don't in this one. Counters are the whole GPU's
-    /// while a range is open, other queues' and processes' work included.
+    /// so passes that overlap in other frames don't in this one, and each is timed exactly.
+    /// Counters are the whole GPU's while a range is open, other queues' and processes' work
+    /// included.
     pub fn begin_frame(&mut self) -> Result<(), Error> {
         self.queue.counting().begin_frame(self.queue)
     }

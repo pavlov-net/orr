@@ -85,6 +85,7 @@ impl TimestampRing {
                     gpu_ms,
                     cpu: None,
                     stats: None,
+                    exact: true,
                 }
             })
             .collect()

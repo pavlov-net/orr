@@ -165,6 +165,13 @@ pub struct PassResult {
     /// Shader invocations; `None` unless the pass asked for statistics and the backend
     /// counts them (Metal does not).
     pub stats: Option<PipelineStats>,
+    /// The pass was timed exactly: its timestamps waited for the work before them on its
+    /// queue, so `gpu_ms` and `cpu` span its own work alone
+    /// ([`CommandList::set_exact_timing`](crate::CommandList::set_exact_timing)). Otherwise
+    /// its time can lose its last workgroups to later passes and take in the tail of earlier
+    /// ones. Every pass a counter frame counts is exact, as is every pass on Metal, whose
+    /// timestamps always wait.
+    pub exact: bool,
     /// Hardware counters, on the passes of a counter frame that completed its collection
     /// ([`crate::CounterFrame::Complete`]) once
     /// [`CounterSession::end_frame`](crate::CounterSession::end_frame) has returned: a read

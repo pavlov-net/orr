@@ -1,6 +1,7 @@
 //! Nsight Perf SDK counters land on the pass they measured, with each metric in its place, in
-//! one frame and across replays. Runs with the `nsight-perf` feature on an NVIDIA GPU with
-//! profiling permissions: `cargo test -p gpu_suite --features nsight-perf --test counters`.
+//! one frame and across replays, beside exact timestamps. Runs with the `nsight-perf` feature
+//! on an NVIDIA GPU with profiling permissions:
+//! `cargo test -p gpu_suite --features nsight-perf --test counters`.
 
 use std::time::Duration;
 
@@ -99,11 +100,11 @@ impl<'d> Bench<'d> {
     }
 }
 
-/// Each pass's counted GPU time is its own, `alu` keeps the SMs busy and DRAM idle and
-/// `stream` the reverse, in one frame with the default metrics, twice in a row in one
-/// session, and across the replays a metric set needs. A replay whose passes differ from its
-/// collection's first frame fails it, and a session dropped inside a frame leaves the next
-/// session free to count.
+/// Each pass's counted GPU time is its own and agrees with its exact timestamps, `alu` keeps
+/// the SMs busy and DRAM idle and `stream` the reverse, in one frame with the default metrics,
+/// twice in a row in one session, and across the replays a metric set needs. A replay whose
+/// passes differ from its collection's first frame fails it, and a session dropped inside a
+/// frame leaves the next session free to count.
 #[test]
 fn counters_land_on_their_pass_and_metric() {
     gpu_suite::log_to_stderr();
@@ -125,7 +126,10 @@ fn counters_land_on_their_pass_and_metric() {
     let point = bench.frame(true);
     queue.wait(point, Duration::from_secs(10)).unwrap();
     let plain = d.pass_results(point).unwrap();
-    assert!(plain.iter().all(|p| p.counters.is_none()), "{plain:?}");
+    assert!(
+        plain.iter().all(|p| p.counters.is_none() && !p.exact),
+        "{plain:?}"
+    );
 
     let mut s = queue.start_counters(DEFAULT_COUNTER_METRICS).unwrap();
     assert_eq!(s.replays(), 1);
@@ -192,19 +196,21 @@ fn check(passes: &[PassResult], at: &dyn Fn(&str) -> usize) {
     let [short, stream, long, empty] = [short, stream, long, empty].map(values);
     let get = |v: &[Option<f64>], m| v[at(m)].unwrap();
     assert!(empty[at(TIME)].is_some(), "{empty:?}");
-    // A pass's end timestamp can land before its last workgroup finishes, which the counted
-    // time doesn't, so `alu`'s time is checked against its iterations instead.
+    assert!(passes.iter().all(|p| p.exact), "{passes:?}");
     let ratio = get(&long, TIME) / get(&short, TIME);
     assert!(
         (3.5..4.5).contains(&ratio),
         "long alu / short alu time {ratio}"
     );
-    let stream_ms = get(&stream, TIME) * 1e-6;
-    assert!(
-        (stream_ms - passes[1].gpu_ms).abs() < 0.2 * passes[1].gpu_ms,
-        "stream: counted {stream_ms} ms, timestamps {} ms",
-        passes[1].gpu_ms
-    );
+    for (p, v) in passes.iter().zip([&short, &stream, &long]) {
+        let counted = get(v, TIME) * 1e-6;
+        assert!(
+            (counted - p.gpu_ms).abs() < 0.05 * p.gpu_ms,
+            "{}: counted {counted} ms, timestamps {} ms",
+            p.name,
+            p.gpu_ms
+        );
+    }
     let (active, issue, dram) = (get(&long, ACTIVE), get(&long, ISSUE), get(&long, DRAM));
     assert!(
         active > 70.0 && issue > 40.0 && dram < 1.0,

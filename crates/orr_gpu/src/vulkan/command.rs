@@ -35,6 +35,8 @@ pub(super) struct PassRecord {
     pub(super) id: u32,
     pub(super) name: &'static str,
     pub(super) stats: bool,
+    /// Its timestamps wait for the queue's earlier work.
+    pub(super) exact: bool,
     /// The pass's counters, when it was recorded in a counter frame.
     #[cfg(feature = "nsight-perf")]
     pub(super) counters: Option<super::perf::Counted>,
@@ -59,6 +61,8 @@ pub struct CommandList<'q> {
     res: Option<ListResources>,
     passes: Vec<PassRecord>,
     open: bool,
+    /// Passes begun now are timed exactly.
+    exact: bool,
     /// Rendering extent while between `begin_rendering` and `end_rendering`.
     rendering: Option<[u32; 2]>,
     bound: vk::Pipeline,
@@ -78,6 +82,7 @@ impl<'q> CommandList<'q> {
             res: Some(res),
             passes: Vec::new(),
             open: false,
+            exact: false,
             rendering: None,
             bound: vk::Pipeline::null(),
             rebind_heaps: false,
@@ -957,38 +962,24 @@ impl<'q> CommandList<'q> {
 
     /// Opens a named pass: a debug label and GPU timestamps, and with `stats` shader
     /// invocation counts. Passes do not nest; [`crate::Device::pass_results`] reads them.
-    /// Inside a counter frame on this list's queue the pass is also a counter range.
-    /// With `Caps::breadcrumbs` and `Caps::checkpoints` the pass's begin and end are also
-    /// marked for [`crate::Device::diagnostics_report`] and crash dumps.
+    /// Inside a counter frame on this list's queue the pass is also a counter range, and is
+    /// timed exactly ([`Self::set_exact_timing`]). With `Caps::breadcrumbs` and
+    /// `Caps::checkpoints` the pass's begin and end are also marked for
+    /// [`crate::Device::diagnostics_report`] and crash dumps.
     pub fn begin_pass(&mut self, name: &'static str, stats: bool) {
         assert!(!self.open, "pass {name} begun inside another pass");
         let index = self.passes.len() as u32;
-        let d = &self.queue.shared.device;
-        let res = self.res.as_mut().unwrap();
-        let cmd = res.cmd;
-        let timestamp = res.timestamps.as_mut().map(|q| q.slot(d, 2 * index));
-        let stats = res
-            .stats
-            .as_mut()
-            .filter(|_| stats)
-            .map(|q| q.slot(d, index));
         let label = CString::new(name).unwrap_or_default();
         let id = next_pass_id();
-        // SAFETY: recording; the queries are reset.
+        let cmd = self.cmd();
+        // SAFETY: recording.
         unsafe {
             self.queue.shared.debug_fn.cmd_begin_debug_utils_label(
                 cmd,
                 &vk::DebugUtilsLabelEXT::default().label_name(&label),
             );
             self.queue.shared.mark_pass(cmd, id, false);
-            if let Some((pool, query)) = timestamp {
-                d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, pool, query);
-            }
-            if let Some((pool, query)) = stats {
-                d.cmd_begin_query(cmd, pool, query, vk::QueryControlFlags::empty());
-            }
         }
-        let stats = stats.is_some();
         #[cfg(feature = "nsight-perf")]
         let counters = self
             .queue
@@ -996,44 +987,109 @@ impl<'q> CommandList<'q> {
             .perf
             .as_ref()
             .and_then(|p| p.push_range(self.queue.kind, cmd, name));
+        #[cfg(feature = "nsight-perf")]
+        let counted = counters.is_some();
+        #[cfg(not(feature = "nsight-perf"))]
+        let counted = false;
+        let exact = self.res().timestamps.is_some() && (self.exact || counted);
+        if exact {
+            self.drain(name);
+        }
+        let d = &self.queue.shared.device;
+        let res = self.res.as_mut().unwrap();
+        let timestamp = res.timestamps.as_mut().map(|q| q.slot(d, 2 * index));
+        let stats = res
+            .stats
+            .as_mut()
+            .filter(|_| stats)
+            .map(|q| q.slot(d, index));
+        // SAFETY: recording; the queries are reset.
+        unsafe {
+            if let Some((pool, query)) = timestamp {
+                d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, pool, query);
+            }
+            if let Some((pool, query)) = stats {
+                d.cmd_begin_query(cmd, pool, query, vk::QueryControlFlags::empty());
+            }
+        }
         self.passes.push(PassRecord {
             id,
             name,
-            stats,
+            stats: stats.is_some(),
+            exact,
             #[cfg(feature = "nsight-perf")]
             counters,
         });
         self.open = true;
     }
 
+    /// Times the passes begun after it exactly while `exact`, until it is called again: each
+    /// pass's begin and end timestamps wait for everything before them on the queue to
+    /// finish, so the pass's time is its own work's, whole. Without it a pass's end timestamp
+    /// can be written before its last workgroups finish, and its begin timestamp before the
+    /// work ahead of it does, so time moves between passes. An exact pass overlaps nothing
+    /// else on this queue, so it costs the overlap the queue would otherwise find; work on
+    /// other queues still runs beside it. [`PassResult::exact`](crate::PassResult::exact) says
+    /// which passes were timed so. Exact passes begin and end outside rendering.
+    pub fn set_exact_timing(&mut self, exact: bool) {
+        self.exact = exact;
+    }
+
+    /// Waits for everything recorded and submitted before on this queue, before an exact
+    /// pass's timestamp.
+    fn drain(&mut self, name: &str) {
+        assert!(
+            self.rendering.is_none(),
+            "the exactly timed pass {name} begins or ends inside rendering"
+        );
+        // NVIDIA's driver writes a timestamp after an execution-only barrier without waiting
+        // for the work before it; a barrier with memory accesses makes it wait.
+        self.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
+    }
+
     pub fn end_pass(&mut self) {
         assert!(self.open, "end_pass without begin_pass");
         let index = self.passes.len() as u32 - 1;
+        let &PassRecord {
+            id,
+            name,
+            stats,
+            exact,
+            ..
+        } = self.passes.last().unwrap();
         let d = &self.queue.shared.device;
         let res = self.res.as_mut().unwrap();
         let cmd = res.cmd;
         let stats = res
             .stats
             .as_mut()
-            .filter(|_| self.passes[index as usize].stats)
+            .filter(|_| stats)
             .map(|q| q.slot(d, index));
+        if let Some((pool, query)) = stats {
+            // SAFETY: recording; the pass's query was begun in this list.
+            unsafe { d.cmd_end_query(cmd, pool, query) };
+        }
+        if exact {
+            self.drain(name);
+        }
+        let d = &self.queue.shared.device;
+        let res = self.res.as_mut().unwrap();
         let timestamp = res.timestamps.as_mut().map(|q| q.slot(d, 2 * index + 1));
         // SAFETY: recording; the pass's queries were begun in this list.
         unsafe {
-            if let Some((pool, query)) = stats {
-                d.cmd_end_query(cmd, pool, query);
-            }
             if let Some((pool, query)) = timestamp {
                 d.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::ALL_COMMANDS, pool, query);
             }
-            let pass = &self.passes[index as usize];
             #[cfg(feature = "nsight-perf")]
-            if pass.counters.as_ref().is_some_and(|c| c.ranged)
+            if self.passes[index as usize]
+                .counters
+                .as_ref()
+                .is_some_and(|c| c.ranged)
                 && let Some(p) = &self.queue.shared.perf
             {
                 p.pop_range(cmd);
             }
-            self.queue.shared.mark_pass(cmd, pass.id, true);
+            self.queue.shared.mark_pass(cmd, id, true);
             self.queue.shared.debug_fn.cmd_end_debug_utils_label(cmd);
         }
         self.open = false;

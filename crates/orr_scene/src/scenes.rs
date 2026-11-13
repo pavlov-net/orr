@@ -337,7 +337,8 @@ pub enum ConsumerMarker {
 pub struct FrameStats {
     /// The frame these figures describe; 0 before any has completed.
     pub frame: u64,
-    /// GPU passes of the frame's submit in order, consumer passes included.
+    /// GPU passes of the frame's submits in order, consumer passes included; exactly timed in
+    /// a frame begun with [`Scenes::set_exact_timing`] on.
     pub gpu: Vec<PassResult>,
     /// Render-thread time per step: `begin_frame`, `write` (the consumer's write phase),
     /// `update_scenes`, `raster_view`, `end`.
@@ -490,6 +491,8 @@ struct Core {
     output: Option<TimelinePoint>,
     stats: FrameStats,
     high_water: u64,
+    /// Frames begun now time their passes exactly.
+    exact_timing: bool,
     mounts: Mounts,
     accel: Arc<AccelShared>,
     ptlas: PtlasPipelines,
@@ -645,6 +648,7 @@ impl Scenes {
                 output: None,
                 stats: FrameStats::default(),
                 high_water: 0,
+                exact_timing: false,
                 mounts,
                 accel,
                 ptlas,
@@ -1261,6 +1265,14 @@ impl Scenes {
         &self.core.stats
     }
 
+    /// Times every pass of the frames begun from now on exactly while `exact`, on every queue
+    /// they use ([`orr_gpu::CommandList::set_exact_timing`]): their passes stop overlapping
+    /// one another, so such a frame takes longer, and each pass's time in
+    /// [`FrameStats::gpu`] is its own, with [`orr_gpu::PassResult::exact`] set.
+    pub fn set_exact_timing(&mut self, exact: bool) {
+        self.core.exact_timing = exact;
+    }
+
     /// Step 1: waits until frame N - frames_in_flight has completed, for as long as the render
     /// queue goes on completing work (an error once it completes nothing for 10 s), sleeps on
     /// the low latency handle when one is given, recycles the upload window and the slots
@@ -1506,9 +1518,7 @@ impl Scenes {
         #[cfg(not(feature = "hot-reload"))]
         let reloads = Vec::new();
         let moves = orr_gpu::zone!("record moves");
-        let mut list = render.command_list()?;
-        // Work from earlier frames on this queue finishes before this frame's writes.
-        list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
+        let mut list = frame_list(render, core.exact_timing)?;
         for (i, moves) in core.mounts.streaming.moves().iter().enumerate() {
             // A later step's copies may read what an earlier step's wrote.
             if i > 0 {
@@ -1783,6 +1793,11 @@ impl<'a> Frame<'a> {
     /// The newest frame whose work had completed when this one began.
     pub fn completed(&self) -> u64 {
         self.core.completed_frame
+    }
+
+    /// The frame times its passes exactly ([`Scenes::set_exact_timing`]).
+    pub fn exact_timing(&self) -> bool {
+        self.core.exact_timing
     }
 
     /// The current pipeline of `id`.
@@ -2569,9 +2584,7 @@ impl<'a> Frame<'a> {
         let list = self.list.take().expect("frame list");
         self.submits.push(render.submit(vec![list], &self.loading)?);
         self.core.mounts.streaming.submitted();
-        let mut list = render.command_list()?;
-        list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
-        self.list = Some(list);
+        self.list = Some(frame_list(render, self.core.exact_timing)?);
         self.after_output = Some(previous);
         Ok(())
     }
@@ -2600,10 +2613,7 @@ impl<'a> Frame<'a> {
             return Ok(self.list.as_mut().expect("frame list"));
         };
         if self.output.is_none() {
-            let mut list = compute.command_list()?;
-            // Earlier frames' output work finishes before this frame's writes.
-            list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
-            self.output = Some(list);
+            self.output = Some(frame_list(compute, self.core.exact_timing)?);
         }
         Ok(self.output.as_mut().expect("output list"))
     }
@@ -3098,6 +3108,15 @@ impl<'a> Frame<'a> {
         });
         Ok(points)
     }
+}
+
+/// A list of a frame on `queue`, whose writes wait for the queue's earlier work, from earlier
+/// frames included, and whose passes are timed exactly when `exact`.
+fn frame_list(queue: &orr_gpu::Queue, exact: bool) -> Result<CommandList<'_>> {
+    let mut list = queue.command_list()?;
+    list.set_exact_timing(exact);
+    list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
+    Ok(list)
 }
 
 /// Builds the producer entries of the listed scenes that build this frame, then sums each

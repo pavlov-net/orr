@@ -211,7 +211,7 @@ pub(super) fn main() {
             .unwrap();
 
         let point = render.submit(vec![list], wait_for.as_slice()).unwrap();
-        display.present(&[point]).unwrap();
+        display.present(&[point], false).unwrap();
         last = Some(point);
         gpu.collect_garbage();
     }

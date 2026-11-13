@@ -128,6 +128,19 @@ kernels with them keep some locals in memory and are about a percent larger: a p
 build's numbers are close to a release build's but not identical. Release and profiling builds
 also leave out shader asserts.
 
+Each pass's GPU time comes from timestamps around it (`PassResult`, in `Device::pass_results` and
+`FrameStats::gpu`). Passes on a queue overlap, and the driver can write a pass's end timestamp
+before its last workgroups finish and its begin timestamp before the work ahead of it does, so a
+pass's time can lose its tail to the passes after it while the frame's total stays right. For
+exact times a program asks for the frames to measure: `Renderer::set_exact_timing(true)` before
+their `begin_frame` and `false` after, or `CommandList::set_exact_timing` on lists of its own.
+Each of their passes then waits for everything before it on its queue to finish before each of
+its timestamps, so its time is its own work's and its `PassResult::exact` is set. Their passes
+stop overlapping, so those frames take longer than the frames around them: time a few and leave
+the rest alone. `bench` times three frames of its first script exactly and prints their passes
+beside the others; `--exact-frame N` and `--exact-frames K` choose them. On Metal every pass's
+timestamps wait so already.
+
 Per-pass hardware counters come from NVIDIA's Nsight Perf SDK, with orr_gpu's `nsight-perf`
 feature, off by default and Vulkan only. The build reads the SDK's headers from
 `NVPERF_SDK_PATH`. At run time the host library loads from the SDK a program names in
@@ -152,14 +165,13 @@ scene, view and settings, and holds still whatever state it carries from frame t
 slightly different frame.
 
 While it counts, the SDK drains the GPU before and after every pass. A counted frame's passes
-don't overlap, its pass times include the SDK's few microseconds of range work, and collecting
-costs the CPU a few milliseconds per frame; frames outside `begin_frame` and `end_frame` cost
-nothing more. Counters are the whole GPU's, other queues' and programs' work included. Pass
-timestamps can end before a pass's last workgroup finishes, so for a pass with a long tail the
-counted `gpu__time_duration` is the truer time. A pass of a few microseconds is mostly the
-SDK's range work, so its rates and percentages say little. For numbers that compare from run
-to run, keep the scene, camera, resolution, settings and frame the same, and lock the GPU's
-clocks as the SDK's guide describes under "Ensuring Stable Measurements".
+don't overlap and are timed exactly, its pass times include the SDK's few microseconds of range
+work, and collecting costs the CPU a few milliseconds per frame; frames outside `begin_frame`
+and `end_frame` cost nothing more. Counters are the whole GPU's, other queues' and programs'
+work included. A pass of a few microseconds is mostly the SDK's range work, so its rates and
+percentages say little. For numbers that compare from run to run, keep the scene, camera,
+resolution, settings and frame the same, and lock the GPU's clocks as the SDK's guide describes
+under "Ensuring Stable Measurements".
 
 CPU and GPU timelines come from the [Tracy](https://github.com/wolfpld/tracy) profiler, with
 orr_gpu's `tracy` feature, which `orr` forwards; off by default, and without it nothing is
@@ -171,8 +183,8 @@ the threads it starts, marks a frame at `Frame::end` and a `presented image` fra
 present, and plots the path pipelines compiling, the loading jobs queued, the streams and mount
 reads in flight and each frame's upload bytes. Each pass is a zone on its queue's GPU context,
 placed on the CPU timeline by its `PassResult::cpu` times, so GPU zones need
-`Caps::calibrated_timestamps`, arrive a few frames late, and share the pass timestamps' early
-ends described above. In Tracy a GPU zone's CPU-side times are when orr read its result, not
+`Caps::calibrated_timestamps`, arrive a few frames late, and are exact only in frames timed
+exactly. In Tracy a GPU zone's CPU-side times are when orr read its result, not
 when it was recorded. Metal has no GPU zones. `orr_cook` has a `tracy` feature of its own.
 
 The examples' `tracy` feature turns on orr's and the cook's, with the Tracy client's default

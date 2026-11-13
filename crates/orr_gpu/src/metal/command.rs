@@ -449,6 +449,12 @@ impl<'q> CommandList<'q> {
         self.in_pass = true;
     }
 
+    /// Nothing on Metal: every pass is timed exactly, since each of its timestamps waits for
+    /// everything before it on the queue to finish.
+    pub fn set_exact_timing(&mut self, exact: bool) {
+        let _ = exact;
+    }
+
     pub fn end_pass(&mut self) {
         assert!(self.in_pass, "end_pass without begin_pass");
         self.end_encoder();

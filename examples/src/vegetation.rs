@@ -21,10 +21,12 @@
 //! `--no-part-animation`, `--rt-range M`, `--animation-range M`, `--directional-lights L,T`,
 //! `--sw-raster-px P`, `--lod0-only`, `--world-km K`, `--world-density N` (trees per km^2
 //! outside the tile), `--particles N`, `--stream-load`, `--no-chain`, `--extent WxH`,
-//! `--script NAME` (walk, turn, overview, flythrough, flyout), `--script-frames N` and
-//! `--counter-frame N` (with the `nsight-perf` feature: the frame of the first script whose
-//! per-pass Nsight Perf SDK counters the run collects, when the device has
-//! `Caps::perf_counters`).
+//! `--script NAME` (walk, turn, overview, flythrough, flyout), `--script-frames N`,
+//! `--exact-frame N` and `--exact-frames K` (the first of the first script's frames whose
+//! passes are timed exactly, with `Renderer::set_exact_timing`, and how many, 3 unless given;
+//! they are not samples) and `--counter-frame N` (with the `nsight-perf` feature: the frame of
+//! the first script whose per-pass Nsight Perf SDK counters the run collects, when the device
+//! has `Caps::perf_counters`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -247,6 +249,10 @@ pub struct Settings {
     pub scripts: Vec<Script>,
     /// Frames per script; `None` runs the window's script until it closes.
     pub script_frames: Option<u64>,
+    /// The first of the first script's frames whose passes are timed exactly.
+    pub exact_frame: Option<u64>,
+    /// How many frames from `exact_frame` on are timed exactly.
+    pub exact_frames: u64,
     /// The frame of the first script that is replayed as a counter frame.
     #[cfg(feature = "nsight-perf")]
     pub counter_frame: Option<u64>,
@@ -282,6 +288,8 @@ impl Settings {
             extent: [1920, 1080],
             scripts: vec![Script::Walk],
             script_frames: None,
+            exact_frame: None,
+            exact_frames: 3,
             #[cfg(feature = "nsight-perf")]
             counter_frame: None,
         };
@@ -347,6 +355,8 @@ impl Settings {
                 }
                 "--script" => s.scripts = vec![Script::parse(value())],
                 "--script-frames" => s.script_frames = Some(number(value()) as u64),
+                "--exact-frame" => s.exact_frame = Some(number(value()) as u64),
+                "--exact-frames" => s.exact_frames = number(value()) as u64,
                 #[cfg(feature = "nsight-perf")]
                 "--counter-frame" => s.counter_frame = Some(number(value()) as u64),
                 _ => panic!("unknown argument {a}"),
@@ -1539,6 +1549,8 @@ pub struct Run {
         Vec<orr::orr_gpu::CounterMetric>,
         Vec<orr::orr_gpu::PassResult>,
     )>,
+    /// The figures of the first script's exactly timed frames, in order.
+    pub exact: Vec<FrameStats>,
     /// The blade field's capacities and the bytes of its own lists, when the grass is one.
     pub blades: Option<(Capacity, u64)>,
     /// What ray reconstruction ran as in the last frame; `None` without it.
@@ -1618,6 +1630,12 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
     let frames_per_script = options.frames.or(settings.script_frames);
     let mut collected: Vec<(Script, Vec<Sample>)> = Vec::new();
     let mut frame_ids: Vec<(u64, usize)> = Vec::new();
+    let exact_frames = settings
+        .exact_frame
+        .map_or(0..0, |f| f..f + settings.exact_frames);
+    // The exactly timed frames' ids, until their figures are in.
+    let mut exact_ids: Vec<u64> = Vec::new();
+    let mut exact = Vec::new();
     let mut last: Option<(u64, TimelinePoint)> = None;
     let mut closed = false;
     let base = fixed_time(scene.frame + 1).absolute;
@@ -1668,6 +1686,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                 &mut frame_ids,
                 &mut collected,
             );
+            take_exact(&renderer, &mut exact_ids, &mut exact);
             #[cfg(feature = "nsight-perf")]
             take_counters(&renderer, &mut counted, &mut counters);
             let t = if options.headless || frames_per_script.is_some() {
@@ -1719,6 +1738,8 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                 }
             }
 
+            let timed = si == 0 && exact_frames.contains(&i);
+            renderer.set_exact_timing(timed);
             let mut f = renderer
                 .begin_frame(FrameDesc {
                     time,
@@ -1843,8 +1864,10 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                     (COUNTS * 4) as u64,
                 );
                 list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
-                if !counting {
-                    frame_ids.push((id, si));
+                match (counting, timed) {
+                    (true, _) => {}
+                    (false, true) => exact_ids.push(id),
+                    (false, false) => frame_ids.push((id, si)),
                 }
                 f.end().expect("end frame")
             };
@@ -1884,6 +1907,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
             .wait(point, Duration::from_secs(30))
             .expect("wait");
     }
+    renderer.set_exact_timing(false);
     // Empty frames take in the figures of the frames still in flight.
     for _ in 0..slots {
         take_sample(
@@ -1894,6 +1918,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
             &mut frame_ids,
             &mut collected,
         );
+        take_exact(&renderer, &mut exact_ids, &mut exact);
         #[cfg(feature = "nsight-perf")]
         take_counters(&renderer, &mut counted, &mut counters);
         clock += 1;
@@ -1921,6 +1946,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
         &mut frame_ids,
         &mut collected,
     );
+    take_exact(&renderer, &mut exact_ids, &mut exact);
     #[cfg(feature = "nsight-perf")]
     take_counters(&renderer, &mut counted, &mut counters);
     let capture = last
@@ -1937,6 +1963,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
         memory,
         #[cfg(feature = "nsight-perf")]
         counters,
+        exact,
         blades: scene.blades.as_ref().map(|b| (b.capacity, b.bytes())),
         reconstruction,
         render_extent,
@@ -1980,6 +2007,16 @@ fn take_sample(
             .as_ref()
             .map_or([0; FIELD_COUNTS], |b| b.counts(id)),
     });
+}
+
+/// Files the figures of the frame that last completed when it is one of the exactly timed
+/// frames `ids`.
+fn take_exact(renderer: &Renderer, ids: &mut Vec<u64>, exact: &mut Vec<FrameStats>) {
+    let stats = renderer.stats();
+    if let Some(k) = ids.iter().position(|&id| id == stats.frame) {
+        ids.remove(k);
+        exact.push(stats.clone());
+    }
 }
 
 /// The counter frame's metrics and passes, once `counted` is the frame whose figures the

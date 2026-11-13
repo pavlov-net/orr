@@ -1,10 +1,14 @@
 //! The dense vegetation test scene's camera scripts with per-pass timings: renders each
 //! script, prints the median and 90th percentile GPU time of every pass and the render
 //! thread's time per step, and writes every figure the frames report to
-//! `target/orr-reports/dense_vegetation-<git rev>.json`. Built with the `nsight-perf` feature,
-//! on a device with `Caps::perf_counters`, it also collects per-pass Nsight Perf SDK counters
-//! for one frame of the first script (the middle one unless `--counter-frame N` says), prints
-//! them as a table and adds them to the report.
+//! `target/orr-reports/dense_vegetation-<git rev>.json`. On Vulkan those pass times are not
+//! exact: passes overlap, and one can lose time to its neighbors. Three frames of the first
+//! script, from a quarter of the way in unless `--exact-frame N` says (`--exact-frames K` for
+//! another count), have their passes timed exactly instead; they are not samples, and bench
+//! prints and reports their times beside the others', with each kind of frame's GPU span. Built
+//! with the `nsight-perf` feature, on a device with `Caps::perf_counters`, it also collects
+//! per-pass Nsight Perf SDK counters for one frame of the first script (the middle one unless
+//! `--counter-frame N` says), prints them as a table and adds them to the report.
 //!
 //! `bench [--synthetic] [--script NAME] [--script-frames N] [--headless] [scene switches...]`
 //! (see `orr_examples::vegetation`). It runs all four scripts for 600 frames each unless told
@@ -35,17 +39,21 @@ fn main() {
         settings.scripts = Script::ALL.to_vec();
     }
     settings.script_frames = settings.script_frames.or(Some(SCRIPT_FRAMES));
+    let frames = options
+        .frames
+        .or(settings.script_frames)
+        .unwrap_or(SCRIPT_FRAMES);
+    settings.exact_frame = settings.exact_frame.or(Some(frames / 4));
     #[cfg(feature = "nsight-perf")]
     {
-        let frames = options
-            .frames
-            .or(settings.script_frames)
-            .unwrap_or(SCRIPT_FRAMES);
         settings.counter_frame = settings.counter_frame.or(Some(frames / 2));
     }
     let r = run(&options, &settings);
     for (script, samples) in &r.scripts {
         print_script(*script, settled(samples));
+    }
+    if let Some((script, samples)) = r.scripts.first() {
+        print_exact(*script, &r.exact, settled(samples));
     }
     #[cfg(feature = "nsight-perf")]
     match &r.counters {
@@ -70,18 +78,26 @@ fn percentile(v: &[f64], p: f64) -> f64 {
     v[((v.len() - 1) as f64 * p).round() as usize]
 }
 
-/// GPU ms per pass name over `samples`, one value per sample (0 where a frame ran none).
-fn pass_times(samples: &[Sample]) -> BTreeMap<&'static str, Vec<f64>> {
+fn stats(samples: &[Sample]) -> impl Iterator<Item = &FrameStats> {
+    samples.iter().map(|s| &s.stats)
+}
+
+/// GPU ms per pass name over `frames`, one value per frame (0 where a frame ran none).
+fn pass_times<'a>(
+    frames: impl Iterator<Item = &'a FrameStats>,
+) -> BTreeMap<&'static str, Vec<f64>> {
     let mut out: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
-    for (i, s) in samples.iter().enumerate() {
-        for p in &s.stats.gpu {
+    let mut n = 0;
+    for (i, f) in frames.enumerate() {
+        n = i + 1;
+        for p in &f.gpu {
             let v = out.entry(p.name).or_default();
-            v.resize(i + 1, 0.0);
+            v.resize(n, 0.0);
             v[i] += p.gpu_ms;
         }
     }
     for v in out.values_mut() {
-        v.resize(samples.len(), 0.0);
+        v.resize(n, 0.0);
     }
     out
 }
@@ -96,11 +112,27 @@ fn cpu_times(samples: &[Sample]) -> BTreeMap<&'static str, Vec<f64>> {
     out
 }
 
-fn frame_gpu_ms(samples: &[Sample]) -> Vec<f64> {
-    samples
-        .iter()
-        .map(|s| s.stats.gpu.iter().map(|p| p.gpu_ms).sum())
+fn frame_gpu_ms<'a>(frames: impl Iterator<Item = &'a FrameStats>) -> Vec<f64> {
+    frames
+        .map(|f| f.gpu.iter().map(|p| p.gpu_ms).sum())
         .collect()
+}
+
+/// GPU ms from the frame's first pass beginning to its last ending, on any queue; `None`
+/// without the passes' CPU times.
+fn gpu_span_ms(stats: &FrameStats) -> Option<f64> {
+    let times: Vec<_> = stats.gpu.iter().filter_map(|p| p.cpu).collect();
+    let begin = times.iter().map(|t| t.0).min()?;
+    let end = times.iter().map(|t| t.1).max()?;
+    Some(end.duration_since(begin).as_secs_f64() * 1e3)
+}
+
+fn spans<'a>(frames: impl Iterator<Item = &'a FrameStats>) -> Vec<f64> {
+    frames.filter_map(gpu_span_ms).collect()
+}
+
+fn every_pass_exact<'a>(mut frames: impl Iterator<Item = &'a FrameStats>) -> bool {
+    frames.all(|f| f.gpu.iter().all(|p| p.exact))
 }
 
 fn print_script(script: Script, samples: &[Sample]) {
@@ -108,15 +140,28 @@ fn print_script(script: Script, samples: &[Sample]) {
         "\n{}: {} frames, GPU frame {:.3} ms median, {:.3} ms p90",
         script.name(),
         samples.len(),
-        median(&frame_gpu_ms(samples)),
-        percentile(&frame_gpu_ms(samples), 0.9)
+        median(&frame_gpu_ms(stats(samples))),
+        percentile(&frame_gpu_ms(stats(samples)), 0.9)
     );
-    let mut passes: Vec<(&str, f64, f64)> = pass_times(samples)
+    let mut passes: Vec<(&str, f64, f64)> = pass_times(stats(samples))
         .into_iter()
         .map(|(n, v)| (n, median(&v), percentile(&v, 0.9)))
         .collect();
     passes.sort_by(|a, b| b.1.total_cmp(&a.1));
-    println!("{:>36} {:>9} {:>9}", "pass", "median", "p90");
+    let spans = spans(stats(samples));
+    if !spans.is_empty() {
+        println!(
+            "GPU span {:.3} ms median, {:.3} ms p90",
+            median(&spans),
+            percentile(&spans, 0.9)
+        );
+    }
+    let pass = if every_pass_exact(stats(samples)) {
+        "pass"
+    } else {
+        "pass (not exact)"
+    };
+    println!("{:>36} {:>9} {:>9}", pass, "median", "p90");
     for (name, m, p) in passes {
         println!("{name:>36} {m:>9.3} {p:>9.3}");
     }
@@ -128,6 +173,59 @@ fn print_script(script: Script, samples: &[Sample]) {
             percentile(&v, 0.9)
         );
     }
+}
+
+/// The exactly timed frames' passes by median time, beside the same passes' median in the
+/// script's other frames, and both kinds of frame's GPU span.
+fn print_exact(script: Script, exact: &[FrameStats], samples: &[Sample]) {
+    if exact.is_empty() {
+        return;
+    }
+    println!(
+        "\n{}: {} frames timed exactly{}",
+        script.name(),
+        exact.len(),
+        if every_pass_exact(exact.iter()) {
+            ""
+        } else {
+            ", but not every pass: a queue without timestamps"
+        }
+    );
+    let exact_spans = spans(exact.iter());
+    let others = spans(stats(samples));
+    if !exact_spans.is_empty() && !others.is_empty() {
+        println!(
+            "GPU span {:.3} ms median, {:.3} ms in the frames not timed exactly",
+            median(&exact_spans),
+            median(&others)
+        );
+    }
+    let sampled = pass_times(stats(samples));
+    let mut passes: Vec<(&str, f64, Option<f64>)> = pass_times(exact.iter())
+        .into_iter()
+        .map(|(n, v)| (n, median(&v), sampled.get(n).map(|s| median(s))))
+        .collect();
+    passes.sort_by(|a, b| b.1.total_cmp(&a.1));
+    println!("{:>36} {:>9} {:>9}", "pass", "exact", "not exact");
+    for (name, e, o) in passes {
+        match o {
+            Some(o) => println!("{name:>36} {e:>9.3} {o:>9.3}"),
+            None => println!("{name:>36} {e:>9.3} {:>9}", "-"),
+        }
+    }
+}
+
+/// The exactly timed frames: which, their GPU span and their passes' times, as
+/// [`script_report`] gives the other frames'.
+fn exact_report(script: Script, exact: &[FrameStats]) -> Value {
+    json!({
+        "script": script.name(),
+        "frames": exact.iter().map(|f| f.frame).collect::<Vec<_>>(),
+        "pass_times_exact": every_pass_exact(exact.iter()),
+        "gpu_frame_ms": spread(&frame_gpu_ms(exact.iter())),
+        "gpu_span_ms": spread(&spans(exact.iter())),
+        "gpu_pass_ms": spreads(pass_times(exact.iter())),
+    })
 }
 
 /// The counter frame's passes, one row each: GPU ms and each metric's value, `-` for a metric
@@ -176,6 +274,7 @@ fn counter_report(metrics: &[CounterMetric], passes: &[PassResult]) -> Value {
             let mut row = Map::new();
             row.insert("pass".into(), p.name.into());
             row.insert("gpu_ms".into(), p.gpu_ms.into());
+            row.insert("exact".into(), p.exact.into());
             match &p.counters {
                 Some(PassCounters::Values(values)) => {
                     for (m, v) in metrics.iter().zip(values) {
@@ -250,8 +349,10 @@ fn script_report(script: Script, samples: &[Sample]) -> Value {
     json!({
         "script": script.name(),
         "frames": samples.len(),
-        "gpu_frame_ms": spread(&frame_gpu_ms(samples)),
-        "gpu_pass_ms": spreads(pass_times(samples)),
+        "pass_times_exact": every_pass_exact(stats(samples)),
+        "gpu_frame_ms": spread(&frame_gpu_ms(stats(samples))),
+        "gpu_span_ms": spread(&spans(stats(samples))),
+        "gpu_pass_ms": spreads(pass_times(stats(samples))),
         "render_thread_ms": spreads(cpu_times(samples)),
         "upload_bytes": fig(&|s| s.upload_bytes as f64),
         "upload_high_water": fig(&|s| s.upload_high_water as f64),
@@ -354,6 +455,11 @@ fn write_report(settings: &Settings, r: &Run) -> PathBuf {
         "load_ms": r.load_ms,
         "memory": memory,
         "scripts": scripts,
+        "exact": r
+            .scripts
+            .first()
+            .filter(|_| !r.exact.is_empty())
+            .map(|(script, _)| exact_report(*script, &r.exact)),
     });
     #[cfg(feature = "nsight-perf")]
     let report = {

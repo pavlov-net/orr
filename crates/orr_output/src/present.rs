@@ -884,7 +884,9 @@ impl Display {
     /// Hands the frame opened by the last `begin_frame` to the present thread, whose submits
     /// wait the frame's `submits` (in order, the last completing after the others), and
     /// returns without waiting. Reports an error the present thread hit since the last call.
-    pub fn present(&mut self, submits: &[TimelinePoint]) -> Result<()> {
+    /// `exact`: the frame's passes were timed exactly, so they didn't overlap, and its GPU
+    /// time is not the cost dynamic frame generation weighs.
+    pub fn present(&mut self, submits: &[TimelinePoint], exact: bool) -> Result<()> {
         let _zone = orr_gpu::zone!("hand to present thread");
         let after = *submits.last().expect("a frame submits");
         if let Some(e) = self.shared.lock().error.take() {
@@ -914,7 +916,7 @@ impl Display {
             flag: s.check.zip(s.flag.clone()).filter(|_| recorded > 0),
             min_images: MIN_IMAGES.max(self.fg.as_ref().map_or(0, |f| f.most() + 2)),
         };
-        if self.fg.as_ref().is_some_and(|f| f.dynamic.is_some()) {
+        if !exact && self.fg.as_ref().is_some_and(|f| f.dynamic.is_some()) {
             self.costs.push_back(Cost {
                 frame: b.frame,
                 submits: submits.to_vec(),

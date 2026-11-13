@@ -1055,6 +1055,17 @@ impl Renderer {
     pub fn stats(&self) -> &FrameStats {
         self.scenes.stats()
     }
+
+    /// Times every pass of the frames begun from now on exactly while `exact`: each pass's
+    /// timestamps wait for the work before them on its queue, so its time in
+    /// [`FrameStats::gpu`] is its own work's, whole, with
+    /// [`PassResult::exact`](orr_gpu::PassResult::exact) set. Otherwise a pass's time can lose
+    /// its last workgroups to later passes and take in the tail of earlier ones. Passes stop
+    /// overlapping in such a frame, so it takes longer than the frames around it; turn it on
+    /// for the frames to measure and off after.
+    pub fn set_exact_timing(&mut self, exact: bool) {
+        self.scenes.set_exact_timing(exact);
+    }
 }
 
 /// One frame, from [`Renderer::begin_frame`] to [`Frame::end`].
@@ -2093,6 +2104,7 @@ impl<'a> Frame<'a> {
         }
         let gpu = self.output.device.clone();
         let slots = std::mem::take(&mut self.slots);
+        let exact = self.scenes.exact_timing();
         let ended = self.scenes.end_submits(wait.as_slice());
         let last = ended.as_ref().ok().and_then(|p| p.last().copied());
         for slot in slots {
@@ -2103,7 +2115,7 @@ impl<'a> Frame<'a> {
         }
         let submits = ended?;
         if let Some(d) = self.display {
-            d.present(&submits)?;
+            d.present(&submits, exact)?;
         }
         drop(zone);
         orr_gpu::frame_mark!();

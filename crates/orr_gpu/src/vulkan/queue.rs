@@ -201,7 +201,7 @@ impl Queue {
 
     /// Held around every call that uses the raw queue.
     #[cfg(feature = "nsight-perf")]
-    pub(super) fn lock_submits(&self) -> std::sync::MutexGuard<'_, bool> {
+    pub(super) fn lock_submits(&self) -> MutexGuard<'_, bool> {
         self.submit_lock.lock().unwrap()
     }
 
@@ -674,6 +674,7 @@ impl Queue {
                     cpu: calibration
                         .and_then(|c| Some((c.to_instant(begin, mask)?, c.to_instant(end, mask)?))),
                     stats,
+                    exact: p.exact,
                     #[cfg(feature = "nsight-perf")]
                     counters: p
                         .counters
