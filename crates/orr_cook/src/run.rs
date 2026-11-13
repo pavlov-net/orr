@@ -17,9 +17,9 @@ use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
+use std::range::Range;
 use std::sync::{Arc, mpsc};
 use std::thread::Scope;
 use std::time::Instant;
@@ -2370,12 +2370,7 @@ fn plan_scene(
             let cooked = &materials[mi].2;
             let back = src.materials[mi].back.map(|b| &materials[b].2);
             // Packing binds the textures that decide a section's class and emission.
-            *sec = section_data(
-                sec.indices.clone(),
-                cooked,
-                back.map(|b| (b, &textures)),
-                &textures,
-            );
+            *sec = section_data(sec.indices, cooked, back.map(|b| (b, &textures)), &textures);
             deps.extend(sec.maps.units().map(str::to_string));
             model_materials.push(if bakes_displacement(&model.settings, &sec.maps) {
                 *baked.entry(mi).or_insert_with(|| {
@@ -2637,7 +2632,12 @@ fn mesh_units(
     let mut deps = Vec::new();
     for (i, ((m, back), span)) in materials.iter().zip(backs).zip(&input.sections).enumerate() {
         let first = span.first as usize;
-        let section = section_data(first..first + span.count as usize, m, *back, textures);
+        let section = section_data(
+            (first..first + span.count as usize).into(),
+            m,
+            *back,
+            textures,
+        );
         deps.extend(section.maps.units().map(str::to_string));
         let mut unit = material_unit(format!("{name}/material/{i}"), m);
         if bakes_displacement(settings, &section.maps) {
@@ -3052,7 +3052,7 @@ fn section_maps(
     let mut out = Vec::with_capacity(m.sections.len());
     for s in &m.sections {
         let uvs = |set: usize| {
-            let corners = m.indices[s.indices.clone()].iter();
+            let corners = m.indices[s.indices].iter();
             corners.map(move |&i| m.uvs[set][i as usize])
         };
         let opacity = match &s.maps.opacity {

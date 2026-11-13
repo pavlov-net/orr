@@ -503,8 +503,8 @@ pub fn white_in_range(xy: [f64; 2]) -> [f64; 2] {
     let cct = p.cct();
     let duv = p.duv(cct);
     let c = cct.clamp(
-        f64::from(*WHITE_BALANCE_CCT.start()),
-        f64::from(*WHITE_BALANCE_CCT.end()),
+        f64::from(WHITE_BALANCE_CCT.start),
+        f64::from(WHITE_BALANCE_CCT.last),
     );
     let limit = f64::from(WHITE_BALANCE_DUV);
     let d = duv.clamp(-limit, limit);

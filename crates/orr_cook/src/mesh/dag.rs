@@ -23,8 +23,8 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::ops::Range;
 use std::os::raw::c_int;
+use std::range::Range;
 
 use crate::par::prelude::*;
 use meshopt::{SimplifyVertex, ffi};
@@ -184,22 +184,22 @@ impl Clusters {
             if !keep(c) {
                 return false;
             }
-            let (vn, tn) = (c.verts.len(), c.tris.len());
-            self.verts.copy_within(c.verts.clone(), v);
+            let (vn, tn) = (c.verts.iter().len(), c.tris.iter().len());
+            self.verts.copy_within(c.verts, v);
             if !self.normals.is_empty() {
-                self.normals.copy_within(c.verts.clone(), v);
-                self.classes.copy_within(c.verts.clone(), v);
-                self.uvs.copy_within(c.verts.clone(), v);
+                self.normals.copy_within(c.verts, v);
+                self.classes.copy_within(c.verts, v);
+                self.uvs.copy_within(c.verts, v);
             }
             if !self.placing.is_empty() {
-                self.placing.copy_within(c.verts.clone(), v);
+                self.placing.copy_within(c.verts, v);
             }
             if !self.base.is_empty() {
-                self.base.copy_within(c.verts.clone(), v);
+                self.base.copy_within(c.verts, v);
             }
-            self.cells.copy_within(c.verts.clone(), v);
-            self.tris.copy_within(c.tris.clone(), t);
-            (c.verts, c.tris) = (v..v + vn, t..t + tn);
+            self.cells.copy_within(c.verts, v);
+            self.tris.copy_within(c.tris, t);
+            (c.verts, c.tris) = ((v..v + vn).into(), (t..t + tn).into());
             (v, t) = (v + vn, t + tn);
             true
         });
@@ -339,7 +339,7 @@ fn stages(
         for g in st.groups.iter().filter(|g| g.error == f32::INFINITY) {
             let gc = &g.clusters;
             for c in &gc.list {
-                for &k in &gc.tris[c.tris.clone()] {
+                for &k in &gc.tris[c.tris] {
                     let k = c.verts.start + usize::from(k);
                     let v = gc.verts[k];
                     let other = |of: &[u32]| of.get(k).copied().unwrap_or(v);
@@ -778,7 +778,7 @@ fn bound_groups(groups: &mut [DagGroup], step: f64) {
                 continue;
             };
             let center = groups[from].sphere.center;
-            for &cell in &g.clusters.cells[c.verts.clone()] {
+            for &cell in &g.clusters.cells[c.verts] {
                 reach[from] = reach[from].max(distance(at(cell), center));
             }
         }
@@ -884,8 +884,8 @@ fn group_of(
         }));
         out.tris.extend_from_slice(tris);
         out.list.push(DagCluster {
-            verts: v..out.verts.len(),
-            tris: t..out.tris.len(),
+            verts: (v..out.verts.len()).into(),
+            tris: (t..out.tris.len()).into(),
             refined,
             section,
         });
@@ -1149,13 +1149,13 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
                     .iter()
                     .map(|c| {
                         let v = ClusterVertices {
-                            shading: &clusters.verts[c.verts.clone()],
-                            normals: clusters.normals.get(c.verts.clone()).unwrap_or(&[]),
-                            uvs: clusters.uvs.get(c.verts.clone()).unwrap_or(&[]),
-                            placing: clusters.placing.get(c.verts.clone()).unwrap_or(&[]),
-                            cells: &clusters.cells[c.verts.clone()],
+                            shading: &clusters.verts[c.verts],
+                            normals: clusters.normals.get(c.verts).unwrap_or(&[]),
+                            uvs: clusters.uvs.get(c.verts).unwrap_or(&[]),
+                            placing: clusters.placing.get(c.verts).unwrap_or(&[]),
+                            cells: &clusters.cells[c.verts],
                         };
-                        let tris = clusters.tris[c.tris.clone()].to_vec();
+                        let tris = clusters.tris[c.tris].to_vec();
                         let mut d = cx.cluster(c.section, st.part, st.merged, v, tris);
                         let r = &mut d.record;
                         (r.self_sphere, r.self_error) = match usize::try_from(c.refined) {

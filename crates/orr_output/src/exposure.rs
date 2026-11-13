@@ -2,7 +2,7 @@
 //! the reflected-light meter value at ISO 100 with K = 12.5. An exposure `s` scales luminance
 //! to exposed values, where 1.0 is paper white.
 
-use std::ops::RangeInclusive;
+use std::range::RangeInclusive;
 
 use orr_scene::ExposureState;
 use orr_scene::orr_gpu::TextureIndex;
@@ -132,9 +132,9 @@ impl Default for AutoExposure {
     fn default() -> Self {
         Self {
             reference_ev100: 3.0,
-            range_ev100: -12.0..=20.0,
-            clamp_ev100: -12.0..=20.0,
-            filter: 0.10..=0.90,
+            range_ev100: (-12.0..=20.0).into(),
+            clamp_ev100: (-12.0..=20.0).into(),
+            filter: (0.10..=0.90).into(),
             speed_brighten: 3.0,
             speed_darken: 1.0,
             exponential_ev: 1.5,
@@ -216,9 +216,9 @@ impl CompensationCurve {
     }
 
     /// The table the GPU interpolates: `COMPENSATION_ENTRIES` evenly spaced over `range`.
-    pub(crate) fn bake(&self, range: &RangeInclusive<f32>) -> [f32; COMPENSATION_ENTRIES] {
-        let step = (range.end() - range.start()) / (COMPENSATION_ENTRIES - 1) as f32;
-        std::array::from_fn(|i| self.stops(range.start() + i as f32 * step))
+    pub(crate) fn bake(&self, range: RangeInclusive<f32>) -> [f32; COMPENSATION_ENTRIES] {
+        let step = (range.last - range.start) / (COMPENSATION_ENTRIES - 1) as f32;
+        std::array::from_fn(|i| self.stops(range.start + i as f32 * step))
     }
 }
 
@@ -294,7 +294,7 @@ mod tests {
         assert_eq!(c.stops(2.0), 0.5);
         assert_eq!(c.stops(7.0), -0.5);
         assert_eq!(c.stops(30.0), -1.0);
-        let lut = c.bake(&(-12.0..=20.0));
+        let lut = c.bake((-12.0..=20.0).into());
         assert_eq!((lut[0], lut[COMPENSATION_ENTRIES - 1]), (1.0, -1.0));
     }
 }

@@ -1433,7 +1433,7 @@ impl<'s> Importer<'s> {
                 ));
             }
             sections.push(SectionData::new(
-                indices.len()..indices.len() + tris.len(),
+                (indices.len()..indices.len() + tris.len()).into(),
                 &self.materials[m].material,
                 None,
                 Default::default(),

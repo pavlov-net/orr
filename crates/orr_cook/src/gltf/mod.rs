@@ -72,8 +72,8 @@ pub(crate) mod data;
 mod material;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::range::Range;
 use std::sync::Arc;
 
 use crate::par::prelude::*;
@@ -181,7 +181,7 @@ impl Building {
             indices.extend(std::mem::take(&mut p.indices));
             match groups.last_mut() {
                 Some((m, range)) if *m == p.material => range.end = indices.len(),
-                _ => groups.push((p.material, start..indices.len())),
+                _ => groups.push((p.material, (start..indices.len()).into())),
             }
         }
         let counts: Vec<usize> = ps.iter().map(|p| p.positions.len()).collect();
@@ -1177,7 +1177,7 @@ impl Imported<'_> {
             }
             let end = at + corners as usize;
             sections.push(SectionData::new(
-                at..end,
+                (at..end).into(),
                 &self.materials[&index].material,
                 None,
                 Default::default(),
@@ -1782,7 +1782,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
             .iter()
             .map(|(index, range)| {
                 SectionData::new(
-                    range.clone(),
+                    *range,
                     &b.materials[index].material,
                     None,
                     Default::default(),

@@ -166,8 +166,8 @@ fn white_point_and_correction_match_the_cpu_model() {
         let cct = held.cct();
         let duv = held.duv(cct) as f32;
         let cct = cct as f32;
-        let on_bound = (cct - WHITE_BALANCE_CCT.start()).abs() < 10.0
-            || (cct - WHITE_BALANCE_CCT.end()).abs() < 10.0
+        let on_bound = (cct - WHITE_BALANCE_CCT.start).abs() < 10.0
+            || (cct - WHITE_BALANCE_CCT.last).abs() < 10.0
             || (duv.abs() - WHITE_BALANCE_DUV).abs() < 1e-3;
         assert!(on_bound, "{field:?} held at {cct} K, Duv {duv}");
     }

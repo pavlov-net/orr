@@ -2083,7 +2083,7 @@ impl LightingKernels {
             } else {
                 lighting
                     .sss_max_steps
-                    .clamp(*SSS_STEPS.start(), *SSS_STEPS.end())
+                    .clamp(SSS_STEPS.start, SSS_STEPS.last)
             },
             subsurface_table: self.support.subsurface_table.gpu(),
             sss_flags: match lighting.sss_depth {

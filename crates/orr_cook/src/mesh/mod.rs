@@ -24,7 +24,7 @@ mod sets;
 pub(crate) mod tangents;
 mod thickness;
 
-use std::ops::Range;
+use std::range::Range;
 use std::sync::Arc;
 
 use crate::par::prelude::*;
@@ -689,7 +689,7 @@ pub(crate) fn cook(
         .map(|sec| {
             let vertices = m.moves.iter().flat_map(|moves| {
                 let at = |&v: &u32| Vec3::from(moves[v as usize][1]).length();
-                m.indices[sec.indices.clone()].iter().map(at)
+                m.indices[sec.indices].iter().map(at)
             });
             vertices.fold([1.0f32; 2], |[lo, hi], l| [lo.min(l), hi.max(l)])
         })
@@ -1352,7 +1352,7 @@ pub(crate) fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
     }
     for sec in &m.sections {
         let r = &sec.indices;
-        if r.start > r.end || r.end > m.indices.len() || !r.len().is_multiple_of(3) {
+        if r.start > r.end || r.end > m.indices.len() || !r.iter().len().is_multiple_of(3) {
             return Err("section index range".into());
         }
     }
@@ -2122,10 +2122,10 @@ impl MeshData {
                 .any(|r| r.start < s.indices.end && s.indices.start < r.end)
             {
                 let start = self.indices.len();
-                self.indices.extend_from_within(s.indices.clone());
-                s.indices = start..self.indices.len();
+                self.indices.extend_from_within(s.indices);
+                s.indices = (start..self.indices.len()).into();
             }
-            taken.push(s.indices.clone());
+            taken.push(s.indices);
         }
         let zeros = vec![[0.0; 2]; self.positions.len()];
         let mut corners = vec![tangents::UNREAD; self.indices.len()];
@@ -2135,7 +2135,7 @@ impl MeshData {
             // without a tangent stream.
             let other = set == usize::from(Material::TANGENT_SET_OTHER);
             let uvs = self.uvs.get(if other { 0 } else { set }).unwrap_or(&zeros);
-            let section = &self.indices[s.indices.clone()];
+            let section = &self.indices[s.indices];
             let at = |i: &u32| *i as usize;
             let positions: Vec<_> = section.iter().map(|i| self.positions[at(i)]).collect();
             let normal = |i| {
@@ -2145,7 +2145,7 @@ impl MeshData {
             };
             let normals: Vec<_> = section.iter().map(normal).collect();
             let uvs: Vec<_> = section.iter().map(|i| uvs[at(i)]).collect();
-            corners[s.indices.clone()]
+            corners[s.indices]
                 .copy_from_slice(&tangents::generate(None, &positions, &normals, &uvs));
         }
         let (tangents, copies) =

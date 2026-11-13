@@ -33,7 +33,7 @@ pub(super) fn bake(
     // Mean displacement, and summed normals and moves of a height of 1, per position over the
     // baked vertices.
     let mut at: FxHashMap<[u32; 3], (f64, DVec3, DVec3, u32, DVec3)> = FxHashMap::default();
-    for (s, r) in w.sections.iter().enumerate() {
+    for (s, &r) in w.sections.iter().enumerate() {
         let Some(disp) = maps[s].displacement.as_ref().filter(|_| baked[s]) else {
             continue;
         };
@@ -43,8 +43,8 @@ pub(super) fn bake(
                 .map(|d| d.vertex_heights(&w.uvs[d.uv_set], w.section_triangles(s)))
         });
         let frames = (along_u.is_some() || along_v.is_some())
-            .then(|| uv_frames(w, &w.indices[r.clone()], disp.uv_set));
-        for &v in &w.indices[r.clone()] {
+            .then(|| uv_frames(w, &w.indices[r], disp.uv_set));
+        for &v in &w.indices[r] {
             let height = heights[&v];
             let frame = frames.as_ref().and_then(|f| f.get(&v)).copied();
             let [u, t] = [&along_u, &along_v].map(|h| h.as_ref().map_or(0.0, |h| h[&v]));
@@ -153,7 +153,7 @@ fn split(w: &mut Welded, parts: &mut Parts, baked: &[bool], max_edge: f32) {
                 stack.push([m, b, c]);
             }
         }
-        sections.push(start..indices.len());
+        sections.push((start..indices.len()).into());
     }
     w.indices = indices;
     w.sections = sections;
@@ -225,11 +225,11 @@ fn midpoint(w: &mut Welded, a: u32, b: u32) -> u32 {
 fn smooth_normals(w: &mut Welded, baked: &[bool]) {
     let mut sums: FxHashMap<[u32; 3], DVec3> = FxHashMap::default();
     let p = |w: &Welded, v: u32| Vec3::from(w.positions[v as usize]).as_dvec3();
-    for (s, r) in w.sections.iter().enumerate() {
+    for (s, &r) in w.sections.iter().enumerate() {
         if !baked[s] {
             continue;
         }
-        for t in w.indices[r.clone()].as_chunks::<3>().0 {
+        for t in w.indices[r].as_chunks::<3>().0 {
             let face = (p(w, t[1]) - p(w, t[0])).cross(p(w, t[2]) - p(w, t[0]));
             for &v in t {
                 *sums
@@ -291,7 +291,7 @@ pub(super) fn simplify(
             indices.extend_from_slice(&p.indices);
             of_triangle.extend(std::iter::repeat_n(p.part, p.indices.len() / 3));
         }
-        sections.push(start..indices.len());
+        sections.push((start..indices.len()).into());
     }
     w.indices = indices;
     w.sections = sections;

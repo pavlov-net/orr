@@ -204,7 +204,7 @@ fn pieces(m: &MeshData, min: u32) -> Vec<Piece> {
         join(&mut parent, first, v as u32);
     }
     for sec in &m.sections {
-        for c in m.indices[sec.indices.clone()].as_chunks::<3>().0 {
+        for c in m.indices[sec.indices].as_chunks::<3>().0 {
             join(&mut parent, c[0], c[1]);
             join(&mut parent, c[0], c[2]);
         }
@@ -213,7 +213,7 @@ fn pieces(m: &MeshData, min: u32) -> Vec<Piece> {
     let mut tris_of: FxHashMap<u32, Vec<Tri>> = FxHashMap::default();
     let mut skip: FxHashSet<u32> = FxHashSet::default();
     for (s, sec) in m.sections.iter().enumerate() {
-        for c in m.indices[sec.indices.clone()].as_chunks::<3>().0 {
+        for c in m.indices[sec.indices].as_chunks::<3>().0 {
             let r = root(&mut parent, c[0]);
             if c.iter().any(|&v| animated(v)) {
                 skip.insert(r);
@@ -527,7 +527,7 @@ fn unit_mesh(m: &MeshData, p: &Piece) -> (MeshData, Vec<u16>) {
             sources.push(t.section);
             let at = out.indices.len();
             out.sections.push(SectionData {
-                indices: at..at,
+                indices: (at..at).into(),
                 ..m.sections[usize::from(t.section)].clone()
             });
         }
@@ -568,7 +568,7 @@ fn remainder(m: &MeshData, mut removed: Vec<Vec<[u32; 3]>>) -> MeshData {
     for (s, sec) in m.sections.iter().enumerate() {
         removed[s].sort_unstable();
         let start = indices.len();
-        for c in m.indices[sec.indices.clone()].as_chunks::<3>().0 {
+        for c in m.indices[sec.indices].as_chunks::<3>().0 {
             let mut k = *c;
             k.sort_unstable();
             if removed[s].binary_search(&k).is_ok() {
@@ -583,7 +583,7 @@ fn remainder(m: &MeshData, mut removed: Vec<Vec<[u32; 3]>>) -> MeshData {
             }
         }
         sections.push(SectionData {
-            indices: start..indices.len(),
+            indices: (start..indices.len()).into(),
             ..sec.clone()
         });
     }
@@ -745,7 +745,7 @@ mod tests {
                 let first = indices.len();
                 indices.extend(tris.iter().flatten());
                 out.push(SectionData {
-                    indices: first..indices.len(),
+                    indices: (first..indices.len()).into(),
                     flags: 0,
                     subsurface: false,
                     maps: MapSpec::default(),
@@ -828,7 +828,7 @@ mod tests {
     fn tri_set(m: &MeshData, sections: &[u16], t: impl Fn(Vec3) -> Vec3) -> TriSet {
         let mut out = Vec::new();
         for (s, sec) in m.sections.iter().enumerate() {
-            for c in m.indices[sec.indices.clone()].as_chunks::<3>().0 {
+            for c in m.indices[sec.indices].as_chunks::<3>().0 {
                 let p = [0, 1, 2].map(|k| t(Vec3::from(m.positions[c[k] as usize])));
                 out.push((sections[s], p));
             }

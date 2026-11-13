@@ -370,11 +370,11 @@ fn references_match_the_cpu_mix() {
 fn exposure_stays_inside_the_clamp_window() {
     let mut h = Harness::new(SIDE, SIDE);
     h.set_image(&natural_image(h.pixels(), 0.0, 1.0));
-    let window = 4.0f32..=6.0;
+    let window = std::range::RangeInclusive::from(4.0f32..=6.0);
     for physiological in [None, Some(Physiological::default())] {
         let output = ViewOutput {
             exposure: Exposure::Auto(AutoExposure {
-                clamp_ev100: window.clone(),
+                clamp_ev100: window,
                 physiological,
                 ..AutoExposure::default()
             }),

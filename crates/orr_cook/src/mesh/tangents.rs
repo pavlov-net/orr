@@ -195,7 +195,7 @@ pub(super) fn check(
         .iter()
         .map(|&(sec, map, set, _)| {
             let largest = largest(map);
-            m.indices[sec.indices.clone()]
+            m.indices[sec.indices]
                 .par_chunks(3 * CHUNK)
                 .map(|chunk| {
                     let mut area = 0u64;
@@ -221,7 +221,7 @@ pub(super) fn check(
     for (sec, map, set, frame) in checked {
         let largest = largest(map);
         let first = sec.indices.start / 3;
-        let (h, n) = m.indices[sec.indices.clone()]
+        let (h, n) = m.indices[sec.indices]
             .par_chunks(3 * CHUNK)
             .enumerate()
             .fold(

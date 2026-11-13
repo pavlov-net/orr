@@ -1,11 +1,14 @@
 //! Auto white balance settings.
 
-use std::ops::RangeInclusive;
+use std::range::RangeInclusive;
 
 use crate::MeterWeights;
 
 /// The correlated color temperatures, in kelvin, a white point is held inside.
-pub const WHITE_BALANCE_CCT: RangeInclusive<f32> = 2500.0..=7000.0;
+pub const WHITE_BALANCE_CCT: RangeInclusive<f32> = RangeInclusive {
+    start: 2500.0,
+    last: 7000.0,
+};
 
 /// The largest distance from the Planckian locus, in CIE 1960 uv, a white point keeps.
 pub const WHITE_BALANCE_DUV: f32 = 0.05;

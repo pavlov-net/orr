@@ -19,8 +19,10 @@ pub enum SubsurfaceDepth {
 
 /// The range of [`ViewLighting::sss_max_steps`](crate::ViewLighting::sss_max_steps): the
 /// step caps the subsurface table covers.
-pub const SSS_STEPS: std::ops::RangeInclusive<u32> =
-    table::CAPS[0]..=table::CAPS[table::CAPS.len() - 1];
+pub const SSS_STEPS: std::range::RangeInclusive<u32> = std::range::RangeInclusive {
+    start: table::CAPS[0],
+    last: table::CAPS[table::CAPS.len() - 1],
+};
 
 /// The subsurface table on the GPU, which every walk reads through
 /// [`PathRoot::subsurface_table`](crate::types::PathRoot::subsurface_table): what a walk stopped

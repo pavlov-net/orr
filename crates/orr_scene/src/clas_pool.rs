@@ -1374,7 +1374,7 @@ pub(crate) fn build_pages(
     // Builds of at most `clas_triangles` triangles, clusters with micromaps in builds of
     // their own. A cluster's results index is its place in `members`.
     let mut members: Vec<(usize, usize)> = Vec::new();
-    let mut builds: Vec<(bool, std::ops::Range<usize>)> = Vec::new();
+    let mut builds: Vec<(bool, std::range::Range<usize>)> = Vec::new();
     for with_omm in [false, true] {
         let start = members.len();
         for (pi, p) in pages.iter().enumerate() {
@@ -1392,7 +1392,7 @@ pub(crate) fn build_pages(
         builds.extend(
             batches(&tris, clas_triangles)
                 .into_iter()
-                .map(|r| (with_omm, start + r.start..start + r.end)),
+                .map(|r| (with_omm, (start + r.start..start + r.end).into())),
         );
     }
     let mut slots: Vec<Vec<u32>> = pages.iter().map(|p| vec![0; p.clusters.len()]).collect();
@@ -1460,8 +1460,8 @@ pub(crate) fn build_pages(
         }));
     }
 
-    let batch = |range: &std::ops::Range<usize>, with_omm: bool| {
-        let sources = members[range.clone()].iter().map(|&(pi, local)| {
+    let batch = |range: std::range::Range<usize>, with_omm: bool| {
+        let sources = members[range].iter().map(|&(pi, local)| {
             let p = &pages[pi];
             let c = &p.clusters[local];
             ClasSource {
@@ -1476,7 +1476,7 @@ pub(crate) fn build_pages(
         });
         clas_batch(sources, ClusterBuild::Clas { omm: with_omm })
     };
-    let batches: Vec<ClasBatch> = builds.iter().map(|(w, r)| batch(r, *w)).collect();
+    let batches: Vec<ClasBatch> = builds.iter().map(|&(w, r)| batch(r, w)).collect();
 
     // Scratch regions: per build its positions, flags, micromap indices, records, record
     // count, implicit results and build scratch; per micromap its build scratch; then the

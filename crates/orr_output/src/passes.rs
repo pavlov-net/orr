@@ -2,7 +2,7 @@
 //! balance (meter and adapt), local exposure, motion blur, depth of field, glare, tonemap,
 //! compose and compose-UI, and screenshot capture.
 
-use std::ops::RangeInclusive;
+use std::range::RangeInclusive;
 
 use bytemuck::Pod;
 use orr_scene::orr_gpu::{
@@ -755,10 +755,9 @@ impl OutputKernels {
                     *curve != auto.compensation || *range != auto.range_ev100
                 });
                 if stale {
-                    let lut = auto.compensation.bake(&auto.range_ev100);
+                    let lut = auto.compensation.bake(auto.range_ev100);
                     roots.put(COMPENSATION, &lut);
-                    roots.compensation =
-                        Some((auto.compensation.clone(), auto.range_ev100.clone()));
+                    roots.compensation = Some((auto.compensation.clone(), auto.range_ev100));
                 }
                 (adapt_params(auto), Some(auto))
             }
@@ -1220,19 +1219,19 @@ const HISTOGRAM_ONLY: MeterWeights = MeterWeights {
 };
 
 fn adapt_params(auto: &AutoExposure) -> AdaptParams {
-    let range = &auto.range_ev100;
+    let range = auto.range_ev100;
     let weights = auto.references.unwrap_or(HISTOGRAM_ONLY);
     let long = auto.physiological.unwrap_or_default();
     AdaptParams {
         mode: 1,
         manual_ev100: 0.0,
         physiological: u32::from(auto.physiological.is_some()),
-        ev_min: *range.start(),
-        bin_ev: (range.end() - range.start()) / HISTOGRAM_BINS as f32,
-        filter_low: *auto.filter.start(),
-        filter_high: *auto.filter.end(),
-        clamp_min: *auto.clamp_ev100.start(),
-        clamp_max: *auto.clamp_ev100.end(),
+        ev_min: range.start,
+        bin_ev: (range.last - range.start) / HISTOGRAM_BINS as f32,
+        filter_low: auto.filter.start,
+        filter_high: auto.filter.last,
+        clamp_min: auto.clamp_ev100.start,
+        clamp_max: auto.clamp_ev100.last,
         speed_brighten: auto.speed_brighten,
         speed_darken: auto.speed_darken,
         exponential_ev: auto.exponential_ev,

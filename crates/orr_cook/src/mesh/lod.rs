@@ -31,7 +31,7 @@ pub(super) struct Welded {
     pub(super) pivots: Option<Vec<[f32; 3]>>,
     pub(super) indices: Vec<u32>,
     /// Section index range per section.
-    pub(super) sections: Vec<std::ops::Range<usize>>,
+    pub(super) sections: Vec<std::range::Range<usize>>,
     /// Per vertex [`Self::wedge`] adds, the vertex it stands for.
     pub(super) stands_for: FxHashMap<u32, u32>,
 }
@@ -99,7 +99,7 @@ impl Welded {
                 .map(|p| meshopt::remap_vertex_buffer(&p.values, count, &remap)),
             pivots: pivots.map(remap_all),
             indices: meshopt::remap_index_buffer(Some(&m.indices), count, &remap),
-            sections: m.sections.iter().map(|s| s.indices.clone()).collect(),
+            sections: m.sections.iter().map(|s| s.indices).collect(),
             stands_for: FxHashMap::default(),
         }
     }
@@ -112,7 +112,7 @@ impl Welded {
     }
 
     pub(super) fn section_triangles(&self, s: usize) -> impl Iterator<Item = [u32; 3]> + '_ {
-        let r = self.sections[s].clone();
+        let r = self.sections[s];
         self.indices[r].as_chunks::<3>().0.iter().copied()
     }
 
@@ -878,8 +878,8 @@ impl Parts {
         // value (and its triangle's section).
         let mut vertex_pivots: Vec<Option<[f32; 3]>> = vec![None; total];
         if let Some(piv) = &w.pivots {
-            for (s, r) in w.sections.iter().enumerate() {
-                for &i in &w.indices[r.clone()] {
+            for (s, &r) in w.sections.iter().enumerate() {
+                for &i in &w.indices[r] {
                     let index = usize::from(values[i as usize]) * per_value
                         + if p.by_section { s } else { 0 };
                     let q = piv[i as usize];
