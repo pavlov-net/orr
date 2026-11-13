@@ -527,8 +527,7 @@ fn bake_model(
     let name = models[m].name.clone().unwrap_or_default();
     let (prototype, skel_root) = (models[m].prototype, models[m].root);
     let first_copy = models[m].first_copy;
-    models.push(Building::new(Some(format!("{name}/baked/{k}")), None, None));
-    let baked = models.last_mut().expect("pushed");
+    let baked = models.push_mut(Building::new(Some(format!("{name}/baked/{k}")), None, None));
     baked.prototype = prototype;
     baked.root = skel_root;
     baked.first_copy = first_copy;
@@ -2007,10 +2006,12 @@ impl<'s> Importer<'s> {
                             None if sites.is_empty() => model,
                             None => {
                                 let name = format!("{name}/{}", self.site_name(root, b.site));
-                                models.push(Building::new(Some(name), None, None));
-                                models.last_mut().expect("pushed").prototype = Some(root);
-                                also.push(models.len() - 1);
-                                models.len() - 1
+                                let m = models.len();
+                                models
+                                    .push_mut(Building::new(Some(name), None, None))
+                                    .prototype = Some(root);
+                                also.push(m);
+                                m
                             }
                         };
                         sites.push((b.site, m));
@@ -2039,10 +2040,11 @@ impl<'s> Importer<'s> {
         for h in instancing.meshes.iter_mut().filter(|h| h.1 == model) {
             if !sites.is_empty() && !bound.contains_key(&h.0) && moves(h.0) {
                 h.1 = *rigged.get_or_insert_with(|| {
-                    models.push(Building::new(Some(format!("{name}/moved")), None, None));
-                    models.last_mut().expect("pushed").prototype = Some(root);
-                    also.push(models.len() - 1);
-                    models.len() - 1
+                    let m = models.len();
+                    let moved = Building::new(Some(format!("{name}/moved")), None, None);
+                    models.push_mut(moved).prototype = Some(root);
+                    also.push(m);
+                    m
                 });
             }
         }
