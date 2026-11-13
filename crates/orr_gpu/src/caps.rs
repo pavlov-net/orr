@@ -91,7 +91,7 @@ pub struct Caps {
     pub perf_counters: bool,
     /// Submits can carry frame boundaries for capture tools.
     pub frame_boundary: bool,
-    /// Pipeline creation logs register, shared-memory and spill counts.
+    /// Pipeline creation logs, at debug level, every statistic the driver reports for the pipeline.
     pub pipeline_executable_info: bool,
     /// Conservative rasterization (`VK_EXT_conservative_rasterization`) for
     /// [`crate::RasterState::conservative`].

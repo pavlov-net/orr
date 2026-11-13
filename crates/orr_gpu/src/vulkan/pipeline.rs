@@ -93,9 +93,12 @@ impl Drop for ComputePipeline {
 }
 
 impl Shared {
-    /// Logs registers, shared memory and spills per executable.
+    /// Logs every statistic the driver reports for each of the pipeline's executables.
     fn log_statistics(&self, pipeline: vk::Pipeline, name: &str) {
         let Some(exec) = &self.exec_fn else { return };
+        if !log::log_enabled!(log::Level::Debug) {
+            return;
+        }
         let info = vk::PipelineInfoKHR::default().pipeline(pipeline);
         // SAFETY: the pipeline was created with CAPTURE_STATISTICS.
         let count = unsafe { exec.get_pipeline_executable_properties_len(&info) }.unwrap_or(0);
@@ -116,15 +119,12 @@ impl Shared {
                     .name_as_c_str()
                     .map(|c| c.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                if !(label.contains("Register")
-                    || label.contains("Spill")
-                    || label.contains("Shared"))
-                {
-                    continue;
-                }
                 // SAFETY: the format says which union member is set.
                 let value = unsafe {
                     match s.format {
+                        vk::PipelineExecutableStatisticFormatKHR::BOOL32 => {
+                            (s.value.b32 != vk::FALSE).to_string()
+                        }
                         vk::PipelineExecutableStatisticFormatKHR::UINT64 => s.value.u64.to_string(),
                         vk::PipelineExecutableStatisticFormatKHR::INT64 => s.value.i64.to_string(),
                         vk::PipelineExecutableStatisticFormatKHR::FLOAT64 => {
