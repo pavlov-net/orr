@@ -259,7 +259,7 @@ pub(super) fn add_shader(code: &[u32]) {
     let Some(lib) = library() else { return };
     let mut hash = ShaderHash(0);
     // SAFETY: `code` is a SPIR-V module of the stated size.
-    if unsafe { (lib.hash_spirv)(lib.version, &spirv(code), &mut hash) } != RESULT_SUCCESS {
+    if unsafe { (lib.hash_spirv)(lib.version, &spirv(code), &raw mut hash) } != RESULT_SUCCESS {
         return;
     }
     if let Some(s) = state().as_mut() {
@@ -279,7 +279,14 @@ pub(super) fn add_sidecar(stripped: &[u32], sidecar: &[u8]) {
     };
     let mut name = DebugName([0; 128]);
     // SAFETY: both are SPIR-V modules of the stated sizes.
-    let r = unsafe { (lib.debug_name_spirv)(lib.version, &full, &spirv(stripped), &mut name) };
+    let r = unsafe {
+        (lib.debug_name_spirv)(
+            lib.version,
+            &raw const full,
+            &spirv(stripped),
+            &raw mut name,
+        )
+    };
     if r != RESULT_SUCCESS {
         log::warn!("GFSDK_Aftermath_GetShaderDebugNameSpirv returned {r:#x}");
         return;
@@ -299,7 +306,7 @@ pub(super) fn wait_for_dump() -> Option<PathBuf> {
     let mut status = STATUS_NOT_STARTED;
     while start.elapsed() < DUMP_TIMEOUT {
         // SAFETY: plain status query.
-        unsafe { (lib.status)(&mut status) };
+        unsafe { (lib.status)(&raw mut status) };
         if status == STATUS_FINISHED || status == STATUS_COLLECTING_FAILED {
             break;
         }
@@ -340,7 +347,7 @@ fn decode(lib: &Library, dump: &[u8]) -> Result<String, String> {
             lib.version,
             dump.as_ptr().cast(),
             dump.len() as u32,
-            &mut decoder,
+            &raw mut decoder,
         )
     };
     if r != RESULT_SUCCESS {
@@ -357,7 +364,7 @@ fn decode(lib: &Library, dump: &[u8]) -> Result<String, String> {
             lookup_shader,
             lookup_source,
             std::ptr::null_mut(),
-            &mut size,
+            &raw mut size,
         )
     };
     let mut json = vec![0u8; size as usize];
@@ -397,7 +404,7 @@ unsafe extern "C" fn on_debug_info(data: *const c_void, size: u32, _: *mut c_voi
     let Some(lib) = library() else { return };
     let mut id = DebugInfoId([0; 2]);
     // SAFETY: Aftermath passes `size` bytes of debug info for the duration of the call.
-    unsafe { (lib.debug_info_id)(lib.version, data, size, &mut id) };
+    unsafe { (lib.debug_info_id)(lib.version, data, size, &raw mut id) };
     // SAFETY: as above.
     let blob = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size as usize) }.to_vec();
     if let Some(s) = state().as_mut() {

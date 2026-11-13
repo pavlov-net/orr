@@ -142,8 +142,7 @@ impl CpuLibrary {
                 .map_err(compile_err)?;
             let stem = path
                 .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
+                .map_or_default(|s| s.to_string_lossy().into_owned());
             let module = session.load(&stem, &path, &text).map_err(compile_err)?;
             inputs.extend(module.dependencies());
             modules.push(module);

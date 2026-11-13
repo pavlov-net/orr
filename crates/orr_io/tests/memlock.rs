@@ -70,7 +70,7 @@ fn a_ring_reads_into_registered_buffers_and_by_address_past_the_memory_lock_limi
         rlim_max: 0,
     };
     // SAFETY: `limit` is written only during the call.
-    let got = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) };
+    let got = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &raw mut limit) };
     assert_eq!(got, 0);
     let Some(ring) = Ring::native(&buffers) else {
         #[allow(clippy::print_stderr)]
@@ -98,7 +98,7 @@ fn a_ring_reads_into_registered_buffers_and_by_address_past_the_memory_lock_limi
 
     limit.rlim_cur = 0;
     // SAFETY: lowers the soft limit only, which needs no privilege.
-    let set = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) };
+    let set = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &raw const limit) };
     assert_eq!(set, 0);
     // Kernels before 5.12 charge the ring itself to the limit.
     let Some(ring) = Ring::native(&buffers) else {

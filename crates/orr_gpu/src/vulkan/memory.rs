@@ -205,7 +205,7 @@ impl<T> Allocation<T> {
         // SAFETY: `this` is never used or dropped again; the buffer is taken and the Arc
         // released exactly once.
         unsafe {
-            std::ptr::drop_in_place(&mut this.shared);
+            std::ptr::drop_in_place(&raw mut this.shared);
             ManuallyDrop::take(&mut this.raw)
         }
     }

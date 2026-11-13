@@ -163,7 +163,7 @@ impl Shared {
         let create = vk::IndirectExecutionSetCreateInfoEXT::default()
             .ty(vk::IndirectExecutionSetInfoTypeEXT::PIPELINES)
             .info(vk::IndirectExecutionSetInfoEXT {
-                p_pipeline_info: &info,
+                p_pipeline_info: &raw const info,
             });
         // SAFETY: valid create info; every pipeline was created indirect-bindable.
         set.raw = unsafe { f.create_indirect_execution_set(&create, None) }
@@ -228,13 +228,13 @@ impl Shared {
             vk::IndirectCommandsLayoutTokenEXT::default()
                 .ty(vk::IndirectCommandsTokenTypeEXT::EXECUTION_SET)
                 .data(vk::IndirectCommandsTokenDataEXT {
-                    p_execution_set: &set_token,
+                    p_execution_set: &raw const set_token,
                 })
                 .offset(0),
             vk::IndirectCommandsLayoutTokenEXT::default()
                 .ty(vk::IndirectCommandsTokenTypeEXT::PUSH_DATA)
                 .data(vk::IndirectCommandsTokenDataEXT {
-                    p_push_constant: &push,
+                    p_push_constant: &raw const push,
                 })
                 .offset(ROOT_OFFSET),
             vk::IndirectCommandsLayoutTokenEXT::default()

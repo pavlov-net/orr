@@ -58,7 +58,7 @@ impl VirtualBlock {
         };
         let mut raw = ptr::null_mut();
         // SAFETY: valid create info and out pointer.
-        if unsafe { sys::vmaCreateVirtualBlock(&info, &mut raw) } != sys::VK_SUCCESS {
+        if unsafe { sys::vmaCreateVirtualBlock(&raw const info, &raw mut raw) } != sys::VK_SUCCESS {
             return Err(AllocError);
         }
         Ok(Self { raw, generation: 0 })
@@ -80,7 +80,9 @@ impl VirtualBlock {
         let mut raw = ptr::null_mut();
         let mut offset = 0;
         // SAFETY: a live block, valid create info and out pointers.
-        let r = unsafe { sys::vmaVirtualAllocate(self.raw, &info, &mut raw, &mut offset) };
+        let r = unsafe {
+            sys::vmaVirtualAllocate(self.raw, &raw const info, &raw mut raw, &raw mut offset)
+        };
         if r != sys::VK_SUCCESS {
             return Err(AllocError);
         }
@@ -114,7 +116,7 @@ impl VirtualBlock {
     pub fn stats(&self) -> VirtualStats {
         let mut s = sys::VmaDetailedStatistics::default();
         // SAFETY: a live block and an out pointer.
-        unsafe { sys::vmaCalculateVirtualBlockStatistics(self.raw, &mut s) };
+        unsafe { sys::vmaCalculateVirtualBlockStatistics(self.raw, &raw mut s) };
         VirtualStats {
             allocations: s.statistics.allocationCount,
             allocation_bytes: s.statistics.allocationBytes,

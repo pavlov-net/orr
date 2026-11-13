@@ -877,7 +877,7 @@ impl<'q> CommandList<'q> {
             });
         // SAFETY: recording on a graphics or compute queue with the extension enabled; the
         // list is the caller's live allocation.
-        unsafe { (f.fp().cmd_copy_memory_indirect_khr)(self.cmd(), &info) };
+        unsafe { (f.fp().cmd_copy_memory_indirect_khr)(self.cmd(), &raw const info) };
     }
 
     /// Copies the regions listed at `regions` into `dst`, one per entry of `layers`, which
@@ -922,7 +922,7 @@ impl<'q> CommandList<'q> {
             .image_subresources(&subresources);
         // SAFETY: recording on a graphics or compute queue with the extension enabled; the
         // texture is in GENERAL and the list is the caller's live allocation.
-        unsafe { (f.fp().cmd_copy_memory_to_image_indirect_khr)(self.cmd(), &info) };
+        unsafe { (f.fp().cmd_copy_memory_to_image_indirect_khr)(self.cmd(), &raw const info) };
     }
 
     fn indirect_copy_fn(&self) -> &'q ash::khr::copy_memory_indirect::Device {
@@ -957,7 +957,7 @@ impl<'q> CommandList<'q> {
             .occupancy_priority(priority)
             .occupancy_throttling(throttling);
         // SAFETY: recording on a compute queue with the extension enabled.
-        unsafe { (f.fp().cmd_set_compute_occupancy_priority_nv)(self.cmd(), &params) };
+        unsafe { (f.fp().cmd_set_compute_occupancy_priority_nv)(self.cmd(), &raw const params) };
     }
 
     /// Opens a named pass: a debug label and GPU timestamps, and with `stats` shader

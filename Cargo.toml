@@ -93,6 +93,7 @@ unused_dependencies = "warn"
 unsafe_op_in_unsafe_fn = "deny"
 unused_qualifications = "warn"
 unreachable_pub = "warn"
+raw_borrows_via_references = "warn"
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
@@ -118,6 +119,11 @@ large_enum_variant = "warn"
 redundant_clone = "warn"
 trivially_copy_pass_by_ref = "warn"
 todo = "warn"
+manual_bit_width = "warn"
+manual_ilog2 = "warn"
+manual_is_power_of_two = "warn"
+map_unwrap_or = "warn"
+borrow_as_ptr = "warn"
 
 [profile.dev.package."*"]
 opt-level = 3

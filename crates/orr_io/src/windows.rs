@@ -116,7 +116,7 @@ pub(crate) fn read_overlapped(
             buf.as_mut_ptr().cast(),
             len,
             std::ptr::null_mut(),
-            &mut overlapped,
+            &raw mut overlapped,
         )
     };
     if started == 0 {
@@ -127,7 +127,7 @@ pub(crate) fn read_overlapped(
     }
     let mut n = 0;
     // SAFETY: the read above uses this handle and `overlapped`.
-    if unsafe { GetOverlappedResult(handle, &overlapped, &mut n, 1) } == 0 {
+    if unsafe { GetOverlappedResult(handle, &raw const overlapped, &raw mut n, 1) } == 0 {
         return read_error(io::Error::last_os_error());
     }
     Ok(n as usize)
@@ -191,7 +191,7 @@ pub(crate) fn physical_memory() -> Option<u64> {
         ..Default::default()
     };
     // SAFETY: `status` is a valid MEMORYSTATUSEX with its length set.
-    let got = unsafe { GlobalMemoryStatusEx(&mut status) };
+    let got = unsafe { GlobalMemoryStatusEx(&raw mut status) };
     (got != 0).then_some(status.ullTotalPhys)
 }
 
@@ -334,7 +334,7 @@ impl OsRing {
         };
         let mut ring = std::ptr::null_mut();
         // SAFETY: plain ring creation into `ring`.
-        unsafe { create(IORING_VERSION_3, flags, 256, 512, &mut ring) }
+        unsafe { create(IORING_VERSION_3, flags, 256, 512, &raw mut ring) }
             .ok()
             .ok()?;
         let ring = Self {
@@ -369,12 +369,12 @@ impl OsRing {
         .ok()?;
         let mut submitted = 0;
         // SAFETY: the ring is live; waits for the registration.
-        unsafe { (ring.fns.submit)(ring.ring, 1, INFINITE, &mut submitted) }
+        unsafe { (ring.fns.submit)(ring.ring, 1, INFINITE, &raw mut submitted) }
             .ok()
             .ok()?;
         let mut cqe = IORING_CQE::default();
         // SAFETY: the ring is live; `cqe` is written on S_OK.
-        let popped = unsafe { (ring.fns.pop)(ring.ring, &mut cqe) }.0 == S_OK;
+        let popped = unsafe { (ring.fns.pop)(ring.ring, &raw mut cqe) }.0 == S_OK;
         (popped && cqe.UserData == REGISTRATION && cqe.ResultCode.is_ok()).then_some(ring)
     }
 
@@ -466,7 +466,7 @@ impl OsRing {
         if self.unsubmitted {
             let mut submitted = 0;
             // SAFETY: the ring is live; no wait.
-            let h = unsafe { (self.fns.submit)(self.ring, 0, 0, &mut submitted) };
+            let h = unsafe { (self.fns.submit)(self.ring, 0, 0, &raw mut submitted) };
             // Entries a failed submit leaves in the queue go with the next one; setting the
             // event makes the next wait return so that it happens. Reads already in the kernel
             // keep their slots and buffers until they complete.
@@ -482,7 +482,7 @@ impl OsRing {
     pub(crate) fn wait(&mut self) -> bool {
         let mut submitted = 0;
         // SAFETY: the ring is live; waits for one completion.
-        let h = unsafe { (self.fns.submit)(self.ring, 1, 1000, &mut submitted) };
+        let h = unsafe { (self.fns.submit)(self.ring, 1, 1000, &raw mut submitted) };
         h.0 != IORING_E_CORRUPT
     }
 
@@ -492,7 +492,7 @@ impl OsRing {
         loop {
             let mut cqe = IORING_CQE::default();
             // SAFETY: the ring is live; `cqe` is written on S_OK.
-            if unsafe { (self.fns.pop)(self.ring, &mut cqe) }.0 != S_OK {
+            if unsafe { (self.fns.pop)(self.ring, &raw mut cqe) }.0 != S_OK {
                 return None;
             }
             if cqe.UserData & REGISTRATION != 0 {
@@ -545,7 +545,7 @@ mod tests {
         unsafe {
             let query = GetProcAddress(lib, c"QueryIoRingCapabilities".as_ptr().cast())?;
             let query = std::mem::transmute::<Proc, QueryIoRingCapabilities>(query);
-            query(&mut capabilities).ok().ok()?;
+            query(&raw mut capabilities).ok().ok()?;
         }
         Some(capabilities.MaxVersion)
     }

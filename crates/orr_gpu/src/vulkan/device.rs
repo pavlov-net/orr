@@ -903,10 +903,7 @@ fn create_instance(
             ext_names.push(name.as_ptr());
         }
     }
-    let hooked = desc
-        .hooks
-        .map(|h| h.instance_extensions(entry))
-        .unwrap_or_default();
+    let hooked = desc.hooks.map_or_default(|h| h.instance_extensions(entry));
     #[cfg(feature = "nsight-perf")]
     let hooked = [hooked, perf_extensions.to_vec()].concat();
     for name in &hooked {

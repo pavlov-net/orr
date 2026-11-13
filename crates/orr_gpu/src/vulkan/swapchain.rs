@@ -610,8 +610,8 @@ impl Swapchain {
             (timing.fp().get_swapchain_timing_properties_ext)(
                 self.shared().device.handle(),
                 locked.raw,
-                &mut props,
-                &mut counter,
+                &raw mut props,
+                &raw mut counter,
             )
         };
         if r != vk::Result::SUCCESS {

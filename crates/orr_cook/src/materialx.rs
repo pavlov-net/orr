@@ -918,7 +918,7 @@ fn network(
         // A value keeps the scope of the input that states it, wherever it is read.
         let (n, _, e, unit) = filenames
             .iter()
-            .find(|s| std::ptr::eq(&net.nodes[s.0].inputs[&s.1], read))
+            .find(|s| std::ptr::eq(&raw const net.nodes[s.0].inputs[&s.1], read))
             .unwrap_or(f);
         let layer = match net.nodes[f.0].inputs.get("layer").map(|l| through(&net, l)) {
             Some(Input::Text(l)) if !l.is_empty() => Layer::Named(l.clone()),

@@ -152,8 +152,14 @@ impl GDeflate for Libdeflate {
             };
             // SAFETY: one page of at most 64 KiB in, into a buffer of the bound's length; the
             // compressor is this thread's.
-            let done =
-                unsafe { libdeflate_gdeflate_compress_ex(c.ptr.as_ptr(), &input, &mut output, 1) };
+            let done = unsafe {
+                libdeflate_gdeflate_compress_ex(
+                    c.ptr.as_ptr(),
+                    &raw const input,
+                    &raw mut output,
+                    1,
+                )
+            };
             if done != 1 || output.nbytes == 0 || output.nbytes > bound {
                 out.truncate(at);
                 return Err(Error::Encode(format!(
@@ -190,11 +196,11 @@ impl GDeflate for Libdeflate {
             let r = unsafe {
                 libdeflate_gdeflate_decompress(
                     d.ptr.as_ptr(),
-                    &mut input,
+                    &raw mut input,
                     1,
                     dst.as_mut_ptr().cast(),
                     dst.len(),
-                    &mut written,
+                    &raw mut written,
                 )
             };
             if r != 0 || written != dst.len() {

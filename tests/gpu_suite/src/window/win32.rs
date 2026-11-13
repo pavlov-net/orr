@@ -52,7 +52,7 @@ impl Window {
                 ..Default::default()
             };
             // A second registration fails harmlessly.
-            RegisterClassW(&wc);
+            RegisterClassW(&raw const wc);
             let hwnd = CreateWindowExW(
                 0,
                 class.as_ptr(),
@@ -105,9 +105,9 @@ impl Window {
         // SAFETY: the message loop of the thread that owns the window.
         unsafe {
             let mut msg = MSG::default();
-            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE as u32) != 0 {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+            while PeekMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE as u32) != 0 {
+                TranslateMessage(&raw const msg);
+                DispatchMessageW(&raw const msg);
             }
         }
         !CLOSED.load(Ordering::Relaxed)
@@ -134,7 +134,7 @@ impl Window {
     pub fn client_size(&self) -> [u32; 2] {
         let mut rc = RECT::default();
         // SAFETY: the window is live.
-        unsafe { GetClientRect(self.hwnd, &mut rc) };
+        unsafe { GetClientRect(self.hwnd, &raw mut rc) };
         [(rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32]
     }
 }

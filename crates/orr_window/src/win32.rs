@@ -306,7 +306,7 @@ pub fn hardware_scheduling(adapter_luid: [u8; 8]) -> Option<bool> {
         hAdapter: D3DKMT_HANDLE::default(),
     };
     // SAFETY: a plain struct the call fills.
-    if unsafe { D3DKMTOpenAdapterFromLuid(&mut open) }.is_err() {
+    if unsafe { D3DKMTOpenAdapterFromLuid(&raw mut open) }.is_err() {
         return None;
     }
     let mut caps = D3DKMT_WDDM_2_7_CAPS::default();
@@ -317,7 +317,7 @@ pub fn hardware_scheduling(adapter_luid: [u8; 8]) -> Option<bool> {
         PrivateDriverDataSize: size_of::<D3DKMT_WDDM_2_7_CAPS>() as u32,
     };
     // SAFETY: `query` points at a caps struct of the size it states.
-    let read = unsafe { D3DKMTQueryAdapterInfo(&mut query) }.is_ok();
+    let read = unsafe { D3DKMTQueryAdapterInfo(&raw mut query) }.is_ok();
     // SAFETY: the adapter was opened above.
     let _ = unsafe {
         D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER {
@@ -404,16 +404,16 @@ fn refresh_hz(hwnd: HWND) -> Option<f32> {
         // SAFETY: plain out-parameter calls with buffers of the reported sizes.
         let paths = unsafe {
             let flags = QDC_ONLY_ACTIVE_PATHS as u32;
-            if GetDisplayConfigBufferSizes(flags, &mut path_count, &mut mode_count) != 0 {
+            if GetDisplayConfigBufferSizes(flags, &raw mut path_count, &raw mut mode_count) != 0 {
                 return None;
             }
             let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
             let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
             let status = QueryDisplayConfig(
                 flags,
-                &mut path_count,
+                &raw mut path_count,
                 paths.as_mut_ptr(),
-                &mut mode_count,
+                &raw mut mode_count,
                 modes.as_mut_ptr(),
                 std::ptr::null_mut(),
             );
@@ -437,7 +437,7 @@ fn refresh_hz(hwnd: HWND) -> Option<f32> {
                 ..Default::default()
             };
             // SAFETY: the header names a SOURCE_DEVICE_NAME request of the right size.
-            if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } != 0
+            if unsafe { DisplayConfigGetDeviceInfo(&raw mut source.header) } != 0
                 || until_nul(&source.viewGdiDeviceName) != device
             {
                 return None;

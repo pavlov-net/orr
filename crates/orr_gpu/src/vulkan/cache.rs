@@ -46,7 +46,7 @@ fn data_size(device: &ash::Device, cache: vk::PipelineCache) -> Option<usize> {
         (device.fp_v1_0().get_pipeline_cache_data)(
             device.handle(),
             cache,
-            &mut size,
+            &raw mut size,
             std::ptr::null_mut(),
         )
     };

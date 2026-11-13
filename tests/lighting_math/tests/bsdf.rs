@@ -419,7 +419,8 @@ fn a_fresnel_mix_runs_from_f0_to_a_white_edge() {
         let got = delta(&mut bsdf, c);
         let x = (1.0f32 - c).powi(5);
         for k in 0..3 {
-            let want = 0.5 * (f0[k] + (1.0 - f0[k]) * x);
+            let schlick = f0[k] + (1.0 - f0[k]) * x;
+            let want = 0.5 * schlick;
             assert!((got[k] - want).abs() < 1e-4, "{c}: {got:?}");
         }
     }

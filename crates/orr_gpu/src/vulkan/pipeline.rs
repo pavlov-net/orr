@@ -117,8 +117,7 @@ impl Shared {
             for s in &stats {
                 let label = s
                     .name_as_c_str()
-                    .map(|c| c.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+                    .map_or_default(|c| c.to_string_lossy().into_owned());
                 // SAFETY: the format says which union member is set.
                 let value = unsafe {
                     match s.format {

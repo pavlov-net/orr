@@ -144,7 +144,7 @@ impl RealTime {
                 component,
                 wi.as_ptr(),
                 value.as_mut_ptr(),
-                &mut chance,
+                &raw mut chance,
             );
         };
         (value, chance)
@@ -182,7 +182,7 @@ pub fn subsurface_volume(inputs: &Inputs) -> Volume {
             inputs,
             v.extinction.as_mut_ptr(),
             v.albedo.as_mut_ptr(),
-            &mut v.anisotropy,
+            &raw mut v.anisotropy,
         );
     };
     v
@@ -196,7 +196,12 @@ impl Default for RealTime {
 
 fn sample_with(call: impl FnOnce(*mut f32, *mut f32, *mut f32, *mut u32)) -> Option<Sample> {
     let (mut wi, mut weight, mut pdf, mut lobe) = ([0.0; 3], [0.0; 3], 0.0, 0);
-    call(wi.as_mut_ptr(), weight.as_mut_ptr(), &mut pdf, &mut lobe);
+    call(
+        wi.as_mut_ptr(),
+        weight.as_mut_ptr(),
+        &raw mut pdf,
+        &raw mut lobe,
+    );
     (pdf > 0.0).then_some(Sample {
         wi,
         weight,
@@ -324,7 +329,7 @@ impl Fit for Fitting {
                 coefficients.as_ptr(),
                 wi.as_ptr(),
                 eval.as_mut_ptr(),
-                &mut pdf,
+                &raw mut pdf,
                 d_eval.as_mut_ptr().cast(),
                 d_pdf.as_mut_ptr(),
             );

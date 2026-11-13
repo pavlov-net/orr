@@ -401,7 +401,7 @@ impl Shared {
                     get(
                         self.device.handle(),
                         FAULT_TIMEOUT_NS,
-                        &mut count,
+                        &raw mut count,
                         std::ptr::null_mut(),
                     )
                 };
@@ -412,7 +412,7 @@ impl Shared {
                         get(
                             self.device.handle(),
                             FAULT_TIMEOUT_NS,
-                            &mut count,
+                            &raw mut count,
                             infos.as_mut_ptr(),
                         )
                     };
@@ -453,7 +453,7 @@ impl Shared {
                 let get = f.fp().get_device_fault_info_ext;
                 let mut counts = vk::DeviceFaultCountsEXT::default();
                 // SAFETY: a count query on a lost device.
-                let _ = unsafe { get(self.device.handle(), &mut counts, std::ptr::null_mut()) };
+                let _ = unsafe { get(self.device.handle(), &raw mut counts, std::ptr::null_mut()) };
                 let mut addresses = vec![
                     vk::DeviceFaultAddressInfoKHR::default();
                     counts.address_info_count as usize
@@ -469,7 +469,7 @@ impl Shared {
                     ..Default::default()
                 };
                 // SAFETY: the arrays hold the counted entries; no vendor binary is asked for.
-                let r = unsafe { get(self.device.handle(), &mut counts, &mut info) };
+                let r = unsafe { get(self.device.handle(), &raw mut counts, &raw mut info) };
                 if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
                     return (Vec::new(), None);
                 }
@@ -494,7 +494,7 @@ impl Shared {
             ..Default::default()
         };
         // SAFETY: a size query on a lost device.
-        let r = unsafe { get(self.device.handle(), &mut info) };
+        let r = unsafe { get(self.device.handle(), &raw mut info) };
         let size = message.message_data_size as usize;
         if size == 0 {
             log::debug!("vkGetDeviceFaultDebugInfoKHR: {r:?}, no abort message");
@@ -505,7 +505,7 @@ impl Shared {
         info.vendor_binary_size = 0;
         info.p_vendor_binary_data = std::ptr::null_mut();
         // SAFETY: the message buffer holds `size` bytes; no vendor binary is asked for.
-        let r = unsafe { get(self.device.handle(), &mut info) };
+        let r = unsafe { get(self.device.handle(), &raw mut info) };
         if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
             return None;
         }

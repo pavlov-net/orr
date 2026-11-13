@@ -786,13 +786,14 @@ fn task_mesh_pixel_two_targets() {
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = || (xorshift(&mut state) >> 40) as f32 / (1u64 << 24) as f32;
     // One triangle in each cell of an 8x4 grid over clip space.
+    let cell = [0.25, 0.5];
     let mut vertices = Vec::new();
     for j in 0..4 {
         for i in 0..8 {
-            let (x0, y0) = (-1.0 + 0.25 * i as f32, -1.0 + 0.5 * j as f32);
+            let (x0, y0) = (-1.0 + cell[0] * i as f32, -1.0 + cell[1] * j as f32);
             for (cx, cy) in [(0.1, 0.1), (0.9, 0.2), (0.3, 0.9)] {
-                let x = x0 + 0.25 * (cx + 0.08 * (next() - 0.5));
-                let y = y0 + 0.5 * (cy + 0.08 * (next() - 0.5));
+                let x = x0 + cell[0] * (cx + 0.08 * (next() - 0.5));
+                let y = y0 + cell[1] * (cy + 0.08 * (next() - 0.5));
                 vertices.push([x, y, 0.5, 1.0]);
             }
         }

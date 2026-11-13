@@ -590,7 +590,7 @@ impl Device {
         self.shared.collect();
         let store = lock(&self.shared.results);
         let found = store.iter().find(|(p, _)| *p == point);
-        Some(found.map(|(_, r)| r.clone()).unwrap_or_default())
+        Some(found.map_or_default(|(_, r)| r.clone()))
     }
 
     /// Releases what dropped objects held once the GPU is done with them.

@@ -194,7 +194,7 @@ impl Handle {
         // SAFETY: the shim returns a pointer to `n` 4-byte values that live as long as the
         // handle.
         let words: &[u32] = unsafe {
-            let n = orr_osd_table(self.0, table, &mut data);
+            let n = orr_osd_table(self.0, table, &raw mut data);
             if n == 0 {
                 return &[];
             }
@@ -262,7 +262,7 @@ pub(super) fn refine(cage: &CageInput, settings: &SubdSettings) -> Result<Refine
     let desc = arrays.cage(cage, settings);
     let mut error = [0 as c_char; 512];
     // SAFETY: `desc` points into `arrays`, which outlives the call.
-    let osd = unsafe { orr_osd_build(&desc, error.as_mut_ptr(), error.len() as c_int) };
+    let osd = unsafe { orr_osd_build(&raw const desc, error.as_mut_ptr(), error.len() as c_int) };
     if osd.is_null() {
         return Err(format!("OpenSubdiv: {}", message(&error)));
     }
@@ -297,8 +297,7 @@ pub(super) fn limit(
             CageValues::FaceVarying(f) => Some(&f.values),
             _ => None,
         })
-        .map(|v| v.iter().map(orr_math::Vec2::to_array).collect())
-        .unwrap_or_default();
+        .map_or_default(|v| v.iter().map(orr_math::Vec2::to_array).collect());
     limit_of(cage, settings, at, &uvs)
 }
 
@@ -352,7 +351,7 @@ fn limit_of<const N: usize>(
     // SAFETY: every array holds what the shim reads or writes for `at.len()` locations.
     let ok = unsafe {
         orr_osd_limit(
-            &desc,
+            &raw const desc,
             points.as_ptr().cast(),
             if fvar.is_empty() {
                 std::ptr::null()

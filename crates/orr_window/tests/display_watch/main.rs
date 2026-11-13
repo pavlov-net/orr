@@ -25,9 +25,9 @@ fn pump_for(time: Duration) -> u32 {
         let mut msg = MSG::default();
         // SAFETY: plain message pumping on this thread with a live `msg`.
         unsafe {
-            while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE as u32) != 0 {
+            while PeekMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE as u32) != 0 {
                 timers += u32::from(msg.message == WM_TIMER as u32);
-                DispatchMessageW(&msg);
+                DispatchMessageW(&raw const msg);
             }
         }
         std::thread::sleep(Duration::from_millis(10));

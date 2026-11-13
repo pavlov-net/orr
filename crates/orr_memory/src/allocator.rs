@@ -179,8 +179,8 @@ impl Allocator {
             physicalDevice: sys::to_raw(desc.physical),
             device: sys::to_raw(desc.device.handle()),
             preferredLargeHeapBlockSize: LARGE_HEAP_BLOCK,
-            pDeviceMemoryCallbacks: &callbacks,
-            pVulkanFunctions: &functions,
+            pDeviceMemoryCallbacks: &raw const callbacks,
+            pVulkanFunctions: &raw const functions,
             instance: sys::to_raw(desc.instance.handle()),
             vulkanApiVersion: desc.api_version,
             ..Default::default()
@@ -188,7 +188,7 @@ impl Allocator {
         let mut allocator = ptr::null_mut();
         // SAFETY: valid create info; VMA copies the callbacks and functions.
         check("vmaCreateAllocator", unsafe {
-            sys::vmaCreateAllocator(&info, &mut allocator)
+            sys::vmaCreateAllocator(&raw const info, &raw mut allocator)
         })?;
         Ok(Self {
             raw: allocator,
@@ -208,7 +208,7 @@ impl Allocator {
         let mut pool = ptr::null_mut();
         // SAFETY: a live allocator and valid create info.
         check("vmaCreatePool", unsafe {
-            sys::vmaCreatePool(self.raw, &info, &mut pool)
+            sys::vmaCreatePool(self.raw, &raw const info, &raw mut pool)
         })?;
         if let Ok(name) = CString::new(desc.name) {
             // SAFETY: VMA copies the name.
@@ -254,7 +254,7 @@ impl Allocator {
         }
         let mut info = sys::VmaAllocationInfo2::default();
         // SAFETY: a live allocation.
-        unsafe { sys::vmaGetAllocationInfo2(self.raw, raw, &mut info) };
+        unsafe { sys::vmaGetAllocationInfo2(self.raw, raw, &raw mut info) };
         let a = &info.allocationInfo;
         Allocation {
             raw,
@@ -290,9 +290,9 @@ impl Allocator {
             sys::vmaCreateBuffer(
                 self.raw,
                 sys::buffer_info(info),
-                &create,
-                &mut buffer,
-                &mut allocation,
+                &raw const create,
+                &raw mut buffer,
+                &raw mut allocation,
                 ptr::null_mut(),
             )
         })?;
@@ -320,9 +320,9 @@ impl Allocator {
             sys::vmaCreateImage(
                 self.raw,
                 sys::image_info(info),
-                &create,
-                &mut image,
-                &mut allocation,
+                &raw const create,
+                &raw mut image,
+                &raw mut allocation,
                 ptr::null_mut(),
             )
         })?;
@@ -344,8 +344,8 @@ impl Allocator {
             sys::vmaAllocateMemory(
                 self.raw,
                 sys::memory_requirements(requirements),
-                &create,
-                &mut allocation,
+                &raw const create,
+                &raw mut allocation,
                 ptr::null_mut(),
             )
         })?;
@@ -405,7 +405,7 @@ impl Allocator {
         let mut props = ptr::null();
         // SAFETY: a live allocator; VMA keeps the properties for its lifetime.
         let heaps = unsafe {
-            sys::vmaGetMemoryProperties(self.raw, &mut props);
+            sys::vmaGetMemoryProperties(self.raw, &raw mut props);
             (*props).memoryHeapCount as usize
         };
         let mut budgets: [sys::VmaBudget; vk::MAX_MEMORY_HEAPS] =
@@ -433,7 +433,7 @@ impl Allocator {
             .map(|(pool, name, memory_type)| {
                 let mut s = sys::VmaStatistics::default();
                 // SAFETY: a live allocator and pool.
-                unsafe { sys::vmaGetPoolStatistics(self.raw, *pool, &mut s) };
+                unsafe { sys::vmaGetPoolStatistics(self.raw, *pool, &raw mut s) };
                 PoolStats {
                     name: name.clone(),
                     memory_type: *memory_type,
@@ -452,7 +452,7 @@ impl Allocator {
         let mut s = ptr::null_mut();
         // SAFETY: a live allocator; the string is freed once, after the copy.
         unsafe {
-            sys::vmaBuildStatsString(self.raw, &mut s, u32::from(detailed));
+            sys::vmaBuildStatsString(self.raw, &raw mut s, u32::from(detailed));
             let json = CStr::from_ptr(s).to_string_lossy().into_owned();
             sys::vmaFreeStatsString(self.raw, s);
             json

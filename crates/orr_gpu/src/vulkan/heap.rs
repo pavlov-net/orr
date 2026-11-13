@@ -296,9 +296,12 @@ impl Device {
         let image = vk::ImageDescriptorInfoEXT::default()
             .view(&view)
             .layout(vk::ImageLayout::GENERAL);
-        let info = [vk::ResourceDescriptorInfoEXT::default()
-            .ty(ty)
-            .data(vk::ResourceDescriptorDataEXT { p_image: &image })];
+        let info =
+            [vk::ResourceDescriptorInfoEXT::default()
+                .ty(ty)
+                .data(vk::ResourceDescriptorDataEXT {
+                    p_image: &raw const image,
+                })];
         let dst = [heaps.resource.slot(slot, "image")];
         // SAFETY: the destination is one descriptor's bytes inside the mapped heap.
         unsafe { self.shared.heap_fn.write_resource_descriptors(&info, &dst) }

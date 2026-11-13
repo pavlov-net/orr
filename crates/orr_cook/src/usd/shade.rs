@@ -82,8 +82,7 @@ impl Builder<'_> {
         let ty = prim
             .type_name()
             .map_err(|e| e.to_string())?
-            .map(|t| t.as_str().to_string())
-            .unwrap_or_default();
+            .map_or_default(|t| t.as_str().to_string());
         if ty == "Shader" {
             let output = property
                 .strip_prefix("outputs:")

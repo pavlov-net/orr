@@ -104,11 +104,7 @@ impl<'a> Planner<'a> {
             Some(s) if s < cursor => {
                 return Err(Mismatch {
                     structure: def.name.clone(),
-                    field: def
-                        .fields
-                        .last()
-                        .map(|f| f.name.clone())
-                        .unwrap_or_default(),
+                    field: def.fields.last().map_or_default(|f| f.name.clone()),
                     message: format!(
                         "SPIR-V size {s} ends inside the fields, which end at {cursor}"
                     ),

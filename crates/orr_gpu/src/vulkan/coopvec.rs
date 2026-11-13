@@ -121,7 +121,7 @@ impl Shared {
         info.src_data = vk::DeviceOrHostAddressConstKHR {
             host_address: src.as_ptr().cast(),
         };
-        info.p_dst_size = &mut bytes;
+        info.p_dst_size = &raw mut bytes;
         // SAFETY: a size query (null destination) over a live host source.
         unsafe { self.coop_fn().convert_cooperative_vector_matrix(&info) }
             .map_err(Error::vk("vkConvertCooperativeVectorMatrixNV"))?;
@@ -172,7 +172,7 @@ impl Device {
         info.src_data = vk::DeviceOrHostAddressConstKHR {
             host_address: src.as_ptr().cast(),
         };
-        info.p_dst_size = &mut bytes;
+        info.p_dst_size = &raw mut bytes;
         info.dst_data = vk::DeviceOrHostAddressKHR {
             host_address: dst.as_mut_ptr().cast(),
         };
@@ -205,7 +205,7 @@ impl CommandList<'_> {
         info.src_data = vk::DeviceOrHostAddressConstKHR {
             device_address: src.0,
         };
-        info.p_dst_size = &mut dst_size;
+        info.p_dst_size = &raw mut dst_size;
         info.dst_data = vk::DeviceOrHostAddressKHR {
             device_address: dst.0,
         };

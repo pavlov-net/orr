@@ -243,7 +243,12 @@ impl Device {
         let mut a = ManuallyDrop::new(a);
         // SAFETY: `a` is never used or dropped again; the buffer is taken once and the Arc
         // dropped once, here.
-        let (raw, shared) = unsafe { (ManuallyDrop::take(&mut a.raw), std::ptr::read(&a.shared)) };
+        let (raw, shared) = unsafe {
+            (
+                ManuallyDrop::take(&mut a.raw),
+                std::ptr::read(&raw const a.shared),
+            )
+        };
         let start = a.gpu.address().0;
         shared.defer_until(after.timeline, after.value, release(&shared, start, raw));
     }

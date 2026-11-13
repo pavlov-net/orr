@@ -149,7 +149,7 @@ unsafe fn pointer_types(
             f.device(),
             handle,
             ptr.as_ptr().cast(),
-            &mut out,
+            &raw mut out,
         )
     }
     .result()?;

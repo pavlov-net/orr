@@ -951,7 +951,7 @@ impl Device {
         }
         let store = self.shared.results.lock().unwrap();
         let found = store.iter().find(|(p, _)| *p == point);
-        Some(found.map(|(_, r)| r.clone()).unwrap_or_default())
+        Some(found.map_or_default(|(_, r)| r.clone()))
     }
 
     /// Destroys objects whose deferred-free points have completed and frees every queue's lists

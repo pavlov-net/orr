@@ -180,7 +180,11 @@ pub(crate) fn instance_extensions(project_id: Uuid) -> Result<Vec<CString>, Dlss
         let (mut count, mut props) = (0u32, ptr::null_mut());
         // SAFETY: `info` and the strings it points at outlive the call.
         let r = unsafe {
-            NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(&info, &mut count, &mut props)
+            NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(
+                &raw const info,
+                &raw mut count,
+                &raw mut props,
+            )
         };
         if check(
             "NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements",
@@ -230,7 +234,12 @@ pub(crate) unsafe fn device_extensions(
         let mut req: NVSDK_NGX_FeatureRequirement = unsafe { std::mem::zeroed() };
         // SAFETY: the handles are live (caller), `info` outlives the call.
         let r = unsafe {
-            NVSDK_NGX_VULKAN_GetFeatureRequirements(raw_instance, raw_physical, &info, &mut req)
+            NVSDK_NGX_VULKAN_GetFeatureRequirements(
+                raw_instance,
+                raw_physical,
+                &raw const info,
+                &raw mut req,
+            )
         };
         check("NVSDK_NGX_VULKAN_GetFeatureRequirements", r)?;
         if req.FeatureSupported != 0 {
@@ -246,9 +255,9 @@ pub(crate) unsafe fn device_extensions(
             NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(
                 raw_instance,
                 raw_physical,
-                &info,
-                &mut count,
-                &mut props,
+                &raw const info,
+                &raw mut count,
+                &raw mut props,
             )
         };
         check("NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements", r)?;
@@ -293,7 +302,7 @@ impl Ngx {
                 device.as_raw() as usize as VkDevice,
                 gipa,
                 gdpa,
-                &common,
+                &raw const common,
                 NVSDK_NGX_Version_NVSDK_NGX_Version_API,
             )
         };
@@ -305,7 +314,7 @@ impl Ngx {
         let mut caps = ptr::null_mut();
         // SAFETY: NGX is initialized.
         check("NVSDK_NGX_VULKAN_GetCapabilityParameters", unsafe {
-            NVSDK_NGX_VULKAN_GetCapabilityParameters(&mut caps)
+            NVSDK_NGX_VULKAN_GetCapabilityParameters(&raw mut caps)
         })?;
         Ok(Self {
             device: DropGuard::dismiss(device),
@@ -317,14 +326,14 @@ impl Ngx {
     fn get_i(&self, name: &[u8]) -> i32 {
         let mut v = 0;
         // SAFETY: `caps` is NGX's capability map; a missing key leaves `v` unchanged.
-        unsafe { NVSDK_NGX_Parameter_GetI(self.caps, key(name), &mut v) };
+        unsafe { NVSDK_NGX_Parameter_GetI(self.caps, key(name), &raw mut v) };
         v
     }
 
     fn get_ui(&self, name: &[u8]) -> u32 {
         let mut v = 0;
         // SAFETY: as in `get_i`.
-        unsafe { NVSDK_NGX_Parameter_GetUI(self.caps, key(name), &mut v) };
+        unsafe { NVSDK_NGX_Parameter_GetUI(self.caps, key(name), &raw mut v) };
         v
     }
 
@@ -332,7 +341,7 @@ impl Ngx {
     fn callback(&self, name: &[u8]) -> Option<NVSDK_NGX_Result> {
         let mut f: *mut c_void = ptr::null_mut();
         // SAFETY: as in `get_i`.
-        unsafe { NVSDK_NGX_Parameter_GetVoidPointer(self.caps, key(name), &mut f) };
+        unsafe { NVSDK_NGX_Parameter_GetVoidPointer(self.caps, key(name), &raw mut f) };
         if f.is_null() {
             return None;
         }
@@ -372,7 +381,7 @@ impl Ngx {
                     NVSDK_NGX_Parameter_GetULL(
                         self.caps,
                         key(NVSDK_NGX_Parameter_SizeInBytes),
-                        &mut v,
+                        &raw mut v,
                     )
                 };
                 total += v;
@@ -560,7 +569,7 @@ impl Upscale {
         let mut params = ptr::null_mut();
         // SAFETY: NGX is initialized.
         check("NVSDK_NGX_VULKAN_AllocateParameters", unsafe {
-            NVSDK_NGX_VULKAN_AllocateParameters(&mut params)
+            NVSDK_NGX_VULKAN_AllocateParameters(&raw mut params)
         })?;
         let params = DropGuard::new(params, |p| {
             // SAFETY: allocated above and not shared.
@@ -606,7 +615,7 @@ impl Upscale {
                 cmd.as_raw() as usize as VkCommandBuffer,
                 feature,
                 *params,
-                &mut handle,
+                &raw mut handle,
             )
         };
         check("NVSDK_NGX_VULKAN_CreateFeature1", r)?;
@@ -829,7 +838,7 @@ impl Fg {
         let mut params = ptr::null_mut();
         // SAFETY: NGX is initialized.
         check("NVSDK_NGX_VULKAN_AllocateParameters", unsafe {
-            NVSDK_NGX_VULKAN_AllocateParameters(&mut params)
+            NVSDK_NGX_VULKAN_AllocateParameters(&raw mut params)
         })?;
         let params = DropGuard::new(params, |p| {
             // SAFETY: allocated above and not shared.
@@ -861,7 +870,7 @@ impl Fg {
                 cmd.as_raw() as usize as VkCommandBuffer,
                 NVSDK_NGX_Feature_NVSDK_NGX_Feature_FrameGeneration,
                 *params,
-                &mut handle,
+                &raw mut handle,
             )
         };
         check("NVSDK_NGX_VULKAN_CreateFeature1", r)?;

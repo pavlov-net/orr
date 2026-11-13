@@ -42,7 +42,7 @@ impl ClassicAs {
         let raw = self.raw;
         let mut this = std::mem::ManuallyDrop::new(self);
         // SAFETY: `this` is never used or dropped again; its Arc is released exactly once.
-        unsafe { std::ptr::drop_in_place(&mut this.shared) };
+        unsafe { std::ptr::drop_in_place(&raw mut this.shared) };
         raw
     }
 }
@@ -386,7 +386,7 @@ impl CommandList<'_> {
                 (shared.accel_fn.fp().cmd_build_acceleration_structures_khr)(
                     self.cmd(),
                     1,
-                    &build,
+                    &raw const build,
                     ranges.as_ptr(),
                 );
             }
@@ -488,9 +488,9 @@ impl Device {
                     .get_acceleration_structure_build_sizes_khr)(
                     self.shared.device.handle(),
                     vk::AccelerationStructureBuildTypeKHR::DEVICE,
-                    &build,
+                    &raw const build,
                     std::ptr::null(),
-                    &mut sizes,
+                    &raw mut sizes,
                 );
             }
         });

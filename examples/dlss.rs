@@ -137,7 +137,7 @@ fn run(options: &Options) {
     let sdk = DlssSdk::new(gpu, PROJECT_ID)
         .inspect_err(|e| log::warn!("no DLSS: {e}"))
         .ok();
-    let support = sdk.as_ref().map(DlssSdk::support).unwrap_or_default();
+    let support = sdk.as_ref().map_or_default(DlssSdk::support);
     let recommended = FrameGenerationMode::recommended(support.max_generated);
     let most = support.max_generated.clamp(1, 3);
     let chosen = if options.has("--off") {

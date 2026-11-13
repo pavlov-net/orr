@@ -80,10 +80,10 @@ impl Reach {
         .max(1.0);
         // A cluster stores its uvs on a grid no coarser than the box's own, and a stored uv lies
         // within half its step of the source one, so outside the box by up to that.
-        let step = [0, 1].map(|a| f64::from(super::uv_grid(lo[a], hi[a]).1));
+        let half = [0, 1].map(|a| 0.5 * f64::from(super::uv_grid(lo[a], hi[a]).1));
         let stored = [
-            0.5 * ((1.0 + a).abs() * step[0] + b.abs() * step[1]),
-            0.5 * (d.abs() * step[0] + (1.0 + e).abs() * step[1]),
+            (1.0 + a).abs() * half[0] + b.abs() * half[1],
+            d.abs() * half[0] + (1.0 + e).abs() * half[1],
         ];
         let corners = [lo, [hi[0], lo[1]], [lo[0], hi[1]], hi].map(|c| mapped(uv, c));
         let side = |a: usize, pick: fn(f64, f64) -> f64| {
@@ -246,7 +246,7 @@ impl<T> Tiles<T> {
             }
         });
         let (read, uv) = self.read(at, cell);
-        let held = !std::ptr::eq(read, &self.missing);
+        let held = !std::ptr::eq(read, &raw const self.missing);
         CornerRead { read, uv, held }
     }
 
@@ -276,7 +276,7 @@ impl<T> Tiles<T> {
         let line =
             e1[0] * e2[1] == e1[1] * e2[0] || spread(&p, 0) <= slack || spread(&p, 1) <= slack;
         let mut emit = |read: &'a T, origin: [f64; 2], poly: Vec<Corner>| {
-            let missing = std::ptr::eq(read, &self.missing);
+            let missing = std::ptr::eq(read, &raw const self.missing);
             let thin = if missing { slack } else { 0.0 };
             let flat = spread(&poly, 0) <= thin || spread(&poly, 1) <= thin;
             if flat && !line && (missing || !edges) {
@@ -393,7 +393,7 @@ impl<T> Map<T> {
             return self.parts(uv, f);
         };
         let p = uv.map(|c| mapped(t.uv, c));
-        let mut seen: Vec<*const T> = vec![&t.missing];
+        let mut seen: Vec<*const T> = vec![&raw const t.missing];
         let whole = t.walk(p, false, &mut |part| {
             seen.push(part.read);
             f(part)

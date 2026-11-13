@@ -3660,8 +3660,7 @@ impl Mounts {
     /// The pages of ready mount `m`; none for other mounts.
     pub(crate) fn pages_of(&self, m: MountId) -> Vec<PageId> {
         self.resident(m)
-            .map(|r| r.pages.values().copied().collect())
-            .unwrap_or_default()
+            .map_or_default(|r| r.pages.values().copied().collect())
     }
 
     /// Ends every edit of mount `m`'s meshes with it.

@@ -1101,8 +1101,7 @@ fn find_kernels(root: &Path) -> Result<Vec<(String, PathBuf)>, Error> {
 fn tool_hash() -> String {
     env::current_exe()
         .and_then(fs::read)
-        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-        .unwrap_or_default()
+        .map_or_default(|bytes| blake3::hash(&bytes).to_hex().to_string())
 }
 
 fn cache_key(settings: &Settings<'_>, job: &Job, inputs: &[PathBuf]) -> Option<String> {
@@ -1712,8 +1711,7 @@ pub(super) fn read(path: &Path) -> Result<String, Error> {
 
 pub(super) fn canonical_lossy(path: &Path) -> PathBuf {
     path.canonicalize()
-        .map(strip_verbatim)
-        .unwrap_or_else(|_| path.to_path_buf())
+        .map_or_else(|_| path.to_path_buf(), strip_verbatim)
 }
 
 /// Drops Windows' `\\?\` prefix so paths stay readable and comparable with user paths.

@@ -200,8 +200,7 @@ impl Link {
         self.import.clone().unwrap_or_else(|| {
             self.module
                 .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default()
+                .map_or_default(|s| s.to_string_lossy().into_owned())
         })
     }
 }

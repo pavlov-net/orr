@@ -129,7 +129,7 @@ fn with_cluster_input<R>(
                 .max_total_vertex_count(l.max_total_verts)
                 .min_position_truncate_bit_count(l.min_truncate_bits);
             vk::ClusterAccelerationStructureOpInputNV {
-                p_triangle_clusters: &mut triangles,
+                p_triangle_clusters: &raw mut triangles,
             }
         }
         RtasLimits::Blas(l) => {
@@ -137,7 +137,7 @@ fn with_cluster_input<R>(
                 .max_total_cluster_count(l.max_total_clas)
                 .max_cluster_count_per_acceleration_structure(l.max_clas_per_blas);
             vk::ClusterAccelerationStructureOpInputNV {
-                p_clusters_bottom_level: &mut blas,
+                p_clusters_bottom_level: &raw mut blas,
             }
         }
         RtasLimits::Move(l) => {
@@ -154,7 +154,7 @@ fn with_cluster_input<R>(
                 .no_move_overlap(l.no_overlap)
                 .max_moved_bytes(l.max_bytes);
             vk::ClusterAccelerationStructureOpInputNV {
-                p_move_objects: &mut moves,
+                p_move_objects: &raw mut moves,
             }
         }
         RtasLimits::Ptlas(_) => unreachable!("a PTLAS build is not a cluster op"),

@@ -169,8 +169,9 @@ fn subd() {
 fn constant_define(text: &str, name: &str, file: &Path) -> String {
     text.lines()
         .find_map(|l| l.trim().strip_prefix("#define ")?.strip_prefix(name))
-        .map(|v| v.trim().to_string())
         .unwrap_or_else(|| panic!("{} has no {name}", file.display()))
+        .trim()
+        .to_string()
 }
 
 #[cfg(not(feature = "subd"))]

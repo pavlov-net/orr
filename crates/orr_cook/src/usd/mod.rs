@@ -747,8 +747,7 @@ impl<'s> Importer<'s> {
             let ty = prim
                 .type_name()
                 .map_err(|e| e.to_string())?
-                .map(|t| t.as_str().to_string())
-                .unwrap_or_default();
+                .map_or_default(|t| t.as_str().to_string());
             let imageable = IMAGEABLE.contains(&ty.as_str());
             let invisible = imageable && r.token("visibility")?.as_deref() == Some("invisible");
             let purpose = if imageable { r.token("purpose")? } else { None };

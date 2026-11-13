@@ -212,14 +212,12 @@ fn blob_bytes(blob: &Com) -> &[u8] {
 
 /// The text of an owned blob (diagnostics, names), which this releases.
 pub(super) fn blob_text(blob: *mut c_void) -> String {
-    Com::from_raw(blob)
-        .map(|b| {
-            String::from_utf8_lossy(blob_bytes(&b))
-                .trim_end_matches('\0')
-                .trim()
-                .to_owned()
-        })
-        .unwrap_or_default()
+    Com::from_raw(blob).map_or_default(|b| {
+        String::from_utf8_lossy(blob_bytes(&b))
+            .trim_end_matches('\0')
+            .trim()
+            .to_owned()
+    })
 }
 
 fn words(bytes: &[u8]) -> Result<Vec<u32>, String> {
@@ -308,7 +306,7 @@ impl GlobalSession {
         // SAFETY: desc is a valid SlangGlobalSessionDesc; out receives one reference.
         let r = unsafe {
             lib.api
-                .slang_createGlobalSession2(&desc, (&raw mut out).cast())
+                .slang_createGlobalSession2(&raw const desc, (&raw mut out).cast())
         };
         let com = match Com::from_raw(out) {
             Some(com) if !failed(r) => com,
@@ -365,8 +363,8 @@ impl GlobalSession {
                 self.com.as_ptr(),
                 argv.len() as c_int,
                 argv.as_ptr(),
-                &mut desc,
-                &mut aux,
+                &raw mut desc,
+                &raw mut aux,
             );
             let _aux = Com::from_raw(aux);
             if failed(r) {
@@ -385,7 +383,7 @@ impl GlobalSession {
                 desc.targets = targets.as_ptr();
             }
             let mut out = ptr::null_mut();
-            let r = (v.create_session)(self.com.as_ptr(), &desc, &mut out);
+            let r = (v.create_session)(self.com.as_ptr(), &raw const desc, &raw mut out);
             match Com::from_raw(out) {
                 Some(com) if !failed(r) => Ok(Session {
                     com,
@@ -429,7 +427,7 @@ impl Session {
                 name.as_ptr(),
                 path_c.as_ptr(),
                 source.as_ptr(),
-                &mut diag,
+                &raw mut diag,
             )
         };
         let text = blob_text(diag);
@@ -458,7 +456,7 @@ impl Session {
             let mv = module.com.vtbl::<ModuleVtbl>();
             for i in 0..(mv.get_defined_entry_point_count)(module.com.as_ptr()) {
                 let mut ep = ptr::null_mut();
-                let r = (mv.get_defined_entry_point)(module.com.as_ptr(), i, &mut ep);
+                let r = (mv.get_defined_entry_point)(module.com.as_ptr(), i, &raw mut ep);
                 let ep = Com::from_raw(ep)
                     .filter(|_| !failed(r))
                     .ok_or("getDefinedEntryPoint failed")?;
@@ -476,7 +474,7 @@ impl Session {
                     let r = (ep.vtbl::<ComponentTypeVtbl>().rename_entry_point)(
                         ep.as_ptr(),
                         symbol.as_ptr(),
-                        &mut renamed,
+                        &raw mut renamed,
                     );
                     Com::from_raw(renamed)
                         .filter(|_| !failed(r))
@@ -492,8 +490,8 @@ impl Session {
                 self.com.as_ptr(),
                 parts.as_ptr(),
                 parts.len() as sys::SlangInt,
-                &mut composite,
-                &mut diag,
+                &raw mut composite,
+                &raw mut diag,
             );
             let text = blob_text(diag);
             let composite = Com::from_raw(composite)
@@ -503,8 +501,8 @@ impl Session {
             let mut diag = ptr::null_mut();
             let r = (composite.vtbl::<ComponentTypeVtbl>().link)(
                 composite.as_ptr(),
-                &mut linked,
-                &mut diag,
+                &raw mut linked,
+                &raw mut diag,
             );
             let text = blob_text(diag);
             let com = Com::from_raw(linked).filter(|_| !failed(r)).ok_or(text)?;
@@ -535,7 +533,7 @@ impl Session {
             let r = (self.com.vtbl::<SessionVtbl>().get_decl_source_location)(
                 self.com.as_ptr(),
                 decl,
-                &mut loc,
+                &raw mut loc,
             );
             if failed(r) {
                 return None;
@@ -574,8 +572,8 @@ impl Program {
             (self.com.vtbl::<ComponentTypeVtbl>().get_target_code)(
                 self.com.as_ptr(),
                 0,
-                &mut code,
-                &mut diag,
+                &raw mut code,
+                &raw mut diag,
             )
         };
         let text = blob_text(diag);
@@ -604,7 +602,7 @@ impl Program {
             let r = (self.com.vtbl::<UnknownVtbl>().query_interface)(
                 self.com.as_ptr(),
                 &COMPONENT_TYPE2,
-                &mut two,
+                &raw mut two,
             );
             let two = Com::from_raw(two)
                 .filter(|_| !failed(r))
@@ -614,8 +612,8 @@ impl Program {
             let r = (two.vtbl::<ComponentType2Vtbl>().get_target_compile_result)(
                 two.as_ptr(),
                 0,
-                &mut result,
-                &mut diag,
+                &raw mut result,
+                &raw mut diag,
             );
             let text = blob_text(diag);
             let result = Com::from_raw(result).filter(|_| !failed(r)).ok_or(text)?;
@@ -628,7 +626,7 @@ impl Program {
             }
             let item = |i| {
                 let mut blob = ptr::null_mut();
-                let r = (v.get_item_data)(result.as_ptr(), i, &mut blob);
+                let r = (v.get_item_data)(result.as_ptr(), i, &raw mut blob);
                 let blob = Com::from_raw(blob)
                     .filter(|_| !failed(r))
                     .ok_or_else(|| format!("getItemData({i}) failed: {r:#x}"))?;
@@ -643,7 +641,7 @@ impl Program {
         let mut diag = ptr::null_mut();
         // SAFETY: the vtable is IComponentType's.
         let layout = unsafe {
-            (self.com.vtbl::<ComponentTypeVtbl>().get_layout)(self.com.as_ptr(), 0, &mut diag)
+            (self.com.vtbl::<ComponentTypeVtbl>().get_layout)(self.com.as_ptr(), 0, &raw mut diag)
         };
         let text = blob_text(diag);
         if layout.is_null() {
