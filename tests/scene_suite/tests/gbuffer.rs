@@ -13,6 +13,7 @@
 //! kernels move, cooked instance pages against the same copies
 //! placed at run time, and a streaming mesh's finer cached cuts.
 
+use std::assert_matches;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -4797,7 +4798,7 @@ fn later_mounts_and_unmounts_leave_traced_scenes_intact() {
             f.end(&[]).unwrap();
             assert!(start.elapsed() < Duration::from_secs(60), "mount pending");
         }
-        assert!(matches!(w.scenes.mount_state(m), LoadState::Ready));
+        assert_matches!(w.scenes.mount_state(m), LoadState::Ready);
         w.scenes.unmount(m);
         check(&mut w, 3 + round);
     }
@@ -5672,7 +5673,7 @@ fn a_copy_of_an_unmounted_model_stays_hidden_when_its_id_is_reused() {
             "the mount never landed"
         );
     }
-    assert!(matches!(w.scenes.mount_state(again), LoadState::Ready));
+    assert_matches!(w.scenes.mount_state(again), LoadState::Ready);
     let new = w
         .scenes
         .model(again, AssetId::from_name("plain"))
@@ -5745,7 +5746,7 @@ fn a_copy_of_an_unmounted_page_stays_hidden_when_its_slot_is_reused() {
             "the mount never landed"
         );
     }
-    assert!(matches!(w.scenes.mount_state(again), LoadState::Ready));
+    assert_matches!(w.scenes.mount_state(again), LoadState::Ready);
     for _ in 0..12 {
         frame += 1;
         let g = shoot(&mut w, &placed, &Shot::at(eye, target, frame));
@@ -10451,7 +10452,7 @@ fn an_unmount_takes_a_skinned_page_and_its_motion_from_the_scene() {
             scenes.begin_frame(&desc).unwrap().end(&[]).unwrap();
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(matches!(scenes.mount_state(m), LoadState::Ready));
+        assert_matches!(scenes.mount_state(m), LoadState::Ready);
         m
     };
     let models = mounted(&mut scenes, models);

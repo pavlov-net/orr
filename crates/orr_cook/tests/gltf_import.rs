@@ -9,6 +9,7 @@ mod float_ktx2;
 #[path = "common/glb.rs"]
 mod glb;
 
+use std::assert_matches;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -606,7 +607,7 @@ fn selected_models_join_on_one_grid() {
     ] {
         rocks(&path, ta, tb);
         let err = cook(&path, settings.clone()).err().unwrap();
-        assert!(matches!(err, orr_cook::Error::Import { .. }), "{err}");
+        assert_matches!(err, orr_cook::Error::Import { .. }, "{err}");
     }
 }
 
@@ -1112,7 +1113,7 @@ fn displacement_bounds_hold_every_mip() {
         ..Default::default()
     };
     let err = cook(&path, settings).err().unwrap();
-    assert!(matches!(err, orr_cook::Error::Mesh { .. }), "{err}");
+    assert_matches!(err, orr_cook::Error::Mesh { .. }, "{err}");
 }
 
 #[test]

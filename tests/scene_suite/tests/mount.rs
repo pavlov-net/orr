@@ -3,6 +3,7 @@
 //! loading side, failures, the archive handles, hierarchy pages streamed on request and on
 //! the traversal's feedback, and textures decoded from neural texture sets.
 
+use std::assert_matches;
 use std::mem::DropGuard;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -528,10 +529,10 @@ fn file_and_memory_mounts_place_the_same_assets() {
         let dome = entry(&a, AssetId::from_name("kit/dome/mesh"));
         let dome = MeshInfo::parse(&blob(&a, dome, 0)).unwrap();
         pages_seen = (dome.pages.len(), dome.node_pages.len());
-        assert!(matches!(
+        assert_matches!(
             scenes.model(memory, AssetId::from_name("kit/albedo")),
             Err(Error::Missing { .. })
-        ));
+        );
     }
     assert!(
         pages_seen.0 > 1 && pages_seen.1 >= 1,
@@ -552,9 +553,9 @@ fn mounts_wait_for_workers() {
         std::thread::sleep(Duration::from_millis(2));
     }
     for m in [file, memory] {
-        assert!(matches!(scenes.mount_state(m), LoadState::Pending));
+        assert_matches!(scenes.mount_state(m), LoadState::Pending);
         let lookup = scenes.model(m, AssetId::from_name("kit/panel"));
-        assert!(matches!(lookup, Err(Error::NotReady(_))));
+        assert_matches!(lookup, Err(Error::NotReady(_)));
     }
     let _workers = Workers::start(&scenes, 2);
     ready(&mut scenes, file);
@@ -585,14 +586,11 @@ fn truncated_archives_fail() {
             let LoadState::Failed(e) = settle(&mut scenes, m) else {
                 panic!("{m:?} mounted a truncated archive");
             };
-            assert!(
-                matches!(*e, Error::Pack(orr_pack::Error::Truncated { .. })),
-                "{e}"
-            );
-            assert!(matches!(
+            assert_matches!(*e, Error::Pack(orr_pack::Error::Truncated { .. }), "{e}");
+            assert_matches!(
                 scenes.model(m, AssetId::from_name("kit/panel")),
                 Err(Error::MountFailed(_))
-            ));
+            );
         }
     }
     assert_clean();
@@ -751,7 +749,7 @@ fn a_placement_past_the_devices_partitions_is_refused_and_leaves_the_scene_as_it
             user_tag: 0,
         };
         let refused = |r: orr_scene::Result<InstanceRange>| {
-            assert!(matches!(r, Err(Error::Capacity { .. })), "{r:?}");
+            assert_matches!(r, Err(Error::Capacity { .. }));
         };
         let frame_with = |scenes: &mut Scenes, write: &mut dyn FnMut(&mut SceneWriter<'_>)| {
             let mut f = scenes
@@ -821,13 +819,13 @@ fn a_placement_past_the_devices_partitions_is_refused_and_leaves_the_scene_as_it
         };
         let root = frame_with(&mut scenes, &mut |w| {
             let r = w.set_light(LightId(2), Some(&lamp));
-            assert!(matches!(r, Err(Error::Capacity { .. })), "{r:?}");
+            assert_matches!(r, Err(Error::Capacity { .. }));
             let untraced = ProducerDesc {
                 flags: InstanceFlags::RASTER,
                 ..ProducerDesc::default()
             };
             let r = w.set_producer(ProducerId(5), Some(&untraced));
-            assert!(matches!(r, Err(Error::Capacity { .. })), "{r:?}");
+            assert_matches!(r, Err(Error::Capacity { .. }));
             assert_eq!(w.producer_entry(ProducerId(5)), None);
         });
         assert_eq!(root.light_capacity, 0, "the refused light took an entry");
@@ -1001,7 +999,7 @@ fn proxies_keep_their_instances_as_a_full_ptlas_trades_their_room() {
                 .unwrap();
             w.set_light(LightId(0), Some(&lamp(0))).unwrap();
             let r = w.set_medium_proxy(MediumProxyId(1), Some(&proxy(1)));
-            assert!(matches!(r, Err(Error::Capacity { .. })), "{r:?}");
+            assert_matches!(r, Err(Error::Capacity { .. }));
         });
         // The second producer goes, and its entry is free once that frame has completed.
         frame_with(&mut scenes, &mut |w| {
@@ -1288,10 +1286,7 @@ fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
         .sum();
     let mounted = upload_bytes();
     scenes.unmount(m);
-    assert!(matches!(
-        scenes.model(m, panel_id),
-        Err(Error::UnknownMount(_))
-    ));
+    assert_matches!(scenes.model(m, panel_id), Err(Error::UnknownMount(_)));
     assert_eq!(
         upload_bytes(),
         mounted,
@@ -1314,7 +1309,7 @@ fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
         })
         .unwrap();
     let placed = f.scene(s).unwrap().add_instances(&copy);
-    assert!(matches!(placed, Err(Error::NotResident(id)) if id == panel));
+    assert_matches!(placed, Err(Error::NotResident(id)) if id == panel);
     f.update_scenes(&mut |_| {}).unwrap();
     f.end(&[]).unwrap();
     let again = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
@@ -3796,31 +3791,26 @@ fn requested_blobs_land_in_consumer_buffers_and_images_under_their_budget() {
                 },
             )
             .unwrap();
-        assert!(matches!(
-            settle_blob(&mut scenes, into_buffer),
-            LoadState::Ready
-        ));
+        assert_matches!(settle_blob(&mut scenes, into_buffer), LoadState::Ready);
         assert!(gpu.bytes(buffer.gpu().address().0, data.len()) == data);
         for _ in 0..5 {
             frame(&mut scenes);
         }
-        assert!(
-            matches!(scenes.blob_state(into_image), LoadState::Pending),
+        assert_matches!(
+            scenes.blob_state(into_image),
+            LoadState::Pending,
             "the second blob waits for room in the budget"
         );
         let blobs = *scenes.residency().class(ResidencyClass::UserBlobs);
         assert_eq!(blobs.resident_bytes, data.len() as u64);
 
         scenes.release_blob(into_buffer);
-        assert!(matches!(
-            settle_blob(&mut scenes, into_image),
-            LoadState::Ready
-        ));
+        assert_matches!(settle_blob(&mut scenes, into_image), LoadState::Ready);
         assert!(gpu.texture(&image, &region) == texels);
-        assert!(matches!(
+        assert_matches!(
             scenes.blob_state(into_buffer),
             LoadState::Failed(e) if matches!(*e, Error::UnknownBlob(_))
-        ));
+        );
         scenes.release_blob(into_image);
         frame(&mut scenes);
         let blobs = *scenes.residency().class(ResidencyClass::UserBlobs);
@@ -3837,11 +3827,8 @@ fn requested_blobs_land_in_consumer_buffers_and_images_under_their_budget() {
                 },
             )
             .unwrap();
-        assert!(matches!(
-            settle_blob(&mut scenes, too_small),
-            LoadState::Failed(_)
-        ));
-        assert!(matches!(
+        assert_matches!(settle_blob(&mut scenes, too_small), LoadState::Failed(_));
+        assert_matches!(
             scenes.request_blob(
                 m,
                 AssetId::from_name("cells/none"),
@@ -3852,7 +3839,7 @@ fn requested_blobs_land_in_consumer_buffers_and_images_under_their_budget() {
                 },
             ),
             Err(Error::Missing { .. })
-        ));
+        );
     }
     assert_eq!(
         staged.validation_messages(),
@@ -3913,10 +3900,11 @@ fn a_requested_blob_lands_while_a_mount_build_waits_on_the_loading_queue() {
     };
     let id = AssetId::from_name(CONSUMER);
     let blob = scenes.request_blob(tiled, id, 2, target).unwrap();
-    assert!(matches!(settle_blob(&mut scenes, blob), LoadState::Ready));
+    assert_matches!(settle_blob(&mut scenes, blob), LoadState::Ready);
     assert!(Gpu(dev).bytes(buffer.gpu().address().0, data.len()) == data);
-    assert!(
-        matches!(scenes.mount_state(meshes), LoadState::Pending),
+    assert_matches!(
+        scenes.mount_state(meshes),
+        LoadState::Pending,
         "the mount's build waits behind the gate"
     );
     drop(gate);

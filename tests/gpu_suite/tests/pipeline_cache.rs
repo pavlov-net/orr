@@ -1,6 +1,7 @@
 //! The disk pipeline cache: warm loads, files from another driver or device, files the driver
 //! refuses and creation from several threads.
 
+use std::assert_matches;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -207,10 +208,10 @@ fn a_cached_only_handle_compiles_nothing() {
     };
     let stage = ShaderStage::new(&cached::MODULE, "compute_main", data).unwrap();
     let only = d.cached_pipelines_only();
-    assert!(matches!(
-        only.create_compute_pipeline(&stage, "cached compute"),
-        Err(Error::CompileRequired)
-    ));
+    assert_matches!(
+        only.create_compute_pipeline(&stage, "cached compute").err(),
+        Some(Error::CompileRequired)
+    );
     assert_eq!(d.pipeline_cache_report().misses, 0);
     d.create_compute_pipeline(&stage, "cached compute").unwrap();
     only.create_compute_pipeline(&stage, "cached compute")
@@ -222,10 +223,11 @@ fn a_cached_only_handle_compiles_nothing() {
             bytes: &spec,
         };
         let stage = ShaderStage::new(&cached_rays::MODULE, "raygen_main", data).unwrap();
-        assert!(matches!(
-            only.create_ray_dispatch_pipeline(&stage, "cached raygen"),
-            Err(Error::CompileRequired)
-        ));
+        assert_matches!(
+            only.create_ray_dispatch_pipeline(&stage, "cached raygen")
+                .err(),
+            Some(Error::CompileRequired)
+        );
         d.create_ray_dispatch_pipeline(&stage, "cached raygen")
             .unwrap();
         only.create_ray_dispatch_pipeline(&stage, "cached raygen")

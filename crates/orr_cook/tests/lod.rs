@@ -1,6 +1,7 @@
 //! Discrete levels, rigid parts, the merged stage and subsurface thickness, on meshes handed
 //! over in memory.
 
+use std::assert_matches;
 use std::collections::HashSet;
 
 use orr_cook::{
@@ -353,16 +354,16 @@ fn parts_follow_the_majority_then_the_lowest_value() {
 
     // A value at the declared count fails, and so do pivots that differ within a part.
     let mut input = triangles(&[[4, 4, 4]], 1);
-    assert!(matches!(
-        cook(input.clone(), MeshSettings::default()),
-        Err(orr_cook::Error::Mesh { .. })
-    ));
+    assert_matches!(
+        cook(input.clone(), MeshSettings::default()).err(),
+        Some(orr_cook::Error::Mesh { .. })
+    );
     input.parts.as_mut().unwrap().values = vec![1; 3];
     input.parts.as_mut().unwrap().pivots = Some(vec![Vec3::ZERO, Vec3::ZERO, Vec3::X]);
-    assert!(matches!(
-        cook(input, MeshSettings::default()),
-        Err(orr_cook::Error::Mesh { .. })
-    ));
+    assert_matches!(
+        cook(input, MeshSettings::default()).err(),
+        Some(orr_cook::Error::Mesh { .. })
+    );
 }
 
 /// The step stays 2^-11 m while every cell of a point is within 2^23 of the origin, 4096 m,

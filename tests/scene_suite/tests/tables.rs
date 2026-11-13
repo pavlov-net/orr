@@ -1,5 +1,7 @@
 //! Scene tables, uploads, groups, lights and views against what was written.
 
+use std::assert_matches;
+
 use orr_gpu::{GpuPtr, Hazards, MemoryKind, Stages};
 use orr_math::{DQuat, DVec3, Quat, UVec2, Vec2, Vec3, Vec4};
 use orr_scene::testing::{assert_clean, device, read_buffer, wait};
@@ -387,7 +389,7 @@ fn an_unlisted_scene_records_nothing() {
     let only_b = [b];
     let mut f = scenes.begin_frame(&frame(&only_b)).unwrap();
     let frame_b = f.id();
-    assert!(matches!(f.scene(a), Err(orr_scene::Error::NotListed(_))));
+    assert_matches!(f.scene(a).err(), Some(orr_scene::Error::NotListed(_)));
     let mut computed = Vec::new();
     f.update_scenes(&mut |c| computed.push(c.scene)).unwrap();
     wait(f.end(&[]).unwrap());

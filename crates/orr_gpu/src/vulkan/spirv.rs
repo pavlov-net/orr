@@ -83,6 +83,8 @@ pub(super) fn payload_first<'a>(code: &'a [u32], entry: &[u8]) -> Cow<'a, [u32]>
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
 
     fn inst(op: u32, operands: &[u32]) -> Vec<u32> {
@@ -118,14 +120,8 @@ mod tests {
             code.extend_from_slice(i);
         }
 
-        assert!(matches!(
-            payload_first(&code, b"task_main"),
-            Cow::Borrowed(_)
-        ));
-        assert!(matches!(
-            payload_first(&code, b"pixel_main"),
-            Cow::Borrowed(_)
-        ));
+        assert_matches!(payload_first(&code, b"task_main"), Cow::Borrowed(_));
+        assert_matches!(payload_first(&code, b"pixel_main"), Cow::Borrowed(_));
         let moved = payload_first(&code, b"mesh_main");
         let mut want = code[..HEADER_WORDS].to_vec();
         for i in [&task, &mesh, &pointer, &mesh_var, &task_var, &other] {

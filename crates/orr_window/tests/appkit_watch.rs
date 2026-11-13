@@ -3,6 +3,7 @@
 
 #[cfg(target_os = "macos")]
 fn main() {
+    use std::assert_matches;
     use std::ptr::NonNull;
     use std::time::Duration;
 
@@ -61,10 +62,10 @@ fn main() {
         DisplayWatch::new(sent.0).err()
     })
     .join();
-    assert!(matches!(
+    assert_matches!(
         made_elsewhere.unwrap(),
         Some(orr_window::Error::NotWindowThread)
-    ));
+    );
     pump_for(Duration::from_millis(1200));
     std::thread::spawn(move || drop(watching)).join().unwrap();
     pump_for(Duration::from_millis(100));

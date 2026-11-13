@@ -12,6 +12,8 @@
 //! elsewhere the `strands` kernel turns each segment into a tube of triangles in a tube
 //! batch of the entry's own, which builds through one template like any other entry.
 
+use std::assert_matches;
+
 use orr_gpu::rtas::consts::GEOMETRY_OPAQUE;
 use orr_gpu::{
     Allocation, BlasLimits, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicKind,
@@ -550,8 +552,9 @@ pub(crate) fn build(
             !strands && !desc.tessellated,
             "a drawn entry is neither strands nor tessellated"
         );
-        assert!(
-            matches!(desc.opacity, Opacity::Opaque | Opacity::AlphaTested),
+        assert_matches!(
+            desc.opacity,
+            Opacity::Opaque | Opacity::AlphaTested,
             "a drawn entry is opaque or alpha-tested"
         );
     }

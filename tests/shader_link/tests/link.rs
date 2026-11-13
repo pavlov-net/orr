@@ -1,3 +1,5 @@
+use std::assert_matches;
+
 use orr_shaders::{DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM, KernelSet, Mismatch};
 use shader_link::renderer::MODULES as RENDERER;
 use shader_link::{AirData, edited, linked, unlinked};
@@ -121,7 +123,7 @@ fn kernel_set_names_its_environment_and_medium() {
 fn a_set_built_against_an_edited_root_is_rejected() {
     let e = edited::KERNELS.check(RENDERER).unwrap_err();
     assert_eq!(e.kernel, "resolve");
-    assert!(matches!(e.reason, Mismatch::Interface { .. }), "{e}");
+    assert_matches!(e.reason, Mismatch::Interface { .. }, "{e}");
 }
 
 mod hot_reload {

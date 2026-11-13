@@ -3,6 +3,7 @@
 #[path = "common/assembly.rs"]
 mod common_assembly;
 
+use std::assert_matches;
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -500,7 +501,7 @@ material = { base_color = [0.5, 0.25, 0.125], surface = 4 }
     .unwrap();
     let m = Manifest::load(&path).unwrap();
     let a = &m.archives[0];
-    assert!(matches!(&a.output, Target::File(p) if *p == d.join("out.orr")));
+    assert_matches!(&a.output, Target::File(p) if *p == d.join("out.orr"));
     assert_eq!(a.cell_log2, 7);
     assert!(a.gdeflate);
     let Source::Gltf { path: p, settings } = &a.assets[0].source else {
@@ -545,15 +546,16 @@ material = { base_color = [0.5, 0.25, 0.125], surface = 4 }
             max_lights: 2
         }
     );
-    assert!(
-        matches!(&a.assets[3].source, Source::User { class: 32771, bytes, .. } if *bytes == [1, 2, 3])
+    assert_matches!(
+        &a.assets[3].source,
+        Source::User { class: 32771, bytes, .. } if *bytes == [1, 2, 3]
     );
     let Source::Instances(i) = &a.assets[4].source else {
         panic!("instances");
     };
     assert_eq!(i.records[0].position, [1.0, 2.0, 3.0]);
-    assert!(matches!(i.records[0].linear, Linear::Scaled { .. }));
-    assert!(matches!(i.records[1].linear, Linear::Matrix(_)));
+    assert_matches!(i.records[0].linear, Linear::Scaled { .. });
+    assert_matches!(i.records[1].linear, Linear::Matrix(_));
     assert!(i.prototypes[0].sections[0].hidden);
     let Source::Material(paint) = &a.assets[5].source else {
         panic!("material");
@@ -564,10 +566,7 @@ material = { base_color = [0.5, 0.25, 0.125], surface = 4 }
     );
 
     std::fs::write(&path, "[[archive]]\noutput = \"x\"\nbogus = 1\n").unwrap();
-    assert!(matches!(
-        Manifest::load(&path),
-        Err(orr_cook::Error::Manifest { .. })
-    ));
+    assert_matches!(Manifest::load(&path), Err(orr_cook::Error::Manifest { .. }));
 }
 
 #[test]
@@ -584,8 +583,9 @@ fn accessors_past_their_views_fail_to_import() {
     std::fs::write(&gltf, bad).unwrap();
     let err =
         orr_cook::cook(&manifest(&d, Target::Memory, MipFilter::Kaiser), &opts(1)).unwrap_err();
-    assert!(
-        matches!(&err, orr_cook::Error::Import { message, .. } if message.contains("runs past")),
+    assert_matches!(
+        &err,
+        orr_cook::Error::Import { message, .. } if message.contains("runs past"),
         "{err}"
     );
 }
@@ -663,7 +663,7 @@ fn gdeflate_archives_store_payload_pages() {
         .unwrap();
     let b = gd.blobs(e)[0];
     assert_eq!((b.codec(), b.chunk_count), (Codec::GDeflate, 5));
-    assert!(matches!(gd.verify(e), Err(orr_pack::Error::GDeflate)));
+    assert_matches!(gd.verify(e), Err(orr_pack::Error::GDeflate));
 
     let file = d.join("out.orr");
     let cook_file = |gdeflate| {

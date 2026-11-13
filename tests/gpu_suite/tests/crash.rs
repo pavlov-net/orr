@@ -4,6 +4,7 @@
 //! `ORR_GPU_EXPECT_FAULT=1 cargo test -p gpu_suite --test crash -- --ignored <name>`.
 //! The hang resets the GPU, so no other GPU application may be running.
 
+use std::assert_matches;
 use std::path::Path;
 use std::time::Duration;
 
@@ -51,10 +52,7 @@ fn lose_device(
     let result = queue
         .submit(vec![list], &[])
         .and_then(|point| queue.wait(point, Duration::from_secs(60)));
-    assert!(
-        matches!(result, Err(Error::DeviceLost)),
-        "expected device loss, got {result:?}"
-    );
+    assert_matches!(result, Err(Error::DeviceLost));
     let report = d.diagnostics_report();
     assert!(report.lost, "{report}");
     let q = report

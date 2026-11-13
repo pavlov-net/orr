@@ -2,6 +2,7 @@ mod common;
 #[path = "common/assembly.rs"]
 mod common_assembly;
 
+use std::assert_matches;
 use std::path::{Path, PathBuf};
 
 use orr_cook::{
@@ -726,9 +727,9 @@ fn prototypes_outside_the_format_fail_with_named_errors() {
         model: "kit/missing".into(),
         ..proto(0)
     }));
-    assert!(matches!(r, Err(Error::UnknownModel { model, .. }) if model == "kit/missing"));
+    assert_matches!(r.err(), Some(Error::UnknownModel { model, .. }) if model == "kit/missing");
     let r = cook_instances(one(proto(256)));
-    assert!(matches!(r, Err(Error::PoseVariant { pose: 256, .. })));
+    assert_matches!(r.err(), Some(Error::PoseVariant { pose: 256, .. }));
     let r = cook_instances(one(PrototypeSpec {
         sections: vec![SectionSpec {
             material: Some("kit/other/material/0".into()),
@@ -736,7 +737,7 @@ fn prototypes_outside_the_format_fail_with_named_errors() {
         }],
         ..proto(0)
     }));
-    assert!(matches!(r, Err(Error::UnknownMaterial { .. })));
+    assert_matches!(r.err(), Some(Error::UnknownMaterial { .. }));
 
     // Checked before the model's section count.
     let mut sections = vec![SectionSpec::default(); 17];
@@ -745,7 +746,7 @@ fn prototypes_outside_the_format_fail_with_named_errors() {
         sections,
         ..proto(0)
     }));
-    assert!(matches!(r, Err(Error::HiddenSection { section: 16, .. })));
+    assert_matches!(r.err(), Some(Error::HiddenSection { section: 16, .. }));
 }
 
 #[test]
@@ -775,7 +776,7 @@ fn user_classes_pass_through() {
             bytes: vec![1],
         },
     }]);
-    assert!(matches!(r, Err(Error::UserClass { class: 7, .. })));
+    assert_matches!(r.err(), Some(Error::UserClass { class: 7, .. }));
 }
 
 fn assembly_model(path: &Path) -> AssetSpec {
@@ -944,7 +945,7 @@ fn assemblies_place_their_units_through_instance_sources() {
         ..src.clone()
     };
     let r = cook_with_report(vec![assembly_model(&path), paint.clone(), scatter(joined)]);
-    assert!(matches!(r, Err(Error::Instances { .. })), "{:?}", r.err());
+    assert_matches!(r.err(), Some(Error::Instances { .. }));
     // Uneven scale over a unit copy's rotation shears it, which an exact row holds.
     let mut uneven = src;
     uneven.records[0].linear = Linear::Scaled {

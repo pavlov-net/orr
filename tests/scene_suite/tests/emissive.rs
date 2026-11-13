@@ -1,5 +1,6 @@
 //! The emissive list: instance entries and producer entries, their power summed on the GPU.
 
+use std::assert_matches;
 use std::sync::Arc;
 
 use orr_cook::{
@@ -416,10 +417,10 @@ fn material_sets_hold_every_entry_a_write_or_a_copy_names() {
     let low = w.add_instances(&desc(0, Some(0))).unwrap();
     w.copy_variants(low, 0, &set(1)).unwrap();
     w.add_instances(&desc(1, Some(3))).unwrap();
-    assert!(matches!(
+    assert_matches!(
         w.add_instances(&desc(2, Some(1 << 31))),
         Err(orr_scene::Error::Capacity { .. })
-    ));
+    );
     drop(w);
     f.update_scenes(&mut |_| {}).unwrap();
     wait(f.end(&[]).unwrap());

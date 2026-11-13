@@ -1,3 +1,4 @@
+use std::assert_matches;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -287,10 +288,10 @@ fn copy_entry_keeps_stored_bytes() {
     for e in src.entries() {
         w.copy_entry(&src, e).unwrap();
     }
-    assert!(matches!(
+    assert_matches!(
         w.copy_entry(&src, &src.entries()[0]),
         Err(Error::Duplicate(_))
-    ));
+    );
     let copy = Archive::from_memory(w.finish().unwrap().unwrap()).unwrap();
     check(&copy, &cases);
     for (a, b) in src.entries().iter().zip(copy.entries()) {
@@ -321,41 +322,35 @@ fn damaged_archives_fail_by_name() {
         .unwrap()
         .offset;
     toc[index as usize + 200] ^= 1;
-    assert!(matches!(from(toc), Err(Error::CorruptToc)));
+    assert_matches!(from(toc).err(), Some(Error::CorruptToc));
 
     let short = good[..good.len() - 4096].to_vec();
-    assert!(matches!(from(short), Err(Error::Truncated { .. })));
-    assert!(matches!(
-        from(good[..64].to_vec()),
-        Err(Error::Truncated { .. })
-    ));
+    assert_matches!(from(short).err(), Some(Error::Truncated { .. }));
+    assert_matches!(
+        from(good[..64].to_vec()).err(),
+        Some(Error::Truncated { .. })
+    );
 
     let mut version = good.to_vec();
     version[8] = 99;
-    assert!(matches!(
-        from(version),
-        Err(Error::Version { found: 99, .. })
-    ));
-    assert!(matches!(from(vec![0; 8192]), Err(Error::NotArchive)));
+    assert_matches!(from(version).err(), Some(Error::Version { found: 99, .. }));
+    assert_matches!(from(vec![0; 8192]).err(), Some(Error::NotArchive));
 
     let a = Archive::from_memory(Arc::clone(&good)).unwrap();
     let id = AssetId::from_name(&cases[0].name);
-    assert!(matches!(
+    assert_matches!(
         a.expect(id, USER, 2),
         Err(Error::Schema {
             found: 1,
             expected: 2,
             ..
         })
-    ));
-    assert!(matches!(
-        a.expect(id, USER + 1, 1),
-        Err(Error::Class { .. })
-    ));
-    assert!(matches!(
+    );
+    assert_matches!(a.expect(id, USER + 1, 1), Err(Error::Class { .. }));
+    assert_matches!(
         a.expect(AssetId::from_name("absent"), USER, 1),
         Err(Error::Missing(_))
-    ));
+    );
 
     // A payload byte flipped: the archive opens, and verify catches the entry.
     let e = a.find(AssetId::from_name("none/small")).unwrap();
@@ -364,11 +359,11 @@ fn damaged_archives_fail_by_name() {
     payload[b.offset as usize] ^= 1;
     let damaged = from(payload).unwrap();
     let e = damaged.find(e.id).unwrap();
-    assert!(matches!(damaged.verify(e), Err(Error::ContentHash { .. })));
+    assert_matches!(damaged.verify(e), Err(Error::ContentHash { .. }));
 
     let path = dir("truncated").join("a.orrpack");
     std::fs::write(&path, &good[..good.len() - 4096]).unwrap();
-    assert!(matches!(Archive::open(&path), Err(Error::Truncated { .. })));
+    assert_matches!(Archive::open(&path).err(), Some(Error::Truncated { .. }));
 }
 
 #[test]
@@ -435,7 +430,7 @@ fn finish_replaces_an_open_archive() {
     let mut w = ArchiveWriter::create(Target::File(path.clone())).unwrap();
     w.add("newest", USER, 1, Hash32([0; 32]), &[BlobIn::new(b"x")])
         .unwrap();
-    assert!(matches!(w.finish(), Err(Error::Replace { .. })));
+    assert_matches!(w.finish(), Err(Error::Replace { .. }));
     check(&Archive::open(&path).unwrap(), &[one("newer")]);
     assert!(d.join("a.orrpack.tmp").exists());
     assert!(!d.join("a.orrpack.payload.tmp").exists());
@@ -469,7 +464,7 @@ fn streamed_and_pre_encoded_blobs_equal_plain_adds() {
         e.push(&BlobIn::new(&bytes))?;
         Err(Error::InvalidBlob("stop"))
     });
-    assert!(matches!(failed, Err(Error::InvalidBlob("stop"))));
+    assert_matches!(failed, Err(Error::InvalidBlob("stop")));
     w.add("kept", USER, 1, Hash32([1; 32]), &[BlobIn::new(&bytes)])
         .unwrap();
     let a = Archive::from_memory(w.finish().unwrap().unwrap()).unwrap();

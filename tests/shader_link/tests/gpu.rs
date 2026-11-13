@@ -1,6 +1,8 @@
 //! The linked switches dispatched on the GPU and read back, and `orr::Renderer::new` checking
 //! kernel sets built against orr's own kernels.
 
+use std::assert_matches;
+
 use orr::{Renderer, RendererDesc};
 use orr_gpu::{
     Allocation, ComputePipeline, GpuPtr, Hazards, MemoryKind, QueueKind, ShaderModule, ShaderStage,
@@ -280,7 +282,7 @@ fn renderer_rejects_a_set_built_against_other_kernels() {
     match renderer_error(&orr_edited::KERNELS) {
         Some(orr::Error::Scene(orr::SceneError::Kernels(e))) => {
             assert_eq!(e.kernel, "environment/bake");
-            assert!(matches!(e.reason, Mismatch::Interface { .. }), "{e}");
+            assert_matches!(e.reason, Mismatch::Interface { .. }, "{e}");
         }
         other => panic!("expected an interface mismatch, got {other:?}"),
     }

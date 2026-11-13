@@ -3,6 +3,7 @@
 //! memory, the glare a view's lens asks for, exposure and ray reconstruction's resets across a
 //! camera cut, and views while the path kernels compile.
 
+use std::assert_matches;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs;
@@ -865,13 +866,13 @@ fn a_failed_path_compile_comes_back_from_render_view_and_wait_paths() {
         .unwrap();
     let history = r.create_view_history().unwrap();
     let failed = |e: orr::Error| match e {
-        orr::Error::PathKernels(e) => assert!(
-            matches!(
+        orr::Error::PathKernels(e) => {
+            assert_matches!(
                 &*e,
-                orr::LightingError::LateCompile { kernel, .. } if *kernel == "staged opaque shade"
-            ),
-            "{e}"
-        ),
+                orr::LightingError::LateCompile { kernel, .. } if *kernel == "staged opaque shade",
+                "{e}"
+            );
+        }
         e => panic!("{e}"),
     };
     r.wait_paths().unwrap();

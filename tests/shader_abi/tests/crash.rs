@@ -3,6 +3,7 @@
 //! never loses the device. Each runs alone:
 //! `ORR_GPU_EXPECT_FAULT=1 cargo test -p shader_abi --test crash -- --ignored <name>`.
 
+use std::assert_matches;
 use std::path::Path;
 use std::time::Duration;
 
@@ -38,9 +39,10 @@ fn null_tlas_aborts_with_asserts() {
     let result = queue
         .submit(vec![list], &[])
         .and_then(|point| queue.wait(point, Duration::from_secs(10)));
-    assert!(
-        matches!(result, Err(Error::DeviceLost)),
-        "the abort should lose the device, got {result:?}"
+    assert_matches!(
+        result,
+        Err(Error::DeviceLost),
+        "the abort should lose the device"
     );
     assert_clean();
 }
@@ -87,9 +89,10 @@ fn failed_assert_dumps_with_source_lines() {
     let result = queue
         .submit(vec![list], &[])
         .and_then(|point| queue.wait(point, Duration::from_secs(60)));
-    assert!(
-        matches!(result, Err(Error::DeviceLost)),
-        "the assert should lose the device, got {result:?}"
+    assert_matches!(
+        result,
+        Err(Error::DeviceLost),
+        "the assert should lose the device"
     );
 
     let report = d.diagnostics_report();

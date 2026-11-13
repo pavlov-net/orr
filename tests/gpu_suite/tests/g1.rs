@@ -1,5 +1,6 @@
 //! Device, memory, heaps, compute, timestamps and the empty TLAS.
 
+use std::assert_matches;
 use std::time::{Duration, Instant};
 
 use gpu_suite::shaders::{
@@ -274,10 +275,10 @@ fn a_wait_goes_on_while_the_queue_completes_work() {
     let (first, second) = (after(1), after(2));
     let stall = Duration::from_secs(1);
     // Both wait for the gate, so the queue completes nothing.
-    assert!(matches!(
+    assert_matches!(
         render().wait_while_completing(second, stall),
         Err(Error::Timeout)
-    ));
+    );
     // The first completes inside one stall time and the second inside the next.
     let started = Instant::now();
     std::thread::scope(|threads| {
