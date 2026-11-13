@@ -2606,8 +2606,6 @@ impl LimitSurface {
     /// clamped to the face.
     fn project(&self, x: Vec3, from: Spot) -> Spot {
         let mut s = from;
-        // Derivatives of an n-sided face's patches are twice those in its face coordinates
-        // (OpenSubdiv's scale), which halves each step there.
         for _ in 0..48 {
             let l = self.at(s);
             let r = (Vec3::from(l.position) - x).as_dvec3();

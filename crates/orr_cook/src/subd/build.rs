@@ -1063,4 +1063,77 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn derivatives_match_differences_in_face_coordinates() {
+        let data = CageData {
+            cage: test_cage(),
+            skin: None,
+        };
+        let cooked = cook(&data, &[Material::default(); 2], &SubdSettings::default()).unwrap();
+        // Dyadic samples and step keep every u ± h exact in f32.
+        const H: f32 = 1.0 / 64.0;
+        let mut seen = [false; 2];
+        for bytes in &cooked.pages {
+            let page = Page::parse(bytes).unwrap();
+            let points = page.points(&cooked.info.points);
+            // A patch reads only its own points, so each patch rewrites just those.
+            let mut moved = points.clone();
+            for face in &page.faces {
+                let first = face.patches.first as usize;
+                for patch in first..first + face.patches.count as usize {
+                    let p = &page.patches[patch];
+                    // Gregory derivatives are the Bezier patch's, not the rational blend's.
+                    if p.param.kind == PatchKind::Gregory {
+                        continue;
+                    }
+                    let cvs = &page.cvs[p.cvs as usize..p.cvs as usize + p.param.cv_count()];
+                    // Moved to the patch's first point, the positions round to its extent.
+                    let origin = Vec3::from(points[usize::from(cvs[0])]);
+                    let mut extent = 0.0f32;
+                    for &c in cvs {
+                        let q = Vec3::from(points[usize::from(c)]) - origin;
+                        moved[usize::from(c)] = q.to_array();
+                        extent = extent.max(q.length());
+                    }
+                    let at = |u, v| Vec3::from(page.patch_limit(patch, u, v, &moved).position);
+                    let n = f32::from(1u16 << p.param.levels());
+                    let h = H / n;
+                    for a in [0.25, 0.5, 0.75] {
+                        for b in [0.25, 0.5, 0.75] {
+                            let (u, v) = (
+                                (f32::from(p.param.u) + a) / n,
+                                (f32::from(p.param.v) + b) / n,
+                            );
+                            // Richardson's combination of central differences at steps h and
+                            // 2h is exact on cubics up to rounding.
+                            let slope = |d: Vec2| {
+                                let step = |k: f32| {
+                                    (at(u + k * d.x, v + k * d.y) - at(u - k * d.x, v - k * d.y))
+                                        / (2.0 * k)
+                                };
+                                (4.0 * step(h) - step(2.0 * h)) / 3.0
+                            };
+                            let l = page.patch_limit(patch, u, v, &moved);
+                            // The f32 weights put each position within 16 ulps of the extent,
+                            // and the combination scales a position error by 1.5 / h.
+                            let tol = 1.5 / h * 16.0 * f32::EPSILON * extent;
+                            for (d, ours) in [(Vec2::X, l.du), (Vec2::Y, l.dv)] {
+                                let e = (slope(d) - Vec3::from(ours)).abs().max_element();
+                                assert!(
+                                    e <= tol,
+                                    "face {} patch {patch} ({:?}) at ({u}, {v}): {ours:?}, differences {}, off {e} > {tol}",
+                                    face.ptex,
+                                    p.param.kind,
+                                    slope(d)
+                                );
+                            }
+                        }
+                    }
+                    seen[usize::from(p.param.flags & PatchParam::NON_QUAD != 0)] = true;
+                }
+            }
+        }
+        assert_eq!(seen, [true; 2], "quad and n-sided faces");
+    }
 }

@@ -354,10 +354,9 @@ impl PatchParam {
             }
             _ => 0,
         };
-        let scale = f32::from(1u16 << self.depth);
         for i in 0..count {
-            du[i] *= scale;
-            dv[i] *= scale;
+            du[i] *= n;
+            dv[i] *= n;
         }
         count
     }
