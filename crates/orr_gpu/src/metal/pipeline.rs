@@ -66,7 +66,7 @@ impl<'a> ShaderStage<'a> {
         }
         let digest = blake3::hash(bytes);
         Library::Reload(
-            u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap()),
+            u64::from_le_bytes(*digest.as_bytes().first_chunk().unwrap()),
             bytes,
         )
     }

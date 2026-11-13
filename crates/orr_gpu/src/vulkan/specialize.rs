@@ -359,7 +359,7 @@ pub(super) fn specialize(
             .iter()
             .find(|e| e.constant_id == constant && e.size == 4)?;
         let at = e.offset as usize;
-        Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+        Some(u32::from_le_bytes(*bytes.get(at..)?.first_chunk()?))
     };
 
     // The module's declarations: its entry points, scalar types and constants.
@@ -1183,8 +1183,11 @@ mod tests {
     fn text(s: &str) -> Vec<u32> {
         let mut b = s.as_bytes().to_vec();
         b.resize((b.len() / 4 + 1) * 4, 0);
-        b.chunks(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        b.as_chunks()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
             .collect()
     }
 

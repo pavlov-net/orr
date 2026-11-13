@@ -96,8 +96,11 @@ mod tests {
     fn name(s: &str) -> Vec<u32> {
         let mut b = s.as_bytes().to_vec();
         b.resize((b.len() / 4 + 1) * 4, 0);
-        b.chunks(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        b.as_chunks()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
             .collect()
     }
 

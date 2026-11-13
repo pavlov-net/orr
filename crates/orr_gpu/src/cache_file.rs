@@ -60,13 +60,14 @@ pub(crate) fn decode<'a>(file: &'a [u8], expect: &Identity) -> Result<&'a [u8], 
     if blake3::hash(body).as_bytes() != sum {
         return Err("checksum mismatch".into());
     }
-    let Some((header, payload)) = body.split_at_checked(HEADER) else {
+    let Some((header, payload)) = body.split_first_chunk::<HEADER>() else {
         return Err("truncated".into());
     };
     if header[..8] != MAGIC {
         return Err("not an orr pipeline cache".into());
     }
-    let word = |i: usize| u32::from_le_bytes(header[8 + 4 * i..12 + 4 * i].try_into().unwrap());
+    let words = header[8..24].as_chunks::<4>().0;
+    let word = |i: usize| u32::from_le_bytes(words[i]);
     let format = word(0);
     if format != FORMAT {
         return Err(format!("format {format}, expected {FORMAT}"));

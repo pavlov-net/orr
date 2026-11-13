@@ -375,7 +375,7 @@ impl PtlasCheck {
 
 /// Little-endian word `i` of `bytes`.
 fn word(bytes: &[u8], i: usize) -> u32 {
-    u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap())
+    u32::from_le_bytes(bytes.as_chunks().0[i])
 }
 
 fn word64(bytes: &[u8], i: usize) -> u64 {
@@ -971,10 +971,10 @@ impl CommandList<'_> {
                 let clas: Vec<Vec<u64>> = blas
                     .iter()
                     .map(|&(_, n)| {
-                        let v = (0..n as usize)
-                            .map(|i| {
-                                u64::from_le_bytes(bytes[at + 8 * i..][..8].try_into().unwrap())
-                            })
+                        let v = bytes[at..].as_chunks().0[..n as usize]
+                            .iter()
+                            .copied()
+                            .map(u64::from_le_bytes)
                             .collect();
                         at += 8 * n as usize;
                         v

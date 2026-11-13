@@ -44,7 +44,7 @@ type ComputeState = ProtocolObject<dyn MTLComputePipelineState>;
 type RenderState = ProtocolObject<dyn MTLRenderPipelineState>;
 
 fn word(hash: &blake3::Hash) -> u32 {
-    u32::from_le_bytes(hash.as_bytes()[..4].try_into().unwrap())
+    u32::from_le_bytes(*hash.as_bytes().first_chunk().unwrap())
 }
 
 /// The device's identity: the GPU by name, and the OS, whose Metal compiler builds the binaries.
@@ -58,7 +58,7 @@ fn identity(device: &ProtocolObject<dyn MTLDevice>) -> Identity {
         vendor: APPLE,
         device: word(&blake3::hash(name.as_bytes())),
         driver_version: word(&blake3::hash(os.as_bytes())),
-        cache_uuid: uuid.as_bytes()[..16].try_into().unwrap(),
+        cache_uuid: *uuid.as_bytes().first_chunk().unwrap(),
     }
 }
 

@@ -118,7 +118,7 @@ pub fn slerp(a: [f32; 4], b: [f32; 4], u: f32) -> [f32; 4] {
 /// Joint name hash: the first 8 bytes of blake3 of the name, little-endian.
 pub fn name_hash(name: &str) -> u64 {
     let h = blake3::hash(name.as_bytes());
-    u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap())
+    u64::from_le_bytes(*h.as_bytes().first_chunk().unwrap())
 }
 
 /// A skeleton blob: the header and its tables.

@@ -639,7 +639,7 @@ fn component(b: &[u8], ty: DataType, c: usize, normalized: bool) -> f32 {
             if normalized { x / 255.0 } else { x }
         }
         DataType::I16 => {
-            let x = f32::from(i16::from_le_bytes([b[2 * c], b[2 * c + 1]]));
+            let x = f32::from(i16::from_le_bytes(b.as_chunks().0[c]));
             if normalized {
                 (x / 32767.0).max(-1.0)
             } else {
@@ -647,11 +647,11 @@ fn component(b: &[u8], ty: DataType, c: usize, normalized: bool) -> f32 {
             }
         }
         DataType::U16 => {
-            let x = f32::from(u16::from_le_bytes([b[2 * c], b[2 * c + 1]]));
+            let x = f32::from(u16::from_le_bytes(b.as_chunks().0[c]));
             if normalized { x / 65535.0 } else { x }
         }
-        DataType::U32 => u32::from_le_bytes(b[4 * c..4 * c + 4].try_into().unwrap()) as f32,
-        DataType::F32 => f32::from_le_bytes(b[4 * c..4 * c + 4].try_into().unwrap()),
+        DataType::U32 => u32::from_le_bytes(b.as_chunks().0[c]) as f32,
+        DataType::F32 => f32::from_le_bytes(b.as_chunks().0[c]),
     }
 }
 

@@ -50,9 +50,7 @@ fn read_chunk(d: &[u8]) -> Vec<Record> {
             varint(d, &mut p);
             let prototype = varint(d, &mut p);
             varint(d, &mut p);
-            let f = std::array::from_fn(|i| {
-                f32::from_le_bytes(d[p + 4 * i..p + 4 * i + 4].try_into().unwrap())
-            });
+            let f = std::array::from_fn(|i| f32::from_le_bytes(d[p..].as_chunks().0[i]));
             p += 40;
             Record { prototype, f }
         })
@@ -167,8 +165,7 @@ fn scatter_set_cooks_within_its_error_bounds() {
         let corner = DVec3::from(h.cell.map(f64::from)) * 256.0;
         let (_, decoded) = instance::decode(&head, &recs).unwrap();
         for (k, (record, (_, m))) in raw.iter().zip(decoded).enumerate() {
-            let r =
-                &recs_src[u32::from_le_bytes(user[4 * k..4 * k + 4].try_into().unwrap()) as usize];
+            let r = &recs_src[u32::from_le_bytes(user.as_chunks().0[k]) as usize];
             let q = DQuat::from_xyzw(r.f[3].into(), r.f[4].into(), r.f[5].into(), r.f[6].into())
                 .normalize();
             let s = Vec3::new(r.f[7], r.f[8], r.f[9]).as_dvec3();

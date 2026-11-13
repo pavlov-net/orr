@@ -263,7 +263,7 @@ fn fixture_page_decodes_within_its_error_bounds() {
     let mut seen = vec![false; n];
     let mut turned = 0;
     for (k, (prototype, m)) in decoded.enumerate() {
-        let src_index = u32::from_le_bytes(user[k * 4..k * 4 + 4].try_into().unwrap()) as usize;
+        let src_index = u32::from_le_bytes(user.as_chunks().0[k]) as usize;
         assert!(!std::mem::replace(&mut seen[src_index], true));
         let p = &records[src_index];
         assert_eq!(prototype, p.prototype);
@@ -1177,7 +1177,7 @@ fn a_field_of_small_copies_stays_compact() {
     };
     let (cell, decoded) = instance::decode(&head, &blob).unwrap();
     for (k, (r, (_, m))) in raw.iter().zip(decoded).enumerate() {
-        let i = u32::from_le_bytes(user[4 * k..4 * k + 4].try_into().unwrap()) as usize;
+        let i = u32::from_le_bytes(user.as_chunks().0[k]) as usize;
         assert_placed(r, &records[i], cell, m, &bounds);
     }
 }
