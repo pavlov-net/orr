@@ -16,7 +16,7 @@
 //! on a face-varying patch, or bilinear over the patch's corners. Each gives a uv set or some of
 //! the vertex color stream's four channels, so values of different interpolations share a face.
 
-use bytemuck::{Pod, Zeroable};
+use bytemuck::{CheckedBitPattern, NoUninit, Pod, Zeroable};
 use orr_math::{Affine3, Vec3};
 
 use crate::blob::{put_table, read, table};
@@ -27,6 +27,9 @@ pub const SCHEMA: u16 = 5;
 
 /// Largest page.
 pub const PAGE_MAX: usize = 128 << 10;
+
+/// Deepest isolation, OpenSubdiv's: a patch's depth and position fit Far's packed patch param.
+pub const ISOLATION_MAX: u8 = 10;
 
 /// Blob 0 header. Spans name tables in blob 0: `first` is a byte offset, `count` a record
 /// count.
@@ -269,49 +272,79 @@ pub struct Face {
     pub patches: Span,
 }
 
+/// How a patch's points combine.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, NoUninit, CheckedBitPattern)]
+pub enum PatchKind {
+    /// Bicubic B-spline, 16 points.
+    #[default]
+    Regular = 0,
+    /// Gregory basis, 20 points.
+    Gregory = 1,
+    /// Bilinear, 4 points.
+    Linear = 2,
+}
+
+impl PatchKind {
+    pub const fn cv_count(self) -> usize {
+        match self {
+            Self::Regular => 16,
+            Self::Gregory => 20,
+            Self::Linear => 4,
+        }
+    }
+}
+
+impl TryFrom<u8> for PatchKind {
+    type Error = u8;
+
+    fn try_from(code: u8) -> std::result::Result<Self, u8> {
+        bytemuck::checked::try_cast(code).map_err(|_| code)
+    }
+}
+
 /// Where a patch sits in its face and how its points combine.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, NoUninit, CheckedBitPattern)]
 pub struct PatchParam {
-    /// Position of the patch in its face's grid of `2^depth` (`2^(depth - 1)` for the root
-    /// of an n-sided face's sub-face) patches per side.
+    /// Position of the patch in its face's grid of `2^levels()` patches per side.
     pub u: u16,
     pub v: u16,
+    /// Refinement level, at most [`ISOLATION_MAX`] and at least 1 with [`Self::NON_QUAD`].
     pub depth: u8,
     /// Edges 0..3 (bits 0..3: v = 0, u = 1, v = 1, u = 0) beyond which a B-spline patch
     /// extrapolates its missing points.
     pub boundary: u8,
     /// Edges whose neighbor is one level finer, for crack-free tessellation.
     pub transition: u8,
-    /// [`Self::REGULAR`], [`Self::GREGORY`] or [`Self::LINEAR`].
-    pub kind: u8,
+    pub kind: PatchKind,
     /// [`Self::NON_QUAD`].
     pub flags: u8,
     pub _pad: [u8; 3],
 }
 
 impl PatchParam {
-    /// Bicubic B-spline, 16 points.
-    pub const REGULAR: u8 = 0;
-    /// Gregory basis, 20 points.
-    pub const GREGORY: u8 = 1;
-    /// Bilinear, 4 points.
-    pub const LINEAR: u8 = 2;
-    /// The patch belongs to a sub-face of an n-sided cage face.
+    /// The patch belongs to a sub-face of an n-sided cage face, whose root is at depth 1.
     pub const NON_QUAD: u8 = 1;
 
     pub fn cv_count(&self) -> usize {
-        match self.kind {
-            Self::REGULAR => 16,
-            Self::GREGORY => 20,
-            Self::LINEAR => 4,
-            _ => 0,
-        }
+        self.kind.cv_count()
     }
 
     /// Subdivision levels of the face's grid of patches: `2^levels` patches per side.
     pub fn levels(&self) -> u8 {
         self.depth - u8::from(self.flags & Self::NON_QUAD != 0)
+    }
+
+    /// Whether the fields hold what the cook writes: a known flag, a depth within
+    /// [`ISOLATION_MAX`] and at or below a sub-face's root, and a position in the grid.
+    fn valid(&self) -> bool {
+        let non_quad = self.flags & Self::NON_QUAD != 0;
+        self.flags & !Self::NON_QUAD == 0
+            && self.depth <= ISOLATION_MAX
+            && (!non_quad || self.depth >= 1)
+            && self.u >> self.levels() == 0
+            && self.v >> self.levels() == 0
     }
 
     /// Whether face coordinates `(u, v)` lie in the patch.
@@ -334,26 +367,19 @@ impl PatchParam {
         let n = f32::from(1u16 << self.levels());
         let s = u * n - f32::from(self.u);
         let t = v * n - f32::from(self.v);
-        let count = match self.kind {
-            Self::REGULAR => {
+        match self.kind {
+            PatchKind::Regular => {
                 bspline(s, t, w, du, dv);
                 if self.boundary != 0 {
                     for x in [&mut *w, &mut *du, &mut *dv] {
                         bspline_boundary(self.boundary, x);
                     }
                 }
-                16
             }
-            Self::GREGORY => {
-                gregory(s, t, w, du, dv);
-                20
-            }
-            Self::LINEAR => {
-                linear(s, t, w, du, dv);
-                4
-            }
-            _ => 0,
-        };
+            PatchKind::Gregory => gregory(s, t, w, du, dv),
+            PatchKind::Linear => linear(s, t, w, du, dv),
+        }
+        let count = self.kind.cv_count();
         for i in 0..count {
             du[i] *= n;
             dv[i] *= n;
@@ -364,7 +390,7 @@ impl PatchParam {
 
 /// One patch: its parameters and first point for positions, and its parts.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
+#[derive(Copy, Clone, Debug, PartialEq, NoUninit, CheckedBitPattern)]
 pub struct Patch {
     pub param: PatchParam,
     /// First entry of the page's `cvs` table.
@@ -376,7 +402,7 @@ pub struct Patch {
 
 /// A uv set or some channels of the vertex color stream over one patch.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
+#[derive(Copy, Clone, Debug, PartialEq, NoUninit, CheckedBitPattern)]
 pub struct Part {
     /// Where the part's own patch sits in the face.
     pub param: PatchParam,
@@ -466,14 +492,15 @@ impl Page {
                 .is_some_and(|c| c.iter().all(|&i| usize::from(i) < limit))
         };
         for p in &self.patches {
-            if !cvs(p.cvs, p.param.cv_count(), &self.cvs, points)
+            if !p.param.valid()
+                || !cvs(p.cvs, p.param.cv_count(), &self.cvs, points)
                 || p.parts.first as usize + p.parts.count as usize > self.parts.len()
             {
                 return Err(bad);
             }
         }
         for c in &self.parts {
-            if !cvs(c.cvs, c.param.cv_count(), &self.part_cvs, value_points) {
+            if !c.param.valid() || !cvs(c.cvs, c.param.cv_count(), &self.part_cvs, value_points) {
                 return Err(bad);
             }
         }

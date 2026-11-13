@@ -313,7 +313,7 @@ impl CageTables {
             for p in &page.patches {
                 let n = p.param.cv_count();
                 t.patches.push(SubdPatchGpu {
-                    bits: u32::from(p.param.kind) | u32::from(p.param.boundary) << 8,
+                    bits: p.param.kind as u32 | u32::from(p.param.boundary) << 8,
                     cvs: t.cvs.len() as u32,
                     part_first: t.parts.len() as u32,
                     part_count: p.parts.count,
@@ -324,7 +324,7 @@ impl CageTables {
                 for part in &page.parts[first..first + p.parts.count as usize] {
                     let (scale, offset) = coordinates(&p.param, &part.param);
                     t.parts.push(SubdPartGpu {
-                        bits: u32::from(part.param.kind)
+                        bits: part.param.kind as u32
                             | u32::from(part.param.boundary) << 8
                             | part.channels << 16,
                         cvs: t.part_cvs.len() as u32,
@@ -361,11 +361,6 @@ impl CageTables {
                 let patch = patch_base + local;
                 let param = page.patches[local].param;
                 let lp = u32::from(param.levels());
-                if lp > 15 {
-                    return Err(
-                        orr_pack::Error::Malformed("subd patch deeper than 15 levels").into(),
-                    );
-                }
                 let tris = base_triangles(param.transition);
                 let mut local_vertices: Vec<[u32; 2]> = Vec::new();
                 for tri in &tris {

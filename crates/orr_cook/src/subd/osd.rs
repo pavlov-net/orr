@@ -2,6 +2,8 @@
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 
+use orr_pack::subd::PatchKind;
+
 use super::{Boundary, CageInput, CageValues, SubdSettings};
 
 #[repr(C)]
@@ -81,7 +83,7 @@ impl Stencils {
 /// One patch table side (positions or a face-varying channel): per patch its type, points and
 /// Far patch param.
 pub(super) struct Patches {
-    pub(super) types: Vec<u8>,
+    pub(super) types: Vec<PatchKind>,
     /// Points of patch `p` are `cvs[first[p]..first[p + 1]]`, indices into the stencils.
     pub(super) first: Vec<usize>,
     pub(super) cvs: Vec<u32>,
@@ -214,18 +216,23 @@ impl Handle {
     }
 
     fn patches(&self, base: c_int) -> Patches {
-        let types: Vec<u8> = self.table::<i32>(base).iter().map(|&t| t as u8).collect();
+        let types: Vec<PatchKind> = self
+            .table::<i32>(base)
+            .iter()
+            .map(|&t| {
+                u8::try_from(t)
+                    .ok()
+                    .and_then(|t| PatchKind::try_from(t).ok())
+                    .expect("the shim stores only the patch kinds it names")
+            })
+            .collect();
         let raw = self.table::<i32>(base + 1);
         let mut first = Vec::with_capacity(types.len() + 1);
         let mut cvs = Vec::with_capacity(raw.len());
         let mut at = 0;
         for &t in &types {
             first.push(cvs.len());
-            let n = match t {
-                0 => 16,
-                1 => 20,
-                _ => 4,
-            };
+            let n = t.cv_count();
             let own = &raw[at..at + n];
             // Points beyond a boundary have no weight; keep their index valid.
             let fill = own.iter().copied().find(|&i| i >= 0).unwrap_or(0) as u32;

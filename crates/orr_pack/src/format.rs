@@ -105,19 +105,15 @@ impl Header {
 
 impl Blob {
     pub fn codec(&self) -> Codec {
-        match self.codec & 0xF {
-            1 => Codec::Zstd,
-            2 => Codec::GDeflate,
-            _ => Codec::None,
-        }
+        Codec::from_code(self.codec & 0xF).expect("a validated blob record")
     }
 
     pub fn filter(&self) -> Filter {
-        Filter::from_code(self.codec >> 4).unwrap_or(Filter::None)
+        Filter::from_code(self.codec >> 4).expect("a validated blob record")
     }
 
     pub fn is_mount(&self) -> bool {
-        self.mount != 0
+        bool::try_from(self.mount).expect("a validated blob record")
     }
 
     /// Decoded length of every chunk but the last, which may be shorter. Chunk lengths are
@@ -268,9 +264,9 @@ pub(crate) fn validate(h: &Header, index: &[u8]) -> Result<Layout> {
             return Err(Error::Malformed("blob chunk range"));
         };
         if b.chunk_count == 0
-            || b.codec & 0xF > Codec::GDeflate as u8
+            || Codec::from_code(b.codec & 0xF).is_none()
             || Filter::from_code(b.codec >> 4).is_none()
-            || b.mount > 1
+            || bool::try_from(b.mount).is_err()
         {
             return Err(Error::Malformed("blob record"));
         }

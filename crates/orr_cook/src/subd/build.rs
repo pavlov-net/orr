@@ -7,7 +7,8 @@ use orr_math::{Vec2, Vec3, Vec4};
 use orr_pack::material::Material;
 use orr_pack::mesh::Section;
 use orr_pack::subd::{
-    Face, PAGE_MAX, Page, PageHeader, PageInfo, Part, Patch, PatchParam, SubdHeader, SubdInfo,
+    Face, PAGE_MAX, Page, PageHeader, PageInfo, Part, Patch, PatchKind, PatchParam, SubdHeader,
+    SubdInfo,
 };
 use orr_pack::{Aabb, Span};
 
@@ -22,7 +23,7 @@ fn ptex_count(corners: u32) -> u32 {
 }
 
 /// Far's packed patch param as the cooked one.
-fn param(kind: u8, p: [u32; 2]) -> (u32, PatchParam) {
+fn param(kind: PatchKind, p: [u32; 2]) -> (u32, PatchParam) {
     let bits = |v: u32, width: u32, offset: u32| (v >> offset) & ((1 << width) - 1);
     let face = bits(p[0], 28, 0);
     let param = PatchParam {
@@ -188,7 +189,7 @@ impl<'a> Layers<'a> {
                             v: (f32::from(surface.v + d.1) / n).to_bits(),
                         };
                         let param = PatchParam {
-                            kind: PatchParam::LINEAR,
+                            kind: PatchKind::Linear,
                             boundary: 0,
                             ..surface
                         };
@@ -485,7 +486,7 @@ where
     T: Copy + Add<Output = T> + Sub<Output = T> + Mul<f32, Output = T> + Div<f32, Output = T>,
 {
     let at = |i: usize| rest[cvs[i] as usize];
-    if p.kind != PatchParam::REGULAR {
+    if p.kind != PatchKind::Regular {
         return (0..cvs.len()).map(at).collect();
     }
     let mut q: [T; 16] = std::array::from_fn(at);

@@ -145,7 +145,8 @@ pub enum UvLinear {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SubdSettings {
-    /// Refinement levels around creases, corners and boundaries, 1 to 10.
+    /// Refinement levels around creases, corners and boundaries, 1 to
+    /// [`orr_pack::subd::ISOLATION_MAX`].
     pub isolation: u8,
     /// Refinement levels around smooth extraordinary vertices, 1 to `isolation`.
     pub smooth_isolation: u8,
@@ -317,11 +318,13 @@ pub(crate) fn cook(
     materials: &[Material],
     settings: &SubdSettings,
 ) -> Result<Cooked, String> {
-    if !(1..=10).contains(&settings.isolation)
+    use orr_pack::subd::ISOLATION_MAX;
+
+    if !(1..=ISOLATION_MAX).contains(&settings.isolation)
         || !(1..=settings.isolation).contains(&settings.smooth_isolation)
     {
         return Err(format!(
-            "isolation {} and smooth isolation {}: 1 <= smooth <= isolation <= 10",
+            "isolation {} and smooth isolation {}: 1 <= smooth <= isolation <= {ISOLATION_MAX}",
             settings.isolation, settings.smooth_isolation
         ));
     }

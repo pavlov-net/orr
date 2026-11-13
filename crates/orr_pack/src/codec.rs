@@ -1,5 +1,16 @@
 use crate::{BcLayout, Codec, DEFAULT_CHUNK, Error, Filter, GDeflate, Result};
 
+impl Codec {
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::None),
+            1 => Some(Self::Zstd),
+            2 => Some(Self::GDeflate),
+            _ => None,
+        }
+    }
+}
+
 impl Filter {
     /// The filter's nibble in [`crate::Blob::codec`].
     pub(crate) fn code(self) -> u8 {

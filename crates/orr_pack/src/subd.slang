@@ -6,7 +6,7 @@ module subd;
 
 import orr_shaders.packing;
 
-// `PatchParam.kind`.
+// `PatchKind`.
 public static const uint SUBD_REGULAR = 0;
 public static const uint SUBD_GREGORY = 1;
 public static const uint SUBD_LINEAR = 2;
