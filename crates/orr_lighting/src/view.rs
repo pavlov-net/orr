@@ -1046,13 +1046,22 @@ impl SupportKernels {
 }
 
 /// The rounds of the staged loop a path of `max_bounces` bounces and `dielectric_depth` layers
-/// may take: one per iteration of a path (`path_iterations`), which traces at most once,
-/// and one for the vertex its start leaves to shade.
-fn rounds(max_bounces: u32, dielectric_depth: u32, reference: bool) -> Result<u32, Error> {
-    let walks = if reference {
-        u64::from(max_bounces) + 1
-    } else {
-        1
+/// may take: one per iteration of a path, which traces at most once, and one for the vertex its
+/// start leaves to shade. A path's iterations are a camera ray, then a vertex and its ray each,
+/// and where `walks` a subsurface walk, or under the reference one at every opaque vertex. An
+/// interior's walk takes none of its own: it runs where a segment scatters, and its way out is
+/// a vertex that counts as a bounce. The kernels end a path that would take more
+/// (`path_iterations`).
+fn rounds(
+    max_bounces: u32,
+    dielectric_depth: u32,
+    reference: bool,
+    walks: bool,
+) -> Result<u32, Error> {
+    let walks = match (walks, reference) {
+        (false, _) => 0,
+        (true, true) => u64::from(max_bounces) + 1,
+        (true, false) => 1,
     };
     let rounds = u64::from(max_bounces) + 3 + walks + u64::from(dielectric_depth) + 1;
     if rounds > u64::from(MAX_ROUNDS) {
@@ -1063,10 +1072,13 @@ fn rounds(max_bounces: u32, dielectric_depth: u32, reference: bool) -> Result<u3
     Ok(rounds as u32)
 }
 
-/// [`rounds`] of a path under `root`.
-fn path_rounds(root: &PathRoot) -> u32 {
+/// [`rounds`] of a path under `root` that may meet `may`: one that never walks takes no walk's
+/// iterations, and one whose rays meet no layer and that lies in no interior none of a layer.
+fn path_rounds(root: &PathRoot, may: u64) -> u32 {
     let reference = root.dielectric_flags & DIELECTRIC_REFERENCE != 0;
-    rounds(root.max_bounces, root.dielectric_depth, reference)
+    let layers = may & (MAY_LAYERS | MAY_INTERIORS) != 0;
+    let depth = if layers { root.dielectric_depth } else { 0 };
+    rounds(root.max_bounces, depth, reference, may & MAY_WALK != 0)
         .expect("record_paths checked the view's and the photons' rounds")
 }
 
@@ -1981,10 +1993,11 @@ impl LightingKernels {
         let depth = dielectric_depth(lighting);
         let max_bounces = lighting.max_bounces;
         let passes = if pass.frosted_glass { 2 } else { 1 };
-        let rows = (rounds(max_bounces, depth, reference)? * passes).max(rounds(
+        let rows = (rounds(max_bounces, depth, reference, true)? * passes).max(rounds(
             PHOTON_BOUNCES,
             depth,
             reference,
+            true,
         )?) + 1;
         // The update paths of a view's blocks ride with its own, shared out over its slices.
         let update = if reference {
@@ -2111,12 +2124,12 @@ impl LightingKernels {
         let mut meets = may(&path_root, predicted.view);
         let mut update = 0;
         if let Some(update_root) = &update_root {
+            meets |= may(update_root, predicted.update) | Source::Update.may();
             assert_eq!(
-                path_rounds(update_root),
-                path_rounds(&path_root),
+                path_rounds(update_root, meets),
+                path_rounds(&path_root, meets),
                 "update paths take the rounds of their view's"
             );
-            meets |= may(update_root, predicted.update) | Source::Update.may();
             update = blocks[0] * blocks[1];
         }
         list.begin_pass(
@@ -2135,7 +2148,7 @@ impl LightingKernels {
                 source: Source::View,
                 may: meets,
                 items: pixels,
-                rounds: path_rounds(&path_root),
+                rounds: path_rounds(&path_root, meets),
                 passes: if pass.frosted_glass { 2 } else { 1 },
                 update,
             },
@@ -2151,15 +2164,16 @@ impl LightingKernels {
                 pixel_fraction: 1.0,
                 ..path_root
             };
+            let meets = may(&background_root, predicted.background);
             k.stages.record(
                 list,
                 &SourcePaths {
                     memory: view.staged.as_ref().expect("made above"),
                     root: &background_root,
                     source: Source::Background,
-                    may: may(&background_root, predicted.background),
+                    may: meets,
                     items: pixels,
-                    rounds: path_rounds(&background_root),
+                    rounds: path_rounds(&background_root, meets),
                     passes: 1,
                     update: 0,
                 },
@@ -2256,7 +2270,7 @@ impl LightingKernels {
         // As many slots as the photons of a frame at its default count: more photons
         // than that run in slices that each hold as many.
         let slots = photons.min(PHOTON_SLOTS);
-        let queues = path_rounds(&photon_root) + 1;
+        let queues = path_rounds(&photon_root, may) + 1;
         if own.holds(slots, parts, queues) {
             view.staged_photons = None;
         } else if !view
@@ -2286,7 +2300,7 @@ impl LightingKernels {
                 source: Source::Photon,
                 may,
                 items: photons,
-                rounds: path_rounds(&photon_root),
+                rounds: path_rounds(&photon_root, may),
                 passes: 1,
                 update: 0,
             },

@@ -1712,13 +1712,11 @@ public bool stack_owns<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 ori
         && abs(dot(normal, stack.normal)) >= STACK_PARALLEL;
 }
 
-// Iterations of a path: a camera ray, then a vertex and its ray each, and a subsurface walk, or
-// under the reference one at every opaque vertex. An interior's walk takes none of its own: it
-// runs where a segment scatters, and its way out is a vertex that counts as a bounce.
+// Iterations of a path: one per round of its pass but the one its start leaves to shade, which
+// the host gives the pass for what its paths may meet (`rounds` in view.rs).
 public uint path_iterations(PathRoot r)
 {
-    uint walks = (r.dielectric_flags & DIELECTRIC_REFERENCE) != 0 ? r.max_bounces + 1 : 1;
-    return r.max_bounces + 3 + walks + r.dielectric_depth;
+    return r.round_next - r.round_first - 1;
 }
 
 // The first vertex of `pixel` from the G-buffer; false for sky pixels.

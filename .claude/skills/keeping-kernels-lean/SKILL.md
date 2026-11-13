@@ -26,7 +26,8 @@ support kernels it reads, so kernel compile time is something a user sees.
   isn't, a gate isn't folding.
 - Every round of a pass runs as stages, however few paths reach it: a late round pays its
   dispatches and barriers even when its queues are empty. Keep that fixed cost small rather
-  than folding rounds into a looping kernel, which holds every stage it loops over.
+  than folding rounds into a looping kernel, which holds every stage it loops over, and give a
+  pass only the rounds its paths may take (`rounds` in `view.rs`).
 - The pipeline store fills with the number of distinct pipelines more than with their code size,
   so each new axis of specialization multiplies it.
 
@@ -91,6 +92,10 @@ These depend on the driver, so measure again on other hardware:
   it takes minutes to compile where a stage takes seconds. A rest stage that ran the rounds
   from the fifth on in one lane saved about a tenth of a small bed's frame and compiled
   seven to twelve times as long as the slowest stage.
+- **Conditional rendering over late rounds' dispatches** (`VK_EXT_conditional_rendering` on a
+  queue's workgroup count or a round's trace count): no faster on empty rounds, whose cost is
+  mostly barriers, and per dispatch it serialized a shade step's dispatches and made a frame
+  about 40% slower.
 - **One entry point per module:** no gain in the driver, and longer builds.
 - **Shade stages as ray-generation entries** (for reordering): about twice as slow as compute
   with no reordering, cause unknown.
