@@ -134,6 +134,12 @@ opt-level = 3
 [profile.dev.package.lighting_math]
 opt-level = 3
 
+# Release with line tables, which give the kernels line tables and their source too
+# (orr_shaders' `DebugInfo`), for profilers.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+
 # The debug profile inherits dev's opt-level overrides; at 1 these crates stay fast enough to run
 # their tests and a debugger can still step through them.
 [profile.debug.package.orr_pack]

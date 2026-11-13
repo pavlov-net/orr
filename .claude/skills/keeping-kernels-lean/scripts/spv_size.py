@@ -4,8 +4,9 @@
     python -I spv_size.py --lines MODULE.spv     instructions by source file and most-copied lines
     python -I spv_size.py [--lines] --stage NAME the newest build of path/staged/NAME.spv
 
---lines needs a build with ORR_SHADER_DEBUG_INFO=lines. A line that shows many copies is a
-body inlined at many call sites.
+--lines needs a build with line tables (dev, the profiling profile, or
+ORR_SHADER_DEBUG_INFO=lines). A line that shows many copies is a body inlined at many call
+sites. Sizes to compare come from a build without them (release, or ORR_SHADER_DEBUG_INFO=off).
 """
 import collections
 import json
@@ -54,6 +55,9 @@ def summary(path):
         ops[OP_RAY_QUERY_INITIALIZE], ops[OP_RAY_QUERY_PROCEED], ops[OP_LOOP_MERGE]))
     for function, count in sorted(functions, key=lambda f: -f[1])[:8]:
         print("  %8d  %s" % (count, names.get(function, "%%%d" % function)[:90]))
+    if ops[OP_LINE]:
+        print("  built with line tables, unlike what ships: measure sizes from a build with "
+              "ORR_SHADER_DEBUG_INFO=off or in release")
 
 
 def lines(path):
@@ -83,7 +87,8 @@ def lines(path):
         return strings.get(file, "?").replace("\\", "/").split("/crates/")[-1][-56:]
 
     if not by_line:
-        sys.exit("no line info: build with ORR_SHADER_DEBUG_INFO=lines")
+        sys.exit("no line info: build in dev, with the profiling profile or with "
+                 "ORR_SHADER_DEBUG_INFO=lines")
     print("%s: %d instructions in functions" % (os.path.basename(path), total))
     print("by source file:")
     for file, count in by_file.most_common(20):

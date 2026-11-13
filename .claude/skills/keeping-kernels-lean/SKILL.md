@@ -108,12 +108,16 @@ Compare with the same stage before your change, on the same machine; numbers fro
 or an older build don't transfer. Compile times of the same module vary a lot between runs and
 processes, so trust only differences measured in the same run, or of several times.
 
+Measure the kernels that ship: dev and test builds compile them with line tables, which keep
+some locals in memory and make them about a percent larger. Build the sizes, compile times and
+frame times you compare with `ORR_SHADER_DEBUG_INFO=off`, or in release.
+
 - **Size:** `python -I ${CLAUDE_SKILL_DIR}/scripts/spv_size.py --stage trace` reports the newest
   build of a stage module (`primary`, `shade_opaque`, `shade_other`, `trace`, `walk`,
   `sources`, `reset`) and prints its path; it also accepts module paths. It reads the module as
   emitted, before the fold, so the size is the same for every mask and every GPU. With `--lines`
-  on a build made with `ORR_SHADER_DEBUG_INFO=lines`, it lists instructions by source file and
-  the lines with the most copies, which finds a body inlined at many sites.
+  on a build with line tables (dev, or the `profiling` profile), it lists instructions by source
+  file and the lines with the most copies, which finds a body inlined at many sites.
 - **Compile time:** only a cold compile counts, because the pipeline store and the driver's cache
   serve later ones. Time with an empty store (`ORR_TEST_PIPELINE_STORE` set to a new directory)
   and an empty driver cache directory, and record the mask, GPU and driver.

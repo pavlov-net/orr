@@ -112,17 +112,21 @@ read code, start with those examples and the `orr` crate.
 ### Profiling
 
 Each kernel's entry point is named after its module, such as `orr_lighting.path.staged.trace`, so
-a GPU profiler tells kernels apart, and passes carry debug labels. For hotspots at Slang source
-lines, build with line tables and the source text in the SPIR-V:
+a GPU profiler tells kernels apart, and passes carry debug labels. Kernels follow the Rust debug
+info of the build: where it has some, they carry line tables and their Slang source, so a
+profiler maps hotspots to source lines; release builds have none. The `profiling` profile is
+release with line tables:
 
 ```sh
-ORR_SHADER_DEBUG_INFO=lines cargo build --release -p orr_examples --example viewer
+cargo build --profile profiling -p orr_examples --example viewer
 ```
 
-The variable reaches every crate that builds kernels with `orr_shaders::build`, a program's own
-too. Release builds also leave out shader asserts. Slang optimizes less around line tables, so a
-`lines` build's kernels keep some locals in memory and are about a percent larger than a normal
-build's: its numbers are close to a normal build's but not identical.
+A program built on orr gets the same from its own profiles, which govern orr's build scripts.
+`ORR_SHADER_DEBUG_INFO` (`off`, `lines`, `embedded`, `separate`) overrides the profile for every
+crate that builds kernels with `orr_shaders::build`. Slang optimizes less around line tables, so
+kernels with them keep some locals in memory and are about a percent larger: a profiling
+build's numbers are close to a release build's but not identical. Release and profiling builds
+also leave out shader asserts.
 
 ## Contributing
 

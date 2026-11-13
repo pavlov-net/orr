@@ -52,7 +52,10 @@ pub struct Build {
     publish_types: Option<String>,
 }
 
-/// How much debug info a build puts in the SPIR-V, and where.
+/// How much debug info a build puts in the SPIR-V, and where. [`Build::debug_info`] sets it,
+/// else `ORR_SHADER_DEBUG_INFO` (`off`, `lines`, `embedded` or `separate`), else the profile:
+/// [`Lines`](Self::Lines) when the Rust code gets debug info (cargo's `DEBUG`), as in dev builds
+/// and the workspace's `profiling` profile, [`Off`](Self::Off) when it gets none, as in release.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DebugInfo {
     Off,
@@ -118,6 +121,7 @@ impl Build {
             deps: Vec::new(),
             externs: BTreeMap::new(),
             debug_info: match env::var("ORR_SHADER_DEBUG_INFO").as_deref() {
+                Err(_) if env::var("DEBUG").is_ok_and(|d| d == "true") => DebugInfo::Lines,
                 Err(_) | Ok("off") => DebugInfo::Off,
                 Ok("lines") => DebugInfo::Lines,
                 Ok("embedded") => DebugInfo::Embedded,
@@ -241,9 +245,8 @@ impl Build {
         self
     }
 
-    /// How much debug info the SPIR-V carries, overriding `ORR_SHADER_DEBUG_INFO` (`off`,
-    /// `lines`, `embedded` or `separate`). Without either it is [`DebugInfo::Off`] in every
-    /// profile.
+    /// How much debug info the SPIR-V carries, overriding `ORR_SHADER_DEBUG_INFO` and the
+    /// profile ([`DebugInfo`]).
     pub fn debug_info(mut self, debug_info: DebugInfo) -> Self {
         self.debug_info = debug_info;
         self
