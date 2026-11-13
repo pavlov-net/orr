@@ -8,14 +8,14 @@ use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, DEFAULT_ENVIRONMENT, Device, GpuAddress, GpuPtr,
     Hazards, MemoryKind, ROOT_ALIGN, Stages,
 };
-use orr_scene::{LightTables, SceneFeatures, SceneRoot, SkyStats};
+use orr_scene::{ClusterBlocks, LightTables, SceneFeatures, SceneRoot, SkyStats};
 
 use crate::caustics::{CausticSettings, CausticStats, Caustics, PerEntry, feedback_ids};
 use crate::environment::EnvironmentBake;
 use crate::shaders::light_sampling::{directional, tiles};
 use crate::shaders::types::{
     DirectionalState, EmissiveSelection, EnvironmentGpu, LightSample, LightSetGpu, LightSetStats,
-    WorldCacheGpu,
+    ListBlock, WorldCacheGpu,
 };
 use crate::world_cache::{ResolvePipelines, WorldCache, WorldCacheStats};
 use crate::{Error, KernelSet, pipeline};
@@ -240,7 +240,9 @@ pub struct SceneLighting {
     environment: EnvironmentBake,
     directional: ComputePipeline,
     select: ComputePipeline,
-    clusters: ComputePipeline,
+    lists_weigh: ComputePipeline,
+    lists_place: ComputePipeline,
+    lists_finish: ComputePipeline,
     presample: ComputePipeline,
     /// For the light tables of the last scene pass recorded.
     per: PerTable,
@@ -253,6 +255,8 @@ pub struct SceneLighting {
     /// The producer entries' cluster CDFs, for `cluster_room` clusters.
     cluster_cdf: Allocation<u32>,
     cluster_room: u32,
+    /// Their clusters in blocks, with room for the light tables of the last scene pass.
+    cluster_blocks: ClusterBlocks<ListBlock>,
     /// None until a scene pass finds something a tile sample can name.
     tiles: Option<Allocation<LightSample>>,
     /// The kernels bake an environment other than the default map, which may radiate whatever
@@ -297,7 +301,9 @@ impl SceneLighting {
             environment: EnvironmentBake::new(device, kernels)?,
             directional: pipeline(device, kernels, &directional::MODULE, "main")?,
             select: pipeline(device, kernels, &tiles::MODULE, "select")?,
-            clusters: pipeline(device, kernels, &tiles::MODULE, "clusters")?,
+            lists_weigh: pipeline(device, kernels, &tiles::MODULE, "lists_weigh")?,
+            lists_place: pipeline(device, kernels, &tiles::MODULE, "lists_place")?,
+            lists_finish: pipeline(device, kernels, &tiles::MODULE, "lists_finish")?,
             presample: pipeline(device, kernels, &tiles::MODULE, "presample")?,
             per: PerTable::new(device, LightTables::default())?,
             replaced: Vec::new(),
@@ -305,6 +311,11 @@ impl SceneLighting {
             set: device_local(device, 1, "light set")?,
             cluster_cdf: device_local(device, 0, "emissive cluster cdf")?,
             cluster_room: 0,
+            cluster_blocks: ClusterBlocks::new(
+                device,
+                LightTables::default(),
+                "emissive list blocks",
+            )?,
             tiles: None,
             linked_environment: kernels.environment != DEFAULT_ENVIRONMENT,
             shadow_overflows: device_local(device, 1, "shadow overflows")?,
@@ -396,6 +407,9 @@ impl SceneLighting {
         let cluster_cdf = (clusters != self.cluster_room)
             .then(|| device_local(&self.device, u64::from(clusters), "emissive cluster cdf"))
             .transpose()?;
+        let cluster_blocks = (!self.cluster_blocks.holds(pass.tables))
+            .then(|| ClusterBlocks::new(&self.device, pass.tables, "emissive list blocks"))
+            .transpose()?;
         let tiles = (sampled && self.tiles.is_none())
             .then(|| {
                 let samples = u64::from(LIGHT_TILES * LIGHT_TILE_SIZE);
@@ -413,6 +427,10 @@ impl SceneLighting {
             let before = std::mem::replace(&mut self.cluster_cdf, cdf);
             self.retired.push(pass.frame, before);
             self.cluster_room = clusters;
+        }
+        if let Some(blocks) = cluster_blocks {
+            let before = std::mem::replace(&mut self.cluster_blocks, blocks);
+            self.retired.push(pass.frame, before);
         }
         if tiles.is_some() {
             self.tiles = tiles;
@@ -482,6 +500,8 @@ impl SceneLighting {
                 lights_before: before.tables.lights,
                 entries_before: before.tables.entries,
                 _pad0: 0,
+                block_layout: self.cluster_blocks.layout(),
+                blocks: self.cluster_blocks.records(),
             },
         );
 
@@ -493,9 +513,14 @@ impl SceneLighting {
         self.environment.record_reduce(list);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         list.dispatch(&self.select, tile_root, [1, 1, 1]);
-        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
         if now.tables.producers > 0 {
-            list.dispatch(&self.clusters, tile_root, [now.tables.producers, 1, 1]);
+            let groups = self.cluster_blocks.groups();
+            list.dispatch_indirect(&self.lists_weigh, tile_root, groups);
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+            list.dispatch(&self.lists_place, tile_root, [now.tables.producers, 1, 1]);
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+            list.dispatch_indirect(&self.lists_finish, tile_root, groups);
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         }
         if self.tiles.is_some() {

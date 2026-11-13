@@ -1,10 +1,11 @@
 // What the frame's caustic photons start from, after the light set's selection and the
 // emissive entries' pass: `pool` places each producer entry's caster list in the pool, which
-// holds every cluster the scene's producers can emit, `lists`
-// writes those lists' CDFs over the area of the clusters whose material casts, `weigh` weighs
-// every entry by its casters' render-space area, its falloff from the focus and the share of
-// its last photons that deposited, and builds the entry CDF, and `interiors` walks each light
-// out to find the interiors that hold it.
+// holds every cluster the scene's producers can emit, and the lists' clusters in blocks,
+// `lists_weigh`, `lists_place` and `lists_finish` write those lists' CDFs over the area of the
+// clusters whose material casts (`cluster_lists`), `weigh` weighs every entry by its casters'
+// render-space area, its falloff from the focus and the share of its last photons that
+// deposited, and builds the entry CDF, and `interiors` walks each light out to find the
+// interiors that hold it.
 #include "orr_root.h"
 import orr_shaders.math;
 import orr_shaders.sampling;
@@ -14,8 +15,11 @@ import orr_scene.hit;
 import orr_scene.lights;
 import orr_scene.material;
 import orr_scene.producer;
+import orr_scene.producer_blocks;
+import orr_scene.visibility;
 import orr_scene.tables;
 import orr_lighting.caustics;
+import orr_lighting.cluster_lists;
 import orr_lighting.interiors;
 import orr_lighting.light_sampling;
 import orr_lighting.media;
@@ -42,7 +46,8 @@ struct Root
     uint* started_before;
     uint* deposited_before;
     float* yields_before;
-    uint64_t _pad4;
+    // What each block of the caster lists' clusters adds up to.
+    ListBlock* blocks;
     // The producer entries' caster lists' CDFs.
     uint* pool;
     EyeInterior* interiors;
@@ -57,8 +62,8 @@ struct Root
     uint cell_lifetime;             // frames without a deposit before a cell is evicted
     uint entries_before;
     uint _pad1;
-    uint _pad2;
-    uint _pad3;
+    // The caster lists' clusters in blocks (`producer_blocks`).
+    uint* block_layout;
 }
 ORR_ROOT(Root);
 
@@ -90,11 +95,11 @@ uint scan_uint(uint lane, uint v, out uint total)
     return r;
 }
 
-float scan_float(uint lane, uint lanes, float v, out float total)
+float scan_float(uint lane, float v, out float total)
 {
     scan_w[lane] = v;
     GroupMemoryBarrierWithGroupSync();
-    for (uint off = 1; off < lanes; off <<= 1)
+    for (uint off = 1; off < GROUP; off <<= 1)
     {
         float add = lane >= off ? scan_w[lane - off] : 0.0;
         GroupMemoryBarrierWithGroupSync();
@@ -102,55 +107,9 @@ float scan_float(uint lane, uint lanes, float v, out float total)
         GroupMemoryBarrierWithGroupSync();
     }
     float r = scan_w[lane];
-    total = scan_w[lanes - 1];
+    total = scan_w[GROUP - 1];
     GroupMemoryBarrierWithGroupSync();
     return r;
-}
-
-// Marks a position of no weight in a fixed-point CDF while the CDF still holds float sums; the
-// bits are a NaN, which no sum of weights is.
-static const uint NO_WEIGHT = 0xffffffffu;
-
-groupshared uint weighted;
-
-// Inclusive maxima over the first `lanes` lanes of the workgroup.
-uint scan_max(uint lane, uint lanes, uint v, out uint total)
-{
-    scan_c[lane] = v;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint off = 1; off < lanes; off <<= 1)
-    {
-        uint other = lane >= off ? scan_c[lane - off] : 0;
-        GroupMemoryBarrierWithGroupSync();
-        scan_c[lane] = max(scan_c[lane], other);
-        GroupMemoryBarrierWithGroupSync();
-    }
-    uint r = scan_c[lane];
-    total = scan_c[lanes - 1];
-    GroupMemoryBarrierWithGroupSync();
-    return r;
-}
-
-// Replaces the float sums at `cdf[0..count]` over 64 lanes, `NO_WEIGHT` where a position has
-// none, by their fixed-point CDF: `total` is the last sum and `end` one past the last position
-// with weight, which takes 0xffffffff whatever rounding left. A float scan's lanes add
-// in different orders, so its sums can fall by a rounding past a weight of 0 or a tiny one; a
-// running maximum keeps the CDF rising, and a position of no weight takes the one before it.
-void write_fixed_cdf(uint lane, uint* cdf, uint count, float total, uint end)
-{
-    uint carry = 0;
-    for (uint base = 0; base < count; base += 64)
-    {
-        uint c = base + lane;
-        uint v = 0;
-        if (c < count && cdf[c] != NO_WEIGHT)
-            v = c + 1 == end ? 0xffffffffu : fixed_point_share(asfloat(cdf[c]) / total);
-        uint chunk;
-        uint top = max(carry, scan_max(lane, 64, v, chunk));
-        if (c < count)
-            cdf[c] = top;
-        carry = max(carry, chunk);
-    }
 }
 
 // Whether producer entry `producer` is traced this frame: only what rays meet can cast.
@@ -161,7 +120,7 @@ bool producer_traced(SceneRoot* s, uint producer)
         && (s.producer_state[producer].rt_flags & PRODUCER_RT_WRITTEN) != 0;
 }
 
-// The producer entries' places in the pool, one workgroup.
+// The producer entries' places in the pool and their clusters' blocks, one workgroup.
 [shader("compute")]
 [numthreads(GROUP, 1, 1)]
 void pool(uint lane: SV_GroupIndex)
@@ -169,6 +128,7 @@ void pool(uint lane: SV_GroupIndex)
     ORR_OMM(pool);
     SceneRoot* s = root.scene;
     uint carry = 0;
+    uint carry_blocks = 0;
     for (uint base = 0; base < s.producer_capacity; base += GROUP)
     {
         uint i = base + lane;
@@ -182,6 +142,11 @@ void pool(uint lane: SV_GroupIndex)
         }
         uint chunk;
         uint first = carry + scan_uint(lane, n, chunk) - n;
+        uint blocks = cluster_blocks(n);
+        uint chunk_blocks;
+        uint first_block = carry_blocks + scan_uint(lane, blocks, chunk_blocks) - blocks;
+        if (i < s.producer_capacity)
+            set_first_block(root.block_layout, i, first_block);
         if (set)
         {
             EmissiveSelection e = (EmissiveSelection)0;
@@ -193,7 +158,10 @@ void pool(uint lane: SV_GroupIndex)
             root.entries[entry] = e;
         }
         carry += chunk;
+        carry_blocks += chunk_blocks;
     }
+    if (lane == 0)
+        close_layout(root.block_layout, s.producer_capacity, carry_blocks);
 }
 
 // Render-space area of cluster `c` of producer entry `producer`'s batch where its material
@@ -208,62 +176,64 @@ float producer_caster_area(SceneRoot* s, uint producer, uint c)
     if (material == MATERIAL_NONE || (s.materials[material].flags & MATERIAL_CASTER) == 0
         || !producer_placement(s, p, false, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), pl))
         return 0.0;
-    float area = 0.0;
-    for (uint i = 0; i < k.tri_count; i++)
-    {
-        float3 p0, p1, p2;
-        cluster_triangle(b, k, i, p0, p1, p2);
-        float3 e1 = mul(pl.linear, p1 - p0);
-        float3 e2 = mul(pl.linear, p2 - p0);
-        float size = unit_factor(max(abs(e1), abs(e2)));
-        area += 0.5 * unit_length(cross(e1 * size, e2 * size)) / size / size;
-    }
-    return area;
+    return cluster_area(b, k, pl.linear);
 }
 
-// One workgroup per producer entry: its caster list's fixed-point CDF over its clusters' caster
-// area, and that area's sum. A cluster of no area takes a step of 0, and the last with area
-// takes 0xffffffff; a list of no area at all is left empty.
-[shader("compute")]
-[numthreads(64, 1, 1)]
-void lists(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
+// The producer entries' caster lists: each position's cluster's caster area.
+struct CasterLists : IClusterLists
 {
-    ORR_OMM(lists);
+    uint* list(uint p, out uint count)
+    {
+        uint entry;
+        producer_emissive(root.scene, p, entry);
+        EmissiveSelection e = root.entries[entry];
+        count = e.count;
+        return e.cdf;
+    }
+
+    float weight(uint p, uint c)
+    {
+        return producer_caster_area(root.scene, p, c);
+    }
+}
+
+// One workgroup per block of the caster lists' clusters: their areas, summed within the block.
+[shader("compute")]
+[numthreads(BLOCK_CLUSTERS, 1, 1)]
+void lists_weigh(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
+{
+    ORR_OMM(lists_weigh);
+    CasterLists lists;
+    weigh_blocks(lists, root.block_layout, root.blocks, root.scene.producer_capacity, grid_index(group), lane);
+}
+
+// One workgroup per producer entry: its blocks' places in its list, and its casters' area. A
+// list of no area is left empty.
+[shader("compute")]
+[numthreads(BLOCK_CLUSTERS, 1, 1)]
+void lists_place(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
+{
+    ORR_OMM(lists_place);
     uint entry;
     if (!producer_emissive(root.scene, group.x, entry))
         return;
-    EmissiveSelection e = root.entries[entry];
-    uint count = e.count;
-    if (count == 0)
-    {
-        if (lane == 0)
-            root.areas[entry] = 0.0;
-        return;
-    }
-    if (lane == 0)
-        weighted = 0;
-    float carry = 0.0;
-    for (uint base = 0; base < count; base += 64)
-    {
-        uint c = base + lane;
-        float w = c < count ? producer_caster_area(root.scene, group.x, c) : 0.0;
-        float chunk;
-        float sum = carry + scan_float(lane, 64, w, chunk);
-        if (w > 0.0)
-            InterlockedMax(weighted, c + 1);
-        if (c < count)
-            e.cdf[c] = w > 0.0 ? asuint(sum) : NO_WEIGHT;
-        carry += chunk;
-    }
-    AllMemoryBarrierWithGroupSync();
-    float total = carry;
-    write_fixed_cdf(lane, e.cdf, count, total, weighted);
+    float total = place_blocks(root.block_layout, root.blocks, group.x, lane);
     if (lane == 0)
     {
         root.areas[entry] = total;
         if (!(total > 0.0))
             root.entries[entry].count = 0;
     }
+}
+
+// One workgroup per block of the caster lists' clusters: their fixed-point CDF.
+[shader("compute")]
+[numthreads(BLOCK_CLUSTERS, 1, 1)]
+void lists_finish(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
+{
+    ORR_OMM(lists_finish);
+    CasterLists lists;
+    finish_blocks(lists, root.block_layout, root.blocks, root.scene.producer_capacity, grid_index(group), lane);
 }
 
 // The caster list of instance entry `e`, its copy's mesh `mesh`: the cooked set of the row its
@@ -359,7 +329,7 @@ void weigh(uint lane: SV_GroupIndex)
                 w = 0.0;
         }
         float chunk;
-        float cdf = carry + scan_float(lane, GROUP, w, chunk);
+        float cdf = carry + scan_float(lane, w, chunk);
         if (i < n)
             root.cdf[i] = cdf;
         carry += chunk;

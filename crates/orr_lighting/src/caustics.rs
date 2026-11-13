@@ -4,13 +4,13 @@
 use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, GpuPtr, Hazards, MemoryKind, Stages,
 };
-use orr_scene::{LightTables, SceneRoot};
+use orr_scene::{ClusterBlocks, LightTables, SceneRoot};
 
 use crate::scene::{FRAME_SLOTS, Retired, Ring, device_local};
 use crate::shaders::caustics::{casters, resolve};
 use crate::shaders::types::{
-    CausticStatsGpu, CausticsGpu, EmissiveSelection, EyeInterior, LightSetGpu, PhotonGpu,
-    PhotonSourceGpu,
+    CausticStatsGpu, CausticsGpu, EmissiveSelection, EyeInterior, LightSetGpu, ListBlock,
+    PhotonGpu, PhotonSourceGpu,
 };
 use crate::{Error, KernelSet, pipeline};
 
@@ -138,7 +138,9 @@ pub(crate) fn check_settings(s: &CausticSettings) -> Result<(), Error> {
 
 pub(crate) struct CausticPipelines {
     pool: ComputePipeline,
-    lists: ComputePipeline,
+    lists_weigh: ComputePipeline,
+    lists_place: ComputePipeline,
+    lists_finish: ComputePipeline,
     weigh: ComputePipeline,
     interiors: ComputePipeline,
     clear: ComputePipeline,
@@ -152,7 +154,9 @@ impl CausticPipelines {
     pub(crate) fn new(device: &Device, kernels: &KernelSet) -> Result<Self, Error> {
         Ok(Self {
             pool: pipeline(device, kernels, &casters::MODULE, "pool")?,
-            lists: pipeline(device, kernels, &casters::MODULE, "lists")?,
+            lists_weigh: pipeline(device, kernels, &casters::MODULE, "lists_weigh")?,
+            lists_place: pipeline(device, kernels, &casters::MODULE, "lists_place")?,
+            lists_finish: pipeline(device, kernels, &casters::MODULE, "lists_finish")?,
             weigh: pipeline(device, kernels, &casters::MODULE, "weigh")?,
             interiors: pipeline(device, kernels, &casters::MODULE, "interiors")?,
             clear: pipeline(device, kernels, &resolve::MODULE, "clear")?,
@@ -187,6 +191,9 @@ pub(crate) struct Caustics {
     /// grid.
     pool: Allocation<u32>,
     pool_room: u32,
+    /// The caster lists' clusters in blocks, with room for the light tables of a scene pass
+    /// that recorded the caustics.
+    blocks: ClusterBlocks<ListBlock>,
     /// For the scene's light tables at the last scene pass.
     per: PerEntry,
     roots: Ring<CausticsGpu>,
@@ -209,6 +216,7 @@ struct Grid {
 pub(crate) struct Room {
     per: Option<PerEntry>,
     pool: Option<(Allocation<u32>, u32)>,
+    blocks: Option<ClusterBlocks<ListBlock>>,
     grid: Option<Grid>,
 }
 
@@ -279,6 +287,7 @@ impl Caustics {
             grid: None,
             pool: device_local(device, 0, "producer caster cdf")?,
             pool_room: 0,
+            blocks: ClusterBlocks::new(device, LightTables::default(), "caster list blocks")?,
             per: PerEntry::new(device, LightTables::default())?,
             roots: Ring::new(device, "caustic roots")?,
             caster_roots: Ring::new(device, "caster roots")?,
@@ -344,12 +353,16 @@ impl Caustics {
         let pool = (clusters != self.pool_room)
             .then(|| device_local(device, u64::from(clusters), "producer caster cdf"))
             .transpose()?;
+        let blocks = (self.casts(casters) && !self.blocks.holds(tables))
+            .then(|| ClusterBlocks::new(device, tables, "caster list blocks"))
+            .transpose()?;
         let grid = (self.casts(casters) && self.grid.is_none())
             .then(|| Grid::new(device, &self.settings))
             .transpose()?;
         Ok(Room {
             per,
             pool: pool.map(|pool| (pool, clusters)),
+            blocks,
             grid,
         })
     }
@@ -369,6 +382,9 @@ impl Caustics {
         if let Some((pool, clusters)) = room.pool {
             retired.push(frame, std::mem::replace(&mut self.pool, pool));
             self.pool_room = clusters;
+        }
+        if let Some(blocks) = room.blocks {
+            retired.push(frame, std::mem::replace(&mut self.blocks, blocks));
         }
         if let Some(grid) = room.grid {
             self.grid = Some(grid);
@@ -450,7 +466,7 @@ impl Caustics {
                 started_before: before.started.gpu(),
                 deposited_before: before.deposited.gpu(),
                 yields_before: before.yields.gpu(),
-                _pad4: 0,
+                blocks: self.blocks.records(),
                 pool: self.pool.gpu(),
                 interiors: per.interiors.gpu(),
                 focus: [focus[0], focus[1], focus[2], s.lod_scale],
@@ -461,8 +477,7 @@ impl Caustics {
                 cell_lifetime: s.cell_lifetime,
                 entries_before: before.tables.entries,
                 _pad1: 0,
-                _pad2: 0,
-                _pad3: 0,
+                block_layout: self.blocks.layout(),
             },
         );
         let grid = self.resolve_roots.write(
@@ -478,9 +493,14 @@ impl Caustics {
         );
         let p = &self.pipelines;
         list.dispatch(&p.pool, casters, [1, 1, 1]);
-        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
         if per.tables.producers > 0 {
-            list.dispatch(&p.lists, casters, [per.tables.producers, 1, 1]);
+            let groups = self.blocks.groups();
+            list.dispatch_indirect(&p.lists_weigh, casters, groups);
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+            list.dispatch(&p.lists_place, casters, [per.tables.producers, 1, 1]);
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+            list.dispatch_indirect(&p.lists_finish, casters, groups);
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         }
         list.dispatch(&p.weigh, casters, [1, 1, 1]);

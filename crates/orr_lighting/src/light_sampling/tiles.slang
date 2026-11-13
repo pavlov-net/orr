@@ -1,5 +1,5 @@
-// The light set's selection, per-entry cluster CDFs and presampled light tiles, after the
-// environment's pyramid and the directional pass.
+// The light set's selection, per-entry cluster CDFs (`cluster_lists`) and presampled light
+// tiles, after the environment's pyramid and the directional pass.
 #include "orr_root.h"
 import orr_shaders.math;
 import orr_shaders.sampling;
@@ -11,8 +11,11 @@ import orr_color.luminance;
 import orr_color.primaries;
 import orr_scene.lights;
 import orr_scene.producer;
+import orr_scene.producer_blocks;
 import orr_scene.tables;
 import orr_scene.view;
+import orr_scene.visibility;
+import orr_lighting.cluster_lists;
 import orr_lighting.environment;
 import orr_lighting.light_sampling;
 import orr_lighting.shadow;
@@ -54,6 +57,10 @@ struct Root
     uint lights_before;
     uint entries_before;
     uint _pad0;
+    // The producer entries' lists' clusters in blocks (`producer_blocks`), and what each block
+    // adds up to.
+    uint* block_layout;
+    ListBlock* blocks;
 }
 ORR_ROOT(Root);
 
@@ -84,12 +91,12 @@ uint scan_uint(uint lane, uint v, out uint total)
     return r;
 }
 
-// Inclusive sums over the first `lanes` lanes of the workgroup.
-float scan_float(uint lane, uint lanes, float v, out float total)
+// Inclusive sums over the workgroup; `total` is the group's sum.
+float scan_float(uint lane, float v, out float total)
 {
     scan_w[lane] = v;
     GroupMemoryBarrierWithGroupSync();
-    for (uint off = 1; off < lanes; off <<= 1)
+    for (uint off = 1; off < SELECT_GROUP; off <<= 1)
     {
         float add = lane >= off ? scan_w[lane - off] : 0.0;
         GroupMemoryBarrierWithGroupSync();
@@ -97,55 +104,9 @@ float scan_float(uint lane, uint lanes, float v, out float total)
         GroupMemoryBarrierWithGroupSync();
     }
     float r = scan_w[lane];
-    total = scan_w[lanes - 1];
+    total = scan_w[SELECT_GROUP - 1];
     GroupMemoryBarrierWithGroupSync();
     return r;
-}
-
-// Marks a position of no weight in a fixed-point CDF while the CDF still holds float sums; the
-// bits are a NaN, which no sum of weights is.
-static const uint NO_WEIGHT = 0xffffffffu;
-
-groupshared uint weighted;
-
-// Inclusive maxima over the first `lanes` lanes of the workgroup.
-uint scan_max(uint lane, uint lanes, uint v, out uint total)
-{
-    scan_c[lane] = v;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint off = 1; off < lanes; off <<= 1)
-    {
-        uint other = lane >= off ? scan_c[lane - off] : 0;
-        GroupMemoryBarrierWithGroupSync();
-        scan_c[lane] = max(scan_c[lane], other);
-        GroupMemoryBarrierWithGroupSync();
-    }
-    uint r = scan_c[lane];
-    total = scan_c[lanes - 1];
-    GroupMemoryBarrierWithGroupSync();
-    return r;
-}
-
-// Replaces the float sums at `cdf[0..count]` over 64 lanes, `NO_WEIGHT` where a position has
-// none, by their fixed-point CDF: `total` is the last sum and `end` one past the last position
-// with weight, which takes 0xffffffff whatever rounding left. A float scan's lanes add
-// in different orders, so its sums can fall by a rounding past a weight of 0 or a tiny one; a
-// running maximum keeps the CDF rising, and a position of no weight takes the one before it.
-void write_fixed_cdf(uint lane, uint* cdf, uint count, float total, uint end)
-{
-    uint carry = 0;
-    for (uint base = 0; base < count; base += 64)
-    {
-        uint c = base + lane;
-        uint v = 0;
-        if (c < count && cdf[c] != NO_WEIGHT)
-            v = c + 1 == end ? 0xffffffffu : fixed_point_share(asfloat(cdf[c]) / total);
-        uint chunk;
-        uint top = max(carry, scan_max(lane, 64, v, chunk));
-        if (c < count)
-            cdf[c] = top;
-        carry = max(carry, chunk);
-    }
 }
 
 // Selection weight of candidate `i`, its emitted power in luminance (nit m² sr), the clusters
@@ -284,8 +245,8 @@ float feedback(uint i, uint lights, uint entries)
 }
 
 // The selection CDF and probabilities, each emissive entry's place in the cluster pool, which
-// holds every cluster the scene's producers can emit, the light set record, `SkyStats` and the
-// frame's statistics. One workgroup. A candidate's
+// holds every cluster the scene's producers can emit, the pooled lists' clusters in blocks, the
+// light set record, `SkyStats` and the frame's statistics. One workgroup. A candidate's
 // probability blends its share of the emitted power with its share of the feedback weights,
 // `feedback_share` of the second once any light has fed back; lights with no power take no
 // feedback share, so every light the feedback names stays reachable through its power.
@@ -333,8 +294,8 @@ void select(uint lane: SV_GroupIndex)
         }
         float chunk_w;
         float chunk_h;
-        scan_float(lane, SELECT_GROUP, w, chunk_w);
-        scan_float(lane, SELECT_GROUP, w > 0.0 ? h : 0.0, chunk_h);
+        scan_float(lane, w, chunk_w);
+        scan_float(lane, w > 0.0 ? h : 0.0, chunk_h);
         if (i < n)
         {
             root.cdf[i] = w;
@@ -372,7 +333,7 @@ void select(uint lane: SV_GroupIndex)
             p = w * power_scale + (w > 0.0 ? root.feedback_weights[i] * fed_scale : 0.0);
         }
         float chunk;
-        float cdf = carry + scan_float(lane, SELECT_GROUP, p, chunk);
+        float cdf = carry + scan_float(lane, p, chunk);
         if (i < n)
             root.cdf[i] = cdf;
         carry += chunk;
@@ -388,8 +349,21 @@ void select(uint lane: SV_GroupIndex)
         else
             root.emissive[i - lights].probability = p;
     }
+    uint blocks = 0;
+    for (uint base = 0; base < s.producer_capacity; base += SELECT_GROUP)
+    {
+        uint p = base + lane;
+        uint entry;
+        uint listed = p < s.producer_capacity && producer_emissive(s, p, entry) ? cluster_blocks(root.emissive[entry].count) : 0;
+        uint chunk;
+        uint first = blocks + scan_uint(lane, listed, chunk) - listed;
+        if (p < s.producer_capacity)
+            set_first_block(root.block_layout, p, first);
+        blocks += chunk;
+    }
     if (lane != 0)
         return;
+    close_layout(root.block_layout, s.producer_capacity, blocks);
     LightSetGpu* set = root.set;
     set.scene = s;
     set.environment = root.environment;
@@ -438,37 +412,51 @@ void select(uint lane: SV_GroupIndex)
     *root.stats = st;
 }
 
-// One workgroup per producer entry: its list's CDF over its clusters' luminance x area, in
-// fixed point. A cluster of no weight takes a step of 0, and the last that has weight takes
-// 0xffffffff; a list of no weight at all stays at 0, so nothing draws from it.
+// The producer entries' lists: each position's cluster's luminance x area.
+struct EmissiveLists : IClusterLists
+{
+    uint* list(uint p, out uint count)
+    {
+        uint entry;
+        producer_emissive(root.scene, p, entry);
+        EmissiveSelection e = root.emissive[entry];
+        count = e.count;
+        return e.cdf;
+    }
+
+    float weight(uint p, uint c)
+    {
+        return producer_cluster_weight(root.scene, p, c);
+    }
+}
+
+// One workgroup per block of the producer entries' lists' clusters: their weights, summed
+// within the block.
 [shader("compute")]
-[numthreads(64, 1, 1)]
-void clusters(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
+[numthreads(BLOCK_CLUSTERS, 1, 1)]
+void lists_weigh(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
+{
+    EmissiveLists lists;
+    weigh_blocks(lists, root.block_layout, root.blocks, root.scene.producer_capacity, grid_index(group), lane);
+}
+
+// One workgroup per producer entry: its blocks' places in its list.
+[shader("compute")]
+[numthreads(BLOCK_CLUSTERS, 1, 1)]
+void lists_place(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
 {
     uint entry;
-    if (!producer_emissive(root.scene, group.x, entry))
-        return;
-    EmissiveSelection e = root.emissive[entry];
-    uint count = e.count;
-    if (count == 0)
-        return;
-    if (lane == 0)
-        weighted = 0;
-    float carry = 0.0;
-    for (uint base = 0; base < count; base += 64)
-    {
-        uint c = base + lane;
-        float w = c < count ? producer_cluster_weight(root.scene, group.x, c) : 0.0;
-        float chunk;
-        float sum = carry + scan_float(lane, 64, w, chunk);
-        if (w > 0.0)
-            InterlockedMax(weighted, c + 1);
-        if (c < count)
-            e.cdf[c] = w > 0.0 ? asuint(sum) : NO_WEIGHT;
-        carry += chunk;
-    }
-    AllMemoryBarrierWithGroupSync();
-    write_fixed_cdf(lane, e.cdf, count, carry, weighted);
+    if (producer_emissive(root.scene, group.x, entry))
+        place_blocks(root.block_layout, root.blocks, group.x, lane);
+}
+
+// One workgroup per block of the producer entries' lists' clusters: their fixed-point CDF.
+[shader("compute")]
+[numthreads(BLOCK_CLUSTERS, 1, 1)]
+void lists_finish(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
+{
+    EmissiveLists lists;
+    finish_blocks(lists, root.block_layout, root.blocks, root.scene.producer_capacity, grid_index(group), lane);
 }
 
 // One thread per tile sample.

@@ -20,9 +20,9 @@ use orr_math::{Affine3, DVec3, Mat3, Vec3};
 use orr_pack::texture::octahedral;
 use orr_scene::{
     ClusterTopology, Cone, EmissiveGpu, EnvironmentData, FrameDesc, FrameTime, GroupWriter,
-    InstanceFlags, LightTables, MaterialGpu, MaterialId, MaterialWriter, Opacity, ProducerDesc,
-    ProducerId, ProducerUpdate, SceneCompute, SceneDesc, SceneWriter, TransformGroupDesc,
-    material_flags,
+    InstanceFlags, LightTables, MaterialGpu, MaterialId, MaterialWriter, Opacity, ProducerBatch,
+    ProducerClusterGpu, ProducerDesc, ProducerId, ProducerUpdate, SceneCompute, SceneDesc,
+    SceneWriter, TransformGroupDesc, material_flags,
 };
 use shader_math::stats::chi_square_p;
 
@@ -1250,6 +1250,88 @@ fn producer_cluster_cdfs_follow_the_producers_set() {
         runs.windows(2).all(|w| w[1] - w[0] >= 32 * 4),
         "two entries' runs share clusters of the list: {runs:?}"
     );
+    assert_clean();
+}
+
+/// A list longer than a block of the kernels that build it gives each cluster its own weight's
+/// step across the blocks: equal emitters equal steps, a dark one none, and the dark clusters
+/// after the last emitter the CDF's end.
+#[test]
+fn producer_cluster_cdfs_step_by_each_cluster_across_blocks() {
+    let mut scene = TestScene::new(SceneDesc::default());
+    let count = 2 * orr_scene::BLOCK_CLUSTERS + 190;
+    let quads = Quads {
+        producer: 0,
+        count,
+        size: 0.25,
+        origin: Vec3::ZERO,
+        step: Vec3::new(0.5, 0.0, 0.0),
+    };
+    let p = pipeline(&emit::MODULE, "main");
+    scene.frame(
+        |w, m| {
+            let materials = producer_materials(m);
+            let g = w
+                .create_transform_group(&TransformGroupDesc {
+                    count: 1,
+                    writer: GroupWriter::Cpu,
+                    anchor: DVec3::ZERO,
+                })
+                .unwrap();
+            w.transforms(g, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
+            let topology = [ClusterTopology {
+                vertex_count: 4,
+                triangles: &[[0, 1, 2], [0, 2, 3]],
+            }];
+            w.set_producer(
+                ProducerId(0),
+                Some(&ProducerDesc {
+                    max_clusters: count,
+                    max_vertices: 4 * count,
+                    topologies: &topology,
+                    materials: &materials,
+                    transform: (g, 0),
+                    ..ProducerDesc::default()
+                }),
+            )
+            .unwrap();
+        },
+        |c| quads.dispatch(c, &p),
+    );
+    let mut lighting = scene.lighting();
+    scene_pass(&scene, &mut lighting, scene.frame);
+    let set: LightSetGpu = read(lighting.light_set(), 1)[0];
+    let selections: Vec<EmissiveSelection> = read(set.emissive, u64::from(scene.tables.entries));
+    let list = selections.iter().find(|s| s.count > 0).unwrap();
+    assert_eq!(list.count, count);
+    let cdf: Vec<u32> = read(list.cdf, u64::from(count));
+    // Clusters land in the batch in any order; each one's word is the quad it is, whose
+    // material is the quad's index modulo 3.
+    let batch: ProducerBatch = read(scene.root_value().batches, 1)[0];
+    let clusters: Vec<ProducerClusterGpu> = read(batch.clusters, u64::from(count));
+    let materials: Vec<u32> = clusters.iter().map(|k| k.user % 3).collect();
+    let last = materials.iter().rposition(|&m| m != 1).unwrap();
+    let mut steps: [Vec<u64>; 3] = Default::default();
+    let mut before = 0u32;
+    for (k, (&v, &m)) in cdf.iter().zip(&materials).enumerate() {
+        assert!(v >= before, "the CDF falls at position {k}");
+        if k > last {
+            assert_eq!(v, u32::MAX, "position {k} past the last emitter");
+        } else if m == 1 {
+            assert_eq!(v, before, "dark position {k} takes a step");
+        } else if k < last {
+            steps[m as usize].push(u64::from(v - before));
+        }
+        before = v;
+    }
+    assert_eq!(cdf[last], u32::MAX);
+    for (m, s) in steps.iter().enumerate().filter(|(m, _)| *m != 1) {
+        let (lo, hi) = (*s.iter().min().unwrap(), *s.iter().max().unwrap());
+        assert!(
+            (hi - lo) as f64 <= 1e-3 * hi as f64,
+            "material {m}'s steps run from {lo} to {hi}"
+        );
+    }
     assert_clean();
 }
 
