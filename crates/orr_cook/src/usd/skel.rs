@@ -218,12 +218,10 @@ impl Skel {
         }
         let rest = match mats("restTransforms")? {
             Some(r) => r,
-            None => (0..joints.len())
-                .map(|i| match parents[i] {
-                    NO_PARENT => binds[i],
-                    p => bind_inverse(binds[usize::from(p)]) * binds[i],
-                })
-                .collect(),
+            None => Vec::from_fn(joints.len(), |i| match parents[i] {
+                NO_PARENT => binds[i],
+                p => bind_inverse(binds[usize::from(p)]) * binds[i],
+            }),
         };
         let to_bind = if collapses(DMat3::from_mat4(to_model)) {
             stage

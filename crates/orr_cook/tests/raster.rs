@@ -155,17 +155,15 @@ fn levels<T: Copy>(
     for _ in 1..lods {
         let src = out.last().unwrap();
         let m = n / 2;
-        let next = (0..m * m)
-            .map(|i| {
-                let (x, y) = (2 * (i % m), 2 * (i / m));
-                reduce([
-                    src[y * n + x],
-                    src[y * n + x + 1],
-                    src[(y + 1) * n + x],
-                    src[(y + 1) * n + x + 1],
-                ])
-            })
-            .collect();
+        let next = Vec::from_fn(m * m, |i| {
+            let (x, y) = (2 * (i % m), 2 * (i / m));
+            reduce([
+                src[y * n + x],
+                src[y * n + x + 1],
+                src[(y + 1) * n + x],
+                src[(y + 1) * n + x + 1],
+            ])
+        });
         out.push(next);
         n = m;
     }
@@ -194,14 +192,12 @@ fn mean_f32(v: [f32; 4]) -> f32 {
 
 fn test_values(n: usize, seed: u32) -> Vec<f32> {
     let mut s = seed.wrapping_mul(2_654_435_761).max(1);
-    (0..n)
-        .map(|_| {
-            s ^= s << 13;
-            s ^= s >> 17;
-            s ^= s << 5;
-            (s % 100_000) as f32 * 0.0137 - 300.0
-        })
-        .collect()
+    Vec::from_fn(n, |_| {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        (s % 100_000) as f32 * 0.0137 - 300.0
+    })
 }
 
 #[test]
@@ -309,7 +305,7 @@ fn producer_tiles_match_the_cooks_tiling() {
     let finest = test_values(8 * 8, 11);
     let raw = d.join("h.r32");
     write_raw(&raw, 8, "r32f", bytemuck::cast_slice(&finest));
-    let color: Vec<u8> = (0..8 * 8 * 4).map(|i| (i * 37 % 251) as u8).collect();
+    let color: Vec<u8> = Vec::from_fn(8 * 8 * 4, |i| (i * 37 % 251) as u8);
     let craw = d.join("c.rgba");
     write_raw(&craw, 8, "rgba8", &color);
     // The producer side: the same border and LOD rules, written as TIFF tiles.
@@ -359,7 +355,7 @@ fn producer_tiles_match_the_cooks_tiling() {
 #[test]
 fn rgb_tiles_store_rgba_with_opaque_alpha() {
     let d = dir("raster-rgb");
-    let rgb: Vec<u8> = (0..4 * 4 * 3).map(|i| (i * 13) as u8).collect();
+    let rgb: Vec<u8> = Vec::from_fn(4 * 4 * 3, |i| (i * 13) as u8);
     write_tiff_rgb8(&d.join("c/0/0_0/0_0_0_0.tif"), 4, &rgb);
     let s = Set::new(cook(set(vec![RasterLayerSpec {
         border: 0,
@@ -451,9 +447,9 @@ fn srgb_mean_averages_linear_light() {
 fn lossless_tiles_take_byte_planes_where_they_shrink() {
     let d = dir("raster-planes");
     // A smooth slope: the high bytes of neighboring floats repeat.
-    let v: Vec<f32> = (0..256 * 256)
-        .map(|i| 100.0 + (i % 256) as f32 * 0.37 + (i / 256) as f32 * 0.11)
-        .collect();
+    let v: Vec<f32> = Vec::from_fn(256 * 256, |i| {
+        100.0 + (i % 256) as f32 * 0.37 + (i / 256) as f32 * 0.11
+    });
     let raw = d.join("h.r32");
     write_raw(&raw, 256, "r32f", bytemuck::cast_slice(&v));
     let c = cook_to(Target::Memory, set(vec![layer("height", whole(&raw, 128))])).unwrap();
@@ -481,7 +477,7 @@ fn lossless_tiles_take_byte_planes_where_they_shrink() {
 #[test]
 fn bc4_layer_encodes_through_the_texture_path() {
     let d = dir("raster-bc");
-    let v: Vec<u8> = (0..16 * 16).map(|i| ((i % 16) * 16) as u8).collect();
+    let v: Vec<u8> = Vec::from_fn(16 * 16, |i| ((i % 16) * 16) as u8);
     let raw = d.join("g.r8");
     write_raw(&raw, 16, "r8", &v);
     let s = Set::new(cook(set(vec![RasterLayerSpec {

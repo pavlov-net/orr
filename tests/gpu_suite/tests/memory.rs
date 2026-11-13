@@ -38,7 +38,7 @@ fn the_gpu_reads_imported_host_memory_as_the_cpu_wrote_it() {
     let layout = Layout::from_size_align(len, align).unwrap();
     // SAFETY: a nonzero size.
     let at = NonNull::new(unsafe { std::alloc::alloc(layout) }).unwrap();
-    let bytes: Vec<u8> = (0..len).map(|i| (i * 131 % 251) as u8).collect();
+    let bytes: Vec<u8> = Vec::from_fn(len, |i| (i * 131 % 251) as u8);
     // SAFETY: `at` holds `len` bytes.
     unsafe { at.copy_from_nonoverlapping(NonNull::from(&bytes[..]).cast(), len) };
     {

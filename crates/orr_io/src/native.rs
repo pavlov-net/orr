@@ -69,9 +69,9 @@ impl Native {
     pub(crate) fn new(buffers: &ReadBuffers) -> Option<Self> {
         Some(Self {
             ring: sys::OsRing::new(&buffers.0)?,
-            slots: (0..DEPTH).map(|_| None).collect(),
+            slots: Vec::from_fn(DEPTH, |_| None),
             queued: VecDeque::new(),
-            files: (0..DEPTH).map(|_| None).collect(),
+            files: Vec::from_fn(DEPTH, |_| None),
             files_changed: false,
             buffers: buffers.clone(),
         })

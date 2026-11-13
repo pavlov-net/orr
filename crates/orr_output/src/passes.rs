@@ -249,24 +249,24 @@ impl OutputView {
     pub fn motion_blur_bytes(&self) -> u64 {
         self.motion_blur
             .as_ref()
-            .map_or(0, MotionBlurTargets::bytes)
+            .map_or_default(MotionBlurTargets::bytes)
     }
 
     /// Bytes of the depth-of-field images and lens state held for the view: 0 unless its
     /// last frame had depth of field on.
     pub fn depth_of_field_bytes(&self) -> u64 {
-        self.dof.as_ref().map_or(0, DofTargets::bytes)
+        self.dof.as_ref().map_or_default(DofTargets::bytes)
     }
 
     /// Bytes of the glare buffers held for the view: 0 unless its last frame had glare.
     pub fn glare_bytes(&self) -> u64 {
-        self.glare.as_ref().map_or(0, ViewGlare::bytes)
+        self.glare.as_ref().map_or_default(ViewGlare::bytes)
     }
 
     /// Bytes of the local exposure grid held for the view: 0 unless its last frame had local
     /// exposure.
     pub fn local_exposure_bytes(&self) -> u64 {
-        self.local.as_ref().map_or(0, LocalTargets::bytes)
+        self.local.as_ref().map_or_default(LocalTargets::bytes)
     }
 
     /// The glare chain (RGBA16F, from 1/2 or 1/4 of the extent), while the view's lens has
@@ -783,7 +783,7 @@ impl OutputKernels {
                 ev_min: params.ev_min,
                 bins_per_ev: 1.0 / params.bin_ev,
                 chroma: params.white_balance,
-                grid_width: local.map_or(0, |(_, t, _)| t.cells[0]),
+                grid_width: local.map_or_default(|(_, t, _)| t.cells[0]),
                 grid: local.map_or(GpuPtr::NULL, |(_, t, _)| t.sums.gpu()),
                 _pad0: 0,
                 _pad1: 0,
@@ -1053,19 +1053,19 @@ impl OutputKernels {
             grade_scale: o.grade.exposure_ev.exp2(),
             sdr: u32::from(d.encoding == OutputFormat::Sdr),
             debug,
-            pattern_patch: pattern.map_or(0.0, |p| p.patch),
-            pattern_surround: pattern.map_or(0.0, |p| p.surround),
+            pattern_patch: pattern.map_or_default(|p| p.patch),
+            pattern_surround: pattern.map_or_default(|p| p.surround),
             white_balance: u32::from(o.white_balance.is_some()),
             distortion: u32::from(lens.is_some()),
-            k1: lens.map_or(0.0, |l| l.k1),
-            k2: lens.map_or(0.0, |l| l.k2),
-            chromatic_aberration: lens.map_or(0.0, |l| l.chromatic_aberration),
+            k1: lens.map_or_default(|l| l.k1),
+            k2: lens.map_or_default(|l| l.k2),
+            chromatic_aberration: lens.map_or_default(|l| l.chromatic_aberration),
             distortion_scale: lens.map_or(1.0, |l| distortion_scale(&l, pass.extent)),
-            local_strength: roots.local.map_or(0.0, |l| l.strength),
-            local_ev_min: roots.local.map_or(0.0, |l| l.ev_min),
+            local_strength: roots.local.map_or_default(|l| l.strength),
+            local_ev_min: roots.local.map_or_default(|l| l.ev_min),
             local_bin_ev: roots.local.map_or(1.0, |l| l.bin_ev),
-            local_width: roots.local.map_or(0, |l| l.cells[0]),
-            local_height: roots.local.map_or(0, |l| l.cells[1]),
+            local_width: roots.local.map_or_default(|l| l.cells[0]),
+            local_height: roots.local.map_or_default(|l| l.cells[1]),
         };
         let (field, field_source) = match (lens, field) {
             (Some(_), Some(f)) => {

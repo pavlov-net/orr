@@ -281,7 +281,7 @@ fn rig(
         let n = mesh.parts.len();
         (
             mesh.parts.iter().map(|p| Vec3::from(p.pivot)).collect(),
-            (0..n).map(|i| (i > 0).then_some(0)).collect(),
+            Vec::from_fn(n, |i| (i > 0).then_some(0)),
             vec![Hint::default(); n],
             (0..n as u32).collect(),
         )
@@ -318,16 +318,14 @@ fn rig(
     }
     let body = part_joints[0] as usize;
     let deepest = depth.iter().copied().max().unwrap_or(0).max(1) as f32;
-    let flexibility: Vec<f32> = (0..n)
-        .map(|j| match joint_hints[j].stiffness {
-            _ if j == body => 0.0,
-            Some(s) => (1.0 - s).clamp(0.0, 1.0),
-            None => depth[j] as f32 / deepest,
-        })
-        .collect();
+    let flexibility: Vec<f32> = Vec::from_fn(n, |j| match joint_hints[j].stiffness {
+        _ if j == body => 0.0,
+        Some(s) => (1.0 - s).clamp(0.0, 1.0),
+        None => depth[j] as f32 / deepest,
+    });
     let mut chain = vec![0.0f32; n];
     for j in 0..n {
-        chain[j] = flexibility[j] + parents[j].map_or(0.0, |p| chain[p]);
+        chain[j] = flexibility[j] + parents[j].map_or_default(|p| chain[p]);
     }
     let longest = chain.iter().copied().fold(0.0, f32::max).max(1e-6);
     let most = joint_hints
@@ -340,17 +338,15 @@ fn rig(
         None if leaf[j] => 1.0,
         _ => 0.0,
     };
-    let joints = (0..n)
-        .map(|j| tree_wind::Joint {
-            pivot: pivots[j].to_array(),
-            parent: parents[j].map_or(u32::MAX, |p| p as u32),
-            bend: TIP_BEND * flexibility[j] / longest,
-            flutter: FLUTTER * flutter(j),
-            phase: (j as u32).wrapping_mul(2_654_435_761) as f32 / u32::MAX as f32
-                * std::f32::consts::TAU,
-            _pad: 0,
-        })
-        .collect();
+    let joints = Vec::from_fn(n, |j| tree_wind::Joint {
+        pivot: pivots[j].to_array(),
+        parent: parents[j].map_or(u32::MAX, |p| p as u32),
+        bend: TIP_BEND * flexibility[j] / longest,
+        flutter: FLUTTER * flutter(j),
+        phase: (j as u32).wrapping_mul(2_654_435_761) as f32 / u32::MAX as f32
+            * std::f32::consts::TAU,
+        _pad: 0,
+    });
     (joints, part_joints)
 }
 

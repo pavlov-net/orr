@@ -225,16 +225,14 @@ fn tiles_round_trip(desc: &TextureDesc, seed: u64) {
     let mut rng = Rng(seed);
     let data = texels(desc, &mut rng);
     let n = tiles_of(&t).len();
-    let blocks: Vec<Allocation<u8>> = (0..2)
-        .map(|_| {
-            d.gpu_malloc::<u8>(
-                MemoryKind::DeviceLocal,
-                sparse_bytes(&t).max(1),
-                "tile block",
-            )
-            .unwrap()
-        })
-        .collect();
+    let blocks: Vec<Allocation<u8>> = Vec::from_fn(2, |_| {
+        d.gpu_malloc::<u8>(
+            MemoryKind::DeviceLocal,
+            sparse_bytes(&t).max(1),
+            "tile block",
+        )
+        .unwrap()
+    });
     let in_order: Vec<u64> = (0..n as u64).collect();
     let mut shuffled = in_order.clone();
     rng.shuffle(&mut shuffled);
@@ -795,28 +793,30 @@ fn compute_queue_orders_by_timeline() {
             }
         })
         .collect();
-    let roots: Vec<_> = (0..LINKS)
-        .map(|i| {
-            upload(
-                &[step::Root {
-                    src: buffers[i].gpu(),
-                    dst: buffers[i + 1].gpu(),
-                    n: N,
-                    pad0: 0,
-                    pad1: 0,
-                    pad2: 0,
-                }],
-                "chain root",
-            )
-        })
-        .collect();
+    let roots: Vec<_> = Vec::from_fn(LINKS, |i| {
+        upload(
+            &[step::Root {
+                src: buffers[i].gpu(),
+                dst: buffers[i + 1].gpu(),
+                n: N,
+                pad0: 0,
+                pad1: 0,
+                pad2: 0,
+            }],
+            "chain root",
+        )
+    });
     let p = pipeline(&step::MODULE, "main");
     let compute = queue(QueueKind::Compute);
     let mut last = None;
     for (i, root) in roots.iter().enumerate() {
-        let q = if i % 2 == 0 { compute } else { render() };
+        let q = if i.is_multiple_of(2) {
+            compute
+        } else {
+            render()
+        };
         let mut list = q.command_list().unwrap();
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             list.set_occupancy(0.25, 0.0);
         }
         list.dispatch(&p, root.gpu(), [N.div_ceil(64), 1, 1]);
@@ -867,27 +867,23 @@ fn indirect_copies_match_recorded_copies() {
     let pool_bytes = pages_bytes + page_bytes;
     let src = upload(&rng.bytes(pages_bytes as usize), "page sources");
     let guard = rng.bytes(PAGE_BYTES as usize);
-    let dst: Vec<Allocation<u8>> = (0..2)
-        .map(|_| {
-            let mut a = d
-                .gpu_malloc::<u8>(MemoryKind::Upload, pool_bytes, "page pool")
-                .unwrap();
-            a.as_mut_slice().unwrap()[pages_bytes as usize..].copy_from_slice(&guard);
-            a
-        })
-        .collect();
+    let dst: Vec<Allocation<u8>> = Vec::from_fn(2, |_| {
+        let mut a = d
+            .gpu_malloc::<u8>(MemoryKind::Upload, pool_bytes, "page pool")
+            .unwrap();
+        a.as_mut_slice().unwrap()[pages_bytes as usize..].copy_from_slice(&guard);
+        a
+    });
     let mut page_source: Vec<u32> = (0..PAGES).collect();
     rng.shuffle(&mut page_source);
     let page_source = upload(&page_source, "page source");
 
     let mut desc = TextureDesc::d2(Format::Bc7Unorm, 4096, 4096, TextureUsage::SAMPLED);
     desc.mips = 2;
-    let textures: Vec<Texture> = (0..2)
-        .map(|_| {
-            d.create_texture(&desc, TextureMemory::Sparse, "tile copies")
-                .unwrap()
-        })
-        .collect();
+    let textures: Vec<Texture> = Vec::from_fn(2, |_| {
+        d.create_texture(&desc, TextureMemory::Sparse, "tile copies")
+            .unwrap()
+    });
     let layout = *textures[0].sparse_layout().unwrap();
     let mut tiles = tiles_of(&textures[0]);
     let slots: Vec<u64> = (0..tiles.len() as u64).collect();

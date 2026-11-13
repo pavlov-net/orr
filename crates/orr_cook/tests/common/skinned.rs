@@ -125,9 +125,9 @@ fn write(path: &Path, bend: bool) {
     let tube_idx = b.add(bytemuck::cast_slice(&idx), idx.len(), "SCALAR", 5125, "");
 
     // A box without normals, so the importer splits it into flat corners.
-    let prop: Vec<[f32; 3]> = (0..8)
-        .map(|i| [0, 1, 2].map(|a| if i >> a & 1 == 1 { 0.05 } else { -0.05 }))
-        .collect();
+    let prop: Vec<[f32; 3]> = Vec::from_fn(8, |i| {
+        [0, 1, 2].map(|a| if i >> a & 1 == 1 { 0.05 } else { -0.05 })
+    });
     let prop_idx: [u32; 36] = [
         0, 2, 1, 1, 2, 3, 4, 5, 6, 5, 7, 6, 0, 1, 4, 1, 5, 4, 2, 6, 3, 3, 6, 7, 0, 4, 2, 2, 4, 6,
         1, 3, 5, 3, 7, 5,

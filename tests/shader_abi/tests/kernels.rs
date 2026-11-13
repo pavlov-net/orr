@@ -302,7 +302,7 @@ fn alpha_expect(scene: &[Placed<'_>], x: u32, y: u32) -> Option<[u32; 4]> {
     let first = hits
         .iter()
         .find(|&&(_, i, t)| scene[i].opaque || alpha_keeps(u32::MAX, t as u32));
-    Some(first.map_or([0; 4], |&(_, i, t)| [1, i as u32, t as u32, u32::MAX]))
+    Some(first.map_or_default(|&(_, i, t)| [1, i as u32, t as u32, u32::MAX]))
 }
 
 fn alpha_root(
@@ -442,7 +442,7 @@ fn alpha_test_on_micromap_clusters() {
     front.geom_flags = GEOMETRY_CULL_DISABLE;
     front.base_geom = 2;
     let table: [i32; 8] = [-1, -2, -3, 0, 1, 3, -5, 2];
-    front.omm_index = Some((0..front.tris.len()).map(|t| table[t % 8]).collect());
+    front.omm_index = Some(Vec::from_fn(front.tris.len(), |t| table[t % 8]));
     let clusters = vec![front, cl::back_cluster()];
     let flags = cl::data_flags() | RtasFlags::ALLOW_OMM;
     let clas = b.build_clas(&clusters, flags, micromap.address().0, None, None);
@@ -703,7 +703,7 @@ fn transmittance_and_translucent_resolve() {
             for t in 0..layers.tris.len() {
                 match hit_t(corners(&layers, t), [0.0; 3], p) {
                     Err(()) => continue 'rays,
-                    Ok(Some(d)) => on_ray.push((d, t % 2 == 0)),
+                    Ok(Some(d)) => on_ray.push((d, t.is_multiple_of(2))),
                     Ok(None) => {}
                 }
             }

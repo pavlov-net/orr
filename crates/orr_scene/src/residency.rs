@@ -2297,7 +2297,7 @@ mod tests {
     #[test]
     fn least_recently_touched_units_are_evicted_first_and_locked_units_stay() {
         let mut r = Residency::new(limits(400));
-        let mut units: Vec<UnitDesc> = (0..5).map(|_| unit(100, &[], Start::Absent)).collect();
+        let mut units: Vec<UnitDesc> = Vec::from_fn(5, |_| unit(100, &[], Start::Absent));
         units.push(unit(100, &[], Start::Locked));
         r.register(M, &units).unwrap();
         step(&mut r, &[0], 1);
@@ -2323,7 +2323,7 @@ mod tests {
             in_flight: 40,
             ..limits(u64::MAX)
         });
-        let units: Vec<UnitDesc> = (0..9).map(|_| unit(10, &[], Start::Absent)).collect();
+        let units: Vec<UnitDesc> = Vec::from_fn(9, |_| unit(10, &[], Start::Absent));
         r.register(M, &units).unwrap();
         let at = |error, cell_distance| Priority {
             error,
@@ -2362,7 +2362,7 @@ mod tests {
             in_flight: 100,
             ..limits(u64::MAX)
         });
-        let units: Vec<UnitDesc> = (0..20).map(|_| unit(10, &[], Start::Absent)).collect();
+        let units: Vec<UnitDesc> = Vec::from_fn(20, |_| unit(10, &[], Start::Absent));
         r.register(M, &units).unwrap();
         // Six times the limit, the last read alone past it.
         let mut queue: VecDeque<(u64, ())> = (0..25).map(|_| (20, ())).collect();
@@ -2411,7 +2411,7 @@ mod tests {
             in_flight: 100,
             ..limits(u64::MAX)
         });
-        let units: Vec<UnitDesc> = (0..30).map(|_| unit(10, &[], Start::Absent)).collect();
+        let units: Vec<UnitDesc> = Vec::from_fn(30, |_| unit(10, &[], Start::Absent));
         r.register(M, &units).unwrap();
         // Each read alone fills the limit.
         let mut queue: VecDeque<(u64, ())> = (0..20).map(|_| (100, ())).collect();
@@ -2711,7 +2711,7 @@ mod tests {
         r.release_blob(100);
         assert_eq!(r.stats().class(user).resident_bytes, 0);
 
-        let units: Vec<UnitDesc> = (0..4).map(|_| unit(30, &[], Start::Absent)).collect();
+        let units: Vec<UnitDesc> = Vec::from_fn(4, |_| unit(30, &[], Start::Absent));
         r.register(M, &units).unwrap();
         for u in 0..4 {
             r.request(key(u), P, RequestSource::Traversal);
@@ -2740,12 +2740,10 @@ mod tests {
             &[0],
         ];
         let bytes = [100, 10, 20, 30, 40, 50, 60, 70, 80, 90, 15];
-        let units: Vec<UnitDesc> = (0..11)
-            .map(|u| {
-                let start = if u == 0 { Start::Pinned } else { Start::Absent };
-                unit(bytes[u], deps[u], start)
-            })
-            .collect();
+        let units: Vec<UnitDesc> = Vec::from_fn(11, |u| {
+            let start = if u == 0 { Start::Pinned } else { Start::Absent };
+            unit(bytes[u], deps[u], start)
+        });
         r.register(M, &units).unwrap();
         // 2 under 3, 1 locked, 10 failed, 6 loading.
         assert_eq!(step(&mut r, &[1, 3, 4, 5], 1).loads.len(), 5);
@@ -3041,7 +3039,7 @@ mod tests {
         let mut l = limits(400);
         l.budgets[texture as usize] = 200;
         let mut r = Residency::new(l);
-        let mut units: Vec<UnitDesc> = (0..4).map(|_| unit(100, &[], Start::Absent)).collect();
+        let mut units: Vec<UnitDesc> = Vec::from_fn(4, |_| unit(100, &[], Start::Absent));
         units.push(unit(100, &[], Start::Pinned));
         let tile = UnitDesc {
             class: texture,
@@ -3135,7 +3133,7 @@ mod tests {
     fn evictions_that_return_no_memory_are_followed_by_cuts_down_to_the_floor() {
         let period = response_period(2);
         let mut r = Residency::new(limits(800));
-        let units: Vec<UnitDesc> = (0..8).map(|_| unit(100, &[], Start::Absent)).collect();
+        let units: Vec<UnitDesc> = Vec::from_fn(8, |_| unit(100, &[], Start::Absent));
         r.register(M, &units).unwrap();
         step(&mut r, &[0, 1, 2, 3, 4, 5, 6, 7], 1);
         r.react(1, &heap(&r, 1100));
@@ -3164,7 +3162,7 @@ mod tests {
     #[test]
     fn managers_on_one_device_share_a_heaps_excess_by_what_each_uses() {
         let mut r = Residency::new(limits(400));
-        let units: Vec<UnitDesc> = (0..4).map(|_| unit(100, &[], Start::Absent)).collect();
+        let units: Vec<UnitDesc> = Vec::from_fn(4, |_| unit(100, &[], Start::Absent));
         r.register(M, &units).unwrap();
         step(&mut r, &[0, 1, 2], 1);
         let over = |held| {

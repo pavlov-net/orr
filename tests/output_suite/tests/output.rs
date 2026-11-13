@@ -71,7 +71,7 @@ fn run(display: &ResolvedDisplay, format: Format) -> Vec<u8> {
         "display linear",
     );
     let backbuffer = texture(format, TextureUsage::STORAGE, "backbuffer");
-    let slots: Vec<u32> = (0..4).map(|_| gpu.alloc_image_slot().unwrap()).collect();
+    let slots: Vec<u32> = Vec::from_fn(4, |_| gpu.alloc_image_slot().unwrap());
     let view = ViewDesc::default();
     let source_index = gpu.write_sampled(slots[0], &source, &view);
     let linear_store = gpu.write_storage(slots[1], &linear, &view);

@@ -256,78 +256,76 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
         2..=4 => 0.02 + 0.08 * u,
         _ => u,
     };
-    let cases: Vec<codec::Case> = (0..N)
-        .map(|i| {
-            let kind = i % 4; // plain, subsurface, thin subsurface, coat and fuzz
-            let mut c: codec::Case = bytemuck::Zeroable::zeroed();
-            c.base_color = arr(rng.rgb());
-            c.roughness = ggx(rng.next(), i);
-            c.normal = arr(rng.unit());
-            c.metalness = rng.next();
-            c.emission = arr(rng.rgb() * 4000.0 * rng.next());
-            // Weights past 1, up to 1 / F0, and IORs over all of 0 to infinity.
-            c.specular_weight = rng.next() * if i % 3 == 0 { 2000.0 } else { 1.0 };
-            c.specular_color = arr(rng.rgb());
-            c.ior = match i % 5 {
-                0 => rng.next(),
-                1 => 3.0 + 100.0 * rng.next(),
-                2 => 1.5,
-                _ => 1.0 + 2.0 * rng.next(),
-            };
-            c.geometric_normal = arr(rng.unit());
-            c.diffuse_roughness = rng.next();
-            c.raster_error = if i % 7 == 0 {
-                0.0
-            } else {
-                1e-5 * 1e7f32.powf(rng.next())
-            };
-            c.flags = ((i as u32 % 3) << 5) | ((i as u32 % 2) * 2);
-            if i % 6 == 5 {
-                c.specular_color = arr(rng.rgb() * rng.next());
-                c.specular_weight = rng.next();
-                c.bsdf_flags |= BSDF_FRESNEL_MIX;
+    let cases: Vec<codec::Case> = Vec::from_fn(N, |i| {
+        let kind = i % 4; // plain, subsurface, thin subsurface, coat and fuzz
+        let mut c: codec::Case = bytemuck::Zeroable::zeroed();
+        c.base_color = arr(rng.rgb());
+        c.roughness = ggx(rng.next(), i);
+        c.normal = arr(rng.unit());
+        c.metalness = rng.next();
+        c.emission = arr(rng.rgb() * 4000.0 * rng.next());
+        // Weights past 1, up to 1 / F0, and IORs over all of 0 to infinity.
+        c.specular_weight = rng.next() * if i.is_multiple_of(3) { 2000.0 } else { 1.0 };
+        c.specular_color = arr(rng.rgb());
+        c.ior = match i % 5 {
+            0 => rng.next(),
+            1 => 3.0 + 100.0 * rng.next(),
+            2 => 1.5,
+            _ => 1.0 + 2.0 * rng.next(),
+        };
+        c.geometric_normal = arr(rng.unit());
+        c.diffuse_roughness = rng.next();
+        c.raster_error = if i.is_multiple_of(7) {
+            0.0
+        } else {
+            1e-5 * 1e7f32.powf(rng.next())
+        };
+        c.flags = ((i as u32 % 3) << 5) | ((i as u32 % 2) * 2);
+        if i % 6 == 5 {
+            c.specular_color = arr(rng.rgb() * rng.next());
+            c.specular_weight = rng.next();
+            c.bsdf_flags |= BSDF_FRESNEL_MIX;
+        }
+        if i % 4 == 3 {
+            c.bsdf_flags |= BSDF_METAL_FLAT;
+        }
+        if kind == 1 || kind == 2 {
+            c.subsurface_weight = 0.05 + 0.95 * rng.next();
+            c.subsurface_color = arr(rng.rgb());
+            c.subsurface_radius = arr(rng.rgb() * 0.05);
+            c.subsurface_anisotropy = rng.next() * 1.8 - 0.9;
+        }
+        if kind == 2 {
+            c.bsdf_flags |= BSDF_THIN_WALLED;
+        }
+        if kind == 3 {
+            c.coat_weight = rng.next();
+            c.coat_color = arr(rng.rgb());
+            c.fuzz_weight = rng.next();
+            c.fuzz_color = arr(rng.rgb());
+            c.coat_anisotropy = rng.next();
+            c.coat_tangent_angle = rng.next() * std::f32::consts::PI;
+            c.coat_normal = arr(rng.unit());
+            if let Some(&axis) = AXES.get(i / 4) {
+                c.coat_normal = axis;
             }
-            if i % 4 == 3 {
-                c.bsdf_flags |= BSDF_METAL_FLAT;
-            }
-            if kind == 1 || kind == 2 {
-                c.subsurface_weight = 0.05 + 0.95 * rng.next();
-                c.subsurface_color = arr(rng.rgb());
-                c.subsurface_radius = arr(rng.rgb() * 0.05);
-                c.subsurface_anisotropy = rng.next() * 1.8 - 0.9;
-            }
-            if kind == 2 {
-                c.bsdf_flags |= BSDF_THIN_WALLED;
-            }
-            if kind == 3 {
-                c.coat_weight = rng.next();
-                c.coat_color = arr(rng.rgb());
-                c.fuzz_weight = rng.next();
-                c.fuzz_color = arr(rng.rgb());
-                c.coat_anisotropy = rng.next();
-                c.coat_tangent_angle = rng.next() * std::f32::consts::PI;
-                c.coat_normal = arr(rng.unit());
-                if let Some(&axis) = AXES.get(i / 4) {
-                    c.coat_normal = axis;
-                }
-                c.bsdf_flags |= BSDF_COAT_FRAME;
-            }
-            if kind == 3 || i % 16 == 1 {
-                c.thin_film_weight = 0.05 + 0.95 * rng.next();
-                c.thin_film_thickness = 1500.0 * rng.next();
-                c.thin_film_ior = 1.0 + 2.0 * rng.next();
-                c.coat_darkening = rng.next();
-            }
-            if kind != 0 {
-                c.coat_roughness = ggx(rng.next(), i / 4);
-                c.coat_ior = 0.5 + 6.0 * rng.next();
-                c.fuzz_roughness = rng.next();
-                c.anisotropy = rng.next();
-                c.tangent_angle = rng.next() * std::f32::consts::PI;
-            }
-            c
-        })
-        .collect();
+            c.bsdf_flags |= BSDF_COAT_FRAME;
+        }
+        if kind == 3 || i % 16 == 1 {
+            c.thin_film_weight = 0.05 + 0.95 * rng.next();
+            c.thin_film_thickness = 1500.0 * rng.next();
+            c.thin_film_ior = 1.0 + 2.0 * rng.next();
+            c.coat_darkening = rng.next();
+        }
+        if kind != 0 {
+            c.coat_roughness = ggx(rng.next(), i / 4);
+            c.coat_ior = 0.5 + 6.0 * rng.next();
+            c.fuzz_roughness = rng.next();
+            c.anisotropy = rng.next();
+            c.tangent_angle = rng.next() * std::f32::consts::PI;
+        }
+        c
+    });
     let upload = |bytes: &[u8]| {
         let mut a = d
             .gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, "codec input")
@@ -4014,7 +4012,7 @@ fn chain_steps_and_fades_follow_the_reference_over_a_distance_sweep() {
     set_chain(&mut w, &models);
     // Out past every step and back, a pause, then back and forth across the first switch
     // faster than a fade.
-    let mut path: Vec<f32> = (0..45).map(|i| 3.0 + 2.7 * i as f32).collect();
+    let mut path: Vec<f32> = Vec::from_fn(45, |i| 3.0 + 2.7 * i as f32);
     path.extend([path[44]; 20]);
     path.extend((0..45).rev().map(|i| 3.0 + 2.7 * i as f32));
     path.extend([3.0; 20]);
@@ -8640,15 +8638,13 @@ fn mesh_pages_move_out_of_draining_blocks_under_the_frames_that_draw_them() {
         let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
         let (pages, bases, _) = mesh_pages(w, models[0]);
         let pinned = mesh.pinned_pages as usize;
-        let of_page: Vec<Vec<orr_scene::ClusterRef>> = (0..pages.len())
-            .map(|p| {
-                if p < pinned || pages[p] == 0 {
-                    return Vec::new();
-                }
-                let count = u64::from(firsts[p + 1] - firsts[p]);
-                read_buffer(root.clusters.offset(u64::from(bases[p])), count)
-            })
-            .collect();
+        let of_page: Vec<Vec<orr_scene::ClusterRef>> = Vec::from_fn(pages.len(), |p| {
+            if p < pinned || pages[p] == 0 {
+                return Vec::new();
+            }
+            let count = u64::from(firsts[p + 1] - firsts[p]);
+            read_buffer(root.clusters.offset(u64::from(bases[p])), count)
+        });
         (pages, of_page)
     };
 
@@ -9871,13 +9867,13 @@ fn long_walk() -> Instances {
     };
     let rows = (0..WALK_INTERVALS).flat_map(|k| (0..WALK_RECORDS).map(move |i| row(k, i)));
     Instances {
-        records: (0..WALK_RECORDS).map(spot).collect(),
+        records: Vec::from_fn(WALK_RECORDS, spot),
         prototypes: vec![PrototypeSpec {
             model: "plain".into(),
             ..PrototypeSpec::default()
         }],
         motion: Some(Arc::new(InstanceMotion {
-            times: (0..WALK_INTERVALS).map(|k| k as f64 * 0.1).collect(),
+            times: Vec::from_fn(WALK_INTERVALS, |k| k as f64 * 0.1),
             rows: rows.collect(),
             anchors: vec![[0.0; 3]; WALK_RECORDS],
             left: DMat4::IDENTITY,
@@ -10255,9 +10251,9 @@ fn a_far_worm_skins_where_f64_puts_it() {
         };
         model_pose.push(parent * trs_f64(&locals[j]));
     }
-    let skinning: Vec<DMat4> = (0..n)
-        .map(|j| model_pose[j] * orr_math::Mat4::from(sk.inverse_binds[j]).as_dmat4())
-        .collect();
+    let skinning: Vec<DMat4> = Vec::from_fn(n, |j| {
+        model_pose[j] * orr_math::Mat4::from(sk.inverse_binds[j]).as_dmat4()
+    });
     let mesh = CpuMesh::of(FAR_WORM);
     let total: u32 = (0..mesh.pages.len())
         .map(|p| {

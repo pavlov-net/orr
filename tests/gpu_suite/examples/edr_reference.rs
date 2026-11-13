@@ -62,16 +62,14 @@ mod measure {
     fn bars(levels: &[f64; 10], extent: [u32; 2]) -> Vec<u32> {
         let [w, h] = extent.map(|v| v as usize);
         let n = levels.len();
-        let row: Vec<u32> = (0..w)
-            .map(|x| {
-                let gap = (x * n) % w < w / 100;
-                if gap {
-                    pq_gray(0.0)
-                } else {
-                    pq_gray(levels[x * n / w])
-                }
-            })
-            .collect();
+        let row: Vec<u32> = Vec::from_fn(w, |x| {
+            let gap = (x * n) % w < w / 100;
+            if gap {
+                pq_gray(0.0)
+            } else {
+                pq_gray(levels[x * n / w])
+            }
+        });
         row.repeat(h)
     }
 

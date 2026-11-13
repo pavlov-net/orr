@@ -194,7 +194,7 @@ impl Cascade {
             t,
             r,
             linear: srgb && r == Reduction::Mean && t == Texel::Rgba8,
-            pending: (0..coarser).map(|_| None).collect(),
+            pending: Vec::from_fn(coarser, |_| None),
         }
     }
 
@@ -294,13 +294,11 @@ impl Cascade {
 /// The 2x2 sums of two rows of `channels`-channel sums: a row of half the width.
 fn sum_rows(channels: usize, top: &[u128], bottom: &[u128]) -> Vec<u128> {
     let n = channels;
-    (0..top.len() / 2)
-        .map(|i| {
-            let (px, ch) = (i / n, i % n);
-            let at = 2 * px * n + ch;
-            top[at] + top[at + n] + bottom[at] + bottom[at + n]
-        })
-        .collect()
+    Vec::from_fn(top.len() / 2, |i| {
+        let (px, ch) = (i / n, i % n);
+        let at = 2 * px * n + ch;
+        top[at] + top[at + n] + bottom[at] + bottom[at + n]
+    })
 }
 
 /// Reduces two rows of finer stored texels into one row of half the width, for every

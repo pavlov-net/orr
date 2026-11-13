@@ -160,9 +160,9 @@ impl Terrain {
                 patch_size: self.patch_size,
                 corner_x: self.corner[0],
                 corner_z: self.corner[1],
-                hole_x: self.hole.map_or(0.0, |h| h.0[0]),
-                hole_z: self.hole.map_or(0.0, |h| h.0[1]),
-                hole_size: self.hole.map_or(0.0, |h| h.1),
+                hole_x: self.hole.map_or_default(|h| h.0[0]),
+                hole_z: self.hole.map_or_default(|h| h.0[1]),
+                hole_size: self.hole.map_or_default(|h| h.1),
             })
             .expect("terrain root");
         let groups = (self.patches * self.patches).div_ceil(64);

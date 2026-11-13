@@ -116,7 +116,7 @@ impl Frame<'_> {
             .get(view.history.0 as usize)
             .and_then(Option::as_ref)
             .and_then(|h| h.lists.as_ref())
-            .map_or(0, |l| l.sizes().visible_clusters);
+            .map_or_default(|l| l.sizes().visible_clusters);
         let [probe, lists] = core.probe_pipelines(device, self.kernels)?;
         let list = self.list.as_mut().expect("frame list");
         list.begin_pass("pixel probe", false);

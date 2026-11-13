@@ -147,7 +147,7 @@ mod windowed {
                 latency.marker(id, LatencyMarker::PresentStart);
                 present_one(&mut sc, &fill, id as u32, None, &[point]).expect("window has area");
                 latency.marker(id, LatencyMarker::PresentEnd);
-                if id % 16 == 0 {
+                if id.is_multiple_of(16) {
                     out.clear();
                     latency.timings(&mut out);
                     for t in &out {

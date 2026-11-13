@@ -653,7 +653,7 @@ fn gdeflate_archives_store_payload_pages() {
             if b.codec() == Codec::GDeflate {
                 gdeflate_blobs += 1;
                 assert!(b.chunk_raw_len() <= 64 << 10);
-                assert!(gd.chunks(b).iter().all(|c| c.stored_len % 4 == 0));
+                assert!(gd.chunks(b).iter().all(|c| c.stored_len.is_multiple_of(4)));
             }
         }
     }
@@ -691,16 +691,14 @@ fn linked_imports_still_expand_assemblies() {
     let manifest = |output: Target, n: usize| {
         let mut settings = GltfSettings::default();
         settings.mesh.assemblies = Some(AssemblySettings::default());
-        let records = (0..n)
-            .map(|i| Placement {
-                position: DVec3::new(10.0 * i as f64, 0.0, 5.0).to_array(),
-                linear: Linear::Scaled {
-                    rotation: Quat::from_rotation_y(i as f32).to_array(),
-                    scale: [1.0; 3],
-                },
-                prototype: 0,
-            })
-            .collect();
+        let records = Vec::from_fn(n, |i| Placement {
+            position: DVec3::new(10.0 * i as f64, 0.0, 5.0).to_array(),
+            linear: Linear::Scaled {
+                rotation: Quat::from_rotation_y(i as f32).to_array(),
+                scale: [1.0; 3],
+            },
+            prototype: 0,
+        });
         let assets = vec![
             AssetSpec {
                 name: "rack".into(),

@@ -90,7 +90,7 @@ const RECONSTRUCTIONS: [Reconstruction; 7] = [
 /// The entry after `current` in `list`, wrapping; the first if `current` is not in it.
 fn next<T: Copy + PartialEq>(list: &[T], current: T) -> T {
     let at = list.iter().position(|&v| v == current);
-    list[at.map_or(0, |i| (i + 1) % list.len())]
+    list[at.map_or_default(|i| (i + 1) % list.len())]
 }
 
 /// What `--cycle` steps through: a mode and an encoding request.
@@ -259,7 +259,7 @@ fn run(options: &Options) {
             extent[0],
             extent[1],
             resolved.encoding,
-            presented.map_or(0, |p| p.generated),
+            presented.map_or_default(|p| p.generated),
             time.delta * 1000.0,
         );
         overlay.layout(extent, time, &text);

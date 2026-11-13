@@ -26,7 +26,7 @@ fn main() {
         .sum();
     let mut ms = 0.0;
     for batch in pages.chunks(BATCH) {
-        let mut runs: Vec<f64> = (0..RUNS).map(|_| decode_stored(batch).gpu_ms).collect();
+        let mut runs: Vec<f64> = Vec::from_fn(RUNS, |_| decode_stored(batch).gpu_ms);
         runs.sort_by(f64::total_cmp);
         ms += runs[RUNS / 2];
     }

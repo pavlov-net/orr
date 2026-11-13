@@ -40,7 +40,7 @@ fn random_affine(rng: &mut Rng) -> Affine3 {
 #[test]
 fn orthonormal_basis_is_right_handed_everywhere() {
     let mut rng = Rng::new(10);
-    let mut normals: Vec<[f32; 3]> = (0..100_000).map(|_| rng.unit()).collect();
+    let mut normals: Vec<[f32; 3]> = Vec::from_fn(100_000, |_| rng.unit());
     for z in [-1.0f32, -0.999_999_9, -0.99999, -0.0, 0.0, 1.0] {
         let r = (1.0 - z * z).max(0.0).sqrt();
         normals.push([r, 0.0, z]);

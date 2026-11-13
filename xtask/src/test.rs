@@ -254,7 +254,7 @@ fn target_name(package: &str, target: &Value) -> String {
 }
 
 fn strings(value: &Value) -> Vec<String> {
-    let items = value.as_array().map_or(&[][..], Vec::as_slice);
+    let items = value.as_array().map_or_default(Vec::as_slice);
     items
         .iter()
         .filter_map(|s| s.as_str().map(str::to_owned))

@@ -741,7 +741,7 @@ impl Surface {
                     continue;
                 }
                 let n = (tri.n[0] * l[0] + tri.n[1] * l[1] + tri.n[2] * l[2]).normalize_or_zero();
-                let dot = face.map_or(0.0, |f| n.dot(f));
+                let dot = face.map_or_default(|f| n.dot(f));
                 if face.is_some() && dot <= 0.0 {
                     continue;
                 }
@@ -764,7 +764,7 @@ fn corner_of(l: [f64; 3]) -> usize {
 /// Welded vertex `v`'s uvs, in each set the mesh has.
 pub(super) fn uvs_of(w: &Welded, v: u32) -> Uvs {
     let v = v as usize;
-    [w.uvs[0][v], w.uvs.get(1).map_or([0.0; 2], |u| u[v])]
+    [w.uvs[0][v], w.uvs.get(1).map_or_default(|u| u[v])]
 }
 
 /// The smoothing class of a source normal: the normal a cluster stores for it, so normals

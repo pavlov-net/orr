@@ -850,9 +850,7 @@ fn halves_png(name: &str, left: u8, right: u8) -> PathBuf {
     let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), 16, 16);
     enc.set_color(png::ColorType::Grayscale);
     enc.set_depth(png::BitDepth::Eight);
-    let data: Vec<u8> = (0..256)
-        .map(|i| if i % 16 < 8 { left } else { right })
-        .collect();
+    let data: Vec<u8> = Vec::from_fn(256, |i| if i % 16 < 8 { left } else { right });
     enc.write_header().unwrap().write_image_data(&data).unwrap();
     path
 }
@@ -1856,7 +1854,7 @@ impl Capture {
     /// The guides as the last completed recording read them.
     pub fn guides(&self) -> GuideImages {
         let v = self.guides.as_slice().unwrap();
-        let plane = |k: usize| (0..PIXELS as usize).map(|i| v[i * 6 + k]).collect();
+        let plane = |k: usize| Vec::from_fn(PIXELS as usize, |i| v[i * 6 + k]);
         GuideImages {
             diffuse_albedo: plane(0),
             specular_albedo: plane(1),

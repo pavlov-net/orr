@@ -1000,7 +1000,7 @@ pub(crate) fn read_into(
         Box::new(move |stored| {
             // SAFETY: the caller gives this load the first `len` bytes at `at`.
             let out = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, len) };
-            let read = stored.as_ref().map_or(0, |s| s.len() as u64);
+            let read = stored.as_ref().map_or_default(|s| s.len() as u64);
             let decoded = stored.and_then(|s| {
                 a.decode(&b, chunk, s, out)?;
                 Ok(&*out)

@@ -1225,7 +1225,7 @@ fn toksvig_roughness_follows_the_normal_scale_of_each_axis() {
         let d = fixture();
         std::fs::write(
             d.join("ripple.png"),
-            png(|_, y| [128, if y % 2 == 0 { 40 } else { 216 }, 200, 255]),
+            png(|_, y| [128, if y.is_multiple_of(2) { 40 } else { 216 }, 200, 255]),
         )
         .unwrap();
         let (a, _) = cook(&write_doc(&d, "m.mtlx", "", &body, inputs), "M").unwrap();
@@ -1561,9 +1561,8 @@ fn an_image_reads_its_layer_or_else_its_default() {
         .to_file(d.join("layers.exr"))
         .unwrap();
     let cooked = |file: &str, layer: Option<&str>| {
-        let layer = layer.map_or(String::new(), |l| {
-            format!(r#"<input name="layer" type="string" value="{l}"/>"#)
-        });
+        let layer =
+            layer.map_or_default(|l| format!(r#"<input name="layer" type="string" value="{l}"/>"#));
         let body = format!(
             r#"<image name="i" type="float">
               <input name="file" type="filename" value="{file}"/>

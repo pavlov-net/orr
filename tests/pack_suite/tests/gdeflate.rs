@@ -16,14 +16,12 @@ fn source() -> Vec<u8> {
     let page = GDEFLATE_PAGE as usize;
     let mut x = 11u64;
     let mut random = |n: usize| -> Vec<u8> {
-        (0..n)
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                x as u8
-            })
-            .collect()
+        Vec::from_fn(n, |_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
     };
     let mut bytes = Vec::new();
     for i in 0..30 {
@@ -74,18 +72,16 @@ fn cooked_pages_decompress_on_the_loading_queue() {
             .gpu_malloc::<u8>(MemoryKind::DeviceLocal, source.len() as u64, "gdeflate out")
             .unwrap();
         let mut src = stored.gpu().address().0;
-        let regions: Vec<DecompressRegion> = (0..n)
-            .map(|i| {
-                let region = DecompressRegion {
-                    src,
-                    dst: out.gpu().address().0 + u64::from(b.chunk_raw_len()) * i as u64,
-                    compressed_bytes: u64::from(chunks[i].stored_len),
-                    decompressed_bytes: u64::from(b.chunk_len(i as u32)),
-                };
-                src += region.compressed_bytes;
-                region
-            })
-            .collect();
+        let regions: Vec<DecompressRegion> = Vec::from_fn(n, |i| {
+            let region = DecompressRegion {
+                src,
+                dst: out.gpu().address().0 + u64::from(b.chunk_raw_len()) * i as u64,
+                compressed_bytes: u64::from(chunks[i].stored_len),
+                decompressed_bytes: u64::from(b.chunk_len(i as u32)),
+            };
+            src += region.compressed_bytes;
+            region
+        });
         let regions = upload(&regions, "gdeflate regions");
         let cleared = upload(&vec![0xcdu8; source.len()], "gdeflate clear");
         let host = readback::<u8>(source.len() as u64, "gdeflate readback");

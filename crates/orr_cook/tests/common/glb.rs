@@ -28,7 +28,7 @@ impl Glb {
     /// A buffer view of `bytes`, with a stride when given.
     pub(crate) fn view(&mut self, bytes: &[u8], stride: Option<usize>) -> usize {
         let (at, len) = self.push(bytes);
-        let stride = stride.map_or(String::new(), |s| format!(r#","byteStride":{s}"#));
+        let stride = stride.map_or_default(|s| format!(r#","byteStride":{s}"#));
         self.views.push(format!(
             r#"{{"buffer":0,"byteOffset":{at},"byteLength":{len}{stride}}}"#
         ));
@@ -65,7 +65,7 @@ impl Glb {
             }
             "TRIANGLES" => {
                 let indices: Vec<u32> = bytemuck::cast_slice(raw).to_vec();
-                let vertices = indices.iter().max().map_or(0, |&m| m as usize + 1);
+                let vertices = indices.iter().max().map_or_default(|&m| m as usize + 1);
                 meshopt::encode_index_buffer(&indices, vertices).unwrap()
             }
             _ => panic!("mode {mode}"),

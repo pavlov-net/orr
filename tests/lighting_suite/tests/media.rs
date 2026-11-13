@@ -1547,16 +1547,14 @@ fn smoke_takes_its_opacity_from_the_camera_ray() {
     // In a square 8 m away, 2 m across, a grid of specks 2 cm across.
     let n = 40;
     let half = 0.01;
-    let specks: Vec<Particle> = (0..n * n)
-        .map(|i| Particle {
-            center: Vec3::new(
-                ((i % n) as f32 + 0.5) / n as f32 * 2.0 - 1.0,
-                1.5 + ((i / n) as f32 + 0.5) / n as f32 * 2.0 - 1.0,
-                -3.0,
-            ),
-            size: half,
-        })
-        .collect();
+    let specks: Vec<Particle> = Vec::from_fn(n * n, |i| Particle {
+        center: Vec3::new(
+            ((i % n) as f32 + 0.5) / n as f32 * 2.0 - 1.0,
+            1.5 + ((i / n) as f32 + 0.5) / n as f32 * 2.0 - 1.0,
+            -3.0,
+        ),
+        size: half,
+    });
     let opacity = 0.8;
     let (mut bed, _fog) = foggy(&CLEAR, Vec::new(), Vec::new(), None, eye, target);
     bed.set_particles(&specks, smoke_look(opacity, 0.0), Opacity::Smoke);

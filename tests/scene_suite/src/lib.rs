@@ -38,12 +38,10 @@ pub struct Workers {
 impl Workers {
     pub fn start(scenes: &Scenes, n: usize) -> Self {
         let loading = scenes.loading();
-        let threads = (0..n)
-            .map(|_| {
-                let l = Arc::clone(&loading);
-                std::thread::spawn(move || l.run_worker())
-            })
-            .collect();
+        let threads = Vec::from_fn(n, |_| {
+            let l = Arc::clone(&loading);
+            std::thread::spawn(move || l.run_worker())
+        });
         Self { loading, threads }
     }
 }

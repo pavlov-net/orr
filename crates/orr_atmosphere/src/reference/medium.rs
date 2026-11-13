@@ -77,7 +77,7 @@ impl Profile {
             aerosol_scale: f64::from(a.aerosol.scale_height),
             ozone_peak: f64::from(a.ozone.peak_altitude),
             ozone_half_width: f64::from(a.ozone.half_width),
-            fog_base: fog.map_or(0.0, |f| f64::from(f.base_height)),
+            fog_base: fog.map_or_default(|f| f64::from(f.base_height)),
             fog_falloff: fog.map_or(1.0, |f| f64::from(f.falloff_height)),
             active: [
                 a.rayleigh.density > 0.0,

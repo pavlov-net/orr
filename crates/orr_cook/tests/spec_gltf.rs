@@ -447,9 +447,7 @@ fn strips_and_fans_are_the_spec_triangles() {
         let path = d.join(format!("{i}.glb"));
         let mut g = Glb::default();
         let pa = g.floats(&V, "VEC3");
-        let ix = indices.map_or(String::new(), |ix| {
-            format!(r#","indices":{}"#, g.indices(ix))
-        });
+        let ix = indices.map_or_default(|ix| format!(r#","indices":{}"#, g.indices(ix)));
         g.write(
             &path,
             &format!(
@@ -1290,9 +1288,7 @@ fn displaced_quad(name: &str, scale: [f32; 3], normals: Option<&[[f32; 3]]>) -> 
     let ua = g.floats(&QUAD_UV, "VEC2");
     let ia = g.indices(&QUAD_INDICES);
     let img = g.image(&png(4, |_, _| [255, 255, 255, 255]));
-    let normal = normals.map_or(String::new(), |n| {
-        format!(r#","NORMAL":{}"#, g.floats(n, "VEC3"))
-    });
+    let normal = normals.map_or_default(|n| format!(r#","NORMAL":{}"#, g.floats(n, "VEC3")));
     g.write(
         &path,
         &format!(
@@ -1724,21 +1720,19 @@ fn long_chain(path: &Path, count: usize, skinned: bool) {
     let wa = g.floats(&vec![[1.0f32, 0.0, 0.0, 0.0]; joints.len()], "VEC4");
     let ta = g.floats(&[[0.0f32], [1.0]], "SCALAR");
     let va = g.floats(&[[0.0f32, 1.0, 0.0], [1.0, 1.0, 0.0]], "VEC3");
-    let channels: Vec<String> = (0..count)
-        .map(|i| format!(r#"{{"sampler":0,"target":{{"node":{i},"path":"translation"}}}}"#))
-        .collect();
-    let chain: Vec<String> = (0..count)
-        .map(|i| {
-            let mesh = if skinned { "" } else { r#""mesh":0,"# };
-            let next = if i + 1 < count {
-                format!(r#","children":[{}]"#, i + 1)
-            } else {
-                String::new()
-            };
-            format!(r#"{{"name":"n{i}",{mesh}"translation":[0,1,0]{next}}}"#)
-        })
-        .collect();
-    let list: Vec<String> = (0..count).map(|i| i.to_string()).collect();
+    let channels: Vec<String> = Vec::from_fn(count, |i| {
+        format!(r#"{{"sampler":0,"target":{{"node":{i},"path":"translation"}}}}"#)
+    });
+    let chain: Vec<String> = Vec::from_fn(count, |i| {
+        let mesh = if skinned { "" } else { r#""mesh":0,"# };
+        let next = if i + 1 < count {
+            format!(r#","children":[{}]"#, i + 1)
+        } else {
+            String::new()
+        };
+        format!(r#"{{"name":"n{i}",{mesh}"translation":[0,1,0]{next}}}"#)
+    });
+    let list: Vec<String> = Vec::from_fn(count, |i| i.to_string());
     let (extra, roots, attributes) = if skinned {
         (
             r#",{"mesh":0,"skin":0}"#.to_string(),

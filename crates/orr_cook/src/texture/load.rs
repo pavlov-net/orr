@@ -1388,9 +1388,9 @@ mod tests {
 
     #[test]
     fn lossy_webp_decodes_its_colors_and_alpha() {
-        let bytes: Vec<u8> = (0..LOSSY_WEBP.len() / 2)
-            .map(|i| u8::from_str_radix(&LOSSY_WEBP[2 * i..2 * i + 2], 16).unwrap())
-            .collect();
+        let bytes: Vec<u8> = Vec::from_fn(LOSSY_WEBP.len() / 2, |i| {
+            u8::from_str_radix(&LOSSY_WEBP[2 * i..2 * i + 2], 16).unwrap()
+        });
         let src = decode(&bytes).unwrap();
         assert!(src.color.rgb8 && !src.rg && src.blocks.is_none() && !is_animated(&bytes));
         let img = &src.layers[0];

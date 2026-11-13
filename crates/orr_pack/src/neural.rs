@@ -351,7 +351,7 @@ mod tests {
                     converted_bytes: 0,
                     constants: Span::default(),
                 },
-                (0..CONSTANTS_BYTES).map(|i| i as u8).collect(),
+                Vec::from_fn(CONSTANTS_BYTES, |i| i as u8),
             )],
         };
         let back = NeuralInfo::parse(&info.to_bytes()).unwrap();
@@ -375,12 +375,12 @@ mod tests {
             hidden: std::array::from_fn(|l| {
                 let (rows, cols) = LAYERS[l];
                 (
-                    (0..rows * cols).map(|i| (i * 7 + l) as u8).collect(),
-                    (0..rows).map(|i| half::f16::from_f32(i as f32)).collect(),
+                    Vec::from_fn(rows * cols, |i| (i * 7 + l) as u8),
+                    Vec::from_fn(rows, |i| half::f16::from_f32(i as f32)),
                 )
             }),
-            output: (0..OUTPUTS * LAYERS[3].1).map(|i| i as i8).collect(),
-            scale: (0..OUTPUTS).map(|i| i as f32 * 0.5).collect(),
+            output: Vec::from_fn(OUTPUTS * LAYERS[3].1, |i| i as i8),
+            scale: Vec::from_fn(OUTPUTS, |i| i as f32 * 0.5),
             bias: (0..OUTPUTS as i32).map(|i| -i).collect(),
         };
         let bytes = n.to_bytes();

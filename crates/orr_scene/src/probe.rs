@@ -798,8 +798,7 @@ impl PixelProbe {
             "  page {}: {}{}",
             g.mesh_page,
             bits(g.page_bits & 15),
-            self.page
-                .map_or(String::new(), |u| format!("; loading side: {u}"))
+            self.page.map_or_default(|u| format!("; loading side: {u}"))
         )?;
         if g.flags & FROM_GROUP == 0 {
             return writeln!(f, "  source cluster: simplified from no group");
@@ -820,7 +819,7 @@ impl PixelProbe {
             },
             bits(g.page_bits >> 4),
             self.from_page
-                .map_or(String::new(), |u| format!("; loading side: {u}")),
+                .map_or_default(|u| format!("; loading side: {u}")),
             g.page_wanted_error
         )?;
         writeln!(

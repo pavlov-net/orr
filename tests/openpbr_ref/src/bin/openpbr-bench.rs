@@ -86,9 +86,9 @@ fn main() {
                 _pad1: 0,
             };
         }
-        let ms: Vec<f64> = (0..modes.len())
-            .map(|k| median_ms(&device, &pipeline, roots.gpu().offset(k as u64)))
-            .collect();
+        let ms: Vec<f64> = Vec::from_fn(modes.len(), |k| {
+            median_ms(&device, &pipeline, roots.gpu().offset(k as u64))
+        });
         let per = |t: f64| t * 1e6 / f64::from(THREADS);
         let per_call = |t: f64| (t - ms[0]).max(0.0) * 1e6 / f64::from(THREADS * CALLS);
         out += &format!(

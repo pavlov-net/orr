@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn runs_are_consecutive_and_reuse_freed_runs() {
         let mut a = SlotAllocator::default();
-        let singles: Vec<u32> = (0..6).map(|_| a.take(100).unwrap()).collect();
+        let singles: Vec<u32> = Vec::from_fn(6, |_| a.take(100).unwrap());
         for s in [4, 1, 2, 5] {
             a.release(singles[s]);
         }

@@ -337,22 +337,20 @@ pub(crate) fn in_parallel<S, T: Send>(
     let threads = thread::available_parallelism().map_or(4, usize::from);
     let next = AtomicUsize::new(0);
     let mut out: Vec<(usize, T)> = thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads.min(count))
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut state = make();
-                    let mut done = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        if i >= count {
-                            break;
-                        }
-                        done.push((i, job(&mut state, i)));
+        let handles: Vec<_> = Vec::from_fn(threads.min(count), |_| {
+            scope.spawn(|| {
+                let mut state = make();
+                let mut done = Vec::new();
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= count {
+                        break;
                     }
-                    done
-                })
+                    done.push((i, job(&mut state, i)));
+                }
+                done
             })
-            .collect();
+        });
         handles
             .into_iter()
             .flat_map(|h| h.join().expect("harness thread panicked"))

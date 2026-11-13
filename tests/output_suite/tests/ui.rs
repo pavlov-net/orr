@@ -204,7 +204,7 @@ impl UiFrames {
             painter: Painter::new(gpu, 2).unwrap(),
             kernels: OutputKernels::new(gpu).unwrap(),
             layer: UiLayer::new(gpu, extent).unwrap(),
-            roots: (0..3).map(|_| ComposeRoot::new(gpu).unwrap()).collect(),
+            roots: Vec::from_fn(3, |_| ComposeRoot::new(gpu).unwrap()),
             frame: 0,
         }
     }
@@ -629,25 +629,21 @@ fn compose_ui_matches_model() {
         [1.1, -0.05, 0.0],
         [0.4, 0.4, 0.4],
     ];
-    let linear: Vec<[u16; 4]> = (0..n)
-        .map(|i| {
-            let (x, y) = (i as u32 % extent[0], i as u32 / extent[0]);
-            let scale = 4.0 * x as f32 / (extent[0] - 1) as f32;
-            let h = hues[(y / 8) as usize];
-            [h[0] * scale, h[1] * scale, h[2] * scale, 1.0].map(|v| f16::from_f32(v).to_bits())
-        })
-        .collect();
+    let linear: Vec<[u16; 4]> = Vec::from_fn(n, |i| {
+        let (x, y) = (i as u32 % extent[0], i as u32 / extent[0]);
+        let scale = 4.0 * x as f32 / (extent[0] - 1) as f32;
+        let h = hues[(y / 8) as usize];
+        [h[0] * scale, h[1] * scale, h[2] * scale, 1.0].map(|v| f16::from_f32(v).to_bits())
+    });
     let mut random = bytes(11);
-    let ui: Vec<[u8; 4]> = (0..n)
-        .map(|i| {
-            if i % 5 == 0 {
-                return [0; 4];
-            }
-            let a = random();
-            let mut c = || (u32::from(random()) * (u32::from(a) + 1) / 256) as u8;
-            [c(), c(), c(), a]
-        })
-        .collect();
+    let ui: Vec<[u8; 4]> = Vec::from_fn(n, |i| {
+        if i.is_multiple_of(5) {
+            return [0; 4];
+        }
+        let a = random();
+        let mut c = || (u32::from(random()) * (u32::from(a) + 1) / 256) as u8;
+        [c(), c(), c(), a]
+    });
 
     let source = Target::new(Format::Rgba16Float, extent, "linear");
     let layer = UiLayer::new(gpu, extent).unwrap();
@@ -664,7 +660,7 @@ fn compose_ui_matches_model() {
         let backbuffer = Target::new(format, extent, "backbuffer");
         let presented = Target::new(format, extent, "presented");
         let black = Target::new(format, extent, "ui only");
-        let mut roots: Vec<ComposeRoot> = (0..3).map(|_| ComposeRoot::new(gpu).unwrap()).collect();
+        let mut roots: Vec<ComposeRoot> = Vec::from_fn(3, |_| ComposeRoot::new(gpu).unwrap());
         let mut view = OutputView::new(gpu, 3).unwrap();
         let queue = gpu.queue(QueueKind::Render).unwrap();
         let mut list = queue.command_list().unwrap();

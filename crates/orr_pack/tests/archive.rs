@@ -30,20 +30,18 @@ impl Rng {
 /// Compressible bytes: a slow ramp of f32s with noise in the low byte.
 fn data(len: usize, seed: u64) -> Vec<u8> {
     let mut r = Rng(seed | 1);
-    (0..len)
-        .map(|i| {
-            if i % 4 == 0 {
-                r.next() as u8 & 3
-            } else {
-                (i / 4096 + i % 4) as u8
-            }
-        })
-        .collect()
+    Vec::from_fn(len, |i| {
+        if i.is_multiple_of(4) {
+            r.next() as u8 & 3
+        } else {
+            (i / 4096 + i % 4) as u8
+        }
+    })
 }
 
 fn noise(len: usize, seed: u64) -> Vec<u8> {
     let mut r = Rng(seed | 1);
-    (0..len).map(|_| r.next() as u8).collect()
+    Vec::from_fn(len, |_| r.next() as u8)
 }
 
 struct Case {
@@ -373,7 +371,7 @@ fn many_entries_open_from_the_index_range() {
     for i in 0u32..100_000 {
         let bytes = i.to_le_bytes();
         let blob = BlobIn {
-            mount: i % 2 == 0,
+            mount: i.is_multiple_of(2),
             codec: Codec::None,
             ..BlobIn::new(&bytes)
         };

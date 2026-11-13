@@ -225,7 +225,7 @@ impl Perf {
         telemetry: Option<&ExposureTelemetry>,
         averaged: u32,
     ) -> String {
-        let ev = telemetry.map_or(String::new(), |t| format!("  EV100 {:.2}", t.adapted_ev100));
+        let ev = telemetry.map_or_default(|t| format!("  EV100 {:.2}", t.adapted_ev100));
         format!(
             "{camera}  {w} x {h}  {:?}\n{averaged} frames averaged{ev}\n{}",
             resolved.encoding, self.figures,

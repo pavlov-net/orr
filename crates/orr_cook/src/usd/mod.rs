@@ -868,9 +868,8 @@ impl<'s> Importer<'s> {
         // The rigs of the stage's models, before what they move places anything. Per model the
         // models its meshes go to, with what they apply: the model itself unless it places
         // nothing, and those that bake its other copies.
-        let mut holders: Vec<Vec<(usize, DMat4)>> = (0..models.len())
-            .map(|m| vec![(m, DMat4::IDENTITY)])
-            .collect();
+        let mut holders: Vec<Vec<(usize, DMat4)>> =
+            Vec::from_fn(models.len(), |m| vec![(m, DMat4::IDENTITY)]);
         let mut rigs: HashMap<usize, skel::PrimRig> = HashMap::new();
         let mut rig_skeletons = Vec::new();
         let mut rig_of: HashMap<usize, usize> = HashMap::new();
@@ -1137,7 +1136,7 @@ impl<'s> Importer<'s> {
                         }
                         let missing = held
                             .as_ref()
-                            .map_or(0, |p| p.missing(mesh.domain(p.interp)));
+                            .map_or_default(|p| p.missing(mesh.domain(p.interp)));
                         if missing > 0 {
                             self.warnings.push(format!(
                                 "{path}: primvar {} holds no value for {missing} elements of the \
@@ -2292,7 +2291,7 @@ impl<'s> Importer<'s> {
         let positions = read("positions", moved, 3)?;
         let orientations = read(orientation, turned, 4)?.filter(|v| !v.lower.is_empty());
         let scales = read("scales", around("scales")?, 3)?.filter(|v| !v.lower.is_empty());
-        let since = |b: Option<Around>| b.map_or(0.0, |b| (time - b.sample) / per_second);
+        let since = |b: Option<Around>| b.map_or_default(|b| (time - b.sample) / per_second);
         let (moved_for, turned_for) = (since(moved), since(turned));
         let ids = r.ints("ids")?.filter(|v| !v.is_empty());
         let mut masked: std::collections::HashSet<i64> = r
@@ -2316,7 +2315,7 @@ impl<'s> Importer<'s> {
         let lengths = [
             (
                 "positions",
-                Some(positions.as_ref().map_or(0, |v| v.lower.len() / 3)),
+                Some(positions.as_ref().map_or_default(|v| v.lower.len() / 3)),
             ),
             (
                 orientation,

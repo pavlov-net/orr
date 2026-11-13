@@ -195,12 +195,12 @@ impl Building {
             by_section: pa.by_section,
             pivots: match (skinned, &pa.pivot) {
                 (true, _) => {
-                    Pivots::PerValue(jp.iter().map(|p| p.map_or([0.0; 3], |p| p.0)).collect())
+                    Pivots::PerValue(jp.iter().map(|p| p.map_or_default(|p| p.0)).collect())
                 }
                 (false, Some(_)) => Pivots::PerVertex(joined(ps, |p| &mut p.pivots)),
                 (false, None) => Pivots::Origin,
             },
-            joints: skinned.then(|| jp.iter().map(|p| p.map_or(0, |p| p.1)).collect()),
+            joints: skinned.then(|| jp.iter().map(|p| p.map_or_default(|p| p.1)).collect()),
         });
         let mesh = MeshData {
             positions: joined(ps, |p| &mut p.positions),
@@ -1235,7 +1235,7 @@ impl Imported<'_> {
                 parts: parts.as_ref(),
                 rigid: false,
             };
-            let count = parts.as_ref().map_or(0, |p| usize::from(p.parts));
+            let count = parts.as_ref().map_or_default(|p| usize::from(p.parts));
             let mut b = Building::new(None, count);
             b.tangents = tangents;
             let gm = src.doc.meshes().nth(mesh).expect("mesh index");
@@ -1354,24 +1354,18 @@ fn instance_locals(src: &Data<'_>, n: usize) -> Result<Vec<DMat4>, String> {
     if counts.iter().any(|&c| c != count) {
         return Err(format!("{what}: attribute counts differ"));
     }
-    Ok((0..count)
-        .map(|i| {
-            let t = t
-                .as_ref()
-                .map_or(Vec3::ZERO, |v| Vec3::from_slice(&v[3 * i..]));
-            let r = r
-                .as_ref()
-                .map_or(Quat::IDENTITY, |v| Quat::from_slice(&v[4 * i..]));
-            let s = sc
-                .as_ref()
-                .map_or(Vec3::ONE, |v| Vec3::from_slice(&v[3 * i..]));
-            DMat4::from_scale_rotation_translation(
-                s.as_dvec3(),
-                r.as_dquat().normalize(),
-                t.as_dvec3(),
-            )
-        })
-        .collect())
+    Ok(Vec::from_fn(count, |i| {
+        let t = t
+            .as_ref()
+            .map_or(Vec3::ZERO, |v| Vec3::from_slice(&v[3 * i..]));
+        let r = r
+            .as_ref()
+            .map_or(Quat::IDENTITY, |v| Quat::from_slice(&v[4 * i..]));
+        let s = sc
+            .as_ref()
+            .map_or(Vec3::ONE, |v| Vec3::from_slice(&v[3 * i..]));
+        DMat4::from_scale_rotation_translation(s.as_dvec3(), r.as_dquat().normalize(), t.as_dvec3())
+    }))
 }
 
 /// Loads the instancing accessors and records the files they read.
@@ -1568,7 +1562,7 @@ fn node_models(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     let part_values = settings
         .parts_from_attribute
         .as_ref()
-        .map_or(0, |p| usize::from(p.parts));
+        .map_or_default(|p| usize::from(p.parts));
     let whole = !selecting && !by_mesh && rigs.len() == 1 && still.iter().all(|&n| is_instanced[n]);
     let mut hung: Vec<(usize, usize)> = Vec::new();
     for rig in rigs {
@@ -1878,7 +1872,7 @@ fn select_models(
     let parts = settings
         .parts_from_attribute
         .as_ref()
-        .map_or(0, |p| usize::from(p.parts));
+        .map_or_default(|p| usize::from(p.parts));
     let building = |node| Building::new(node, parts);
     let mut owner: Vec<Option<usize>> = vec![None; graph.parent.len()];
     if settings.models.is_empty() {

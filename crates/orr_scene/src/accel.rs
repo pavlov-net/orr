@@ -874,7 +874,7 @@ pub(crate) async fn build(
         .sum();
     let mut part_blas =
         device.gpu_malloc::<u64>(MemoryKind::Upload, part_rows.max(1) as u64, "part BLAS")?;
-    let at = |j: Option<usize>| j.map_or(0, |j| blas[j]);
+    let at = |j: Option<usize>| j.map_or_default(|j| blas[j]);
     let mut row = 0;
     let mut records: Vec<RtCutGpu> = Vec::with_capacity(plans.len());
     let mut remaining = plans.iter();
@@ -1111,7 +1111,7 @@ pub(crate) async fn build_fine_cut(
                 device.gpu_malloc::<u64>(MemoryKind::Upload, parts.len() as u64, "part BLAS")?;
             let out = a.as_mut_slice().expect("upload is mapped");
             for (o, &j) in out.iter_mut().zip(parts) {
-                *o = j.map_or(0, |j| blas[j]);
+                *o = j.map_or_default(|j| blas[j]);
             }
             let gpu = a.gpu();
             part_table = Some(a);
@@ -1148,7 +1148,7 @@ impl CutPlan {
             blas: blas[self.rest],
             error: self.error,
             clusters: self.clusters.len() as u32,
-            body: self.body.map_or(0, |j| blas[j]),
+            body: self.body.map_or_default(|j| blas[j]),
             parts,
             hash: cut_hash(&self.clusters),
             row: self.row,

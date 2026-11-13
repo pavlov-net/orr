@@ -196,7 +196,7 @@ fn frame_generation_presents_generated_images_before_each_frame() {
             (encoding, expected) = (OutputFormat::Sdr, OutputFormat::Sdr);
         }
         let per_present = i / PHASE == UI_PER_PRESENT;
-        if i % PHASE == 0 {
+        if i.is_multiple_of(PHASE) {
             display.set_request(&request(encoding));
             display.set_frame_generation(sdk.clone(), mode).unwrap();
             display.set_ui_per_present(per_present);
@@ -265,7 +265,7 @@ fn frame_generation_presents_generated_images_before_each_frame() {
             output_extent: UVec2::from(extent),
             jitter: Vec2::ZERO,
             // The bar jumps back when it wraps.
-            camera_cut: i % PHASE == 0 || (i as f32 * SPEED) % travel < SPEED,
+            camera_cut: i.is_multiple_of(PHASE) || (i as f32 * SPEED) % travel < SPEED,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
         };

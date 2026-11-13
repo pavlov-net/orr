@@ -220,14 +220,12 @@ mod tests {
 
     fn random(seed: u64, n: usize) -> Vec<u8> {
         let mut x = seed | 1;
-        (0..n)
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                x as u8
-            })
-            .collect()
+        Vec::from_fn(n, |_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
     }
 
     fn round_trip(g: Libdeflate, page: &[u8]) -> usize {

@@ -1767,13 +1767,11 @@ fn node_pages_move_out_of_draining_blocks_and_their_tables_follow() {
     let mut scenes = Scenes::new(dev, &desc).unwrap();
     let _workers = Workers::start(&scenes, 2);
     let class = |scenes: &Scenes| *scenes.residency().class(ResidencyClass::MeshPages);
-    let models: Vec<ModelId> = (0..12)
-        .map(|_| {
-            let m = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
-            ready(&mut scenes, m);
-            scenes.model(m, AssetId::from_name("kit/dome")).unwrap()
-        })
-        .collect();
+    let models: Vec<ModelId> = Vec::from_fn(12, |_| {
+        let m = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
+        ready(&mut scenes, m);
+        scenes.model(m, AssetId::from_name("kit/dome")).unwrap()
+    });
     let pinned = class(&scenes).resident_bytes;
     for &m in &models {
         stream_in(&mut scenes, &gpu, m, &models, (&info, u64::MAX));
@@ -2428,7 +2426,7 @@ fn streamed_texture_tiles_load_exact_and_evict_after_their_hold() {
     let path = write_pack("tiled.orr", bytes);
     let staged = staged_device();
     for (dev, positioned_reads) in [(device(), false), (device(), true), (&staged, false)] {
-        let layouts: Vec<(u64, u64)> = (0..TILED.len()).map(|t| tiled_layout(dev, t)).collect();
+        let layouts: Vec<(u64, u64)> = Vec::from_fn(TILED.len(), |t| tiled_layout(dev, t));
         let tile = orr_pack::texture::TILE_BYTES as u64;
         let tails: u64 = layouts.iter().map(|l| l.1).sum();
         // Room for the tails and the array's tiles, which the other two's tiles fit.
@@ -4317,13 +4315,13 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
         // pages, hold some, then allocate.
         let mut free_list: Vec<[u32; 2]> = held.drain(..).map(|(f, n)| [f, n]).collect();
         for p in 0..page_count {
-            if !bound[p as usize] && rand() % 4 == 0 {
+            if !bound[p as usize] && rand().is_multiple_of(4) {
                 bound[p as usize] = true;
                 free_list.push([p * UNITS, UNITS]);
             }
         }
         live.retain(|ranges| {
-            let keep = rand() % 3 != 0;
+            let keep = !rand().is_multiple_of(3);
             if !keep {
                 free_list.extend_from_slice(ranges);
             }
@@ -4331,18 +4329,16 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
         });
         free_list.sort_unstable_by_key(|f| f[0]);
         let take_list: Vec<u32> = (0..page_count)
-            .filter(|&p| bound[p as usize] && rand() % 5 == 0)
+            .filter(|&p| bound[p as usize] && rand().is_multiple_of(5))
             .collect();
         let hold_list: Vec<u32> = (0..page_count)
-            .filter(|&p| bound[p as usize] && rand() % 7 == 0)
+            .filter(|&p| bound[p as usize] && rand().is_multiple_of(7))
             .collect();
-        let size_list: Vec<u32> = (0..clas_count)
-            .map(|_| match rand() % 1000 {
-                0 => 0,
-                1 => 128 * UNITS + 1,
-                _ => 128 + rand() % 6000,
-            })
-            .collect();
+        let size_list: Vec<u32> = Vec::from_fn(clas_count, |_| match rand() % 1000 {
+            0 => 0,
+            1 => 128 * UNITS + 1,
+            _ => 128 + rand() % 6000,
+        });
         // Results indices shuffled, as a batch's builds order them apart from its pages.
         let mut results: Vec<u32> = (0..clas_count as u32).collect();
         for i in (1..results.len()).rev() {
@@ -4352,7 +4348,7 @@ fn first_fit_rounds(page_count: u32, clas_count: usize, rounds: u32) {
         let mut page_clas: Vec<&[u32]> = Vec::new();
         let mut rest = results.as_slice();
         while !rest.is_empty() {
-            let wide = if rand() % 8 == 0 { 400 } else { 160 };
+            let wide = if rand().is_multiple_of(8) { 400 } else { 160 };
             let (page, after) = rest.split_at((1 + rand() as usize % wide).min(rest.len()));
             pages.push_page(page);
             page_clas.push(page);
@@ -4505,7 +4501,7 @@ fn the_traversal_requests_kept_are_those_of_the_largest_errors() {
     for capacity in [0u32, 1, 700, 9_000, 40_000] {
         let mut want = vec![None; entries as usize];
         for w in want.iter_mut() {
-            if rand() % 4 == 0 {
+            if rand().is_multiple_of(4) {
                 *w = Some(levels[rand() as usize % levels.len()].to_bits());
             }
         }
@@ -4900,7 +4896,7 @@ fn tiles_apart_from_their_textures_others_move_beside_them_and_stay_exact() {
     let _serial = serial();
     let bytes = tiled_pack();
     let dev = device();
-    let layouts: Vec<(u64, u64)> = (0..TILED.len()).map(|t| tiled_layout(dev, t)).collect();
+    let layouts: Vec<(u64, u64)> = Vec::from_fn(TILED.len(), |t| tiled_layout(dev, t));
     let tile = orr_pack::texture::TILE_BYTES as u64;
     let tails: u64 = layouts.iter().map(|l| l.1).sum();
     // Room for the flat texture's tiles, a few of the cube's and some others.
@@ -4980,7 +4976,7 @@ impl Tiled {
     fn new(dev: &Device, kinds: &[usize]) -> Self {
         let bytes = tiled_pack();
         let tile = orr_pack::texture::TILE_BYTES as u64;
-        let layouts: Vec<(u64, u64)> = (0..TILED.len()).map(|t| tiled_layout(dev, t)).collect();
+        let layouts: Vec<(u64, u64)> = Vec::from_fn(TILED.len(), |t| tiled_layout(dev, t));
         let tails = layouts.iter().map(|l| l.1).sum::<u64>();
         let tiles: u64 = kinds.iter().map(|&k| layouts[k].0).sum();
         let desc = RendererDesc {
@@ -5344,29 +5340,25 @@ fn neural_net() -> orr_pack::neural::Fp8Network {
     };
     let hidden = std::array::from_fn(|l| {
         let (rows, cols) = LAYERS[l];
-        let m = (0..rows * cols)
-            .map(|_| {
-                loop {
-                    let b = next() as u8;
-                    let v = e4m3_to_f32(b);
-                    if v.abs() <= 0.25 {
-                        break b;
-                    }
+        let m = Vec::from_fn(rows * cols, |_| {
+            loop {
+                let b = next() as u8;
+                let v = e4m3_to_f32(b);
+                if v.abs() <= 0.25 {
+                    break b;
                 }
-            })
-            .collect();
-        let b = (0..rows)
-            .map(|_| half::f16::from_f32((next() >> 8) as f32 / (1u32 << 24) as f32 - 0.5))
-            .collect();
+            }
+        });
+        let b = Vec::from_fn(rows, |_| {
+            half::f16::from_f32((next() >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+        });
         (m, b)
     });
     let output = (0..OUTPUTS * LAYERS[3].1)
         .map(|_| (next() % 255) as i32 - 127)
         .map(|v| v as i8)
         .collect();
-    let scale: Vec<f32> = (0..OUTPUTS)
-        .map(|r| 1.0 / (40_000.0 + 1000.0 * r as f32))
-        .collect();
+    let scale: Vec<f32> = Vec::from_fn(OUTPUTS, |r| 1.0 / (40_000.0 + 1000.0 * r as f32));
     let bias = scale.iter().map(|s| (0.5 / s) as i32).collect();
     Fp8Network {
         hidden,
@@ -5581,14 +5573,12 @@ impl NeuralCpu {
             .map(|&v| if self.fp8 { to_e4m3(v) } else { v })
             .collect();
         let (m, b) = &self.net.hidden[l];
-        (0..rows)
-            .map(|r| {
-                let sum: f32 = (0..cols).map(|c| e4m3_to_f32(m[r * cols + c]) * x[c]).sum();
-                let y = to_f16(sum + b[r].to_f32());
-                let third = to_f16(1.0 / 3.0);
-                to_f16(y.min(3.0) * to_f16(to_f16(y * third) + 0.5).clamp(0.0, 1.0))
-            })
-            .collect()
+        Vec::from_fn(rows, |r| {
+            let sum: f32 = (0..cols).map(|c| e4m3_to_f32(m[r * cols + c]) * x[c]).sum();
+            let y = to_f16(sum + b[r].to_f32());
+            let third = to_f16(1.0 / 3.0);
+            to_f16(y.min(3.0) * to_f16(to_f16(y * third) + 0.5).clamp(0.0, 1.0))
+        })
     }
 
     /// The outputs at `texel` (repeating) of color mip `mip`, sRGB channels decoded.

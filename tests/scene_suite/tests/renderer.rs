@@ -737,12 +737,10 @@ fn a_fading_copy_stops_rays_under_the_pipelines_made_for_its_scene() {
     };
     let mut r = Renderer::new(d, desc).unwrap();
     let loading = r.loading();
-    let workers: Vec<_> = (0..8)
-        .map(|_| {
-            let l = Arc::clone(&loading);
-            std::thread::spawn(move || l.run_worker())
-        })
-        .collect();
+    let workers: Vec<_> = Vec::from_fn(8, |_| {
+        let l = Arc::clone(&loading);
+        std::thread::spawn(move || l.run_worker())
+    });
     let mut frame = 0;
     let mount = mount_pack(&mut r, &pack, &mut frame);
     let models = ["floor", "box"].map(|name| r.model(mount, AssetId::from_name(name)).unwrap());
@@ -1367,12 +1365,10 @@ fn ray_reconstruction_resets_on_the_frame_pre_exposure_steps() {
             }
             // Waited on, a frame's telemetry is back before the next, which is lit with it;
             // a cut's frame is lit as its exposure starts.
-            let lit: Vec<f32> = (0..shots.len())
-                .map(|i| match shots[i].cut {
-                    true => exposure(&shots[i]).start().pre_exposure,
-                    false => next_pre_exposure[&ids[i - 1]],
-                })
-                .collect();
+            let lit: Vec<f32> = Vec::from_fn(shots.len(), |i| match shots[i].cut {
+                true => exposure(&shots[i]).start().pre_exposure,
+                false => next_pre_exposure[&ids[i - 1]],
+            });
             let steps: String = (0..shots.len())
                 .map(|i| i > 0 && (lit[i] / lit[i - 1]).log2().abs() > 0.5)
                 .map(|step| if step { 'T' } else { 'F' })

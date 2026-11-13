@@ -586,7 +586,7 @@ fn build_page(
             .frame
             .as_ref()
             .map_or(AssetId::NONE, |f| AssetId::from_name(&f.skeleton)),
-        frame_joint: src.frame.as_ref().map_or(0, |f| f.joint),
+        frame_joint: src.frame.as_ref().map_or_default(|f| f.joint),
         motion_times: Span::default(),
         motion_left: AffineRows::from(Affine3::IDENTITY),
         motion_right: AffineRows::from(Affine3::IDENTITY),

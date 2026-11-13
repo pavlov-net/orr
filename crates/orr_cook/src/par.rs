@@ -274,7 +274,7 @@ mod tests {
             .par_iter()
             .filter(|&&v| {
                 assert!(in_job());
-                v % 2 == 0
+                v.is_multiple_of(2)
             })
             .copied()
             .collect();

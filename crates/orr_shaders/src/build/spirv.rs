@@ -230,7 +230,7 @@ impl Module {
                     );
                 }
                 op::CONSTANT => {
-                    let value = u64::from(a[2]) | a.get(3).map_or(0, |&h| u64::from(h) << 32);
+                    let value = u64::from(a[2]) | a.get(3).map_or_default(|&h| u64::from(h) << 32);
                     m.constants.insert(a[1], value);
                 }
                 op::SPEC_CONSTANT_TRUE | op::SPEC_CONSTANT_FALSE => {

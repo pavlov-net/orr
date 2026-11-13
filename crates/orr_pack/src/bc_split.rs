@@ -258,14 +258,12 @@ mod tests {
 
     fn noise(len: usize, seed: u64) -> Vec<u8> {
         let mut s = seed;
-        (0..len)
-            .map(|_| {
-                s = s
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (s >> 33) as u8
-            })
-            .collect()
+        Vec::from_fn(len, |_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 33) as u8
+        })
     }
 
     /// Random blocks, with the first byte forced through every mode byte the layout has.
@@ -281,7 +279,7 @@ mod tests {
                         b[0] << (i % 9) | 1 << (i % 9)
                     }
                 }
-                BcLayout::Bc6h if i % 3 == 0 => b[0] &= !2,
+                BcLayout::Bc6h if i.is_multiple_of(3) => b[0] &= !2,
                 _ => {}
             }
         }

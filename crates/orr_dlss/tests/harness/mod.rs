@@ -45,7 +45,7 @@ unsafe extern "system" fn on_message(
     _user: *mut c_void,
 ) -> vk::Bool32 {
     // SAFETY: the layer passes valid callback data.
-    let data = unsafe { &*data };
+    let data = unsafe { data.as_ref_unchecked() };
     let text = |p: *const std::ffi::c_char| {
         if p.is_null() {
             String::new()

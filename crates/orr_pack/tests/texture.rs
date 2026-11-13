@@ -47,9 +47,7 @@ fn tiles_round_trip_with_padded_edges() {
         (vk::R8G8B8A8_SRGB, 129, 257),
     ] {
         let f = FormatInfo::of(format).unwrap();
-        let tight: Vec<u8> = (0..f.mip_bytes(w, h))
-            .map(|i| (i * 7 + i / 251) as u8)
-            .collect();
+        let tight: Vec<u8> = Vec::from_fn(f.mip_bytes(w, h), |i| (i * 7 + i / 251) as u8);
         let mut tiles = Vec::new();
         tile(f, w, h, &tight, &mut tiles);
         let [tw, th] = tile_shape(f);

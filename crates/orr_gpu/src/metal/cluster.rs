@@ -704,7 +704,7 @@ impl CommandList<'_> {
                     })
                     .collect()
             }
-            RtasMode::Explicit => (0..sizes.len()).map(|i| rb.destination(i)).collect(),
+            RtasMode::Explicit => Vec::from_fn(sizes.len(), |i| rb.destination(i)),
             RtasMode::GetSizes => Vec::new(),
         }
     }
@@ -832,28 +832,26 @@ impl CommandList<'_> {
         let clas = d.op != RtasOp::BuildTemplates;
         let structures = clas && !d.flags.contains(RtasFlags::FLAT_ONLY);
         // Triangles, vertices and opacity of each record.
-        let shapes: Vec<(u32, u32, bool)> = (0..count)
-            .map(|i| {
-                let r = rb.record(i);
-                if d.op == RtasOp::InstantiateTemplates {
-                    let template = word64(r, 2);
-                    let objects = lock(&shared.objects);
-                    let t = objects.by_start.get(&template).unwrap_or_else(|| {
-                        panic!("instantiating {template:#x}, which holds no template")
-                    });
-                    (t.tris, t.verts, t.opaque)
-                } else {
-                    let bits = word(r, 2);
-                    let base = word(r, 3);
-                    let flags = word64(r, 10);
-                    (
-                        bits & 0x1ff,
-                        (bits >> 9) & 0x1ff,
-                        base >> 31 != 0 && flags == 0,
-                    )
-                }
-            })
-            .collect();
+        let shapes: Vec<(u32, u32, bool)> = Vec::from_fn(count, |i| {
+            let r = rb.record(i);
+            if d.op == RtasOp::InstantiateTemplates {
+                let template = word64(r, 2);
+                let objects = lock(&shared.objects);
+                let t = objects.by_start.get(&template).unwrap_or_else(|| {
+                    panic!("instantiating {template:#x}, which holds no template")
+                });
+                (t.tris, t.verts, t.opaque)
+            } else {
+                let bits = word(r, 2);
+                let base = word(r, 3);
+                let flags = word64(r, 10);
+                (
+                    bits & 0x1ff,
+                    (bits >> 9) & 0x1ff,
+                    base >> 31 != 0 && flags == 0,
+                )
+            }
+        });
         let sizes: Vec<u64> = shapes
             .iter()
             .map(|&(t, v, _)| object_bytes(clas, t, v))
@@ -927,12 +925,10 @@ impl CommandList<'_> {
         count: usize,
         reservation: Reservation,
     ) {
-        let blas: Vec<(u64, u32)> = (0..count)
-            .map(|i| {
-                let r = rb.record(i);
-                (word64(r, 2), word(r, 0))
-            })
-            .collect();
+        let blas: Vec<(u64, u32)> = Vec::from_fn(count, |i| {
+            let r = rb.record(i);
+            (word64(r, 2), word(r, 0))
+        });
         let sizes = vec![HEADER; count];
         if d.mode == RtasMode::GetSizes {
             self.write_results(io, &[], &sizes);
@@ -1117,7 +1113,7 @@ impl CommandList<'_> {
     /// may overlap sources.
     fn move_objects(&mut self, d: &RtasOpDesc, io: &RtasIo, rb: &Readback, count: usize) {
         let shared = Arc::clone(&self.queue.shared);
-        let sources: Vec<u64> = (0..count).map(|i| word64(rb.record(i), 0)).collect();
+        let sources: Vec<u64> = Vec::from_fn(count, |i| word64(rb.record(i), 0));
         let sizes: Vec<u64> = {
             let objects = lock(&shared.objects);
             sources

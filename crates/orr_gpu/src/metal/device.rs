@@ -316,7 +316,7 @@ impl Device {
             .shared
             .ptlas_check
             .get()
-            .map_or(0, PtlasCheck::failures);
+            .map_or_default(PtlasCheck::failures);
         self.shared.gpu_errors.load(Ordering::Relaxed) + rejected
     }
 }

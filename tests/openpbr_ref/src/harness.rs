@@ -69,9 +69,7 @@ pub fn albedo(bsdf: &mut dyn Bsdf, inputs: &Inputs, view: V3, samples: usize, se
 
 /// `count` triples of uniform random numbers in [0, 1).
 fn uniforms(rng: &mut Rng, count: usize) -> Vec<V3> {
-    (0..count)
-        .map(|_| [rng.f32(), rng.f32(), rng.f32()])
-        .collect()
+    Vec::from_fn(count, |_| [rng.f32(), rng.f32(), rng.f32()])
 }
 
 /// The p-value of Pearson's chi-square test of `samples` directions from `sample` against
@@ -310,7 +308,7 @@ pub fn compare(
     candidate.prepare(inputs, view);
     reference.prepare(inputs, view);
     let mut rng = Rng::new(seed);
-    let wi: Vec<V3> = (0..cases).map(|_| rng.unit()).collect();
+    let wi: Vec<V3> = Vec::from_fn(cases, |_| rng.unit());
     let u = uniforms(&mut rng, cases);
     let mut out = Comparison {
         samples: cases,

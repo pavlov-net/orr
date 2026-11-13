@@ -189,30 +189,28 @@ impl Reference {
             (f64::from(f.density), rec2020(f.albedo))
         });
         let ozone_peak = ozone_peak(a);
-        (0..N)
-            .map(|k| {
-                let per_channel = |rgb: [f64; 3]| rgb_at(bands.wavelength[k], rgb);
-                let rayleigh = bands.rayleigh[k] * f64::from(a.rayleigh.density);
-                let aerosol = f64::from(a.aerosol.optical_depth_550) * aerosol_factor(k);
-                Chan {
-                    ext: [
-                        rayleigh,
-                        aerosol,
-                        bands.ozone_cross_section[k] * ozone_peak,
-                        fog_ext,
-                    ],
-                    sca: [
-                        rayleigh,
-                        aerosol * f64::from(a.aerosol.single_scattering_albedo),
-                        0.0,
-                        fog_ext * per_channel(fog_albedo),
-                    ],
-                    rec2020: bands.rec2020[k],
-                    wavelength: bands.wavelength[k],
-                    ground_albedo: per_channel(ground),
-                }
-            })
-            .collect()
+        Vec::from_fn(N, |k| {
+            let per_channel = |rgb: [f64; 3]| rgb_at(bands.wavelength[k], rgb);
+            let rayleigh = bands.rayleigh[k] * f64::from(a.rayleigh.density);
+            let aerosol = f64::from(a.aerosol.optical_depth_550) * aerosol_factor(k);
+            Chan {
+                ext: [
+                    rayleigh,
+                    aerosol,
+                    bands.ozone_cross_section[k] * ozone_peak,
+                    fog_ext,
+                ],
+                sca: [
+                    rayleigh,
+                    aerosol * f64::from(a.aerosol.single_scattering_albedo),
+                    0.0,
+                    fog_ext * per_channel(fog_albedo),
+                ],
+                rec2020: bands.rec2020[k],
+                wavelength: bands.wavelength[k],
+                ground_albedo: per_channel(ground),
+            }
+        })
     }
 }
 

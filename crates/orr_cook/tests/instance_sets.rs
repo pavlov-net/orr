@@ -85,13 +85,11 @@ fn scatter_set_cooks_within_its_error_bounds() {
             .map(|(i, id)| (id, i as u16))
             .collect()
     };
-    let prototypes: Vec<PrototypeSpec> = (0..ids.len())
-        .map(|i| PrototypeSpec {
-            model: "block".into(),
-            flags: i as u32,
-            ..Default::default()
-        })
-        .collect();
+    let prototypes: Vec<PrototypeSpec> = Vec::from_fn(ids.len(), |i| PrototypeSpec {
+        model: "block".into(),
+        flags: i as u32,
+        ..Default::default()
+    });
 
     let mut assets = vec![AssetSpec {
         name: "block".into(),

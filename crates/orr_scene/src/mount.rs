@@ -1578,7 +1578,7 @@ fn place_page(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     let info = InstancePageInfo::parse(blob0)?;
     let a = t.archive();
     let blobs = a.blobs(&a.entries()[entry]);
-    let bytes = blobs.get(1).map_or(0, |b| b.raw_len);
+    let bytes = blobs.get(1).map_or_default(|b| b.raw_len);
     let h = &info.header;
     h.exact_rows(bytes as usize)?;
     for w in 0..h.motion_windows() {
@@ -1934,8 +1934,8 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                         .ok_or_else(|| missing(k))?,
                 ),
             };
-            let sections = mesh.map_or(0, |i| meshes[i].sections)
-                + cage.map_or(0, |i| p.cages[i].shape.sections);
+            let sections = mesh.map_or_default(|i| meshes[i].sections)
+                + cage.map_or_default(|i| p.cages[i].shape.sections);
             if mesh.is_none() && cage.is_none() || m.materials.len() != sections as usize {
                 return Err(orr_pack::Error::Malformed("model materials per section").into());
             }
@@ -3158,14 +3158,14 @@ impl Mounts {
         let micromap = |k: usize| {
             loaded.micromaps[k]
                 .as_ref()
-                .map_or(0, |(m, _)| m.address().0)
+                .map_or_default(|(m, _)| m.address().0)
         };
         let clas = EditClas::new(
             w.device,
             &ClasInputs {
-                pages: (0..p.own.len())
-                    .map(|k| (loaded.addresses[k], micromap(k), &loaded.clusters[k][..]))
-                    .collect(),
+                pages: Vec::from_fn(p.own.len(), |k| {
+                    (loaded.addresses[k], micromap(k), &loaded.clusters[k][..])
+                }),
                 cluster_bases: own_bases,
                 firsts: p
                     .own
@@ -3482,7 +3482,7 @@ impl Mounts {
     /// The bytes page `id`'s records and exact table take in the instance page pool.
     pub(crate) fn page_bytes(&self, id: PageId) -> u64 {
         self.page(id)
-            .map_or(0, |p| u64::from(p.bytes).next_multiple_of(256))
+            .map_or_default(|p| u64::from(p.bytes).next_multiple_of(256))
     }
 
     /// The mount and records unit of page `id`.
@@ -3500,7 +3500,7 @@ impl Mounts {
 
     /// The bytes window `window` of page `id`'s rows takes in the instance page pool.
     pub(crate) fn window_bytes(&self, id: PageId, window: u32) -> u64 {
-        self.page(id).map_or(0, |p| {
+        self.page(id).map_or_default(|p| {
             u64::from(p.info.header.motion_window_bytes(window)).next_multiple_of(256)
         })
     }
@@ -4009,7 +4009,7 @@ impl Mounts {
             if w.cages.len() <= i {
                 w.cages.resize(i + 1, None);
             }
-            let mesh_sections = m.mesh.map_or(0, |k| meshes[k].sections as usize);
+            let mesh_sections = m.mesh.map_or_default(|k| meshes[k].sections as usize);
             w.cages[i] = m.cage.map(|k| {
                 let c = &cages[k];
                 ModelCage {
@@ -4124,7 +4124,7 @@ impl Mounts {
             }
             let id = r.meshes[mesh as usize];
             let rt = &r.rt[mesh as usize];
-            let built = self.masks.get(&id).map_or(&[][..], |m| &m.built[..]);
+            let built = self.masks.get(&id).map_or_default(|m| &m.built[..]);
             if rt.cuts.is_empty() || built.iter().any(|b| b.0 == mask) || todo.contains(&(id, mask))
             {
                 continue;

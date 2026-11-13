@@ -487,7 +487,7 @@ where
 {
     let at = |i: usize| rest[cvs[i] as usize];
     if p.kind != PatchKind::Regular {
-        return (0..cvs.len()).map(at).collect();
+        return Vec::from_fn(cvs.len(), at);
     }
     let mut q: [T; 16] = std::array::from_fn(at);
     let b = p.boundary;
@@ -735,7 +735,7 @@ mod tests {
         c.positions.push(origin + lift(Vec3::ZERO));
         for i in 0..2 * k {
             let a = std::f32::consts::PI * i as f32 / k as f32;
-            let r = if i % 2 == 0 { 1.0 } else { 1.3 };
+            let r = if i.is_multiple_of(2) { 1.0 } else { 1.3 };
             c.positions
                 .push(origin + lift(Vec3::new(r * a.cos(), r * a.sin(), 0.0)));
         }
@@ -839,7 +839,7 @@ mod tests {
             faces: Vec::new(),
         });
         c.uv_linear = UvLinear::CornersPlus1;
-        c.face_sections = (0..c.face_counts.len()).map(|f| (f % 2) as u16).collect();
+        c.face_sections = Vec::from_fn(c.face_counts.len(), |f| (f % 2) as u16);
         c
     }
 

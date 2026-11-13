@@ -205,7 +205,7 @@ fn raster_wrong(counts: &[i32], sq: Square) -> (usize, usize) {
         })
         .map(|i| counts[i as usize])
         .collect();
-    let sign = inside.first().map_or(0, |c| c.signum());
+    let sign = inside.first().map_or_default(|c| c.signum());
     let wrong = inside.iter().filter(|&&c| c != sign || sign == 0).count();
     (inside.len(), wrong)
 }

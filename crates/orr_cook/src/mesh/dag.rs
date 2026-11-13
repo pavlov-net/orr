@@ -1101,7 +1101,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
     // freed once it is full. Thickness reads every cluster, so a mesh with subsurface
     // sections cooks in one batch.
     let whole = cx.sections.iter().any(|sec| sec.subsurface);
-    let mut cooked: Vec<Option<Cooked>> = (0..at.len()).map(|_| None).collect();
+    let mut cooked: Vec<Option<Cooked>> = Vec::from_fn(at.len(), |_| None);
     let mut refined: Vec<Vec<i32>> = vec![Vec::new(); at.len()];
     let mut page_groups: Vec<Vec<usize>> = Vec::new();
     let mut page_of = vec![0u32; at.len()];
@@ -1361,9 +1361,9 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
             .copied()
             .unwrap_or(MeshHeader::NO_ROOT)
     };
-    let mut roots: Vec<u32> = (0..cx.parts.table.len() * sections)
-        .map(|i| stage_of(i / sections, i % sections, false))
-        .collect();
+    let mut roots: Vec<u32> = Vec::from_fn(cx.parts.table.len() * sections, |i| {
+        stage_of(i / sections, i % sections, false)
+    });
     let merge = merge_error(s, cx.parts);
     if merge.is_some() {
         roots.extend((0..sections).map(|sec| stage_of(0, sec, true)));
@@ -1421,7 +1421,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
 /// Makes a group fit one page: its clusters' micromaps are measured again under halving
 /// caps, and dropped below 64 bytes.
 fn fit(cx: &Ctx<'_>, clusters: &mut [ClusterData]) -> Result<(), String> {
-    let mut cap = cx.s.omm.as_ref().map_or(0, |o| o.cluster_bytes_max);
+    let mut cap = cx.s.omm.as_ref().map_or_default(|o| o.cluster_bytes_max);
     loop {
         let fill = PageFill::EMPTY.with(&*clusters, cx.stride);
         let bytes = fill.len();

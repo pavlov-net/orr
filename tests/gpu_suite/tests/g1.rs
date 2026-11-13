@@ -180,14 +180,12 @@ fn atomic_max_u64_matches_cpu() {
     let count = 1 << 20;
     let slots = 1000u64;
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let values: Vec<u64> = (0..count)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        })
-        .collect();
+    let values: Vec<u64> = Vec::from_fn(count, |_| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    });
     let mut expected = vec![0u64; slots as usize];
     for (i, &v) in values.iter().enumerate() {
         let s = &mut expected[i % slots as usize];
@@ -492,9 +490,9 @@ fn cooperative_vector_matmul_matches_cpu() {
     const VECTORS: usize = 4096;
     let mut rnd = noise(7);
     let mut random = |scale: f32| f16::from_f32((rnd() * 2.0 - 1.0) * scale);
-    let weights: Vec<f16> = (0..16 * 16).map(|_| random(1.0 / 8.0)).collect();
-    let inputs: Vec<f16> = (0..16 * VECTORS).map(|_| random(1.0)).collect();
-    let bias: Vec<f16> = (0..16).map(|_| random(0.5)).collect();
+    let weights: Vec<f16> = Vec::from_fn(16 * 16, |_| random(1.0 / 8.0));
+    let inputs: Vec<f16> = Vec::from_fn(16 * VECTORS, |_| random(1.0));
+    let bias: Vec<f16> = Vec::from_fn(16, |_| random(0.5));
     coopvec_case(ComponentType::F16, "f16", &weights, &inputs, &bias);
 
     if !gpu_suite::require(d.caps().shader_float8, "no 8-bit floats") {
@@ -509,8 +507,8 @@ fn cooperative_vector_matmul_matches_cpu() {
         let mantissa = 1.0 + ((r >> 1) & 3) as f32 / 4.0;
         f16::from_f32(sign * mantissa * 2f32.powi(-min_exp - ((r >> 3) & 3) as i32))
     };
-    let weights: Vec<f16> = (0..16 * 16).map(|_| exact(3)).collect();
-    let inputs: Vec<f16> = (0..16 * VECTORS).map(|_| exact(0)).collect();
+    let weights: Vec<f16> = Vec::from_fn(16 * 16, |_| exact(3));
+    let inputs: Vec<f16> = Vec::from_fn(16 * VECTORS, |_| exact(0));
     for (t, entry) in [(ComponentType::E4m3, "e4m3"), (ComponentType::E5m2, "e5m2")] {
         if gpu_suite::require(supports(t), "no cooperative vectors with this FP8 type") {
             coopvec_case(t, entry, &weights, &inputs, &bias);
@@ -590,7 +588,7 @@ fn coopvec_case(
                     input: input.gpu(),
                     output: out.gpu(),
                     weights,
-                    bias: bias.map_or(0, |_| bias_buf.gpu().address().0),
+                    bias: bias.map_or_default(|_| bias_buf.gpu().address().0),
                     offset,
                     bias_offset: bias.unwrap_or(0),
                     count: vectors as u32,
@@ -623,7 +621,7 @@ fn coopvec_case(
         let (mut outside, mut worst) = (0, 0.0f32);
         for v in 0..vectors {
             for row in 0..N {
-                let b = with_bias.map_or(0.0, |_| bias[row].to_f32());
+                let b = with_bias.map_or_default(|_| bias[row].to_f32());
                 let want = b
                     + (0..N)
                         .map(|k| weights[row * N + k].to_f32() * as_f32[v * N + k])
@@ -895,25 +893,21 @@ fn generated_dispatches_match_recorded_dispatches() {
     let item_counts = upload(&items, "bin items");
     // Roots 64 bytes apart, the root alignment: one array per output.
     let roots = |out: GpuPtr<u32>, name| {
-        let slots: Vec<[u32; 16]> = (0..BINS as usize)
-            .map(|b| {
-                let root = bins::Root {
-                    out,
-                    first: firsts[b],
-                    count: items[b],
-                };
-                let mut slot = [0u32; 16];
-                slot[..4].copy_from_slice(orr_shaders::bytemuck::cast_slice(
-                    orr_shaders::bytemuck::bytes_of(&root),
-                ));
-                slot
-            })
-            .collect();
+        let slots: Vec<[u32; 16]> = Vec::from_fn(BINS as usize, |b| {
+            let root = bins::Root {
+                out,
+                first: firsts[b],
+                count: items[b],
+            };
+            let mut slot = [0u32; 16];
+            slot[..4].copy_from_slice(orr_shaders::bytemuck::cast_slice(
+                orr_shaders::bytemuck::bytes_of(&root),
+            ));
+            slot
+        });
         upload(&slots, name)
     };
-    let outputs: Vec<_> = (0..3)
-        .map(|i| readback::<u32>(total, &format!("bins out {i}")))
-        .collect();
+    let outputs: Vec<_> = Vec::from_fn(3, |i| readback::<u32>(total, &format!("bins out {i}")));
     let root_arrays: Vec<_> = outputs
         .iter()
         .map(|o| roots(o.gpu(), "bin roots"))
@@ -922,44 +916,36 @@ fn generated_dispatches_match_recorded_dispatches() {
         .gpu_malloc::<u32>(MemoryKind::DeviceLocal, u64::from(BINS) * 3, "bin args")
         .unwrap();
     // Sequences and counts for the preprocessed and the directly executed runs.
-    let sequences: Vec<_> = (0..2)
-        .map(|_| {
-            d.gpu_malloc::<Sequence>(MemoryKind::DeviceLocal, u64::from(BINS), "bin sequences")
-                .unwrap()
-        })
-        .collect();
-    let counts: Vec<_> = (0..2)
-        .map(|_| upload(&[0u32], "bin sequence count"))
-        .collect();
-    let classify_roots: Vec<_> = (0..2)
-        .map(|i| {
-            upload(
-                &[classify_bins::Root {
-                    items: item_counts.gpu(),
-                    count: counts[i].gpu(),
-                    args: args.gpu(),
-                    sequences: sequences[i].gpu().address().0,
-                    roots: root_arrays[i].gpu().address().0,
-                    bins: BINS,
-                    pad0: 0,
-                }],
-                "classify bins root",
-            )
-        })
-        .collect();
+    let sequences: Vec<_> = Vec::from_fn(2, |_| {
+        d.gpu_malloc::<Sequence>(MemoryKind::DeviceLocal, u64::from(BINS), "bin sequences")
+            .unwrap()
+    });
+    let counts: Vec<_> = Vec::from_fn(2, |_| upload(&[0u32], "bin sequence count"));
+    let classify_roots: Vec<_> = Vec::from_fn(2, |i| {
+        upload(
+            &[classify_bins::Root {
+                items: item_counts.gpu(),
+                count: counts[i].gpu(),
+                args: args.gpu(),
+                sequences: sequences[i].gpu().address().0,
+                roots: root_arrays[i].gpu().address().0,
+                bins: BINS,
+                pad0: 0,
+            }],
+            "classify bins root",
+        )
+    });
     let layout = set.preprocess_layout(BINS);
     let mut arenas = d
         .create_device_arenas(1, 2 * layout.size() as u64 + 4096, "bin preprocess")
         .unwrap();
-    let runs: Vec<_> = (0..2)
-        .map(|i| Generated {
-            set: &set,
-            sequences: sequences[i].gpu(),
-            count: counts[i].gpu(),
-            max: BINS,
-            preprocess: arenas.allocate(layout).unwrap(),
-        })
-        .collect();
+    let runs: Vec<_> = Vec::from_fn(2, |i| Generated {
+        set: &set,
+        sequences: sequences[i].gpu(),
+        count: counts[i].gpu(),
+        max: BINS,
+        preprocess: arenas.allocate(layout).unwrap(),
+    });
 
     let mut list = render().command_list().unwrap();
     let groups = [BINS.div_ceil(64), 1, 1];

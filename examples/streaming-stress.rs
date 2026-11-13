@@ -84,7 +84,7 @@ fn write_texture(path: &PathBuf, i: usize) {
     let data: Vec<u8> = (0..n * n)
         .flat_map(|p| {
             let (x, y) = (p % n, p / n);
-            let cell = (x / 64 + y / 64) % 2 == 0;
+            let cell = (x / 64 + y / 64).is_multiple_of(2);
             let line = x % 64 < 2 || y % 64 < 2 || (x / 8 + y / 8) % 16 == i as u32 % 16;
             let c = if line {
                 [20, 20, 20]
@@ -292,7 +292,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .model(mount, AssetId::from_name(name))
             .unwrap_or_else(|e| panic!("model {name}: {e}"))
     };
-    let panels: Vec<_> = (0..TEXTURES).map(|i| model(&panel(i))).collect();
+    let panels: Vec<_> = Vec::from_fn(TEXTURES, |i| model(&panel(i)));
     let floor = model("floor");
 
     // Panels face the corridor from both sides, each side cycling through the models.
@@ -468,7 +468,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             meshes.resident_bytes + meshes.loading_bytes
         );
         mesh_high = mesh_high.max(meshes.resident_bytes);
-        if i % 60 == 0 {
+        if i.is_multiple_of(60) {
             log::info!(
                 "{:.1} m: mesh pages {:.1} of {:.1} MiB, CLAS {:.1} MiB, texture pool {:.1} of {:.1} MiB ({} units, {:.1} MiB loading), {} loads, {} evictions, {} unserved",
                 along,

@@ -5259,7 +5259,7 @@ fn moving_instances_hang_from_what_moves_them() {
 fn many_moving_copies_stay_records_of_one_model() {
     let n = 20_000;
     let spot = |i: usize, y: usize| format!("({}, {y}, {})", i % 200 * 3, i / 200 * 3);
-    let list = |y: usize| (0..n).map(|i| spot(i, y)).collect::<Vec<_>>().join(", ");
+    let list = |y: usize| Vec::from_fn(n, |i| spot(i, y)).join(", ");
     let a = cook(
         "instances-many",
         &instancing(&format!(

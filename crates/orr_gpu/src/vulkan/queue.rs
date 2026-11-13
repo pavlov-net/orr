@@ -774,7 +774,7 @@ impl Shared {
         std::array::from_fn(|i| {
             self.timelines[i]
                 .as_ref()
-                .map_or(0, |t| t.submitted.load(Ordering::Acquire))
+                .map_or_default(|t| t.submitted.load(Ordering::Acquire))
         })
     }
 

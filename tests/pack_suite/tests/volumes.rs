@@ -206,16 +206,14 @@ fn resident_volumes_sample_as_the_cpu_reference() {
         let h = info.header;
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         let n = 20_000usize;
-        let points: Vec<[f32; 4]> = (0..n).map(|_| point(info, &mut rng, 0.6)).collect();
-        let voxels: Vec<[i32; 4]> = (0..n)
-            .map(|_| {
-                let v = [0, 1, 2].map(|a| {
-                    let span = (h.bricks[a] * 8 + 4) as f32;
-                    h.brick_min[a] - 2 + (span * rng.unit()) as i32
-                });
-                [v[0], v[1], v[2], 0]
-            })
-            .collect();
+        let points: Vec<[f32; 4]> = Vec::from_fn(n, |_| point(info, &mut rng, 0.6));
+        let voxels: Vec<[i32; 4]> = Vec::from_fn(n, |_| {
+            let v = [0, 1, 2].map(|a| {
+                let span = (h.bricks[a] * 8 + 4) as f32;
+                h.brick_min[a] - 2 + (span * rng.unit()) as i32
+            });
+            [v[0], v[1], v[2], 0]
+        });
         let pts = upload(&points, "points");
         let vox = upload(&voxels, "voxels");
         for g in 0..info.grids.len() {
@@ -282,15 +280,13 @@ fn majorant_cells_along_a_ray_bound_every_sample() {
         .sqrt();
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
     let n = 4096usize;
-    let points: Vec<[f32; 4]> = (0..n).map(|_| point(info, &mut rng, 1.0)).collect();
-    let dirs: Vec<[f32; 4]> = (0..n)
-        .map(|_| {
-            let z = 2.0 * rng.unit() - 1.0;
-            let phi = std::f32::consts::TAU * rng.unit();
-            let r = (1.0 - z * z).sqrt();
-            [r * phi.cos(), r * phi.sin(), z, diagonal]
-        })
-        .collect();
+    let points: Vec<[f32; 4]> = Vec::from_fn(n, |_| point(info, &mut rng, 1.0));
+    let dirs: Vec<[f32; 4]> = Vec::from_fn(n, |_| {
+        let z = 2.0 * rng.unit() - 1.0;
+        let phi = std::f32::consts::TAU * rng.unit();
+        let r = (1.0 - z * z).sqrt();
+        [r * phi.cos(), r * phi.sin(), z, diagonal]
+    });
     let pts = upload(&points, "points");
     let dir = upload(&dirs, "directions");
     let spans = device()
@@ -344,24 +340,20 @@ fn a_grid_past_the_records_grid_count_reads_0() {
     let h = info.header;
     let mut rng = Rng(0x6a09_e667_f3bc_c909);
     let n = 1024usize;
-    let points: Vec<[f32; 4]> = (0..n).map(|_| point(info, &mut rng, 0.6)).collect();
-    let voxels: Vec<[i32; 4]> = (0..n)
-        .map(|_| {
-            let v = [0, 1, 2].map(|a| {
-                let span = (h.bricks[a] * 8 + 4) as f32;
-                h.brick_min[a] - 2 + (span * rng.unit()) as i32
-            });
-            [v[0], v[1], v[2], 0]
-        })
-        .collect();
-    let dirs: Vec<[f32; 4]> = (0..n)
-        .map(|_| {
-            let z = 2.0 * rng.unit() - 1.0;
-            let phi = std::f32::consts::TAU * rng.unit();
-            let r = (1.0 - z * z).sqrt();
-            [r * phi.cos(), r * phi.sin(), z, 10.0]
-        })
-        .collect();
+    let points: Vec<[f32; 4]> = Vec::from_fn(n, |_| point(info, &mut rng, 0.6));
+    let voxels: Vec<[i32; 4]> = Vec::from_fn(n, |_| {
+        let v = [0, 1, 2].map(|a| {
+            let span = (h.bricks[a] * 8 + 4) as f32;
+            h.brick_min[a] - 2 + (span * rng.unit()) as i32
+        });
+        [v[0], v[1], v[2], 0]
+    });
+    let dirs: Vec<[f32; 4]> = Vec::from_fn(n, |_| {
+        let z = 2.0 * rng.unit() - 1.0;
+        let phi = std::f32::consts::TAU * rng.unit();
+        let r = (1.0 - z * z).sqrt();
+        [r * phi.cos(), r * phi.sin(), z, 10.0]
+    });
     let pts = upload(&points, "points");
     let vox = upload(&voxels, "voxels");
     let dir = upload(&dirs, "directions");

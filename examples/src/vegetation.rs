@@ -535,7 +535,8 @@ fn tree(species: u32, variant: u32) -> orr_cook::MeshInput {
         m.part(b as u16 + 1, base);
         m.tube(0, base, tip, trunk * 0.35, trunk * 0.08, 8, 4);
         let fork = base.lerp(tip, 0.6);
-        let side = Vec3::new(-dir.z, 0.3, dir.x).normalize() * if b % 2 == 0 { 1.0 } else { -1.0 };
+        let side = Vec3::new(-dir.z, 0.3, dir.x).normalize()
+            * if b.is_multiple_of(2) { 1.0 } else { -1.0 };
         let twig = fork + (dir + side).normalize() * reach * 0.45;
         m.part((s.branches + b) as u16 + 1, fork);
         m.tube(0, fork, twig, trunk * 0.12, trunk * 0.04, 6, 2);
@@ -1528,7 +1529,7 @@ impl DenseVegetation {
             + self
                 .far
                 .as_ref()
-                .map_or(0, |(_, t)| t.patches * t.patches - hole * hole)
+                .map_or_default(|(_, t)| t.patches * t.patches - hole * hole)
     }
 }
 

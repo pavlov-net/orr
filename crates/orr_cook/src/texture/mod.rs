@@ -389,7 +389,7 @@ fn kept_mip_count(w: u32, h: u32, max_size: Option<u32>, full_chain: bool) -> u3
 
 /// Mips dropped from the top of a `w` x `h` chain so mip 0 fits `max_size`.
 fn skipped_mips(w: u32, h: u32, max_size: Option<u32>) -> u32 {
-    max_size.map_or(0, |max| {
+    max_size.map_or_default(|max| {
         (0..full_mip_count(w, h))
             .take_while(|&m| mip_size(w, h, m).into_iter().any(|e| e > max.max(1)))
             .count() as u32

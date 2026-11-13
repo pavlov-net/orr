@@ -216,7 +216,7 @@ fn reference_cases<R: Bsdf>(reference: &(impl Fn() -> R + Sync), settings: &Sett
     in_parallel(points.len(), reference, |r, i| {
         let (material, v) = points[i];
         let mut rng = Rng::new(((material as u64) << 16 | (v as u64) << 8) ^ settings.seed);
-        let wi: Vec<V3> = (0..settings.directions).map(|_| rng.unit()).collect();
+        let wi: Vec<V3> = Vec::from_fn(settings.directions, |_| rng.unit());
         r.prepare(&settings.materials[material].inputs, view(VIEW_COSINES[v]));
         Case {
             material,

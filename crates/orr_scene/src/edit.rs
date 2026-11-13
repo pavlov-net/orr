@@ -570,7 +570,7 @@ impl EditRecorder<'_> {
         };
         let mut todo: Vec<Todo<'_>> = Vec::new();
         for e in edits.iter() {
-            let block = e.block.as_ref().map_or(0, |b| b.gpu().address().0);
+            let block = e.block.as_ref().map_or_default(|b| b.gpu().address().0);
             let frozen = if e.built { &[][..] } else { &e.frozen[..] };
             for (b, edited) in e
                 .edited
@@ -750,7 +750,7 @@ impl EditTables {
             0
         };
         let templates_at = take(templates_bytes);
-        let cut = d.skin.as_ref().map_or(&[][..], |s| s.cut);
+        let cut = d.skin.as_ref().map_or_default(|s| s.cut);
         let cut_clusters_at = take(size_of_val(cut) as u64);
         let cut_first_at = take(8);
         let cut_error_at = take(4);

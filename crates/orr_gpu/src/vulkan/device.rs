@@ -865,7 +865,11 @@ impl Device {
     /// Validation-layer and ray-tracing-validation warnings and errors reported so far, and
     /// PTLAS builds the debug check rejected among completed work.
     pub fn validation_messages(&self) -> u32 {
-        let rejected = self.shared.rtas_check.get().map_or(0, RtasCheck::failures);
+        let rejected = self
+            .shared
+            .rtas_check
+            .get()
+            .map_or_default(RtasCheck::failures);
         self.shared.messages.get() + rejected
     }
 }

@@ -85,7 +85,7 @@ impl RasterLayer {
     /// Decoded bytes of one tile.
     pub fn tile_bytes(&self) -> usize {
         let t = self.tile_texels();
-        self.format().map_or(0, |f| f.mip_bytes(t, t))
+        self.format().map_or_default(|f| f.mip_bytes(t, t))
     }
 
     /// Texels per axis of the level at `lod`.

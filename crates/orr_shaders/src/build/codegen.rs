@@ -109,7 +109,7 @@ pub(super) fn kernel_set(kernels: &[Kernel<'_>], links: &[Link], manifest: &Path
     for i in 0..kernels.len() {
         let _ = write!(out, "&MODULE_{i}, ");
     }
-    let surfaces = ids.get(&LinkPoint::Surface).map_or(0, Vec::len);
+    let surfaces = ids.get(&LinkPoint::Surface).map_or_default(Vec::len);
     let environment =
         link::single_type(links, LinkPoint::Environment).unwrap_or(crate::DEFAULT_ENVIRONMENT);
     let medium = link::single_type(links, LinkPoint::Medium).unwrap_or(crate::DEFAULT_MEDIUM);
@@ -203,7 +203,7 @@ fn emit_module(out: &mut String, item: &str, k: &Kernel<'_>, manifest: &Path) {
             "        ::orr_shaders::EntryPoint {{ name: c{:?}, spirv_name: c{:?}, metal_name: c{:?}, stage: ::orr_shaders::Stage::{:?}, workgroup: {:?}, interface: {:#018x} }},",
             e.name,
             entry_symbol(k.module, &e.name),
-            k.metallib.names.get(&e.name).map_or("", String::as_str),
+            k.metallib.names.get(&e.name).map_or_default(String::as_str),
             e.stage,
             e.workgroup,
             k.interface

@@ -328,12 +328,8 @@ fn hdr_set_round_trips() {
         let n = info.header.width;
         let mip0 = info.mip_texels(&read_blob(&a, e, 1), 0, 0).unwrap();
         let map: Vec<[f32; 3]> = {
-            let ch: Vec<Vec<f32>> = (0..3)
-                .map(|c| decode(vk::BC6H_UFLOAT, n, n, &mip0, c))
-                .collect();
-            (0..(n * n) as usize)
-                .map(|i| [ch[0][i], ch[1][i], ch[2][i]])
-                .collect()
+            let ch: Vec<Vec<f32>> = Vec::from_fn(3, |c| decode(vk::BC6H_UFLOAT, n, n, &mip0, c));
+            Vec::from_fn((n * n) as usize, |i| [ch[0][i], ch[1][i], ch[2][i]])
         };
         let (w, h) = (1024u32, 512u32);
         let (kx, ky) = (sw / w, sh / h);

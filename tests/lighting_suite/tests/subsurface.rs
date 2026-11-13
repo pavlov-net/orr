@@ -87,17 +87,15 @@ fn probe(cases: &[Case], walks: u32) -> Vec<(DVec3, u32)> {
     run(list);
     let s = sums.as_slice().unwrap();
     let total = f64::from(walks) * LANES as f64;
-    (0..cases.len())
-        .map(|i| {
-            let lanes = &s[i * LANES as usize..(i + 1) * LANES as usize];
-            let mean = lanes
-                .iter()
-                .map(|l| Vec3::from_slice(l).as_dvec3())
-                .sum::<DVec3>()
-                / total;
-            (mean, lanes.iter().map(|l| l[3] as u32).sum())
-        })
-        .collect()
+    Vec::from_fn(cases.len(), |i| {
+        let lanes = &s[i * LANES as usize..(i + 1) * LANES as usize];
+        let mean = lanes
+            .iter()
+            .map(|l| Vec3::from_slice(l).as_dvec3())
+            .sum::<DVec3>()
+            / total;
+        (mean, lanes.iter().map(|l| l[3] as u32).sum())
+    })
 }
 
 fn cpu_top(case: &Case, walks: usize) -> DVec3 {

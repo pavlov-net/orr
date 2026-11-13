@@ -177,7 +177,7 @@ mod tests {
             };
             let job = || c.get(key(0), decode).unwrap();
             let values: Vec<Arc<u64>> = std::thread::scope(|s| {
-                let jobs: Vec<_> = (0..8).map(|_| s.spawn(job)).collect();
+                let jobs: Vec<_> = Vec::from_fn(8, |_| s.spawn(job));
                 jobs.into_iter().map(|j| j.join().unwrap()).collect()
             });
             assert_eq!(decodes.load(Ordering::Relaxed), 1, "limit {limit}");

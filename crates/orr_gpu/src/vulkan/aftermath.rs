@@ -390,7 +390,7 @@ unsafe extern "C" fn on_dump(data: *const c_void, size: u32, _: *mut c_void) {
     let app = s.app.to_string_lossy();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
+        .map_or_default(|d| d.as_millis());
     let path = s
         .dump_dir
         .join(format!("{app}-{}-{stamp}.nv-gpudmp", std::process::id()));

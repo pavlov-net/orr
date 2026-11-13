@@ -127,7 +127,7 @@ impl Builder<'_> {
             .strip_prefix("ND_")
             .and_then(|r| r.strip_prefix(kind.as_str()))
             .and_then(|r| r.strip_prefix('_'))
-            .map_or("", |suffix| output_type(&kind, suffix))
+            .map_or_default(|suffix| output_type(&kind, suffix))
             .to_string();
         let n = self.net.nodes.len();
         self.net.nodes.push(Node {

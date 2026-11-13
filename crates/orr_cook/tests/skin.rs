@@ -96,9 +96,7 @@ impl Doc {
             world[i] = Some(m);
             m
         }
-        (0..local.len())
-            .map(|i| at(i, &parents, local, &mut world))
-            .collect()
+        Vec::from_fn(local.len(), |i| at(i, &parents, local, &mut world))
     }
 
     fn rest(&self) -> Vec<(Vec3, Quat, Vec3)> {
@@ -393,7 +391,7 @@ fn moved_points(
     ibm: &[Mat4],
     vertices: &(Vec<Skinned>, Vec<(usize, Vec3)>),
 ) -> Vec<(usize, Vec3)> {
-    let mut out: Vec<(usize, Vec3)> = (0..nodes.len()).map(|j| (j, Vec3::ZERO)).collect();
+    let mut out: Vec<(usize, Vec3)> = Vec::from_fn(nodes.len(), |j| (j, Vec3::ZERO));
     for v in &vertices.0 {
         let inf = v.influences.iter().filter(|i| i.1 > 0.0);
         out.extend(inf.map(|&(j, _)| (j, ibm[j].transform_point3(v.position))));
@@ -529,7 +527,7 @@ fn check(path: &Path, name: &str, settings: GltfSettings) -> (Cooked, Errors) {
         .map(|p| PageView::new(p, &info.header).unwrap())
         .collect();
     let candidates = |view: &PageView<'_>, c: &Cluster, v: u32| {
-        by_cell.get(&view.grid(c, v)).map_or(&[][..], Vec::as_slice)
+        by_cell.get(&view.grid(c, v)).map_or_default(Vec::as_slice)
     };
 
     let mut err = Errors {
@@ -604,9 +602,9 @@ fn check(path: &Path, name: &str, settings: GltfSettings) -> (Cooked, Errors) {
             skel.palette(&pose, &mut palette);
             let world = src.world(&src.pose(&channels, start + t));
             // A still joint's palette entry is the identity.
-            let reference: Vec<Mat4> = (0..n)
-                .map(|j| nodes[j].map_or(Mat4::IDENTITY, |node| world[node] * ibm[j]))
-                .collect();
+            let reference: Vec<Mat4> = Vec::from_fn(n, |j| {
+                nodes[j].map_or(Mat4::IDENTITY, |node| world[node] * ibm[j])
+            });
             for view in &views {
                 for c in (0..view.cluster_count()).map(|i| view.cluster(i)) {
                     let mut out = vec![[0.0; 3]; usize::from(c.vertex_count)];

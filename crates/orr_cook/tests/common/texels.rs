@@ -147,13 +147,11 @@ pub(crate) fn write_glb(path: &Path, materials: &[String], images: &[Vec<u8>]) {
             {{"bufferView":{vu},"componentType":5126,"count":4,"type":"VEC2"}},
             {{"bufferView":{vi},"componentType":5125,"count":6,"type":"SCALAR"}}]"#
     );
-    let prims: Vec<String> = (0..materials.len())
-        .map(|m| {
-            format!(
-                r#"{{"attributes":{{"POSITION":0,"NORMAL":1,"TEXCOORD_0":2}},"indices":3,"material":{m}}}"#
-            )
-        })
-        .collect();
+    let prims: Vec<String> = Vec::from_fn(materials.len(), |m| {
+        format!(
+            r#"{{"attributes":{{"POSITION":0,"NORMAL":1,"TEXCOORD_0":2}},"indices":3,"material":{m}}}"#
+        )
+    });
     let json = format!(
         r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
             "meshes":[{{"primitives":[{}]}}],"materials":[{}],
@@ -161,10 +159,7 @@ pub(crate) fn write_glb(path: &Path, materials: &[String], images: &[Vec<u8>]) {
             "accessors":{accessors},"bufferViews":[{}],"buffers":[{{"byteLength":{}}}]}}"#,
         prims.join(","),
         materials.join(","),
-        (0..images.len())
-            .map(|i| format!(r#"{{"source":{i},"sampler":0}}"#))
-            .collect::<Vec<_>>()
-            .join(","),
+        Vec::from_fn(images.len(), |i| format!(r#"{{"source":{i},"sampler":0}}"#)).join(","),
         image_views
             .iter()
             .map(|v| format!(r#"{{"bufferView":{v},"mimeType":"image/png"}}"#))

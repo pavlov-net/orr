@@ -1421,7 +1421,7 @@ impl<'a> Frame<'a> {
         let sdr = DisplayRequest::default().resolve(&[OutputFormat::Sdr], None, false);
         let frame = self.display.as_deref_mut().and_then(Display::frame);
         // Whatever the view's target: the consumer may compose a texture into the display.
-        let generated = frame.as_ref().map_or(0, |f| f.generated);
+        let generated = frame.as_ref().map_or_default(|f| f.generated);
         let mut display = frame.filter(|_| matches!(view.target, ViewTarget::Display));
         let resolved = display.as_ref().map_or(sdr, |f| f.display);
         let tonemapped = !matches!(view.target, ViewTarget::Radiance { .. });

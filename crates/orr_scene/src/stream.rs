@@ -1904,9 +1904,8 @@ impl Streaming {
         // Over its mark a heap's pools empty every block they can; under it they keep a
         // block's room for loads.
         let over = |h: usize| report.heaps[h].usage > report.heaps[h].budget / 10 * MARK_TENTHS;
-        let mut mine: Vec<[u64; 2]> = (0..report.heaps.len())
-            .map(|h| [self.residency.held_on(h), 0])
-            .collect();
+        let mut mine: Vec<[u64; 2]> =
+            Vec::from_fn(report.heaps.len(), |h| [self.residency.held_on(h), 0]);
         for (pool, &heap) in [&self.pool, &self.units].into_iter().zip(&self.pool_heaps) {
             mine[heap][1] += pool.lock().unwrap().plan_drain(over(heap));
         }
@@ -2737,7 +2736,7 @@ impl Streaming {
         let placed = l.result.is_ok() && units.iter().all(|&(u, _)| u != NO_UNIT);
         if l.result.is_ok() && self.mounts.contains_key(&key.mount) {
             let clas: u64 = units.iter().map(|&(_, n)| u64::from(n)).sum();
-            let micromap = p.micromap.as_ref().map_or(0, |m| m.bytes);
+            let micromap = p.micromap.as_ref().map_or_default(|m| m.bytes);
             self.residency.built(key, clas * clas_pool::UNIT + micromap);
         }
         let live = if l.result.is_ok() && !placed && self.mounts.contains_key(&key.mount) {
@@ -3309,7 +3308,7 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
                 let mut landed = Landed {
                     what: load.what,
                     placed,
-                    gpu: block.map_or(0, |b| b.gpu()),
+                    gpu: block.map_or_default(|b| b.gpu()),
                     tile: match &load.kind {
                         LoadKind::Tile { stream, tile, .. } => Some((Arc::clone(stream), *tile)),
                         _ => None,

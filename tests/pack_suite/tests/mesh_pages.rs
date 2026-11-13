@@ -128,7 +128,9 @@ fn check(page: &[u8], mesh: &MeshHeader, spread: &mut Spread) {
         for t in 0..u32::from(c.tri_count) {
             let g = triangles[ci * SLOTS + t as usize].corners;
             let corners = view.triangle(&c, t).map(u32::from);
-            let omm = view.omm_index(&c, t).map_or(0, |i| i32::from(i) as u32);
+            let omm = view
+                .omm_index(&c, t)
+                .map_or_default(|i| i32::from(i) as u32);
             assert_eq!(
                 g,
                 [corners[0], corners[1], corners[2], omm],
@@ -170,9 +172,8 @@ fn synthetic(
     highs: bool,
     entries: u32,
 ) -> Vec<u8> {
-    let mut counts: Vec<(usize, usize)> = (0..clusters)
-        .map(|_| (3 + rng.below(SLOTS - 2), 1 + rng.below(255)))
-        .collect();
+    let mut counts: Vec<(usize, usize)> =
+        Vec::from_fn(clusters, |_| (3 + rng.below(SLOTS - 2), 1 + rng.below(255)));
     let vertex = 6 + if highs { 6 } else { 0 } + attr_stride;
     let len = |counts: &[(usize, usize)]| {
         let per = |&(vn, tn): &(usize, usize)| {
@@ -334,7 +335,7 @@ fn wavy(n: u32) -> MeshInput {
                 1.0,
                 0.1 * x,
                 0.0,
-                if i % 2 == 0 { 1.0 } else { -1.0 },
+                if i.is_multiple_of(2) { 1.0 } else { -1.0 },
             ));
             uvs.push(Vec2::new(u * 3.0, v * 2.0 - 1.0));
             values.push((i * 4 / (n + 1)) as u16);

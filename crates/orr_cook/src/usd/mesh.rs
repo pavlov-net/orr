@@ -855,7 +855,7 @@ fn corner_values<T>(
                 (Interp::Uniform, _) => usize::MAX - face,
                 (Interp::Constant, _) => usize::MAX,
             };
-            let bits = v.map(|v| std::array::from_fn(|i| v.get(i).map_or(0, |x| x.to_bits())));
+            let bits = v.map(|v| std::array::from_fn(|i| v.get(i).map_or_default(|x| x.to_bits())));
             let key = (element, bits);
             let id = match seen.get(&key) {
                 Some(&id) => id,

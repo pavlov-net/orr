@@ -342,8 +342,9 @@ const RASTER_COUNTS: [(usize, &str); 14] = [
 
 fn script_report(script: Script, samples: &[Sample]) -> Value {
     let fig = |f: &dyn Fn(&FrameStats) -> f64| figure(samples, |s| f(&s.stats));
-    let lit =
-        |f: &dyn Fn(&LightingStats) -> f64| figure(samples, |s| s.lighting.as_ref().map_or(0.0, f));
+    let lit = |f: &dyn Fn(&LightingStats) -> f64| {
+        figure(samples, |s| s.lighting.as_ref().map_or_default(f))
+    };
     let raster: Map<String, Value> = RASTER_COUNTS
         .iter()
         .map(|&(i, name)| (name.to_owned(), figure(samples, |s| s.counts[i].into())))

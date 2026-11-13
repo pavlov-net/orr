@@ -417,17 +417,13 @@ fn rasterize_across(
         alpha: &Map<OmmRead<'_>>,
         cutoff: f32,
     ) {
-        let [c0, c1, c2] = tri;
         if level > 0 {
-            let mid = |a: [f32; 2], b: [f32; 2]| [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
-            let (c01, c12, c20) = (mid(c0, c1), mid(c1, c2), mid(c2, c0));
-            let l = level - 1;
-            visit(data, index * 4, l, [c0, c01, c20], alpha, cutoff);
-            visit(data, index * 4 + 1, l, [c20, c12, c01], alpha, cutoff);
-            visit(data, index * 4 + 2, l, [c01, c1, c12], alpha, cutoff);
-            visit(data, index * 4 + 3, l, [c12, c20, c2], alpha, cutoff);
+            for (k, child) in children(tri).into_iter().enumerate() {
+                visit(data, index * 4 + k, level - 1, child, alpha, cutoff);
+            }
             return;
         }
+        let [c0, c1, c2] = tri;
         let value = |r: &OmmRead<'_>, p| f32::from(remap(r.read.mip0.sample(p), cutoff)) / 255.0;
         let corner = |k: usize| {
             let c = alpha.corner(tri, k);
@@ -449,6 +445,19 @@ fn rasterize_across(
     visit(data, 0, level, uv, alpha, cutoff);
 }
 
+/// The four micro-triangles of `tri` in the order meshoptimizer rasterizes them: children 0 and
+/// 2 keep the winding, 1 and 3 flip it.
+fn children([c0, c1, c2]: [[f32; 2]; 3]) -> [[[f32; 2]; 3]; 4] {
+    let mid = |a: [f32; 2], b: [f32; 2]| [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+    let (c01, c12, c20) = (mid(c0, c1), mid(c1, c2), mid(c2, c0));
+    [
+        [c0, c01, c20],
+        [c20, c12, c01],
+        [c01, c1, c12],
+        [c12, c20, c2],
+    ]
+}
+
 /// Whether micro-triangles `first..first + count` of a four-state entry hold a known state.
 fn any_known(data: &[u8], first: usize, count: usize) -> bool {
     if count >= 4 {
@@ -463,9 +472,8 @@ fn any_known(data: &[u8], first: usize, count: usize) -> bool {
 /// Turns each known state into the unknown state of the same side unless every texel a
 /// bilinear sample on its micro-triangle reads is on that side of the cutoff.
 fn known_states_hold(data: &mut [u8], level: u8, uv: [[f32; 2]; 3], alpha: &Map<OmmRead<'_>>) {
-    // Micro-triangles in the order meshoptimizer rasterizes them: children 0 and 2 keep
-    // the winding, 1 and 3 flip it. A triangle whose footprint stays on one side of the
-    // cutoff settles every micro-triangle under it.
+    // A triangle whose footprint stays on one side of the cutoff settles every micro-triangle
+    // under it.
     fn visit(
         data: &mut [u8],
         index: usize,
@@ -483,14 +491,9 @@ fn known_states_hold(data: &mut [u8], level: u8, uv: [[f32; 2]; 3], alpha: &Map<
             sides != PASS | FAIL
         });
         if sides == PASS | FAIL && level > 0 {
-            let [c0, c1, c2] = tri;
-            let mid = |a: [f32; 2], b: [f32; 2]| [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
-            let (c01, c12, c20) = (mid(c0, c1), mid(c1, c2), mid(c2, c0));
-            let l = level - 1;
-            visit(data, index * 4, l, [c0, c01, c20], alpha);
-            visit(data, index * 4 + 1, l, [c20, c12, c01], alpha);
-            visit(data, index * 4 + 2, l, [c01, c1, c12], alpha);
-            visit(data, index * 4 + 3, l, [c12, c20, c2], alpha);
+            for (k, child) in children(tri).into_iter().enumerate() {
+                visit(data, index * 4 + k, level - 1, child, alpha);
+            }
             return;
         }
         let first = index << (2 * level);
@@ -694,9 +697,7 @@ mod tests {
     /// Triangles inside a tile rasterize as the same image's do, wherever the tile lies.
     #[test]
     fn micromaps_of_a_tile_match_the_same_image() {
-        let uvs: Vec<[f32; 2]> = (0..64)
-            .map(|i| [(i % 8) as f32 / 8.0, (i / 8) as f32 / 8.0])
-            .collect();
+        let uvs: Vec<[f32; 2]> = Vec::from_fn(64, |i| [(i % 8) as f32 / 8.0, (i / 8) as f32 / 8.0]);
         let tris: Vec<[u8; 3]> = (0..56u8)
             .filter(|i| i % 8 != 7)
             .flat_map(|i| [[i, i + 1, i + 8], [i + 1, i + 9, i + 8]])

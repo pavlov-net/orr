@@ -364,7 +364,7 @@ pub fn check_latency_reports(reports: &BTreeMap<u64, LatencyTimings>, frames: u6
         SimulationStart,
     };
     let markers = LATENCY_MARKERS.lock().unwrap();
-    for id in (64..frames - 64).filter(|id| id % 128 != 0) {
+    for id in (64..frames - 64).filter(|id| !id.is_multiple_of(128)) {
         let t = reports
             .get(&id)
             .unwrap_or_else(|| panic!("no latency report for frame {id}"));

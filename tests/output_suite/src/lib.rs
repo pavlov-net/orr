@@ -431,13 +431,11 @@ pub fn natural_image(n: usize, ev100: f32, sigma: f32) -> Vec<f32> {
             .wrapping_add(1_442_695_040_888_963_407);
         (state >> 40) as f32 / (1u64 << 24) as f32
     };
-    (0..n)
-        .map(|_| {
-            // Irwin-Hall: 12 uniforms less 6 have unit variance.
-            let z = ((0..12).map(|_| uniform()).sum::<f32>() - 6.0).clamp(-4.0, 4.0);
-            orr_output::luminance_from_ev100(ev100 + sigma * z)
-        })
-        .collect()
+    Vec::from_fn(n, |_| {
+        // Irwin-Hall: 12 uniforms less 6 have unit variance.
+        let z = ((0..12).map(|_| uniform()).sum::<f32>() - 6.0).clamp(-4.0, 4.0);
+        orr_output::luminance_from_ev100(ev100 + sigma * z)
+    })
 }
 
 /// The CPU model of the meter: the mean EV100 of `nits` between the `filter` percentiles,

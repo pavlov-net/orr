@@ -76,9 +76,7 @@ pub fn write_glb(path: &Path, rings: u32, sides: u32, radius: f32, color: [f32; 
         })
         .collect();
     let keys = 17;
-    let times: Vec<f32> = (0..keys)
-        .map(|i| PERIOD * i as f32 / (keys - 1) as f32)
-        .collect();
+    let times: Vec<f32> = Vec::from_fn(keys, |i| PERIOD * i as f32 / (keys - 1) as f32);
 
     let mut bin: Vec<u8> = Vec::new();
     let mut views = Vec::new();
@@ -153,7 +151,7 @@ pub fn write_glb(path: &Path, rings: u32, sides: u32, radius: f32, color: [f32; 
         })
         .chain([r#"{"name":"body","mesh":0,"skin":0}"#.to_string()])
         .collect();
-    let joint_list: Vec<String> = (0..JOINTS).map(|j| j.to_string()).collect();
+    let joint_list: Vec<String> = Vec::from_fn(JOINTS, |j| j.to_string());
     let json = format!(
         r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0,{JOINTS}]}}],
 "nodes":[{nodes}],

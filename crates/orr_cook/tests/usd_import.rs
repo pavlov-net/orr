@@ -2041,12 +2041,10 @@ fn usd_cages_cook_the_surface_of_the_same_cage_built_in_memory() {
 
     // The same cage in scene space (Y up, meters), uvs with v flipped.
     let points = [-1.0f32, 1.0];
-    let positions = (0..8)
-        .map(|i| {
-            let p = [points[i & 1], points[(i >> 1) & 1], points[(i >> 2) & 1]];
-            Vec3::new(p[0], p[2], -p[1])
-        })
-        .collect();
+    let positions = Vec::from_fn(8, |i| {
+        let p = [points[i & 1], points[(i >> 1) & 1], points[(i >> 2) & 1]];
+        Vec3::new(p[0], p[2], -p[1])
+    });
     let st = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.5, 0.5]];
     let corners: [u32; 24] = [
         0, 2, 3, 1, 4, 5, 7, 6, 0, 1, 5, 4, 2, 6, 7, 3, 0, 4, 6, 2, 1, 3, 7, 5,
@@ -2152,12 +2150,10 @@ fn usd_cages_carry_primvars_by_their_interpolation_as_the_same_cage_built_in_mem
     let corners = vec![0, 1, 4, 3, 1, 2, 5, 4, 3, 4, 7, 6, 4, 5, 8, 7];
     let fade = [0.25, 0.5, 0.75, 1.0].map(|f| Vec4::new(0.0, 0.0, 0.0, f));
     let cage = CageInput {
-        positions: (0..9)
-            .map(|i| {
-                let y = if i == 4 { 0.5 } else { 0.0 };
-                Vec3::new((i % 3) as f32, y, (i / 3) as f32)
-            })
-            .collect(),
+        positions: Vec::from_fn(9, |i| {
+            let y = if i == 4 { 0.5 } else { 0.0 };
+            Vec3::new((i % 3) as f32, y, (i / 3) as f32)
+        }),
         face_counts: vec![4; 4],
         face_indices: corners.clone(),
         face_sections: vec![0, 1, 0, 1],

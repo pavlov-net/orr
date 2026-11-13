@@ -141,7 +141,7 @@ unsafe extern "C" fn on_allocate(
     user: *mut c_void,
 ) {
     // SAFETY: `user` is the allocator's boxed counter, which outlives VMA's use of it.
-    let count = unsafe { &*user.cast::<AtomicU64>() };
+    let count = unsafe { user.cast::<AtomicU64>().as_ref_unchecked() };
     count.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -158,7 +158,7 @@ impl Allocator {
         let callbacks = sys::VmaDeviceMemoryCallbacks {
             pfnAllocate: Some(on_allocate),
             pfnFree: None,
-            pUserData: ptr::from_ref::<AtomicU64>(&allocations).cast_mut().cast(),
+            pUserData: Box::as_ptr(&allocations).cast_mut().cast(),
         };
         let functions = sys::VmaVulkanFunctions {
             vkGetInstanceProcAddr: sys::instance_proc_addr(

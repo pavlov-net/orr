@@ -464,12 +464,10 @@ fn tube_triangles() -> Vec<[u8; 3]> {
 /// Vertex `i` of `n` on the moment curve (t, t², t³): no three distinct points are
 /// collinear, so every template triangle is a proper triangle whatever its corners.
 pub(crate) fn curve(n: usize) -> Vec<[f32; 3]> {
-    (0..n)
-        .map(|i| {
-            let t = i as f32 / n as f32;
-            [t, t * t, t * t * t]
-        })
-        .collect()
+    Vec::from_fn(n, |i| {
+        let t = i as f32 / n as f32;
+        [t, t * t, t * t * t]
+    })
 }
 
 /// Offsets of one batch's arrays in an entry's allocation.
@@ -751,7 +749,7 @@ pub(crate) fn build(
         curve: at(curve_at).cast(),
         batch: tube_batch_at.map_or(GpuPtr::NULL, |o| at(o).cast()),
         swept_indices: at(swept_indices_at).cast(),
-        swept_blas: swept.as_ref().map_or(0, |s| s.blas.address().0),
+        swept_blas: swept.as_ref().map_or_default(|s| s.blas.address().0),
         topology_count: built_topologies as u32,
         direct_capacity: direct_clusters,
         geometry_flags: if opaque { GEOMETRY_OPAQUE } else { 0 },

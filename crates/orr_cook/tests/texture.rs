@@ -239,18 +239,16 @@ fn bc_split_keeps_the_blocks() {
 fn bc6h_cube_from_ktx2_round_trips() {
     let d = dir("cube");
     let n = 512;
-    let faces: Vec<Vec<u8>> = (0..6)
-        .map(|f| {
-            (0..n * n)
-                .flat_map(|i| {
-                    let (x, y) = ((i % n) as f32 / n as f32, (i / n) as f32 / n as f32);
-                    let v = (f as f32 + 1.0) * (1.0 + 8.0 * x * y);
-                    [v, v * 0.5 * (1.0 + y), 0.1 + x, 1.0]
-                })
-                .flat_map(f32::to_le_bytes)
-                .collect()
-        })
-        .collect();
+    let faces: Vec<Vec<u8>> = Vec::from_fn(6, |f| {
+        (0..n * n)
+            .flat_map(|i| {
+                let (x, y) = ((i % n) as f32 / n as f32, (i / n) as f32 / n as f32);
+                let v = (f as f32 + 1.0) * (1.0 + 8.0 * x * y);
+                [v, v * 0.5 * (1.0 + y), 0.1 + x, 1.0]
+            })
+            .flat_map(f32::to_le_bytes)
+            .collect()
+    });
     let image = ctt::ImageRef {
         surfaces: faces
             .iter()

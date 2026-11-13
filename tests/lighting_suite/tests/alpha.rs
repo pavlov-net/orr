@@ -92,7 +92,7 @@ impl Rays {
 
 /// Traces the probe's rays toward the sun across each of `models`, placed side by side.
 fn trace(models: &[&'static str]) -> Vec<Rays> {
-    let xs: Vec<f32> = (0..models.len()).map(|i| 3.0 * i as f32).collect();
+    let xs: Vec<f32> = Vec::from_fn(models.len(), |i| 3.0 * i as f32);
     let spec = Spec {
         copies: models.iter().zip(&xs).map(|(&m, &x)| at(m, x)).collect(),
         lights: vec![Light::Directional(SUN)],

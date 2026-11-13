@@ -108,7 +108,7 @@ pub(crate) fn scan(path: &Path) -> Scan {
         return Scan::default();
     };
     let head = &text[..at];
-    let cut = head.rfind(['/', '\\']).map_or(0, |i| i + 1);
+    let cut = head.rfind(['/', '\\']).map_or_default(|i| i + 1);
     let (dir, stem) = head.split_at(cut);
     let dir = PathBuf::from(if dir.is_empty() { "." } else { dir });
     // What follows the token in the same file name, up to any other token.

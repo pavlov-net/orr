@@ -236,7 +236,7 @@ pub(crate) fn generate(n: [u32; 3]) -> Pattern {
         KEY_RING | (e as u32) << 2 | r << 4 | k << 8
     };
 
-    let mut keys: Vec<u32> = (0..3).map(corner_key).collect();
+    let mut keys: Vec<u32> = Vec::from_fn(3, corner_key);
     let mut at: HashMap<u32, u8> = keys
         .iter()
         .enumerate()
@@ -315,7 +315,7 @@ mod tests {
     }
 
     fn table() -> Vec<Pattern> {
-        (0..PATTERNS).map(|i| generate(counts(i))).collect()
+        Vec::from_fn(PATTERNS, |i| generate(counts(i)))
     }
 
     /// Twice the signed area of triangle `t` in barycentric units.

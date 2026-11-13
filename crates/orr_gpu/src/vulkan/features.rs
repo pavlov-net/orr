@@ -440,7 +440,7 @@ pub(super) fn select(
     q.link(&opt, false);
     // SAFETY: the chain holds only structs of extensions the device lists.
     unsafe {
-        instance.get_physical_device_features2(physical, &mut *std::ptr::from_mut(&mut q.core));
+        instance.get_physical_device_features2(physical, &mut q.core);
     };
 
     let c = &q.core.features;

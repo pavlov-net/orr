@@ -1206,9 +1206,9 @@ mod glare {
         let rows = &TABLES[first_level - 1];
         let mut out = vec![[0.0; 3]; mips + 1];
         for c in 0..3 {
-            let lerped: Vec<f64> = (0..rows[i].len())
-                .map(|e| rows[i][e][c] + (rows[i + 1][e][c] - rows[i][e][c]) * (t - i as f64))
-                .collect();
+            let lerped: Vec<f64> = Vec::from_fn(rows[i].len(), |e| {
+                rows[i][e][c] + (rows[i + 1][e][c] - rows[i][e][c]) * (t - i as f64)
+            });
             for (o, w) in out.iter_mut().zip(pyramid::fold(&lerped, mips)) {
                 o[c] = w;
             }
@@ -1400,15 +1400,13 @@ mod glare {
         let extent = [200, 120];
         let ev = ev_at(9);
         let k = nits_per_exposed(ev);
-        let nits: Vec<f32> = (0..200 * 120)
-            .map(|i| {
-                if (i % 200 + i / 200) % 2 == 0 {
-                    0.02 * k
-                } else {
-                    0.9 * k
-                }
-            })
-            .collect();
+        let nits: Vec<f32> = Vec::from_fn(200 * 120, |i| {
+            if (i % 200 + i / 200).is_multiple_of(2) {
+                0.02 * k
+            } else {
+                0.9 * k
+            }
+        });
         let worst = worst_change(extent, &nits, &output(ev, OutputDebug::Linear));
         log::info!("detail below the knee: worst relative change {worst:.2e}");
         assert!(worst < 1e-3, "{worst}");
@@ -1872,12 +1870,10 @@ mod glare {
         let table = fft::TABLE as f64 / fft::Kernel::texels(lens_f_number(ev), 1);
         let steps = 1440;
         for radius in [0.6 * table, 1.5 * table] {
-            let ring: Vec<f64> = (0..steps)
-                .map(|i| {
-                    let a = std::f64::consts::TAU * i as f64 / steps as f64;
-                    at(128.0 + radius * a.cos(), 128.0 + radius * a.sin())
-                })
-                .collect();
+            let ring: Vec<f64> = Vec::from_fn(steps, |i| {
+                let a = std::f64::consts::TAU * i as f64 / steps as f64;
+                at(128.0 + radius * a.cos(), 128.0 + radius * a.sin())
+            });
             let max = ring.iter().copied().fold(0.0, f64::max);
             let peaks: Vec<f64> = (0..steps)
                 .filter(|&i| {

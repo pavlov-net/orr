@@ -475,7 +475,7 @@ impl ViewArena {
         #[cfg(debug_assertions)]
         self.shared
             .step
-            .store(step.map_or(0, |s| s as u8 + 1), Ordering::Relaxed);
+            .store(step.map_or_default(|s| s as u8 + 1), Ordering::Relaxed);
     }
 
     /// Size and alignment of a target's memory.

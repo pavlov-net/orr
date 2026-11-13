@@ -110,65 +110,51 @@ fn write(i: usize) -> PtlasWrite {
 #[test]
 fn stores_match_vulkan_structs() {
     let d = device();
-    let clas: Vec<ClasBuild> = (0..RECORDS).map(clas_record).collect();
-    let templates: Vec<TemplateBuild> = (0..RECORDS)
-        .map(|i| TemplateBuild {
-            cluster: clas_record(i),
-            bounds: if i == 0 { 0 } else { addr(i, 7) },
-        })
-        .collect();
-    let instantiate: Vec<Instantiate> = (0..RECORDS)
-        .map(|i| Instantiate {
-            cluster_id_offset: 0xffff_0000 + i as u32,
-            geometry_index_offset: 0xff_ff00 + i as u32,
-            template_address: addr(i, 8),
-            vertices: addr(i, 9),
-        })
-        .collect();
-    let blas: Vec<ClusterBlas> = (0..RECORDS)
-        .map(|i| ClusterBlas {
-            clas_addresses: addr(i, 10),
-            clas_count: [1, 4096, 65535][i],
-            pad: 0,
-        })
-        .collect();
-    let moves: Vec<Move> = (0..RECORDS).map(|i| Move { src: addr(i, 11) }).collect();
-    let writes: Vec<PtlasWrite> = (0..RECORDS).map(write).collect();
-    let updates: Vec<PtlasUpdate> = (0..RECORDS)
-        .map(|i| PtlasUpdate {
-            blas: if i == 2 { 0 } else { addr(i, 12) },
-            instance_index: 7 * i as u32,
-            pad: 0,
-        })
-        .collect();
-    let translates: Vec<PtlasTranslate> = (0..RECORDS)
-        .map(|i| PtlasTranslate {
-            translation: [-32768.0 * i as f32, 0.5, 16384.0],
-            partition: [0, 1, 2047][i],
-        })
-        .collect();
-    let commands: Vec<PtlasCommand> = (0..RECORDS)
-        .map(|i| PtlasCommand {
-            args: addr(i, 13),
-            op: i as u32,
-            count: [1, 1000, 4096][i],
-        })
-        .collect();
-    let classic: Vec<ClassicInstance> = (0..RECORDS)
-        .map(|i| {
-            ClassicInstance::new(
-                transform(i),
-                0xff_ff00 + i as u32,
-                [0xff, 1, 0x80][i],
-                [
-                    InstanceFlags::CULL_DISABLE,
-                    InstanceFlags::FORCE_OPAQUE | InstanceFlags::FLIP_FACING,
-                    InstanceFlags::FORCE_NO_OPAQUE,
-                ][i],
-                GpuAddress(addr(i, 14)),
-            )
-        })
-        .collect();
+    let clas: Vec<ClasBuild> = Vec::from_fn(RECORDS, clas_record);
+    let templates: Vec<TemplateBuild> = Vec::from_fn(RECORDS, |i| TemplateBuild {
+        cluster: clas_record(i),
+        bounds: if i == 0 { 0 } else { addr(i, 7) },
+    });
+    let instantiate: Vec<Instantiate> = Vec::from_fn(RECORDS, |i| Instantiate {
+        cluster_id_offset: 0xffff_0000 + i as u32,
+        geometry_index_offset: 0xff_ff00 + i as u32,
+        template_address: addr(i, 8),
+        vertices: addr(i, 9),
+    });
+    let blas: Vec<ClusterBlas> = Vec::from_fn(RECORDS, |i| ClusterBlas {
+        clas_addresses: addr(i, 10),
+        clas_count: [1, 4096, 65535][i],
+        pad: 0,
+    });
+    let moves: Vec<Move> = Vec::from_fn(RECORDS, |i| Move { src: addr(i, 11) });
+    let writes: Vec<PtlasWrite> = Vec::from_fn(RECORDS, write);
+    let updates: Vec<PtlasUpdate> = Vec::from_fn(RECORDS, |i| PtlasUpdate {
+        blas: if i == 2 { 0 } else { addr(i, 12) },
+        instance_index: 7 * i as u32,
+        pad: 0,
+    });
+    let translates: Vec<PtlasTranslate> = Vec::from_fn(RECORDS, |i| PtlasTranslate {
+        translation: [-32768.0 * i as f32, 0.5, 16384.0],
+        partition: [0, 1, 2047][i],
+    });
+    let commands: Vec<PtlasCommand> = Vec::from_fn(RECORDS, |i| PtlasCommand {
+        args: addr(i, 13),
+        op: i as u32,
+        count: [1, 1000, 4096][i],
+    });
+    let classic: Vec<ClassicInstance> = Vec::from_fn(RECORDS, |i| {
+        ClassicInstance::new(
+            transform(i),
+            0xff_ff00 + i as u32,
+            [0xff, 1, 0x80][i],
+            [
+                InstanceFlags::CULL_DISABLE,
+                InstanceFlags::FORCE_OPAQUE | InstanceFlags::FLIP_FACING,
+                InstanceFlags::FORCE_NO_OPAQUE,
+            ][i],
+            GpuAddress(addr(i, 14)),
+        )
+    });
 
     let cells: Vec<Translation> = (0..64)
         .map(|i: i32| Translation {

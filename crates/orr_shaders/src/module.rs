@@ -217,7 +217,7 @@ macro_rules! aligned_spirv {
         // SAFETY: the bytes are 4-aligned, their length is checked to be whole words, and
         // the crate only builds for little-endian targets, the byte order of orr's SPIR-V.
         unsafe {
-            assert!(ALIGNED.0.len() % 4 == 0);
+            assert!(ALIGNED.0.len().is_multiple_of(4));
             ::core::slice::from_raw_parts(ALIGNED.0.as_ptr().cast::<u32>(), ALIGNED.0.len() / 4)
         }
     }};

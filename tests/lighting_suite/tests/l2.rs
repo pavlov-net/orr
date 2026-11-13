@@ -97,12 +97,10 @@ fn textured(
 
 /// A 16 x 16 albedo varying smoothly from 0.2 to 0.8.
 fn gradient_albedo() -> TestTexture {
-    let texels: Vec<[f32; 4]> = (0..256)
-        .map(|i| {
-            let (x, y) = ((i % 16) as f32 / 15.0, (i / 16) as f32 / 15.0);
-            [0.2 + 0.6 * x, 0.2 + 0.6 * y, 0.5, 1.0]
-        })
-        .collect();
+    let texels: Vec<[f32; 4]> = Vec::from_fn(256, |i| {
+        let (x, y) = ((i % 16) as f32 / 15.0, (i / 16) as f32 / 15.0);
+        [0.2 + 0.6 * x, 0.2 + 0.6 * y, 0.5, 1.0]
+    });
     texture(16, 16, &texels, "albedo gradient")
 }
 
@@ -539,9 +537,9 @@ fn glint_converges_to_the_same_value_from_nee_and_bsdf_sampling() {
     let mut lighting = scene.lighting();
     let threads = 1u32 << 16;
     let per_thread = 1024;
-    let sums: Vec<_> = (0..table.len())
-        .map(|i| readback::<[f32; 4]>(u64::from(threads), &format!("glint sums {i}")))
-        .collect();
+    let sums: Vec<_> = Vec::from_fn(table.len(), |i| {
+        readback::<[f32; 4]>(u64::from(threads), &format!("glint sums {i}"))
+    });
     let roots: Vec<_> = table
         .iter()
         .zip(&sums)

@@ -124,7 +124,7 @@ fn page_prototypes(
             records: p.records,
             stride: model_cpu
                 .get(p.model.0 as usize)
-                .map_or(0, |m| m.emissive_stride),
+                .map_or_default(|m| m.emissive_stride),
         })
         .collect();
     Ok((entries, protos))
@@ -1337,7 +1337,7 @@ impl Scene {
             .copies
             .get(&model)
             .filter(|c| !c.far)
-            .map_or(0, |c| c.count);
+            .map_or_default(|c| c.count);
         cpu.ptlas.check_runs([(FAR_RUN, n)])
     }
 
@@ -2147,7 +2147,7 @@ impl<'f> SceneWriter<'f> {
             .iter()
             .zip(named)
             .filter(|(_, base)| base.is_none())
-            .map(|(p, _)| p.sets.as_ref().map_or(0, |s| s.len() as u32))
+            .map(|(p, _)| p.sets.as_ref().map_or_default(|s| s.len() as u32))
             .sum();
         // Window room comes first, so nothing fails once the page holds slots.
         let (sets_src, sets_out) = self.window.slice::<u32>(self.device, set_entries)?;
@@ -2246,15 +2246,15 @@ impl<'f> SceneWriter<'f> {
                     group_index: 0,
                     model: p.model.0,
                     material_base: base,
-                    pose_group: pose.map_or(0, |q| q.group.0),
-                    pose_index: pose.map_or(0, |q| q.index),
+                    pose_group: pose.map_or_default(|q| q.group.0),
+                    pose_index: pose.map_or_default(|q| q.index),
                     first_part: u32::MAX,
                     rt_range: half::f16::from_f32(r.rt_range).to_bits(),
                     animation_range: half::f16::from_f32(r.animation_range).to_bits(),
                     flags: flags & InstanceFlags::CONSUMER,
                     _pad: 0,
-                    pose_variants: pose.map_or(0, |q| q.variants as u16),
-                    pose_stride: pose.map_or(0, |q| q.stride as u16),
+                    pose_variants: pose.map_or_default(|q| q.variants as u16),
+                    pose_stride: pose.map_or_default(|q| q.stride as u16),
                     debug_lod: 0,
                     user_tag: r.user_tag,
                     variant: u32::from(p.pose) | u32::from(p.mask) << 16,
@@ -2474,7 +2474,7 @@ impl<'f> SceneWriter<'f> {
         };
         let copies = group.count;
         let cooked = proto.sets.as_ref().filter(|_| r.material_set.is_none());
-        let set_entries = cooked.map_or(0, |s| s.len() as u32);
+        let set_entries = cooked.map_or_default(|s| s.len() as u32);
         let (sets_src, sets_out) = self.window.slice::<u32>(self.device, set_entries)?;
         let (group_src, group_out) = self.window.slice::<GroupGpu>(self.device, 1)?;
         let (id, sets) = {
@@ -2745,7 +2745,7 @@ impl<'f> SceneWriter<'f> {
         let sections = self
             .model_cpu
             .get(model.0 as usize)
-            .map_or(0, |m| m.sections);
+            .map_or_default(|m| m.sections);
         u64::from(base) + (u64::from(set) + 1) * u64::from(sections)
     }
 
@@ -2882,7 +2882,7 @@ impl<'f> SceneWriter<'f> {
             let sections = self
                 .model_cpu
                 .get(hold.model as usize)
-                .map_or(0, |m| m.sections);
+                .map_or_default(|m| m.sections);
             let mask = u32::from(v.section_mask) & ((1 << sections.min(16)) - 1);
             if mask != 0 {
                 cpu.masks.insert((ModelId(hold.model), mask as u16));
@@ -2971,7 +2971,7 @@ impl<'f> SceneWriter<'f> {
         let joints = self
             .model_cpu
             .get(d.model.0 as usize)
-            .map_or(0, |m| m.joints);
+            .map_or_default(|m| m.joints);
         subd::check(d, cage, joints)?;
         let cage = cage.expect("checked");
         let materials = if d.materials.is_empty() {
@@ -3053,7 +3053,7 @@ impl<'f> SceneWriter<'f> {
             (index, held.emissive, held.max_clusters)
         });
         // The lists kept per producer cluster count the set producers' clusters in 32 bits.
-        let clusters = u64::from(cpu.producer_clusters) - held.map_or(0, |h| u64::from(h.2))
+        let clusters = u64::from(cpu.producer_clusters) - held.map_or_default(|h| u64::from(h.2))
             + u64::from(b.producer.max_clusters);
         let clusters = u32::try_from(clusters).map_err(|_| Error::Capacity {
             what: "producer clusters",

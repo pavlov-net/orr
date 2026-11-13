@@ -54,7 +54,7 @@ impl Reader<'_> {
 
     fn counted(&mut self) -> Vec<f64> {
         let n = self.int();
-        (0..n).map(|_| self.double()).collect()
+        Vec::from_fn(n, |_| self.double())
     }
 
     fn half(&mut self) -> f32 {
@@ -150,13 +150,11 @@ impl Prague {
         assert_eq!(numbers(initializer(source, "SUN_RAD_STEP")), [1.0]);
         let sun_radius = numbers(initializer(source, "SUN_RADIUS"))[0];
         let disc = std::f64::consts::TAU * (1.0 - sun_radius.cos());
-        let solar = (0..channels)
-            .map(|c| {
-                let first = channel_start + c as f64 * channel_width - table_start;
-                let span = &table[first as usize..(first + channel_width) as usize];
-                span.iter().sum::<f64>() / span.len() as f64 * disc
-            })
-            .collect();
+        let solar = Vec::from_fn(channels, |c| {
+            let first = channel_start + c as f64 * channel_width - table_start;
+            let span = &table[first as usize..(first + channel_width) as usize];
+            span.iter().sum::<f64>() / span.len() as f64 * disc
+        });
 
         Prague {
             visibilities,

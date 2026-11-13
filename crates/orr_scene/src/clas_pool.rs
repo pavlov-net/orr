@@ -584,7 +584,7 @@ impl ClasPool {
             bound: s.bound,
             wholly_free: wholly_free.count() as u32,
             reserved: s.reserved,
-            held: s.moving.as_ref().map_or(0, |m| m.pages.len() as u32),
+            held: s.moving.as_ref().map_or_default(|m| m.pages.len() as u32),
             used: s.used_units * UNIT,
         };
         drop(s);
@@ -1466,7 +1466,9 @@ pub(crate) fn build_pages(
             let c = &p.clusters[local];
             ClasSource {
                 page: p.page,
-                micromap: micromaps[pi].as_ref().map_or(0, |m| m.micromap.address().0),
+                micromap: micromaps[pi]
+                    .as_ref()
+                    .map_or_default(|m| m.micromap.address().0),
                 cluster: c,
                 cluster_id: p.cluster_base + local as u32,
                 step: p.step,

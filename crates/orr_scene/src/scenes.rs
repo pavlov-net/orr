@@ -895,7 +895,7 @@ impl Scenes {
         let ranks = |m: ModelId| {
             core.model_cpu
                 .get(m.0 as usize)
-                .map_or(0, |c| c.emissive_sections)
+                .map_or_default(|c| c.emissive_sections)
         };
         let stride = chain
             .iter()
@@ -904,7 +904,7 @@ impl Scenes {
         let held = core
             .model_cpu
             .get(model.0 as usize)
-            .map_or(0, |c| c.emissive_stride);
+            .map_or_default(|c| c.emissive_stride);
         if stride > held {
             let frame = core.next_frame - 1;
             // A page's other prototypes keep what they hold.
@@ -1685,7 +1685,7 @@ impl Core {
                 let distance = cpu
                     .focus
                     .filter(|_| !hung)
-                    .map_or(0.0, |f| (f.distance(center) - radius).max(0.0));
+                    .map_or_default(|f| (f.distance(center) - radius).max(0.0));
                 let e = wanted.entry(page).or_insert(f64::INFINITY);
                 *e = e.min(distance / edge);
             }
@@ -2232,7 +2232,7 @@ impl<'a> Frame<'a> {
                 let records = cpu.groups[p.group.0 as usize]
                     .as_ref()
                     .and_then(|g| g.page.as_ref())
-                    .map_or(0, |g| g.records);
+                    .map_or_default(|g| g.records);
                 if records == 0 {
                     continue;
                 }
@@ -2294,7 +2294,7 @@ impl<'a> Frame<'a> {
                 let records = cpu.groups[m.records.0 as usize]
                     .as_ref()
                     .and_then(|g| g.page.as_ref())
-                    .map_or(0, |g| g.records);
+                    .map_or_default(|g| g.records);
                 let page = core.mounts.page(m.page);
                 let row_size = size_of::<orr_pack::instance::MotionRow>() as u64;
                 // The address of interval `k`'s rows, 0 while its window is not resident.

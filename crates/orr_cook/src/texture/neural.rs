@@ -241,25 +241,23 @@ impl NeuralJob {
             return Err(self.fail("neural set members differ in mip count".into()));
         }
         // Per mip, the members' channels interleaved, linear; signed ones at 0.5 v + 0.5.
-        let data: Vec<Vec<f32>> = (0..mips)
-            .map(|mip| {
-                let texels = chains[0][mip].px.len();
-                let mut out = Vec::with_capacity(texels * channels);
-                for t in 0..texels {
-                    for (c, &(_, n, stored)) in chains.iter().zip(&layout) {
-                        let px = c[mip].px[t];
-                        for v in &px[..usize::from(n)] {
-                            out.push(if stored == NeuralTexture::SIGNED {
-                                0.5 * v.clamp(-1.0, 1.0) + 0.5
-                            } else {
-                                v.clamp(0.0, 1.0)
-                            });
-                        }
+        let data: Vec<Vec<f32>> = Vec::from_fn(mips, |mip| {
+            let texels = chains[0][mip].px.len();
+            let mut out = Vec::with_capacity(texels * channels);
+            for t in 0..texels {
+                for (c, &(_, n, stored)) in chains.iter().zip(&layout) {
+                    let px = c[mip].px[t];
+                    for v in &px[..usize::from(n)] {
+                        out.push(if stored == NeuralTexture::SIGNED {
+                            0.5 * v.clamp(-1.0, 1.0) + 0.5
+                        } else {
+                            v.clamp(0.0, 1.0)
+                        });
                     }
                 }
-                out
-            })
-            .collect();
+            }
+            out
+        });
         let srgb: Vec<bool> = layout
             .iter()
             .flat_map(|&(_, n, stored)| (0..n).map(move |_| stored == NeuralTexture::SRGB))
@@ -312,9 +310,7 @@ impl NeuralJob {
                 .map(move |&v| if srgb { linear_to_srgb(v) } else { v })
         };
         let decoded = |c: usize| out.decoded.iter().skip(c).step_by(channels).copied();
-        let channel_psnr: Vec<f32> = (0..channels)
-            .map(|c| psnr(reference(c), decoded(c)))
-            .collect();
+        let channel_psnr: Vec<f32> = Vec::from_fn(channels, |c| psnr(reference(c), decoded(c)));
 
         let weight_bytes: u64 = out.weights.iter().map(|w| w.data.len() as u64).sum();
         let latent_bytes: u64 = out.latents.iter().flatten().map(|l| l.len() as u64).sum();

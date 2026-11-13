@@ -553,7 +553,7 @@ impl MediaKernels {
     ) -> FroxelRoot {
         let settings = &lighting.media;
         let v = media.volumes.as_ref();
-        let [columns, rows, slices] = v.map_or([0; 3], |v| v.shape.grid);
+        let [columns, rows, slices] = v.map_or_default(|v| v.shape.grid);
         let (cur, prev) = (media.current, 1 - media.current);
         let pair = |t: Option<&Volume>| {
             t.map_or((StorageImageIndex::NONE, TextureIndex::NONE), |t| {
@@ -643,7 +643,7 @@ impl MediaKernels {
         let held = media.volumes.as_ref().filter(|_| readers.any());
         let v = held.filter(|_| readers.lit);
         let fog = held.filter(|_| readers.fogged);
-        let [columns, rows, slices] = held.map_or([0; 3], |v| v.shape.grid);
+        let [columns, rows, slices] = held.map_or_default(|v| v.shape.grid);
         let current = |p: &[Volume; 2]| p[media.current].sampled;
         ParticleLighting {
             scene: pass.scene,

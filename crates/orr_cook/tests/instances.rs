@@ -154,33 +154,31 @@ fn fixture_page_decodes_within_its_error_bounds() {
     let cell = [-3, 0, 7];
     let corner = DVec3::new(-768.0, 0.0, 1792.0);
     let n = 6000;
-    let records: Vec<Placement> = (0..n)
-        .map(|i| Placement {
-            position: (corner
-                + DVec3::new(
-                    rng.range(3.0, 250.0),
-                    rng.range(10.0, 40.0),
-                    rng.range(0.0, 256.0),
-                ))
+    let records: Vec<Placement> = Vec::from_fn(n, |i| Placement {
+        position: (corner
+            + DVec3::new(
+                rng.range(3.0, 250.0),
+                rng.range(10.0, 40.0),
+                rng.range(0.0, 256.0),
+            ))
+        .to_array(),
+        linear: Linear::Scaled {
+            rotation: rotation(&mut rng).to_array(),
+            scale: (if i.is_multiple_of(4) {
+                Vec3::ONE
+            } else if i.is_multiple_of(3) {
+                Vec3::splat(rng.range(0.5, 2.0) as f32)
+            } else {
+                Vec3::new(
+                    rng.range(0.6, 1.8) as f32,
+                    rng.range(0.6, 1.8) as f32,
+                    rng.range(0.6, 1.8) as f32,
+                )
+            })
             .to_array(),
-            linear: Linear::Scaled {
-                rotation: rotation(&mut rng).to_array(),
-                scale: (if i % 4 == 0 {
-                    Vec3::ONE
-                } else if i % 3 == 0 {
-                    Vec3::splat(rng.range(0.5, 2.0) as f32)
-                } else {
-                    Vec3::new(
-                        rng.range(0.6, 1.8) as f32,
-                        rng.range(0.6, 1.8) as f32,
-                        rng.range(0.6, 1.8) as f32,
-                    )
-                })
-                .to_array(),
-            },
-            prototype: (i % 3) as u16,
-        })
-        .collect();
+        },
+        prototype: (i % 3) as u16,
+    });
     let stride = 4;
     let user: Vec<u8> = (0..n as u32).flat_map(u32::to_le_bytes).collect();
     let prototypes = vec![
@@ -1037,23 +1035,21 @@ fn a_ring_of_wedges_meets_across_pages() {
     let (centered, _) = wedge(step, center);
     let pivot = DVec3::new(259.0, 3.0, 100.0);
     let turn = |k: usize| Quat::from_rotation_y((step * k as f32).to_radians());
-    let records: Vec<Placement> = (0..16)
-        .map(|k| {
-            let (position, prototype) = if k < 8 {
-                (pivot, 0)
-            } else {
-                (pivot + (turn(k) * center).as_dvec3(), 1)
-            };
-            Placement {
-                position: position.to_array(),
-                linear: Linear::Scaled {
-                    rotation: turn(k).to_array(),
-                    scale: [1.0; 3],
-                },
-                prototype,
-            }
-        })
-        .collect();
+    let records: Vec<Placement> = Vec::from_fn(16, |k| {
+        let (position, prototype) = if k < 8 {
+            (pivot, 0)
+        } else {
+            (pivot + (turn(k) * center).as_dvec3(), 1)
+        };
+        Placement {
+            position: position.to_array(),
+            linear: Linear::Scaled {
+                rotation: turn(k).to_array(),
+                scale: [1.0; 3],
+            },
+            prototype,
+        }
+    });
     let a = cook(vec![
         mesh_asset("kit/wedge", ring),
         mesh_asset("kit/wedge-centered", centered),
@@ -1135,20 +1131,18 @@ fn a_field_of_small_copies_stays_compact() {
         sections: vec![Span { first: 0, count: 6 }],
         ..Default::default()
     };
-    let records: Vec<Placement> = (0..5000)
-        .map(|_| Placement {
-            position: [
-                rng.range(0.0, 256.0),
-                rng.range(0.0, 30.0),
-                rng.range(0.0, 256.0),
-            ],
-            linear: Linear::Scaled {
-                rotation: rotation(&mut rng).to_array(),
-                scale: [rng.range(0.9, 1.1) as f32; 3],
-            },
-            prototype: 0,
-        })
-        .collect();
+    let records: Vec<Placement> = Vec::from_fn(5000, |_| Placement {
+        position: [
+            rng.range(0.0, 256.0),
+            rng.range(0.0, 30.0),
+            rng.range(0.0, 256.0),
+        ],
+        linear: Linear::Scaled {
+            rotation: rotation(&mut rng).to_array(),
+            scale: [rng.range(0.9, 1.1) as f32; 3],
+        },
+        prototype: 0,
+    });
     let a = cook(vec![
         mesh_asset("kit/pebble", pebble),
         AssetSpec {

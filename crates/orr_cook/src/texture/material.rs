@@ -476,7 +476,7 @@ impl ImageFile {
     fn len(&self) -> u64 {
         match &self.data {
             ImageData::Bytes(b) => b.len() as u64,
-            ImageData::File { read, .. } => read.map_or(0, |r| r.1),
+            ImageData::File { read, .. } => read.map_or_default(|r| r.1),
             ImageData::Unread(_) | ImageData::Solid(_) | ImageData::Tiles(_) => 0,
         }
     }
@@ -1814,7 +1814,7 @@ impl<'a> Packer<'a> {
         let r = &r;
         let map = r.remap.expect("a normal map reads through a remap");
         let flat = [0, 1, 2].map(|c| ([0.0, 0.0, 1.0][c] - map[c][0]) / map[c][1]);
-        let mut consts: Vec<Option<f32>> = (0..3).map(|c| self.constant(r, c)).collect();
+        let mut consts: Vec<Option<f32>> = Vec::from_fn(3, |c| self.constant(r, c));
         // A two-channel image's blue is no z, so x and y alone say whether it is flat.
         if source.rg {
             consts[2] = Some(flat[2]);

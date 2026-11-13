@@ -36,7 +36,7 @@ unsafe extern "system" fn callback(
     user: *mut c_void,
 ) -> vk::Bool32 {
     // SAFETY: the loader passes valid callback data for the duration of the call.
-    let data = unsafe { &*data };
+    let data = unsafe { data.as_ref_unchecked() };
     let text = |p: *const std::ffi::c_char| {
         if p.is_null() {
             String::new()
@@ -74,7 +74,7 @@ unsafe extern "system" fn callback(
         log::warn!("{id}: {message}");
     }
     // SAFETY: `user` is the `MessageCount` the messenger was created with, which outlives it.
-    unsafe { &*user.cast::<MessageCount>() }
+    unsafe { user.cast::<MessageCount>().as_ref_unchecked() }
         .0
         .fetch_add(1, Ordering::Relaxed);
     vk::FALSE

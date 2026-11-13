@@ -30,7 +30,7 @@ fn normals(count: usize) -> Vec<[f32; 3]> {
 fn oct_normal_and_tangent_codes_match_orr_pack_bit_for_bit() {
     for (i, n) in normals(200_000).into_iter().enumerate() {
         assert_eq!(oct_encode_snorm16(n), mesh::oct_encode(n), "{n:?}");
-        let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+        let sign = if i.is_multiple_of(2) { 1.0 } else { -1.0 };
         let (a, b) = (
             oct_encode_tangent(n, sign),
             mesh::oct_encode_tangent(n, sign),
@@ -118,16 +118,14 @@ fn page(clusters: &[TestCluster]) -> Vec<u8> {
 fn mesh_page_decode_matches_orr_pack_bit_for_bit() {
     let mut rng = Rng::new(3);
     let limit = (1 << 23) - 65536;
-    let clusters: Vec<_> = (0..64)
-        .map(|_| {
-            let anchor = [0; 3].map(|_: i32| (rng.next_u32() % (2 * limit as u32)) as i32 - limit);
-            let count = 1 + rng.next_u32() as usize % 255;
-            let vertices = (0..count)
-                .map(|_| ([0; 3].map(|_: u16| rng.next_u32() as u16), rng.next_u32()))
-                .collect();
-            (anchor, vertices)
-        })
-        .collect();
+    let clusters: Vec<_> = Vec::from_fn(64, |_| {
+        let anchor = [0; 3].map(|_: i32| (rng.next_u32() % (2 * limit as u32)) as i32 - limit);
+        let count = 1 + rng.next_u32() as usize % 255;
+        let vertices = (0..count)
+            .map(|_| ([0; 3].map(|_: u16| rng.next_u32() as u16), rng.next_u32()))
+            .collect();
+        (anchor, vertices)
+    });
     let bytes = page(&clusters);
     for k in [-24i8, -13, -7, -1, 0, 3, 8] {
         let mesh_header = MeshHeader {

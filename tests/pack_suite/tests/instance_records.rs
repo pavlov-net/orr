@@ -148,58 +148,56 @@ impl Rng {
 /// Placements over three cells (one negative), random rotations of either sign, some about
 /// the axes only, and uniform and non-uniform scales, every fifth sheared.
 fn scattered(rng: &mut Rng) -> Vec<Placement> {
-    (0..5000)
-        .map(|i| {
-            let rotation = if i % 7 == 0 {
-                let turn = |r: &mut Rng| (90.0 * (r.next() % 4) as f32).to_radians();
-                Quat::from_rotation_y(turn(rng)) * Quat::from_rotation_x(turn(rng))
-            } else {
-                let q = Quat::from_xyzw(
-                    rng.range(-1.0, 1.0) as f32,
-                    rng.range(-1.0, 1.0) as f32,
-                    rng.range(-1.0, 1.0) as f32,
-                    rng.range(-1.0, 1.0) as f32,
-                )
-                .normalize();
-                if i % 2 == 0 { -q } else { q }
-            };
-            let scale = if i % 4 == 1 {
-                Vec3::ONE
-            } else if i % 3 == 0 {
-                Vec3::splat(rng.range(0.25, 4.0) as f32)
-            } else {
-                Vec3::new(
-                    rng.range(0.5, 2.0) as f32,
-                    rng.range(0.5, 2.0) as f32,
-                    rng.range(0.5, 2.0) as f32,
-                )
-            };
-            let linear = if i % 5 == 0 {
-                let shear = Mat3::from_cols(
-                    Vec3::X,
-                    Vec3::new(rng.range(0.1, 1.0) as f32, 1.0, 0.0),
-                    Vec3::Z,
-                );
-                let m = Mat3::from_quat(rotation) * shear * Mat3::from_diagonal(scale);
-                Linear::Matrix(m.to_cols_array_2d())
-            } else {
-                Linear::Scaled {
-                    rotation: rotation.to_array(),
-                    scale: scale.to_array(),
-                }
-            };
-            Placement {
-                position: DVec3::new(
-                    rng.range(-300.0, 500.0),
-                    rng.range(-20.0, 60.0),
-                    rng.range(-100.0, 100.0),
-                )
-                .to_array(),
-                linear,
-                prototype: 0,
+    Vec::from_fn(5000, |i| {
+        let rotation = if i.is_multiple_of(7) {
+            let turn = |r: &mut Rng| (90.0 * (r.next() % 4) as f32).to_radians();
+            Quat::from_rotation_y(turn(rng)) * Quat::from_rotation_x(turn(rng))
+        } else {
+            let q = Quat::from_xyzw(
+                rng.range(-1.0, 1.0) as f32,
+                rng.range(-1.0, 1.0) as f32,
+                rng.range(-1.0, 1.0) as f32,
+                rng.range(-1.0, 1.0) as f32,
+            )
+            .normalize();
+            if i.is_multiple_of(2) { -q } else { q }
+        };
+        let scale = if i % 4 == 1 {
+            Vec3::ONE
+        } else if i.is_multiple_of(3) {
+            Vec3::splat(rng.range(0.25, 4.0) as f32)
+        } else {
+            Vec3::new(
+                rng.range(0.5, 2.0) as f32,
+                rng.range(0.5, 2.0) as f32,
+                rng.range(0.5, 2.0) as f32,
+            )
+        };
+        let linear = if i.is_multiple_of(5) {
+            let shear = Mat3::from_cols(
+                Vec3::X,
+                Vec3::new(rng.range(0.1, 1.0) as f32, 1.0, 0.0),
+                Vec3::Z,
+            );
+            let m = Mat3::from_quat(rotation) * shear * Mat3::from_diagonal(scale);
+            Linear::Matrix(m.to_cols_array_2d())
+        } else {
+            Linear::Scaled {
+                rotation: rotation.to_array(),
+                scale: scale.to_array(),
             }
-        })
-        .collect()
+        };
+        Placement {
+            position: DVec3::new(
+                rng.range(-300.0, 500.0),
+                rng.range(-20.0, 60.0),
+                rng.range(-100.0, 100.0),
+            )
+            .to_array(),
+            linear,
+            prototype: 0,
+        }
+    })
 }
 
 /// Placements on the piece's 2^-11 m grid, turned by multiples of 90 degrees.

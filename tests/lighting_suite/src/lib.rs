@@ -151,12 +151,10 @@ pub(crate) struct Workers {
 impl Workers {
     pub(crate) fn start(scenes: &Scenes) -> Self {
         let loading = scenes.loading();
-        let threads = (0..2)
-            .map(|_| {
-                let l = Arc::clone(&loading);
-                std::thread::spawn(move || l.run_worker())
-            })
-            .collect();
+        let threads = Vec::from_fn(2, |_| {
+            let l = Arc::clone(&loading);
+            std::thread::spawn(move || l.run_worker())
+        });
         Self { loading, threads }
     }
 }

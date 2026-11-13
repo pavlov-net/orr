@@ -14,9 +14,9 @@ impl Rng {
 /// A resident page of `clusters` random clusters with `attr_stride`-byte attributes, high
 /// halves when `highs`, and an OMM region of `omm` bytes.
 fn page(rng: &mut Rng, clusters: usize, attr_stride: usize, highs: bool, omm: usize) -> Vec<u8> {
-    let counts: Vec<(usize, usize)> = (0..clusters)
-        .map(|_| (3 + rng.next() as usize % 254, 1 + rng.next() as usize % 128))
-        .collect();
+    let counts: Vec<(usize, usize)> = Vec::from_fn(clusters, |_| {
+        (3 + rng.next() as usize % 254, 1 + rng.next() as usize % 128)
+    });
     let slots: usize = counts.iter().map(|c| c.0.next_multiple_of(2)).sum();
     let tris: usize = counts.iter().map(|c| (c.1 * 3).next_multiple_of(4)).sum();
     let positions = size_of::<PageHeader>() + clusters * size_of::<Cluster>();
@@ -238,7 +238,7 @@ fn clas_truncation_keeps_every_cell_of_a_box() {
 fn axes_round_trip_exactly_through_the_normal_and_tangent_codes() {
     for a in 0..6 {
         let mut n = [0.0f32; 3];
-        n[a / 2] = if a % 2 == 0 { 1.0 } else { -1.0 };
+        n[a / 2] = if a.is_multiple_of(2) { 1.0 } else { -1.0 };
         assert_eq!(mesh::oct_decode(mesh::oct_encode(n)), n, "normal {n:?}");
         for sign in [1.0, -1.0] {
             let [x, y, z, s] = mesh::oct_decode_tangent(mesh::oct_encode_tangent(n, sign));

@@ -311,7 +311,7 @@ impl AtmosphereState {
         let up = d.up.normalize().as_dvec3();
         let ceiling = f64::from(d.top_radius - d.planet_radius) - 1.0;
         let altitude = |p: DVec3| ((p - d.planet_top).dot(up)).clamp(0.0, ceiling) as f32;
-        let focus = cx.focus.map_or(0.0, |(focus, _)| altitude(focus));
+        let focus = cx.focus.map_or_default(|(focus, _)| altitude(focus));
         let r = &mut self.record;
         let views = 1 + assign_views(
             focus,

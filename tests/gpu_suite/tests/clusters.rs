@@ -226,7 +226,14 @@ fn clas_alpha() {
     mixed.base_geom = 20;
     mixed.tri_gflags = Some(
         (0..mixed.tris.len() as u32)
-            .map(|t| (t % 4) | if t % 4 == 0 { GEOMETRY_OPAQUE << 29 } else { 0 })
+            .map(|t| {
+                (t % 4)
+                    | if t.is_multiple_of(4) {
+                        GEOMETRY_OPAQUE << 29
+                    } else {
+                        0
+                    }
+            })
             .collect(),
     );
     let rect = [0.05, 0.52, 0.95, 0.95];
@@ -293,7 +300,7 @@ fn clas_omm() {
     front.geom_flags = GEOMETRY_CULL_DISABLE;
     front.base_geom = 2;
     let table: [i32; 8] = [-1, -2, -3, 0, 1, 3, -5, 2];
-    front.omm_index = Some((0..front.tris.len()).map(|t| table[t % 8]).collect());
+    front.omm_index = Some(Vec::from_fn(front.tris.len(), |t| table[t % 8]));
     let clusters = vec![front, back_cluster()];
     let flags = data_flags() | RtasFlags::ALLOW_OMM;
     let clas = b.build_clas(&clusters, flags, micromap.address().0, None, None);
@@ -604,14 +611,12 @@ struct Segment {
 /// 24 segments alternating in front of the cluster instance (z 0.12) and behind it (z 0.6).
 fn segments() -> Vec<Segment> {
     let mut rnd = noise(0x2545_f491);
-    (0..24)
-        .map(|i| Segment {
-            a: [0.05 + 0.9 * rnd(), 0.05 + 0.9 * rnd()],
-            b: [0.05 + 0.9 * rnd(), 0.05 + 0.9 * rnd()],
-            z: if i % 2 == 0 { 0.12 } else { 0.6 },
-            r: 0.008 + 0.022 * rnd(),
-        })
-        .collect()
+    Vec::from_fn(24, |i| Segment {
+        a: [0.05 + 0.9 * rnd(), 0.05 + 0.9 * rnd()],
+        b: [0.05 + 0.9 * rnd(), 0.05 + 0.9 * rnd()],
+        z: if i.is_multiple_of(2) { 0.12 } else { 0.6 },
+        r: 0.008 + 0.022 * rnd(),
+    })
 }
 
 enum Want {

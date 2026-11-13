@@ -312,9 +312,7 @@ fn a_model_mixing_classes_traces_each_cluster_by_its_class() {
     );
     let mut bed = Bed::with(spec);
     let settings = paths(reference(2));
-    let frames: Vec<f64> = (0..8)
-        .map(|_| center(&render_paths(&mut bed, &settings, 4), 8)[1])
-        .collect();
+    let frames: Vec<f64> = Vec::from_fn(8, |_| center(&render_paths(&mut bed, &settings, 4), 8)[1]);
     let (f, t) = (fresnel(1.5, 1.0), 0.5);
     let through = (1.0 - f) * (1.0 - f) * t / (1.0 - f * f * t * t);
     assert_mean(
@@ -342,9 +340,7 @@ fn an_emitter_inside_glass_reaches_the_eye_by_beer_and_the_squared_ior() {
     );
     let mut bed = Bed::with(spec);
     let settings = paths(reference(2));
-    let frames: Vec<f64> = (0..8)
-        .map(|_| center(&render_paths(&mut bed, &settings, 4), 8)[1])
-        .collect();
+    let frames: Vec<f64> = Vec::from_fn(8, |_| center(&render_paths(&mut bed, &settings, 4), 8)[1]);
     let beer = 0.5f64.powf(0.5 * f64::from(SLAB_THICKNESS) / 0.3);
     let enter = 1.0 - fresnel(1.5, 1.0);
     let l = f64::from(EMITTER_LUMINANCE) * enter * beer / (1.5 * 1.5);

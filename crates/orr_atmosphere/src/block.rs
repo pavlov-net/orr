@@ -70,7 +70,7 @@ pub(crate) fn groups(a: &Atmosphere) -> [AtmosphereGroups; PASSES] {
     let density = f64::from(a.rayleigh.density);
     let ozone = ozone_peak(a);
     let ground = rec2020(a.ground_albedo);
-    let fog = a.height_fog.map_or([0.0; 3], |f| rec2020(f.albedo));
+    let fog = a.height_fog.map_or_default(|f| rec2020(f.albedo));
     std::array::from_fn(|p| {
         let per = |f: &dyn Fn(usize) -> f64| xyz(std::array::from_fn(|j| f(3 * p + j)));
         AtmosphereGroups {
@@ -112,7 +112,7 @@ pub(crate) fn medium(a: &Atmosphere, out: &mut AtmosphereGpu) {
         aod * RGB.aerosol_factor(c, alpha) * f64::from(a.aerosol.single_scattering_albedo)
     });
     out.ozone = band(&|c| RGB.ozone_cross_section[c] * ozone);
-    out.fog_albedo = xyz(a.height_fog.map_or([0.0; 3], |f| rec2020(f.albedo)));
+    out.fog_albedo = xyz(a.height_fog.map_or_default(|f| rec2020(f.albedo)));
     out.planet_radius = a.planet_radius;
     out.top_radius = a.top_radius;
     out.rayleigh_scale = a.rayleigh.scale_height;
@@ -126,8 +126,8 @@ pub(crate) fn medium(a: &Atmosphere, out: &mut AtmosphereGpu) {
         0.0
     };
     let fog = a.height_fog.filter(|f| f.density > 0.0);
-    out.fog_density = fog.map_or(0.0, |f| f.density);
-    out.fog_base = fog.map_or(0.0, |f| f.base_height);
+    out.fog_density = fog.map_or_default(|f| f.density);
+    out.fog_base = fog.map_or_default(|f| f.base_height);
     out.fog_falloff = fog.map_or(1.0, |f| f.falloff_height);
     out.fog_diameter = fog.map_or(10.0, |f| f.droplet_diameter);
     out.sky_lights = a.sky_lights;

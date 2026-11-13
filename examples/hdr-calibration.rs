@@ -117,7 +117,7 @@ mod run {
             let (label, request) = requests[step];
             if *display.request() != request {
                 display.set_request(&request);
-                let size = if step % 2 == 0 {
+                let size = if step.is_multiple_of(2) {
                     [1920, 1080]
                 } else {
                     [960, 600]
@@ -205,7 +205,7 @@ mod run {
             last = Some(f.end().expect("end frame"));
 
             // The first frame of each pattern presents at the encoding and extent it resolved.
-            if i % frames_per_pattern == 0 {
+            if i.is_multiple_of(frames_per_pattern) {
                 display.wait_idle();
                 let p = display.last_presented().expect("presented");
                 assert_eq!(p.frame, id);

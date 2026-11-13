@@ -160,7 +160,7 @@ pub fn upsample(
                 tent += w * coarse.sample(p);
             }
         }
-        own.map_or(0.0, |(p, w)| w * p.get(x, y)) + coarse_weight * tent
+        own.map_or_default(|(p, w)| w * p.get(x, y)) + coarse_weight * tent
     })
 }
 
@@ -171,9 +171,7 @@ pub fn levels(extent: [u32; 2], first_level: u32) -> Vec<[u32; 2]> {
     let first = extent.map(|n| (n >> first_level).max(1));
     let max = (LAST_LEVEL + 1 - first_level) as usize;
     let fit = first[0].min(first[1]).bit_width() as usize;
-    (0..max.min(fit))
-        .map(|m| first.map(|n| (n >> m).max(1)))
-        .collect()
+    Vec::from_fn(max.min(fit), |m| first.map(|n| (n >> m).max(1)))
 }
 
 /// The chain's downsampled levels of `input`.

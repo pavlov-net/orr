@@ -317,21 +317,17 @@ fn partitions_are_the_largest_fitting_morton_cells_and_cut_one_position_in_order
         let centers: Vec<[u32; 3]> = (0..1 + rng.next() % 8)
             .map(|_| [0; 3].map(|_: u8| rng.next() as u32 >> 11))
             .collect();
-        let mut codes: Vec<u64> = (0..n)
-            .map(|_| {
-                let c = centers[(rng.next() % centers.len() as u64) as usize];
-                let spread = 1u64 << (10 + rng.next() % 12);
-                instance::morton(c.map(|v| (v + (rng.next() % spread) as u32) & 0x1f_ffff))
-            })
-            .collect();
+        let mut codes: Vec<u64> = Vec::from_fn(n, |_| {
+            let c = centers[(rng.next() % centers.len() as u64) as usize];
+            let spread = 1u64 << (10 + rng.next() % 12);
+            instance::morton(c.map(|v| (v + (rng.next() % spread) as u32) & 0x1f_ffff))
+        });
         codes.sort_unstable();
-        let costs: Vec<u32> = (0..n)
-            .map(|_| match round % 3 {
-                0 => 1,
-                1 => 1 + (rng.next() % 33) as u32,
-                _ => [1, 1, 1, 241][(rng.next() % 4) as usize],
-            })
-            .collect();
+        let costs: Vec<u32> = Vec::from_fn(n, |_| match round % 3 {
+            0 => 1,
+            1 => 1 + (rng.next() % 33) as u32,
+            _ => [1, 1, 1, 241][(rng.next() % 4) as usize],
+        });
         let starts = instance::partitions(&codes, &costs, 1000);
         check_partitions(&codes, &costs, &starts, 1000);
     }

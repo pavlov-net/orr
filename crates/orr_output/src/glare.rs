@@ -175,23 +175,21 @@ impl GlareKernels {
                 ..base
             }
         };
-        let mut roots: Vec<Root> = (0..targets.sizes.len())
-            .map(|m| {
-                let (source, [w, h], stride) = if m == 0 {
-                    let stride = (1u32 << (targets.first_level - 1)) as f32;
-                    (pass.source, pass.extent, stride)
-                } else {
-                    (targets.chain.sampled, targets.sizes[m - 1], 1.0)
-                };
-                Root {
-                    source,
-                    source_texel_x: 1.0 / w as f32,
-                    source_texel_y: 1.0 / h as f32,
-                    stride,
-                    ..at(m)
-                }
-            })
-            .collect();
+        let mut roots: Vec<Root> = Vec::from_fn(targets.sizes.len(), |m| {
+            let (source, [w, h], stride) = if m == 0 {
+                let stride = (1u32 << (targets.first_level - 1)) as f32;
+                (pass.source, pass.extent, stride)
+            } else {
+                (targets.chain.sampled, targets.sizes[m - 1], 1.0)
+            };
+            Root {
+                source,
+                source_texel_x: 1.0 / w as f32,
+                source_texel_y: 1.0 / h as f32,
+                stride,
+                ..at(m)
+            }
+        });
         roots.extend((0..targets.sizes.len() - 1).rev().map(|m| Root {
             source: targets.chain.sampled,
             ..at(m)

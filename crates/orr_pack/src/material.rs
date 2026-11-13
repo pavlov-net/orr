@@ -226,7 +226,7 @@ impl Material {
             .into_iter()
             .find(|&s| self.tangent_map(s));
         match self.frame_uv {
-            Self::FRAME_NORMAL_MAP => map.map_or(0, |s| self.textures[s].uv_set & 1),
+            Self::FRAME_NORMAL_MAP => map.map_or_default(|s| self.textures[s].uv_set & 1),
             f => f - 1,
         }
     }

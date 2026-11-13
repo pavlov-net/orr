@@ -830,16 +830,14 @@ mod tests {
     /// Leaves as random ellipses with soft edges on a clear background.
     fn foliage(w: u32, h: u32, seed: u64) -> Img {
         let mut r = Rng(seed);
-        let leaves: Vec<[f32; 4]> = (0..60)
-            .map(|_| {
-                [
-                    r.next() * w as f32,
-                    r.next() * h as f32,
-                    4.0 + r.next() * 18.0,
-                    1.5 + r.next() * 5.0,
-                ]
-            })
-            .collect();
+        let leaves: Vec<[f32; 4]> = Vec::from_fn(60, |_| {
+            [
+                r.next() * w as f32,
+                r.next() * h as f32,
+                4.0 + r.next() * 18.0,
+                1.5 + r.next() * 5.0,
+            ]
+        });
         let mut img = Img::new(w, h);
         for y in 0..h {
             for x in 0..w {
@@ -992,7 +990,11 @@ mod tests {
                     if (x / 48, y / 48) != (1, 0) {
                         let p = &mut img.px[(y * w + x) as usize];
                         p[0] = other;
-                        p[3] = if (x + y) % 3 == 0 { other } else { 1.0 - other };
+                        p[3] = if (x + y).is_multiple_of(3) {
+                            other
+                        } else {
+                            1.0 - other
+                        };
                     }
                 }
             }
@@ -1048,7 +1050,11 @@ mod tests {
         // code value.
         let mut img = Img::new(64, 64);
         for (i, p) in img.px.iter_mut().enumerate() {
-            let code = if (i + i / 64) % 2 == 0 { 255 } else { 0 };
+            let code = if (i + i / 64).is_multiple_of(2) {
+                255
+            } else {
+                0
+            };
             *p = [orr_color::srgb8_decode(code); 4];
         }
         for filter in [MipFilter::Box, MipFilter::Kaiser] {
@@ -1075,8 +1081,8 @@ mod tests {
         let mut normals = Img::new(w, h);
         for y in 0..h {
             for x in 0..w {
-                let sx = if x % 2 == 0 { a } else { -a };
-                let sy = if y % 2 == 0 { a } else { -a };
+                let sx = if x.is_multiple_of(2) { a } else { -a };
+                let sy = if y.is_multiple_of(2) { a } else { -a };
                 normals.px[(y * w + x) as usize] = normalized([-sx, -sy, 1.0, 1.0]);
             }
         }
@@ -1163,9 +1169,9 @@ mod tests {
             f32::NEG_INFINITY,
             f32::NAN,
         ];
-        let px: Vec<[f32; 4]> = (0..v.len().pow(3))
-            .map(|i| [v[i % 10], v[i / 10 % 10], v[i / 100], v[(i * 7) % 10]])
-            .collect();
+        let px: Vec<[f32; 4]> = Vec::from_fn(v.len().pow(3), |i| {
+            [v[i % 10], v[i / 10 % 10], v[i / 100], v[(i * 7) % 10]]
+        });
         let detected = fearless_simd::Level::new();
         #[allow(unused_mut, reason = "x86 adds the levels below the detected one")]
         let mut levels = vec![detected];

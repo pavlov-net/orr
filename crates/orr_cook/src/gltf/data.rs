@@ -167,7 +167,7 @@ fn check_morph_weights(doc: &gltf::Document) -> Result<(), String> {
         check("mesh", mesh.index(), mesh.weights(), n)?;
     }
     for node in doc.nodes() {
-        let n = node.mesh().map_or(0, |m| targets(&m));
+        let n = node.mesh().map_or_default(|m| targets(&m));
         check("node", node.index(), node.weights(), n)?;
     }
     Ok(())
@@ -321,7 +321,7 @@ impl Document {
     /// The morph targets of primitive `prim` of mesh `mesh`.
     fn morph_targets(&self, mesh: usize, prim: usize) -> &[Value] {
         let targets = self.json["meshes"][mesh]["primitives"][prim]["targets"].as_array();
-        targets.map_or(&[], Vec::as_slice)
+        targets.map_or_default(Vec::as_slice)
     }
 
     fn accessor(&self, json: &Value) -> Option<gltf::Accessor<'_>> {
@@ -665,8 +665,8 @@ fn decode_view(e: &Value, src: &[u8], length: usize) -> Result<Vec<u8>, String> 
     let mode = e["mode"].as_str().unwrap_or_default();
     let filter = e["filter"].as_str().unwrap_or("NONE");
     let valid = match mode {
-        "ATTRIBUTES" => stride % 4 == 0 && (4..=256).contains(&stride),
-        "TRIANGLES" => (stride == 2 || stride == 4) && count % 3 == 0,
+        "ATTRIBUTES" => stride.is_multiple_of(4) && (4..=256).contains(&stride),
+        "TRIANGLES" => (stride == 2 || stride == 4) && count.is_multiple_of(3),
         "INDICES" => stride == 2 || stride == 4,
         _ => false,
     } && match filter {

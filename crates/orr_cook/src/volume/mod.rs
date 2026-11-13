@@ -166,7 +166,7 @@ pub(crate) fn plan<'m>(
         VolumeInput::Vdb { path } => {
             let hash = memo.hash(path)?;
             key = key.str("vdb").hash(hash);
-            let len = std::fs::metadata(path).map_or(0, |m| m.len());
+            let len = std::fs::metadata(path).map_or_default(|m| m.len());
             (Some(hash), 24 * len + (64 << 20), Some(path.clone()))
         }
         VolumeInput::Grids(g) => {
@@ -339,12 +339,10 @@ fn gather(g: &SourceGrid) -> Bricks {
         .par_iter()
         .filter_map(|&c| {
             let first = c.map(|x| i64::from(x) * i64::from(BRICK) - 1);
-            let texels: Vec<f32> = (0..BRICK_TEXEL_COUNT)
-                .map(|i| {
-                    let t = [i % n, i / n % n, i / (n * n)];
-                    g.voxel([0, 1, 2].map(|a| first[a] + t[a] as i64))
-                })
-                .collect();
+            let texels: Vec<f32> = Vec::from_fn(BRICK_TEXEL_COUNT, |i| {
+                let t = [i % n, i / n % n, i / (n * n)];
+                g.voxel([0, 1, 2].map(|a| first[a] + t[a] as i64))
+            });
             texels
                 .iter()
                 .any(|&v| v != g.background)

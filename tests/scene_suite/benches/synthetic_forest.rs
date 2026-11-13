@@ -607,12 +607,10 @@ struct Workers {
 
 impl Workers {
     fn new(loading: Arc<Loading>) -> Self {
-        let threads = (0..4)
-            .map(|_| {
-                let l = Arc::clone(&loading);
-                std::thread::spawn(move || l.run_worker())
-            })
-            .collect();
+        let threads = Vec::from_fn(4, |_| {
+            let l = Arc::clone(&loading);
+            std::thread::spawn(move || l.run_worker())
+        });
         Self { loading, threads }
     }
 }
@@ -1120,10 +1118,7 @@ fn ptlas_sweep(device: &'static Device, pack: &Arc<[u8]>, args: &Args) {
     for &k in &counts {
         for (layout, chosen) in [
             // One tree per stride: writes spread over every partition.
-            (
-                "scattered",
-                (0..k).map(|i| i * trees / k).collect::<Vec<_>>(),
-            ),
+            ("scattered", Vec::from_fn(k, |i| i * trees / k)),
             // Consecutive trees: writes fill whole partitions.
             ("aligned", (0..k).collect()),
         ] {
@@ -1202,7 +1197,7 @@ fn cpu_sweep(device: &'static Device, pack: &Arc<[u8]>, args: &Args) {
         let mut streaming: Option<MountId> = None;
         let mut last = None;
         for i in 0..frames {
-            if i % 20 == 0 {
+            if i.is_multiple_of(20) {
                 match streaming.take() {
                     Some(m) => forest.r.unmount(m),
                     None => streaming = Some(forest.r.mount(PackSource::Memory(Arc::clone(&pack)))),

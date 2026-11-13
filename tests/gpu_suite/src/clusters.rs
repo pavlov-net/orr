@@ -143,7 +143,7 @@ pub fn grid(
             let a = j * (nx + 1) + i;
             let (b, c) = (a + 1, a + nx + 1);
             let d = c + 1;
-            if (i + j) % 2 == 0 {
+            if (i + j).is_multiple_of(2) {
                 tris.push([a, b, d]);
                 tris.push([a, d, c]);
             } else {
@@ -245,7 +245,7 @@ pub fn ref_tris(
         .iter()
         .enumerate()
         .map(|(t, tri)| {
-            let word = c.tri_gflags.as_ref().map_or(0, |g| g[t]);
+            let word = c.tri_gflags.as_ref().map_or_default(|g| g[t]);
             let flags = c.geom_flags | (word >> 29);
             let geometry = if flags & GEOMETRY_OPAQUE != 0 {
                 Kind::Opaque
@@ -692,9 +692,9 @@ impl Builder {
                     omm_index_format: 4,
                     vertices: verts.address().0,
                     indices: indices.address().0,
-                    triangle_flags: gflags.map_or(0, |g| g.address().0),
+                    triangle_flags: gflags.map_or_default(|g| g.address().0),
                     omm_array: if omm.is_some() { omm_array } else { 0 },
-                    omm_indices: omm.map_or(0, |g| g.address().0),
+                    omm_indices: omm.map_or_default(|g| g.address().0),
                 }
             })
             .collect()

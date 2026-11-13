@@ -184,7 +184,7 @@ fn white_point_and_correction_match_the_cpu_model() {
         let (nits, xy) = patches[i * patches.len() / (SIDE * SIDE) as usize];
         (nits, rec2020_from_xy(xy))
     };
-    let pixels: Vec<(f32, [f32; 3])> = (0..h.pixels()).map(pixel).collect();
+    let pixels: Vec<(f32, [f32; 3])> = Vec::from_fn(h.pixels(), pixel);
     h.set_image(&pixels.iter().map(|p| p.0).collect::<Vec<_>>());
     h.set_colors(Some(&pixels.iter().map(|p| p.1).collect::<Vec<_>>()));
     let sun = rec2020_from_xy(xy_at(5000.0, 0.0)).map(|c| 5e4 * c);

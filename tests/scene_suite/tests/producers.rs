@@ -2052,12 +2052,10 @@ fn closed_cages() -> CageInput {
         c.positions.extend(points.iter().map(|&p| p + at));
         base
     };
-    let cube: Vec<Vec3> = (0..8)
-        .map(|i| {
-            let b = |k: u32| if i & (1 << k) != 0 { 0.5 } else { -0.5 };
-            Vec3::new(b(0), b(1), b(2))
-        })
-        .collect();
+    let cube: Vec<Vec3> = Vec::from_fn(8, |i| {
+        let b = |k: u32| if i & (1 << k) != 0 { 0.5 } else { -0.5 };
+        Vec3::new(b(0), b(1), b(2))
+    });
     let cube_faces = [
         [0, 2, 3, 1],
         [4, 5, 7, 6],
@@ -2218,13 +2216,21 @@ fn painted_cage() -> CageInput {
                 .push(Vec3::new(centered(i), height, centered(j)));
             heights.push(Vec4::new(height, 0.0, 0.0, 0.0));
             plane.push(Vec2::new(height, 0.1 * j as f32));
-            uv_checker.push(Vec2::splat(if (i + j) % 2 == 0 { 0.25 } else { 0.75 }));
+            uv_checker.push(Vec2::splat(if (i + j).is_multiple_of(2) {
+                0.25
+            } else {
+                0.75
+            }));
             seamed.push(Vec4::new(0.0, 0.1 * i as f32, 0.15 * j as f32, 0.0));
             checker.push(Vec4::new(
                 0.0,
                 0.0,
                 0.0,
-                if (i + j) % 2 == 0 { 0.25 } else { 0.75 },
+                if (i + j).is_multiple_of(2) {
+                    0.25
+                } else {
+                    0.75
+                },
             ));
         }
     }
@@ -2363,12 +2369,10 @@ fn quilt_cage() -> CageInput {
 /// A cube of side 1 around the origin, wound outward, its top face in section 1.
 fn lidded_cage() -> CageInput {
     let mut c = CageInput {
-        positions: (0..8)
-            .map(|i| {
-                let b = |k: u32| if i & (1 << k) != 0 { 0.5 } else { -0.5 };
-                Vec3::new(b(0), b(1), b(2))
-            })
-            .collect(),
+        positions: Vec::from_fn(8, |i| {
+            let b = |k: u32| if i & (1 << k) != 0 { 0.5 } else { -0.5 };
+            Vec3::new(b(0), b(1), b(2))
+        }),
         ..CageInput::default()
     };
     for (face, section) in [

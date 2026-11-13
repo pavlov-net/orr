@@ -201,7 +201,7 @@ mod windowed {
             let mut last = None;
             for i in 0..n {
                 window.pump();
-                last = Some(r.frame(display, i % 2 == 0, i % 5 == 4));
+                last = Some(r.frame(display, i.is_multiple_of(2), i % 5 == 4));
             }
             last.unwrap()
         };

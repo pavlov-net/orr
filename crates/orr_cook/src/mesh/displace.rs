@@ -47,7 +47,7 @@ pub(super) fn bake(
         for &v in &w.indices[r] {
             let height = heights[&v];
             let frame = frames.as_ref().and_then(|f| f.get(&v)).copied();
-            let [u, t] = [&along_u, &along_v].map(|h| h.as_ref().map_or(0.0, |h| h[&v]));
+            let [u, t] = [&along_u, &along_v].map(|h| h.as_ref().map_or_default(|h| h[&v]));
             let v = v as usize;
             let e = at.entry(w.positions[v].map(f32::to_bits)).or_insert((
                 0.0,

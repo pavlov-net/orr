@@ -221,7 +221,7 @@ impl Queue {
                 .spawn(move || {
                     let queue = queue;
                     // SAFETY: the queue outlives the thread (`QueueRef`).
-                    let q = unsafe { &*queue.0 };
+                    let q = unsafe { queue.0.as_ref_unchecked() };
                     crate::name_thread!(&format!("orr {:?} queue steps", q.kind));
                     let _release = ReleaseWaiters(q);
                     for job in receive {

@@ -109,7 +109,7 @@ mod arena {
                     self.block + 1
                 };
                 if self.blocks.get(next).is_none_or(|b| !fits(b, 0)) {
-                    let last = self.blocks.last().map_or(0, Vec::len);
+                    let last = self.blocks.last().map_or_default(Vec::len);
                     let _arena = crate::job::enter(None);
                     self.blocks.truncate(next);
                     let len = words.max(MIN_BLOCK / ALIGN).max(last * 2);

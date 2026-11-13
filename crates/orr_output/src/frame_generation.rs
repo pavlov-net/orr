@@ -250,7 +250,7 @@ mod tests {
             .iter()
             .rev()
             .find(|(start, _)| t >= *start)
-            .map_or(0.0, |&(_, ms)| ms)
+            .map_or_default(|&(_, ms)| ms)
     }
 
     #[test]

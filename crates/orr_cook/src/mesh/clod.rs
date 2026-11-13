@@ -219,7 +219,7 @@ fn clusterize(
 ) -> (Vec<Cluster>, Vec<u32>) {
     let _z = crate::profile::zone!("clod.clusterize");
     let tris = indices.as_chunks::<3>().0;
-    let section = |t: &[u32; 3]| sections.map_or(0, |s| s[t[0] as usize]);
+    let section = |t: &[u32; 3]| sections.map_or_default(|s| s[t[0] as usize]);
     let (lo, hi) = match sections {
         Some(_) => tris.iter().fold((u16::MAX, 0), |(lo, hi), t| {
             let s = section(t);

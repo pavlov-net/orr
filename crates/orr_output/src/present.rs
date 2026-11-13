@@ -404,7 +404,7 @@ impl Display {
                 swapchain,
                 latency: latency.clone(),
                 compose,
-                roots: (0..n).map(|_| Vec::new()).collect(),
+                roots: Vec::from_fn(n, |_| Vec::new()),
                 format: None,
             };
             std::thread::Builder::new()
@@ -427,20 +427,18 @@ impl Display {
             feed,
             logged: None,
             _watch: watch,
-            slots: (0..n)
-                .map(|_| Slot {
-                    backbuffer: None,
-                    ui: Vec::new(),
-                    backbuffer_written: false,
-                    ui_drawn: Vec::new(),
-                    generated: Vec::new(),
-                    flag: None,
-                    check: None,
-                    view: None,
-                    field_used: false,
-                    recorded: 0,
-                })
-                .collect(),
+            slots: Vec::from_fn(n, |_| Slot {
+                backbuffer: None,
+                ui: Vec::new(),
+                backbuffer_written: false,
+                ui_drawn: Vec::new(),
+                generated: Vec::new(),
+                flag: None,
+                check: None,
+                view: None,
+                field_used: false,
+                recorded: 0,
+            }),
             begun: None,
             latency,
             low_latency: (false, false),
@@ -897,7 +895,11 @@ impl Display {
         };
         let s = &self.slots[b.slot];
         let recorded = s.recorded as usize;
-        let ui_used = s.ui_drawn.iter().rposition(|&d| d).map_or(0, |i| i + 1);
+        let ui_used = s
+            .ui_drawn
+            .iter()
+            .rposition(|&d| d)
+            .map_or_default(|i| i + 1);
         let job = Job {
             frame: b.frame,
             slot: b.slot,
@@ -914,7 +916,7 @@ impl Display {
                 .collect(),
             generated: s.generated[..recorded].iter().map(|g| g.sampled).collect(),
             flag: s.check.zip(s.flag.clone()).filter(|_| recorded > 0),
-            min_images: MIN_IMAGES.max(self.fg.as_ref().map_or(0, |f| f.most() + 2)),
+            min_images: MIN_IMAGES.max(self.fg.as_ref().map_or_default(|f| f.most() + 2)),
         };
         if !exact && self.fg.as_ref().is_some_and(|f| f.dynamic.is_some()) {
             self.costs.push_back(Cost {

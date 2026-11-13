@@ -10,22 +10,19 @@ use orr_io::{Read, ReadBuffers, ReadFile, Ring, SECTOR, Wake};
 
 fn bytes(len: usize) -> Vec<u8> {
     let mut x = 0x2545_f491_4f6c_dd1d_u64;
-    (0..len)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x as u8
-        })
-        .collect()
+    Vec::from_fn(len, |_| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x as u8
+    })
 }
 
 /// Reads into the arena, into memory of their own once it is full and past the end of the
 /// file match the file.
 fn reads_match(mut ring: Ring, file: &Arc<ReadFile>, data: &[u8]) {
-    let reads: Vec<(usize, usize)> = (0..100)
-        .map(|i| (i * 3 % 42 * SECTOR, 1 + i * 1777 % (6 * SECTOR)))
-        .collect();
+    let reads: Vec<(usize, usize)> =
+        Vec::from_fn(100, |i| (i * 3 % 42 * SECTOR, 1 + i * 1777 % (6 * SECTOR)));
     let got = Arc::new(Mutex::new(vec![None; reads.len()]));
     for (i, &(offset, len)) in reads.iter().enumerate() {
         let got = Arc::clone(&got);

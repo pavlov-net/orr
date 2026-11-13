@@ -307,7 +307,7 @@ fn rays_leave_surfaces_from_the_origin_to_30_km() {
                 position: p.to_array(),
                 policy: i % 3,
                 geometric_normal: n.to_array(),
-                error: if i % 2 == 0 { 0.0 } else { 0.01 },
+                error: if i.is_multiple_of(2) { 0.0 } else { 0.01 },
                 dir: d.to_array(),
                 camera_distance: if i % 4 < 2 { 1.0 } else { p.length() },
             });

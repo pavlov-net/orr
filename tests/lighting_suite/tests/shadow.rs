@@ -385,9 +385,9 @@ fn presence_layers_multiply_up_to_the_candidate_limit() {
         (16, pass.powi(16), 0),
         (20, pass.powi(16), origins.len() as u32),
     ] {
-        let copies = (0..veils)
-            .map(|k| at(PRESENCE_VEIL, Vec3::new(0.0, 0.5 + 0.1 * k as f32, 0.0)))
-            .collect();
+        let copies = Vec::from_fn(veils, |k| {
+            at(PRESENCE_VEIL, Vec3::new(0.0, 0.5 + 0.1 * k as f32, 0.0))
+        });
         let t = trace(copies, &origins, Vec3::Y);
         assert_all(
             &format!("{veils} veils"),
@@ -505,15 +505,13 @@ fn only_rays_with_the_medium_mask_see_medium_proxies() {
     };
     let id = MediumProxyId(3);
     bed.set_medium_proxy(id, Some(proxy));
-    let origins: Vec<Vec3> = (0..256)
-        .map(|k| {
-            Vec3::new(
-                (k % 16) as f32 * 0.4 - 3.0,
-                6.0,
-                (k / 16) as f32 * 0.4 - 3.0,
-            )
-        })
-        .collect();
+    let origins: Vec<Vec3> = Vec::from_fn(256, |k| {
+        Vec3::new(
+            (k % 16) as f32 * 0.4 - 3.0,
+            6.0,
+            (k / 16) as f32 * 0.4 - 3.0,
+        )
+    });
     let probe = pipeline(&proxy_rays::MODULE, "main");
     let o: Vec<[f32; 4]> = origins.iter().map(|p| p.extend(0.0).to_array()).collect();
     let o = upload(&o, "proxy ray origins");
@@ -585,9 +583,7 @@ fn particles_shadow_by_one_minus_their_opacity() {
         opacity,
         anisotropy: 0.0,
     };
-    let origins: Vec<Vec3> = (0..16)
-        .map(|k| Vec3::new(-0.75 + 0.1 * k as f32, 1.0, -0.5))
-        .collect();
+    let origins: Vec<Vec3> = Vec::from_fn(16, |k| Vec3::new(-0.75 + 0.1 * k as f32, 1.0, -0.5));
     for count in [1, 2] {
         let mut bed = Bed::with(spec(vec![at(FLOOR, Vec3::ZERO)]));
         let particles: Vec<Particle> = (0..count)

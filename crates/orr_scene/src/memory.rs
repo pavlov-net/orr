@@ -595,7 +595,7 @@ impl Pool {
             retired: self.places.retired * unit,
             draining: self.draining_bytes(),
             made: self.made,
-            spare: self.spare.as_ref().map_or(0, Allocation::size),
+            spare: self.spare.as_ref().map_or_default(Allocation::size),
         }
     }
 

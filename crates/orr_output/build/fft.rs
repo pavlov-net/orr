@@ -49,25 +49,23 @@ impl Kernel {
             .filter(|(_, w)| w.iter().any(|&w| w > 0.0))
             .collect();
         let row = |j: usize| -> Vec<[f64; 3]> {
-            (0..TABLE)
-                .map(|i| {
-                    let mut e = [0.0; 3];
-                    for &(gx, wx) in &GAUSS {
-                        for &(gy, wy) in &GAUSS {
-                            let x = (i as f64 + 0.5 + 0.5 * gx) * texel;
-                            let y = (j as f64 + 0.5 + 0.5 * gy) * texel;
-                            for &&(lambda, w) in &spectral {
-                                let scale = lambda * REFERENCE_F;
-                                let p = diaphragm.psf([x / scale, y / scale]) / (scale * scale);
-                                for c in 0..3 {
-                                    e[c] += wx * wy * w[c] * p;
-                                }
+            Vec::from_fn(TABLE, |i| {
+                let mut e = [0.0; 3];
+                for &(gx, wx) in &GAUSS {
+                    for &(gy, wy) in &GAUSS {
+                        let x = (i as f64 + 0.5 + 0.5 * gx) * texel;
+                        let y = (j as f64 + 0.5 + 0.5 * gy) * texel;
+                        for &&(lambda, w) in &spectral {
+                            let scale = lambda * REFERENCE_F;
+                            let p = diaphragm.psf([x / scale, y / scale]) / (scale * scale);
+                            for c in 0..3 {
+                                e[c] += wx * wy * w[c] * p;
                             }
                         }
                     }
-                    e.map(|e| e * texel * texel / 4.0)
-                })
-                .collect()
+                }
+                e.map(|e| e * texel * texel / 4.0)
+            })
         };
         let threads = std::thread::available_parallelism().map_or(8, std::num::NonZero::get);
         let mut base = vec![[0.0; 3]; TABLE * TABLE];
@@ -86,19 +84,17 @@ impl Kernel {
         for k in 1..LEVELS {
             let n = TABLE >> k;
             let prev = &levels[k - 1];
-            let level = (0..n * n)
-                .map(|t| {
-                    let (i, j) = (t % n, t / n);
-                    let mut e = [0.0; 3];
-                    for (a, b) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                        let p = prev[(2 * j + b) * 2 * n + 2 * i + a];
-                        for c in 0..3 {
-                            e[c] += p[c];
-                        }
+            let level = Vec::from_fn(n * n, |t| {
+                let (i, j) = (t % n, t / n);
+                let mut e = [0.0; 3];
+                for (a, b) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let p = prev[(2 * j + b) * 2 * n + 2 * i + a];
+                    for c in 0..3 {
+                        e[c] += p[c];
                     }
-                    e
-                })
-                .collect();
+                }
+                e
+            });
             levels.push(level);
         }
         let inside = [0, 1, 2].map(|c| 4.0 * levels[LEVELS - 1][0][c]);

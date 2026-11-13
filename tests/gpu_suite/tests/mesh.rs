@@ -416,12 +416,12 @@ fn generated_draws_match_recorded_draws() {
         preprocess: arenas.allocate(layout).unwrap(),
     };
 
-    let targets: Vec<_> = (0..2)
-        .map(|i| target(Format::R32Uint, TextureUsage::COLOR, &format!("tiles {i}")))
-        .collect();
-    let outs: Vec<_> = (0..2)
-        .map(|i| readback::<u32>(u64::from(W * H), &format!("tiles out {i}")))
-        .collect();
+    let targets: Vec<_> = Vec::from_fn(2, |i| {
+        target(Format::R32Uint, TextureUsage::COLOR, &format!("tiles {i}"))
+    });
+    let outs: Vec<_> = Vec::from_fn(2, |i| {
+        readback::<u32>(u64::from(W * H), &format!("tiles out {i}"))
+    });
     let mut list = render().command_list().unwrap();
     for (i, t) in targets.iter().enumerate() {
         list.discard(t);

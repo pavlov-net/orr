@@ -87,7 +87,7 @@ impl<'a> Planner<'a> {
                     field.offset
                 )));
             }
-            if field.offset % field_align != 0 {
+            if !field.offset.is_multiple_of(field_align) {
                 return Err(mismatch(format!(
                     "SPIR-V offset {} is not a multiple of the Rust alignment {field_align}",
                     field.offset
@@ -110,7 +110,7 @@ impl<'a> Planner<'a> {
                     ),
                 });
             }
-            Some(s) if s % align != 0 => {
+            Some(s) if !s.is_multiple_of(align) => {
                 return Err(Mismatch {
                     structure: def.name.clone(),
                     field: String::new(),

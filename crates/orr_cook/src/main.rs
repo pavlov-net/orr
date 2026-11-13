@@ -268,7 +268,7 @@ fn texture_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
     let info = TextureInfo::parse(&head)?;
     let h = info.header;
     let tail = if h.tail_first_mip < h.mip_count {
-        a.blobs(e).last().map_or(0, |b| b.raw_len)
+        a.blobs(e).last().map_or_default(|b| b.raw_len)
     } else {
         0
     };
@@ -402,13 +402,13 @@ fn volume_lines(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
         h.bricks,
         h.brick_min,
         info.grids.len(),
-        blobs.get(1).map_or(0, |b| b.raw_len)
+        blobs.get(1).map_or_default(|b| b.raw_len)
     )?;
     for (g, name) in info.grids.iter().zip(&info.names) {
         let pages = g.pages.first as usize..(g.pages.first + g.pages.count) as usize;
         let stored: u64 = blobs
             .get(pages)
-            .map_or(0, |b| b.iter().map(|b| u64::from(b.stored_len)).sum());
+            .map_or_default(|b| b.iter().map(|b| u64::from(b.stored_len)).sum());
         writeln!(
             out,
             "    {name}: vk format {}, scale {} offset {} background {}, range {:?}, {} bricks, {} pages, stored {stored} B",

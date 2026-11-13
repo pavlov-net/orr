@@ -232,7 +232,7 @@ fn float_part_attributes_round_to_parts() {
     let ids: Vec<[f32; 1]> = pos
         .iter()
         .enumerate()
-        .map(|(i, p)| [(p[0] * 6.99).floor() + if i % 3 == 0 { 0.4 } else { -0.3 }])
+        .map(|(i, p)| [(p[0] * 6.99).floor() + if i.is_multiple_of(3) { 0.4 } else { -0.3 }])
         .collect();
     let mut g = Glb::default();
     let pa = g.floats(&pos, "VEC3");
@@ -284,12 +284,10 @@ fn rigid_skin(path: &Path, blend: Option<usize>) -> (Vec<u32>, Vec<usize>) {
     let (pos, _, idx) = grid(8, |_, _| 0.0);
     let joint: Vec<usize> = pos.iter().map(|p| usize::from(p[0] > 0.5)).collect();
     let joints: Vec<[u8; 4]> = joint.iter().map(|&j| [j as u8, 1, 0, 0]).collect();
-    let weights: Vec<[f32; 4]> = (0..pos.len())
-        .map(|i| match blend {
-            Some(b) if b == i => [0.5, 0.5, 0.0, 0.0],
-            _ => [1.0, 0.0, 0.0, 0.0],
-        })
-        .collect();
+    let weights: Vec<[f32; 4]> = Vec::from_fn(pos.len(), |i| match blend {
+        Some(b) if b == i => [0.5, 0.5, 0.0, 0.0],
+        _ => [1.0, 0.0, 0.0, 0.0],
+    });
     let ib =
         |t: [f32; 3]| orr_math::Mat4::from_translation(-orr_math::Vec3::from(t)).to_cols_array();
     let flat = orr_math::Mat4::from_scale(orr_math::Vec3::ZERO).to_cols_array();
@@ -630,9 +628,8 @@ fn cut_out(name: &str, transform: Option<&str>) -> [f32; 6] {
     let ia = g.indices(&idx);
     let img = g.image(&tex);
     let path = d.join("alpha.glb");
-    let ext = transform.map_or(String::new(), |t| {
-        format!(r#","extensions":{{"KHR_texture_transform":{t}}}"#)
-    });
+    let ext =
+        transform.map_or_default(|t| format!(r#","extensions":{{"KHR_texture_transform":{t}}}"#));
     g.write(
         &path,
         &format!(
@@ -772,7 +769,7 @@ fn cards(count: u32) -> (Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<u32>) {
         ];
         let cell = c % 16;
         let (u0, v0) = ((cell % 4) as f32 * 0.25, (cell / 4) as f32 * 0.25);
-        let flip = c % 3 == 0;
+        let flip = c.is_multiple_of(3);
         let first = pos.len() as u32;
         for j in 0..3 {
             for i in 0..3 {
@@ -855,7 +852,8 @@ fn micromap_states_never_contradict_the_alpha_test() {
                         .omm_index(&c, t)
                         .expect("alpha-tested triangles have micromaps");
                     let uv = view.triangle(&c, t).map(|v| view.uv(&c, u32::from(v), 0));
-                    let level = u32::try_from(index).map_or(0, |e| u32::from(maps.entry(e).level));
+                    let level =
+                        u32::try_from(index).map_or_default(|e| u32::from(maps.entry(e).level));
                     let n = (2 << level).min(32);
                     for j in 0..n {
                         for i in 0..n - j {
@@ -1598,18 +1596,16 @@ fn winding_and_normals_agree_on_flat_products() {
         Vec3::new(1.0, 2.0, 3.0).normalize(),
         Vec3::new(3.0, -1.0, 2.0).normalize(),
     );
-    let nodes: Vec<String> = (0..count)
-        .map(|i| {
-            let angle = i as f32 * 0.4 + 0.1;
-            let a = Quat::from_axis_angle(outer, angle).to_array();
-            let b = Quat::from_axis_angle(inner, angle * 0.1).to_array();
-            let child = 2 * i + 1;
-            format!(
-                r#"{{"rotation":{a:?},"scale":[2,2,0],"children":[{child}]}},{{"mesh":0,"rotation":{b:?}}}"#
-            )
-        })
-        .collect();
-    let roots: Vec<usize> = (0..count).map(|i| 2 * i).collect();
+    let nodes: Vec<String> = Vec::from_fn(count, |i| {
+        let angle = i as f32 * 0.4 + 0.1;
+        let a = Quat::from_axis_angle(outer, angle).to_array();
+        let b = Quat::from_axis_angle(inner, angle * 0.1).to_array();
+        let child = 2 * i + 1;
+        format!(
+            r#"{{"rotation":{a:?},"scale":[2,2,0],"children":[{child}]}},{{"mesh":0,"rotation":{b:?}}}"#
+        )
+    });
+    let roots: Vec<usize> = Vec::from_fn(count, |i| 2 * i);
     let [p, q, r] = TRIANGLE.map(Vec3::from);
     triangle_facing(
         &path,

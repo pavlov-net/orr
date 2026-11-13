@@ -730,7 +730,7 @@ impl Skeleton {
     /// Bind-space position of skeleton joint `j`, the origin if its inverse bind has no inverse.
     pub(crate) fn bind_origin(&self, j: u16) -> [f32; 3] {
         self.bind(j)
-            .map_or([0.0; 3], |b| b.w_axis.truncate().as_vec3().to_array())
+            .map_or_default(|b| b.w_axis.truncate().as_vec3().to_array())
     }
 
     /// Skeleton joint of each joint of glTF skin `s`.

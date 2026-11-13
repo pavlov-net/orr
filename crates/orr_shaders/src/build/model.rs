@@ -330,8 +330,8 @@ impl Extract<'_> {
                     let id = api.spReflectionVariableLayout_GetOffset(vl, category) as u32;
                     let scalar = Scalar::from_slang(api.spReflectionType_GetScalarType(ty))
                         .ok_or_else(|| format!("specialization constant {name} is not a scalar"))?;
-                    let default = spec_defaults.get(&id).map_or(0, |(_, w)| {
-                        u64::from(w[0]) | w.get(1).map_or(0, |&h| u64::from(h) << 32)
+                    let default = spec_defaults.get(&id).map_or_default(|(_, w)| {
+                        u64::from(w[0]) | w.get(1).map_or_default(|&h| u64::from(h) << 32)
                     });
                     spec.push(SpecConstant {
                         name,

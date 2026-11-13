@@ -280,11 +280,7 @@ fn check_output(out: &[f32], render: [u32; 2]) {
 
 /// Output images for `count` features: one for the frames before the last, one for the last.
 fn outputs(gpu: &mut Gpu, size: [u32; 2], count: usize) -> (Vec<Image>, Vec<Image>) {
-    let mut make = || {
-        (0..count)
-            .map(|_| gpu.image(size, vk::Format::R16G16B16A16_SFLOAT))
-            .collect()
-    };
+    let mut make = || Vec::from_fn(count, |_| gpu.image(size, vk::Format::R16G16B16A16_SFLOAT));
     (make(), make())
 }
 

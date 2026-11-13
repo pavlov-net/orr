@@ -286,7 +286,10 @@ fn recompile(
             // Raygen entries have no Metal function in either.
             let renamed = module.entry_points.iter().find(|e| {
                 let name = e.name.to_str().unwrap_or("");
-                libs.names.get(name).map_or("", String::as_str).as_bytes()
+                libs.names
+                    .get(name)
+                    .map_or_default(String::as_str)
+                    .as_bytes()
                     != e.metal_name.to_bytes()
             });
             if let Some(e) = renamed {

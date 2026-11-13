@@ -158,12 +158,10 @@ pub(crate) fn device_weights(
             (1.0, 0.0)
         }
     };
-    let output: Vec<f16> = (0..rows3 * cols3)
-        .map(|i| {
-            let r = i / cols3;
-            f16::from_f32(f32::from(net.output[i]) * net.scale[r] * affine(r).0)
-        })
-        .collect();
+    let output: Vec<f16> = Vec::from_fn(rows3 * cols3, |i| {
+        let r = i / cols3;
+        f16::from_f32(f32::from(net.output[i]) * net.scale[r] * affine(r).0)
+    });
     let mut sources: Vec<(ComponentType, Vec<u8>)> = net
         .hidden
         .iter()
@@ -206,12 +204,10 @@ pub(crate) fn device_weights(
         };
         device.convert_matrix(&c, src, &mut out[matrices[l] as usize..])?;
     }
-    let output_bias: Vec<f16> = (0..rows3)
-        .map(|r| {
-            let (gain, shift) = affine(r);
-            f16::from_f32(net.bias[r] as f32 * net.scale[r] * gain + shift)
-        })
-        .collect();
+    let output_bias: Vec<f16> = Vec::from_fn(rows3, |r| {
+        let (gain, shift) = affine(r);
+        f16::from_f32(net.bias[r] as f32 * net.scale[r] * gain + shift)
+    });
     for (l, b) in net
         .hidden
         .iter()

@@ -284,7 +284,7 @@ impl MeshBuilder {
                 count: m.indices.len() as u32 - first,
             });
         }
-        let count = self.parts.iter().max().map_or(0, |&p| p + 1);
+        let count = self.parts.iter().max().map_or_default(|&p| p + 1);
         m.parts = (count > 1).then_some(MeshParts {
             values: self.parts,
             count,

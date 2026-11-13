@@ -120,7 +120,7 @@ fn band_rings(rings: &Rings, first_level: u32) -> Vec<Vec<f64>> {
     let reach = shells
         .keys()
         .next_back()
-        .map_or(0, |&d2| (d2 as f64).sqrt().ceil() as i64);
+        .map_or_default(|&d2| (d2 as f64).sqrt().ceil() as i64);
     for y in -reach..=reach {
         for x in -reach..=reach {
             *lattice.entry(x * x + y * y).or_default() += 1;
@@ -164,10 +164,10 @@ fn nnls(columns: &[Vec<f64>], target: &[f64], weight: &[f64]) -> Vec<f64> {
             .map(|((x, y), w)| x * y * w * w)
             .sum()
     };
-    let gram: Vec<Vec<f64>> = (0..n)
-        .map(|i| (0..n).map(|j| dot(&columns[i], &columns[j])).collect())
-        .collect();
-    let rhs: Vec<f64> = (0..n).map(|i| dot(&columns[i], target)).collect();
+    let gram: Vec<Vec<f64>> = Vec::from_fn(n, |i| {
+        (0..n).map(|j| dot(&columns[i], &columns[j])).collect()
+    });
+    let rhs: Vec<f64> = Vec::from_fn(n, |i| dot(&columns[i], target));
     let mut x = vec![0.0; n];
     for _ in 0..20000 {
         for i in 0..n {
@@ -192,31 +192,29 @@ fn tables() -> Vec<Vec<Vec<[f64; 3]>>> {
             let mut identity = vec![0.0; rings.len()];
             identity[0] = 1.0;
             let columns: Vec<Vec<f64>> = std::iter::once(identity).chain(bands).collect();
-            (0..F_NUMBERS)
-                .map(|i| {
-                    let n = f_number(i);
-                    let mut inside = [0.0; 3];
-                    let mut target = vec![[0.0; 3]; rings.len()];
-                    for (b, &r) in rings.area_radius.iter().enumerate() {
-                        let e = encircled_rgb(r, n, psf::REFERENCE_PITCH_UM);
-                        for c in 0..3 {
-                            target[b][c] = (e[c] - inside[c]).max(1e-12);
-                        }
-                        inside = e;
-                    }
-                    let mut row = vec![[0.0; 3]; entries];
+            Vec::from_fn(F_NUMBERS, |i| {
+                let n = f_number(i);
+                let mut inside = [0.0; 3];
+                let mut target = vec![[0.0; 3]; rings.len()];
+                for (b, &r) in rings.area_radius.iter().enumerate() {
+                    let e = encircled_rgb(r, n, psf::REFERENCE_PITCH_UM);
                     for c in 0..3 {
-                        let t: Vec<f64> = target.iter().map(|t| t[c]).collect();
-                        let w: Vec<f64> = t.iter().map(|t| 1.0 / t).collect();
-                        let x = nnls(&columns, &t, &w);
-                        let total: f64 = x.iter().sum();
-                        for (e, v) in row.iter_mut().zip(&x) {
-                            e[c] = v / total;
-                        }
+                        target[b][c] = (e[c] - inside[c]).max(1e-12);
                     }
-                    row
-                })
-                .collect()
+                    inside = e;
+                }
+                let mut row = vec![[0.0; 3]; entries];
+                for c in 0..3 {
+                    let t: Vec<f64> = target.iter().map(|t| t[c]).collect();
+                    let w: Vec<f64> = t.iter().map(|t| 1.0 / t).collect();
+                    let x = nnls(&columns, &t, &w);
+                    let total: f64 = x.iter().sum();
+                    for (e, v) in row.iter_mut().zip(&x) {
+                        e[c] = v / total;
+                    }
+                }
+                row
+            })
         })
         .collect()
 }

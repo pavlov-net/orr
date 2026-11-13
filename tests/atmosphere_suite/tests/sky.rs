@@ -428,9 +428,9 @@ fn folding() {
     }
     rig.sky.set_lights(&[LightId(0), LightId(1), LightId(2)]);
     rig.frame_lights(&lights, EYE);
-    let sum: Vec<[f64; 3]> = (0..single[0].len())
-        .map(|i| std::array::from_fn(|c| single.iter().map(|l| l[i][c]).sum()))
-        .collect();
+    let sum: Vec<[f64; 3]> = Vec::from_fn(single[0].len(), |i| {
+        std::array::from_fn(|c| single.iter().map(|l| l[i][c]).sum())
+    });
     let added = lut_difference(&lut(&rig), &sum);
     eprintln!(
         "three lights against the sum of each: {:.4}%",

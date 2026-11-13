@@ -459,7 +459,7 @@ fn parts_merge_past_the_merge_error() {
     // slot.
     assert_eq!(d.info.roots.len(), 5 * 2 + 2);
     for (i, &r) in d.info.roots.iter().enumerate() {
-        assert_eq!(r != MeshHeader::NO_ROOT, i % 2 == 0, "root {i}");
+        assert_eq!(r != MeshHeader::NO_ROOT, i.is_multiple_of(2), "root {i}");
     }
     for c in &d.clusters {
         let r = &c.record;

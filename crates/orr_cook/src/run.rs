@@ -1006,7 +1006,7 @@ impl<'m, 's> Run<'m, 's> {
         let size: Vec<u64> = self
             .imports
             .iter()
-            .map(|i| std::fs::metadata(i.path).map_or(0, |m| m.len() * 8))
+            .map(|i| std::fs::metadata(i.path).map_or_default(|m| m.len() * 8))
             .collect();
         let mut queue: Vec<usize> = (0..self.imports.len()).collect();
         queue.sort_by_key(|&i| Reverse(size[i]));
@@ -1984,7 +1984,7 @@ impl<'m, 's> Run<'m, 's> {
                 None => {
                     if let Target::File(path) = &spec.output {
                         report.output = Some(path.clone());
-                        report.bytes = std::fs::metadata(path).map_or(0, |m| m.len());
+                        report.bytes = std::fs::metadata(path).map_or_default(|m| m.len());
                     }
                 }
             }
@@ -2036,7 +2036,7 @@ fn assembly_report(a: &Assembly, entries: &[report::EntryReport]) -> AssemblyRep
         let stored = entries
             .iter()
             .find(|e| e.name == mesh)
-            .map_or(0, |e| e.stored);
+            .map_or_default(|e| e.stored);
         let extra = u64::from(copies.saturating_sub(1));
         out.repeated_triangles += extra * u64::from(unit.triangles);
         out.repeated_bytes += extra * stored;
@@ -2102,7 +2102,7 @@ fn texture_file_working_set(
     size: Option<[u32; 2]>,
     settings: &TextureSettings,
 ) -> u64 {
-    let file = || std::fs::metadata(path).map_or(0, |m| m.len());
+    let file = || std::fs::metadata(path).map_or_default(|m| m.len());
     let texels = size.map(|[w, h]| u64::from(w) * u64::from(h));
     match settings.usage {
         crate::Usage::Environment { .. } => {
@@ -3119,7 +3119,7 @@ fn section_maps(
                     )?),
                     None => None,
                 },
-                uv_set: d.texture.as_ref().map_or(0, |t| t.uv_set),
+                uv_set: d.texture.as_ref().map_or_default(|t| t.uv_set),
             })
         };
         let displacement = s.maps.displacement.as_ref().map(&mut height).transpose()?;
@@ -3271,9 +3271,9 @@ fn emission_map(arc: &Archive, id: AssetId) -> Result<EmissionMap> {
         }
     };
     let [r, g, b] = [&planes[0], &planes[1], &planes[2]];
-    let texels = (0..r.len())
-        .map(|i| y.x * linear(r[i]) + y.y * linear(g[i]) + y.z * linear(b[i]))
-        .collect();
+    let texels = Vec::from_fn(r.len(), |i| {
+        y.x * linear(r[i]) + y.y * linear(g[i]) + y.z * linear(b[i])
+    });
     Ok(EmissionMap {
         w,
         h: hh,
@@ -3311,9 +3311,7 @@ fn mip_planes(format: u32, w: u32, h: u32, bytes: &[u8], channels: usize) -> Res
         }
         f => {
             let px = texture::decode_blocks(f, w, h, bytes).map_err(unread)?.px;
-            (0..channels)
-                .map(|c| px.iter().map(|p| p[c]).collect())
-                .collect()
+            Vec::from_fn(channels, |c| px.iter().map(|p| p[c]).collect())
         }
     };
     Ok(planes)

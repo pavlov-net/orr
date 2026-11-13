@@ -157,7 +157,7 @@ static IDENTITY44: LazyLock<Input> = LazyLock::new(|| identity(4));
 
 fn identity(n: usize) -> Input {
     let cell = |i| if i % (n + 1) == 0 { 1.0 } else { 0.0 };
-    Input::Value((0..n * n).map(cell).collect(), Unit::Unstated)
+    Input::Value(Vec::from_fn(n * n, cell), Unit::Unstated)
 }
 
 fn is_pick(node: &Node) -> bool {
@@ -1972,7 +1972,7 @@ impl Mapper<'_, '_> {
 
     /// `opacity`, as `opacityThreshold` and `opacityMode` have it.
     fn preview_opacity(&mut self, n: usize) -> Result<(), String> {
-        let threshold = self.number(n, "opacityThreshold")?.map_or(0.0, |v| v[0]);
+        let threshold = self.number(n, "opacityThreshold")?.map_or_default(|v| v[0]);
         if threshold > 0.0 || self.text(n, "opacityMode") == Some("presence") {
             self.scalar(
                 n,

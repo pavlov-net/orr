@@ -624,7 +624,7 @@ impl Page {
     ) -> Option<[f32; 2]> {
         let parts = self.parts_at(face, u, v)?;
         let last = parts.iter().rfind(|p| p.channels & (Part::UV << set) != 0);
-        Some(last.map_or([0.0; 2], |part| {
+        Some(last.map_or_default(|part| {
             let [x, y, ..] = self.part_value(part, u, v, points);
             [x, y]
         }))

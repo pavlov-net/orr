@@ -14,14 +14,12 @@ fn path(name: &str) -> PathBuf {
 
 fn bytes(len: usize) -> Vec<u8> {
     let mut x = 0x9e37_79b9_7f4a_7c15_u64;
-    (0..len)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x as u8
-        })
-        .collect()
+    Vec::from_fn(len, |_| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x as u8
+    })
 }
 
 /// An arena for fewer reads than a ring keeps in flight: the others take memory of their own.
@@ -73,14 +71,12 @@ fn ring_matches_positioned_reads() {
 
         // More reads than the ring keeps in flight, with lengths that are not whole sectors and
         // reads that cross, end at and start past the end of the file.
-        let mut reads: Vec<(u64, usize)> = (0..150)
-            .map(|i| {
-                (
-                    (i * 7 % 36) as u64 * SECTOR as u64,
-                    1 + i * 997 % (3 * SECTOR),
-                )
-            })
-            .collect();
+        let mut reads: Vec<(u64, usize)> = Vec::from_fn(150, |i| {
+            (
+                (i * 7 % 36) as u64 * SECTOR as u64,
+                1 + i * 997 % (3 * SECTOR),
+            )
+        });
         reads.extend([
             (36 * SECTOR as u64, 2 * SECTOR),
             (37 * SECTOR as u64, SECTOR),

@@ -420,7 +420,7 @@ impl Live {
         let was = std::mem::replace(self.set.get_mut(at)?, live);
         self.count = self.count + u32::from(live) - u32::from(was);
         let last = self.set.iter().rposition(|&l| l);
-        self.set.truncate(last.map_or(0, |i| i + 1));
+        self.set.truncate(last.map_or_default(|i| i + 1));
         Some(was)
     }
 
@@ -793,7 +793,7 @@ impl Ptlas {
             return Ok(());
         }
         let per = self.max_per_partition / cost;
-        let open = self.open.get(&cell).map_or(0, |&p| {
+        let open = self.open.get(&cell).map_or_default(|&p| {
             (self.max_per_partition - self.partitions[p as usize].count) / cost
         });
         let rest = count.saturating_sub(open);
@@ -1109,7 +1109,7 @@ impl Ptlas {
     pub(crate) fn scratch_bytes(&self, device: &Device) -> u64 {
         self.storage
             .as_ref()
-            .map_or(0, |s| device.rtas_sizes(&desc(s.limits)).scratch)
+            .map_or_default(|s| device.rtas_sizes(&desc(s.limits)).scratch)
     }
 
     /// Scatter records of the partitions changed since the last frame.

@@ -970,7 +970,12 @@ impl Ctx<'_> {
             }
             out
         };
-        let uvs = stored(section_maps.opacity.as_ref().map_or(0, Opacity::uv_set));
+        let uvs = stored(
+            section_maps
+                .opacity
+                .as_ref()
+                .map_or_default(Opacity::uv_set),
+        );
         let opaque = {
             let _z = crate::profile::zone!("mesh.cluster.opaque");
             partition_opaque(&uvs[..n], &mut tris, section_maps.opacity.as_ref())
@@ -1929,8 +1934,8 @@ fn build_cluster(
         alpha_first: tri_count,
         flags: flags & (Section::CLASS_MASK | Section::SOLID),
         local_max,
-        uv_offset: [0, 1].map(|s| uv.get(s).map_or([0.0; 2], |u| u.offset)),
-        uv_step: [0, 1].map(|s| uv.get(s).map_or([0.0; 2], |u| u.step)),
+        uv_offset: [0, 1].map(|s| uv.get(s).map_or_default(|u| u.offset)),
+        uv_step: [0, 1].map(|s| uv.get(s).map_or_default(|u| u.step)),
         omm_first: Cluster::NO_OMM,
         area: area as f32,
         from_group: Cluster::SOURCE,
@@ -1969,7 +1974,7 @@ impl PageFill {
     fn add(self, c: &ClusterData, stride: usize) -> Self {
         let resident = cluster_resident_len(c.local.len(), c.tris.len() / 3, stride, false);
         Self {
-            bytes: self.bytes + resident + c.omm.as_ref().map_or(0, ClusterOmm::bytes),
+            bytes: self.bytes + resident + c.omm.as_ref().map_or_default(ClusterOmm::bytes),
             slots: self.slots + c.slots(),
             highs: self.highs || c.record.wide(),
             omm: self.omm || c.omm.is_some(),
@@ -2187,9 +2192,13 @@ impl MeshData {
         };
         part(bytemuck::cast_slice(&self.positions));
         part(bytemuck::cast_slice(&self.normals));
-        part(self.tangents.as_deref().map_or(&[], bytemuck::cast_slice));
-        part(self.colors.as_deref().map_or(&[], bytemuck::cast_slice));
-        part(self.moves.as_deref().map_or(&[], bytemuck::cast_slice));
+        part(
+            self.tangents
+                .as_deref()
+                .map_or_default(bytemuck::cast_slice),
+        );
+        part(self.colors.as_deref().map_or_default(bytemuck::cast_slice));
+        part(self.moves.as_deref().map_or_default(bytemuck::cast_slice));
         for u in &self.uvs {
             part(bytemuck::cast_slice(u));
         }
@@ -2213,7 +2222,7 @@ impl MeshData {
                 }
                 Pivots::Origin => part(b"origin"),
             }
-            part(p.joints.as_deref().map_or(&[], bytemuck::cast_slice));
+            part(p.joints.as_deref().map_or_default(bytemuck::cast_slice));
         }
         part(format!("{:?}", self.min_exponent).as_bytes());
         sections_hash(Hash32(*h.finalize().as_bytes()), &self.sections)

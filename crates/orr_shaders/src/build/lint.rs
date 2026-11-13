@@ -288,7 +288,7 @@ pub(super) fn model_lints(
                         describe(&f.ty)
                     ),
                 ),
-                Some(a) if f.offset % a != 0 => push(
+                Some(a) if !f.offset.is_multiple_of(a) => push(
                     Lint::RootLayout,
                     format!(
                         "root field {} at offset {} is not at its native alignment {a}",
