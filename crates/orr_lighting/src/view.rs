@@ -91,8 +91,9 @@ pub struct ViewLighting {
     /// seconds on a first run; `false` runs the pipelines that hold every feature, which a run
     /// over many small scenes compiles once.
     pub specialize: bool,
-    /// Whether each stage of the staged path loop records in a pass of its own ("view trace",
-    /// "view shade" and so on), so pass timings tell the stages apart.
+    /// Whether each stage of the staged path loop and each froxel kernel records in a pass of
+    /// its own ("view trace", "view shade", "froxel light" and so on), so pass timings tell
+    /// them apart.
     pub stage_passes: bool,
 }
 

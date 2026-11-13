@@ -25,10 +25,11 @@
 //! `--exact-frame N` and `--exact-frames K` (the first of the first script's frames whose
 //! passes are timed exactly, with `Renderer::set_exact_timing`, and how many, 3 unless given;
 //! they are not samples), `--stage-passes` (`ViewLighting::stage_passes`: each stage of the path
-//! loop in a pass of its own), `--counter-frame N` (with the `nsight-perf` feature: the frame of
-//! the first script whose per-pass Nsight Perf SDK counters the run collects, when the device
-//! has `Caps::perf_counters`) and `--counter-metrics A,B,...` (the metrics it collects, by the
-//! SDK's names, `DEFAULT_COUNTER_METRICS` unless given).
+//! loop and each froxel kernel in a pass of its own), `--froxel-shadowed-lights N`
+//! (`MediaSettings::froxel_shadowed_lights`), `--counter-frame N` (with the `nsight-perf`
+//! feature: the frame of the first script whose per-pass Nsight Perf SDK counters the run
+//! collects, when the device has `Caps::perf_counters`) and `--counter-metrics A,B,...` (the
+//! metrics it collects, by the SDK's names, `DEFAULT_COUNTER_METRICS` unless given).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,11 +48,11 @@ use orr::orr_pack::{Archive, AssetId, Target};
 use orr::{
     AffineRows, BoundTexture, ClusterTopology, CopyVariant, DirectionalLight, DiscProfile, Display,
     DisplayRequest, FrameDesc, FrameStats, FrameTime, GroupWriter, InstanceFlags, InstancesDesc,
-    Lens, Light, LightId, LightingStats, LitView, LoadState, MaterialGpu, ModelId, MountId,
-    Opacity, OpaquePass, PackSource, PipelineId, Pose, ProducerDesc, ProducerId, ProducerUpdate,
-    Projection, Renderer, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneLightingSettings,
-    ScreenshotRequest, TextureFilter, TransformGroupDesc, TransformGroupId, TransparencyPass,
-    ViewHistoryId, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Lens, Light, LightId, LightingStats, LitView, LoadState, MaterialGpu, MediaSettings, ModelId,
+    MountId, Opacity, OpaquePass, PackSource, PipelineId, Pose, ProducerDesc, ProducerId,
+    ProducerUpdate, Projection, Renderer, RendererDesc, SceneCompute, SceneDesc, SceneId,
+    SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, TransformGroupId,
+    TransparencyPass, ViewHistoryId, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::{Atmosphere, AtmosphereState, MAX_SKY_LIGHTS};
@@ -257,6 +258,8 @@ pub struct Settings {
     pub exact_frames: u64,
     /// `ViewLighting::stage_passes`.
     pub stage_passes: bool,
+    /// `MediaSettings::froxel_shadowed_lights`.
+    pub froxel_shadowed_lights: u32,
     /// The frame of the first script that is replayed as a counter frame.
     #[cfg(feature = "nsight-perf")]
     pub counter_frame: Option<u64>,
@@ -298,6 +301,7 @@ impl Settings {
             exact_frame: None,
             exact_frames: 3,
             stage_passes: false,
+            froxel_shadowed_lights: MediaSettings::default().froxel_shadowed_lights,
             #[cfg(feature = "nsight-perf")]
             counter_frame: None,
             #[cfg(feature = "nsight-perf")]
@@ -372,6 +376,9 @@ impl Settings {
                 "--exact-frame" => s.exact_frame = Some(number(value()) as u64),
                 "--exact-frames" => s.exact_frames = number(value()) as u64,
                 "--stage-passes" => s.stage_passes = true,
+                "--froxel-shadowed-lights" => {
+                    s.froxel_shadowed_lights = number(value()) as u32;
+                }
                 #[cfg(feature = "nsight-perf")]
                 "--counter-frame" => s.counter_frame = Some(number(value()) as u64),
                 #[cfg(feature = "nsight-perf")]
@@ -1832,6 +1839,10 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                     target: view_target,
                 };
                 let lighting = ViewLighting {
+                    media: MediaSettings {
+                        froxel_shadowed_lights: settings.froxel_shadowed_lights,
+                        ..MediaSettings::default()
+                    },
                     stage_passes: settings.stage_passes,
                     ..ViewLighting::default()
                 };

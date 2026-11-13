@@ -782,23 +782,33 @@ impl MediaKernels {
         let step = |list: &mut CommandList<'_>| {
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         };
+        let stage = |list: &mut CommandList<'_>, name| {
+            if lighting.stage_passes {
+                list.end_pass();
+                list.begin_pass(name, false);
+            }
+        };
         list.begin_pass("froxels", false);
         if let Some(start) = media.lights_start.take() {
             list.copy(media.lights.gpu().cast(), start.gpu().cast(), start.size());
         }
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
+        stage(list, "froxel order");
         list.dispatch(&self.order, root, [1, 1, 1]);
         step(list);
         if readers.any() {
             // With no reader at all no column can lie in an interior, and nothing reads the
             // columns.
             let column_groups = [columns.div_ceil(8), rows.div_ceil(8), 1];
+            stage(list, "froxel eye column");
             list.dispatch(&self.eye_column, root, column_groups);
             step(list);
+            stage(list, "froxel eye reach");
             list.dispatch(&self.eye_reach, root, column_groups);
             step(list);
         }
         if readers.fogged {
+            stage(list, "froxel inject");
             list.dispatch(
                 &self.inject,
                 root,
@@ -806,18 +816,21 @@ impl MediaKernels {
             );
             step(list);
             if let Some(args) = pass.smoke_args {
+                stage(list, "froxel smoke");
                 list.dispatch_indirect(&self.smoke, root, args);
                 step(list);
             }
         }
         if let Some(set) = &light {
             let light = set.get(Masked::FroxelLight).expect("taken above");
+            stage(list, "froxel list");
             list.dispatch(
                 &self.list,
                 root,
                 [columns.div_ceil(8), rows.div_ceil(4), slices],
             );
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
+            stage(list, "froxel light");
             list.dispatch_indirect(light, root, media.queue.gpu().cast());
             step(list);
             media.history = (media.history + 1).min(MAX_HISTORY);
@@ -825,12 +838,14 @@ impl MediaKernels {
             media.history = 0;
         }
         if readers.fogged {
+            stage(list, "froxel integrate");
             list.dispatch(
                 &self.integrate,
                 root,
                 [columns.div_ceil(8), rows.div_ceil(8), 1],
             );
         }
+        stage(list, "froxels");
         list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
         list.copy(
             media.stats.gpu().offset(slot as u64).cast(),
