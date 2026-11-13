@@ -33,9 +33,10 @@ pub struct Caps {
     /// [`crate::Device::create_mesh_set`]) run per GPU-written sequence by
     /// [`crate::CommandList::execute_generated`].
     pub generated_commands: bool,
-    /// Ray-dispatch pipelines (`VK_KHR_ray_tracing_pipeline` with invocation reordering):
-    /// [`crate::Device::create_ray_dispatch_pipeline`] and
-    /// [`crate::CommandList::dispatch_rays`] and [`crate::CommandList::dispatch_rays_indirect`].
+    /// Ray tracing pipelines (`VK_KHR_ray_tracing_pipeline` with invocation reordering):
+    /// [`crate::Device::create_ray_pipeline`], [`crate::CommandList::trace_rays`] and its
+    /// indirect form, and the raygen-only [`crate::Device::create_ray_dispatch_pipeline`] with
+    /// [`crate::CommandList::dispatch_rays`] and its indirect form. Metal has none.
     pub ray_dispatch: bool,
     /// The device reorders invocations at coherence points in hardware. Without it
     /// reordering is a no-op and kernels run their compute entry. False without
@@ -139,9 +140,19 @@ pub struct Limits {
     /// Workgroups one mesh draw may launch in all, of its task stage or, without one, its
     /// mesh stage: the smaller of `maxTaskWorkGroupTotalCount` and `maxMeshWorkGroupTotalCount`.
     pub max_mesh_draw_groups: u32,
-    /// Invocations one [`crate::CommandList::dispatch_rays`] may launch; 0 without
-    /// `Caps::ray_dispatch`.
+    /// Invocations one [`crate::CommandList::trace_rays`] or
+    /// [`crate::CommandList::dispatch_rays`] may launch; 0 without `Caps::ray_dispatch`, as
+    /// are the ray tracing limits after it.
     pub max_ray_dispatch_invocations: u32,
+    /// Bytes of a shader group handle, which starts every binding table record.
+    pub ray_handle_bytes: u32,
+    /// The alignment of a binding table's record stride.
+    pub ray_handle_align: u32,
+    /// The alignment of a binding table region's start.
+    pub ray_table_align: u32,
+    pub max_ray_record_stride: u32,
+    /// The deepest [`crate::RayPipelineDesc::max_recursion`].
+    pub max_ray_recursion: u32,
     /// Size of the device-local heap.
     pub device_local_bytes: u64,
     /// Size of the heap behind [`crate::MemoryKind::Upload`].

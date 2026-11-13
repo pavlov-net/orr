@@ -272,7 +272,7 @@ mod records {
         pub flags: u32,
         pub instance_index: u32,
         pub partition: u32,
-        pub pad: u32,
+        pub hit_group: u32,
     }
 
     #[repr(C)]
@@ -280,7 +280,7 @@ mod records {
     pub struct PtlasUpdate {
         pub blas: u64,
         pub instance_index: u32,
-        pub pad: u32,
+        pub hit_group: u32,
     }
 
     #[repr(C)]

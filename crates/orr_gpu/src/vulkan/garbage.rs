@@ -34,7 +34,6 @@ pub(super) enum Item {
         pipelines: Vec<vk::Pipeline>,
     },
     ImageSlot(u32),
-    RaygenRecord(u32),
     /// A library's objects, released by its closure.
     Release(Box<dyn FnOnce() + Send>),
     /// An import of host memory.
@@ -249,11 +248,6 @@ impl Shared {
                     }
                 }
                 Item::ImageSlot(slot) => self.heaps().release_image_slot(slot),
-                Item::RaygenRecord(slot) => {
-                    if let Some(r) = self.records.get() {
-                        r.release(slot);
-                    }
-                }
                 Item::Release(release) => release(),
                 Item::Imported(i) => self.destroy_imported(i),
             }

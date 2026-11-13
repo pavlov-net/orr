@@ -529,12 +529,16 @@ impl Shared {
     /// Creates a pipeline through the cache with `extra` creation flags, compiling it once when
     /// several threads ask for it. `stages` and `state`, whatever else the create info depends on,
     /// tell pipelines apart. `create` builds the create info with `next` as its `p_next` (creation
-    /// flags, then creation feedback) and calls the create function with `cache`.
+    /// flags, then creation feedback) and calls the create function with `cache`. A `ray`
+    /// tracing pipeline takes no executable statistics, which other pipelines capture where the
+    /// device reports them.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn create_pipeline(
         &self,
         stages: &[&StageParts<'_>],
         state: &[u8],
         extra: vk::PipelineCreateFlags2,
+        ray: bool,
         name: &str,
         call: &'static str,
         create: impl Fn(vk::PipelineCache, *const c_void) -> Result<vk::Pipeline, vk::Result>,
@@ -567,8 +571,8 @@ impl Shared {
             } else {
                 extra
             };
-            let mut flags =
-                vk::PipelineCreateFlags2CreateInfo::default().flags(self.pipeline_flags() | extra);
+            let mut flags = vk::PipelineCreateFlags2CreateInfo::default()
+                .flags(self.pipeline_flags(!ray) | extra);
             flags.p_next = std::ptr::from_mut(&mut feedback_info).cast();
             let pipeline =
                 create(handle, std::ptr::from_ref(&flags).cast()).map_err(Error::vk(call))?;
@@ -600,7 +604,7 @@ impl Shared {
             count.fetch_add(1, Ordering::Release);
         }
         drop(guard);
-        self.created(raw, name, start);
+        self.created(raw, name, start, !ray);
         Ok(raw)
     }
 }

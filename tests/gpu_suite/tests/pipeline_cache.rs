@@ -8,10 +8,11 @@ use std::time::{Duration, SystemTime};
 use gpu_suite::shaders::{cached, cached_rays};
 use gpu_suite::{log_to_stderr, require};
 use orr_gpu::{
-    ClearColor, ColorAttachment, ColorLoad, ColorTarget, ComputePipeline, Cull, Device, DeviceDesc,
-    Error, Format, Hazards, MemoryKind, MeshPipeline, MeshPipelineDesc, QueueKind, RasterState,
-    RayDispatchPipeline, Rendering, ShaderStage, SpecData, Stages, TextureDesc, TextureMemory,
-    TextureRegion, TextureUsage,
+    ClearColor, ColorAttachment, ColorLoad, ColorTarget, CompileThreads, ComputePipeline, Cull,
+    Device, DeviceDesc, Error, Format, Hazards, HitGroup, HitTable, MemoryKind, MeshPipeline,
+    MeshPipelineDesc, QueueKind, RasterState, RayDispatchPipeline, RayPipeline, RayPipelineDesc,
+    RayPipelineFlags, Rendering, ShaderRecord, ShaderStage, SpecData, Stages, TextureDesc,
+    TextureMemory, TextureRegion, TextureUsage,
 };
 
 fn cache_path(test: &str) -> PathBuf {
@@ -38,10 +39,12 @@ struct Set {
     compute: ComputePipeline,
     mesh: MeshPipeline,
     raygen: Option<RayDispatchPipeline>,
-    /// Whether the compute, mesh and ray-dispatch pipelines came from the cache, when created
-    /// alone; the last is true on a device without ray dispatch, and where a hit is not known to
-    /// be reported for one: only NVIDIA's driver has been measured.
-    cached: [bool; 3],
+    /// A ray tracing pipeline with a shader of every kind.
+    traced: Option<RayPipeline>,
+    /// Whether the compute, mesh, ray-dispatch and ray tracing pipelines came from the cache,
+    /// when created alone; the last two are true on a device without ray dispatch, and where a
+    /// hit is not known to be reported for one: only NVIDIA's driver has been measured.
+    cached: [bool; 4],
 }
 
 impl Set {
@@ -79,28 +82,77 @@ impl Set {
             d.create_ray_dispatch_pipeline(&stage, "cached raygen")
                 .unwrap()
         });
+        let after_raygen = hits();
+        let traced = d.caps().ray_dispatch.then(|| {
+            let spec = cached_rays::Spec { value }.bytes();
+            let data = SpecData {
+                entries: cached_rays::Spec::ENTRIES,
+                bytes: &spec,
+            };
+            let stages: Vec<_> = [
+                "pipeline_main",
+                "miss_main",
+                "hit_main",
+                "any_main",
+                "span_main",
+                "span_hit_main",
+                "callable_main",
+            ]
+            .iter()
+            .map(|e| ShaderStage::new(&cached_rays::MODULE, e, data).unwrap())
+            .collect();
+            d.create_ray_pipeline(
+                &RayPipelineDesc {
+                    stages: &stages,
+                    raygens: &[ShaderRecord::new(0)],
+                    misses: &[ShaderRecord::new(1)],
+                    hit_groups: &[
+                        HitGroup {
+                            closest_hit: Some(2),
+                            any_hit: Some(3),
+                            intersection: None,
+                        },
+                        HitGroup {
+                            closest_hit: Some(5),
+                            any_hit: None,
+                            intersection: Some(4),
+                        },
+                    ],
+                    callables: &[ShaderRecord::new(6)],
+                    max_recursion: 1,
+                    flags: RayPipelineFlags::empty(),
+                    // A deferred creation's feedback reports no cache hit on NVIDIA's 621.24.
+                    threads: CompileThreads::Spawned(1),
+                },
+                "cached ray pipeline",
+            )
+            .unwrap()
+        });
+        let nvidia = d.caps().device_name.contains("NVIDIA");
         let cached = [
             after_compute > before,
             after_mesh > after_compute,
-            raygen.is_none() || !d.caps().device_name.contains("NVIDIA") || hits() > after_mesh,
+            raygen.is_none() || !nvidia || after_raygen > after_mesh,
+            traced.is_none() || !nvidia || hits() > after_raygen,
         ];
         Set {
             value,
             compute,
             mesh,
             raygen,
+            traced,
             cached,
         }
     }
 
     fn kinds(&self) -> u32 {
-        2 + u32::from(self.raygen.is_some())
+        2 + u32::from(self.raygen.is_some()) + u32::from(self.traced.is_some())
     }
 
     /// Runs every pipeline and checks what it wrote.
     fn check(&self, d: &Device) {
         let mut out = d
-            .gpu_malloc::<u32>(MemoryKind::Readback, 2, "cached out")
+            .gpu_malloc::<u32>(MemoryKind::Readback, 3, "cached out")
             .unwrap();
         out.as_mut_slice().unwrap().fill(0);
         let mut root = d
@@ -130,6 +182,14 @@ impl Set {
             };
             list.dispatch_rays(r, &rays_root, [1, 1, 1]);
         }
+        if let Some(p) = &self.traced {
+            let rays_root = cached_rays::Root {
+                out: out.gpu(),
+                pad0: 0,
+                pad1: 0,
+            };
+            list.trace_rays(p, 0, &HitTable::NONE, &rays_root, [1, 1, 1]);
+        }
         list.begin_rendering(&Rendering {
             extent: [4, 4],
             colors: &[ColorAttachment {
@@ -152,7 +212,8 @@ impl Set {
         queue.wait(point, Duration::from_secs(10)).unwrap();
         let v = self.value;
         let ray = if self.raygen.is_some() { v + 1 } else { 0 };
-        assert_eq!(out.as_slice().unwrap(), [v, ray]);
+        let traced = if self.traced.is_some() { 2 * v + 3 } else { 0 };
+        assert_eq!(out.as_slice().unwrap(), [v, ray, traced]);
         assert!(texels.as_slice().unwrap().iter().all(|&t| t == v + 2));
     }
 }
@@ -256,7 +317,7 @@ fn round_trip_and_refuse_foreign_files() {
     let set = Set::new(&d, 1);
     assert_eq!(
         set.cached,
-        [true, true, true],
+        [true, true, true, true],
         "warm: {:?}",
         d.pipeline_cache_report()
     );
@@ -301,7 +362,7 @@ fn a_second_save_keeps_the_first() {
         let set = Set::new(&d, value);
         assert_eq!(
             set.cached,
-            [true, true, true],
+            [true, true, true, true],
             "set {value}: {:?}",
             d.pipeline_cache_report()
         );
@@ -357,7 +418,7 @@ fn a_file_the_driver_refuses_is_replaced() {
     let set = Set::new(&d, 1);
     assert_eq!(
         set.cached,
-        [true, true, true],
+        [true, true, true, true],
         "after replacing: {:?}",
         d.pipeline_cache_report()
     );

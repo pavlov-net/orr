@@ -415,6 +415,11 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
             // against, so draws keep to the least `VK_EXT_mesh_shader` guarantees.
             max_mesh_draw_groups: 1 << 22,
             max_ray_dispatch_invocations: 0,
+            ray_handle_bytes: 0,
+            ray_handle_align: 0,
+            ray_table_align: 0,
+            max_ray_record_stride: 0,
+            max_ray_recursion: 0,
             device_local_bytes: working_set,
             upload_bytes: working_set,
             max_memory_allocations: u32::MAX,

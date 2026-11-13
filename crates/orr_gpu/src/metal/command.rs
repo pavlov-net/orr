@@ -17,7 +17,7 @@ use super::mesh::PendingPass;
 use super::pipeline::ComputePipeline;
 use super::queue::{Queue, TimestampRing};
 use super::texture::Texture;
-use super::unsupported::RayDispatchPipeline;
+use super::unsupported::{RayDispatchPipeline, RayPipeline};
 use super::{lock, not_implemented};
 use crate::{
     DecompressRegion, DispatchArgs, Error, GpuPtr, Hazards, MemoryCopy, MemoryKind, Stages,
@@ -366,6 +366,31 @@ impl<'q> CommandList<'q> {
         args: GpuPtr<DispatchArgs>,
     ) {
         let _ = (root, args);
+        p.unreachable()
+    }
+
+    /// No call creates a [`RayPipeline`] on Metal.
+    pub fn trace_rays<R: Pod>(
+        &mut self,
+        p: &RayPipeline,
+        raygen: u32,
+        hits: &crate::HitTable,
+        root: &R,
+        extent: [u32; 3],
+    ) {
+        let _ = (raygen, hits, root, extent);
+        p.unreachable()
+    }
+
+    pub fn trace_rays_indirect<R: Pod>(
+        &mut self,
+        p: &RayPipeline,
+        raygen: u32,
+        hits: &crate::HitTable,
+        root: &R,
+        args: GpuPtr<DispatchArgs>,
+    ) {
+        let _ = (raygen, hits, root, args);
         p.unreachable()
     }
 

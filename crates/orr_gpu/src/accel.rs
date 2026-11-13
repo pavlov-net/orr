@@ -76,7 +76,7 @@ pub struct ClassicInstance {
     pub transform: [f32; 12],
     /// Custom index in bits 0-23, visibility mask in bits 24-31.
     pub custom_index_and_mask: u32,
-    /// Shader-binding-table offset in bits 0-23 (always 0 in orr), flags in bits 24-31.
+    /// The instance's contribution to its hit record index in bits 0-23, flags in bits 24-31.
     pub sbt_offset_and_flags: u32,
     /// The BLAS address; 0 makes the instance inactive.
     pub blas: u64,
@@ -99,6 +99,19 @@ impl ClassicInstance {
             custom_index_and_mask: custom_index | u32::from(mask) << 24,
             sbt_offset_and_flags: u32::from(flags.bits()) << 24,
             blas: blas.0,
+        }
+    }
+
+    /// The instance with `hit_group` as its contribution to its hit record index
+    /// ([`crate::HitTable`]).
+    pub fn with_hit_group(self, hit_group: u32) -> Self {
+        assert!(
+            hit_group < 1 << 24,
+            "hit group contribution {hit_group} needs more than 24 bits"
+        );
+        Self {
+            sbt_offset_and_flags: self.sbt_offset_and_flags & 0xff00_0000 | hit_group,
+            ..self
         }
     }
 }

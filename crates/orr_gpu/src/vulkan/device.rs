@@ -24,7 +24,6 @@ use super::memory::{MemoryTypes, Pools, Range, buffer_usage, sharing};
 #[cfg(feature = "nsight-perf")]
 use super::perf::{self, Perf};
 use super::queue::{Calibration, Queue, Timeline};
-use super::ray::RecordBlock;
 use super::rtas::{RtasCheck, cluster_caps};
 use super::texture::{image_info, vk_format};
 use crate::{
@@ -67,6 +66,7 @@ pub(crate) struct Shared {
     pub(super) max_allocation: u64,
     pub(super) mesh_fn: ash::ext::mesh_shader::Device,
     pub(super) rt_fn: Option<ash::khr::ray_tracing_pipeline::Device>,
+    pub(super) deferred_fn: ash::khr::deferred_host_operations::Device,
     pub(super) debug_fn: ash::ext::debug_utils::Device,
     pub(super) calibrated_fn: Option<ash::khr::calibrated_timestamps::Device>,
     pub(super) exec_fn: Option<ash::khr::pipeline_executable_properties::Device>,
@@ -90,8 +90,6 @@ pub(crate) struct Shared {
     /// [`HostTimeline`]: super::HostTimeline
     pub(super) host_timelines: Mutex<Vec<vk::Semaphore>>,
     heaps: OnceLock<Heaps>,
-    /// Raygen shader-table records; with `Caps::ray_dispatch` only.
-    pub(super) records: OnceLock<RecordBlock>,
     empty_tlas: OnceLock<EmptyTlas>,
     /// The debug PTLAS check, created by the first PTLAS build of a debug build.
     pub(super) rtas_check: OnceLock<RtasCheck>,
@@ -176,9 +174,6 @@ impl Drop for Shared {
             if let Some(t) = self.empty_tlas.take() {
                 self.accel_fn.destroy_acceleration_structure(t.accel, None);
                 self.destroy(Item::Buffer(t.storage));
-            }
-            if let Some(r) = self.records.take() {
-                self.destroy(Item::Buffer(r.raw));
             }
             if let Some(b) = self.breadcrumbs.take() {
                 self.destroy(Item::Buffer(b.raw));
@@ -537,6 +532,11 @@ impl Device {
                     .max_task_work_group_total_count
                     .min(mesh_props.max_mesh_work_group_total_count),
                 max_ray_dispatch_invocations: rt_props.max_ray_dispatch_invocation_count,
+                ray_handle_bytes: rt_props.shader_group_handle_size,
+                ray_handle_align: rt_props.shader_group_handle_alignment,
+                ray_table_align: rt_props.shader_group_base_alignment,
+                max_ray_record_stride: rt_props.max_shader_group_stride,
+                max_ray_recursion: rt_props.max_ray_recursion_depth,
                 device_local_bytes: memory.heap_size(MemoryKind::DeviceLocal),
                 upload_bytes: memory.heap_size(MemoryKind::Upload),
                 max_memory_allocations: props.limits.max_memory_allocation_count,
@@ -671,6 +671,7 @@ impl Device {
             rt_fn: optional
                 .ray_dispatch
                 .then(|| ash::khr::ray_tracing_pipeline::Device::load(&instance, &device)),
+            deferred_fn: ash::khr::deferred_host_operations::Device::load(&instance, &device),
             debug_fn: ash::ext::debug_utils::Device::load(&instance, &device),
             calibrated_fn: optional
                 .calibrated_timestamps
@@ -708,7 +709,6 @@ impl Device {
             timelines,
             host_timelines: Mutex::default(),
             heaps: OnceLock::new(),
-            records: OnceLock::new(),
             empty_tlas: OnceLock::new(),
             rtas_check: OnceLock::new(),
             buffers: RwLock::default(),
@@ -775,9 +775,6 @@ impl Device {
         let heaps = Heaps::new(&shared, desc.image_heap_slots, desc.sampler_heap_slots)?;
         let _ = shared.heaps.set(heaps);
         let _ = shared.classic_bind.set(ClassicBind::new(&shared.device)?);
-        if optional.ray_dispatch {
-            let _ = shared.records.set(RecordBlock::new(&shared, &rt_props)?);
-        }
         let device = Device {
             shared,
             queues: Arc::new(queues),

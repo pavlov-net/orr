@@ -111,7 +111,7 @@ public struct PtlasWrite
     public uint flags;         // INSTANCE_* bits
     public uint instance_index;
     public uint partition;     // or PTLAS_GLOBAL_PARTITION
-    public uint pad;
+    public uint hit_group;     // 24 bits: the instance's contribution to its hit record index
 }
 
 // Points an instance at another BLAS without rebuilding its partition.
@@ -119,7 +119,7 @@ public struct PtlasUpdate
 {
     public uint64_t blas;
     public uint instance_index;
-    public uint pad;
+    public uint hit_group;     // restates the instance's contribution to its hit record index
 }
 
 // Sets a partition's translation, added to the transform of every instance in it. Replaces
@@ -152,12 +152,20 @@ public struct ClassicInstance
 // INSTANCE_EXPLICIT_AABB.
 public ClassicInstance classic_instance(float3x4 transform, uint custom_index, uint mask, uint flags, uint64_t blas)
 {
+    return classic_instance(transform, custom_index, mask, flags, blas, 0);
+}
+
+// As above, with `hit_group` (24 bits) the instance's contribution to its hit record index.
+public ClassicInstance classic_instance(float3x4 transform, uint custom_index, uint mask, uint flags, uint64_t blas, uint hit_group)
+{
     if (ASSERTS && custom_index >= (1u << 24))
         abort("rtas: an instance custom index above 24 bits");
+    if (ASSERTS && hit_group >= (1u << 24))
+        abort("rtas: an instance hit group contribution above 24 bits");
     ClassicInstance v;
     v.transform = transform;
     v.custom_index_and_mask = (custom_index & 0xffffff) | (mask << 24);
-    v.sbt_offset_and_flags = flags << 24;
+    v.sbt_offset_and_flags = (hit_group & 0xffffff) | (flags << 24);
     v.blas = blas;
     return v;
 }
@@ -269,7 +277,7 @@ public void store(uint64_t args, uint index, PtlasWrite v)
     p[17] = asuint(v.aabb_max.z);
     p[18] = v.custom_index;
     p[19] = v.mask;
-    p[20] = 0;
+    p[20] = v.hit_group;
     p[21] = v.flags;
     p[22] = v.instance_index;
     p[23] = v.partition;
@@ -280,7 +288,7 @@ public void store(uint64_t args, uint index, PtlasUpdate v)
 {
     uint* p = record(args, index, PTLAS_UPDATE_STRIDE);
     p[0] = v.instance_index;
-    p[1] = 0;
+    p[1] = v.hit_group;
     put64(p, 2, v.blas);
 }
 

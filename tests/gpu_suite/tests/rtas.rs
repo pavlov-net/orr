@@ -103,7 +103,7 @@ fn write(i: usize) -> PtlasWrite {
         ][i],
         instance_index: 500_000 + i as u32,
         partition: [0, 2047, u32::MAX][i],
-        pad: 0,
+        hit_group: [0, 0xab_cdef, 0xff_ffff][i],
     }
 }
 
@@ -131,7 +131,7 @@ fn stores_match_vulkan_structs() {
     let updates: Vec<PtlasUpdate> = Vec::from_fn(RECORDS, |i| PtlasUpdate {
         blas: if i == 2 { 0 } else { addr(i, 12) },
         instance_index: 7 * i as u32,
-        pad: 0,
+        hit_group: [0xff_ffff, 0, 0x12_3456][i],
     });
     let translates: Vec<PtlasTranslate> = Vec::from_fn(RECORDS, |i| PtlasTranslate {
         translation: [-32768.0 * i as f32, 0.5, 16384.0],
@@ -154,6 +154,7 @@ fn stores_match_vulkan_structs() {
             ][i],
             GpuAddress(addr(i, 14)),
         )
+        .with_hit_group([0x80_0001, 0, 0xff_ffff][i])
     });
 
     let cells: Vec<Translation> = (0..64)
@@ -334,7 +335,7 @@ fn stores_match_vulkan_structs() {
                 ],
                 instance_id: v.custom_index,
                 instance_mask: v.mask,
-                instance_contribution_to_hit_group_index: 0,
+                instance_contribution_to_hit_group_index: v.hit_group,
                 instance_flags: vk::PartitionedAccelerationStructureInstanceFlagsNV::from_raw(
                     v.flags,
                 ),
@@ -355,7 +356,7 @@ fn stores_match_vulkan_structs() {
         .map(
             |v| vk::PartitionedAccelerationStructureUpdateInstanceDataNV {
                 instance_index: v.instance_index,
-                instance_contribution_to_hit_group_index: 0,
+                instance_contribution_to_hit_group_index: v.hit_group,
                 acceleration_structure: v.blas,
             },
         )
@@ -413,7 +414,7 @@ fn stores_match_vulkan_structs() {
                 (v.custom_index_and_mask >> 24) as u8,
             ),
             instance_shader_binding_table_record_offset_and_flags: vk::Packed24_8::new(
-                0,
+                v.sbt_offset_and_flags & 0xff_ffff,
                 (v.sbt_offset_and_flags >> 24) as u8,
             ),
             acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {

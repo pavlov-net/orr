@@ -1,11 +1,12 @@
 //! orr's GPU interface: one device with GPU memory reached by address, a texture heap,
-//! compute, mesh and ray-dispatch pipelines whose only parameter is a root, stage barriers and
+//! compute, mesh and ray tracing pipelines whose only parameter is a root, stage barriers and
 //! timeline submits.
 //!
 //! Shaders read everything through the root: [`CommandList::dispatch`] and
 //! [`CommandList::draw_mesh_tasks`] push the [`GpuPtr`] of a root struct in GPU memory, and
-//! [`CommandList::dispatch_rays`] and [`CommandList::dispatch_inline`] push the struct itself,
-//! for kernels that declare `ORR_ROOT_INLINE`;
+//! [`CommandList::trace_rays`], [`CommandList::dispatch_rays`] and
+//! [`CommandList::dispatch_inline`] push the struct itself, for kernels that declare
+//! `ORR_ROOT_INLINE`;
 //! buffers are pointers inside it, textures and samplers are heap slots ([`TextureIndex`],
 //! [`StorageImageIndex`], [`SamplerIndex`]) and acceleration structures are [`Tlas`]
 //! addresses. Textures stay in one layout for their whole life; [`CommandList::discard`]
@@ -31,6 +32,7 @@ mod present;
 pub mod profile;
 mod queue;
 mod raster;
+mod ray;
 pub mod rtas;
 mod sync;
 mod texture;
@@ -102,6 +104,10 @@ pub use raster::{
     ColorTarget, Cull, DepthAttachment, DepthBias, DepthLoad, DepthTarget, Fill, FrontFace,
     MeshPipelineDesc, RasterState, Rendering,
 };
+pub use ray::{
+    CodeStatistics, CompileThreads, HitGroup, HitTable, RayPipelineDesc, RayPipelineFlags,
+    ShaderRecord,
+};
 pub use rtas::{
     BlasLimits, ClusterCaps, ClusterLimits, ClusterVertexFormat, MoveKind, MoveLimits, PtlasArgs,
     PtlasLimits, RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, RtasSizes,
@@ -118,8 +124,8 @@ pub use vulkan::CounterSession;
 pub use backend::{
     Allocation, ClassicAs, CommandList, ComputePipeline, Device, DeviceArenas, DeviceHooks,
     Diagnostics, ExecutionSet, HostArenas, HostTimeline, ImportedMemory, LowLatency, MeshPipeline,
-    Micromap, Queue, RayDispatchPipeline, ShaderStage, SparseAllocation, SparseBinds, Swapchain,
-    SwapchainFrame, Texture, WindowExtent,
+    Micromap, Queue, RayDispatchPipeline, RayPipeline, ShaderStage, SparseAllocation, SparseBinds,
+    Swapchain, SwapchainFrame, Texture, WindowExtent,
 };
 
 #[cfg(not(target_vendor = "apple"))]

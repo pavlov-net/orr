@@ -877,7 +877,7 @@ void emit(uint3 id: SV_DispatchThreadID)
             PtlasUpdate u;
             u.blas = blas;
             u.instance_index = slot;
-            u.pad = 0;
+            u.hit_group = 0;
             store((uint64_t)t.updates, index, u);
             st.rt_blas = blas;
             st.rt_lod = uint8_t(op.cut);

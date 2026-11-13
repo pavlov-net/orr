@@ -179,7 +179,7 @@ fn clas_ptlas() {
         updates: vec![PtlasUpdate {
             blas: 2,
             instance_index: 0,
-            pad: 0,
+            hit_group: 0,
         }],
         translates: vec![PtlasTranslate {
             translation: [0.125, -0.0625, 0.0],
@@ -627,8 +627,8 @@ enum Want {
 
 /// The nearest hit of ray (x, y) among the cluster instance `front` and `segs`; `None`
 /// near any triangle edge, segment silhouette or segment end.
-fn lss_reference(front: &RefInst, segs: &[Segment], x: u32, y: u32) -> Option<Want> {
-    let mut best = match reference_hit(std::slice::from_ref(front), x, y)? {
+fn lss_reference(front: &Reference<'_>, segs: &[Segment], x: u32, y: u32) -> Option<Want> {
+    let mut best = match front.committed_hit(x, y, 0)? {
         Some((_, tri, t)) => Want::Cluster(tri, t),
         None => Want::Miss,
     };
@@ -664,10 +664,11 @@ fn check_lss(out: &[u32], front: &RefInst, segs: &[Segment], what: &str) -> (u32
     let (mut lss, mut cluster) = (0, 0);
     let mut bad: BTreeMap<&'static str, u32> = BTreeMap::new();
     let mut first = Vec::new();
+    let reference = Reference::new(std::slice::from_ref(front));
     for y in 0..H {
         for x in 0..W {
             let o = &out[(y * W + x) as usize * REC..][..REC];
-            let Some(want) = lss_reference(front, segs, x, y) else {
+            let Some(want) = lss_reference(&reference, segs, x, y) else {
                 continue;
             };
             let mut fail = |kind: &'static str, detail: String| {

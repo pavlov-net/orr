@@ -10,12 +10,12 @@ use super::garbage::Item;
 use super::mesh::MeshPipeline;
 use super::pipeline::ComputePipeline;
 use super::queue::{ListResources, Queue};
-use super::ray::RayDispatchPipeline;
+use super::ray::{RayDispatchPipeline, RayPipeline};
 use super::texture::{Texture, indirect_copy_format, vk_extent, vk_offset};
 use crate::{
     Caps, ClearColor, ColorLoad, DecompressRegion, DepthLoad, DispatchArgs, Error, GpuAddress,
-    GpuPtr, Hazards, MAX_INLINE_ROOT_BYTES, MemoryCopy, MemoryKind, MeshArgs, Rendering, Stages,
-    TextureCopy, TextureLayers, TextureRegion, TextureUsage,
+    GpuPtr, Hazards, HitTable, MAX_INLINE_ROOT_BYTES, MemoryCopy, MemoryKind, MeshArgs, Rendering,
+    Stages, TextureCopy, TextureLayers, TextureRegion, TextureUsage,
 };
 
 /// What device address commands are told about every `gpu_malloc` and sparse range: their
@@ -342,8 +342,11 @@ impl<'q> CommandList<'q> {
             data: vk::HostAddressRangeConstEXT::default().address(data),
             ..Default::default()
         };
-        // SAFETY: recording; heaps are bound.
-        unsafe { self.queue.shared.heap_fn.cmd_push_data(cmd, &push) };
+        // A ray tracing pipeline whose stages declare no root takes none.
+        if !data.is_empty() {
+            // SAFETY: recording; heaps are bound.
+            unsafe { self.queue.shared.heap_fn.cmd_push_data(cmd, &push) };
+        }
     }
 
     /// Binds `p`, whose kernel reads its root from GPU memory, and pushes the address of `root`.
@@ -383,33 +386,7 @@ impl<'q> CommandList<'q> {
 
     /// Runs `p`'s raygen entry once per element of `extent`, with `root` pushed with the dispatch.
     pub fn dispatch_rays<R: Pod>(&mut self, p: &RayDispatchPipeline, root: &R, extent: [u32; 3]) {
-        self.bind_inline(
-            vk::PipelineBindPoint::RAY_TRACING_KHR,
-            p.raw,
-            p.inline_root_bytes,
-            root,
-        );
-        let rt = self
-            .queue
-            .shared
-            .rt_fn
-            .as_ref()
-            .expect("a ray-dispatch pipeline exists");
-        let empty = vk::StridedDeviceAddressRegionKHR::default();
-        // SAFETY: recording with a ray-tracing pipeline bound; its raygen record is live
-        // while the pipeline is.
-        unsafe {
-            rt.cmd_trace_rays(
-                self.cmd(),
-                &p.raygen,
-                &empty,
-                &empty,
-                &empty,
-                extent[0],
-                extent[1],
-                extent[2],
-            );
-        };
+        self.trace_rays(&p.0, 0, &HitTable::NONE, root, extent);
     }
 
     /// Runs `p`'s raygen entry once per element of the extent `args` holds on the GPU
@@ -420,28 +397,113 @@ impl<'q> CommandList<'q> {
         root: &R,
         args: GpuPtr<DispatchArgs>,
     ) {
+        self.trace_rays_indirect(&p.0, 0, &HitTable::NONE, root, args);
+    }
+
+    /// Binds `p` with `root` and returns the regions of a launch of raygen `raygen` over the
+    /// hit records `hits`.
+    fn bind_rays<R: Pod>(
+        &mut self,
+        p: &RayPipeline,
+        raygen: u32,
+        hits: &HitTable,
+        root: &R,
+    ) -> [vk::StridedDeviceAddressRegionKHR; 4] {
+        let limits = &self.queue.shared.caps.limits;
+        if hits.count > 0 {
+            assert!(
+                hits.stride >= p.hit_stride()
+                    && hits.stride <= u64::from(limits.max_ray_record_stride)
+                    && hits
+                        .stride
+                        .is_multiple_of(u64::from(limits.ray_handle_align))
+                    && hits
+                        .address
+                        .0
+                        .is_multiple_of(u64::from(limits.ray_table_align)),
+                "hit table {hits:?}: the stride is at least {} and at most {}, a multiple of {}, and the address a multiple of {}",
+                p.hit_stride(),
+                limits.max_ray_record_stride,
+                limits.ray_handle_align,
+                limits.ray_table_align
+            );
+        }
         self.bind_inline(
             vk::PipelineBindPoint::RAY_TRACING_KHR,
             p.raw,
             p.inline_root_bytes,
             root,
         );
+        let hit = if hits.count == 0 {
+            vk::StridedDeviceAddressRegionKHR::default()
+        } else {
+            vk::StridedDeviceAddressRegionKHR {
+                device_address: hits.address.0,
+                stride: hits.stride,
+                size: hits.stride * hits.count,
+            }
+        };
+        [p.raygens[raygen as usize], p.miss, hit, p.callable]
+    }
+
+    /// Runs raygen `raygen` of `p` once per element of `extent`, with `root` pushed with the
+    /// launch, its traces choosing records of `hits`.
+    pub fn trace_rays<R: Pod>(
+        &mut self,
+        p: &RayPipeline,
+        raygen: u32,
+        hits: &HitTable,
+        root: &R,
+        extent: [u32; 3],
+    ) {
+        let [raygen, miss, hit, callable] = self.bind_rays(p, raygen, hits, root);
         let rt = self
             .queue
             .shared
             .rt_fn
             .as_ref()
-            .expect("a ray-dispatch pipeline exists");
-        let empty = vk::StridedDeviceAddressRegionKHR::default();
-        // SAFETY: recording with a ray-tracing pipeline bound; its raygen record is live
-        // while the pipeline is, and the arguments are the caller's live allocation.
+            .expect("a ray tracing pipeline exists");
+        // SAFETY: recording with a ray tracing pipeline bound; its own regions are live while
+        // it is, and the hit records are the caller's live allocation.
+        unsafe {
+            rt.cmd_trace_rays(
+                self.cmd(),
+                &raygen,
+                &miss,
+                &hit,
+                &callable,
+                extent[0],
+                extent[1],
+                extent[2],
+            );
+        };
+    }
+
+    /// As [`Self::trace_rays`], over the extent `args` holds on the GPU (width, height,
+    /// depth). Order its writes before the launch with [`Hazards::DRAW_ARGUMENTS`].
+    pub fn trace_rays_indirect<R: Pod>(
+        &mut self,
+        p: &RayPipeline,
+        raygen: u32,
+        hits: &HitTable,
+        root: &R,
+        args: GpuPtr<DispatchArgs>,
+    ) {
+        let [raygen, miss, hit, callable] = self.bind_rays(p, raygen, hits, root);
+        let rt = self
+            .queue
+            .shared
+            .rt_fn
+            .as_ref()
+            .expect("a ray tracing pipeline exists");
+        // SAFETY: as in `trace_rays`, and the arguments are the caller's live allocation.
         unsafe {
             rt.cmd_trace_rays_indirect(
                 self.cmd(),
-                &p.raygen,
-                &empty,
-                &empty,
-                &empty,
+                &raygen,
+                &miss,
+                &hit,
+                &callable,
                 args.address().0,
             );
         };

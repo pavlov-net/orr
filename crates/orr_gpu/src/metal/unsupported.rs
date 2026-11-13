@@ -1,6 +1,6 @@
 //! The parts of orr_gpu the Metal backend does not implement yet, or that Metal has no
 //! counterpart for: crash diagnostics, device-generated commands, cooperative vectors,
-//! counter frames, ray-dispatch pipelines and host memory imports. The types mirror the
+//! counter frames, ray tracing pipelines and host memory imports. The types mirror the
 //! Vulkan backend's; the calls fail, panic, or take handles no call creates.
 
 use std::alloc::Layout;
@@ -159,6 +159,40 @@ pub struct RayDispatchPipeline {
     never: !,
 }
 
+/// A ray tracing pipeline; Metal has none.
+pub struct RayPipeline {
+    never: !,
+}
+
+impl RayPipeline {
+    pub(super) fn unreachable(&self) -> ! {
+        match self.never {}
+    }
+
+    pub fn hit_handle(&self, group: u32) -> &[u8] {
+        let _ = group;
+        match self.never {}
+    }
+
+    pub fn hit_handles(&self) -> &[u8] {
+        match self.never {}
+    }
+
+    pub fn hit_record_bytes(&self, group: u32) -> u32 {
+        let _ = group;
+        match self.never {}
+    }
+
+    pub fn hit_stride(&self) -> u64 {
+        match self.never {}
+    }
+
+    pub fn write_hit_record(&self, record: &mut [u8], group: u32, data: &[u8]) {
+        let _ = (record, group, data);
+        match self.never {}
+    }
+}
+
 impl RayDispatchPipeline {
     pub(super) fn unreachable(&self) -> ! {
         match self.never {}
@@ -173,5 +207,14 @@ impl Device {
     ) -> Result<RayDispatchPipeline, Error> {
         let _ = (s, name);
         Err(Error::NotImplemented("ray-dispatch pipelines"))
+    }
+
+    pub fn create_ray_pipeline(
+        &self,
+        desc: &crate::RayPipelineDesc<'_>,
+        name: &str,
+    ) -> Result<RayPipeline, Error> {
+        let _ = (desc, name);
+        Err(Error::NotImplemented("ray tracing pipelines"))
     }
 }

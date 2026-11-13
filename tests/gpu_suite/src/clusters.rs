@@ -309,13 +309,97 @@ fn seg_dist(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
     (p - a - t * e).length()
 }
 
+/// Cells of an instance's triangles in its xy plane: a ray tests only the triangles whose
+/// bounds, widened by EDGE_EPS, overlap its cell.
+struct Grid {
+    lo: [f32; 2],
+    size: [f32; 2],
+    /// Cells per side.
+    n: usize,
+    cells: Vec<Vec<usize>>,
+}
+
+impl Grid {
+    fn new(inst: &RefInst) -> Grid {
+        let bounds = |t: &RefTri, axis: usize| {
+            let c = t.v.map(|v| v[axis]);
+            (
+                c[0].min(c[1]).min(c[2]) - EDGE_EPS,
+                c[0].max(c[1]).max(c[2]) + EDGE_EPS,
+            )
+        };
+        let mut lo = [f32::INFINITY; 2];
+        let mut hi = [f32::NEG_INFINITY; 2];
+        for t in &inst.tris {
+            for axis in 0..2 {
+                let (a, b) = bounds(t, axis);
+                lo[axis] = lo[axis].min(a);
+                hi[axis] = hi[axis].max(b);
+            }
+        }
+        let n = (inst.tris.len() as f32).sqrt().clamp(1.0, 64.0) as usize;
+        let size = [0, 1].map(|a| (hi[a] - lo[a]).max(f32::MIN_POSITIVE) / n as f32);
+        let mut grid = Grid {
+            lo,
+            size,
+            n,
+            cells: vec![Vec::new(); n * n],
+        };
+        for (ti, t) in inst.tris.iter().enumerate() {
+            let range = |axis: usize| {
+                let (a, b) = bounds(t, axis);
+                grid.cell(a, axis)..=grid.cell(b, axis)
+            };
+            let (xs, ys) = (range(0), range(1));
+            for y in ys {
+                for x in xs.clone() {
+                    grid.cells[y * n + x].push(ti);
+                }
+            }
+        }
+        grid
+    }
+
+    fn cell(&self, v: f32, axis: usize) -> usize {
+        (((v - self.lo[axis]) / self.size[axis]).max(0.0) as usize).min(self.n - 1)
+    }
+
+    /// The triangles that may hold `q`.
+    fn near(&self, q: [f32; 2]) -> &[usize] {
+        &self.cells[self.cell(q[1], 1) * self.n + self.cell(q[0], 0)]
+    }
+}
+
+/// The reference of instances' triangles, with each instance's cells.
+pub struct Reference<'a> {
+    insts: &'a [RefInst],
+    grids: Vec<Grid>,
+}
+
+impl<'a> Reference<'a> {
+    pub fn new(insts: &'a [RefInst]) -> Self {
+        Self {
+            insts,
+            grids: insts.iter().map(Grid::new).collect(),
+        }
+    }
+
+    /// The hit (instance, triangle, t) the reference expects for ray (x, y) traced in `mode`,
+    /// or `None` when the ray passes within the edge tolerance.
+    pub fn committed_hit(&self, x: u32, y: u32, mode: u32) -> Option<Option<(usize, usize, f32)>> {
+        expect(self, x, y, mode).map(|e| e.hit)
+    }
+}
+
 /// The reference for ray (x, y); `None` when it passes within EDGE_EPS of an edge.
-fn expect(insts: &[RefInst], x: u32, y: u32, mode: u32) -> Option<Expect> {
+fn expect(r: &Reference<'_>, x: u32, y: u32, mode: u32) -> Option<Expect> {
+    let insts = r.insts;
     let p = [(x as f32 + 0.5) / W as f32, (y as f32 + 0.5) / H as f32];
     let mut hits = Vec::new();
     for (ii, inst) in insts.iter().enumerate() {
         let q = [p[0] - inst.offset[0], p[1] - inst.offset[1]];
-        for (ti, tri) in inst.tris.iter().enumerate() {
+        for &ti in r.grids[ii].near(q) {
+            let tri = &inst.tris[ti];
             let v = tri.v.map(|v| [v[0], v[1]]);
             let minx = v[0][0].min(v[1][0]).min(v[2][0]);
             let maxx = v[0][0].max(v[1][0]).max(v[2][0]);
@@ -394,12 +478,6 @@ fn expect(insts: &[RefInst], x: u32, y: u32, mode: u32) -> Option<Expect> {
     })
 }
 
-/// The opaque hit (instance, triangle, t) the reference expects for ray (x, y), or `None`
-/// when the ray passes within the edge tolerance.
-pub fn reference_hit(insts: &[RefInst], x: u32, y: u32) -> Option<Option<(usize, usize, f32)>> {
-    expect(insts, x, y, 0).map(|e| e.hit)
-}
-
 /// Mismatches of one checked trace.
 #[derive(Default)]
 pub struct Report {
@@ -427,11 +505,12 @@ impl Report {
 
 /// Compares every ray record of `out` with the reference.
 pub fn check(out: &[u32], insts: &[RefInst], mode: u32) -> Report {
+    let reference = Reference::new(insts);
     let mut r = Report::default();
     for y in 0..H {
         for x in 0..W {
             let o = &out[(y * W + x) as usize * REC..][..REC];
-            let Some(e) = expect(insts, x, y, mode) else {
+            let Some(e) = expect(&reference, x, y, mode) else {
                 continue;
             };
             r.checked += 1;
@@ -871,7 +950,14 @@ pub fn clas_desc(op: RtasOp, mode: RtasMode, flags: RtasFlags, clusters: &[Clust
             max_verts_per_cluster: clusters.iter().map(|c| c.verts.len() as u32).max().unwrap(),
             max_total_tris: clusters.iter().map(|c| c.tris.len() as u32).sum(),
             max_total_verts: clusters.iter().map(|c| c.verts.len() as u32).sum(),
-            max_geometry_index: 64,
+            // 64 leaves room for the geometry index offsets instantiations add here.
+            max_geometry_index: clusters
+                .iter()
+                .map(|c| {
+                    let words = c.tri_gflags.as_deref().unwrap_or(&[0]);
+                    c.base_geom + words.iter().map(|w| w & 0xff_ffff).max().unwrap_or(0)
+                })
+                .fold(64, u32::max),
             max_geometries_per_cluster: geometries,
             min_truncate_bits: clusters.iter().map(|c| c.truncate).min().unwrap(),
         }),
@@ -926,7 +1012,7 @@ pub fn ptlas_write(
         flags: INSTANCE_CULL_DISABLE | if aabb { INSTANCE_EXPLICIT_AABB } else { 0 },
         instance_index: index,
         partition,
-        pad: 0,
+        hit_group: 0,
     }
 }
 

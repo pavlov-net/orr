@@ -59,6 +59,9 @@ world.
 **Lighting and materials**
 
 - Path tracing with shader execution reordering
+- Ray tracing pipelines in `orr_gpu`: raygen, closest-hit, any-hit, intersection, miss and
+  callable shaders compiled in parallel, hit records your GPU code can write, hit objects and
+  reordering (Vulkan only, not yet used by the path tracer)
 - A real time OpenPBR BSDF, checked against the reference implementation
 - Light selection across many lights, including area lights and emissive meshes, guided by per
   pixel feedback, with light and BSDF samples weighed against each other, plus a world radiance

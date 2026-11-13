@@ -14,7 +14,7 @@ use super::device::{Device, Shared};
 use super::garbage::Item;
 use super::specialize;
 use super::spirv;
-use crate::{EntryPoint, Error, ShaderModule, SpecData, Stage};
+use crate::{CodeStatistics, EntryPoint, Error, ShaderModule, SpecData, Stage};
 
 /// One shader stage of a pipeline: SPIR-V words, the entry point and specialization data.
 #[derive(Clone, Copy, Debug)]
@@ -84,6 +84,33 @@ impl ComputePipeline {
     pub fn workgroup(&self) -> [u32; 3] {
         self.workgroup
     }
+
+    /// What the driver reports of the pipeline's code; `None` where it reports nothing
+    /// (without `Caps::pipeline_executable_info`).
+    pub fn statistics(&self) -> Option<CodeStatistics> {
+        // A compute pipeline has one executable.
+        let stats = self.shared.executable_statistics(self.raw, 0)?;
+        let mut out = CodeStatistics::default();
+        for s in &stats {
+            // SAFETY: the format says which union member is set.
+            let value = unsafe {
+                match s.format {
+                    vk::PipelineExecutableStatisticFormatKHR::UINT64 => s.value.u64,
+                    vk::PipelineExecutableStatisticFormatKHR::INT64 => s.value.i64 as u64,
+                    _ => continue,
+                }
+            };
+            match s.name_as_c_str().ok().and_then(|c| c.to_str().ok()) {
+                Some("Register Count") => out.registers = value as u32,
+                // NVIDIA's drivers set bit 36 beside the bytes.
+                Some("Local Memory Size") => out.local_bytes = value & 0xffff_ffff,
+                Some("Shared Memory Size") => out.shared_bytes = value,
+                Some("Binary Size") => out.binary_bytes = value,
+                _ => {}
+            }
+        }
+        Some(out)
+    }
 }
 
 impl Drop for ComputePipeline {
@@ -93,6 +120,25 @@ impl Drop for ComputePipeline {
 }
 
 impl Shared {
+    /// The statistics the driver reports for executable `index` of `pipeline`, which was
+    /// created with CAPTURE_STATISTICS; `None` without `Caps::pipeline_executable_info`.
+    fn executable_statistics(
+        &self,
+        pipeline: vk::Pipeline,
+        index: u32,
+    ) -> Option<Vec<vk::PipelineExecutableStatisticKHR<'static>>> {
+        let exec = self.exec_fn.as_ref()?;
+        let einfo = vk::PipelineExecutableInfoKHR::default()
+            .pipeline(pipeline)
+            .executable_index(index);
+        // SAFETY: the pipeline was created with CAPTURE_STATISTICS.
+        let n = unsafe { exec.get_pipeline_executable_statistics_len(&einfo) }.ok()?;
+        let mut stats = vec![vk::PipelineExecutableStatisticKHR::default(); n];
+        // SAFETY: as above, with room for `n` statistics.
+        unsafe { exec.get_pipeline_executable_statistics(&einfo, &mut stats) }.ok()?;
+        Some(stats)
+    }
+
     /// Logs every statistic the driver reports for each of the pipeline's executables.
     fn log_statistics(&self, pipeline: vk::Pipeline, name: &str) {
         let Some(exec) = &self.exec_fn else { return };
@@ -103,16 +149,9 @@ impl Shared {
         // SAFETY: the pipeline was created with CAPTURE_STATISTICS.
         let count = unsafe { exec.get_pipeline_executable_properties_len(&info) }.unwrap_or(0);
         for i in 0..count as u32 {
-            let einfo = vk::PipelineExecutableInfoKHR::default()
-                .pipeline(pipeline)
-                .executable_index(i);
-            // SAFETY: as above.
-            let n = unsafe { exec.get_pipeline_executable_statistics_len(&einfo) }.unwrap_or(0);
-            let mut stats = vec![vk::PipelineExecutableStatisticKHR::default(); n];
-            // SAFETY: as above, with room for `n` statistics.
-            if unsafe { exec.get_pipeline_executable_statistics(&einfo, &mut stats) }.is_err() {
+            let Some(stats) = self.executable_statistics(pipeline, i) else {
                 continue;
-            }
+            };
             let mut line = String::new();
             for s in &stats {
                 let label = s
@@ -171,18 +210,10 @@ impl<'a> StageParts<'a> {
                 s.entry.name, s.entry.stage
             )));
         }
-        match want {
-            Stage::RayGen if s.inline_root_bytes == 0 => {
-                return Err(Error::Shader(format!(
-                    "{name}: a ray-dispatch kernel declares its root with ORR_ROOT_INLINE"
-                )));
-            }
-            Stage::Task | Stage::Mesh | Stage::Pixel if s.inline_root_bytes > 0 => {
-                return Err(Error::Shader(format!(
-                    "{name}: a {want:?} entry cannot use ORR_ROOT_INLINE"
-                )));
-            }
-            _ => {}
+        if matches!(want, Stage::Task | Stage::Mesh | Stage::Pixel) && s.inline_root_bytes > 0 {
+            return Err(Error::Shader(format!(
+                "{name}: a {want:?} entry cannot use ORR_ROOT_INLINE"
+            )));
         }
         if s.omm && !shared.caps.omm {
             return Err(Error::Shader(format!(
@@ -238,7 +269,8 @@ impl<'a> StageParts<'a> {
         Ok(Self {
             code,
             entry: s.entry.spirv_name,
-            mappings: if s.inline_root_bytes > 0 {
+            // A ray tracing stage's root, if any, is inline: the build checks it.
+            mappings: if s.inline_root_bytes > 0 || want.ray_tracing() {
                 Vec::new()
             } else {
                 vec![root_mapping()]
@@ -292,7 +324,7 @@ impl StageChain<'_> {
             info.specialization_info(&self.spec)
         };
         let info = info.push(&mut self.module);
-        // Ray-dispatch pipelines with this struct on the stage miss every pipeline cache.
+        // Ray tracing pipelines with this struct on a stage miss every pipeline cache.
         if self.mapping.mapping_count == 0 {
             info
         } else {
@@ -302,21 +334,25 @@ impl StageChain<'_> {
 }
 
 impl Shared {
-    pub(super) fn pipeline_flags(&self) -> vk::PipelineCreateFlags2 {
+    pub(super) fn pipeline_flags(&self, statistics: bool) -> vk::PipelineCreateFlags2 {
         let mut flags = vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT;
-        if self.exec_fn.is_some() {
+        if statistics && self.exec_fn.is_some() {
             flags |= vk::PipelineCreateFlags2::CAPTURE_STATISTICS_KHR;
         }
         flags
     }
 
-    pub(super) fn created(&self, raw: vk::Pipeline, name: &str, start: Instant) {
+    /// Names a new pipeline and logs its creation, and its statistics when it was created with
+    /// `statistics`.
+    pub(super) fn created(&self, raw: vk::Pipeline, name: &str, start: Instant, statistics: bool) {
         name_object(&self.debug_fn, raw, name);
         log::debug!(
             "pipeline {name}: created in {:.1} ms",
             start.elapsed().as_secs_f64() * 1e3
         );
-        self.log_statistics(raw, name);
+        if statistics {
+            self.log_statistics(raw, name);
+        }
     }
 
     /// A compute pipeline with `extra` creation flags.
@@ -331,6 +367,7 @@ impl Shared {
             &[&parts],
             &[],
             extra,
+            false,
             name,
             "vkCreateComputePipelines",
             |cache, next| {

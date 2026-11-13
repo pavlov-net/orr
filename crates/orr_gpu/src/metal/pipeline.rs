@@ -277,6 +277,11 @@ impl ComputePipeline {
     pub fn workgroup(&self) -> [u32; 3] {
         self.workgroup
     }
+
+    /// `None`: Metal reports nothing of a pipeline's code.
+    pub fn statistics(&self) -> Option<crate::CodeStatistics> {
+        None
+    }
 }
 
 impl Device {
