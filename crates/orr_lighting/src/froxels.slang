@@ -68,7 +68,7 @@ public static const uint SMOKE_WORDS = 7;
 public static const float SMOKE_DEPTH_SCALE = 65536.0;
 public static const float SMOKE_EMISSION_SCALE = 1024.0;
 
-// One frame's froxel counts, read back by the CPU.
+// One frame's froxel counts. The passes add to them in device memory, and the CPU reads a copy.
 public struct MediaStatsGpu
 {
     // Froxels in front of their tiles' surfaces.
