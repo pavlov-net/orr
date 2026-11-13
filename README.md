@@ -109,6 +109,21 @@ The other programs in `examples/` show one feature each: try `sky`, `dielectrics
 `skinned` for animated characters, and `dense-vegetation` for a large scene. When you're ready to
 read code, start with those examples and the `orr` crate.
 
+### Profiling
+
+Each kernel's entry point is named after its module, such as `orr_lighting.path.staged.trace`, so
+a GPU profiler tells kernels apart, and passes carry debug labels. For hotspots at Slang source
+lines, build with line tables and the source text in the SPIR-V:
+
+```sh
+ORR_SHADER_DEBUG_INFO=lines cargo build --release -p orr_examples --example viewer
+```
+
+The variable reaches every crate that builds kernels with `orr_shaders::build`, a program's own
+too. Release builds also leave out shader asserts. Slang optimizes less around line tables, so a
+`lines` build's kernels keep some locals in memory and are about a percent larger than a normal
+build's: its numbers are close to a normal build's but not identical.
+
 ## Contributing
 
 Install the pre-commit hook, which runs fmt, clippy and typos:

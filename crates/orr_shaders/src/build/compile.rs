@@ -56,13 +56,17 @@ pub struct Build {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DebugInfo {
     Off,
-    /// Line tables only (`-g1`): `OpLine` instructions, no variables, types or scopes.
+    /// Line tables (`-g1`) and the source text (`OpSource`), which a profiler maps samples to
+    /// source lines with; no variables, types or scopes. Slang optimizes less around the line
+    /// instructions and keeps some locals in memory, so the code differs slightly from an `Off`
+    /// build's.
     Lines,
-    /// In the SPIR-V (`-g2`).
+    /// In the SPIR-V (`-g2`). The code differs from an `Off` build's, as with `Lines`.
     Embedded,
     /// In a sidecar beside each module (`-g2 -separate-debug-info`): the module is stripped
     /// but keeps its `DebugBuildIdentifier`, and `<name>.dbg.spv` holds the debug info, the
-    /// form Aftermath maps crash dumps through.
+    /// form Aftermath maps crash dumps through. The code differs from an `Off` build's, as with
+    /// `Lines`.
     Separate,
 }
 
@@ -731,7 +735,7 @@ impl Build {
         }
         match self.debug_info {
             DebugInfo::Off => {}
-            DebugInfo::Lines => options.push("-g1".into()),
+            DebugInfo::Lines => options.extend(["-g1".into(), "-debug-info-include-source".into()]),
             DebugInfo::Embedded => options.push("-g2".into()),
             DebugInfo::Separate => {
                 options.extend(["-g2".into(), "-separate-debug-info".into()]);
