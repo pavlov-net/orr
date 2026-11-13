@@ -3924,8 +3924,9 @@ impl Mounts {
             records[i].flags |= material_flags::HAS_BACK;
         }
         for (m, &mid) in records.iter().zip(&material_ids) {
-            w.materials.note(mid, m);
-            w.put(w.materials.table.entry(mid.0), &[w.materials.record(m)])?;
+            let record = w.materials.record(m);
+            w.materials.note(mid, &record);
+            w.put(w.materials.table.entry(mid.0), &[record])?;
         }
         let mut mesh_ids = Vec::with_capacity(meshes.len());
         let mut entries = Vec::with_capacity(meshes.len());

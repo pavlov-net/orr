@@ -25,6 +25,10 @@ public static const uint MATERIAL_ANISOTROPY = 1 << 12;
 // Ray origin policy (gbuffer ORIGIN_*), 2 bits.
 public static const uint MATERIAL_ORIGIN_SHIFT = 13;
 public static const uint MATERIAL_ORIGIN_MASK = 3 << 13;
+// A solid dielectric caster that transmits and that no texture, vertex color stream, back,
+// displacement, linked surface, coat, fuzz, thin film or anisotropy varies; the host sets it on
+// every record (orr_scene::material_flags::STACK_FACE).
+public static const uint MATERIAL_STACK_FACE = 1 << 15;
 public static const uint MATERIAL_COST_SHIFT = 16;
 public static const uint MATERIAL_COST_MASK = 3 << 16;
 // The coat shades on the base's normal, normal map included, not the mesh's.

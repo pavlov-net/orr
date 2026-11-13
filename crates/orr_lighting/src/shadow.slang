@@ -495,24 +495,15 @@ public StackLight straight_light(float3 dir)
 }
 
 // The BSDF a plane stack face of material `m` shows, the same at every point: what
-// `StandardSurface` gives a material that no texture, vertex color stream, coat, fuzz, thin film,
-// anisotropy or decal varies, solid, smooth below MIRROR_ROUGHNESS and transmitting; with
-// `dispersion`, not dispersive. False for any other material.
+// `StandardSurface` gives a MATERIAL_STACK_FACE material that is an ideal mirror and window, with
+// no decal listed to vary it; with `dispersion`, not dispersive. False for any other material.
 public bool stack_material(SceneRoot* s, uint m, bool dispersion, out BsdfParams p)
 {
     p = (BsdfParams)0;
     if (m == MATERIAL_NONE || s.decal_globals != 0 || s.decal_bin_slots != 0)
         return false;
     MaterialGpu* g = s.materials + m;
-    uint varies = MATERIAL_THIN_WALLED | MATERIAL_VERTEX | MATERIAL_MORE_TEXTURES | MATERIAL_ANISOTROPY | MATERIAL_HAS_BACK | MATERIAL_DISPLACED | MATERIAL_MEDIUM_TEXTURED;
-    if (g.surface != 0 || (g.flags & varies) != 0 || g.coat_weight != 0.0 || g.fuzz_weight != 0.0 || g.thin_film_weight != 0.0)
-        return false;
-    for (uint k = 0; k < TEXTURE_SLOTS; k++)
-    {
-        if (material_bound(g, k))
-            return false;
-    }
-    if (!crosses_interior(s, m) || (dispersion && disperses(s, m)))
+    if ((g.flags & MATERIAL_STACK_FACE) == 0 || (dispersion && disperses(s, m)))
         return false;
     p.base_color = g.base_weight * g.base_color;
     p.metalness = g.metalness;
@@ -528,7 +519,7 @@ public bool stack_material(SceneRoot* s, uint m, bool dispersion, out BsdfParams
         p.flags |= BSDF_FRESNEL_MIX;
     if ((g.flags & MATERIAL_METAL_FLAT) != 0)
         p.flags |= BSDF_METAL_FLAT;
-    return (1.0 - p.metalness) * p.transmission_weight > 0.0 && bsdf_thin_mirror(p, AMBIENT_IOR);
+    return bsdf_thin_mirror(p, AMBIENT_IOR);
 }
 
 // A plane stack face at a hit: its material and BSDF, the unit shading normal its corners share,

@@ -42,6 +42,12 @@ pub mod material_flags {
     /// The ray origin policy, 0-2 (default, surface, triangle), in bits 13-14.
     pub const ORIGIN_SHIFT: u32 = 13;
     pub const ORIGIN_MASK: u32 = 3 << ORIGIN_SHIFT;
+    /// The record is a solid dielectric caster that transmits and that no texture, vertex
+    /// color stream, back, displacement, linked surface, coat, fuzz, thin film or anisotropy
+    /// varies: a plane stack face where its BSDF is an ideal mirror and window (`shadow.slang`'s
+    /// `stack_material`), which only a surface smoother than `CHAIN_ROUGHNESS` is. The material
+    /// table sets it on every record it stores, from the record's other fields.
+    pub const STACK_FACE: u32 = 1 << 15;
     /// The cost class, 0-3, in bits 16-17.
     pub const COST_SHIFT: u32 = 16;
     pub const COST_MASK: u32 = 3 << COST_SHIFT;
@@ -302,6 +308,26 @@ pub(crate) struct MaterialTable {
     world_lengths: Mutex<HashSet<u32>>,
 }
 
+/// Whether record `m` takes [`material_flags::STACK_FACE`].
+fn stack_face(m: &MaterialGpu) -> bool {
+    use material_flags as f;
+    let varies = f::THIN_WALLED
+        | f::VERTEX
+        | f::MORE_TEXTURES
+        | f::ANISOTROPY
+        | f::HAS_BACK
+        | f::DISPLACED
+        | f::MEDIUM_TEXTURED;
+    m.surface == 0
+        && m.flags & varies == 0
+        && m.flags & (f::DIELECTRIC | f::CASTER) == f::DIELECTRIC | f::CASTER
+        && m.coat_weight == 0.0
+        && m.fuzz_weight == 0.0
+        && m.thin_film_weight == 0.0
+        && m.textures.iter().all(|&t| t == TextureIndex::NONE)
+        && (1.0 - m.metalness) * m.transmission_weight > 0.0
+}
+
 /// Whether pixels of `m` may use the extended G-buffer targets. A linked surface may set any
 /// lobe.
 fn needs_extended(m: &MaterialGpu) -> bool {
@@ -326,15 +352,19 @@ impl MaterialTable {
         })
     }
 
-    /// `m` as the table stores it: pointing at the texture stream table.
+    /// `m` as the table stores it: pointing at the texture stream table, with the stack face
+    /// flag as its other fields decide.
     pub(crate) fn record(&self, m: &MaterialGpu) -> MaterialGpu {
+        use material_flags as f;
+        let stack = if stack_face(m) { f::STACK_FACE } else { 0 };
         MaterialGpu {
             texture_streams: self.streams.gpu(),
+            flags: m.flags & !f::STACK_FACE | stack,
             ..*m
         }
     }
 
-    /// Records what material `id` now holds.
+    /// Records what material `id` now holds: `m`, as [`Self::record`] gave it.
     pub(crate) fn note(&self, id: MaterialId, m: &MaterialGpu) {
         let mark = |set: &Mutex<HashSet<u32>>, on: bool| {
             let mut set = set.lock().unwrap();
@@ -370,7 +400,7 @@ impl MaterialTable {
         self.features.lock().unwrap().casts()
     }
 
-    /// Whether any material could be a plane stack face.
+    /// Whether any record has the stack face flag.
     pub(crate) fn stack_faces(&self) -> bool {
         self.features.lock().unwrap().stack_faces()
     }
@@ -427,8 +457,9 @@ impl MaterialWriter<'_> {
             id.0 < self.table.table.capacity(),
             "{id:?} is outside the material table"
         );
-        let src = self.window.put(self.device, &self.table.record(m))?;
-        self.table.note(id, m);
+        let record = self.table.record(m);
+        let src = self.window.put(self.device, &record)?;
+        self.table.note(id, &record);
         let dst = self.table.table.entry(id.0);
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         self.records
