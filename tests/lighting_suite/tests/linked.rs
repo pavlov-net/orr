@@ -181,12 +181,22 @@ fn a_linked_surface_switches_form_only_from_the_second_bounce() {
         focus: None,
     };
     let mut bed = linked_bed(spec);
-    let mut light = |view| {
-        let p = linked_paths(debug(view, 3));
-        surface_mean(&render_paths(&mut bed, &p, 32, 1))
+    let mut light = |view, specialize| {
+        let mut p = linked_paths(debug(view, 3));
+        p.specialize = specialize;
+        render_paths(&mut bed, &p, 32, 1)
     };
-    let direct = light(LightingDebugView::DirectOnly);
-    let indirect = light(LightingDebugView::IndirectOnly);
+    let direct = light(LightingDebugView::DirectOnly, false);
+    let indirect = light(LightingDebugView::IndirectOnly, false);
+    // The scene's own pipelines shade a linked surface's vertex in the stage that holds the
+    // linked surfaces, not in the plain opaque stage, and render the same image.
+    let bits =
+        |a: &Accumulated| -> Vec<[u32; 4]> { a.mean.iter().map(|p| p.map(f32::to_bits)).collect() };
+    assert!(
+        bits(&light(LightingDebugView::IndirectOnly, true)) == bits(&indirect),
+        "the scene's own pipelines changed the image"
+    );
+    let (direct, indirect) = (surface_mean(&direct), surface_mean(&indirect));
     assert!(
         direct[1] < 0.15 * direct[0],
         "light from the first bounce holds the far form: {direct:?}"

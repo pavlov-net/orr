@@ -74,6 +74,9 @@ public static const uint QUEUE_FINISH = 4;
 // those lobes; with none in the scene every opaque vertex goes there.
 public static const uint QUEUE_RICH = 5;
 public static const uint STAGE_QUEUES = 6;
+// Not a queue: the shade stage `K` of the primary stage, which shades only the vertex a path
+// starts on the G-buffer's surface.
+static const uint SHADE_START = STAGE_QUEUES;
 
 // Lanes per workgroup of the stages over a queue.
 public static const uint STAGE_GROUP = 32;
@@ -1323,7 +1326,7 @@ public void primary_stage<S : ISurface, M : IMedium>(PathRoot root, uint lane)
     start_state(r, pixel, start, rng, false, f, p, c);
     // The round's trace stage, which runs next, traces these paths' rays beside the camera
     // rays: a queue's list holds one round at a time.
-    shade_slot<S, M, QUEUE_OPAQUE>(r, lane, f, p, (PathPending)0, c, round_now(r));
+    shade_slot<S, M, SHADE_START>(r, lane, f, p, (PathPending)0, c, round_now(r));
 }
 
 // The background layer's path of the slice's `lane`th pixel: on a marked pixel its lens ray past
@@ -1922,9 +1925,10 @@ ShadeNee no_nee(VertexScatter scatter, Spectral spectral)
 // Resolves the vertex the trace stage's ray reached (a layer for `layer`), and takes its
 // emission, the cache's light where the path ends there, and the record's view of it: the rest
 // of the iteration that traced the ray. A `start_vertex` is the G-buffer surface a path starts
-// on, whose throughput is 1 and whose light counts wherever the G-buffer's emission does. False
-// where the path ends.
-bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, PathPending pending, inout StagedRecord record, PathContext x, bool layer, bool start_vertex, inout Sampler rng, inout ShadeVertex sv)
+// on, whose throughput is 1 and whose light counts wherever the G-buffer's emission does.
+// `gbuffer_only`, a constant, says the vertex is the G-buffer's surface, as the path's flags do,
+// so the kernel holds no hit resolve. False where the path ends.
+bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, PathPending pending, inout StagedRecord record, PathContext x, bool layer, bool start_vertex, bool gbuffer_only, inout Sampler rng, inout ShadeVertex sv)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
@@ -1936,7 +1940,7 @@ bool resolve_vertex<S : ISurface>(PathRoot r, PathFixed f, inout PathLoop p, ino
     // The ray's length, and for the camera ray's vertex its distance from the eye.
     float t = pending.t;
     bool first = has(p.flags, LOOP_CAMERA);
-    bool gbuffer = !layer && has(p.flags, LOOP_GBUFFER_HIT);
+    bool gbuffer = gbuffer_only || (!layer && has(p.flags, LOOP_GBUFFER_HIT));
     bool counted = has(p.flags, LOOP_COUNTED);
     bool through = has(p.flags, LOOP_THROUGH);
     set_flag(p.flags, LOOP_CAMERA, false);
@@ -2406,7 +2410,15 @@ void shade_slot<S : ISurface, M : IMedium, let K : uint>(PathRoot r, uint slot, 
         set_flag(p.flags, LOOP_GBUFFER_START, false);
         if (!start_vertex)
             p.iteration++;
-        if (!resolve_vertex<S>(r, f, p, c, pending, record, x, K == QUEUE_OTHER, start_vertex, rng, sv) || !iteration_runs(r, p, kind, true))
+        // The plain opaque queue holds only vertices of standard surfaces (`opaque_queue`), and
+        // the primary stage's start vertex is the G-buffer's, which resolves no hit: neither
+        // resolves its vertex through the linked surfaces.
+        bool resolved;
+        if (K == QUEUE_OPAQUE || K == SHADE_START)
+            resolved = resolve_vertex<StandardSurface>(r, f, p, c, pending, record, x, false, start_vertex, K == SHADE_START, rng, sv);
+        else
+            resolved = resolve_vertex<S>(r, f, p, c, pending, record, x, K == QUEUE_OTHER, start_vertex, false, rng, sv);
+        if (!resolved || !iteration_runs(r, p, kind, true))
         {
             p.rng = rng;
             leave_shade(r, slot, f, p, c, false, false, next);
