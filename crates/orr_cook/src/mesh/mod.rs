@@ -1582,23 +1582,37 @@ fn largest(step: f64) -> f64 {
     (f64::from(f32::MAX) / step).floor()
 }
 
-/// f16 bits of the smallest half at or above `v`.
+/// f16 bits of the smallest half at or above `v` that is 0 or normal.
 fn f16_up(v: f32) -> u16 {
     let h = half::f16::from_f32(v);
-    if h.to_f32() < v {
+    let b = if h.to_f32() < v {
         f16_next(h, true)
     } else {
         h.to_bits()
-    }
+    };
+    normal_or_zero(b, true)
 }
 
-/// f16 bits of the largest half at or below `v`.
+/// f16 bits of the largest half at or below `v` that is 0 or normal.
 fn f16_down(v: f32) -> u16 {
     let h = half::f16::from_f32(v);
-    if h.to_f32() > v {
+    let b = if h.to_f32() > v {
         f16_next(h, false)
     } else {
         h.to_bits()
+    };
+    normal_or_zero(b, false)
+}
+
+/// Half bits `b`, a subnormal taken up (`up`) or down to the nearest 0 or normal half. A device
+/// may flush a subnormal half to 0 as it reads it, which would move a bound to the wrong side.
+fn normal_or_zero(b: u16, up: bool) -> u16 {
+    if b & 0x7c00 != 0 || b & 0x03ff == 0 {
+        b
+    } else if (b & 0x8000 == 0) == up {
+        (b & 0x8000) | 0x0400
+    } else {
+        0
     }
 }
 
@@ -2235,7 +2249,35 @@ impl MeshData {
 
 #[cfg(test)]
 mod tests {
-    use super::stored_corner_order;
+    use super::{f16_down, f16_up, stored_corner_order};
+
+    /// Rounded bounds lie on the right side of their value and are never subnormal, so a
+    /// device that flushes subnormal halves reads them unchanged.
+    #[test]
+    fn f16_bounds_hold_their_value_and_are_never_subnormal() {
+        let value = |b: u16| half::f16::from_bits(b).to_f32();
+        let subnormal = |b: u16| b & 0x7c00 == 0 && b & 0x03ff != 0;
+        let mut v = 1e-9_f32;
+        while v < 65000.0 {
+            for x in [v, -v] {
+                let (up, down) = (f16_up(x), f16_down(x));
+                assert!(
+                    value(up) >= x && value(down) <= x,
+                    "{x}: {up:#06x} {down:#06x}"
+                );
+                assert!(
+                    !subnormal(up) && !subnormal(down),
+                    "{x}: {up:#06x} {down:#06x}"
+                );
+            }
+            v *= 1.37;
+        }
+        let tiny = 1e-6;
+        assert_eq!(
+            [f16_up(tiny), f16_down(tiny), f16_up(-tiny), f16_down(-tiny)],
+            [0x0400, 0, 0, 0x8400]
+        );
+    }
 
     /// The port of the meshlet encoder's rotations matches the codec: random clusters and
     /// strips that reuse edges, after an encode and decode.

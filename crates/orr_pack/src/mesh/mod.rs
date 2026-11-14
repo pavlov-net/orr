@@ -382,7 +382,8 @@ pub struct Cluster {
     /// Rest AABB is `(anchor, anchor + local_max) x 2^k`. Past [`LOCAL_LOW_MAX`] on an axis,
     /// the cluster's page holds high halves.
     pub local_max: [u32; 3],
-    /// f16 bits, meters.
+    /// f16 bits, meters, each 0 or normal and rounded outward, so a device that flushes
+    /// subnormal halves reads the same bound.
     pub deformation_bound: u16,
     pub displacement_min: u16,
     pub displacement_max: u16,
@@ -397,7 +398,7 @@ pub struct Cluster {
     pub area: f32,
     /// f16 bits, meters: on clusters of subsurface sections the smallest distance a ray cast
     /// inward from one of its triangles travels to the geometry drawn with it (infinity when
-    /// none hits); 0 elsewhere.
+    /// none hits); 0 elsewhere. 0 or normal, rounded down.
     pub min_thickness: u16,
     pub part: u16,
     /// DAG mode: the group, in [`MeshInfo::groups`], whose simplification made the cluster,
