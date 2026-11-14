@@ -162,66 +162,67 @@ public LaunchWalk new_walk(Walk e, uint flags, uint owner, PathCover cover, uint
 }
 
 // The end of `slot`'s walk, once its walk part holds it: STEP_ENDED; STEP_VERTEX with the class of
-// a subsurface walk's exit at its cap or of an interior's way out; or STEP_INVOKE where its last
-// step met a surface, which the raygen then invokes as the exit or the path ray's hit. It loads the
-// loop and the walk, and for an interior's walk the ray and the interiors.
+// a subsurface walk's exit at its cap (STEP_CAPPED) or of an interior's way out; or STEP_INVOKE
+// where its last step met a surface, which the raygen then invokes as the exit or the path ray's
+// hit. It loads the loop and the walk, and for an interior's walk the ray and the interiors.
 public uint launch_walk_end(PathRoot r, uint slot)
 {
     uint4* at = hot_words(r, slot);
     uint4* walk = walk_words(r, slot);
     uint2 pixel = launch_pixel(r, slot);
-    uint reach;
-    PathLoop p = load_path_loop(r, at, pixel, reach);
+    PathLoop p = load_loop_state(r, at, pixel);
     LaunchWalk w = load_part<LaunchWalk, WALK_STATE_WORDS>(walk);
     Walk e = walk_of(moving_part(w), fixed_part(w));
     e.normal = w.normal;
-    p.rays += w.rays;
+    if (may(MAY_DEBUG))
+        p.rays += w.rays;
     LaunchRecord record = launch_record(r, slot);
     PathContext x = path_context(r, record, pixel);
     if ((w.kind & LAUNCH_WALK_INTERIOR) == 0 || !interiors_tracked(r))
     {
         bool alive = subsurface_walk_ended(r, p, x, e);
-        store_path_loop(at, p, e.kind == WALK_CAP ? REACH_EXIT_CAP : 0);
+        store_loop_state(at, p);
+        flush_loop_radiance(at, p);
         if (!alive)
             return STEP_ENDED;
         if (e.kind == WALK_BOUNDARY)
+        {
             store_invoke_cover(at, p, x, true);
-        return e.kind == WALK_BOUNDARY ? STEP_INVOKE : STEP_VERTEX | (AT_EXIT << STEP_AT_SHIFT);
+            return STEP_INVOKE;
+        }
+        return STEP_VERTEX | (AT_EXIT << STEP_AT_SHIFT) | STEP_CAPPED;
     }
-    LayerRay ray = layer_ray(load_launch_ray(at));
-    uint4* inside = interior_words(r, slot);
-    LaunchInterior i = load_part<LaunchInterior, SLOT_INTERIOR_WORDS>(inside);
-    ray.start = i.start;
-    p.entered = i.entered;
-    p.entered_at = i.entered_at;
-    p.entered_normal = i.entered_normal;
+    LaunchRay stored = load_launch_ray(at);
+    ShadeState c = launch_state(layer_ray(stored));
+    load_interiors(r, slot, p, c);
+    bool stack_ray = has(p.flags, LOOP_STACK_RAY);
+    Interior arrived = c.interior;
     Sampler rng = p.rng;
     bool leaves;
     float3 out, n, dir;
-    bool alive = interior_walk_ended(r, p, i.interior, ray, x, record.adjoint(), e, w.owner, rng, leaves, out, n, dir);
+    bool alive = interior_walk_ended(r, p, c.interior, c.ray, x, record.adjoint(), e, w.owner, rng, leaves, out, n, dir);
     p.rng = rng;
-    store_path_loop(at, p, reach);
+    if (alive && !leaves)
+    {
+        // The ray words may hold the path's plane stack, which the walk keeps.
+        if (stack_kept(r) && stack_ray)
+            keep_path_stack(r, slot, p, load_path_stack(r, slot, p.flags, stored, arrived, p.depth - 1, !x.photon && !x.one_technique));
+        // The hit's arrival takes no segment: the walk's last step ran inside the interior.
+        store_launch_ray(at, launch_ray(c.ray, 0.0, 0, LAUNCH_INSIDE));
+        store_invoke_cover(at, p, x, false);
+    }
+    else if (alive)
+    {
+        // The way out leaves the walk's interior.
+        store_interiors(r, slot, p, c);
+        e.origin = out;
+        e.normal = n;
+        e.dir = dir;
+        store_walk_moving(walk, e, w.kind, w.rays);
+    }
+    store_loop_state(at, p);
+    flush_loop_radiance(at, p);
     if (!alive)
         return STEP_ENDED;
-    if (!leaves)
-    {
-        // The ray words may hold the path's plane stack (SCALARS_STACK_RAY), which the walk keeps.
-        if (stack_kept(r) && (load_scalar(at, SCALAR_FLAGS) & SCALARS_STACK_RAY) != 0)
-            keep_path_stack(r, slot, load_path_stack(r, slot, load_launch_ray(at), i.interior, p.depth - 1, !x.photon && !x.one_technique));
-        store_launch_ray(at, launch_ray(ray, 0.0, 0));
-        store_invoke_cover(at, p, x, false);
-        return STEP_INVOKE;
-    }
-    // The way out leaves the walk's interior, which the IOR around the vertex and the scalars'
-    // flags follow.
-    store_part<LaunchInterior, SLOT_INTERIOR_WORDS>(inside, i);
-    store_scalar(at, SCALAR_IOR, asuint(interior_ior(r.scene, i.interior.innermost())));
-    uint flags = load_scalar(at, SCALAR_FLAGS);
-    set_flag(flags, SCALARS_INTERIOR, i.interior.count > 0);
-    store_scalar(at, SCALAR_FLAGS, flags);
-    e.origin = out;
-    e.normal = n;
-    e.dir = dir;
-    store_walk_moving(walk, e, w.kind, w.rays);
-    return STEP_VERTEX | (AT_LEAVE << STEP_AT_SHIFT);
+    return leaves ? STEP_VERTEX | (AT_LEAVE << STEP_AT_SHIFT) : STEP_INVOKE;
 }

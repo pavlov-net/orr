@@ -6,8 +6,8 @@
 // hit record (`orr_scene.runs`' `HitData`): its class, the class its geometry traces as, and its
 // section material, which the inline handlers find through the cluster and the copy's tables. A
 // linked coverage type's shaders are the same bodies over `Surfaces` of that type. Shadow rays
-// pass what bends light at a dielectric to the raygen, which walks it one crossing per trace
-// (`crossing_any_hit`), and a medium proxy with a volume to a march.
+// pass what bends light at a dielectric to the raygen, which walks it one crossing per path trace,
+// and a medium proxy with a volume to a march.
 module candidates;
 
 import orr_shaders.abi;
@@ -32,9 +32,6 @@ public static const uint PRESENCE_DRAWN = 2;     // where a hashed draw from `se
 [Host] public static const uint COVER_ALPHA = 0;        // present by the alpha test: `Alpha`
 [Host] public static const uint COVER_LAYERS = 1;       // presence layers by `presence`, the rest by the alpha test: `LayerAccept`
 [Host] public static const uint COVER_STACK = 2;        // present opaque triangles and cooked solid glass: `StackAccept`
-// A shadow ray's crossing step: the nearest present dielectric past the walk's last crossing, by
-// the alpha test, committed (`crossing_any_hit`); presence layers never.
-public static const uint COVER_CROSSING = 3;
 
 // What a path ray's any-hit reads of its trace, 16 bytes of payload (`path_payload`).
 public struct PathCover
@@ -42,7 +39,7 @@ public struct PathCover
     public uint mask;               // the trace's instance mask, which turns away other classes
     public uint policy;             // COVER_*
     public uint presence;           // PRESENCE_*, with COVER_LAYERS
-    public uint seed;               // PRESENCE_DRAWN's draws; a crossing step's last crossing's distance
+    public uint seed;               // PRESENCE_DRAWN's draws
     public HitContext context;      // with no tap and the cone's width at the ray's origin
 }
 
@@ -61,8 +58,6 @@ public uint4 path_payload(PathCover c)
     return uint4(word, c.seed, asuint(c.context.cone_width), asuint(c.context.cone_spread));
 }
 
-// A crossing step's payload carries no cone: a shadow ray's context has none. Its third word holds
-// the distance of the crossing the trace has committed so far (`crossing_payload`).
 public PathCover path_cover(uint4 payload)
 {
     uint word = payload.x;
@@ -72,15 +67,13 @@ public PathCover path_cover(uint4 payload)
     c.presence = (word >> 10) & 3;
     c.seed = payload.y;
     RayCone cone = { asfloat(payload.z), asfloat(payload.w) };
-    if (c.policy == COVER_CROSSING)
-        cone = RayCone();
     c.context = hit_context((word >> 12) & 1, word >> 16, cone, 0.0, float2(-1.0), ((word >> 13) & 1) != 0);
     return c;
 }
 
 // Whether a path ray commits the non-opaque triangle candidate with hit record data `d` on cluster
-// `cluster_id` of instance `instance_index` along unit `dir`, by `c`'s policy but a crossing step's:
-// ANY_HIT_ACCEPT or ANY_HIT_IGNORE. `cover_decision` as the record has it.
+// `cluster_id` of instance `instance_index` along unit `dir`, by `c`'s policy: ANY_HIT_ACCEPT or
+// ANY_HIT_IGNORE. `cover_decision` as the record has it.
 public uint cover_path<S : ISurfaces>(SceneRoot* s, ViewConstants* v, PathCover c, HitData d, float3 dir, uint instance_index, int cluster_id, uint primitive, float2 bary)
 {
     if (cluster_id < 0)
@@ -150,84 +143,11 @@ public bool cover_decision<S : ISurfaces>(SceneRoot* s, ViewConstants* v, uint p
     return presence_drawn(seed, instance_index, cluster, primitive) < coverage;
 }
 
-// A shadow ray's dielectric crossing, by which a crossing walk orders the crossings it takes:
-// its distance, then its instance, cluster and primitive, which order crossings at one distance.
-public struct CrossingKey
-{
-    public float t;
-    public uint instance;
-    public uint cluster;
-    public uint primitive;
-}
-
-// Whether crossing `a` lies before `b`.
-public bool crossing_before(CrossingKey a, CrossingKey b)
-{
-    if (a.t != b.t)
-        return a.t < b.t;
-    if (a.instance != b.instance)
-        return a.instance < b.instance;
-    if (a.cluster != b.cluster)
-        return a.cluster < b.cluster;
-    return a.primitive < b.primitive;
-}
-
-// Where a crossing step's any-hit reads the keys it orders candidates by, only for a candidate at
-// exactly their distance, and keeps the key of the candidate it commits: a hit's cluster is a
-// hit shader's alone.
-public interface ICrossingKeys
-{
-    // The walk's last crossing, which the step looks past: at the payload's second word.
-    CrossingKey last();
-    // The crossing the trace committed last: at the payload's third word.
-    CrossingKey committed();
-    // Keeps `key` as the committed crossing.
-    void commit(CrossingKey key);
-}
-
-// The payload of a crossing step of a shadow ray whose path's cover word `cover` has COVER_CROSSING
-// (`path_payload`'s first word), past the walk's last crossing at distance `last`, -infinity
-// before the first: the any-hit keeps the committed crossing's distance in its third word,
-// +infinity until one commits.
-public uint4 crossing_payload(uint cover, float last)
-{
-    return uint4(cover, asuint(last), 0x7f800000u, 0);
-}
-
-// A crossing step's any-hit at triangle candidate `h` with hit record data `d`: commits the
-// present dielectric whose key lies past the walk's last crossing and before the crossing the
-// trace has committed, so traversal narrows to the nearest and the trace ends at the walk's next
-// crossing. Candidates nearer than the last crossing go on a register's compare; a key is read
-// only on an exact tie of distances. The raygen's trace forces every candidate non-opaque.
-public uint crossing_any_hit<S : ISurfaces, H : IHit, K : ICrossingKeys>(SceneRoot* s, ViewConstants* v, PathCover c, inout uint4 payload, HitData d, H h, K keys)
-{
-    float t = h.t();
-    float last = asfloat(payload.y);
-    float committed = asfloat(payload.z);
-    int cluster_id = h.cluster_id();
-    if (t < last || cluster_id < 0 || d.class_id() != CLASS_DIELECTRIC || !class_taken(CLASS_DIELECTRIC, c.mask))
-        return ANY_HIT_IGNORE;
-    CrossingKey key = { t, h.instance_index(), uint(cluster_id), h.primitive_index() };
-    if (t == last && !crossing_before(keys.last(), key))
-        return ANY_HIT_IGNORE;
-    if (t == committed && !crossing_before(key, keys.committed()))
-        return ANY_HIT_IGNORE;
-    if (!(record_presence<S>(s, v, h.world_direction(), key.instance, key.cluster, key.primitive, h.barycentrics(), c.context, d.material, d.attributes, d.has(HIT_ALPHA_TESTED), true) > 0.0))
-        return ANY_HIT_IGNORE;
-    keys.commit(key);
-    payload.z = asuint(t);
-    return ANY_HIT_ACCEPT;
-}
-
 // A path ray's any-hit at triangle candidate `h` with hit record data `d`, under the cover its
-// `payload` holds, as `S` resolves surfaces: ANY_HIT_ACCEPT or ANY_HIT_IGNORE. A crossing step's
-// keys are in `keys`.
-public uint path_any_hit<S : ISurfaces, H : IHit, K : ICrossingKeys>(SceneRoot* s, ViewConstants* v, inout uint4 payload, HitData d, H h, K keys)
+// `payload` holds, as `S` resolves surfaces: ANY_HIT_ACCEPT or ANY_HIT_IGNORE.
+public uint path_any_hit<S : ISurfaces, H : IHit>(SceneRoot* s, ViewConstants* v, uint4 payload, HitData d, H h)
 {
-    PathCover c = path_cover(payload);
-    if (c.policy == COVER_CROSSING)
-        return crossing_any_hit<S>(s, v, c, payload, d, h, keys);
-    return cover_path<S>(s, v, c, d, h.world_direction(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.barycentrics());
+    return cover_path<S>(s, v, path_cover(payload), d, h.world_direction(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.barycentrics());
 }
 
 // A shadow ray's any-hit at triangle candidate `h` with hit record data `d`, the shadow's state in

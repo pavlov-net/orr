@@ -1,7 +1,6 @@
 // The path ray: the trace half of the ray its makers store ready, the payload its hit shader is
 // invoked with, the closest-hit body that resolves its hit from that payload and its record's
-// data, the loop's account of reaching the vertex that the vertex's first shader takes, and the
-// miss shader's body.
+// data, and the miss shader's body.
 module hit;
 
 import orr_shaders.abi;
@@ -29,35 +28,38 @@ import orr_lighting.path.common;
 import orr_lighting.path.launch.steps;
 import orr_lighting.path.launch.slot;
 import orr_lighting.path.launch.record;
-import orr_lighting.path.launch.load;
 import orr_lighting.path.launch.shade_surface;
 
 // Stores path `p`'s ray `c.ray` in hot words `at` ready for its trace, as the raygen loads it: its
 // origin and reach, its direction with its instance mask, the mask of a LAYERS trace in front of
-// its hit (`front_mask`), whether a segment runs along it and whether the opaque vertex it may
-// reach is the last bounce's, and the cover payload its any-hit shaders read; and its MIS half.
-// Counts the ray and its depth on `p`, which its caller stores. The camera ray reaches `t_max`
-// with instance mask `camera_mask` and LAUNCH_* `flags`, and crosses a segment only inside an
-// interior that the froxels do not hold.
-public void store_path_ray<R : IPathRecord>(PathRoot r, uint4* at, inout PathLoop p, ShadeState c, R record, PathContext x, float t_max = 0.0, uint camera_mask = 0, uint flags = 0)
+// its hit (`front_mask`), whether it runs inside an interior, whether the opaque vertex it may
+// reach is the last bounce's and whether its path tracks a plane stack it crossed, and the cover
+// payload its any-hit shaders read; and its MIS half. Counts the ray and its depth on `p`, which
+// its caller stores. The camera ray reaches `t_max` with instance mask `camera_mask` and LAUNCH_*
+// `flags` from `offset` m past the eye, where its cover takes the camera's cone.
+public void store_path_ray<R : IPathRecord>(PathRoot r, uint4* at, inout PathLoop p, ShadeState c, R record, PathContext x, float t_max = 0.0, uint camera_mask = 0, uint flags = 0, float offset = 0.0)
 {
     bool camera = has(p.flags, LOOP_CAMERA);
     uint front = front_mask(r, p, c.ray, record, x);
-    bool segment = (!camera && (r.features & FEATURE_SEGMENTS) != 0) || in_interior(r, p, c.interior);
+    bool inside = in_interior(r, p, c.interior);
     uint depth = camera ? 0 : p.depth + 1;
     uint mask = camera ? camera_mask : MASK_OPAQUE | MASK_DIELECTRIC;
-    PathCover cover = new_path_cover(mask, COVER_LAYERS, PRESENCE_DRAWN, camera ? x.seed : pcg(x.seed ^ depth), hit_context(camera ? HIT_PRIMARY : HIT_SECONDARY, depth, p.cone, 0.0, float2(-1.0), x.feedback));
+    RayCone cone = p.cone;
+    if (camera)
+        cone.width = cone_width(p.cone, offset);
+    PathCover cover = new_path_cover(mask, COVER_LAYERS, PRESENCE_DRAWN, camera ? x.seed : pcg(x.seed ^ depth), hit_context(camera ? HIT_PRIMARY : HIT_SECONDARY, depth, cone, 0.0, float2(-1.0), x.feedback));
     if (!camera)
     {
         count_ray(p);
         p.depth = depth;
     }
-    flags |= ray_flags(c.ray) | (mask << LAUNCH_MASK_SHIFT) | (front << LAUNCH_FRONT_SHIFT) | (segment ? LAUNCH_SEGMENT : 0)
-        | (p.opaque > r.max_bounces ? LAUNCH_LAST : 0);
+    bool stacked = stack_kept(r) && !x.photon && c.stack.valid && c.stack.crossed > 0;
+    flags |= ray_flags(c.ray) | (mask << LAUNCH_MASK_SHIFT) | (front << LAUNCH_FRONT_SHIFT) | (inside ? LAUNCH_INSIDE : 0)
+        | (p.opaque > r.max_bounces ? LAUNCH_LAST : 0) | (stacked ? LAUNCH_STACKED : 0);
     RayOrigin o = { c.ray.origin, camera ? t_max : positive_infinity() };
     RayDir d = { c.ray.dir, flags };
     RayNormal n = { c.ray.normal, c.ray.pdf };
-    RayFrom f = { c.ray.from, c.ray.run };
+    RayFrom f = { c.ray.from, camera ? offset : c.ray.run };
     store_word(at + RAY_ORIGIN_AT, o);
     store_word(at + RAY_DIR_AT, d);
     store_coherent(at + RAY_COVER_AT, path_payload(cover));
@@ -65,16 +67,12 @@ public void store_path_ray<R : IPathRecord>(PathRoot r, uint4* at, inout PathLoo
     store_word(at + RAY_FROM_AT, f);
 }
 
-// What a path ray's hit shader or the miss shader is invoked with: the cover payload of the ray
-// (`path_payload`), whose first word gives the hit's context and whose last two the cone at the
-// ray's origin, with INVOKE_* in place of its seed. A segment ran along the ray, which drew the
-// march's jitter; the hit is where a subsurface walk leaves, whose surface goes to the walk part;
-// the miss shader's plane stack probe has run. In window mode the hit is a crossing of a shadow
-// ray's walk, which stores nothing: the IOR around the ray in the third word, and whether the ray
-// goes to the environment.
-public static const uint INVOKE_SEGMENTED = 1 << 0;
+// What a path ray's hit shader is invoked with: the cover payload of the ray (`path_payload`),
+// whose first word gives the hit's context and whose last two the cone at the ray's origin, with
+// INVOKE_* in place of its seed. The hit is where a subsurface walk leaves, whose surface goes to
+// the walk part. In window mode the hit is a crossing of a shadow ray's walk, which stores
+// nothing: the IOR around the ray in the third word, and whether the ray goes to the environment.
 public static const uint INVOKE_EXIT = 1 << 1;
-public static const uint INVOKE_PROBED = 1 << 2;
 public static const uint INVOKE_WINDOW = 1 << 3;
 public static const uint INVOKE_ENVIRONMENT = 1 << 4;
 
@@ -95,11 +93,11 @@ public void store_invoke_cover(uint4* at, PathLoop p, PathContext x, bool exit)
 }
 
 // The payload the hit a walk of `slot`'s path ended at is invoked with, from the cover its end
-// stored: a subsurface walk's exit, or the hit of an interior's walk, which its segment started.
+// stored: a subsurface walk's exit, or the hit of an interior's walk.
 public uint4 walk_invoke_payload(PathRoot r, uint slot, bool exit)
 {
     uint4 w = load_coherent(hot_words(r, slot) + RAY_COVER_AT);
-    w.y = exit ? INVOKE_EXIT : INVOKE_SEGMENTED;
+    w.y = exit ? INVOKE_EXIT : 0;
     return w;
 }
 
@@ -112,25 +110,25 @@ PackedSurface pack_opaque<H : IHit>(PathRoot r, SurfaceHit sh, H h)
 
 // The closest-hit shader's body: resolves the hit `h` of `slot`'s ray, invoked with `payload`,
 // through `S` with its section material from `material`, as a layer where `class_id` is a
-// layer's, and stores it in the slot's surface words: the step of the vertex, with STEP_ARRIVES,
-// the class and how the ray reached it, and in the second word the ray's length to the vertex,
-// from the eye for the camera ray's; STEP_ENDED where the hit names nothing to resolve, whose
-// march's jitter the slot's sampler draws past. It loads no slot word. A subsurface walk's exit
-// (INVOKE_EXIT) goes to the walk part as an opaque surface, solid glass too. In window mode, the
-// thin wall's straight transmission in the first three words, where it is an ideal window and else
-// nothing, 1 where the hit names nothing; the crossing's key goes to the scratch's CROSSED_AT.
+// layer's, and stores it in the slot's surface words: the step of the vertex, with its class,
+// whether it is the camera ray's and whether an opaque surface emits, and in the second word the
+// ray's length to the vertex; STEP_ENDED where the hit names nothing to resolve. It reads nothing
+// of the path. A subsurface walk's exit (INVOKE_EXIT) goes to the walk part as an opaque surface,
+// solid glass too. In window mode, the thin wall's straight transmission in the first three words,
+// where it is an ideal window and else nothing, 1 where the hit names nothing.
 public uint4 launch_resolve<S : ISurfaces, H : IHit, M : ISectionMaterial>(PathRoot r, uint slot, uint4 payload, uint class_id, M material, H h)
 {
     PathCover c = path_cover(payload);
     uint mode = payload.y;
-    bool window = has(mode, INVOKE_WINDOW);
+    bool window = may2(MAY2_THIN_DIELECTRICS) && has(mode, INVOKE_WINDOW);
     bool first = c.context.kind == HIT_PRIMARY;
     uint2 pixel = launch_pixel(r, slot);
-    float t = first ? camera_start(r, pixel).offset + h.t() : h.t();
+    float t = h.t();
     HitContext context = c.context;
-    // A crossing's surface reports no texture feedback, as its candidates' coverage did.
+    // A crossing's surface takes a shadow ray's context, of no cone, and reports no texture
+    // feedback, as its candidates' coverage did.
     if (window)
-        context.feedback = false;
+        context = hit_context(HIT_SECONDARY, context.depth, RayCone(), 0.0);
     else
     {
         RayCone cone = { context.cone_width, context.cone_spread };
@@ -143,8 +141,6 @@ public uint4 launch_resolve<S : ISurfaces, H : IHit, M : ISectionMaterial>(PathR
     SurfaceHit sh = resolve_hit_by<FeedbackSurface<S>>(r.scene, r.view, dir, instance, cluster, h.primitive_index(), h.barycentrics(), positions, false, context, material);
     if (window)
     {
-        CrossingKey key = { h.t(), instance, cluster, h.primitive_index() };
-        store_word(scratch_words(r, slot) + CROSSED_AT, key);
         float3 through = float3(1.0);
         if (sh.valid)
         {
@@ -154,22 +150,16 @@ public uint4 launch_resolve<S : ISurfaces, H : IHit, M : ISectionMaterial>(PathR
         }
         return uint4(asuint(through), 0);
     }
-    bool exit = has(mode, INVOKE_EXIT);
-    bool segmented = has(mode, INVOKE_SEGMENTED);
     if (!sh.valid)
-    {
-        if (!exit && !first && !segmented)
-            skip_dimension(r, slot);
         return uint4(STEP_ENDED, 0, 0, 0);
-    }
-    if (exit)
+    if (may(MAY_WALK) && has(mode, INVOKE_EXIT))
     {
         store_part<PackedSurface, SURFACE_WORDS>(walk_words(r, slot) + EXIT_AT, pack_opaque(r, sh, h));
         return uint4(STEP_VERTEX | (AT_EXIT << STEP_AT_SHIFT), 0, 0, 0);
     }
     uint4* at = hot_words(r, slot);
     uint step;
-    if (class_id == CLASS_DIELECTRIC || class_id == CLASS_PRESENCE)
+    if (may(MAY_LAYERS) && (class_id == CLASS_DIELECTRIC || class_id == CLASS_PRESENCE))
     {
         PackedLayer pl = pack_layer(r, sh, instance, cluster, h.primitive_index(), h.barycentrics(), dir, false);
         store_part<PackedSurface, SURFACE_WORDS>(at + SURFACE_AT, pl.surface);
@@ -180,20 +170,9 @@ public uint4 launch_resolve<S : ISurfaces, H : IHit, M : ISectionMaterial>(PathR
     {
         PackedSurface ps = pack_opaque(r, sh, h);
         store_part<PackedSurface, SURFACE_WORDS>(at + SURFACE_AT, ps);
-        step = vertex_step(ps);
+        step = vertex_step() | (may(MAY_EMISSIVE) && surface_emits(ps) ? STEP_EMITS : 0);
     }
-    step |= STEP_ARRIVES | (first ? STEP_FIRST : 0) | (segmented ? STEP_SEGMENTED : 0);
-    return uint4(step, asuint(t), 0, 0);
-}
-
-// Draws past the dimension of the march's jitter of `slot`'s path, whose ray found a hit that
-// names nothing to resolve.
-void skip_dimension(PathRoot r, uint slot)
-{
-    uint4* at = hot_words(r, slot) + LOOP_RADIANCE_AT;
-    LoopRadiance l = load_word<LoopRadiance>(at);
-    l.dimension++;
-    store_word(at, l);
+    return uint4(step | (first ? STEP_FIRST : 0), asuint(t), 0, 0);
 }
 
 // `launch_resolve` of the hit a photon's start gave `slot`'s path, which no ray found, by the
@@ -213,112 +192,81 @@ public uint4 launch_resolve_given<S : ISurfaces>(PathRoot r, uint slot)
     return launch_resolve<S, ValueHit, SectionLookup>(r, slot, payload, class_id, lookup, h);
 }
 
-// The loop's account of the ray that reached `v`'s vertex `t` m along it, which the hit's resolve
-// leaves to the first shader of the vertex that loads the loop (STEP_ARRIVES in `step`): the
-// march's jitter where no segment drew it, the iteration, the camera's flags and the cone past
-// the hit. An opaque vertex is counted, and the camera ray's takes its cone's width from the eye
-// and the record's view; a layer is counted against the root's dielectric depth, past which the
-// path ends with the cache's light for the interior, and is marked where it lies on a face of the
-// plane stack the path tracks. Without STEP_ARRIVES, only how the vertex was reached, which
-// `v.reach` holds from here on. False where the path ends; the caller stores the loop.
-public bool arrive_vertex(PathRoot r, inout LaunchVertex v, uint step, float t)
+// The path of `slot` as a ray that met nothing reads it: its throughput, flags and keep, the whole
+// ray, its wavelengths, and its plane stack where it tracks one it crossed.
+struct Missed
 {
-    bool first = has(step, STEP_FIRST);
-    v.reach = (v.reach & ~(REACH_FIRST | REACH_GBUFFER)) | (first ? REACH_FIRST : 0) | (has(step, STEP_GBUFFER) ? REACH_GBUFFER : 0);
-    if (!has(step, STEP_ARRIVES))
-        return true;
-    if (!first && !has(step, STEP_SEGMENTED))
-        v.p.rng.next();
-    v.p.iteration++;
-    set_flag(v.p.flags, LOOP_CAMERA, false);
-    set_flag(v.p.flags, LOOP_GBUFFER_HIT, false);
-    if (!first)
-        v.p.cone = cone_after_hit(v.p.cone, t, 0.0);
-    if (step_at(step) != AT_LAYER)
-    {
-        v.p.opaque++;
-        set_flag(v.p.flags, LOOP_DISPERSIVE, false);
-        if (first)
-        {
-            PackedSurface ps = load_surface_part(v);
-            v.p.cone.width = cone_width(v.p.cone, length(ps.position - r.view.eye_render.xyz));
-            v.record.arrive(r, surface_vertex(r.view, ps, v.c.ray.dir), bsdf_unprepared(), t, false);
-        }
-        return true;
-    }
-    v.p.layers++;
-    if (v.p.layers > r.dielectric_depth && !first)
-    {
-        if (v.x.cache && has(v.p.flags, LOOP_COUNTED))
-        {
-            float3 position = asfloat(load_coherent(v.at + SURFACE_AT).xyz);
-            v.p.radiance += v.c.spectral.color(v.p.throughput * interior_ambient(r, position, v.c.ray.dir, v.p.rng));
-        }
-        return false;
-    }
-    if (may(MAY_STACK) && v.c.stack.valid)
-    {
-        PackedSurface ps = load_surface_part(v);
-        Hit face_hit = Hit();
-        face_hit.hit = true;
-        face_hit.triangle = true;
-        face_hit.instance_index = ps.instance;
-        face_hit.cluster_id = int(ps.cluster);
-        face_hit.primitive_index = ps.primitive;
-        face_hit.barycentrics = ps.barycentrics;
-        face_hit.class_id = class_of(scene_traced(r.scene), 0, ps.instance, int(ps.cluster));
-        StackFace face;
-        if (stack_face(r.scene, face_hit, v.x.disperse, face))
-        {
-            ps.flags |= SURFACE_STACK;
-            store_part<PackedSurface, SURFACE_WORDS>(v.at + SURFACE_AT, ps);
-        }
-    }
-    return true;
+    PathFixed f;
+    PathLoop p;
+    ShadeState c;
+    LaunchRecord record;
+    PathContext x;
 }
 
-// The miss shader's body: what `slot`'s ray that met nothing adds, the environment and the
-// directional lights' discs, or for the camera ray the sky its finish adds: STEP_ENDED. It is
-// invoked with INVOKE_* in `mode`. A disc the ray sees past a plane stack its path crossed takes
-// the stack's probe from the vertex before the stack, which the raygen traces where it has not
-// run (STEP_PROBE).
-public uint launch_miss<S : ISurfaces, M : IMedium>(PathRoot r, uint slot, uint mode)
+Missed load_missed(PathRoot r, uint slot)
 {
-    LaunchVertex v = load_vertex(r, slot);
-    if (has(v.p.flags, LOOP_CAMERA))
-        v.p.sky = v.p.throughput;
-    else
-    {
-        bool adds = v.x.count_bsdf && has(v.p.flags, LOOP_COUNTED);
-        if (adds && !has(mode, INVOKE_PROBED) && sees_stacked_disc<M>(r, v))
-        {
-            PathStack s = v.c.stack;
-            store_probe(v.at, s.origin, v.c.ray.dir, s.depth, v.x.feedback);
-            return STEP_PROBE;
-        }
-        // The march's jitter, drawn where no segment ran.
-        if (!has(mode, INVOKE_SEGMENTED))
-            v.p.rng.next();
-        if (adds)
-            miss_light<S, M, LaunchRecord>(r, v.f, v.p, v.c.ray, v.c.spectral, v.x, v.record, v.c.stack);
-    }
-    set_flag(v.p.flags, LOOP_CAMERA, false);
-    store_loop_part(v);
-    return STEP_ENDED;
+    uint4* at = hot_words(r, slot);
+    Missed v;
+    v.f.pixel = launch_pixel(r, slot);
+    LoopThroughput t = load_word<LoopThroughput>(at + LOOP_THROUGHPUT_AT);
+    v.p = empty_loop(r, v.f.pixel);
+    v.p.throughput = t.throughput;
+    v.p.flags = t.flags;
+    v.p.keep = load_word<LoopKeep>(at + LOOP_KEEP_AT).keep;
+    LaunchRay ray = load_launch_ray(at);
+    v.c = launch_state(layer_ray(ray));
+    v.c.spectral = path_spectral(r, slot, t.flags);
+    v.record = launch_record(r, slot);
+    v.x = path_context(r, v.record, v.f.pixel);
+    if (stack_kept(r) && (ray.flags & LAUNCH_STACKED) != 0)
+        v.c.stack = load_part<PathStack, PATH_STACK_WORDS>(stack_words(r, slot));
+    return v;
 }
 
-// Whether `v`'s ray, which met nothing, sees a directional light's disc while its path tracks a
-// plane stack it crossed: where `miss_light` asks the record whether the stack owns the light.
-bool sees_stacked_disc<M : IMedium>(PathRoot r, LaunchVertex v)
+// The miss shader's body: what `slot`'s ray that met nothing adds to its path's radiance. The
+// camera ray's adds the sky, the environment `E` and the directional lights' discs through the
+// medium `M`, where the mode shows it; another's the environment and the discs weighed against
+// next-event estimation at the vertex the ray left. A disc the ray sees past a plane stack its
+// path crossed takes the stack's probe, which the raygen traced before (`launch_stack_miss`).
+public void launch_miss<S : ISurfaces, E : IEnvironment, M : IMedium>(PathRoot r, uint slot)
 {
+    uint4* at = hot_words(r, slot);
+    LoopThroughput t = load_word<LoopThroughput>(at + LOOP_THROUGHPUT_AT);
+    if (has(t.flags, LOOP_CAMERA))
+    {
+        uint mode = path_mode(r);
+        if (from_background(r) || (mode != PATH_INDIRECT && mode != PATH_SUBSURFACE))
+        {
+            float3 dir = load_word<RayDir>(at + RAY_DIR_AT).dir;
+            add_radiance(at, t.throughput * sky_radiance<E, M>(r.set, r.view.eye_render.xyz, dir));
+        }
+        return;
+    }
+    Missed v = load_missed(r, slot);
+    if (!v.x.count_bsdf || !has(v.p.flags, LOOP_COUNTED))
+        return;
+    miss_light<S, M, LaunchRecord>(r, v.f, v.p, v.c.ray, v.c.spectral, v.x, v.record, v.c.stack);
+    add_radiance(at, v.p.radiance);
+}
+
+// The stack miss callable's body: whether `slot`'s ray, which met nothing while its path tracks a
+// plane stack it crossed (LAUNCH_STACKED), sees a directional light's disc, where `miss_light`
+// asks the record whether the stack owns the light: the probe's ray is then in the slot's shadow
+// ray, from the vertex before the stack.
+public bool launch_stack_miss<M : IMedium>(PathRoot r, uint slot)
+{
+    Missed v = load_missed(r, slot);
     PathStack s = v.c.stack;
     LightSetGpu* set = r.set;
-    if (!stack_kept(r) || !s.valid || s.crossed == 0 || !may(MAY_DIRECTIONAL))
+    if (!v.x.count_bsdf || !has(v.p.flags, LOOP_COUNTED) || !s.valid || s.crossed == 0 || !may(MAY_DIRECTIONAL))
         return false;
     for (uint k = 0; k < set.directional_count; k++)
     {
         if (any(directional_disc<M>(set, set.directional_ids[k], v.c.ray.origin, v.c.ray.dir) > 0.0))
+        {
+            store_probe(hot_words(r, slot), s.origin, v.c.ray.dir, s.depth, v.x.feedback);
             return true;
+        }
     }
     return false;
 }

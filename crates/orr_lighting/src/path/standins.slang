@@ -59,72 +59,34 @@ void resolve(uint3 id: SV_DispatchThreadID)
 void emission(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(emission);
-    uint4* w = lane_words(id.x);
-    w[0].x = launch_emission(root, id.x, asfloat(w[0].z), w[0].w);
-}
-
-// What a vertex body's calls hand back, from lane `lane`'s words, which the calls' arguments go
-// to: the callables are measured as stand-ins of their own.
-struct LaneCalls : ICalls
-{
-    uint lane;
-
-    uint lights(float3 normal, uint dimension)
-    {
-        uint4* w = lane_words(lane);
-        w[1] = uint4(asuint(normal), dimension);
-        return w[0].w;
-    }
-
-    float3 gather(inout uint dimension, float width, uint flags, uint word)
-    {
-        uint4* w = lane_words(lane);
-        w[1] = uint4(dimension, asuint(width), flags, word);
-        uint4 back = w[0];
-        dimension = back.w;
-        return asfloat(back.xyz);
-    }
-
-    uint deposit(uint dimension)
-    {
-        uint4* w = lane_words(lane);
-        w[1].x = dimension;
-        return w[0].w;
-    }
-
-    void cache_vertex(uint dimension)
-    {
-        lane_words(lane)[1].y = dimension;
-    }
+    launch_emission(root, id.x, lane_words(id.x)[0].x);
 }
 
 [shader("compute")]
 [numthreads(STAGE_GROUP, 1, 1)]
-void direct(uint3 id: SV_DispatchThreadID)
+void arrive(uint3 id: SV_DispatchThreadID)
 {
-    ORR_OMM(direct);
+    ORR_OMM(arrive);
     uint4* w = lane_words(id.x);
-    LaneCalls calls = { id.x };
-    w[0] = launch_direct<AT_SURFACE, Surface, Medium, LaneCalls>(root, id.x, w[0].y, asfloat(w[0].z), w[0].w, calls);
+    w[0] = launch_arrive<AT_SURFACE, Surface, Medium>(root, id.x, w[0].x, asfloat(w[0].y));
 }
 
 [shader("compute")]
 [numthreads(STAGE_GROUP, 1, 1)]
-void scatter(uint3 id: SV_DispatchThreadID)
+void shade(uint3 id: SV_DispatchThreadID)
 {
-    ORR_OMM(scatter);
+    ORR_OMM(shade);
     uint4* w = lane_words(id.x);
-    LaneCalls calls = { id.x };
-    w[0].x = launch_scatter<AT_SURFACE, Surface, LaneCalls>(root, id.x, w[0].y != 0, asfloat(w[0].z), calls);
+    w[0].x = launch_shade<AT_SURFACE, Surface, Medium>(root, id.x, w[0].x, asfloat(w[0].y), w[0].z);
 }
 
 [shader("compute")]
 [numthreads(STAGE_GROUP, 1, 1)]
-void lights(uint3 id: SV_DispatchThreadID)
+void shade_layer(uint3 id: SV_DispatchThreadID)
 {
-    ORR_OMM(lights);
+    ORR_OMM(shade_layer);
     uint4* w = lane_words(id.x);
-    w[0].x = launch_lights<Surface>(root, id.x, asfloat(w[0].xyz), w[0].w);
+    w[0].x = launch_shade<AT_LAYER, Surface, Medium>(root, id.x, w[0].x, asfloat(w[0].y), w[0].z);
 }
 
 [shader("compute")]
@@ -132,11 +94,7 @@ void lights(uint3 id: SV_DispatchThreadID)
 void gather(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(gather);
-    uint4* w = lane_words(id.x);
-    uint4 data = w[0];
-    uint dimension = data.x;
-    float3 g = launch_gather<Surface>(root, id.x, dimension, asfloat(data.y), data.z, data.w);
-    w[0] = uint4(asuint(g), dimension);
+    launch_gather(root, id.x);
 }
 
 [shader("compute")]
@@ -148,8 +106,7 @@ void cover_path_hit(uint3 id: SV_DispatchThreadID)
     HitData data = lane_data(id.x);
     uint4 payload = w[0];
     StoredHit h = lane_hit(id.x);
-    w[1].x = path_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, payload, data, h, slot_crossings(root, id.x));
-    w[0] = payload;
+    w[1].x = path_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, payload, data, h);
 }
 
 [shader("compute")]

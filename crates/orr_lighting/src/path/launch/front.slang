@@ -157,16 +157,19 @@ LayerEntry front_entry(uint4* at, uint k)
 // The layers callable's body: composites the `kept` candidates a LAYERS trace of `slot`'s path
 // ray, reaching `t_max`, kept in front of its hit, in depth order, as `trace_resolve_translucent`
 // takes them with `PathEmission`, and moves the bound to the last. STEP_ENDED where nothing goes
-// on through them, else 0; the bound's distance in `bound`. It loads the loop, the ray and the
-// scalars, and the wavelengths where the scalars say the path is split by them.
+// on through them, else 0; the bound's distance in `bound`. It loads the loop's throughput and
+// keep and the ray, and the wavelengths where the path is split by them.
 public uint launch_layers(PathRoot r, uint slot, uint kept, float t_max, out float bound)
 {
     uint4* words = hot_words(r, slot);
     uint2 pixel = launch_pixel(r, slot);
-    uint reach;
-    PathLoop p = load_path_loop(r, words, pixel, reach);
+    LoopThroughput w = load_word<LoopThroughput>(words + LOOP_THROUGHPUT_AT);
+    PathLoop p = empty_loop(r, pixel);
+    p.throughput = w.throughput;
+    p.flags = w.flags;
+    p.keep = load_word<LoopKeep>(words + LOOP_KEEP_AT).keep;
     LayerRay ray = layer_ray(load_launch_ray(words));
-    Spectral spectral = path_spectral(r, slot, load_scalar(words, SCALAR_FLAGS));
+    Spectral spectral = path_spectral(r, slot, p.flags);
     PathContext x = path_context(r, launch_record(r, slot), pixel);
     bool adds = x.count_bsdf && has(p.flags, LOOP_COUNTED);
     float3 own = owned_light(p, ray);
@@ -201,7 +204,9 @@ public uint launch_layers(PathRoot r, uint slot, uint kept, float t_max, out flo
     }
     store_coherent(at + FRONT_BOUND, key);
     bound = asfloat(key.x);
-    store_path_loop(words, p, reach);
+    w.throughput = p.throughput;
+    store_word(words + LOOP_THROUGHPUT_AT, w);
+    flush_loop_radiance(words, p);
     return carries(p.throughput) ? 0 : STEP_ENDED;
 }
 

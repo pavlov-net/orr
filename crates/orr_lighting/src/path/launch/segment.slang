@@ -1,6 +1,4 @@
 // The segment of a path's ray inside an interior or outside every one.
-// The pipeline's own copy of bodies the staged loop keeps in `path/stages.slang`: a fix to one
-// belongs in both, and the pipeline-against-staged tests compare them.
 module segment;
 
 import orr_shaders.packing;
@@ -67,14 +65,13 @@ public float interior_walk_ior(SceneRoot* s, Interior interior, uint medium)
     return interior_ior(s, medium) / interior_ior(s, interior.outside(medium, medium));
 }
 
-// What the segment of path `p`'s ray `ray` outside every interior does, `t` m to its hit (`hit`)
-// or to infinity, past the camera ray: the linked medium's in-scatter and transmittance, through
-// the froxels for rays leaving a layer or a scatter, marched where the ray is one of those or
-// long; elsewhere transmittance alone. The march's jitter dimension is drawn either way, so later
-// dimensions stay put.
-public void media_segment<M : IMedium>(PathRoot r, inout PathLoop p, inout Sampler rng, LayerRay ray, Spectral spectral, PathContext x, bool hit, float t)
+// What the segment of path `p`'s ray `ray` outside every interior does, `t` m to its hit, past
+// the camera ray: the linked medium's in-scatter and transmittance, through the froxels for rays
+// leaving a layer or a scatter, marched where the ray is one of those or long; elsewhere
+// transmittance alone.
+public void media_segment<M : IMedium>(PathRoot r, inout PathLoop p, inout Sampler rng, LayerRay ray, Spectral spectral, PathContext x, float t)
 {
-    if (hit && (ray.chain || t >= INSCATTER_SEGMENT))
+    if (ray.chain || t >= INSCATTER_SEGMENT)
     {
         float3 through_medium;
         float3 e;
@@ -87,9 +84,5 @@ public void media_segment<M : IMedium>(PathRoot r, inout PathLoop p, inout Sampl
         p.throughput *= through_medium;
     }
     else
-    {
-        rng.next();
-        if (hit)
-            p.throughput *= medium_transmittance<M>(r.scene.medium, ray.origin, ray.dir, t);
-    }
+        p.throughput *= medium_transmittance<M>(r.scene.medium, ray.origin, ray.dir, t);
 }

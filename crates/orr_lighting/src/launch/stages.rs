@@ -9,10 +9,10 @@ use orr_scene::orr_gpu::{
 use orr_scene::{HitGroups, SceneFeatures};
 
 use crate::shaders::consts::{
-    AT_EXIT, AT_LAYER, AT_LEAVE, AT_SCATTER, AT_SURFACE, CALL_CACHE_VERTEX, CALL_DEPOSIT,
-    CALL_DIRECT, CALL_EMISSION, CALL_EMITTER_VIEW, CALL_FINISH_BACKGROUND, CALL_FINISH_RECORD,
-    CALL_FINISH_VIEW, CALL_GATHER, CALL_GBUFFER, CALL_LAYERS, CALL_LIGHTS, CALL_PROXY_MARCH,
-    CALL_RESOLVE_GIVEN, CALL_SCATTER, CALL_SEGMENT, CALL_STACK_STEP, CALL_START_BACKGROUND,
+    AT_EXIT, AT_LAYER, AT_LEAVE, AT_SCATTER, AT_SURFACE, CALL_ARRIVE, CALL_BENT, CALL_CACHE_VERTEX,
+    CALL_DEPOSIT, CALL_EMISSION, CALL_EMITTER_VIEW, CALL_FINISH_BACKGROUND, CALL_FINISH_RECORD,
+    CALL_FINISH_VIEW, CALL_GATHER, CALL_GBUFFER, CALL_LAYERS, CALL_PROXY_MARCH, CALL_RESOLVE_GIVEN,
+    CALL_SEGMENT, CALL_SHADE, CALL_STACK_MISS, CALL_STACK_STEP, CALL_START_BACKGROUND,
     CALL_START_FIRST_VERTEX, CALL_START_PHOTON, CALL_START_UPDATE, CALL_START_VIEW, CALL_WALK_END,
     CALLABLES,
 };
@@ -120,11 +120,10 @@ const COVER_PATH: usize = 3;
 const COVER_SHADOW: usize = 4;
 
 /// Then the callables, each at its `path/launch/steps.slang` CALL_* index with the `path_may` it is
-/// made with. A vertex's next-event estimation and scatter are made per class (AT_*), with every
-/// lobe its surface may have, and so are light sampling, the caustic photons' gather, a walk's end
-/// and an emitter's view. What lies along a ray, a scatter in a medium and a plane stack's step
-/// shade no surface, and are made without the rich lobes and walks. A record's callables are made for their own
-/// source.
+/// made with. A vertex's arrival and shade are made per class (AT_*), with every lobe its surface
+/// may have, and so are a walk's end and an emitter's view. What lies along a ray, a scatter in a
+/// medium and a plane stack's step shade no surface, and are made without the rich lobes and
+/// walks. A record's callables are made for their own source.
 const CALLED: [(u32, Kernel, &str, u64); CALLABLES as usize] = [
     (CALL_START_VIEW, Kernel::Sources, "start_view", MAY_ALL),
     (CALL_START_UPDATE, Kernel::Sources, "start_update", MAY_ALL),
@@ -142,63 +141,52 @@ const CALLED: [(u32, Kernel, &str, u64); CALLABLES as usize] = [
         MAY_ALL,
     ),
     (CALL_EMISSION, Kernel::Vertex, "emission", MAY_ALL),
-    (CALL_DIRECT + AT_SURFACE, Kernel::Vertex, "direct", MAY_ALL),
+    (CALL_ARRIVE + AT_SURFACE, Kernel::Vertex, "arrive", MAY_ALL),
     (
-        CALL_DIRECT + AT_EXIT,
+        CALL_ARRIVE + AT_EXIT,
         Kernel::Vertex,
-        "direct_exit",
+        "arrive_exit",
         MAY_ALL,
     ),
     (
-        CALL_DIRECT + AT_LEAVE,
+        CALL_ARRIVE + AT_LEAVE,
         Kernel::Vertex,
-        "direct_leave",
+        "arrive_leave",
         MAY_ALL,
     ),
     (
-        CALL_DIRECT + AT_SCATTER,
+        CALL_ARRIVE + AT_SCATTER,
         Kernel::Vertex,
-        "direct_medium",
+        "arrive_medium",
         PLAIN,
     ),
     (
-        CALL_DIRECT + AT_LAYER,
+        CALL_ARRIVE + AT_LAYER,
         Kernel::Vertex,
-        "direct_layer",
+        "arrive_layer",
+        MAY_ALL,
+    ),
+    (CALL_SHADE + AT_SURFACE, Kernel::Vertex, "shade", MAY_ALL),
+    (CALL_SHADE + AT_EXIT, Kernel::Vertex, "shade_exit", MAY_ALL),
+    (
+        CALL_SHADE + AT_LEAVE,
+        Kernel::Vertex,
+        "shade_leave",
         MAY_ALL,
     ),
     (
-        CALL_SCATTER + AT_SURFACE,
+        CALL_SHADE + AT_SCATTER,
         Kernel::Vertex,
-        "scatter",
-        MAY_ALL,
-    ),
-    (
-        CALL_SCATTER + AT_EXIT,
-        Kernel::Vertex,
-        "scatter_exit",
-        MAY_ALL,
-    ),
-    (
-        CALL_SCATTER + AT_LEAVE,
-        Kernel::Vertex,
-        "scatter_leave",
-        MAY_ALL,
-    ),
-    (
-        CALL_SCATTER + AT_SCATTER,
-        Kernel::Vertex,
-        "scatter_medium",
+        "shade_medium",
         PLAIN,
     ),
     (
-        CALL_SCATTER + AT_LAYER,
+        CALL_SHADE + AT_LAYER,
         Kernel::Vertex,
-        "scatter_layer",
+        "shade_layer",
         MAY_ALL,
     ),
-    (CALL_LIGHTS, Kernel::Vertex, "lights", MAY_ALL),
-    (CALL_GATHER, Kernel::Vertex, "gather", MAY_ALL),
+    (CALL_GATHER, Kernel::Vertex, "gather", PLAIN),
     (CALL_DEPOSIT, Kernel::Vertex, "deposit", only(MAY_PHOTON)),
     (
         CALL_CACHE_VERTEX,
@@ -206,6 +194,7 @@ const CALLED: [(u32, Kernel, &str, u64); CALLABLES as usize] = [
         "cache_vertex",
         only(MAY_UPDATE),
     ),
+    (CALL_BENT, Kernel::Vertex, "bent", MAY_ALL),
     (CALL_FINISH_VIEW, Kernel::Sources, "finish_view", MAY_ALL),
     (
         CALL_FINISH_RECORD,
@@ -225,6 +214,7 @@ const CALLED: [(u32, Kernel, &str, u64); CALLABLES as usize] = [
     (CALL_PROXY_MARCH, Kernel::Sources, "march_proxy", PLAIN),
     (CALL_GBUFFER, Kernel::Sources, "gbuffer_start", MAY_ALL),
     (CALL_STACK_STEP, Kernel::Vertex, "stack_step", PLAIN),
+    (CALL_STACK_MISS, Kernel::Vertex, "stack_miss", PLAIN),
     (CALL_EMITTER_VIEW, Kernel::Vertex, "emitter_view", MAY_ALL),
     (
         CALL_START_FIRST_VERTEX,

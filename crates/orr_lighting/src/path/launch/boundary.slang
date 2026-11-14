@@ -16,6 +16,7 @@ import orr_scene.runs;
 import orr_scene.tables;
 import orr_scene.candidates;
 import orr_lighting.interiors;
+import orr_lighting.specialize;
 import orr_lighting.path;
 import orr_lighting.path.common;
 import orr_lighting.path.launch.steps;
@@ -149,12 +150,12 @@ uint trace_crossings(PathRoot r, uint slot)
 
 // Runs callable `index`, a start or a finish, with `word` in its data's second word, and again
 // with the crossings it asks for (STEP_CROSS) once they are traced: the step it hands back.
-public uint crossed_call(PathRoot r, uint slot, uint index, uint word)
+uint crossed_call(PathRoot r, uint slot, uint index, uint word)
 {
     Payload c;
     c.words = uint4(0, word, 0, 0);
     call(index, c);
-    if ((c.words.x & STEP_CROSS) == 0)
+    if (!may(MAY_INTERIORS) || (c.words.x & STEP_CROSS) == 0)
         return c.words.x;
     uint crossings = CROSSINGS_TRACED | trace_crossings(r, slot);
     c.words = uint4(0, word, crossings, 0);
@@ -162,11 +163,26 @@ public uint crossed_call(PathRoot r, uint slot, uint index, uint word)
     return c.words.x;
 }
 
-// The start of `slot`'s path by callable `start`: a view's debug view of its first vertex alone
-// starts from its own callable.
-public uint start_path(PathRoot r, uint slot, uint start)
+// The start of `slot`'s path by its source's callable: a view's debug view of its first vertex
+// alone starts from its own.
+public uint start_path(PathRoot r, uint slot)
 {
-    if (start == CALL_START_VIEW && first_vertex_mode(r))
-        start = CALL_START_FIRST_VERTEX;
-    return crossed_call(r, slot, start, 0);
+    if (from_view(r))
+        return crossed_call(r, slot, may(MAY_DEBUG) && first_vertex_mode(r) ? CALL_START_FIRST_VERTEX : CALL_START_VIEW, 0);
+    if (from_background(r))
+        return step_call(CALL_START_BACKGROUND);
+    if (from_update(r))
+        return crossed_call(r, slot, CALL_START_UPDATE, 0);
+    return step_call(CALL_START_PHOTON);
+}
+
+// The finish of `slot`'s path in pass `pass` by its source's callable: the step of a pass that
+// follows, or STEP_DONE.
+public uint finish_path(PathRoot r, uint slot, uint pass)
+{
+    if (from_view(r))
+        return crossed_call(r, slot, CALL_FINISH_VIEW, pass);
+    if (from_background(r))
+        return step_call(CALL_FINISH_BACKGROUND);
+    return step_call(CALL_FINISH_RECORD);
 }

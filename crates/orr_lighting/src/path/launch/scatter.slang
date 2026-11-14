@@ -1,6 +1,4 @@
-// The scatter of a vertex as the shade bodies hold it, past its caustic photons' gather.
-// The pipeline's own copy of bodies the staged loop keeps in `path/stages.slang`: a fix to one
-// belongs in both, and the pipeline-against-staged tests compare them.
+// The scatter of a vertex as the shade bodies hold it, past its next-event estimation.
 module scatter;
 
 import orr_shaders.packing;
@@ -36,12 +34,14 @@ import orr_lighting.path.launch.nee;
 
 // What a vertex's scatter did beside its next ray: it starts a subsurface walk along `wi` in
 // place of the ray; it passed an ideal window, which passes the ray on as it reached it but for
-// its trace half; and how it left the path's plane stack (SCATTER_STACK_*).
+// its trace half; it crossed into or out of an interior; and how it left the path's plane stack
+// (SCATTER_STACK_*).
 public struct Scattered
 {
     public bool walking;
     public float3 wi;
     public bool passed;
+    public bool crossed;
     public uint stack;
 }
 
@@ -59,15 +59,16 @@ public bool vertex_gathers(PathRoot r, PathLoop p, PathContext x, uint kind)
     return may(MAY_CAUSTICS) && x.caustics && gathered && kind != VERTEX_SCATTER && kind != VERTEX_LEAVE;
 }
 
-// The rest of the iteration from vertex `sv` of kind `kind`, with `X` a walk's exit, past its
-// next-event estimation `nee` and its caustic photons' gather: the vertex's next direction, which
-// leaves `c.ray` for the trace, or starts a walk (`Scattered`). The interiors past the vertex are
-// the path's at once: its shadow ray keeps those it arrived with. False where the path ends.
+// The scatter of vertex `sv` of kind `kind`, with `X` a walk's exit, past its next-event
+// estimation `nee`: the vertex's next direction, which leaves `c.ray` for the trace, or starts a
+// walk (`Scattered`). The interiors past the vertex are the path's at once: its shadow job is
+// made with those it arrived with. False where the path ends.
 public bool vertex_scatter<S : ISurfaces, let X : uint, R : IPathRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, R record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv, ShadeNee nee, out Scattered out_)
 {
     out_.walking = false;
     out_.wi = float3(0.0);
     out_.passed = false;
+    out_.crossed = false;
     out_.stack = SCATTER_STACK_KEPT;
     bool walking = false;
     float3 wi = float3(0.0);
@@ -93,8 +94,6 @@ public bool vertex_scatter<S : ISurfaces, let X : uint, R : IPathRecord>(PathRoo
     bool null_crossing = false;
     bool stack_crossing = false;
     float4 u = rng.next4();
-    float u_roulette = rng.next();
-    float u_role = rng.next();
     uint component = 0;
     float3 hero_f = float3(0.0);
     bool through = has(p.flags, LOOP_THROUGH);
@@ -151,7 +150,7 @@ public bool vertex_scatter<S : ISurfaces, let X : uint, R : IPathRecord>(PathRoo
             // Its diffuse lobes' share of the value goes on as the vertex's own light, the rest as
             // a chain.
             float share = luminance_rec2020(bs.diffuse) / max(luminance_rec2020(bs.weight), 1e-30);
-            if (u_role < share)
+            if (rng.next() < share)
             {
                 p.throughput *= bs.diffuse / share;
                 p.keep = float3(0.0);
@@ -175,7 +174,7 @@ public bool vertex_scatter<S : ISurfaces, let X : uint, R : IPathRecord>(PathRoo
     if (alive && !walking && !on_layer && p.opaque > r.roulette_depth)
     {
         float survive = saturate(max_component(p.throughput));
-        alive = u_roulette < survive;
+        alive = rng.next() < survive;
         p.throughput /= max(survive, 1e-6);
     }
     alive = alive && carries(p.throughput);
@@ -199,6 +198,7 @@ public bool vertex_scatter<S : ISurfaces, let X : uint, R : IPathRecord>(PathRoo
     if (alive && !walking)
     {
         Interior past = c.interior;
+        out_.crossed = crossed;
         if (crossed)
         {
             past.cross(l.section, l.front, l.x.surface.medium_point);

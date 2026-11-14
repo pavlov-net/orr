@@ -1,8 +1,6 @@
 // Next-event estimation at a vertex as the shade bodies hold it (`ShadeVertex`): the light
-// candidates `lights` draws into the scratch, their weighing by the vertex's scatter, the shadow
-// ray, and the draw a plane stack bends.
-// Built from bodies the staged loop keeps in `path/stages.slang` (`vertex_nee`, `nee_draw`): a
-// fix to one belongs in both, and the pipeline-against-staged tests compare them.
+// candidates its arrival draws into the scratch, their weighing by the vertex's scatter in its
+// shade, the shadow ray, and the draw a plane stack bends.
 module nee;
 
 import orr_shaders.packing;
@@ -58,6 +56,58 @@ public ShadeVertex no_vertex()
     return sv;
 }
 
+// What a vertex's BSDF is prepared with beside the vertex: its coat, fuzz and film collapse, a
+// subsurface lobe may start a walk, the path carries flux from a light, and the wavelength a
+// dispersive layer is prepared at (0 for none).
+public struct Prep
+{
+    public bool collapse;
+    public bool walks;
+    public bool adjoint;
+    public float hero;
+}
+
+// The IORs a vertex's BSDF is prepared with, as `prepare_vertex` finds them from the interiors the
+// path arrived with: the medium's around it, and its own, a layer's at the path's wavelength.
+public struct PrepIors
+{
+    public float exterior;
+    public float specular;
+}
+
+// `prepare_vertex`'s IORs of vertex `l` inside `interior`, prepared with `q`.
+public PrepIors prep_iors(SceneRoot* s, LayerVertex l, Interior interior, Prep q)
+{
+    uint m = l.section;
+    bool layer = l.kind == VERTEX_LAYER;
+    uint outside = layer ? interior.outside(m, m) : interior.innermost();
+    PrepIors i = { interior_ior(s, outside), walk_params(vertex_params(l, q.collapse), q.walks).specular_ior };
+    if (layer && q.hero > 0.0)
+    {
+        // A path inside `m` read it where it entered; a path meeting it reads it here.
+        float4 entered = interior.point(m);
+        float4 point = entered.x != NO_MEDIUM_POINT.x ? entered : l.x.surface.medium_point;
+        i.specular = dispersed_material_ior(s, m, i.specular, q.hero, point);
+        i.exterior = dispersed_material_ior(s, outside, i.exterior, q.hero, interior.point(outside));
+    }
+    return i;
+}
+
+// The BSDF of vertex `l`, prepared with `q` against IORs `i`: `prepare_vertex`'s, from what a slot
+// keeps of the interiors.
+public Bsdf prepare_iors(LayerVertex l, Prep q, PrepIors i)
+{
+    BsdfParams p = walk_params(vertex_params(l, q.collapse), q.walks);
+    p.specular_ior = i.specular;
+    return bsdf_prepare(p, l.x.surface.normal, l.x.view, i.exterior, q.adjoint);
+}
+
+// The BSDF of vertex `l` inside `interior`, prepared with `q`.
+public Bsdf prepare_with(PathRoot r, LayerVertex l, Interior interior, Prep q)
+{
+    return prepare_iors(l, q, prep_iors(r.scene, l, interior, q));
+}
+
 // What a shade shades (`vertex_nee`'s `X`): a vertex the trace stage reached, or a walk's exit,
 // which scatters by its exit scatter alone.
 public static const uint SHADE_VERTEX = 0;
@@ -94,7 +144,10 @@ public PathShadowRay shadow_ray<S : ISurfaces, M : IMedium>(NeeDraw d, float sca
 }
 
 // What next-event estimation keeps of a draw toward a directional light to weigh it again where
-// a plane stack bends the light (`nee_add`).
+// a plane stack bends the light (`nee_add`), with what rebuilds the vertex's scatter once its
+// shade has left the vertex: the direction the path reached it along, how its BSDF was prepared
+// and the IORs it was prepared with; and the vertex's point, which the stack's first leg starts
+// from.
 public struct BentDraw
 {
     public float3 scale;            // the path's throughput at the vertex x the draw's resampling weight, over the vertex's probability of running it
@@ -102,15 +155,35 @@ public struct BentDraw
     public float3 l;                // the light's radiance
     public uint flags;              // BENT_*
     public float3 keep;             // what a chain keeps of the vertex's scatter
+    public float exterior;
+    public float3 dir;
+    public float specular;
+    public float3 start;
 }
 
 static const uint BENT_ONE = 1 << 0;       // the draw weighs 1 against BSDF rays
 static const uint BENT_CHAIN = 1 << 1;     // the vertex is a chain's
+public static const uint BENT_COLLAPSE = 1 << 2;  // `Prep.collapse`, `walks` and `adjoint`
+public static const uint BENT_WALKS = 1 << 3;
+public static const uint BENT_ADJOINT = 1 << 4;
+// The shadow ray starts inside interiors, which the stack part holds.
+public static const uint BENT_INSIDE = 1 << 5;
 
-public BentDraw bent_draw(ShadeNee nee)
+// The draw of `nee` at a vertex at `start` that the path reached along `dir`, whose BSDF was
+// prepared with `q` against `iors`, its shadow ray starting in interiors where `inside`.
+public BentDraw bent_draw(ShadeNee nee, float3 dir, float3 start, Prep q, PrepIors iors, bool inside)
 {
-    BentDraw b = { nee.throughput * (nee.d.W / nee.run), nee.run * nee.d.chosen.pdf, nee.d.l, (nee.weight_one ? BENT_ONE : 0) | (nee.chain ? BENT_CHAIN : 0), nee.keep };
+    uint flags = (nee.weight_one ? BENT_ONE : 0) | (nee.chain ? BENT_CHAIN : 0) | (q.collapse ? BENT_COLLAPSE : 0) | (q.walks ? BENT_WALKS : 0)
+        | (q.adjoint ? BENT_ADJOINT : 0) | (inside ? BENT_INSIDE : 0);
+    BentDraw b = { nee.throughput * (nee.d.W / nee.run), nee.run * nee.d.chosen.pdf, nee.d.l, flags, nee.keep, iors.exterior, dir, iors.specular, start };
     return b;
+}
+
+// How the BSDF of the vertex of draw `b` was prepared.
+public Prep bent_prep(BentDraw b)
+{
+    Prep q = { (b.flags & BENT_COLLAPSE) != 0, (b.flags & BENT_WALKS) != 0, (b.flags & BENT_ADJOINT) != 0, 0.0 };
+    return q;
 }
 
 // What draw `b` adds to the path, before its colors, from a vertex weighed by `f` where its
@@ -123,7 +196,7 @@ public float3 bent_added<F : IScatter>(BentDraw b, F f, StackLight stack, float3
     return b.scale * (e * vis * mis);
 }
 
-// A light candidate `lights` leaves in the scratch, CANDIDATE_WORDS words: `ResolvedLightSample`
+// A light candidate a vertex's arrival leaves in the scratch, CANDIDATE_WORDS words: `ResolvedLightSample`
 // with the number its resampling draws.
 public struct LightCandidate
 {
@@ -177,23 +250,17 @@ public uint candidate_dimensions(uint candidates)
     return 1 + 6 * candidates;
 }
 
-// The `lights` shader's body: the light candidates of `slot`'s vertex, whose point its surface
-// words' first holds, with shading normal `normal` (zero for a layer or a point in a medium), into
-// the scratch, drawn from sampler dimension `dimension` on as `nee_draw` draws them: with the
-// vertex's directional share one directional light, else the vertex's candidates. How many it
-// drew.
-public uint launch_lights<S : ISurfaces>(PathRoot r, uint slot, float3 normal, uint dimension)
+// Draws the light candidates of `slot`'s vertex at `position` of path depth `depth`, with shading
+// normal `normal` (zero for a layer or a point in a medium), into the scratch, as `nee_draw` draws
+// them: with the vertex's directional share one directional light, else the vertex's candidates.
+// How many it drew; `rng` goes past the dimensions the vertex's candidates take.
+public uint draw_lights<S : ISurfaces>(PathRoot r, uint slot, float3 position, float3 normal, uint depth, uint2 pixel, inout Sampler rng)
 {
     LightSetGpu* set = r.set;
-    uint4* at = hot_words(r, slot);
-    float3 position = load_coherent((float3*)(at + SURFACE_AT));
-    uint depth = load_word<LoopCounts>(at + LOOP_COUNTS_AT).depth & 0xffffff;
-    uint2 pixel = launch_pixel(r, slot);
+    uint dimension = rng.dimension;
     LocalLights* local = nullptr;
     if (depth == 0)
         local = pixel_local_lights(r, pixel);
-    Sampler rng = path_sampler(r, pixel);
-    rng.dimension = dimension;
     NeeVertex v = nee_vertex(set, position, normal, pixel, local);
     bool directional = rng.next() < v.share;
     uint drawn = directional ? 1 : vertex_candidates(r, depth);
@@ -203,10 +270,11 @@ public uint launch_lights<S : ISurfaces>(PathRoot r, uint slot, float3 normal, u
         float u = rng.next();
         store_part<LightCandidate, CANDIDATE_WORDS>(candidate_words(r, slot, i), light_candidate_of(c, u));
     }
+    rng.dimension = dimension + candidate_dimensions(vertex_candidates(r, depth));
     return drawn;
 }
 
-// The draw of next-event estimation at `x` weighed by `f` among the `drawn` candidates `lights`
+// The draw of next-event estimation at `x` weighed by `f` among the `drawn` candidates its arrival
 // left in `slot`'s scratch (`nee_draw` past its candidates): resampled by unshadowed luminance,
 // with `no_environment` the environment's counting for nothing; at a `chain` vertex what a light
 // other than the environment gives keeps `keep` of the share outside the vertex's diffuse lobes.
@@ -280,8 +348,8 @@ public NeeDraw weigh_lights<F : IScatter>(PathRoot r, uint slot, PathVertex x, F
 }
 
 // Whether next-event estimation at vertex `sv` of kind `kind`, with `X` a walk's exit, draws
-// lights, from the vertex's probability of running it, in `run`, and its draw of whether to,
-// which it takes. A dispersive layer with live companions adds no direct light: its BSDF differs
+// lights, from the vertex's probability of running it, in `run`, and its draw of whether to. A
+// dispersive layer with live companions adds no direct light: its BSDF differs
 // by wavelength, and its rays reach lights at full weight. A walk's exit follows an opaque vertex,
 // which is no dispersive layer.
 public bool nee_runs<let X : uint>(PathRoot r, PathLoop p, ShadeState c, PathContext x, uint kind, ShadeVertex sv, inout Sampler rng, out float run)
@@ -294,11 +362,12 @@ public bool nee_runs<let X : uint>(PathRoot r, PathLoop p, ShadeState c, PathCon
     // reference the way out's ray alone carries light.
     run = leaving ? (x.reference ? 0.0 : 1.0) : kind == VERTEX_SCATTER || X == SHADE_EXIT ? 1.0
         : kind == VERTEX_LAYER && !l.front && l.chains && crosses_interior(r.scene, l.section) ? 0.0 : nee_probability(r.set, l.x.surface);
-    float u_run = rng.next();
-    return x.count_nee && vertex_candidates(r, p.depth) > 0 && u_run < run && !split;
+    if (!x.count_nee || vertex_candidates(r, p.depth) == 0 || split || !(run > 0.0))
+        return false;
+    return rng.next() < run;
 }
 
-// The shading normal `lights` draws for at vertex `sv` of kind `kind`: layers and scatters take
+// The shading normal light candidates are drawn for at vertex `sv` of kind `kind`: layers and scatters take
 // light from both sides.
 public float3 nee_normal(ShadeVertex sv, uint kind)
 {
@@ -306,8 +375,8 @@ public float3 nee_normal(ShadeVertex sv, uint kind)
 }
 
 // Next-event estimation at vertex `sv` of kind `kind`, with `X` a walk's exit, which `nee_runs`
-// let run with probability `run` and whose `drawn` candidates `lights` left in `slot`'s scratch:
-// its shadow ray in `nee`.
+// let run with probability `run` and whose `drawn` candidates its arrival left in `slot`'s
+// scratch: its shadow ray in `nee`.
 public ShadeNee vertex_nee<S : ISurfaces, M : IMedium, let X : uint>(PathRoot r, uint slot, inout PathLoop p, ShadeState c, PathContext x, uint kind, ShadeVertex sv, float run, uint drawn)
 {
     ShadeNee nee = no_nee(c.spectral);

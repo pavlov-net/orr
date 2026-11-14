@@ -42,33 +42,30 @@ public LayerRay traced_ray(uint4* at)
     return layer_ray(v);
 }
 
-// The wavelengths of `slot`'s path whose scalars' flags are `scalars`: the wavelengths part where
-// the path is split by wavelength, else none.
-public Spectral path_spectral(PathRoot r, uint slot, uint scalars)
+// The G-buffer's surface as the path's first vertex, reached with `p`, which the path starts on
+// where `start`, else reaches by its camera ray: STEP_VERTEX, with STEP_EMITS where its emission
+// counts and STEP_UNSHADED where its pixel, in no interior, runs no path this frame; or for a sky
+// pixel STEP_SKY, with the camera ray's direction in the ray words, where the path is a view's,
+// else STEP_ENDED. It stores the loop.
+uint reach_gbuffer(PathRoot r, uint4* at, inout PathLoop p, inout LaunchRecord record, uint2 pixel, bool start)
 {
-    if (spectral_tracked(r) && (scalars & SCALARS_SPECTRAL) != 0)
-        return load_part<Spectral, SLOT_SPECTRAL_PART>(spectral_words(r, slot));
-    return Spectral();
-}
-
-// The G-buffer's surface as the path's first vertex, reached with `p` and its ray `ray`, which
-// the path starts on where `start`, else reaches by its camera ray: STEP_VERTEX with STEP_EMITS
-// where it emits, or STEP_ENDED for a sky pixel, which leaves the sky. Its caller stores the ray.
-uint reach_gbuffer(PathRoot r, uint4* at, inout PathLoop p, LayerRay ray, inout LaunchRecord record, uint2 pixel, bool start)
-{
-    set_flag(p.flags, LOOP_GBUFFER_START, false);
-    if (!start)
-        p.iteration++;
     PathFixed f = { pixel };
     PackedSurface ps;
-    if (!arrive_gbuffer(r, f, p, record, start, ps, ray.dir))
+    float3 dir;
+    if (!arrive_gbuffer(r, f, p, record, start, ps, dir))
     {
-        store_path_loop(at, p, 0);
-        return STEP_ENDED;
+        store_path_loop(at, p);
+        // Only a view shows the sky.
+        return from_view(r) ? STEP_SKY : STEP_ENDED;
     }
     store_part<PackedSurface, SURFACE_WORDS>(at + SURFACE_AT, ps);
-    store_path_loop(at, p, REACH_FIRST | REACH_GBUFFER);
-    return vertex_step(ps) | STEP_FIRST | STEP_GBUFFER;
+    store_path_loop(at, p);
+    uint step = vertex_step() | STEP_FIRST | STEP_GBUFFER;
+    if (may(MAY_EMISSIVE) && surface_emits(ps) && has(p.flags, LOOP_COUNTED))
+        step |= STEP_EMITS;
+    if (!has(p.flags, LOOP_INSIDE) && !runs_path(r, pixel))
+        step |= STEP_UNSHADED;
+    return step;
 }
 
 // Starts `slot`'s path of `pixel` from `start` with `rng`, counting `rays` rays already: its
@@ -81,24 +78,31 @@ public uint begin_launch(PathRoot r, uint slot, uint2 pixel, PathStart start, Sa
     start_state(r, pixel, start, rng, record.photon(), f, p, c);
     p.rays = rays;
     uint4* at = hot_words(r, slot);
-    store_start_scalars(r, at, c);
-    store_tracked_parts(r, slot, p, c);
-    store_spectral_part(r, slot, c.spectral);
+    if (c.interior.count > 0)
+        store_interiors(r, slot, p, c);
+    // Only a photon starts with a plane stack, the one its light's direction gives.
+    if (c.stack.valid)
+        keep_path_stack(r, slot, p, c.stack);
+    else
+        set_flag(p.flags, LOOP_STACK_RAY, true);
     if (start.mask != 0)
     {
-        store_path_ray(r, at, p, c, record, path_context(r, record, pixel), start.t_max, start.mask, start.gbuffer ? LAUNCH_GBUFFER : 0);
-        store_path_loop(at, p, 0);
+        store_path_ray(r, at, p, c, record, path_context(r, record, pixel), start.t_max, start.mask, start.gbuffer ? LAUNCH_GBUFFER : 0, start.offset);
+        store_loop_state(at, p);
+        store_loop_radiance(at, p);
         return STEP_RAY;
     }
     store_launch_ray(at, launch_ray(c.ray, 0.0, 0));
-    return reach_gbuffer(r, at, p, c.ray, record, pixel, true);
+    return reach_gbuffer(r, at, p, record, pixel, true);
 }
 
 // Folds into `interior` the crossings of the ray from `origin` along unit `dir` to `t_max` that the
 // raygen traced for `slot`'s start (`crossings`, its data word 2). False on the start's first call,
-// which leaves the ray for them.
+// which leaves the ray for them. A root that tracks no interiors has no surface to cross.
 public bool start_crossed(PathRoot r, uint slot, uint crossings, float3 origin, float3 dir, float t_max, inout Interior interior)
 {
+    if (!interiors_tracked(r))
+        return true;
     if (crossings == 0)
     {
         store_crossing_ray(r, slot, origin, dir, t_max);
@@ -235,14 +239,12 @@ public uint launch_gbuffer(PathRoot r, uint slot)
 {
     uint4* at = hot_words(r, slot);
     uint2 pixel = launch_pixel(r, slot);
-    uint reach;
-    PathLoop p = load_path_loop(r, at, pixel, reach);
-    LayerRay ray = traced_ray(at);
-    LaunchRay v = launch_ray(ray, 0.0, 0);
+    PathLoop p = load_path_loop(r, at, pixel);
+    LaunchRay v = launch_ray(traced_ray(at), 0.0, 0);
     RayOrigin o = { v.origin, v.t_max };
     RayDir d = { v.dir, v.flags };
     store_word(at + RAY_ORIGIN_AT, o);
     store_word(at + RAY_DIR_AT, d);
     LaunchRecord record = launch_record(r, slot);
-    return reach_gbuffer(r, at, p, ray, record, pixel, false);
+    return reach_gbuffer(r, at, p, record, pixel, false);
 }

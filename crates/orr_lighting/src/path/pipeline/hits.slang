@@ -53,14 +53,13 @@ void stack_meet(inout Payload p, TriangleAttributes a)
 }
 
 // The any-hit shaders start from their record's data (`orr_scene.runs`' `HitData`): the class
-// their candidate traces as and its section material. A shadow ray's crossing step commits the
-// nearest crossing past the walk's last.
+// their candidate traces as and its section material.
 [shader("anyhit")]
 void cover_path_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(cover_path_hit);
     TriangleHit h = { a };
-    any_hit_decides(path_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, p.words, data, h, slot_crossings(root, launch_slot())));
+    any_hit_decides(path_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, p.words, data, h));
 }
 
 [shader("anyhit")]

@@ -72,7 +72,7 @@ void resolve_given(inout Payload p)
 void finish_view(inout Payload p)
 {
     ORR_OMM(finish_view);
-    p.words.x = launch_finish_view<Environment, Medium>(root, launch_slot(), p.words.y, p.words.z);
+    p.words.x = launch_finish_view(root, launch_slot(), p.words.y, p.words.z);
 }
 
 [shader("callable")]
@@ -86,7 +86,7 @@ void finish_record(inout Payload p)
 void finish_background(inout Payload p)
 {
     ORR_OMM(finish_background);
-    p.words.x = launch_finish_background<Environment, Medium>(root, launch_slot());
+    p.words.x = launch_finish_background(root, launch_slot());
 }
 
 // Takes the hit flag and distance in, and hands the step back.
@@ -94,7 +94,7 @@ void finish_background(inout Payload p)
 void segment(inout Payload p)
 {
     ORR_OMM(segment);
-    p.words.x = launch_segment<Medium>(root, launch_slot(), p.words.x != 0, asfloat(p.words.y));
+    p.words.x = launch_segment(root, launch_slot(), p.words.x != 0, asfloat(p.words.y));
 }
 
 [shader("callable")]

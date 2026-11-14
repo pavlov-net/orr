@@ -23,11 +23,9 @@ void paths()
     launch_paths(root);
 }
 
-// Takes INVOKE_* in the payload's second word.
 [shader("miss")]
 void miss_path(inout Payload p)
 {
     ORR_OMM(miss_path);
-    p.words.x = launch_miss<Surface, Medium>(root, launch_slot(), p.words.y);
-    p.words.y = 0;
+    launch_miss<Surface, Environment, Medium>(root, launch_slot());
 }

@@ -31,11 +31,21 @@ import orr_lighting.path.launch.raygen_walk;
 import orr_lighting.path.launch.boundary;
 import orr_lighting.path.launch.raygen_vertex;
 
+// Runs the miss shader on a miss made here: it reads its path's ray from the slot.
+void made_miss()
+{
+    Payload p;
+    p.words = uint4(0);
+    Traced miss = traced_miss(0, path_ray(float3(0.0), float3(0.0, 0.0, 1.0), 1.0));
+    miss.invoke(p);
+}
+
 // Traces the ray of `slot`'s path from the trace half of its ray, which its maker stored ready
-// (`store_path_ray`), takes what lies in front of its hit and along it, and runs the shader of
-// what it met, after a reorder by that shader, whether the vertex is the last bounce's, whether it
-// is a layer, whether its material may be rich and whether it emits: the step it returns, and in
-// `t` the length a resolve gave the ray to its vertex.
+// (`store_path_ray`), takes what lies in front of its hit and, inside an interior, along it, and
+// runs the shader of what it met: the miss shader, or after a reorder by it, whether the vertex is
+// the last bounce's, whether it is a layer, whether its material may be rich and whether it emits,
+// its hit's resolve. The step that returns, and in `t` the length a resolve gave the ray to its
+// vertex.
 uint trace_path(PathRoot r, uint slot, out float t)
 {
     t = 0.0;
@@ -49,70 +59,45 @@ uint trace_path(PathRoot r, uint slot, out float t)
     RayDesc ray = path_ray(o.origin, d.dir, o.reach);
     Traced h = trace_hit(r.scene.tlas, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, mask, RAY_TYPE_PATH, RAY_TYPES, 0, ray, p);
     float reach = h.hit() ? h.t() : ray.TMax;
-    if (front != 0)
+    if ((may(MAY_PARTICLES) || may(MAY_LOCAL_LIGHTS)) && front != 0)
     {
         RayDesc layers = ray;
         layers.TMax = reach;
         if ((trace_front(r, layers, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, front, PARTICLE_CANDIDATES, CALL_LAYERS) & STEP_ENDED) != 0)
             return STEP_ENDED;
     }
-    bool segmented = (d.word & LAUNCH_SEGMENT) != 0;
-    if (segmented)
+    if (may(MAY_INTERIORS) && (d.word & LAUNCH_INSIDE) != 0)
     {
-        Payload c;
-        c.words = uint4(h.hit() ? 1u : 0u, asuint(reach), 0, 0);
-        call(CALL_SEGMENT, c);
-        if (c.words.x != 0)
-            return c.words.x;
+        uint step = data_call(CALL_SEGMENT, uint4(h.hit() ? 1u : 0u, asuint(reach), 0, 0)).x;
+        if (step != 0)
+            return step;
     }
     uint flags = h.hit() ? h.record<HitData>().flags : 0;
     uint class_id = flags & HIT_CLASS_MASK;
     bool layer = h.hit() && (class_id == CLASS_DIELECTRIC || class_id == CLASS_PRESENCE);
     if ((d.word & LAUNCH_GBUFFER) != 0 && !layer)
         return step_call(CALL_GBUFFER);
+    if (!h.hit())
+    {
+        // A disc the ray sees past a plane stack its path crossed takes the stack's probe first.
+        if (may(MAY_STACK) && (d.word & LAUNCH_STACKED) != 0)
+        {
+            if (step_call(CALL_STACK_MISS) != 0)
+                trace_probe(r, slot);
+            made_miss();
+        }
+        else
+            h.invoke(p);
+        return STEP_ENDED;
+    }
     bool last = (d.word & LAUNCH_LAST) != 0;
     uint hint = (last ? 8u : 0u) | (layer ? 4u : 0u) | ((flags & HIT_LOBED) != 0 ? 2u : 0u) | ((flags & HIT_EMITS) != 0 ? 1u : 0u);
     h.reorder(hint, 4);
     // Its cover's seed went to its any-hit shaders; its hit shader takes INVOKE_* there.
-    p.words.y = segmented ? INVOKE_SEGMENTED : 0;
+    p.words.y = 0;
     h.invoke(p);
-    if ((p.words.x & STEP_PROBE) != 0)
-    {
-        trace_probe(r, slot);
-        p.words.y = (segmented ? INVOKE_SEGMENTED : 0) | INVOKE_PROBED;
-        h.invoke(p);
-    }
     t = asfloat(p.words.y);
     return p.words.x;
-}
-
-// The callables that start and finish a path of `r`'s source.
-uint source_start(PathRoot r)
-{
-    switch (r.source)
-    {
-    case PATH_SOURCE_VIEW:
-        return CALL_START_VIEW;
-    case PATH_SOURCE_BACKGROUND:
-        return CALL_START_BACKGROUND;
-    case PATH_SOURCE_UPDATE:
-        return CALL_START_UPDATE;
-    default:
-        return CALL_START_PHOTON;
-    }
-}
-
-uint source_finish(PathRoot r)
-{
-    switch (r.source)
-    {
-    case PATH_SOURCE_VIEW:
-        return CALL_FINISH_VIEW;
-    case PATH_SOURCE_BACKGROUND:
-        return CALL_FINISH_BACKGROUND;
-    default:
-        return CALL_FINISH_RECORD;
-    }
 }
 
 // The raygen: the path of the slice's item at the launch index, from its source's start to its
@@ -122,18 +107,16 @@ public void launch_paths(PathRoot r)
     uint slot = launch_slot();
     if (slot >= r.slice_count)
         return;
-    bool deposits = r.source == PATH_SOURCE_PHOTON;
-    uint finish = source_finish(r);
-    uint step = start_path(r, slot, source_start(r));
+    uint step = start_path(r, slot);
     // The length of the ray that reached the vertex the path is at, 0 for the G-buffer's surface.
     float t = 0.0;
     for (uint pass = 0; (step & STEP_DONE) == 0; pass++)
     {
-        if ((step & STEP_GIVEN) != 0)
+        if (may(MAY_PHOTON) && (step & STEP_GIVEN) != 0)
         {
             if ((trace_light(r, slot) & STEP_DONE) != 0)
                 return;
-            uint4 given = data_call(CALL_RESOLVE_GIVEN);
+            uint4 given = data_call(CALL_RESOLVE_GIVEN, uint4(0));
             step = given.x;
             t = asfloat(given.y);
         }
@@ -141,13 +124,18 @@ public void launch_paths(PathRoot r)
         {
             if ((step & STEP_RAY) != 0)
                 step = trace_path(r, slot, t);
-            if ((step & STEP_WALK) != 0)
+            if ((may(MAY_WALK) || may(MAY_INTERIORS)) && (step & STEP_WALK) != 0)
                 step = walk_path(r, slot, t);
+            if ((step & STEP_SKY) != 0)
+            {
+                made_miss();
+                break;
+            }
             if ((step & STEP_ENDED) != 0)
                 break;
-            step = vertex_calls(r, slot, step, t, deposits);
+            step = vertex_calls(r, slot, step, t);
         }
-        step = crossed_call(r, slot, finish, pass);
+        step = finish_path(r, slot, pass);
         t = 0.0;
     }
 }

@@ -2,8 +2,8 @@
 // what the root's features keep; and a scratch every slot keeps. Their bases, the cold parts'
 // offsets and the strides are in the launch's header (`PathRoot.launch`), which the host writes
 // from the root's source, features and candidates (`orr_lighting::launch::memory`): no shader
-// derives a layout. A shader loads and stores the words it reads and writes, a word at a time
-// where it reads few.
+// derives a layout. The slot is the path's state: a shader loads the words it reads where it reads
+// them and stores the ones it changed, and holds none of them across a call.
 module slot;
 
 import orr_shaders.abi;
@@ -32,7 +32,7 @@ import orr_lighting.path.common;
 // ---------------------------------------------------------------------------------------------
 // The hot part, five 64-byte lines: the loop; the ray its last vertex left, the half its trace
 // reads and then the half its hit's MIS weight reads; the vertex's shadow ray; the vertex's
-// surface words; and the scalars an opaque vertex reads in place of the cold parts.
+// surface words; and the IOR around its shadow ray's origin.
 
 public static const uint LOOP_AT = 0;
 public static const uint LOOP_WORDS = 4;
@@ -47,7 +47,9 @@ public static const uint RAY_DIR_AT = RAY_AT + 1;               // `RayDir`
 public static const uint RAY_COVER_AT = RAY_AT + 2;             // the cover payload (`path_payload`)
 public static const uint RAY_NORMAL_AT = RAY_AT + 3;            // `RayNormal`
 public static const uint RAY_FROM_AT = RAY_AT + 4;              // `RayFrom`
-public static const uint SHADOW_AT = RAY_AT + RAY_WORDS;        // `ShadowJob`
+// `ShadowJob`. A plane stack's probe takes the origin and direction words where no shadow ray
+// holds them.
+public static const uint SHADOW_AT = RAY_AT + RAY_WORDS;
 public static const uint SHADOW_WORDS = 3;
 public static const uint SHADOW_CONTRIBUTION_AT = SHADOW_AT;    // `ShadowContribution`
 public static const uint SHADOW_ORIGIN_AT = SHADOW_AT + 1;      // `ShadowOrigin`
@@ -56,29 +58,28 @@ public static const uint SHADOW_DIR_AT = SHADOW_AT + 2;         // `ShadowDir`
 // resolves, its given hit (`ValueHit`, GIVEN_WORDS).
 public static const uint SURFACE_AT = SHADOW_AT + SHADOW_WORDS;
 public static const uint SURFACE_WORDS = 7;
-public static const uint SCALARS_AT = SURFACE_AT + SURFACE_WORDS;  // `Scalars`
-[Host] public static const uint HOT_WORDS = SCALARS_AT + 1;
+// The IOR of the interior the vertex's shadow ray starts in, one float, which the walk of the
+// thin walls the ray passes reads.
+public static const uint SHADOW_IOR_AT = SURFACE_AT + SURFACE_WORDS;
+[Host] public static const uint HOT_WORDS = SHADOW_IOR_AT + 1;
 
-// The loop, a word each. A counter is below the rounds a root may ask for, which 24 bits hold:
-// `chains`' bytes lie above `iteration`, `depth` and `opaque` (`pack_loop`). The cone is the ray's,
-// in its cover payload; the length of the ray to the vertex crosses in the payload and the
-// callables' data.
+// The loop, a word each. The cone is the ray's, in its cover payload.
 public struct LoopThroughput
 {
     public float3 throughput;
-    public uint flags;                      // LOOP_* below REACH_SHIFT, REACH_* from it
+    public uint flags;                      // LOOP_*
 }
 
 public struct LoopRadiance
 {
     public float3 radiance;
-    public uint dimension;                  // the loop's sampler's
+    public uint rays;                       // the debug view's count
 }
 
 public struct LoopKeep
 {
     public float3 keep;
-    public uint iteration;
+    public uint dimension;                  // the loop's sampler's
 }
 
 public struct LoopCounts
@@ -86,26 +87,16 @@ public struct LoopCounts
     public uint depth;
     public uint opaque;
     public uint layers;
-    public uint rays;
+    public uint chains;
 }
 
-public struct LoopPart
-{
-    public LoopThroughput throughput;
-    public LoopRadiance radiance;
-    public LoopKeep keep;
-    public LoopCounts counts;
-}
-
-// `LoopThroughput.flags` from REACH_SHIFT: how the path reached its vertex. The bits there are
-// the staged loop's coherence key, which no pipeline shader sets. The vertex is the path's first,
-// and is the G-buffer's surface, which a vertex's shaders take from the step the raygen hands them
-// (`arrive_vertex`); the path is at a subsurface walk's exit where the walk stopped at its cap,
-// which is the vertex the walk entered.
-public static const uint REACH_SHIFT = LOOP_KEY_SHIFT;
-public static const uint REACH_FIRST = 1 << 0;
-public static const uint REACH_GBUFFER = 1 << 1;
-public static const uint REACH_EXIT_CAP = 1 << 3;
+// `LoopThroughput.flags` of the pipeline's own, above `path.common`'s LOOP_*: the path lies in an
+// interior, whose list the interiors part holds; it is split by wavelength, as the wavelengths
+// part says; and its plane stack is the one its last scatter started at the ray it left, which the
+// ray words hold (`load_path_stack`), in place of the stack part.
+public static const uint LOOP_INSIDE = 1 << 16;
+public static const uint LOOP_SPECTRAL = 1 << 17;
+public static const uint LOOP_STACK_RAY = 1 << 18;
 
 // The ray's trace half: its origin and reach, its direction with a word of what its trace takes
 // (`RayDir.word`), and the cover payload its any-hit shaders read, whose last two words are the
@@ -124,16 +115,20 @@ public struct RayDir
 
 // `RayDir.word`: `ray_flags` below RAY_FLAG_BITS; LAUNCH_GBUFFER, a camera ray that only looks for
 // layers before the G-buffer's surface; from LAUNCH_MASK_SHIFT the trace's instance mask, from
-// LAUNCH_FRONT_SHIFT the mask of a LAYERS trace in front of its hit (0 for none); a segment runs
-// along it before its hit's shader; and the opaque vertex it may reach is the last bounce's.
+// LAUNCH_FRONT_SHIFT the mask of a LAYERS trace in front of its hit (0 for none); the ray runs
+// inside an interior, whose medium its segment takes before its hit's shader; the opaque vertex
+// it may reach is the last bounce's; and its path tracks a plane stack it crossed, whose probe a
+// miss that sees a directional light's disc takes.
 public static const uint LAUNCH_GBUFFER = 1 << RAY_FLAG_BITS;
 public static const uint LAUNCH_MASK_SHIFT = 8;
 public static const uint LAUNCH_FRONT_SHIFT = 16;
-public static const uint LAUNCH_SEGMENT = 1 << 24;
+public static const uint LAUNCH_INSIDE = 1 << 24;
 public static const uint LAUNCH_LAST = 1 << 25;
+public static const uint LAUNCH_STACKED = 1 << 26;
 
 // The ray's MIS half: what weighs the light its hit finds against next-event estimation at the
-// vertex it left.
+// vertex it left. A camera ray weighs nothing, and its `run` is the distance from the eye to its
+// origin.
 public struct RayNormal
 {
     public float3 normal;
@@ -146,8 +141,8 @@ public struct RayFrom
     public float run;
 }
 
-// A path's ray but its cover payload, as `load_vertex` reads it: the trace half's origin, reach,
-// direction and word, and the MIS half.
+// A path's ray but its cover payload: the trace half's origin, reach, direction and word, and the
+// MIS half.
 public struct LaunchRay
 {
     public float3 origin;
@@ -160,7 +155,8 @@ public struct LaunchRay
     public float run;
 }
 
-// A vertex's shadow ray: the fields of `PathShadowRay` a path that tracks no interior keeps.
+// A vertex's shadow ray, made ready by its maker: the raygen adds its contribution times what its
+// trace lets through.
 public struct ShadowJob
 {
     public float3 contribution;
@@ -203,29 +199,6 @@ public struct MediumVertex
 // triangle and point of its caster where its light first meets the scene.
 public static const uint GIVEN_WORDS = 5;
 
-// What an opaque vertex reads of the interiors and wavelengths parts: the IOR of the interior
-// around the vertex and of the one its shadow ray starts in, and the hero wavelength, 0 before the
-// path disperses; and in `flags` whether the path lies in an interior (SCALARS_INTERIOR) and is
-// split by wavelength (SCALARS_SPECTRAL), where those parts hold more.
-public struct Scalars
-{
-    public float ior;
-    public float shadow_ior;
-    public float hero;
-    public uint flags;
-}
-
-public static const uint SCALARS_INTERIOR = 1 << 0;
-public static const uint SCALARS_SPECTRAL = 1 << 1;
-// The path's plane stack is the one its last scatter started at the ray it left, which the ray
-// words hold (`load_path_stack`), in place of the stack part.
-public static const uint SCALARS_STACK_RAY = 1 << 2;
-// Each scalar's place in the word, for the store of one.
-public static const uint SCALAR_IOR = 0;
-public static const uint SCALAR_SHADOW_IOR = 1;
-public static const uint SCALAR_HERO = 2;
-public static const uint SCALAR_FLAGS = 3;
-
 // ---------------------------------------------------------------------------------------------
 // The cold parts, each in a root whose source and features keep it, and the scratch
 
@@ -242,41 +215,43 @@ public static const uint EXIT_AT = WALK_STATE_WORDS;
 // The layer part (FEATURE_LAYERS): a layer's words beside its packed surface (`LayerWords`).
 public static const uint LAYER_WORDS = 2;
 [Host] public static const uint SLOT_LAYER_PART = LAYER_WORDS;
-// The interiors part (FEATURE_INTERIORS): the path's interiors (`LaunchInterior`), then its shadow
-// ray's vertex (`ShadowInterior`).
-public static const uint SLOT_INTERIOR_WORDS = 8;
-public static const uint SLOT_SHADOW_INTERIOR_WORDS = 2;
-[Host] public static const uint SLOT_INTERIOR_PART = SLOT_INTERIOR_WORDS + SLOT_SHADOW_INTERIOR_WORDS;
-// The stack part (FEATURE_STACK): `PathStack`, then `StackHit` and `StackWalk`. The stack hit is
+// The interiors part (FEATURE_INTERIORS): the path's interiors (`LaunchInterior`).
+[Host] public static const uint SLOT_INTERIOR_PART = 8;
+// The stack part (FEATURE_STACK): `PathStack`, then `StackHit` and `StackWalk`, then the interiors
+// a shadow ray a stack may bend starts in, where it starts in any (BENT_INSIDE). The stack hit is
 // live across a leg's segment, whose march and crossings use the scratch and the layer part.
 public static const uint PATH_STACK_WORDS = 5;
 public static const uint STACK_HIT_AT = PATH_STACK_WORDS;
 public static const uint STACK_HIT_WORDS = 2;
 public static const uint STACK_WALK_AT = STACK_HIT_AT + STACK_HIT_WORDS;
 public static const uint STACK_WALK_WORDS = 10;
-[Host] public static const uint SLOT_STACK_PART = STACK_WALK_AT + STACK_WALK_WORDS;
+public static const uint STACK_INSIDE_AT = STACK_WALK_AT + STACK_WALK_WORDS;
+public static const uint STACK_INSIDE_WORDS = 6;
+[Host] public static const uint SLOT_STACK_PART = STACK_INSIDE_AT + STACK_INSIDE_WORDS;
 // The light part (FEATURE_STACK or FEATURE_COATED_EMITTERS): what a shadow ray's light takes at the
-// ray's end, a directional light's draw (`BentDraw`) or a coated emitter's sample (`LightView`).
-[Host] public static const uint SLOT_LIGHT_PART = 3;
+// ray's end, a directional light's draw with the vertex that drew it (`BentDraw`) or a coated
+// emitter's sample (`LightView`).
+[Host] public static const uint SLOT_LIGHT_PART = 5;
 // The wavelengths part (FEATURE_DISPERSION): `Spectral`.
 [Host] public static const uint SLOT_SPECTRAL_PART = 5;
 
 // The scratch, which holds one of these at a time: the LAYERS_KEPT nearest candidates of a LAYERS
 // trace past its bound, by `layer_before`, as two words each (`LayerEntry`) from FRONT_AT, and the
 // key of the last one a callable took at FRONT_BOUND, which bounds the next trace of the same ray;
-// a vertex's light candidates, CANDIDATE_WORDS each from the scratch's first word; what a vertex
-// hands its record's callable, ENTRY_WORDS from the first word; or the keys of a shadow ray's
-// crossing walk (`CrossingKey`): at CROSSED_AT the crossing it took last, which its window's
-// resolve keeps, and at COMMITTED_AT the one its step's trace has committed so far. The host keeps
-// at least FRONT_WORDS of it.
+// a vertex's light candidates, CANDIDATE_WORDS each from the scratch's first word; what a vertex's
+// shade hands a callable the raygen runs after it, up to ENTRY_WORDS from the first word; or the
+// crossings of a start's ray. The host keeps at least FRONT_WORDS of it.
 public static const uint LAYERS_KEPT = 4;
 public static const uint FRONT_AT = 0;
 public static const uint FRONT_BOUND = FRONT_AT + 2 * LAYERS_KEPT;
 [Host] public static const uint FRONT_WORDS = FRONT_BOUND + 1;
 [Host] public static const uint CANDIDATE_WORDS = 4;
-[Host] public static const uint ENTRY_WORDS = 4;
-public static const uint CROSSED_AT = 0;
-public static const uint COMMITTED_AT = 1;
+// A shade's entries: the gather's from the scratch's first word, then its record's, a photon's
+// deposit or an update path's cache vertex.
+public static const uint GATHER_WORDS = 7;
+public static const uint RECORD_ENTRY_AT = GATHER_WORDS;
+public static const uint RECORD_ENTRY_WORDS = 5;
+[Host] public static const uint ENTRY_WORDS = RECORD_ENTRY_AT + RECORD_ENTRY_WORDS;
 
 // `LayerEntry.more.z`: what the candidate is.
 public static const uint LAYER_PARTICLE = 0;
@@ -317,17 +292,7 @@ public struct LaunchWalk
     public uint rng_index;
     public uint rng_seed;
     public float ior;
-    public uint seed;                       // a subsurface walk exit's scatter's, drawn at its next-event estimation
-}
-
-// The rest of `PathShadowRay` for a path that tracks interiors: its vertex's point, and the
-// surface it lies on with what that surface's medium reads there. The interiors it arrived with
-// are the path's until its scatter.
-public struct ShadowInterior
-{
-    public float3 start;
-    public uint surface;
-    public float4 point;
+    public uint seed;                       // a subsurface walk exit's scatter's, drawn at its arrival
 }
 
 // The path's interiors, where it entered the last, and its ray's start.
@@ -487,7 +452,7 @@ public uint4* candidate_words(PathRoot r, uint slot, uint k)
 // The record of `slot`, whose stride the root's source gives alone.
 public uint4* record_words(PathRoot r, uint slot)
 {
-    return r.launch.records + slot * (r.source == PATH_SOURCE_UPDATE ? UPDATE_RECORD_WORDS : RECORD_WORDS);
+    return r.launch.records + slot * (from_update(r) ? UPDATE_RECORD_WORDS : RECORD_WORDS);
 }
 
 // What the root's features keep, which the host's layout of the cold parts follows: whether the
@@ -497,17 +462,23 @@ public uint4* record_words(PathRoot r, uint slot)
 // interior (`interiors_tracked`) or split by wavelength (`spectral_tracked`).
 public bool layers_kept(PathRoot r)
 {
-    return (r.features & FEATURE_LAYERS) != 0;
+    return may(MAY_LAYERS) && (r.features & FEATURE_LAYERS) != 0;
 }
 
 public bool stack_kept(PathRoot r)
 {
-    return (r.features & FEATURE_STACK) != 0;
+    return may(MAY_STACK) && (r.features & FEATURE_STACK) != 0;
 }
 
-public bool light_kept(PathRoot r)
+public bool emitter_views_kept(PathRoot r)
 {
-    return (r.features & (FEATURE_STACK | FEATURE_COATED_EMITTERS)) != 0;
+    return may(MAY_EMISSIVE) && may2(MAY2_COATED_EMITTERS) && (r.features & FEATURE_COATED_EMITTERS) != 0;
+}
+
+// Whether the segments of `r`'s paths outside every interior march a medium.
+public bool segments_marched(PathRoot r)
+{
+    return (r.features & FEATURE_SEGMENTS) != 0;
 }
 
 // The pixel of the path of the slice's `slot`th item.
@@ -529,45 +500,105 @@ public void store_ray_cone(uint4* at, RayCone cone)
     store_coherent((uint2*)(at + RAY_COVER_AT) + 1, uint2(asuint(cone.width), asuint(cone.spread)));
 }
 
-// The loop in hot words `at` with its sampler of `pixel`, and how it reached its vertex in
-// `reach`: the parts but its interiors'.
-public PathLoop load_path_loop(PathRoot r, uint4* at, uint2 pixel, out uint reach)
+// A loop of `pixel` that holds nothing, in no interior, before its words are loaded.
+public PathLoop empty_loop(PathRoot r, uint2 pixel)
 {
-    LoopPart l = load_part<LoopPart, LOOP_WORDS>(at + LOOP_AT);
-    reach = l.throughput.flags >> REACH_SHIFT;
-    StoredLoop v;
-    v.throughput = l.throughput.throughput;
-    v.flags = l.throughput.flags & ((1u << REACH_SHIFT) - 1);
-    v.radiance = l.radiance.radiance;
-    v.iteration = l.keep.iteration;
-    v.keep = l.keep.keep;
-    v.depth = l.counts.depth;
-    v.cone = load_ray_cone(at);
-    v.opaque = l.counts.opaque;
-    v.layers = l.counts.layers;
-    Sampler rng = path_sampler(r, pixel);
-    rng.dimension = l.radiance.dimension;
-    return unpack_loop(v, rng, l.counts.rays);
+    PathLoop p;
+    p.rng = path_sampler(r, pixel);
+    p.iteration = 0;
+    p.depth = 0;
+    p.opaque = 0;
+    p.layers = 0;
+    p.chains = 0;
+    p.flags = 0;
+    p.rays = 0;
+    p.throughput = float3(0.0);
+    p.radiance = float3(0.0);
+    p.keep = float3(0.0);
+    p.cone = RayCone();
+    p.sky = float3(0.0);
+    p.entered = MATERIAL_NONE;
+    p.entered_at = float3(0.0);
+    p.entered_normal = float3(0.0);
+    return p;
 }
 
-// Stores loop `p`, which reached its vertex as `reach` says, in hot words `at`: its words and its
-// cone.
-public void store_path_loop(uint4* at, PathLoop p, uint reach)
+// The loop in hot words `at` with its sampler of `pixel` as a vertex's shader holds it: its
+// throughput and flags, its keep and sampler dimension, its counts and its cone. Its radiance and
+// rays are what the shader adds, which `flush_loop_radiance` adds to the slot's.
+public PathLoop load_loop_state(PathRoot r, uint4* at, uint2 pixel)
 {
-    StoredLoop v = pack_loop(p);
-    LoopPart l;
-    l.throughput.throughput = v.throughput;
-    l.throughput.flags = v.flags | (reach << REACH_SHIFT);
-    l.radiance.radiance = v.radiance;
-    l.radiance.dimension = p.rng.dimension;
-    l.keep.keep = v.keep;
-    l.keep.iteration = v.iteration;
-    l.counts.depth = v.depth;
-    l.counts.opaque = v.opaque;
-    l.counts.layers = v.layers;
-    l.counts.rays = p.rays;
-    store_part<LoopPart, LOOP_WORDS>(at + LOOP_AT, l);
-    store_ray_cone(at, v.cone);
+    LoopThroughput t = load_word<LoopThroughput>(at + LOOP_THROUGHPUT_AT);
+    LoopKeep k = load_word<LoopKeep>(at + LOOP_KEEP_AT);
+    LoopCounts n = load_word<LoopCounts>(at + LOOP_COUNTS_AT);
+    PathLoop p = empty_loop(r, pixel);
+    p.rng.dimension = k.dimension;
+    p.depth = n.depth;
+    p.opaque = n.opaque;
+    p.layers = n.layers;
+    p.chains = n.chains;
+    p.flags = t.flags;
+    p.throughput = t.throughput;
+    p.keep = k.keep;
+    p.cone = load_ray_cone(at);
+    return p;
+}
+
+// The loop in hot words `at` with its sampler of `pixel`: its four words and its cone.
+public PathLoop load_path_loop(PathRoot r, uint4* at, uint2 pixel)
+{
+    PathLoop p = load_loop_state(r, at, pixel);
+    LoopRadiance l = load_word<LoopRadiance>(at + LOOP_RADIANCE_AT);
+    p.radiance = l.radiance;
+    p.rays = l.rays;
+    return p;
+}
+
+// Adds what loop `p`, loaded by `load_loop_state`, gathered of radiance and counted of rays to
+// the radiance word in hot words `at`.
+public void flush_loop_radiance(uint4* at, PathLoop p)
+{
+    if (!any(p.radiance != 0.0) && p.rays == 0)
+        return;
+    LoopRadiance l = load_word<LoopRadiance>(at + LOOP_RADIANCE_AT);
+    l.radiance += p.radiance;
+    l.rays += p.rays;
+    store_word(at + LOOP_RADIANCE_AT, l);
+}
+
+// Stores loop `p`'s throughput and flags, its keep and sampler dimension, and its counts in hot
+// words `at`: what a vertex changes of it beside its radiance and its cone.
+public void store_loop_state(uint4* at, PathLoop p)
+{
+    LoopThroughput t = { p.throughput, p.flags };
+    LoopKeep k = { p.keep, p.rng.dimension };
+    LoopCounts n = { p.depth, p.opaque, p.layers, p.chains };
+    store_word(at + LOOP_THROUGHPUT_AT, t);
+    store_word(at + LOOP_KEEP_AT, k);
+    store_word(at + LOOP_COUNTS_AT, n);
+}
+
+// Stores loop `p`'s radiance word.
+public void store_loop_radiance(uint4* at, PathLoop p)
+{
+    LoopRadiance l = { p.radiance, p.rays };
+    store_word(at + LOOP_RADIANCE_AT, l);
+}
+
+// Stores loop `p` in hot words `at`: its four words and its cone.
+public void store_path_loop(uint4* at, PathLoop p)
+{
+    store_loop_state(at, p);
+    store_loop_radiance(at, p);
+    store_ray_cone(at, p.cone);
+}
+
+// Adds `e` to the radiance of the path in hot words `at`: its radiance word alone.
+public void add_radiance(uint4* at, float3 e)
+{
+    LoopRadiance l = load_word<LoopRadiance>(at + LOOP_RADIANCE_AT);
+    l.radiance += e;
+    store_word(at + LOOP_RADIANCE_AT, l);
 }
 
 // The ray in hot words `at`, but its cover.
@@ -591,6 +622,17 @@ public void store_launch_ray(uint4* at, LaunchRay v)
     store_word(at + RAY_DIR_AT, d);
     store_word(at + RAY_NORMAL_AT, n);
     store_word(at + RAY_FROM_AT, f);
+}
+
+// The ray in hot words `at` as its direction word alone gives it: its direction and its flags.
+public LayerRay load_ray_dir(uint4* at, out uint word)
+{
+    RayDir d = load_word<RayDir>(at + RAY_DIR_AT);
+    word = d.word;
+    LaunchRay v = LaunchRay();
+    v.dir = d.dir;
+    v.flags = d.word;
+    return layer_ray(v);
 }
 
 public LayerRay layer_ray(LaunchRay v)
@@ -627,71 +669,79 @@ public ShadeState launch_state(LayerRay ray)
     return c;
 }
 
-// The bits of scalar `k` (SCALAR_*) of hot words `at`.
-public uint load_scalar(uint4* at, uint k)
+// Stores in `slot`'s interiors part the interiors of path `p` in state `c`, where it entered the
+// last and its ray's start, and marks `p` as lying in one or not. A root that tracks none stores
+// nothing.
+public void store_interiors(PathRoot r, uint slot, inout PathLoop p, ShadeState c)
 {
-    return load_coherent((uint*)(at + SCALARS_AT) + k);
+    if (!interiors_tracked(r))
+        return;
+    LaunchInterior i = { c.interior, p.entered, p.entered_at, p.entered_normal, c.ray.start };
+    store_part<LaunchInterior, SLOT_INTERIOR_PART>(interior_words(r, slot), i);
+    set_flag(p.flags, LOOP_INSIDE, c.interior.count > 0);
 }
 
-public void store_scalar(uint4* at, uint k, uint bits)
+// Stores where the ray of `slot`'s path starts, `start`, in its interiors part: the part's last
+// word, for a path whose interiors a vertex left as they were.
+public void store_interior_start(PathRoot r, uint slot, float3 start)
 {
-    store_coherent((uint*)(at + SCALARS_AT) + k, bits);
+    static_assert(sizeof(LaunchInterior) == 16 * (SLOT_INTERIOR_PART - 1) + 12, "a path's ray's start is the interiors part's last word");
+    store_coherent((float3*)(interior_words(r, slot) + (SLOT_INTERIOR_PART - 1)), start);
 }
 
-// Sets `bit` of `at`'s scalars' flags to `on`.
-public void set_scalar_flag(uint4* at, uint bit, bool on)
+// The interiors of `slot`'s path `p` into `p` and `c`, where it lies in one.
+public void load_interiors(PathRoot r, uint slot, inout PathLoop p, inout ShadeState c)
 {
-    uint flags = load_scalar(at, SCALAR_FLAGS);
-    set_flag(flags, bit, on);
-    store_scalar(at, SCALAR_FLAGS, flags);
+    if (!interiors_tracked(r) || !has(p.flags, LOOP_INSIDE))
+        return;
+    LaunchInterior i = load_part<LaunchInterior, SLOT_INTERIOR_PART>(interior_words(r, slot));
+    c.interior = i.interior;
+    c.ray.start = i.start;
+    p.entered = i.entered;
+    p.entered_at = i.entered_at;
+    p.entered_normal = i.entered_normal;
 }
 
-// The scalars of a path that starts with state `c`, which a root that tracks neither interiors nor
-// wavelengths keeps to its end.
-public void store_start_scalars(PathRoot r, uint4* at, ShadeState c)
+// The wavelengths of `slot`'s path with loop flags `flags`: the wavelengths part where the path is
+// split by wavelength, else none.
+public Spectral path_spectral(PathRoot r, uint slot, uint flags)
 {
-    Interior interior = interiors_tracked(r) ? c.interior : Interior();
-    Spectral spectral = spectral_tracked(r) ? c.spectral : Spectral();
-    float ior = interior_ior(r.scene, interior.innermost());
-    Scalars s = { ior, ior, spectral.hero(), (interior.count > 0 ? SCALARS_INTERIOR : 0) | (spectral.on ? SCALARS_SPECTRAL : 0) };
-    store_word(at + SCALARS_AT, s);
+    if (spectral_tracked(r) && has(flags, LOOP_SPECTRAL))
+        return load_part<Spectral, SLOT_SPECTRAL_PART>(spectral_words(r, slot));
+    return Spectral();
 }
 
-// The path's interiors, where it entered and its ray's start, with the scalars they give, where
-// the root tracks interiors, and its plane stack where the root keeps one.
-public void store_tracked_parts(PathRoot r, uint slot, PathLoop p, ShadeState c)
+// Stores the wavelengths `s` of `slot`'s path `p`, which it marks as split by them or not, where
+// the root splits paths by wavelength.
+public void store_spectral_part(PathRoot r, uint slot, inout PathLoop p, Spectral s)
 {
-    if (interiors_tracked(r))
-    {
-        LaunchInterior i = { c.interior, p.entered, p.entered_at, p.entered_normal, c.ray.start };
-        store_part<LaunchInterior, SLOT_INTERIOR_WORDS>(interior_words(r, slot), i);
-        uint4* at = hot_words(r, slot);
-        store_scalar(at, SCALAR_IOR, asuint(interior_ior(r.scene, c.interior.innermost())));
-        set_scalar_flag(at, SCALARS_INTERIOR, c.interior.count > 0);
-    }
-    keep_path_stack(r, slot, c.stack);
+    if (!spectral_tracked(r))
+        return;
+    store_part<Spectral, SLOT_SPECTRAL_PART>(spectral_words(r, slot), s);
+    set_flag(p.flags, LOOP_SPECTRAL, s.on);
 }
 
-// Keeps `stack` in `slot`'s stack part, where the root keeps one: ahead of a change to the ray
-// words, which may hold it (SCALARS_STACK_RAY).
-public void keep_path_stack(PathRoot r, uint slot, PathStack stack)
+// Keeps `stack` in `slot`'s stack part, where the root keeps one, for path `p`, whose stack is
+// then no longer its ray's.
+public void keep_path_stack(PathRoot r, uint slot, inout PathLoop p, PathStack stack)
 {
     if (!stack_kept(r))
         return;
     store_part<PathStack, PATH_STACK_WORDS>(stack_words(r, slot), stack);
-    set_scalar_flag(hot_words(r, slot), SCALARS_STACK_RAY, false);
+    set_flag(p.flags, LOOP_STACK_RAY, false);
 }
 
-// The plane stack of `slot`'s path, where the root keeps one: the stack part, or where the path
-// has crossed no stack face since its last scatter, the stack that scatter started at the ray it
-// left, `ray`, from a vertex of depth `depth` into `interior`. Only a scatter of a path that
-// `tracks` stacks (no photon's, outside a one-technique mode) starts a valid one.
-public PathStack load_path_stack(PathRoot r, uint slot, LaunchRay ray, Interior interior, uint depth, bool tracks)
+// The plane stack of `slot`'s path with loop flags `flags`, where the root keeps one: the stack
+// part, or where the path has crossed no stack face since its last scatter, the stack that scatter
+// started at the ray it left, `ray`, from a vertex of depth `depth` into `interior`. Only a
+// scatter of a path that `tracks` stacks (no photon's, outside a one-technique mode) starts a
+// valid one.
+public PathStack load_path_stack(PathRoot r, uint slot, uint flags, LaunchRay ray, Interior interior, uint depth, bool tracks)
 {
-    if ((load_scalar(hot_words(r, slot), SCALAR_FLAGS) & SCALARS_STACK_RAY) == 0)
+    if (!has(flags, LOOP_STACK_RAY))
         return load_part<PathStack, PATH_STACK_WORDS>(stack_words(r, slot));
     PathStack s = PathStack();
-    s.valid = may(MAY_STACK) && tracks && ray.pdf > 0.0 && r.set.stack_entries != 0;
+    s.valid = tracks && ray.pdf > 0.0 && r.set.stack_entries != 0;
     s.crossed = 0;
     s.origin = ray.origin;
     s.dir = ray.dir;
@@ -701,47 +751,4 @@ public PathStack load_path_stack(PathRoot r, uint slot, LaunchRay ray, Interior 
     s.ior = interior_ior(r.scene, interior.innermost());
     s.depth = depth;
     return s;
-}
-
-// The path's wavelengths, with the scalars they give, where the root splits paths by wavelength.
-public void store_spectral_part(PathRoot r, uint slot, Spectral s)
-{
-    if (!spectral_tracked(r))
-        return;
-    store_part<Spectral, SLOT_SPECTRAL_PART>(spectral_words(r, slot), s);
-    uint4* at = hot_words(r, slot);
-    store_scalar(at, SCALAR_HERO, asuint(s.hero()));
-    set_scalar_flag(at, SCALARS_SPECTRAL, s.on);
-}
-
-// The interiors a shadow ray of `slot`'s vertex starts in, along `dir` (SHADOW_INTO in its
-// `flags`), with the point it starts from in `start`: those the vertex arrived with, crossed at
-// its surface where the ray goes into it (`PathShadow.inside`). None where the root tracks none.
-public Interior shadow_inside(PathRoot r, uint slot, Interior arrived, float3 origin, uint flags, out float3 start)
-{
-    start = origin;
-    if (!interiors_tracked(r))
-        return arrived;
-    ShadowInterior i = load_part<ShadowInterior, SLOT_SHADOW_INTERIOR_WORDS>(interior_words(r, slot) + SLOT_INTERIOR_WORDS);
-    start = i.start;
-    Interior inside = arrived;
-    if (i.surface != MATERIAL_NONE)
-        inside.cross(i.surface, has(flags, SHADOW_INTO), i.point);
-    return inside;
-}
-
-// Stores `slot`'s shadow ray `q`, with the IOR of the interior it starts in.
-public void store_shadow_ray(PathRoot r, uint slot, PathShadowRay q)
-{
-    uint4* at = hot_words(r, slot);
-    ShadowJob job = { q.contribution, q.light, q.origin, q.t_max, q.dir, q.flags };
-    store_part<ShadowJob, SHADOW_WORDS>(at + SHADOW_AT, job);
-    if (!interiors_tracked(r))
-        return;
-    ShadowInterior i = { q.start, q.surface, q.point };
-    store_part<ShadowInterior, SLOT_SHADOW_INTERIOR_WORDS>(interior_words(r, slot) + SLOT_INTERIOR_WORDS, i);
-    Interior inside = q.arrived;
-    if (q.surface != MATERIAL_NONE)
-        inside.cross(q.surface, has(q.flags, SHADOW_INTO), q.point);
-    store_scalar(at, SCALAR_SHADOW_IOR, asuint(interior_ior(r.scene, inside.innermost())));
 }

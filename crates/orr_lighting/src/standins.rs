@@ -45,13 +45,13 @@ pub enum Body {
     Resolve,
     /// The light an opaque vertex sends along the path.
     Emission,
-    /// An opaque vertex from its arrival to its shadow job.
-    Direct,
-    /// An opaque vertex past its shadow ray to its next ray.
-    Scatter,
-    /// A vertex's light candidates.
-    Lights,
-    /// The caustic photons' light a vertex gathers.
+    /// An opaque vertex's arrival, with its light candidates.
+    Arrive,
+    /// An opaque vertex's shade: its shadow job and its next ray.
+    Shade,
+    /// A layer's shade.
+    ShadeLayer,
+    /// The caustic photons' light a vertex gathers of their grid.
     Gather,
     /// A path ray's any-hit at a non-opaque triangle.
     CoverPath,
@@ -67,9 +67,9 @@ impl Body {
     pub const ALL: [Self; 10] = [
         Self::Resolve,
         Self::Emission,
-        Self::Direct,
-        Self::Scatter,
-        Self::Lights,
+        Self::Arrive,
+        Self::Shade,
+        Self::ShadeLayer,
         Self::Gather,
         Self::CoverPath,
         Self::CoverShadow,
@@ -81,9 +81,9 @@ impl Body {
         match self {
             Self::Resolve => "resolve",
             Self::Emission => "emission",
-            Self::Direct => "direct",
-            Self::Scatter => "scatter",
-            Self::Lights => "lights",
+            Self::Arrive => "arrive",
+            Self::Shade => "shade",
+            Self::ShadeLayer => "shade layer",
             Self::Gather => "gather",
             Self::CoverPath => "cover path",
             Self::CoverShadow => "cover shadow",
@@ -97,7 +97,7 @@ impl Body {
             Self::Resolve => ShaderKind::ClosestHit,
             Self::CoverPath | Self::CoverShadow | Self::ProxyShadow => ShaderKind::AnyHit,
             Self::BoxMedium => ShaderKind::Intersection,
-            Self::Emission | Self::Direct | Self::Scatter | Self::Lights | Self::Gather => {
+            Self::Emission | Self::Arrive | Self::Shade | Self::ShadeLayer | Self::Gather => {
                 ShaderKind::Callable
             }
         }
@@ -107,9 +107,9 @@ impl Body {
         match self {
             Self::Resolve => "resolve",
             Self::Emission => "emission",
-            Self::Direct => "direct",
-            Self::Scatter => "scatter",
-            Self::Lights => "lights",
+            Self::Arrive => "arrive",
+            Self::Shade => "shade",
+            Self::ShadeLayer => "shade_layer",
             Self::Gather => "gather",
             Self::CoverPath => "cover_path_hit",
             Self::CoverShadow => "cover_shadow_hit",
@@ -118,14 +118,10 @@ impl Body {
         }
     }
 
-    /// What its stand-in for paths that may meet `may` may meet. A vertex's next-event
-    /// estimation and scatter are every source's, as the pipeline makes them; the other bodies
-    /// are a view path's.
+    /// What its stand-in for paths that may meet `may` may meet: a view's paths alone, as the
+    /// view's pipeline makes its stages.
     fn may(self, may: u64) -> u64 {
-        match self {
-            Self::Direct | Self::Scatter => may,
-            _ => may & !(MAY_BACKGROUND | MAY_UPDATE | MAY_PHOTON) | MAY_VIEW,
-        }
+        may & !(MAY_BACKGROUND | MAY_UPDATE | MAY_PHOTON) | MAY_VIEW
     }
 }
 

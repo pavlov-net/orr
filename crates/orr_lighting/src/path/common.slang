@@ -87,11 +87,26 @@ public bool frost_pass(PathRoot r) { return may(MAY_FROST) && (r.dielectric_flag
 public bool thin_lens(PathRoot r) { return may(MAY_LENS) && r.aperture_radius > 0.0; }
 bool has_froxels(PathRoot r) { return may(MAY_FROXELS) && r.froxels != nullptr; }
 
-// Whether the paths of `r` are of `source`, which the pipeline may not run at all.
-public bool from_view(PathRoot r) { return may(MAY_VIEW) && r.source == PATH_SOURCE_VIEW; }
-public bool from_background(PathRoot r) { return may(MAY_BACKGROUND) && r.source == PATH_SOURCE_BACKGROUND; }
-public bool from_update(PathRoot r) { return may(MAY_UPDATE) && r.source == PATH_SOURCE_UPDATE; }
-public bool from_photon(PathRoot r) { return may(MAY_PHOTON) && r.source == PATH_SOURCE_PHOTON; }
+// Whether a pipeline made for the source of bit `bit` runs no other source's paths, so its root's
+// source is known where it is made.
+bool sole_source(uint bit)
+{
+    uint others = (MAY_VIEW | MAY_BACKGROUND | MAY_UPDATE | MAY_PHOTON) & ~bit;
+    return PATH_SPECIALIZES && may(bit) && !may_any(others);
+}
+
+// Whether the paths of `r` are of `source`, which the pipeline may not run at all, or may run
+// alone.
+public bool from_view(PathRoot r) { return may(MAY_VIEW) && (sole_source(MAY_VIEW) || r.source == PATH_SOURCE_VIEW); }
+public bool from_background(PathRoot r) { return may(MAY_BACKGROUND) && (sole_source(MAY_BACKGROUND) || r.source == PATH_SOURCE_BACKGROUND); }
+public bool from_update(PathRoot r) { return may(MAY_UPDATE) && (sole_source(MAY_UPDATE) || r.source == PATH_SOURCE_UPDATE); }
+public bool from_photon(PathRoot r) { return may(MAY_PHOTON) && (sole_source(MAY_PHOTON) || r.source == PATH_SOURCE_PHOTON); }
+
+// Whether a pipeline's paths may run next-event estimation: every source's but a photon's.
+public bool may_estimate()
+{
+    return may_any(MAY_VIEW | MAY_BACKGROUND | MAY_UPDATE);
+}
 
 // Counts a ray of the path, which only the debug view of rays per pixel reads.
 public void count_ray(inout PathLoop p)

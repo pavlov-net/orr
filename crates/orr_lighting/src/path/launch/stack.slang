@@ -34,6 +34,7 @@ import orr_lighting.path.common;
 import orr_lighting.path.launch.steps;
 import orr_lighting.path.launch.slot;
 import orr_lighting.path.launch.record;
+import orr_lighting.path.launch.nee;
 
 // The ray of a plane stack's probe or leg from `slot`'s shadow job's origin along its direction,
 // reaching `t_max`, with the payload its any-hit shaders read: the stack policy over opaque
@@ -90,10 +91,13 @@ public uint launch_stack_step<M : IMedium>(PathRoot r, uint slot, uint phase)
         if (!on_face)
             return 0;
         StackWalk w;
-        Interior arrived = Interior();
-        if (interiors_tracked(r))
-            arrived = load_part<LaunchInterior, SLOT_INTERIOR_WORDS>(interior_words(r, slot)).interior;
-        w.inside = shadow_inside(r, slot, arrived, q.origin, q.flags, w.from);
+        // What the vertex's shade kept of the ray's start: the interiors it starts in and the
+        // vertex's point.
+        BentDraw b = load_part<BentDraw, SLOT_LIGHT_PART>(light_words(r, slot));
+        w.inside = Interior();
+        if ((b.flags & BENT_INSIDE) != 0)
+            w.inside = load_part<Interior, STACK_INSIDE_WORDS>(stack_words(r, slot) + STACK_INSIDE_AT);
+        w.from = b.start;
         w.dir = q.dir;
         w.normal = face.normal;
         if (dot(face.geometric_normal, w.dir) > 0.0 && !w.inside.holds(face.material))

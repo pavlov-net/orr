@@ -1,6 +1,4 @@
 // Layers, scatters in an interior's medium and an interior's walk leaving it.
-// The pipeline's own copy of bodies the staged loop keeps in `path/stages.slang`: a fix to one
-// belongs in both, and the pipeline-against-staged tests compare them.
 module shade_other;
 
 import orr_shaders.packing;
@@ -48,7 +46,7 @@ public Walk interior_walk_from(PathLoop p, PathContext x, InteriorMedium im, flo
 // The path's end of its walk `walk` in interior `medium`, the path lying in `interior`: false
 // where the path ends. Where the walk met another surface inside, the path goes on to that hit
 // along `ray`, as its ray's. Else it `leaves` the interior at `at` with outward normal `n` along
-// `dir`, which starts the next iteration from a vertex of kind VERTEX_LEAVE.
+// `dir`, from a vertex of kind VERTEX_LEAVE.
 public bool interior_walk_ended(PathRoot r, inout PathLoop p, inout Interior interior, inout LayerRay ray, PathContext x, bool adjoint, Walk walk, uint medium, inout Sampler rng, out bool leaves, out float3 at, out float3 n, out float3 dir)
 {
     leaves = false;
@@ -89,8 +87,7 @@ public bool interior_walk_ended(PathRoot r, inout PathLoop p, inout Interior int
     set_flag(p.flags, LOOP_DISPERSIVE, false);
     leaves = true;
     set_flag(p.flags, LOOP_CAMERA, false);
-    p.iteration++;
-    if (!iteration_runs(r, p, VERTEX_LEAVE, true))
+    if (p.opaque > r.max_bounces + 1)
         return false;
     set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
     return true;
@@ -99,8 +96,7 @@ public bool interior_walk_ended(PathRoot r, inout PathLoop p, inout Interior int
 // The scatter of a path's ray at `point` inside the medium of interior `medium`, of anisotropy
 // `anisotropy`, as the trace stage makes it: where the scatter is the camera ray's vertex, at
 // `t` m from the eye, the record's view of it; in the cache, the light it holds for the medium,
-// which ends the path past the vertex's next-event estimation; and the end of the iteration that
-// reached it. False where the path ends.
+// which ends the path past the vertex's next-event estimation. False where the path ends.
 public bool reach_scatter<R : IVertexRecord>(PathRoot r, inout PathLoop p, ShadeState c, inout R record, PathContext x, float3 point, uint medium, float anisotropy, float t, inout Sampler rng)
 {
     LayerVertex l = scatter_vertex(r.view, point, c.ray.dir, medium, anisotropy);
@@ -113,8 +109,7 @@ public bool reach_scatter<R : IVertexRecord>(PathRoot r, inout PathLoop p, Shade
         set_flag(p.flags, LOOP_LAST, true);
     }
     set_flag(p.flags, LOOP_CAMERA, false);
-    p.iteration++;
-    if (!iteration_runs(r, p, VERTEX_SCATTER, true))
+    if (p.opaque > r.max_bounces + 1)
         return false;
     set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
     return true;
@@ -151,37 +146,4 @@ public ShadeVertex medium_shade_vertex(ViewConstants* v, float3 point, float3 di
     ShadeVertex sv = no_vertex();
     sv.l = scatter_vertex(v, point, dir, medium, anisotropy);
     return sv;
-}
-
-// Resolves the layer at hit `h` of path `p`'s ray, `t` m along it (the camera ray's vertex's
-// distance from the eye), into `pl`, a face of the plane stack the path tracks where `stack`,
-// with the loop's account of reaching it up to the root's dielectric depth: past it the path
-// ends, with the cache's light for the interior. False where the path ends.
-public bool resolve_layer_hit<S : ISurfaces, H : IHit>(PathRoot r, PathFixed f, inout PathLoop p, ShadeState c, PathContext x, H h, float t, bool stack, inout Sampler rng, out PackedLayer pl)
-{
-    SceneRoot* s = r.scene;
-    ViewConstants* v = r.view;
-    float3 dir = h.world_direction();
-    bool first = has(p.flags, LOOP_CAMERA);
-    set_flag(p.flags, LOOP_CAMERA, false);
-    set_flag(p.flags, LOOP_GBUFFER_HIT, false);
-    pl = PackedLayer();
-    HitContext context = hit_context(first ? HIT_PRIMARY : HIT_SECONDARY, p.depth, p.cone, t, texture_tap(v, f.pixel, r.frame, r.seed, p.depth), x.feedback);
-    float3 positions[3] = { h.corner(0), h.corner(1), h.corner(2) };
-    uint instance = h.instance_index();
-    uint cluster = uint(h.cluster_id());
-    SurfaceHit sh = resolve_hit<FeedbackSurface<S>>(s, v, dir, instance, cluster, h.primitive_index(), h.barycentrics(), positions, false, context);
-    if (!sh.valid)
-        return false;
-    if (!first)
-        p.cone = cone_after_hit(p.cone, t, 0.0);
-    p.layers++;
-    if (p.layers > r.dielectric_depth && !first)
-    {
-        if (x.cache && has(p.flags, LOOP_COUNTED))
-            p.radiance += c.spectral.color(p.throughput * interior_ambient(r, sh.surface.position, dir, rng));
-        return false;
-    }
-    pl = pack_layer(r, sh, instance, cluster, h.primitive_index(), h.barycentrics(), dir, stack);
-    return true;
 }

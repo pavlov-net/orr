@@ -1,6 +1,6 @@
 // Shadow rays: a vertex's job made ready where it is made, so the raygen adds the job's
-// contribution times what its trace let through; a photon's ray toward its light; where a shadow
-// ray's crossing walk keeps its keys; and a coated emitter's view.
+// contribution times what its trace let through; a photon's ray toward its light; and a coated
+// emitter's view.
 module shadow;
 
 import orr_shaders.abi;
@@ -36,30 +36,33 @@ public bool shadow_bends(PathRoot r, uint flags)
     return stack_kept(r) && has(flags, SHADOW_DIRECTIONAL) && has(flags, SHADOW_BEND);
 }
 
-// Shadow ray `q` as the raygen takes it, made ready by the vertex that made it: its contribution
+// Makes shadow ray `q` ready as the raygen takes it, where the vertex makes it: its contribution
 // times the transmittance of the interiors it starts in over its length and, unless it goes to the
 // environment, of the linked medium. The raygen multiplies in what its trace lets through. A plane
-// stack's walk replaces the contribution of a ray it bends with its legs'.
-public void ready_shadow<M : IMedium>(PathRoot r, inout PathShadowRay q)
+// stack's walk replaces the contribution of a ray it bends with its legs'. The interiors the ray
+// starts in: those its vertex arrived with, crossed at its surface where the ray goes into it.
+public Interior shadow_start<M : IMedium>(PathRoot r, inout PathShadowRay q)
 {
-    if (!any(q.contribution > 0.0))
-        return;
-    float3 vis = float3(1.0);
-    if (!has(q.flags, SHADOW_ENVIRONMENT))
-        vis *= medium_transmittance<M>(r.scene.medium, q.origin, q.dir, q.t_max);
-    Interior inside = q.arrived;
+    Interior inside = Interior();
     float3 start = q.origin;
     if (interiors_tracked(r))
     {
+        inside = q.arrived;
         start = q.start;
         if (q.surface != MATERIAL_NONE)
             inside.cross(q.surface, has(q.flags, SHADOW_INTO), q.point);
     }
+    if (!any(q.contribution > 0.0))
+        return inside;
+    float3 vis = float3(1.0);
+    if (!has(q.flags, SHADOW_ENVIRONMENT))
+        vis *= medium_transmittance<M>(r.scene.medium, q.origin, q.dir, q.t_max);
     float scale;
     float3 depth = straight_depth(r.scene, inside, q.t_max, false, scale);
     if (q.t_max > 0.0 && isfinite(q.t_max))
         depth *= segment_length(start, q.origin, q.dir, q.t_max) / q.t_max;
     q.contribution *= vis * exp(-depth);
+    return inside;
 }
 
 // The shadow ray in `slot`'s words as a ray, with its flags in `flags` and the payload its any-hit
@@ -105,14 +108,12 @@ public void add_shadow(PathRoot r, uint slot, uint flags, float3 passed)
     uint4* at = hot_words(r, slot);
     ShadowContribution q = load_word<ShadowContribution>(at + SHADOW_CONTRIBUTION_AT);
     float3 added = q.contribution * passed;
-    if (spectral_tracked(r) && (load_scalar(at, SCALAR_FLAGS) & SCALARS_SPECTRAL) != 0)
-        added = load_part<Spectral, SLOT_SPECTRAL_PART>(spectral_words(r, slot)).color(added);
+    if (all(added == 0.0))
+        return;
+    if (spectral_tracked(r))
+        added = path_spectral(r, slot, load_word<LoopThroughput>(at + LOOP_THROUGHPUT_AT).flags).color(added);
     if (has(flags, SHADOW_COUNTED))
-    {
-        LoopRadiance l = load_word<LoopRadiance>(at + LOOP_RADIANCE_AT);
-        l.radiance += added;
-        store_word(at + LOOP_RADIANCE_AT, l);
-    }
+        add_radiance(at, added);
     if (q.light != NO_LIGHT)
     {
         LaunchRecord record = launch_record(r, slot);
@@ -130,36 +131,6 @@ public uint launch_light_add(PathRoot r, uint slot, float3 passed)
     l.throughput *= q.contribution * passed;
     store_word(at + LOOP_THROUGHPUT_AT, l);
     return any(l.throughput > 0.0) ? STEP_GIVEN : STEP_DONE;
-}
-
-// Where a crossing step of `slot`'s shadow ray reads the keys its any-hit orders candidates by at
-// a tie of distances, in the slot's scratch: the crossing the walk took last, which its window's
-// resolve kept, and the one the step's trace committed so far, which the any-hit keeps.
-public struct ScratchCrossings : ICrossingKeys
-{
-    public PathRoot r;
-    public uint slot;
-
-    public CrossingKey last()
-    {
-        return load_word<CrossingKey>(scratch_words(r, slot) + CROSSED_AT);
-    }
-
-    public CrossingKey committed()
-    {
-        return load_word<CrossingKey>(scratch_words(r, slot) + COMMITTED_AT);
-    }
-
-    public void commit(CrossingKey key)
-    {
-        store_word(scratch_words(r, slot) + COMMITTED_AT, key);
-    }
-}
-
-public ScratchCrossings slot_crossings(PathRoot r, uint slot)
-{
-    ScratchCrossings c = { r, slot };
-    return c;
 }
 
 // The emitter view shader's body: what the coat and fuzz of the emitter `slot`'s shadow ray

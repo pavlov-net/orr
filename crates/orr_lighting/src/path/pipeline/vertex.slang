@@ -1,7 +1,8 @@
-// The pipeline path tracer's callables at a path's vertex (`path.launch`): its emission, its
-// next-event estimation and scatter per vertex class, and what those call: light sampling, the
-// caustic photons' gather, a photon's deposit and an update path's cache vertex; a walk's end; and
-// a shadow ray's plane stack step and coated emitter's view.
+// The pipeline path tracer's callables at a path's vertex (`path.launch`): its arrival and its
+// shade per vertex class, its emission, and what the raygen runs for the entries a shade leaves:
+// the caustic photons' gather, a photon's deposit and an update path's cache vertex; a walk's end;
+// and a shadow ray's plane stack step, the weighing of the light a stack bent, and a coated
+// emitter's view.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_lighting.environment;
@@ -18,131 +19,125 @@ export static const bool PATH_SPECIALIZES = true;
 
 ORR_ROOT_INLINE(PathRoot);
 
+// Each takes the vertex's step in its data's first word.
 [shader("callable")]
 void emission(inout Payload p)
 {
     ORR_OMM(emission);
-    p.words.x = launch_emission(root, launch_slot(), asfloat(p.words.z), p.words.w);
+    launch_emission(root, launch_slot(), p.words.x);
 }
 
-// The emission and the direct callable of vertex class `K` (AT_*) take DIRECT_* in their data's
-// second word, the length of the ray that reached the vertex in its third and the step that
-// reached it in its fourth; the direct callable hands back its step, with the vertex's probability
-// of running next-event estimation in the last word.
-void direct_of<let K : uint>(inout Payload p)
+// The arrival of vertex class `K` (AT_*) takes the length of the ray that reached the vertex in
+// its data's second word, and hands back its step, the vertex's probability of running next-event
+// estimation and the light candidates it drew.
+void arrive_of<let K : uint>(inout Payload p)
 {
-    p.words = launch_direct<K, Surface, Medium, CallableCalls>(root, launch_slot(), p.words.y, asfloat(p.words.z), p.words.w, CallableCalls());
+    p.words = launch_arrive<K, Surface, Medium>(root, launch_slot(), p.words.x, asfloat(p.words.y));
 }
 
-// The scatter callable takes SCATTER_BENT in its data's second word, or 0, and that probability
-// in its third.
-void scatter_of<let K : uint>(inout Payload p)
+// The shade takes that probability and that count in its data's second and third words, and
+// hands back its step.
+void shade_of<let K : uint>(inout Payload p)
 {
-    p.words.x = launch_scatter<K, Surface, CallableCalls>(root, launch_slot(), p.words.y == SCATTER_BENT, asfloat(p.words.z), CallableCalls());
+    p.words.x = launch_shade<K, Surface, Medium>(root, launch_slot(), p.words.x, asfloat(p.words.y), p.words.z);
 }
 
 [shader("callable")]
-void direct(inout Payload p)
+void arrive(inout Payload p)
 {
-    ORR_OMM(direct);
-    direct_of<AT_SURFACE>(p);
+    ORR_OMM(arrive);
+    arrive_of<AT_SURFACE>(p);
 }
 
 [shader("callable")]
-void scatter(inout Payload p)
+void shade(inout Payload p)
 {
-    ORR_OMM(scatter);
-    scatter_of<AT_SURFACE>(p);
+    ORR_OMM(shade);
+    shade_of<AT_SURFACE>(p);
 }
 
 [shader("callable")]
-void direct_exit(inout Payload p)
+void arrive_exit(inout Payload p)
 {
-    ORR_OMM(direct_exit);
-    direct_of<AT_EXIT>(p);
+    ORR_OMM(arrive_exit);
+    arrive_of<AT_EXIT>(p);
 }
 
 [shader("callable")]
-void scatter_exit(inout Payload p)
+void shade_exit(inout Payload p)
 {
-    ORR_OMM(scatter_exit);
-    scatter_of<AT_EXIT>(p);
+    ORR_OMM(shade_exit);
+    shade_of<AT_EXIT>(p);
 }
 
 [shader("callable")]
-void direct_leave(inout Payload p)
+void arrive_leave(inout Payload p)
 {
-    ORR_OMM(direct_leave);
-    direct_of<AT_LEAVE>(p);
+    ORR_OMM(arrive_leave);
+    arrive_of<AT_LEAVE>(p);
 }
 
 [shader("callable")]
-void scatter_leave(inout Payload p)
+void shade_leave(inout Payload p)
 {
-    ORR_OMM(scatter_leave);
-    scatter_of<AT_LEAVE>(p);
+    ORR_OMM(shade_leave);
+    shade_of<AT_LEAVE>(p);
 }
 
 [shader("callable")]
-void direct_medium(inout Payload p)
+void arrive_medium(inout Payload p)
 {
-    ORR_OMM(direct_medium);
-    direct_of<AT_SCATTER>(p);
+    ORR_OMM(arrive_medium);
+    arrive_of<AT_SCATTER>(p);
 }
 
 [shader("callable")]
-void scatter_medium(inout Payload p)
+void shade_medium(inout Payload p)
 {
-    ORR_OMM(scatter_medium);
-    scatter_of<AT_SCATTER>(p);
+    ORR_OMM(shade_medium);
+    shade_of<AT_SCATTER>(p);
 }
 
 [shader("callable")]
-void direct_layer(inout Payload p)
+void arrive_layer(inout Payload p)
 {
-    ORR_OMM(direct_layer);
-    direct_of<AT_LAYER>(p);
+    ORR_OMM(arrive_layer);
+    arrive_of<AT_LAYER>(p);
 }
 
 [shader("callable")]
-void scatter_layer(inout Payload p)
+void shade_layer(inout Payload p)
 {
-    ORR_OMM(scatter_layer);
-    scatter_of<AT_LAYER>(p);
+    ORR_OMM(shade_layer);
+    shade_of<AT_LAYER>(p);
 }
 
-// Takes the vertex's shading normal in its data's first three words and the sampler dimension it
-// draws from in its last, and hands back how many candidates it drew.
-[shader("callable")]
-void lights(inout Payload p)
-{
-    ORR_OMM(lights);
-    p.words.x = launch_lights<Surface>(root, launch_slot(), asfloat(p.words.xyz), p.words.w);
-}
-
-// Takes the sampler dimension, the footprint, the vertex's flags and word (`ICalls.gather`), and
-// hands back what it gathers and the dimension past its draws.
 [shader("callable")]
 void gather(inout Payload p)
 {
     ORR_OMM(gather);
-    uint dimension = p.words.x;
-    float3 g = launch_gather<Surface>(root, launch_slot(), dimension, asfloat(p.words.y), p.words.z, p.words.w);
-    p.words = uint4(asuint(g), dimension);
+    launch_gather(root, launch_slot());
 }
 
 [shader("callable")]
 void deposit(inout Payload p)
 {
     ORR_OMM(deposit);
-    p.words.x = launch_deposit<Surface>(root, launch_slot(), p.words.x);
+    launch_deposit(root, launch_slot());
 }
 
 [shader("callable")]
 void cache_vertex(inout Payload p)
 {
     ORR_OMM(cache_vertex);
-    launch_cache_vertex(root, launch_slot(), p.words.x);
+    launch_cache_vertex(root, launch_slot());
+}
+
+[shader("callable")]
+void bent(inout Payload p)
+{
+    ORR_OMM(bent);
+    launch_bent(root, launch_slot(), p.words.x);
 }
 
 [shader("callable")]
@@ -158,6 +153,14 @@ void stack_step(inout Payload p)
 {
     ORR_OMM(stack_step);
     p.words.x = launch_stack_step<Medium>(root, launch_slot(), p.words.y);
+}
+
+// Hands back whether the raygen traces the stack's probe.
+[shader("callable")]
+void stack_miss(inout Payload p)
+{
+    ORR_OMM(stack_miss);
+    p.words.x = launch_stack_miss<Medium>(root, launch_slot()) ? 1 : 0;
 }
 
 [shader("callable")]

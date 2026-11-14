@@ -1,8 +1,6 @@
 // Opaque vertices and subsurface walks' exits over their packed surface (`PackedSurface`): how a
 // path reaches them, what they are as a shade body holds them and how their BSDF is prepared;
 // and the light a ray that met nothing adds.
-// The pipeline's own copy of bodies the staged loop keeps in `path/stages.slang`: a fix to one
-// belongs in both, and the pipeline-against-staged tests compare them.
 module shade_surface;
 
 import orr_shaders.packing;
@@ -83,23 +81,6 @@ uint surface_owner(SceneRoot* s, PackedSurface ps)
     return ps.instance;
 }
 
-// What a vertex's BSDF is prepared with beside the vertex: its coat, fuzz and film collapse, a
-// subsurface lobe may start a walk, the path carries flux from a light, and the wavelength a
-// dispersive layer is prepared at (0 for none).
-public struct Prep
-{
-    public bool collapse;
-    public bool walks;
-    public bool adjoint;
-    public float hero;
-}
-
-// The BSDF of vertex `l` inside `interior`, prepared with `q`.
-public Bsdf prepare_with(PathRoot r, LayerVertex l, Interior interior, Prep q)
-{
-    return prepare_vertex(r.scene, l, interior, q.collapse, q.walks, q.adjoint, q.hero);
-}
-
 // The opaque vertex of packed surface `ps`, reached along `dir`, its BSDF unprepared.
 public ShadeVertex opaque_shade_vertex(ViewConstants* v, PackedSurface ps, float3 dir)
 {
@@ -116,7 +97,7 @@ public Prep opaque_prep<R : IPathRecord>(PathRoot r, PathLoop p, ShadeState c, R
     uint before = p.opaque - 1;
     Prep q;
     q.collapse = before > 0 && !x.reference;
-    q.walks = may(MAY_WALK) && (r.features & FEATURE_WALK) != 0 && record.walks() && may_walk(r, l.x.surface, before, has(p.flags, LOOP_WALKED), p.cone.width);
+    q.walks = may(MAY_WALK) && may(MAY_SUBSURFACE) && (r.features & FEATURE_WALK) != 0 && record.walks() && may_walk(r, l.x.surface, before, has(p.flags, LOOP_WALKED), p.cone.width);
     q.adjoint = record.adjoint();
     q.hero = c.spectral.hero();
     return q;
@@ -131,54 +112,23 @@ void reached_opaque<R : IVertexRecord>(PathRoot r, inout PathLoop p, inout R rec
     set_flag(p.flags, LOOP_DISPERSIVE, false);
     if (!first)
         return;
-    p.cone.width = cone_width(p.cone, length(ps.position - r.view.eye_render.xyz));
+    p.cone.width = cone_width(camera_cone(r.view), length(ps.position - r.view.eye_render.xyz));
     record.arrive(r, surface_vertex(r.view, ps, dir), bsdf_unprepared(), t, false);
 }
 
 // The G-buffer's surface as the path's first vertex, in `ps`, reached along `dir` from the eye,
 // with the loop's account of reaching it, by no ray where the path `start`s on it. False for a
-// sky pixel, whose path keeps the sky.
+// sky pixel, whose path has no vertex.
 public bool arrive_gbuffer<R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout R record, bool start, out PackedSurface ps, out float3 dir)
 {
-    set_flag(p.flags, LOOP_CAMERA, false);
-    set_flag(p.flags, LOOP_GBUFFER_HIT, false);
     dir = float3(0.0);
     if (!gbuffer_surface(r, f.pixel, ps))
-    {
-        p.sky = p.throughput;
         return false;
-    }
+    set_flag(p.flags, LOOP_CAMERA, false);
     float3 to_eye = r.view.eye_render.xyz - ps.position;
     dir = -to_eye / max(length(to_eye), 1e-30);
     reached_opaque(r, p, record, ps, dir, start ? 0.0 : length(to_eye), true);
     return true;
-}
-
-// The opaque surface at hit `h` of the path's ray, `t` m along it (the camera ray's vertex's
-// distance from the eye), resolved through `S` into `ps`, with the loop's account of reaching it.
-// False where the hit names nothing to resolve.
-public bool arrive_hit<S : ISurfaces, H : IHit, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout R record, PathContext x, H h, float t, out PackedSurface ps)
-{
-    ViewConstants* v = r.view;
-    bool first = has(p.flags, LOOP_CAMERA);
-    set_flag(p.flags, LOOP_CAMERA, false);
-    set_flag(p.flags, LOOP_GBUFFER_HIT, false);
-    HitContext context = hit_context(first ? HIT_PRIMARY : HIT_SECONDARY, p.depth, p.cone, t, texture_tap(v, f.pixel, r.frame, r.seed, p.depth), x.feedback);
-    if (!resolve_opaque<FeedbackSurface<S>, H>(r, h, context, ps))
-        return false;
-    if (!first)
-        p.cone = cone_after_hit(p.cone, t, 0.0);
-    reached_opaque(r, p, record, ps, h.world_direction(), t, first);
-    return true;
-}
-
-// The opaque surface at hit `h` where a subsurface walk of path `p` leaves, resolved through `S`
-// into `exit`. False where the hit names nothing to resolve.
-public bool resolve_walk_exit<S : ISurfaces, H : IHit>(PathRoot r, PathFixed f, PathLoop p, PathContext x, H h, out PackedSurface exit)
-{
-    uint depth = p.depth + 1;
-    HitContext context = hit_context(HIT_SECONDARY, depth, p.cone, h.t(), texture_tap(r.view, f.pixel, r.frame, r.seed, depth), x.feedback);
-    return resolve_opaque<FeedbackSurface<S>, H>(r, h, context, exit);
 }
 
 // Whether the emission the path's ray meets at its vertex counts: the camera ray's vertex
