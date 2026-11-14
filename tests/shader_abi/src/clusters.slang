@@ -34,7 +34,7 @@ void body<C : ICoherence>(uint2 index)
     ray.TMin = 0.0;
     ray.TMax = 4.0;
     float3 positions[3];
-    Hit h = trace_closest(root.scene, ray, 0xff, RAY_FLAG_FORCE_OPAQUE, AcceptAll(), positions);
+    Hit h = trace_closest(opaque_clusters(root.scene), ray, 0xff, RAY_FLAG_FORCE_OPAQUE, AcceptAll(), positions);
     C.point(h.hit ? 1 : 0, 3);
     if (!inside)
         return;

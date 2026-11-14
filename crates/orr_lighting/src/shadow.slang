@@ -444,7 +444,7 @@ public float3 surface_visibility<S : ISurfaces, M : IMedium, let MODE : uint>(Sc
         bool more;
         uint c;
         float c_t;
-        float3 p = trace_transmittance(s.tlas, ray, mask, pass_flags, h, SHADOW_CANDIDATES, more, c, c_t);
+        float3 p = trace_transmittance(scene_traced(s), ray, mask, pass_flags, h, SHADOW_CANDIDATES, more, c, c_t);
         overflow = overflow || more;
         product *= p;
         if (pass == 0)
@@ -654,7 +654,7 @@ public Hit stack_trace<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 ori
     ray.Direction = dir;
     ray.TMin = 0.0;
     ray.TMax = t_max;
-    return trace_closest(s.tlas, ray, MASK_OPAQUE | MASK_DIELECTRIC, flags, a);
+    return trace_closest(scene_traced(s), ray, MASK_OPAQUE | MASK_DIELECTRIC, flags, a);
 }
 
 // Whether a plane stack's probe from `origin` along unit `dir` toward a directional light meets a

@@ -74,10 +74,10 @@ void main(uint3 id: SV_DispatchThreadID)
     if (visibility<ProbeSurface, NoMedium, SHADOW_PATH>(s, root.view, origin, dir, positive_infinity(), RAY_FLAG_NONE, context, false, Interior(), nullptr).x == 0.0)
         stopped |= 1;
     Counted four = { alpha, root.calls };
-    if (trace_any(s.tlas, ray, MASK_OPAQUE, RAY_FLAG_NONE, four))
+    if (trace_any(scene_traced(s), ray, MASK_OPAQUE, RAY_FLAG_NONE, four))
         stopped |= 2;
     Counted two = { alpha, root.calls + 1 };
-    if (trace_closest(s.tlas, ray, MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, two).hit)
+    if (trace_closest(scene_traced(s), ray, MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, two).hit)
         stopped |= 4;
     root.stopped[id.x] = stopped;
     root.shadow[id.x] = visibility<ProbeSurface, NoMedium, SHADOW_PATH>(s, root.view, origin, dir, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, context, false, Interior(), nullptr).x;

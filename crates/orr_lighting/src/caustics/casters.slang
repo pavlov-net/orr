@@ -429,7 +429,7 @@ void interiors(uint3 id: SV_DispatchThreadID)
             ray.TMin = 1e-4 * (1.0 + at);
             ray.TMax = positive_infinity();
             float3 positions[3];
-            Hit h = trace_closest(s.tlas, ray, MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+            Hit h = trace_closest(scene_traced(s), ray, MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
             float3 normal;
             uint m;
             if (!h.hit || h.cluster_id < 0 || !hit_geometry(s, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, normal, m))

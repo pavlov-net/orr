@@ -97,7 +97,7 @@ void main(uint3 id: SV_DispatchThreadID)
     ray.TMax = 1e30;
     AcceptAll all;
     float3 positions[3];
-    Hit h = trace_closest(s.tlas, ray, root.mask, RAY_FLAG_NONE, all, positions);
+    Hit h = trace_closest(scene_traced(s), ray, root.mask, RAY_FLAG_NONE, all, positions);
     uint entry;
     if (h.hit && h.cluster_id >= 0 && hit_producer(s, h.instance_index, entry))
     {

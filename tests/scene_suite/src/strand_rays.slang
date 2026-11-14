@@ -78,7 +78,7 @@ void main(uint3 id: SV_DispatchThreadID)
             ray.Direction = normalize(l + r * (cos(a) * t + sin(a) * b));
             ray.TMin = 1e-3;
             ray.TMax = 1e30;
-            if (!trace_any(s.tlas, ray, MASK_OPAQUE, RAY_FLAG_NONE, all))
+            if (!trace_any(scene_traced(s), ray, MASK_OPAQUE, RAY_FLAG_NONE, all))
                 misses++;
         }
         o.lit = float(misses) / float(RAYS);
@@ -112,7 +112,7 @@ void main(uint3 id: SV_DispatchThreadID)
     ray.TMin = 0.0;
     ray.TMax = 1e30;
     float3 positions[3];
-    Hit h = trace_closest(s.tlas, ray, MASK_OPAQUE, RAY_FLAG_NONE, all, positions);
+    Hit h = trace_closest(scene_traced(s), ray, MASK_OPAQUE, RAY_FLAG_NONE, all, positions);
     if (strand_hit(s, h))
     {
         HitContext c = hit_context(HIT_PRIMARY, 0, camera_cone(v), h.t);

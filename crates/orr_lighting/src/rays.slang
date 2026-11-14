@@ -306,7 +306,7 @@ public ShadowResult trace_shadow<S : ISurfaces>(SceneRoot* s, ViewConstants* v, 
         bool more;
         uint c;
         float c_t;
-        float3 p = trace_transmittance(s.tlas, ray, mask, pass_flags, h, SHADOW_CANDIDATES, more, c, c_t);
+        float3 p = trace_transmittance(scene_traced(s), ray, mask, pass_flags, h, SHADOW_CANDIDATES, more, c, c_t);
         if (pass == 1 && h.mode == SHADOW_PROBE)
         {
             // Light that ends at anything but a dielectric is 0.

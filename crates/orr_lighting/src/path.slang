@@ -730,7 +730,7 @@ public struct WalkTrace<S : ISurfaces> : IWalkTrace
     public Hit trace(float3 origin, float3 dir, float t_max, out float3 positions[3])
     {
         Alpha<S> a = { scene, view, dir, context };
-        return trace_closest(scene.tlas, path_ray(origin, dir, t_max), MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+        return trace_closest(scene_traced(scene), path_ray(origin, dir, t_max), MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
     }
 
     public WalkMeet meet(Hit h, float3 origin, float3 dir, float3 positions[3], inout Sampler rng)
@@ -1293,7 +1293,7 @@ public struct InteriorWalk<S : ISurfaces> : IWalkTrace
     public Hit trace(float3 origin, float3 dir, float t_max, out float3 positions[3])
     {
         LayerAccept<S> a = { scene, view, dir, context, seed, PRESENCE_DRAWN };
-        return trace_closest(scene.tlas, path_ray(origin, dir, t_max), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+        return trace_closest(scene_traced(scene), path_ray(origin, dir, t_max), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
     }
 
     public WalkMeet meet(Hit h, float3 origin, float3 dir, float3 positions[3], inout Sampler rng)
@@ -2012,14 +2012,10 @@ public bool photon_start<S : ISurfaces, M : IMedium>(PathRoot r, uint index, ino
     h.primitive_index = triangle;
     h.barycentrics = bary;
     h.front_face = dot(n, p.dir) < 0.0;
+    // The class a ray that met the triangle would find.
     uint entry_producer;
-    if (hit_producer(s, instance_index, entry_producer))
-        h.class_id = material_class(s.materials + t.material);
-    else
-    {
-        ClusterRef cr = s.clusters[cluster_id];
-        h.class_id = cluster_class(load_cluster(cr.page, cr.local));
-    }
+    h.custom_index = hit_producer(s, instance_index, entry_producer) ? s.producers[entry_producer].class_id : 0;
+    h.class_id = class_of(scene_traced(s), h.custom_index, instance_index, h.cluster_id);
     p.hit = h;
     p.positions = t.corners.position;
     RayCone cone = { 0.0, 0.0 };

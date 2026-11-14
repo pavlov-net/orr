@@ -9,6 +9,7 @@ import orr_shaders.math;
 import orr_shaders.packing;
 import orr_shaders.random;
 import orr_pack.mesh;
+import orr_shaders.trace;
 import orr_scene.producer;
 import orr_scene.scene_may;
 __exported import orr_scene.surface;
@@ -104,6 +105,40 @@ public bool hit_producer(SceneRoot* s, uint index, out uint entry)
 {
     entry = index - s.producer_base;
     return may2(MAY2_PRODUCERS) && index >= s.producer_base && index < s.proxy_base;
+}
+
+// The scene's PTLAS, its candidates classed as the scene built them: a copy's cluster by the class
+// its section cooked with, a producer entry's cluster by the entry's class or, with
+// PRODUCER_SECTIONS, by its material's.
+public struct SceneTraced : ITraced
+{
+    public SceneRoot* scene;
+
+    public Tlas tlas()
+    {
+        return scene.tlas;
+    }
+
+    public uint cluster_class(uint instance_index, uint cluster_id)
+    {
+        uint entry;
+        if (hit_producer(scene, instance_index, entry))
+        {
+            ProducerGpu* p = scene.producers + entry;
+            if (p.opacity != PRODUCER_SECTIONS)
+                return p.class_id;
+            // The build refuses a cluster whose material is past the entry's.
+            return material_class(scene.materials + p.materials[scene.batches[entry].clusters[cluster_id].material]);
+        }
+        ClusterRef* r = scene.clusters + cluster_id;
+        return cluster_class_at(r.page, r.local);
+    }
+}
+
+public SceneTraced scene_traced(SceneRoot* s)
+{
+    SceneTraced t = { s };
+    return t;
 }
 
 // The transform of producer entry `p`, current or previous, relative to the point at

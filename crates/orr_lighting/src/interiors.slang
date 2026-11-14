@@ -233,7 +233,7 @@ public bool next_surface<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 o
     ray.Direction = dir;
     ray.TMin = 0.0;
     ray.TMax = t_max;
-    Hit h = trace_closest(s.tlas, ray, MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+    Hit h = trace_closest(scene_traced(s), ray, MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
     float3 n;
     uint m;
     if (!h.hit || h.cluster_id < 0 || !hit_geometry(s, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, n, m))

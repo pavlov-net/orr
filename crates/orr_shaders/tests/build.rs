@@ -407,7 +407,7 @@ fn omm_builds_declare_the_mode_on_every_ray_query_entry() {
             struct Root {{ uint* out; Tlas scene; }}\nORR_ROOT_INLINE(Root);\n\
             void body(uint2 i) {{\n\
             RayDesc r; r.Origin = float3(i, 0); r.Direction = float3(0, 0, 1); r.TMin = 0; r.TMax = 1;\n\
-            Hit h = trace_closest(root.scene, r, MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, AcceptAll());\n\
+            Hit h = trace_closest(opaque_clusters(root.scene), r, MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, AcceptAll());\n\
             root.out[i.x] = h.hit ? h.instance_index : 0; }}\n\
             [shader(\"raygeneration\")] void main_rays() {{ ORR_OMM(main_rays); body(DispatchRaysIndex().xy); }}\n\
             [shader(\"compute\")] [numthreads(8, 4, 1)] void main_compute(uint3 id: SV_DispatchThreadID) {{ {compute_mode} body(id.xy); }}\n"

@@ -69,9 +69,9 @@ void main(uint3 id: SV_DispatchThreadID)
     Layers handler;
     CandidateResult r;
     bool overflow;
-    r.transmittance = trace_transmittance(root.scene, ray, 0xff, RAY_FLAG_NONE, handler, root.max_candidates, overflow);
+    r.transmittance = trace_transmittance(opaque_clusters(root.scene), ray, 0xff, RAY_FLAG_NONE, handler, root.max_candidates, overflow);
     r.overflow = overflow ? 1 : 0;
-    Hit h = trace_resolve_translucent(root.scene, ray, 0xff, RAY_FLAG_NONE, handler, root.max_candidates, r.layers);
+    Hit h = trace_resolve_translucent(opaque_clusters(root.scene), ray, 0xff, RAY_FLAG_NONE, handler, root.max_candidates, r.layers);
     r.hit = h.hit ? 1 : 0;
     r.instance = h.instance_index;
     r._pad0 = 0;

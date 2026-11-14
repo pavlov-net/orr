@@ -2047,8 +2047,12 @@ impl<'a> Frame<'a> {
                     device,
                     scene.desc.skinned_clusters,
                     scene.tables.skinned.capacity(),
+                    cpu.skinned_sections,
                     core.fif,
                 )?);
+            }
+            if let Some(frame) = &mut cpu.skin_frame {
+                frame.follow_sections(device, cpu.skinned_sections)?;
             }
             let skin_work = cpu.skin_frame.as_ref().map(|f| f.work);
             records.append(&mut cpu.ptlas.partition_records(device, window, &core.seq)?);

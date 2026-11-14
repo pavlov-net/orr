@@ -782,6 +782,8 @@ pub(crate) struct SceneCpu {
     pub(crate) skinned: RangeAllocator,
     /// One past the highest skinned-copy entry handed out.
     pub(crate) skinned_high_water: u32,
+    /// The most sections of a skinned copy's mesh.
+    pub(crate) skinned_sections: u32,
     /// A group has hung from a palette's joint.
     pub(crate) hung: bool,
     skins: Vec<SkinRange>,
@@ -1722,6 +1724,7 @@ impl Scene {
                 cuts: None,
                 skinned: RangeAllocator::new(0),
                 skinned_high_water: 0,
+                skinned_sections: 0,
                 hung: false,
                 skins: Vec::new(),
                 skins_removed: Vec::new(),
@@ -2641,6 +2644,7 @@ impl<'f> SceneWriter<'f> {
                 }
             };
             cpu.skinned_high_water = cpu.skinned_high_water.max(entry + desc.copies);
+            cpu.skinned_sections = cpu.skinned_sections.max(model.sections);
             let holds = &mut cpu.slot_holds[first as usize..(first + desc.copies) as usize];
             for (hold, copy) in holds.iter_mut().zip(0..) {
                 *hold = SlotHold {

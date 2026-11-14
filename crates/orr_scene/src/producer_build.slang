@@ -276,12 +276,14 @@ void records(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
         group_refused = 0;
     }
     GroupMemoryBarrierWithGroupSync();
+    ProducerGpu p = s.producers[root.entry];
     ProducerClusterGpu k = ProducerClusterGpu();
     bool valid = false;
     if (c < emitted_clusters(batch))
     {
         k = batch.clusters[c];
-        valid = producer_cluster_valid(batch, k);
+        // A cluster's material is its geometry index, which the build bounds by the entry's.
+        valid = producer_cluster_valid(batch, k) && uint(k.material) < p.material_count;
         if (!valid)
         {
             b.refs[c] = REF_NONE;
@@ -338,17 +340,14 @@ void records(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
     if (!valid)
         return;
     uint64_t vertices = (uint64_t)(batch.positions + k.first_vertex);
-    // An entry of mixed sections decides class and opacity per cluster; its templates hold
-    // every pattern's opaque set, then its non-opaque set.
-    uint class_id = 0;
+    // An entry of mixed sections decides opacity per cluster by its material's class; its
+    // templates hold every pattern's opaque set, then its non-opaque set.
     uint geometry_flags = b.geometry_flags;
     uint topology = k.topology;
-    ProducerGpu p = s.producers[root.entry];
     if (p.opacity == PRODUCER_SECTIONS)
     {
         MaterialGpu* m = s.materials + producer_material(p, k);
-        class_id = material_class(m);
-        if (class_id == CLASS_OPAQUE && (m.flags & MATERIAL_ALPHA_TESTED) == 0)
+        if (material_class(m) == CLASS_OPAQUE && (m.flags & MATERIAL_ALPHA_TESTED) == 0)
             geometry_flags = GEOMETRY_OPAQUE | GEOMETRY_NO_DUPLICATE_ANY_HIT;
         else
             topology += PATTERNS;
@@ -366,7 +365,7 @@ void records(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
         r.tri_count = k.tri_count;
         r.vertex_count = k.vertex_count;
         r.index_format = 1;
-        r.base_geometry_and_flags = geometry_index_and_flags(class_id, geometry_flags);
+        r.base_geometry_and_flags = geometry_index_and_flags(k.material, geometry_flags);
         r.omm_index_format = 4;
         r.vertices = vertices;
         r.indices = (uint64_t)k.triangles;
@@ -378,7 +377,7 @@ void records(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
         uint index = group_instantiated + local;
         Instantiate r;
         r.cluster_id_offset = c;
-        r.geometry_index_offset = class_id;
+        r.geometry_index_offset = k.material;
         r.template_address = b.templates[topology];
         r.vertices = vertices;
         store((uint64_t)b.instantiate_records, index, r);

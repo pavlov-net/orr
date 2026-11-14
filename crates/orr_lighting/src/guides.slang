@@ -269,7 +269,7 @@ public LayerChain layer_chain<S : ISurfaces>(SceneRoot* s, ViewConstants* v, Lay
     {
         LayerAccept<S> ta = { s, v, d, hit_context(HIT_SECONDARY, k + 1, cone, 0.0), 0, PRESENCE_ANY };
         float3 positions[3];
-        Hit th = trace_closest(s.tlas, path_ray(vertex_origin(x.x, d), d, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, ta, positions);
+        Hit th = trace_closest(scene_traced(s), path_ray(vertex_origin(x.x, d), d, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, ta, positions);
         InteriorMedium im = interior_medium(s, list.innermost(), list.point(list.innermost()));
         float3 tr = beer(im.sigma_t, th.hit ? th.t : positive_infinity());
         scattered += c.through * (1.0 - tr) * im.albedo();
@@ -348,7 +348,7 @@ public Reflection mirror_chain<S : ISurfaces>(GuideRoot r, uint2 pixel, PathVert
         HitContext trace_context = hit_context(HIT_SECONDARY, i + 1, cone, 0.0);
         LayerAccept<S> a = { s, v, dir, trace_context, 0, PRESENCE_NONE };
         float3 positions[3];
-        Hit h = trace_closest(s.tlas, path_ray(vertex_origin(x, dir), dir, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+        Hit h = trace_closest(scene_traced(s), path_ray(vertex_origin(x, dir), dir, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
         if (chain)
         {
             throughput *= g.specular;

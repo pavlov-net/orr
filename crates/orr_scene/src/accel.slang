@@ -1,8 +1,8 @@
 // Acceleration-structure records the loading side builds from: `clas` expands each listed
-// cluster's grid positions to f32, writes its per-triangle flags and micromap indices, and
-// stores its CLAS build, or with CLAS_TEMPLATE its cluster template build over the rest
-// positions, bounded by its rest box grown by its deformation bound; `records` stores
-// cluster BLAS and move records from address jobs.
+// cluster's grid positions to f32, writes its per-triangle flags, geometry index (the cluster's
+// section) and micromap indices, and stores its CLAS build, or with CLAS_TEMPLATE its cluster
+// template build over the rest positions, bounded by its rest box grown by its deformation
+// bound; `records` stores cluster BLAS and move records from address jobs.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.packing;
@@ -85,7 +85,7 @@ void clas(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     for (uint i = t; i < c.tri_count; i += 64)
     {
         bool opaque = !non_opaque && i < c.alpha_first;
-        root.triangle_flags[job.triangle_first + i] = geometry_index_and_flags(class_id, GEOMETRY_NO_DUPLICATE_ANY_HIT | (opaque ? GEOMETRY_OPAQUE : 0));
+        root.triangle_flags[job.triangle_first + i] = geometry_index_and_flags(c.section, GEOMETRY_NO_DUPLICATE_ANY_HIT | (opaque ? GEOMETRY_OPAQUE : 0));
         if (micromap)
             root.omm_indices[job.triangle_first + i] = opaque ? OMM_INDEX_OPAQUE : load_omm_index(job.page, h, c, i);
     }

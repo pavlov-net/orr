@@ -1652,7 +1652,7 @@ public void trace_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
             count_ray(p);
         RayDesc rd = path_ray(ray.origin, ray.dir, camera ? camera_ray.t_max : positive_infinity());
         MayAccept<LayerAccept<CoverageFeedback<S>>> accept = { a };
-        h = trace_closest(s.tlas, rd, mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, accept, positions);
+        h = trace_closest(scene_traced(s), rd, mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, accept, positions);
         // Rays leaving a layer or a scatter, and the first vertex's, see particles, and every
         // path ray that adds emission sees the proxies of sphere and rect lights, which cover
         // nothing: a second trace finds them in front of the hit.
@@ -1668,7 +1668,7 @@ public void trace_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
             PathEmission pe = { s, set, ray_local, ray.origin, ray.dir, ray.from, ray.normal, x.one_technique ? 0.0 : ray.pdf, ray.run, front.TMax, own, adds };
             // What lies in front of the ray's hit, premultiplied.
             float4 layers;
-            trace_resolve_translucent(s.tlas, front, (particles ? MASK_PARTICLE : 0) | (lights ? MASK_LIGHT : 0), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, pe, PARTICLE_CANDIDATES, layers);
+            trace_resolve_translucent(scene_traced(s), front, (particles ? MASK_PARTICLE : 0) | (lights ? MASK_LIGHT : 0), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, pe, PARTICLE_CANDIDATES, layers);
             if (adds)
                 p.radiance += spectral.color(p.throughput * layers.rgb);
             p.throughput *= 1.0 - layers.a;

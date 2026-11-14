@@ -107,7 +107,7 @@ Found trace<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 origin, float3
     a.d = d;
     a.context = context;
     Found f;
-    f.hit = trace_closest(s.tlas, ray, mask, RAY_FLAG_NONE, a, f.positions);
+    f.hit = trace_closest(scene_traced(s), ray, mask, RAY_FLAG_NONE, a, f.positions);
     return f;
 }
 
