@@ -1,4 +1,4 @@
-// The path loop as one ray tracing pipeline launch per source (`path/pipeline.slang`). A raygen
+// The path loop as one ray tracing pipeline launch per source (`path/pipeline/*.slang`). A raygen
 // owns each path from its start to its end and holds nothing across a call but the step a shader
 // returned: it traces the path's ray, composites the particles and light proxies in front of its
 // hit by LAYERS traces, calls the segment that runs along it, inside an interior or outside every
