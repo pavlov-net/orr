@@ -1,7 +1,9 @@
 // The pipeline path tracer's callables at a path's vertex (`path.launch`): its emission, and its
 // next-event estimation and scatter per vertex class, which `orr_lighting::launch` makes per BSDF
 // class by `path_may`; a photon's deposit, an update path's cache vertex and a walk's end; and a
-// shadow ray's window, plane stack step and coated emitter's view.
+// shadow ray's plane stack step and coated emitter's view. The emission, direct and deposit
+// callables take the length of the ray to the vertex in their data's third word and the step that
+// reached it in the fourth.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_lighting.environment;
@@ -22,7 +24,7 @@ ORR_ROOT_INLINE(PathRoot);
 void emission(inout Payload p)
 {
     ORR_OMM(emission);
-    launch_emission(root, launch_slot());
+    p.words.x = launch_emission(root, launch_slot(), asfloat(p.words.z), p.words.w);
 }
 
 // The direct callable of vertex class `K` (AT_*), and the deposit, take DIRECT_* in their data's
@@ -31,7 +33,7 @@ void emission(inout Payload p)
 void direct_of<let K : uint>(inout Payload p)
 {
     uint dimension;
-    p.words.x = launch_direct<K, Surface, Medium>(root, launch_slot(), p.words.y, asfloat(p.words.z), dimension);
+    p.words.x = launch_direct<K, Surface, Medium>(root, launch_slot(), p.words.y, asfloat(p.words.z), p.words.w, dimension);
     p.words.y = dimension;
 }
 
@@ -46,7 +48,7 @@ void direct(inout Payload p)
 void deposit(inout Payload p)
 {
     ORR_OMM(deposit);
-    p.words.x = launch_deposit<Surface>(root, launch_slot(), p.words.y == DIRECT_PROBED, asfloat(p.words.z));
+    p.words.x = launch_deposit<Surface>(root, launch_slot(), p.words.y == DIRECT_PROBED, asfloat(p.words.z), p.words.w);
 }
 
 [shader("callable")]
@@ -124,13 +126,6 @@ void scatter_medium(inout Payload p)
 {
     ORR_OMM(scatter_medium);
     p.words.x = launch_scatter<AT_SCATTER, Surface>(root, launch_slot());
-}
-
-[shader("callable")]
-void window(inout Payload p)
-{
-    ORR_OMM(window);
-    p.words.x = launch_window<Surface>(root, launch_slot());
 }
 
 // Takes the phase in its data's second word, and hands back what follows.

@@ -1,4 +1,4 @@
-// The pipeline path tracer's raygens, one per source, and its miss shader (`path.launch`).
+// The pipeline path tracer's raygen, one for every source, and its miss shader (`path.launch`).
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_lighting.environment;
@@ -15,38 +15,19 @@ export static const bool PATH_SPECIALIZES = true;
 
 ORR_ROOT_INLINE(PathRoot);
 
+// Runs the paths of the root's source.
 [shader("raygeneration")]
-void path_view()
+void paths()
 {
-    ORR_OMM(path_view);
-    launch_paths<Medium>(root, CALL_START_VIEW, CALL_FINISH_VIEW, false);
+    ORR_OMM(paths);
+    launch_paths(root);
 }
 
-[shader("raygeneration")]
-void path_update()
-{
-    ORR_OMM(path_update);
-    launch_paths<Medium>(root, CALL_START_UPDATE, CALL_FINISH_RECORD, false);
-}
-
-[shader("raygeneration")]
-void path_photon()
-{
-    ORR_OMM(path_photon);
-    launch_paths<Medium>(root, CALL_START_PHOTON, CALL_FINISH_RECORD, true);
-}
-
-[shader("raygeneration")]
-void path_background()
-{
-    ORR_OMM(path_background);
-    launch_paths<Medium>(root, CALL_START_BACKGROUND, CALL_FINISH_BACKGROUND, false);
-}
-
-// Reads in the payload's first word whether the raygen traced the probe it asked for.
+// Takes INVOKE_* in the payload's second word.
 [shader("miss")]
 void miss_path(inout Payload p)
 {
     ORR_OMM(miss_path);
-    p.words.x = launch_miss<Surface, Medium>(root, launch_slot(), p.words.x == STEP_PROBE);
+    p.words.x = launch_miss<Surface, Medium>(root, launch_slot(), p.words.y);
+    p.words.y = 0;
 }

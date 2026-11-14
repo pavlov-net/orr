@@ -47,15 +47,16 @@ import orr_lighting.path.common;
 [Host] public static const uint CALL_LAYERS = 25;
 [Host] public static const uint CALL_PROXY_MARCH = 26;
 [Host] public static const uint CALL_GBUFFER = 27;
-[Host] public static const uint CALL_WINDOW = 28;
-[Host] public static const uint CALL_STACK_STEP = 29;
-[Host] public static const uint CALL_EMITTER_VIEW = 30;
-[Host] public static const uint CALL_START_FIRST_VERTEX = 31;   // a view's debug view of its first vertex alone
-[Host] public static const uint CALLABLES = 32;
+[Host] public static const uint CALL_STACK_STEP = 28;
+[Host] public static const uint CALL_EMITTER_VIEW = 29;
+[Host] public static const uint CALL_START_FIRST_VERTEX = 30;   // a view's debug view of its first vertex alone
+[Host] public static const uint CALLABLES = 31;
 
 // What the raygen hands a vertex's direct or deposit callable in its data's second word: its
 // first call; its call again once the raygen has traced the probe it asked for (STEP_PROBE); and
-// its second phase, which takes a directional light that a plane stack bent.
+// its second phase, which takes a directional light that a plane stack bent. The vertex's
+// emission, direct and deposit callables take the length of the ray that reached the vertex in
+// its third word and the step that reached it in its fourth.
 public static const uint DIRECT_FIRST = 0;
 public static const uint DIRECT_PROBED = 1;
 public static const uint DIRECT_BENT = 2;
@@ -87,6 +88,22 @@ public static const uint STEP_AT_SHIFT = 12;
 [Host] public static const uint AT_SCATTER = 4;         // a scatter in an interior's medium, its surface words a `MediumVertex`
 [Host] public static const uint AT_LAYER = 5;           // a dielectric or presence layer, its words a `PackedLayer`
 public static const uint AT_CLASSES = 6;
+static const uint STEP_AT_MASK = 7;
+
+// How the path reached the vertex a step names, which the raygen hands its shaders: the vertex
+// is the path's first; it is the G-buffer's surface; the loop has not yet taken the account of
+// the ray that reached it, which the first of its shaders to load the loop takes
+// (`arrive_vertex`); and a segment along that ray drew the march's jitter.
+public static const uint STEP_FIRST = 1 << 16;
+public static const uint STEP_GBUFFER = 1 << 17;
+public static const uint STEP_ARRIVES = 1 << 18;
+public static const uint STEP_SEGMENTED = 1 << 19;
+
+// The class (AT_*) of the vertex `step` names.
+public uint step_at(uint step)
+{
+    return (step >> STEP_AT_SHIFT) & STEP_AT_MASK;
+}
 
 // What a path ray asks of the raygen beside its trace (`launch_path_ray`): the instance mask of a
 // LAYERS trace in front of its hit in the low bits, 0 for none, and a segment.
@@ -98,11 +115,9 @@ public uint vertex_step(PackedSurface ps)
     return STEP_VERTEX | (surface_emits(ps) ? STEP_EMITS : 0) | ((surface_lobed(ps) ? AT_RICH : AT_PLAIN) << STEP_AT_SHIFT);
 }
 
-// What `launch_shadow_take` hands the raygen: the ray passed thin walls that its walk crosses, and
-// the walk is at its start; its light is a coated emitter's, whose view its end takes; it is a
-// directional light's that ended at an opaque surface or solid glass, before which a plane stack's
-// probe looks for a face, its contribution left as it was.
-public static const uint TAKE_WALKS = 1 << 0;
+// What a shadow ray's trace leaves its raygen to do: its light is a coated emitter's, whose view
+// its end takes; it is a directional light's that ended at an opaque surface or solid glass,
+// before which a plane stack's probe looks for a face.
 public static const uint TAKE_VIEW = 1 << 1;
 public static const uint TAKE_BENDS = 1 << 2;
 

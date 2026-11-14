@@ -26,6 +26,7 @@ import orr_lighting.path.common;
 import orr_lighting.path.launch.steps;
 import orr_lighting.path.launch.slot;
 import orr_lighting.path.launch.record;
+import orr_lighting.path.launch.hit;
 import orr_lighting.path.launch.shade_surface;
 import orr_lighting.path.launch.shade_other;
 
@@ -180,9 +181,11 @@ public uint launch_walk_end(PathRoot r, uint slot)
     if ((w.kind & LAUNCH_WALK_INTERIOR) == 0 || !interiors_tracked(r))
     {
         bool alive = subsurface_walk_ended(r, p, x, e);
-        store_path_loop(at, p, REACH_EXIT | (e.kind == WALK_CAP ? REACH_EXIT_CAP : 0));
+        store_path_loop(at, p, e.kind == WALK_CAP ? REACH_EXIT_CAP : 0);
         if (!alive)
             return STEP_ENDED;
+        if (e.kind == WALK_BOUNDARY)
+            store_invoke_cover(at, p, x, true);
         return e.kind == WALK_BOUNDARY ? STEP_INVOKE : STEP_VERTEX | (AT_EXIT << STEP_AT_SHIFT);
     }
     LayerRay ray = layer_ray(load_launch_ray(at));
@@ -203,6 +206,7 @@ public uint launch_walk_end(PathRoot r, uint slot)
     if (!leaves)
     {
         store_launch_ray(at, launch_ray(ray, 0.0, 0));
+        store_invoke_cover(at, p, x, false);
         return STEP_INVOKE;
     }
     // The way out leaves the walk's interior, which the IOR around the vertex and the scalars'

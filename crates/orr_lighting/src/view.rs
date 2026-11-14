@@ -17,7 +17,7 @@ use orr_scene::{
 };
 
 use crate::caustics::PhotonMap;
-use crate::launch::{LaunchMemory, PathPipeline, Raygen, SlotLayout};
+use crate::launch::{LaunchMemory, PathPipeline, SlotLayout};
 use crate::media::{
     MediaKernels, MediaSettings, MediaStats, MediaView, fogged, links_medium, readers, shows_media,
 };
@@ -2410,7 +2410,7 @@ impl LightingKernels {
             },
             false,
         );
-        launch.record(list, &hits, Raygen::View, &root, &memory.view, pixels);
+        launch.record(list, &hits, &root, &memory.view, pixels);
         if update > 0 && lighting.stage_passes {
             list.end_pass();
             list.begin_pass("update paths", false);
@@ -2421,14 +2421,7 @@ impl LightingKernels {
                 features: update_features,
                 ..update_root(&root)
             };
-            launch.record(
-                list,
-                &hits,
-                Raygen::Update,
-                &update_root,
-                &memory.update,
-                update,
-            );
+            launch.record(list, &hits, &update_root, &memory.update, update);
         }
         list.end_pass();
         if pass.dof_background.is_some() {
@@ -2442,14 +2435,7 @@ impl LightingKernels {
                 source: PATH_SOURCE_BACKGROUND,
                 ..root
             };
-            launch.record(
-                list,
-                &hits,
-                Raygen::Background,
-                &background_root,
-                &memory.view,
-                pixels,
-            );
+            launch.record(list, &hits, &background_root, &memory.view, pixels);
             list.end_pass();
         }
         list.barrier(Stages::RAY, Stages::COMPUTE | Stages::RAY, Hazards::empty());
@@ -2580,7 +2566,7 @@ impl LightingKernels {
                         slots,
                         SlotLayout::new(root.features, false, 0),
                     )?;
-                launch.record(list, hits, Raygen::Photon, &root, memory, photons);
+                launch.record(list, hits, &root, memory, photons);
             }
         }
         if lighting.stage_passes {

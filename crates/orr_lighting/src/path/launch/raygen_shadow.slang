@@ -29,6 +29,8 @@ import orr_lighting.path.launch.slot;
 import orr_lighting.path.launch.front;
 import orr_lighting.path.launch.shadow;
 import orr_lighting.path.launch.stack;
+import orr_lighting.path.launch.hit;
+import orr_lighting.path.launch.boundary;
 
 // Takes what lies along `ray` before its reach, by LAYERS traces of instance mask `mask` with
 // `flags`, each a batch of LAYERS_KEPT candidates that callable `index` takes in depth order, at
@@ -88,7 +90,7 @@ public void trace_probe(PathRoot r, uint slot)
 }
 
 // Multiplies what the medium proxies with a volume along `ray`, the shadow ray of `slot`'s vertex,
-// let through into its contribution, by LAYERS traces over MASK_MEDIUM of LAYERS_KEPT proxies
+// let through into its job's contribution, by LAYERS traces over MASK_MEDIUM of LAYERS_KEPT proxies
 // each, at most SHADOW_CANDIDATES of them, as many as its shadow trace counts: false where
 // nothing is left of it.
 bool march_proxies(PathRoot r, RayDesc ray)
@@ -96,59 +98,92 @@ bool march_proxies(PathRoot r, RayDesc ray)
     return (trace_front(r, ray, RAY_FLAG_NONE, MASK_MEDIUM, SHADOW_CANDIDATES, CALL_PROXY_MARCH) & STEP_ENDED) == 0;
 }
 
-// Traces the shadow ray in `slot`'s shadow job and takes what it lets through into the job's
-// contribution: where nothing blocked it, through the proxies' marches where it passed a medium
-// proxy with a volume, and through the thin walls it passed, walked in order. The TAKE_* of the
-// trace; with TAKE_BENDS, the distance of the surface it ended at in `committed`, and nothing
-// taken.
-uint trace_segment(PathRoot r, uint slot, out float committed)
+// What the thin walls that `ray`, the shadow ray of flags `flags` of `slot`'s vertex, passed let
+// through, walked in order a crossing a boundary step: each commits the nearest present dielectric
+// past the last crossing (`crossing_any_hit`), and the crossing's own resolve, invoked in window
+// mode, hands back its straight transmission and keeps its key. A step starts just short of the
+// last crossing and carries its distance, so the any-hit turns nearer candidates away on a compare
+// and reads a key only at a tie. A plane stack's leg lies inside the interiors its walk holds.
+float3 cross_walls(PathRoot r, uint slot, RayDesc ray, uint flags)
+{
+    float exterior;
+    if (has(flags, SHADOW_LEG))
+        exterior = interior_ior(r.scene, load_part<StackWalk, STACK_WALK_WORDS>(stack_words(r, slot) + STACK_WALK_AT).inside.innermost());
+    else
+        exterior = asfloat(load_scalar(hot_words(r, slot), SCALAR_SHADOW_IOR));
+    uint cover = path_payload(new_path_cover(MASK_DIELECTRIC, COVER_CROSSING, PRESENCE_NONE, 0, shadow_context(flags))).x;
+    float3 through = float3(1.0);
+    float last = -positive_infinity();
+    for (uint k = 0; k < SHADOW_CANDIDATES; k++)
+    {
+        Payload w;
+        w.words = crossing_payload(cover, last);
+        RayDesc step = ray;
+        if (k > 0)
+            step.TMin = layers_t_min(last);
+        Traced h = boundary_trace(r.scene, step, RAY_FLAG_FORCE_NON_OPAQUE, MASK_DIELECTRIC, w);
+        if (!h.hit())
+            break;
+        last = h.t();
+        Payload v;
+        v.words = window_payload(cover, flags, exterior);
+        h.invoke(v);
+        through *= asfloat(v.words.xyz);
+        if (!any(through > 0.0))
+            break;
+    }
+    return through;
+}
+
+// Traces the shadow ray in `slot`'s shadow job, its flags in `flags`: what it let through of the
+// job's contribution in `passed`, the product of its candidates and of the thin walls it passed,
+// and the march of the medium proxies with a volume it passed in the job's contribution. The
+// TAKE_* of what follows; with TAKE_BENDS, the distance of the surface it ended at in
+// `committed`, and nothing taken.
+uint trace_segment(PathRoot r, uint slot, out float committed, out uint flags, out float3 passed)
 {
     Payload p;
-    RayDesc ray = launch_shadow(r, slot, SHADOW_PATH, p.words);
+    RayDesc ray = launch_shadow(r, slot, SHADOW_PATH, flags, p.words);
     Traced h = trace_hit(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, 0, ray, p);
     committed = h.t();
     ShadowCover c = ShadowCover.of_words(p.words);
-    uint took = launch_shadow_take(r, slot, p.words, h.hit());
-    if ((took & TAKE_BENDS) != 0)
-        return took;
+    passed = shadow_passed(r, c, h.hit());
+    // The AS committed what it met, or an any-hit ended the search at solid glass, which stands
+    // for it.
+    if (h.hit() && (!c.has(SHADOW_ENDED) || c.has(SHADOW_SOLID)) && shadow_bends(r, flags))
+        return TAKE_BENDS;
     // The walk crosses no wall that a march left nothing to pass through.
+    bool walks = layers_kept(r) && c.has(SHADOW_CROSSES) && any(passed > 0.0);
     if (c.marches(h.hit()) && !march_proxies(r, ray))
-        took &= ~TAKE_WALKS;
-    if ((took & TAKE_WALKS) != 0)
-    {
-        for (uint k = 0; k < SHADOW_CANDIDATES; k++)
-        {
-            Payload w;
-            RayDesc step = launch_crossing_ray(r, slot, w.words);
-            // Every candidate reaches the any-hit, which commits none.
-            trace_hit(r.scene.tlas, RAY_FLAG_FORCE_NON_OPAQUE, MASK_DIELECTRIC, RAY_TYPE_PATH, RAY_TYPES, 0, step, w);
-            if ((step_call(CALL_WINDOW) & STEP_ENDED) != 0)
-                break;
-        }
-    }
-    return took;
+        walks = false;
+    if (walks)
+        passed *= cross_walls(r, slot, ray, flags);
+    return has(flags, SHADOW_VIEW) ? TAKE_VIEW : 0;
 }
 
 // Traces the shadow ray of `slot`'s vertex and adds what it lets through, through a coated
 // emitter's view; or, where it is a directional light's that ended at an opaque surface or solid
 // glass, walks the plane stack before that, if any: true where light came through one, which
 // next-event estimation's second phase then adds.
-public bool trace_shadow<M : IMedium>(PathRoot r, uint slot)
+public bool trace_shadow(PathRoot r, uint slot)
 {
     float committed;
-    uint took = trace_segment(r, slot, committed);
+    uint flags;
+    float3 passed;
+    uint took = trace_segment(r, slot, committed, flags, passed);
     if ((took & TAKE_BENDS) == 0)
     {
-        if ((took & TAKE_VIEW) != 0)
+        if ((took & TAKE_VIEW) != 0 && any(passed > 0.0))
             step_call(CALL_EMITTER_VIEW);
-        launch_shadow_add<M>(r, slot);
+        add_shadow(r, slot, flags, passed);
         return false;
     }
     Payload p;
     RayDesc ray = launch_probe_ray(r, slot, committed, p.words);
     trace_stack(r, slot, ray, p.words);
     uint step = step_call(CALL_STACK_STEP, STACK_PROBE);
-    // Each leg crosses a face, at most STACK_CROSSINGS of them, before the last.
+    // Each leg crosses a face, at most STACK_CROSSINGS of them, before the last. The stack step
+    // reads what a leg let through in the job's contribution.
     for (uint k = 0; k <= STACK_CROSSINGS && (step & STACK_ON) != 0; k++)
     {
         if ((step & STACK_PROBED) == 0)
@@ -157,20 +192,23 @@ public bool trace_shadow<M : IMedium>(PathRoot r, uint slot)
             trace_stack(r, slot, ray, p.words);
         }
         float unused;
-        trace_segment(r, slot, unused);
+        uint leg;
+        trace_segment(r, slot, unused, leg, passed);
+        scale_shadow(r, slot, passed);
         step = step_call(CALL_STACK_STEP, STACK_LEG);
     }
     return (step & STACK_LIT) != 0;
 }
 
 // Traces the shadow ray of `slot`'s photon toward its light: STEP_GIVEN where flux is left.
-public uint trace_light<M : IMedium>(PathRoot r, uint slot)
+public uint trace_light(PathRoot r, uint slot)
 {
     Payload p;
-    RayDesc ray = launch_shadow(r, slot, SHADOW_PHOTON, p.words);
+    uint flags;
+    RayDesc ray = launch_shadow(r, slot, SHADOW_PHOTON, flags, p.words);
     Traced h = trace_hit(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, 0, ray, p);
     ShadowCover c = ShadowCover.of_words(p.words);
     if (c.marches(h.hit()))
         march_proxies(r, ray);
-    return launch_light_add<M>(r, slot, p.words, h.hit());
+    return launch_light_add(r, slot, shadow_passed(r, c, h.hit()));
 }

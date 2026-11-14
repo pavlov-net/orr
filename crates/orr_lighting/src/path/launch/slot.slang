@@ -99,17 +99,13 @@ public struct LoopPart
 
 // `LoopThroughput.flags` from REACH_SHIFT: how the path reached its vertex. The bits there are
 // the staged loop's coherence key, which no pipeline shader sets. The vertex is the path's first,
-// and is the G-buffer's surface; the path is at a subsurface walk's exit, which is the vertex the
-// walk entered where it stopped at its cap, and which takes the parameters of the vertex it
-// entered (in the walk part's ENTRY_AT) with REACH_ENTRY_PARAMS; a segment drew the sampler
-// dimensions of the ray that reached it, which its resolve or miss then draws none of.
+// and is the G-buffer's surface, which a vertex's shaders take from the step the raygen hands them
+// (`arrive_vertex`); the path is at a subsurface walk's exit where the walk stopped at its cap,
+// which is the vertex the walk entered.
 public static const uint REACH_SHIFT = LOOP_KEY_SHIFT;
 public static const uint REACH_FIRST = 1 << 0;
 public static const uint REACH_GBUFFER = 1 << 1;
-public static const uint REACH_EXIT = 1 << 2;
 public static const uint REACH_EXIT_CAP = 1 << 3;
-public static const uint REACH_ENTRY_PARAMS = 1 << 4;
-public static const uint REACH_SEGMENTED = 1 << 5;
 
 // The ray's trace half: its origin and reach, its direction with a word of what its trace takes
 // (`RayDir.word`), and the cover payload its any-hit shaders read, whose last two words are the
@@ -234,18 +230,15 @@ public static const uint SCALAR_FLAGS = 3;
 [Host] public static const uint PART_NONE = 0xffffffff;
 
 // The walk part (a view's paths and its background layer's, with FEATURE_WALK or
-// FEATURE_INTERIORS): the walk in flight (`LaunchWalk`), and from ENTRY_AT the surface it entered,
-// where the exit scatters with that surface's parameters.
+// FEATURE_INTERIORS): the walk in flight (`LaunchWalk`), and from EXIT_AT the surface a subsurface
+// walk leaves through, while the surface words keep the one it entered, whose parameters the exit
+// may scatter with.
 public static const uint WALK_STATE_WORDS = 8;
-public static const uint ENTRY_AT = WALK_STATE_WORDS;
+public static const uint EXIT_AT = WALK_STATE_WORDS;
 [Host] public static const uint WALK_WORDS = WALK_STATE_WORDS + SURFACE_WORDS;
-// The layer part (FEATURE_LAYERS): a layer's words beside its packed surface (`LayerWords`), the
-// crossing a step of a shadow ray's walk found (`Crossing`) and the key of the last it took
-// (`CrossingKey`).
+// The layer part (FEATURE_LAYERS): a layer's words beside its packed surface (`LayerWords`).
 public static const uint LAYER_WORDS = 2;
-public static const uint CROSSING_WORDS = 4;
-public static const uint CROSSED_WORDS = 1;
-[Host] public static const uint SLOT_LAYER_PART = LAYER_WORDS + CROSSING_WORDS + CROSSED_WORDS;
+[Host] public static const uint SLOT_LAYER_PART = LAYER_WORDS;
 // The interiors part (FEATURE_INTERIORS): the path's interiors (`LaunchInterior`), then its shadow
 // ray's vertex (`ShadowInterior`).
 public static const uint SLOT_INTERIOR_WORDS = 8;
@@ -268,12 +261,17 @@ public static const uint STACK_WALK_WORDS = 10;
 // The scratch, which holds one of these at a time: the LAYERS_KEPT nearest candidates of a LAYERS
 // trace past its bound, by `layer_before`, as two words each (`LayerEntry`) from FRONT_AT, and the
 // key of the last one a callable took at FRONT_BOUND, which bounds the next trace of the same ray;
-// or a vertex's light candidates, CANDIDATE_WORDS each from the scratch's first word.
+// or a vertex's light candidates, CANDIDATE_WORDS each from the scratch's first word; or the keys
+// of a shadow ray's crossing walk (`CrossingKey`): at CROSSED_AT the crossing it took last, which
+// its window's resolve keeps, and at COMMITTED_AT the one its step's trace has committed so far.
+// The host keeps at least FRONT_WORDS of it.
 public static const uint LAYERS_KEPT = 4;
 public static const uint FRONT_AT = 0;
 public static const uint FRONT_BOUND = FRONT_AT + 2 * LAYERS_KEPT;
 [Host] public static const uint FRONT_WORDS = FRONT_BOUND + 1;
 [Host] public static const uint CANDIDATE_WORDS = 3;
+public static const uint CROSSED_AT = 0;
+public static const uint COMMITTED_AT = 1;
 
 // `LayerEntry.more.z`: what the candidate is.
 public static const uint LAYER_PARTICLE = 0;
@@ -335,14 +333,6 @@ public struct LaunchInterior
     public float3 entered_at;
     public float3 entered_normal;
     public float3 start;
-}
-
-// The nearest crossing a step of a shadow ray's walk found past the last it took.
-public struct Crossing
-{
-    public CrossingKey key;
-    public float2 barycentrics;
-    public float3 corners[3];
 }
 
 // What a plane stack's probe or leg met: the nearest opaque surface or solid glass, as
@@ -481,16 +471,6 @@ public uint4* light_words(PathRoot r, uint slot)
 public uint4* spectral_words(PathRoot r, uint slot)
 {
     return cold_words(r, slot) + r.launch.spectral_at;
-}
-
-public uint4* crossing_words(PathRoot r, uint slot)
-{
-    return layer_words(r, slot) + LAYER_WORDS;
-}
-
-public uint4* crossed_words(PathRoot r, uint slot)
-{
-    return crossing_words(r, slot) + CROSSING_WORDS;
 }
 
 // The `k`th light candidate's words of `slot`.

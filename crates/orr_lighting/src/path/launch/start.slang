@@ -29,6 +29,7 @@ import orr_lighting.path.launch.steps;
 import orr_lighting.path.launch.slot;
 import orr_lighting.path.launch.record;
 import orr_lighting.path.launch.boundary;
+import orr_lighting.path.launch.hit;
 import orr_lighting.path.launch.shade_surface;
 
 // The ray of hot words `at` as its trace half gives it: its origin, its direction and its flags,
@@ -67,7 +68,7 @@ uint reach_gbuffer(PathRoot r, uint4* at, inout PathLoop p, LayerRay ray, inout 
     }
     store_part<PackedSurface, SURFACE_WORDS>(at + SURFACE_AT, ps);
     store_path_loop(at, p, REACH_FIRST | REACH_GBUFFER);
-    return vertex_step(ps);
+    return vertex_step(ps) | STEP_FIRST | STEP_GBUFFER;
 }
 
 // Starts `slot`'s path of `pixel` from `start` with `rng`, counting `rays` rays already: its
@@ -85,7 +86,7 @@ public uint begin_launch(PathRoot r, uint slot, uint2 pixel, PathStart start, Sa
     store_spectral_part(r, slot, c.spectral);
     if (start.mask != 0)
     {
-        store_launch_ray(at, launch_ray(c.ray, start.t_max, start.mask, start.gbuffer ? LAUNCH_GBUFFER : 0));
+        store_path_ray(r, at, p, c, record, path_context(r, record, pixel), start.t_max, start.mask, start.gbuffer ? LAUNCH_GBUFFER : 0);
         store_path_loop(at, p, 0);
         return STEP_RAY;
     }
@@ -202,7 +203,7 @@ public uint launch_start_background(PathRoot r, uint slot)
 // Caustic photon `r.slice_base + slot`: its start up to its shadow ray toward its light, which
 // the raygen traces before the photon's first vertex resolves from its given hit, adjoint,
 // depositing in `r.caustics`.
-public uint launch_start_photon<S : ISurfaces>(PathRoot r, uint slot)
+public uint launch_start_photon<S : ISurfaces, M : IMedium>(PathRoot r, uint slot)
 {
     uint index = r.slice_base + slot;
     if (index >= r.caustics.photon_count || !(r.caustics.source.total > 0.0))
@@ -219,10 +220,10 @@ public uint launch_start_photon<S : ISurfaces>(PathRoot r, uint slot)
     uint4* at = hot_words(r, slot);
     ValueHit given = value_hit(p.hit, p.positions, p.dir);
     store_part<ValueHit, GIVEN_WORDS>(at + SURFACE_AT, given);
-    // What the interiors around the start take of the flux on the way to the light, as its
-    // trace in mode SHADOW_PHOTON takes it beside the candidates' product.
+    // What the interiors around the start and the linked medium take of the flux on the way to
+    // the light, beside what its trace in mode SHADOW_PHOTON lets through.
     float scale;
-    float3 beer = exp(-straight_depth(r.scene, p.interior, light.t_max, false, scale));
+    float3 beer = exp(-straight_depth(r.scene, p.interior, light.t_max, false, scale)) * medium_transmittance<M>(r.scene.medium, light.origin, light.dir, light.t_max);
     ShadowJob job = { beer, NO_LIGHT, light.origin, light.t_max, light.dir, 0 };
     store_part<ShadowJob, SHADOW_WORDS>(at + SHADOW_AT, job);
     return STEP_GIVEN;

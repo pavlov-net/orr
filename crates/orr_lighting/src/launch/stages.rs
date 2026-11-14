@@ -13,7 +13,7 @@ use crate::shaders::consts::{
     CALL_DIRECT, CALL_EMISSION, CALL_EMITTER_VIEW, CALL_FINISH_BACKGROUND, CALL_FINISH_RECORD,
     CALL_FINISH_VIEW, CALL_GBUFFER, CALL_LAYERS, CALL_PROXY_MARCH, CALL_RESOLVE_GIVEN,
     CALL_SCATTER, CALL_SEGMENT, CALL_STACK_STEP, CALL_START_BACKGROUND, CALL_START_FIRST_VERTEX,
-    CALL_START_PHOTON, CALL_START_UPDATE, CALL_START_VIEW, CALL_WALK_END, CALL_WINDOW, CALLABLES,
+    CALL_START_PHOTON, CALL_START_UPDATE, CALL_START_VIEW, CALL_WALK_END, CALLABLES,
 };
 use crate::shaders::path::pipeline;
 use crate::staged::{MAY_ALL, MAY_RICH};
@@ -76,14 +76,12 @@ struct Constants {
     hit_surface: Option<u32>,
 }
 
-/// The stages the pipeline holds one of, first, by index: the raygens in [`Raygen`]'s order, the
-/// miss shader, the medium proxies' intersection and any-hit shaders, what layer rays keep of
-/// triangles, medium proxies and light proxies, and the stack meet's closest-hit.
-const FIXED: [(Kernel, &str); 12] = [
-    (Kernel::Raygen, "path_view"),
-    (Kernel::Raygen, "path_update"),
-    (Kernel::Raygen, "path_photon"),
-    (Kernel::Raygen, "path_background"),
+/// The stages the pipeline holds one of, first, by index: the raygen, which runs every source's
+/// paths by its root's, the miss shader, the medium proxies' intersection and any-hit shaders, what
+/// layer rays keep of triangles, medium proxies and light proxies, and the stack meet's
+/// closest-hit.
+const FIXED: [(Kernel, &str); 9] = [
+    (Kernel::Raygen, "paths"),
     (Kernel::Raygen, "miss_path"),
     (Kernel::Hits, "box_medium_hit"),
     (Kernel::Hits, "proxy_shadow_hit"),
@@ -93,41 +91,38 @@ const FIXED: [(Kernel, &str); 12] = [
     (Kernel::Hits, "cover_layers_light_hit"),
     (Kernel::Hits, "stack_meet"),
 ];
-const RAYGENS: u32 = 4;
-const MISS: u32 = 4;
-const MEDIUM_INTERSECTION: u32 = 5;
-const MEDIUM_ANY_HIT: u32 = 6;
-const LAYERS_ANY_HIT: u32 = 7;
-const MEDIUM_LAYERS_ANY_HIT: u32 = 8;
-const LIGHT_INTERSECTION: u32 = 9;
-const LIGHT_LAYERS_ANY_HIT: u32 = 10;
-const STACK_MEET: u32 = 11;
+const RAYGEN: u32 = 0;
+const MISS: u32 = 1;
+const MEDIUM_INTERSECTION: u32 = 2;
+const MEDIUM_ANY_HIT: u32 = 3;
+const LAYERS_ANY_HIT: u32 = 4;
+const MEDIUM_LAYERS_ANY_HIT: u32 = 5;
+const LIGHT_INTERSECTION: u32 = 6;
+const LIGHT_LAYERS_ANY_HIT: u32 = 7;
+const STACK_MEET: u32 = 8;
 
 /// What the pipeline holds per pin after those (`HitGroups`): the closest-hit shaders of a copy's
-/// clusters, of a producer entry's clusters and of strands, and the any-hit shaders under path and
-/// shadow rays, with what each may meet of the scene's geometry, all of [`Kernel::Hits`].
-const PINNED: [(&str, Geometry); 7] = [
+/// clusters, of a producer entry's clusters and of strands, each resolving opaque surfaces and
+/// layers by its record's class, and the any-hit shaders under path and shadow rays, with what
+/// each may meet of the scene's geometry, all of [`Kernel::Hits`].
+const PINNED: [(&str, Geometry); 5] = [
     ("resolve", Geometry::Copies),
     ("resolve", Geometry::Producers),
     ("resolve_strand", Geometry::Any),
     ("cover_path_hit", Geometry::Any),
     ("cover_shadow_hit", Geometry::Any),
-    ("layer_resolve", Geometry::Copies),
-    ("layer_resolve", Geometry::Producers),
 ];
 const RESOLVE_COPIES: usize = 0;
 const RESOLVE_PRODUCERS: usize = 1;
 const RESOLVE_STRANDS: usize = 2;
 const COVER_PATH: usize = 3;
 const COVER_SHADOW: usize = 4;
-const LAYER_COPIES: usize = 5;
-const LAYER_PRODUCERS: usize = 6;
 
 /// Then the callables, each at its `path/launch/steps.slang` CALL_* index with the lobes of the
 /// BSDF its vertices may have. Next-event estimation and the scatter are made per vertex class
 /// (AT_*), an opaque vertex's for a plain surface's and a rich one's. A walk's ends are made rich,
-/// as a walk starts only from a vertex with a subsurface weight, and so are the layer's, the
-/// window's and an emitter's view, whose surfaces may have every lobe. What lies along a ray, a
+/// as a walk starts only from a vertex with a subsurface weight, and so are the layer's and an
+/// emitter's view, whose surfaces may have every lobe. What lies along a ray, a
 /// scatter in a medium and a plane stack's step shade no surface.
 const CALLED: [(u32, Kernel, &str, bool); CALLABLES as usize] = [
     (CALL_START_VIEW, Kernel::Sources, "start_view", true),
@@ -188,7 +183,6 @@ const CALLED: [(u32, Kernel, &str, bool); CALLABLES as usize] = [
     (CALL_LAYERS, Kernel::Sources, "layers", false),
     (CALL_PROXY_MARCH, Kernel::Sources, "march_proxy", false),
     (CALL_GBUFFER, Kernel::Sources, "gbuffer_start", true),
-    (CALL_WINDOW, Kernel::Vertex, "window", true),
     (CALL_STACK_STEP, Kernel::Vertex, "stack_step", false),
     (CALL_EMITTER_VIEW, Kernel::Vertex, "emitter_view", true),
     (
@@ -231,15 +225,6 @@ impl Geometry {
         };
         SceneFeatures(!out).surface_may()
     }
-}
-
-/// A source's raygen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Raygen {
-    View = 0,
-    Update = 1,
-    Photon = 2,
-    Background = 3,
 }
 
 /// The ray tracing pipeline of the path tracer, and the groups a scene's hit records name.
@@ -317,12 +302,6 @@ impl PathPipeline {
             ),
             (&mut groups.strand_path, Some(RESOLVE_STRANDS), None),
             (&mut groups.shadow, None, Some(COVER_SHADOW)),
-            (&mut groups.layer_path, Some(LAYER_COPIES), Some(COVER_PATH)),
-            (
-                &mut groups.producer_layer_path,
-                Some(LAYER_PRODUCERS),
-                Some(COVER_PATH),
-            ),
         ] {
             *first = Some(hit_groups.len() as u32);
             for pin in 0..pins {
@@ -362,7 +341,7 @@ impl PathPipeline {
                 intersection,
             });
         }
-        let raygens: Vec<ShaderRecord<'_>> = (0..RAYGENS).map(ShaderRecord::new).collect();
+        let raygens = [ShaderRecord::new(RAYGEN)];
         let desc = RayPipelineDesc {
             stages: &stages,
             raygens: &raygens,

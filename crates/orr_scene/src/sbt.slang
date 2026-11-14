@@ -30,9 +30,7 @@ import orr_scene.tables;
 [Host] public static const uint KIND_PRODUCER_PATH = 1; // a producer entry's clusters
 [Host] public static const uint KIND_STRAND_PATH = 2;   // a strand entry's
 [Host] public static const uint KIND_SHADOW = 3;
-[Host] public static const uint KIND_LAYER_PATH = 4;          // a copy's dielectric and presence layer clusters
-[Host] public static const uint KIND_PRODUCER_LAYER_PATH = 5; // a producer entry's
-[Host] public static const uint PINNED_KINDS = 6;
+[Host] public static const uint PINNED_KINDS = 4;
 // No group: a record of zeros.
 static const uint SLOT_NONE = 0xffffffff;
 
@@ -73,15 +71,6 @@ uint material_pin(SceneRoot* s, uint material)
             return 0;
     }
     return 1 + id;
-}
-
-// The kind of the path ray groups of a run of class `class_id` on geometry whose path rays take
-// kind `path`: layers on clusters resolve as layers. Strands are opaque.
-uint path_kind(uint path, uint class_id)
-{
-    if (path == KIND_STRAND_PATH || (class_id != CLASS_DIELECTRIC && class_id != CLASS_PRESENCE))
-        return path;
-    return path == KIND_PATH ? KIND_LAYER_PATH : KIND_PRODUCER_LAYER_PATH;
 }
 
 // Writes run `run`'s records: per ray type the handle of slot `slots[type]` and `data`.
@@ -142,7 +131,7 @@ void write_records(SceneRoot* s, uint run)
     }
     uint pin = material_pin(s, material);
     HitData data = hit_data(s, material, class_id, (g.word & ROW_SOLID) != 0, attributes);
-    write_run(run, uint3(pinned(path_kind(path, class_id), pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), data);
+    write_run(run, uint3(pinned(path, pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), data);
 }
 
 // One workgroup per range of runs.

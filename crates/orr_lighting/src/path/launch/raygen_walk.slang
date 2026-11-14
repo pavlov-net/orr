@@ -27,6 +27,7 @@ import orr_lighting.path.launch.steps;
 import orr_lighting.path.launch.slot;
 import orr_lighting.path.launch.walk;
 import orr_lighting.path.launch.boundary;
+import orr_lighting.path.launch.hit;
 
 // Runs the walk of `slot`'s path from its walk part to its end, and returns the step the path
 // goes on with there. Its steps are boundary steps traced here, a ray each. What a step changes
@@ -76,6 +77,7 @@ public uint walk_path(PathRoot r, uint slot, out float t)
             if ((step & STEP_INVOKE) != 0)
             {
                 h.reorder();
+                p.words = walk_invoke_payload(r, slot, !interior || !interiors_tracked(r));
                 h.invoke(p);
                 step = p.words.x;
                 t = asfloat(p.words.y);

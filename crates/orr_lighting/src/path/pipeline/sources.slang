@@ -50,7 +50,7 @@ void gbuffer_start(inout Payload p)
 void start_photon(inout Payload p)
 {
     ORR_OMM(start_photon);
-    p.words.x = launch_start_photon<Surface>(root, launch_slot());
+    p.words.x = launch_start_photon<Surface, Medium>(root, launch_slot());
 }
 
 [shader("callable")]
@@ -64,9 +64,7 @@ void start_background(inout Payload p)
 void resolve_given(inout Payload p)
 {
     ORR_OMM(resolve_given);
-    float t;
-    p.words.x = launch_resolve_given<Surface>(root, launch_slot(), t);
-    p.words.y = asuint(t);
+    p.words = launch_resolve_given<Surface>(root, launch_slot());
 }
 
 // Each finish has the path's pass in its data's second word.

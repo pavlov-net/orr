@@ -89,7 +89,7 @@ public uint launch_segment<M : IMedium>(PathRoot r, uint slot, bool hit, float t
     p.rng = rng;
     if (step == 0 && !carries(p.throughput))
         step = STEP_ENDED;
-    store_path_loop(at, p, reach | REACH_SEGMENTED);
+    store_path_loop(at, p, reach);
     return step;
 }
 

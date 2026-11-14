@@ -126,14 +126,14 @@ fn the_pipeline_renders_opaque_scenes_as_the_staged_loop_does() {
     assert_clean();
 }
 
-/// The pipeline path tracer renders glass as the staged loop does, in eight cases: a solid slab and a tinted one
-/// under the sky, from camera rays that the layer guides trace, and with the frosted-glass pass
-/// over a rough one; a thin-walled pane whose sunlit shadow a shadow ray's walk passes; a glass
-/// sphere that focuses the sun's caustic photons on the floor; a dispersive sphere that splits
-/// paths by wavelength; scattering interiors, which scatter and walk; an eye inside water, whose
-/// interiors start the path; and a lens in that water over a slab, whose rays start inside the
-/// interiors at the lens. Only the sphere's scene gathers caustic photons. Runs the cases `run`, in
-/// that order.
+/// The pipeline path tracer renders glass as the staged loop does, in eight cases: a solid slab
+/// and a tinted one under the sky, from camera rays that the layer guides trace, and with the
+/// frosted-glass pass over a rough one; two thin-walled panes, one behind the other, whose sunlit
+/// shadow a shadow ray's walk crosses one after the other; a glass sphere that focuses the sun's
+/// caustic photons on the floor; a dispersive sphere that splits paths by wavelength; scattering
+/// interiors, which scatter and walk; an eye inside water, whose interiors start the path; and a
+/// lens in that water over a slab, whose rays start inside the interiors at the lens. Only the
+/// sphere's scene gathers caustic photons. Runs the cases `run`, in that order.
 fn glass_cases(run: std::ops::Range<usize>) {
     if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
         return;
@@ -169,7 +169,10 @@ fn glass_cases(run: std::ops::Range<usize>) {
         Vec3::new(0.0, 0.5, 0.0),
     );
     let pane = lit(
-        vec![at(MASKED_PANE, Mat3::IDENTITY, Vec3::new(0.0, 1.1, 0.0))],
+        vec![
+            at(MASKED_PANE, Mat3::IDENTITY, Vec3::new(0.0, 1.1, 0.0)),
+            at(MASKED_PANE, Mat3::IDENTITY, Vec3::new(0.0, 1.1, 0.3)),
+        ],
         vec![Light::Directional(SUN)],
         Vec3::new(0.5, 1.5, 3.5),
         Vec3::new(0.0, 0.9, 0.0),
@@ -224,7 +227,7 @@ fn glass_cases(run: std::ops::Range<usize>) {
     for (what, spec, under_water, settings, photons, frost) in [
         ("slabs", slabs, false, realtime, false, false),
         ("frosted slab", frosted, false, realtime, false, true),
-        ("pane", pane, false, realtime, false, false),
+        ("panes", pane, false, realtime, false, false),
         ("caustic of a sphere", lens, false, realtime, true, false),
         ("dispersive sphere", prism, false, realtime, false, false),
         ("milky slab and cloud", milk, false, realtime, false, false),

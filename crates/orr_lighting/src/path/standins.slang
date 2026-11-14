@@ -11,6 +11,7 @@ import orr_lighting.media;
 import orr_scene.surface;
 import orr_scene.candidates;
 import orr_scene.runs;
+import orr_scene.hit;
 import orr_lighting.path;
 import orr_lighting.path.common;
 import orr_lighting.path.launch;
@@ -48,10 +49,9 @@ HitData lane_data(uint lane)
 void resolve(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(resolve);
-    float t;
     uint4* w = lane_words(id.x);
-    w[0].x = launch_resolve<Surface, StoredHit>(root, id.x, lane_hit(id.x), t);
-    w[0].y = asuint(t);
+    HitData data = lane_data(id.x);
+    w[0] = launch_resolve<Surface, StoredHit, SectionGiven>(root, id.x, w[0], data.class_id(), section_given(data.material), lane_hit(id.x));
 }
 
 [shader("compute")]
@@ -59,7 +59,8 @@ void resolve(uint3 id: SV_DispatchThreadID)
 void emission(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(emission);
-    launch_emission(root, id.x);
+    uint4* w = lane_words(id.x);
+    w[0].x = launch_emission(root, id.x, asfloat(w[0].z), w[0].w);
 }
 
 [shader("compute")]
@@ -69,7 +70,7 @@ void direct(uint3 id: SV_DispatchThreadID)
     ORR_OMM(direct);
     uint4* w = lane_words(id.x);
     uint dimension;
-    w[0].x = launch_direct<AT_PLAIN, Surface, Medium>(root, id.x, w[0].y, asfloat(w[0].z), dimension);
+    w[0].x = launch_direct<AT_PLAIN, Surface, Medium>(root, id.x, w[0].y, asfloat(w[0].z), w[0].w, dimension);
     w[0].y = dimension;
 }
 
@@ -90,7 +91,7 @@ void cover_path_hit(uint3 id: SV_DispatchThreadID)
     HitData data = lane_data(id.x);
     uint4 payload = w[0];
     StoredHit h = lane_hit(id.x);
-    w[1].x = path_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, payload, data, h, slot_crossings(root, id.x, h));
+    w[1].x = path_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, payload, data, h, slot_crossings(root, id.x));
     w[0] = payload;
 }
 

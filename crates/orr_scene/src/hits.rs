@@ -10,10 +10,9 @@ use orr_gpu::{
 
 use crate::memory::UploadWindow;
 use crate::shaders::consts::{
-    FIXED_KINDS, HIT_DATA_BYTES, KIND_LAYER_PATH, KIND_LAYERS, KIND_LIGHT_LAYERS,
-    KIND_MEDIUM_LAYERS, KIND_MEDIUM_SHADOW, KIND_PATH, KIND_PRODUCER_LAYER_PATH,
-    KIND_PRODUCER_PATH, KIND_SHADOW, KIND_STACK_MEET, KIND_STRAND_PATH, KIND_WALK_MEET,
-    PINNED_KINDS, RAY_TYPES, RUNS_PER_GROUP,
+    FIXED_KINDS, HIT_DATA_BYTES, KIND_LAYERS, KIND_LIGHT_LAYERS, KIND_MEDIUM_LAYERS,
+    KIND_MEDIUM_SHADOW, KIND_PATH, KIND_PRODUCER_PATH, KIND_SHADOW, KIND_STACK_MEET,
+    KIND_STRAND_PATH, KIND_WALK_MEET, PINNED_KINDS, RAY_TYPES, RUNS_PER_GROUP,
 };
 use crate::shaders::sbt::HitTableRoot;
 use crate::{Result, SceneRoot};
@@ -54,11 +53,6 @@ pub struct HitGroups {
     /// The closest-hit a plane stack's trace runs on a dielectric triangle it met, in place of the
     /// triangle's own, to read its cluster.
     pub stack_meet: Option<u32>,
-    /// Dielectric and presence layer triangles of copies' clusters under path rays: `path`'s
-    /// any-hit with the closest-hit that resolves a layer.
-    pub layer_path: Option<u32>,
-    /// Dielectric and presence layer triangles of producer entries' clusters under path rays.
-    pub producer_layer_path: Option<u32>,
 }
 
 impl HitGroups {
@@ -92,8 +86,6 @@ impl HitGroups {
             (KIND_PRODUCER_PATH, self.producer_path),
             (KIND_STRAND_PATH, self.strand_path),
             (KIND_SHADOW, self.shadow),
-            (KIND_LAYER_PATH, self.layer_path),
-            (KIND_PRODUCER_LAYER_PATH, self.producer_layer_path),
         ] {
             pinned[kind as usize] = group;
         }

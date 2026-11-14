@@ -1,16 +1,18 @@
 // The pipeline path tracer's hit shaders (`path.launch`): the closest-hit shaders that resolve a
-// path ray's opaque, layer or strand hit and the stack meet's, the coverage's
-// any-hit shaders and the medium proxies' under shadow rays, and what LAYERS rays keep of
-// particles, light proxies and medium proxies. `orr_lighting::launch` makes a stage of each
-// resolve and coverage entry per kind of geometry and per linked surface id by its specialization
-// constants (`path_may2`, `hit_surface`).
+// path ray's hit on triangles or strands and a shadow ray's crossing in window mode, and the stack
+// meet's, the coverage's any-hit shaders and the medium proxies' under shadow rays, and what
+// LAYERS rays keep of particles, light proxies and medium proxies. `orr_lighting::launch` makes a
+// stage of each resolve and coverage entry per kind of geometry and per linked surface id by its
+// specialization constants (`path_may2`, `hit_surface`).
 #include "orr_root.h"
 import orr_shaders.pipeline;
+import orr_shaders.trace;
 import orr_lighting.environment;
 import orr_lighting.media;
 import orr_scene.surface;
 import orr_scene.candidates;
 import orr_scene.runs;
+import orr_scene.hit;
 import orr_lighting.path;
 import orr_lighting.path.launch;
 
@@ -21,24 +23,23 @@ export static const bool PATH_SPECIALIZES = true;
 
 ORR_ROOT_INLINE(PathRoot);
 
+// The closest-hit shaders resolve a path ray's hit from their payload and their record's data
+// (`orr_scene.runs`' `HitData`): the class its geometry traces as, a layer's for dielectrics and
+// presence layers, and its section material. A strand's hit is opaque.
 [shader("closesthit")]
-void resolve(inout Payload p, TriangleAttributes a)
+void resolve(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(resolve);
     TriangleHit h = { a };
-    float t;
-    p.words.x = launch_resolve<Surface, TriangleHit>(root, launch_slot(), h, t);
-    p.words.y = asuint(t);
+    p.words = launch_resolve<Surface, TriangleHit, SectionGiven>(root, launch_slot(), p.words, data.class_id(), section_given(data.material), h);
 }
 
 [shader("closesthit")]
-void resolve_strand(inout Payload p, TriangleAttributes a)
+void resolve_strand(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(resolve_strand);
     BuiltInHit h = { a };
-    float t;
-    p.words.x = launch_resolve<Surface, BuiltInHit>(root, launch_slot(), h, t);
-    p.words.y = asuint(t);
+    p.words = launch_resolve<Surface, BuiltInHit, SectionGiven>(root, launch_slot(), p.words, CLASS_OPAQUE, section_given(data.material), h);
 }
 
 // The closest-hit of the stack meet's record, which a plane stack's trace invokes on a dielectric
@@ -51,16 +52,6 @@ void stack_meet(inout Payload p, TriangleAttributes a)
     p.words.x = asuint(h.cluster_id());
 }
 
-[shader("closesthit")]
-void layer_resolve(inout Payload p, TriangleAttributes a)
-{
-    ORR_OMM(layer_resolve);
-    TriangleHit h = { a };
-    float t;
-    p.words.x = launch_resolve_layer<Surface, TriangleHit>(root, launch_slot(), h, t);
-    p.words.y = asuint(t);
-}
-
 // The any-hit shaders start from their record's data (`orr_scene.runs`' `HitData`): the class
 // their candidate traces as and its section material. A shadow ray's crossing step commits the
 // nearest crossing past the walk's last.
@@ -69,7 +60,7 @@ void cover_path_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(cover_path_hit);
     TriangleHit h = { a };
-    any_hit_decides(path_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, p.words, data, h, slot_crossings(root, launch_slot(), h)));
+    any_hit_decides(path_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, p.words, data, h, slot_crossings(root, launch_slot())));
 }
 
 [shader("anyhit")]

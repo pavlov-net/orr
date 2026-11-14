@@ -88,8 +88,6 @@ fn create_pipeline() -> (RayPipeline, HitGroups) {
         strand_path: Some(0),
         shadow: Some(1),
         medium_shadow: Some(2),
-        layer_path: Some(0),
-        producer_layer_path: Some(0),
         ..HitGroups::default()
     };
     (p, groups)
