@@ -118,7 +118,7 @@ pub struct SamplerIndex(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Pod, Zeroable)]
 pub struct Tlas(pub u64);
 
-/// A ray hit as a pipeline shader's body reads it (`orr_shaders.pipeline`'s `HitInputs`): what a
+/// A ray hit as a pipeline shader's body reads it (`orr_shaders.hits`'s `HitInputs`): what a
 /// compute stand-in of a closest-hit or any-hit body loads in place of the built-ins.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]
