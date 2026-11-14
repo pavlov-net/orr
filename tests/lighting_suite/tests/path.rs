@@ -6,9 +6,9 @@
 use lighting_suite::bed::{
     Accumulated, Analytic, BLACK_SPHERE, BUMPY_FLOOR, Bed, COATED_EMITTER, EMITTER, EMITTER_FIELD,
     EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal, GLASS_SPHERE, GLOSSY_FLOOR, Item, MIRROR, NEAR,
-    Particle, ParticleLook, Paths, QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR, SUN, Spec,
-    StrandRow, TILED_FLOOR, TINTED_FLOOR, TROUGH, WHITE_FLOOR, assert_close, assert_within_noise,
-    image_mean, luminance, mean_where, pixel_of, reference, surface_mean,
+    PLUME, Particle, ParticleLook, Paths, QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR,
+    SUN, Spec, StrandRow, TILED_FLOOR, TINTED_FLOOR, TROUGH, WHITE_FLOOR, assert_close,
+    assert_within_noise, image_mean, luminance, mean_where, pixel_of, reference, surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
@@ -149,6 +149,109 @@ fn the_pipeline_walks_subsurface_materials_as_the_staged_loop_does() {
         let mut bed = Bed::new(Analytic::SubsurfaceSlab);
         bed.set_hit_pipeline(launched.hit_pipeline());
         bed.set_pre_exposure(1.0 / 64.0);
+        render_paths(&mut bed, &staged, 32, 3);
+        let piped = render_paths(&mut bed, &launched, 32, 1);
+        let same_seed = render_paths(&mut bed, &staged, 32, 1);
+        let noise = render_paths(&mut bed, &staged, 32, 2);
+        assert_within_noise(what, &piped, &same_seed, &noise, 1.25);
+        let (mut of_staged, mut of_launched) = (Vec::new(), Vec::new());
+        for k in 0..24 {
+            of_staged.push(image_mean(&render_paths(&mut bed, &staged, 1, 4 + k))[1]);
+            of_launched.push(image_mean(&render_paths(&mut bed, &launched, 1, 4 + k))[1]);
+        }
+        assert_same_mean(what, &of_launched, &of_staged);
+    }
+    assert_clean();
+}
+
+/// The pipeline path tracer renders what lies in front of a hit and along a ray as the staged
+/// loop does: a floor under six stacked emissive particles, which rays from the floor meet in
+/// more than one batch of layers; a sphere and a rect light over a glossy floor, which BSDF rays
+/// meet through the lights' proxies; and the sun through a smoke plume's medium proxy, whose
+/// volume shadow rays march. Compared as the opaque scenes are.
+#[test]
+fn the_pipeline_renders_layers_and_media_as_the_staged_loop_does() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    let settings = ViewLighting::default();
+    let staged = Paths::new(&KernelSet::default(), PathEntry::Compute, settings);
+    let launched = Paths::new(&KernelSet::default(), PathEntry::Pipeline, settings);
+    let particles = || {
+        let mut bed = Bed::with(Spec {
+            copies: vec![at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
+            lights: Vec::new(),
+            environment: Some(SKY.map(|c| c / 2000.0)),
+            eye: Vec3::new(0.0, 2.0, 4.0),
+            target: Vec3::ZERO,
+            fov_y: 0.8,
+            focus: None,
+        });
+        let stack: Vec<Particle> = (0..6)
+            .map(|k| Particle {
+                center: Vec3::new(0.1 * k as f32, 0.5 + 0.12 * k as f32, -1.0),
+                size: 0.6,
+            })
+            .collect();
+        let look = ParticleLook {
+            albedo: [0.0; 3],
+            emission: [40.0, 30.0, 20.0],
+            opacity: 0.4,
+            anisotropy: 0.0,
+        };
+        bed.set_particles(&stack, look, Opacity::Particle);
+        bed
+    };
+    let lights = || {
+        Bed::with(Spec {
+            copies: vec![at(GLOSSY_FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
+            lights: vec![
+                Light::Sphere {
+                    position: DVec3::new(-0.6, 1.2, -0.5),
+                    radius: 0.15,
+                    intensity: Vec3::splat(40.0),
+                    cone: None,
+                },
+                Light::Rect {
+                    center: DVec3::new(0.6, 1.2, -0.5),
+                    edge_x: Vec3::new(0.4, 0.0, 0.0),
+                    edge_y: Vec3::new(0.0, 0.0, 0.3),
+                    luminance: Vec3::splat(200.0),
+                },
+            ],
+            environment: None,
+            eye: Vec3::new(0.0, 1.0, 3.0),
+            target: Vec3::ZERO,
+            fov_y: 0.8,
+            focus: None,
+        })
+    };
+    let plume = || {
+        let mut bed = Bed::new(Analytic::SunAndGround);
+        let v = bed.volume(PLUME);
+        bed.set_medium_proxy(
+            MediumProxyId(0),
+            Some(MediumProxy {
+                position: DVec3::new(1.2, 0.0, -0.5),
+                rotation: Quat::from_rotation_y(0.4),
+                scale: 1.25,
+                density: v.density(v.grid("density").unwrap()),
+                extinction: Vec3::new(1.6, 1.2, 0.9),
+                albedo: Vec3::splat(0.9),
+                anisotropy: 0.5,
+            }),
+        );
+        bed
+    };
+    let scenes: [(&str, &dyn Fn() -> Bed, f32); 3] = [
+        ("particles", &particles, 1.0),
+        ("sphere and rect lights", &lights, 1.0),
+        ("smoke plume", &plume, 1.0 / 64.0),
+    ];
+    for (what, make, pre_exposure) in scenes {
+        let mut bed = make();
+        bed.set_hit_pipeline(launched.hit_pipeline());
+        bed.set_pre_exposure(pre_exposure);
         render_paths(&mut bed, &staged, 32, 3);
         let piped = render_paths(&mut bed, &launched, 32, 1);
         let same_seed = render_paths(&mut bed, &staged, 32, 1);

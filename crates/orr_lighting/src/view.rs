@@ -30,12 +30,13 @@ use crate::shaders::types::{
     ParticleLighting, PathRoot,
 };
 use crate::staged::{
-    FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_STACK, FEATURE_WALK, MAX_ROUNDS, MAY_ALL,
-    MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION,
-    MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS,
-    MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES, MAY_REFERENCE, MAY_SMOKE, MAY_STACK,
-    MAY_SUBSURFACE, MAY_WALK, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, Source, SourcePaths, Stage,
-    StageSet, StagedKernels, StagedMemory, StateParts,
+    FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_SEGMENTS, FEATURE_STACK, FEATURE_WALK,
+    MAX_ROUNDS, MAY_ALL, MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG,
+    MAY_DIRECTIONAL, MAY_DISPERSION, MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ,
+    MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES,
+    MAY_REFERENCE, MAY_SMOKE, MAY_STACK, MAY_SUBSURFACE, MAY_WALK, PATH_SOURCE_UPDATE,
+    PATH_SOURCE_VIEW, Source, SourcePaths, Stage, StageSet, StagedKernels, StagedMemory,
+    StateParts,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::support::{Masked, MaskedFrame, MaskedSupport, Runs};
@@ -1118,12 +1119,7 @@ fn runs_rays(entry: PathEntry) -> bool {
 /// What the scene and settings of a frame ask of the pipeline path tracer that it does not
 /// render yet, which its paths do without: each by name. `path_features` are the view path
 /// root's (`path_features`), and `caustics` says whether the frame gathers caustic photons.
-fn unlaunched(
-    linked_medium: bool,
-    path_features: u32,
-    caustics: bool,
-    pass: &ViewPass,
-) -> Vec<&'static str> {
+fn unlaunched(path_features: u32, caustics: bool, pass: &ViewPass) -> Vec<&'static str> {
     let features = pass.scene_features;
     let asks = [
         (
@@ -1131,20 +1127,6 @@ fn unlaunched(
             "dielectric and presence layers",
         ),
         (path_features & FEATURE_INTERIORS != 0, "interiors"),
-        (
-            features.contains(SceneFeatures::PARTICLES),
-            "particles along path rays",
-        ),
-        (
-            features.contains(SceneFeatures::LOCAL_LIGHTS),
-            "sphere and rect lights met by path rays",
-        ),
-        (
-            linked_medium
-                || features.contains(SceneFeatures::MEDIUM_PROXIES)
-                || features.contains(SceneFeatures::SMOKE),
-            "media along path rays",
-        ),
         (caustics, "caustic photons"),
         (
             features.contains(SceneFeatures::COATED_EMITTERS),
@@ -1379,7 +1361,7 @@ fn path_features(features: SceneFeatures, lighting: &ViewLighting) -> u32 {
 }
 
 /// The features an update path keeps of its view's: it does not walk, nor split by wavelength.
-const UPDATE_FEATURES: u32 = FEATURE_INTERIORS | FEATURE_STACK;
+const UPDATE_FEATURES: u32 = FEATURE_INTERIORS | FEATURE_STACK | FEATURE_SEGMENTS;
 
 /// The root the update paths of the view of `root` run under, as `path/stages.slang`'s
 /// `update_root` makes it, but for its source, which the caller sets.
@@ -2160,7 +2142,6 @@ impl LightingKernels {
         };
         if let Some(launch) = &self.launch {
             launch.note_unlaunched(unlaunched(
-                self.support.masked.linked_medium(),
                 features,
                 gathers_caustics(scene, pass.scene_features, lighting),
                 pass,
@@ -2325,8 +2306,9 @@ impl LightingKernels {
         ))?;
         self.record_layers(list, view, pass, lighting, path)?;
         let reference = lighting.reference.is_some();
+        let segments = self.support.masked.linked_medium() || path.froxels != GpuPtr::NULL;
         let root = PathRoot {
-            features: path.features & FEATURE_WALK,
+            features: (path.features & FEATURE_WALK) | if segments { FEATURE_SEGMENTS } else { 0 },
             dielectric_flags: path.dielectric_flags & !(DIELECTRIC_FROST | DIELECTRIC_DISPERSION),
             caustics: GpuPtr::NULL,
             source: PATH_SOURCE_VIEW,

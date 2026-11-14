@@ -38,8 +38,9 @@ pub struct HitGroups {
     pub strand_path: Option<u32>,
     /// Triangles under shadow rays: an any-hit that decides by `cover_shadow`.
     pub shadow: Option<u32>,
-    /// Particle triangles under layer rays.
-    pub particle_layers: Option<u32>,
+    /// Triangles under layer rays: an any-hit that keeps particles and ignores the rest, since a
+    /// record of zeros would commit them.
+    pub layers: Option<u32>,
     /// Medium proxies under shadow rays: a procedural group of `box_medium` and `proxy_shadow`.
     pub medium_shadow: Option<u32>,
     /// Medium proxies under layer rays.
@@ -66,7 +67,7 @@ impl HitGroups {
     /// kind's pins.
     fn slots(&self) -> Vec<Option<u32>> {
         let fixed: [Option<u32>; FIXED_KINDS] = [
-            self.particle_layers,
+            self.layers,
             self.medium_shadow,
             self.medium_layers,
             self.light_layers,

@@ -58,6 +58,8 @@ pub(crate) const FEATURE_DISPERSION: u32 = 1 << 2;
 /// Paths may lie in an interior, and may track a plane stack: their state holds those parts.
 pub(crate) const FEATURE_INTERIORS: u32 = 1 << 4;
 pub(crate) const FEATURE_STACK: u32 = 1 << 5;
+/// The pipeline path tracer's segments outside interiors march a medium.
+pub(crate) const FEATURE_SEGMENTS: u32 = 1 << 6;
 /// The shade stages run as ray dispatches.
 const FEATURE_RAY_SHADES: u32 = 1 << 3;
 

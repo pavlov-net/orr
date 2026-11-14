@@ -1,10 +1,11 @@
 // The pipeline path tracer's shaders (`path.launch`): a raygen per source, the closest-hit shaders
 // that resolve a path ray's hit on triangles and on strands, the walk meet's closest-hit and the
-// miss shader, the coverage's any-hit shaders and the medium proxies' under shadow rays, and the
-// callables that start, shade and finish a path and end its walks. `orr_lighting::launch` makes
-// several stages of one entry by its specialization constants (`path_may`, `path_may2`,
-// `hit_surface`): a hit shader per kind of geometry and per linked surface id, and next-event
-// estimation and the scatter per BSDF class.
+// miss shader, the coverage's any-hit shaders and the medium proxies' under shadow rays, what
+// LAYERS rays keep of particles, light proxies and medium proxies, and the callables that start,
+// shade and finish a path, end its walks and take what lies along its rays.
+// `orr_lighting::launch` makes several stages of one entry by its specialization constants
+// (`path_may`, `path_may2`, `hit_surface`): a hit shader per kind of geometry and per linked
+// surface id, and next-event estimation and the scatter per BSDF class.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_lighting.environment;
@@ -121,6 +122,48 @@ void proxy_shadow_hit(inout Payload p, SpanAttributes a)
     shadow_decided(p, c, d);
 }
 
+[shader("anyhit")]
+void cover_layers_hit(inout Payload p, TriangleAttributes a)
+{
+    ORR_OMM(cover_layers_hit);
+    TriangleHit h = { a };
+    layers_triangle(root, p.words, h.custom_index(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.t(), h.barycentrics());
+    IgnoreHit();
+}
+
+[shader("anyhit")]
+void cover_layers_medium_hit(inout Payload p, SpanAttributes a)
+{
+    ORR_OMM(cover_layers_medium_hit);
+    layers_medium(root, p.words, InstanceIndex(), PrimitiveIndex(), a.span);
+    IgnoreHit();
+}
+
+struct LightAttributes
+{
+    float t;
+}
+
+[shader("intersection")]
+void box_light_hit()
+{
+    ORR_OMM(box_light_hit);
+    float t;
+    if (box_light(root, InstanceIndex(), WorldRayOrigin(), WorldRayDirection(), RayTCurrent(), t))
+    {
+        LightAttributes a = { t };
+        ReportHit(t, 0, a);
+    }
+}
+
+[shader("anyhit")]
+void cover_layers_light_hit(inout Payload p, LightAttributes a)
+{
+    ORR_OMM(cover_layers_light_hit);
+    layers_light(root, p.words, InstanceIndex(), a.t);
+    IgnoreHit();
+}
+
 [shader("callable")]
 void start_view(inout Payload p)
 {
@@ -203,4 +246,43 @@ void scatter_leave(inout Payload p)
 {
     ORR_OMM(scatter_leave);
     p.words.x = launch_scatter_leave<Surface>(root, launch_slot());
+}
+
+[shader("callable")]
+void segment(inout Payload p)
+{
+    ORR_OMM(segment);
+    p.words.x = launch_segment<Medium>(root, launch_slot(), p.words.x != 0, asfloat(p.words.y));
+}
+
+[shader("callable")]
+void layers(inout Payload p)
+{
+    ORR_OMM(layers);
+    float bound;
+    p.words.x = launch_layers(root, launch_slot(), p.words.x, asfloat(p.words.y), bound);
+    p.words.y = asuint(bound);
+}
+
+[shader("callable")]
+void march_proxy(inout Payload p)
+{
+    ORR_OMM(march_proxy);
+    float bound;
+    launch_proxy_march(root, launch_slot(), p.words.x, bound);
+    p.words.y = asuint(bound);
+}
+
+[shader("callable")]
+void direct_medium(inout Payload p)
+{
+    ORR_OMM(direct_medium);
+    p.words.x = launch_direct_medium<Surface, Medium>(root, launch_slot());
+}
+
+[shader("callable")]
+void scatter_medium(inout Payload p)
+{
+    ORR_OMM(scatter_medium);
+    p.words.x = launch_scatter_medium<Surface>(root, launch_slot());
 }

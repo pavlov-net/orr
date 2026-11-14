@@ -18,7 +18,7 @@ import orr_scene.runs;
 import orr_scene.tables;
 
 // The groups the handle table holds one of, in its order (orr_scene::HitGroups).
-public static const uint KIND_PARTICLE_LAYERS = 0;
+public static const uint KIND_LAYERS = 0;
 public static const uint KIND_MEDIUM_SHADOW = 1;
 public static const uint KIND_MEDIUM_LAYERS = 2;
 public static const uint KIND_LIGHT_LAYERS = 3;
@@ -120,7 +120,7 @@ void runs(uint3 id: SV_DispatchThreadID)
         material = s.page_material_sets[run - s.run_pages];
     uint class_id = material == MATERIAL_NONE ? CLASS_OPAQUE : material_class(s.materials + material);
     uint pin = material_pin(s, material);
-    write_run(run, uint3(pinned(KIND_PATH, pin), pinned(KIND_SHADOW, pin), SLOT_NONE), hit_data(s, material, class_id));
+    write_run(run, uint3(pinned(KIND_PATH, pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), hit_data(s, material, class_id));
 }
 
 // One workgroup per producer entry, a thread per material of a set entry.
@@ -138,8 +138,7 @@ void producer_runs(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
     {
         uint material = p.materials[slot];
         uint class_id = p.opacity == PRODUCER_SECTIONS ? material_class(s.materials + material) : p.class_id;
-        uint layers = class_id == CLASS_PARTICLE ? KIND_PARTICLE_LAYERS : SLOT_NONE;
         uint pin = material_pin(s, material);
-        write_run(s.run_producers + p.runs + slot, uint3(pinned(path, pin), pinned(KIND_SHADOW, pin), layers), hit_data(s, material, class_id));
+        write_run(s.run_producers + p.runs + slot, uint3(pinned(path, pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), hit_data(s, material, class_id));
     }
 }

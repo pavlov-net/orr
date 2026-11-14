@@ -296,13 +296,37 @@ public struct ShadowCandidates<S : ISurfaces, M : IMedium, let MODE : uint> : IC
         MediumProxyGpu p;
         if (proxy_unmarched(scene, c, t_max, beer, p, t0, t1))
             return beer;
-        uint3 key = uint3(asuint(origin.x) ^ (c.instance_index * 0x9E3779B9u), asuint(origin.y) ^ (c.primitive_index * 0x85EBCA6Bu), asuint(origin.z) ^ scene.frame_index);
-        float jitter = unit_float(pcg3d(key).x);
-        float h = max(proxy_voxel_step(p, d), (t1 - t0) / float(PROXY_STEPS));
-        ProxyDepth depth = { p, o, d, float3(0.0) };
-        proxy_march(t0, t1, h, jitter, depth);
-        return exp(-max(depth.tau, 0.0));
+        return proxy_volume(scene, p, c.instance_index, c.primitive_index, origin, o, d, t0, t1);
     }
+}
+
+// What the span from `t0` to `t1` of a ray from render-space `origin` lets through inside proxy
+// `p` with a volume, primitive `primitive` of instance `instance_index`, along the object-space
+// ray `o + d * t`, by `ShadowCandidates.proxy`'s march.
+public float3 proxy_volume(SceneRoot* s, MediumProxyGpu p, uint instance_index, uint primitive, float3 origin, float3 o, float3 d, float t0, float t1)
+{
+    uint3 key = uint3(asuint(origin.x) ^ (instance_index * 0x9E3779B9u), asuint(origin.y) ^ (primitive * 0x85EBCA6Bu), asuint(origin.z) ^ s.frame_index);
+    float jitter = unit_float(pcg3d(key).x);
+    float h = max(proxy_voxel_step(p, d), (t1 - t0) / float(PROXY_STEPS));
+    ProxyDepth depth = { p, o, d, float3(0.0) };
+    proxy_march(t0, t1, h, jitter, depth);
+    return exp(-max(depth.tau, 0.0));
+}
+
+// As above for the span from `t0` to `t1` of the render-space ray from `origin` along unit `dir`
+// through the proxy of instance `instance_index`, whose object space its record places.
+public float3 proxy_volume(SceneRoot* s, uint instance_index, uint primitive, float3 origin, float3 dir, float t0, float t1)
+{
+    MediumProxyGpu p = scene_proxy(s, instance_index);
+    // The rows of the inverse of the object-to-world columns, over its determinant.
+    float3 x = cross(p.axis_y, p.axis_z);
+    float3 y = cross(p.axis_z, p.axis_x);
+    float3 z = cross(p.axis_x, p.axis_y);
+    float det = dot(p.axis_x, x);
+    float3 rel = origin - proxy_render_center(s, p);
+    float3 o = float3(dot(x, rel), dot(y, rel), dot(z, rel)) / det;
+    float3 d = float3(dot(x, dir), dot(y, dir), dot(z, dir)) / det;
+    return proxy_volume(s, p, instance_index, primitive, origin, o, d, t0, t1);
 }
 
 // What medium proxy candidate `c` of a ray reaching `t_max` lets through, in `t`, where that

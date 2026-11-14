@@ -1,11 +1,13 @@
 // The path loop as one ray tracing pipeline launch per source (`path/pipeline.slang`). A raygen
 // owns each path from its start to its end and holds nothing across a call but the step a shader
-// returned: it traces the path's ray, reorders on the hit and invokes the hit's resolve or the
-// miss shader, then calls the vertex's emission, next-event estimation and scatter, tracing the
-// shadow ray between the last two. Every wider value lives in the path's slot of
-// `PathStages.words`, found from the launch index, which each shader loads and stores in the
-// parts it reads and writes; across a trace, reorder, invoke or call that memory is coherent at
-// device scope. An opaque vertex is shaded by the staged loop's bodies over its packed surface.
+// returned: it traces the path's ray, composites the particles and light proxies in front of its
+// hit by LAYERS traces, calls the segment that runs along it, reorders on the hit and invokes the
+// hit's resolve or the miss shader, then calls the vertex's emission, next-event estimation and
+// scatter, tracing the shadow ray between the last two and marching the medium proxies with a
+// volume it passed. Every wider value lives in the path's slot of `PathStages.words`, found from
+// the launch index, which each shader loads and stores in the parts it reads and writes; across a
+// trace, reorder, invoke or call that memory is coherent at device scope. An opaque vertex is
+// shaded by the staged loop's bodies over its packed surface.
 module launch;
 
 import orr_shaders.abi;
@@ -17,9 +19,11 @@ import orr_color.luminance;
 import orr_scene.hit;
 import orr_scene.lights;
 import orr_scene.runs;
+import orr_scene.tables;
 import orr_scene.candidates;
 import orr_lighting.bsdf;
 import orr_lighting.media;
+import orr_lighting.froxels;
 import orr_lighting.environment;
 import orr_lighting.light_sampling;
 import orr_lighting.subsurface;
@@ -46,6 +50,11 @@ public static const uint CALL_DIRECT_EXIT = 10;
 public static const uint CALL_SCATTER_EXIT = 11;
 public static const uint CALL_DIRECT_LEAVE = 12;
 public static const uint CALL_SCATTER_LEAVE = 13;
+public static const uint CALL_SEGMENT = 14;
+public static const uint CALL_LAYERS = 15;
+public static const uint CALL_PROXY_MARCH = 16;
+public static const uint CALL_DIRECT_MEDIUM = 17;
+public static const uint CALL_SCATTER_MEDIUM = 18;
 
 // What a shader hands the raygen in its payload's first word.
 public static const uint STEP_RAY = 1 << 0;      // the path has a ray to trace
@@ -57,23 +66,26 @@ public static const uint STEP_DONE = 1 << 5;     // the start wrote what the pat
 public static const uint STEP_RICH = 1 << 6;     // the vertex's surface may have a lobe a plain one lacks (`surface_lobed`)
 public static const uint STEP_WALK = 1 << 7;     // the path walks from its walk part
 public static const uint STEP_INVOKE = 1 << 8;   // the walk's last step met a surface whose hit shader goes on
-// From STEP_CLASS_SHIFT, with STEP_VERTEX, the class of a vertex past a walk, which selects its
-// direct and scatter callables in place of STEP_RICH.
+// From STEP_CLASS_SHIFT, with STEP_VERTEX, the class of a vertex past a walk or a segment, which
+// selects its direct and scatter callables in place of STEP_RICH.
 static const uint STEP_CLASS_SHIFT = 9;
 static const uint CLASS_SURFACE = 0;             // an opaque vertex, plain or rich
 static const uint CLASS_EXIT = 1;                // a subsurface walk's exit
 static const uint CLASS_LEAVE = 2;               // an interior's walk leaving it
+static const uint CLASS_SCATTER = 3;             // a scatter in an interior's medium, its surface words a `MediumVertex`
 
 // The words of a path's slot, in this order: its loop (`LaunchLoop`), the ray its last vertex left
-// (`LaunchRay`), the vertex's packed surface and its shadow ray (`ShadowJob`); then the parts of
-// the paths that walk (`WALK_WORDS`) and that track interiors (`INTERIORS_WORDS`), where the
-// root's features name them. The path's record is apart, in `PathStages.records`: RECORD_WORDS
-// for a view's, UPDATE_RECORD_WORDS for an update path's.
+// (`LaunchRay`), the vertex's packed surface or `MediumVertex`, its shadow ray (`ShadowJob`) and
+// what a LAYERS trace keeps (FRONT_AT); then the parts of the paths that walk (`WALK_WORDS`) and
+// that track interiors (`INTERIORS_WORDS`), where the root's features name them. The path's record
+// is apart, in `PathStages.records`: RECORD_WORDS for a view's, UPDATE_RECORD_WORDS for an update
+// path's.
 static const uint LOOP_AT = 0;
 static const uint RAY_AT = 5;
 static const uint SURFACE_AT = 9;
 static const uint SHADOW_AT = 16;
-public static const uint SLOT_WORDS = 19;
+static const uint FRONT_AT = 19;
+public static const uint SLOT_WORDS = 28;
 // The walk part: the walk in flight (`LaunchWalk`), and the surface it entered where the exit
 // scatters with that surface's parameters.
 static const uint WALK_STATE_WORDS = 8;
@@ -84,12 +96,53 @@ public static const uint INTERIORS_WORDS = 7;
 
 // `LaunchLoop.vertex`: the vertex is the path's first, and is the G-buffer's surface; the path is
 // at a subsurface walk's exit, which is the vertex the walk entered where it stopped at its cap,
-// and which takes the parameters of the vertex it entered (in ENTRY_AT) with VERTEX_ENTRY_PARAMS.
+// and which takes the parameters of the vertex it entered (in ENTRY_AT) with VERTEX_ENTRY_PARAMS;
+// a segment drew the sampler dimensions of the ray that reached it, which its resolve or miss then
+// draws none of; it is a scatter in a medium.
 static const uint VERTEX_FIRST = 1 << 0;
 static const uint VERTEX_GBUFFER = 1 << 1;
 static const uint VERTEX_EXIT = 1 << 2;
 static const uint VERTEX_EXIT_CAP = 1 << 3;
 static const uint VERTEX_ENTRY_PARAMS = 1 << 4;
+static const uint VERTEX_SEGMENTED = 1 << 5;
+static const uint VERTEX_MEDIUM = 1 << 6;
+
+// What a path ray asks of the raygen beside its trace (`launch_path_ray`): the instance mask of a
+// LAYERS trace in front of its hit in the low bits, 0 for none, and a segment.
+static const uint FRONT_SEGMENT = 1 << 8;
+
+// The front part: the LAYERS_KEPT nearest candidates of a LAYERS trace past its bound, by
+// `layer_before`, as two words each (`LayerEntry`), and the key of the last one a callable took,
+// which bounds the next trace of the same ray.
+public static const uint LAYERS_KEPT = 4;
+static const uint FRONT_BOUND = 2 * LAYERS_KEPT;
+
+// `LayerEntry.more.z`: what the candidate is.
+static const uint LAYER_PARTICLE = 0;
+static const uint LAYER_LIGHT = 1;
+static const uint LAYER_MEDIUM = 2;
+
+// A candidate of a LAYERS trace. `key` is its order: its distance's bits (a medium proxy's span's
+// start), instance, cluster (~0 for a proxy) and primitive. `more` is a particle's barycentrics
+// or a medium proxy's span's end, and LAYER_* in z.
+struct LayerEntry
+{
+    uint4 key;
+    uint4 more;
+}
+
+// A LAYERS trace's payload, 16 bytes: the ray's reach, the distance of the LAYERS_KEPT-th
+// candidate kept (+inf until that many are), the bound's distance, and a word of the candidates
+// past the bound it met (bits 0-7, saturating), its instance mask (bits 8-15) and LAYERS_BOUNDED.
+static const uint LAYERS_BOUNDED = 1 << 16;
+
+// A scatter in a medium as the slot's surface words hold it.
+public struct MediumVertex
+{
+    public float3 point;
+    public uint medium;             // the interior's material
+    public float anisotropy;
+}
 
 // The loop's state, and what the vertex the path is at keeps beside it.
 struct LaunchLoop
@@ -609,12 +662,24 @@ public uint launch_start_update(PathRoot r, uint slot)
 // The ray
 
 // The ray of `slot`'s path and its instance mask, with the payload its any-hit shaders read,
-// counted on the path; `last` where the opaque vertex it may reach is the last bounce's hit.
-public RayDesc launch_path_ray(PathRoot r, uint slot, out uint mask, out uint4 payload, out bool last)
+// counted on the path; `last` where the opaque vertex it may reach is the last bounce's hit, and
+// in `front` what the raygen does between its trace and its hit's shader (FRONT_*). Rays leaving
+// a layer or a scatter, and the first vertex's, see particles, and every path ray that adds
+// emission sees the proxies of sphere and rect lights, which cover nothing: a LAYERS trace finds
+// them in front of the hit. The camera ray sees neither, and crosses no segment.
+public RayDesc launch_path_ray(PathRoot r, uint slot, out uint mask, out uint4 payload, out bool last, out uint front)
 {
     LaunchVertex v = load_vertex(r, slot);
     LaunchRay ray = v.ray;
     bool camera = has(v.p.flags, LOOP_CAMERA);
+    front = 0;
+    if (!camera)
+    {
+        bool adds = v.x.count_bsdf && has(v.p.flags, LOOP_COUNTED);
+        bool particles = v.record.particles() && (v.c.ray.chain || v.p.depth == 0) && r.set.particle_entries > 0;
+        bool lights = adds && r.set.local_lights > 0;
+        front = (particles ? MASK_PARTICLE : 0) | (lights ? MASK_LIGHT : 0) | ((r.features & FEATURE_SEGMENTS) != 0 ? FRONT_SEGMENT : 0);
+    }
     uint depth = camera ? 0 : v.p.depth + 1;
     mask = camera ? ray.flags >> LAUNCH_MASK_SHIFT : MASK_OPAQUE | MASK_DIELECTRIC;
     PathCover cover;
@@ -630,6 +695,7 @@ public RayDesc launch_path_ray(PathRoot r, uint slot, out uint mask, out uint4 p
         v.p.depth = depth;
     }
     last = v.p.opaque > r.max_bounces;
+    v.vertex &= ~VERTEX_SEGMENTED;
     store_loop_part(v);
     return path_ray(ray.origin, ray.dir, camera ? ray.t_max : positive_infinity());
 }
@@ -644,8 +710,8 @@ public uint launch_resolve<S : ISurfaces, H : IHit>(PathRoot r, uint slot, H h)
     if ((v.vertex & VERTEX_EXIT) != 0)
         return resolve_exit<S, H>(r, v, h);
     bool first = has(v.p.flags, LOOP_CAMERA);
-    // The march's jitter of a segment past the first, drawn where no medium marches.
-    if (!first)
+    // The march's jitter of a segment past the first, drawn where no segment ran.
+    if (!first && (v.vertex & VERTEX_SEGMENTED) == 0)
         v.p.rng.next();
     v.p.iteration++;
     set_flag(v.p.flags, LOOP_CAMERA, false);
@@ -702,8 +768,9 @@ public void launch_miss<S : ISurfaces, M : IMedium>(PathRoot r, uint slot)
         v.p.sky = v.p.throughput;
     else
     {
-        // The march's jitter, drawn where no medium marches.
-        v.p.rng.next();
+        // The march's jitter, drawn where no segment ran.
+        if ((v.vertex & VERTEX_SEGMENTED) == 0)
+            v.p.rng.next();
         if (v.x.count_bsdf && has(v.p.flags, LOOP_COUNTED))
             miss_light<S, M, LaunchRecord>(r, v.f, v.p, v.c.ray, v.c.spectral, v.x, v.record, v.c.stack);
     }
@@ -951,6 +1018,276 @@ public uint launch_scatter<S : ISurfaces>(PathRoot r, uint slot)
 }
 
 // ---------------------------------------------------------------------------------------------
+// Media
+
+// What the segment of `v`'s ray outside every interior does, `t` m to its hit (`hit`) or to
+// infinity: past the camera ray, the linked medium's in-scatter and transmittance, through the
+// froxels for rays leaving a layer or a scatter, marched where the ray is one of those or long;
+// elsewhere transmittance alone. The march's jitter dimension is drawn either way, so later
+// dimensions stay put. STEP_ENDED where nothing goes on.
+uint media_segment<M : IMedium>(PathRoot r, inout LaunchVertex v, bool hit, float t)
+{
+    LayerRay ray = v.c.ray;
+    if (hit && (ray.chain || t >= INSCATTER_SEGMENT))
+    {
+        float3 through_medium;
+        float3 e;
+        if (ray.chain)
+            e = froxel_segment_inscatter<M>(r.froxels, r.view, r.set, ray.origin, ray.dir, t, r.segment_steps, v.p.rng.next(), through_medium);
+        else
+            e = segment_inscatter<M>(r.set, ray.origin, ray.dir, t, r.segment_steps, v.p.rng.next(), through_medium);
+        if (has(v.p.flags, LOOP_COUNTED) && !v.x.photon)
+            v.p.radiance += v.c.spectral.color(v.p.throughput * e);
+        v.p.throughput *= through_medium;
+    }
+    else
+    {
+        v.p.rng.next();
+        if (hit)
+            v.p.throughput *= medium_transmittance<M>(r.scene.medium, ray.origin, ray.dir, t);
+    }
+    return any(v.p.throughput > 0.0) && all(isfinite(v.p.throughput)) ? 0 : STEP_ENDED;
+}
+
+// The segment callable's body: what lies along `slot`'s path ray between its origin and its
+// hit (`hit`, `t` m on) or infinity, before the hit's shader. STEP_ENDED where the path ends
+// there, else 0.
+public uint launch_segment<M : IMedium>(PathRoot r, uint slot, bool hit, float t)
+{
+    LaunchVertex v = load_vertex(r, slot);
+    uint step = media_segment<M>(r, v, hit, t);
+    v.vertex |= VERTEX_SEGMENTED;
+    store_loop_part(v);
+    return step;
+}
+
+// The vertex of a scatter of `v`'s ray at `point` inside interior `medium`, of anisotropy
+// `anisotropy`, `offset` m further from the eye than the ray's origin for the camera ray: the
+// scatter's surface words and the end of the iteration that reached it. Its caller stores the
+// loop. STEP_VERTEX of CLASS_SCATTER, or STEP_ENDED.
+uint reach_medium_vertex(PathRoot r, inout LaunchVertex v, float3 point, uint medium, float anisotropy, float offset)
+{
+    float t = offset + distance(v.c.ray.origin, point);
+    if (!reach_scatter<LaunchRecord>(r, v.p, v.c, v.record, v.x, point, medium, anisotropy, t, v.p.rng))
+        return STEP_ENDED;
+    MediumVertex m = { point, medium, anisotropy };
+    store_part<MediumVertex, 2>(v.at + SURFACE_AT, m);
+    v.vertex = VERTEX_MEDIUM;
+    return STEP_VERTEX | (CLASS_SCATTER << STEP_CLASS_SHIFT);
+}
+
+// Next-event estimation at `slot`'s scatter in a medium.
+public uint launch_direct_medium<S : ISurfaces, M : IMedium>(PathRoot r, uint slot)
+{
+    LaunchVertex v = load_vertex(r, slot);
+    MediumVertex m = load_part<MediumVertex, 2>(v.at + SURFACE_AT);
+    Sampler rng = v.p.rng;
+    ShadeNee nee;
+    bool alive = shade_medium_direct<S, M, LaunchRecord>(r, v.f, v.p, v.c, v.record, v.x, m.point, m.medium, m.anisotropy, rng, nee);
+    v.p.rng = rng;
+    return direct_left(v, alive, nee);
+}
+
+// The rest of the iteration from `slot`'s scatter in a medium: its next ray, STEP_RAY, or
+// STEP_ENDED.
+public uint launch_scatter_medium<S : ISurfaces>(PathRoot r, uint slot)
+{
+    LaunchVertex v = load_vertex(r, slot);
+    MediumVertex m = load_part<MediumVertex, 2>(v.at + SURFACE_AT);
+    Sampler rng = v.p.rng;
+    ShadeNee nee = no_nee(v.c.spectral);
+    nee.run = v.c.ray.run;
+    bool alive = shade_medium_scatter<S, LaunchRecord>(r, v.f, v.p, v.c, v.record, v.x, m.point, m.medium, m.anisotropy, nee, rng);
+    v.p.rng = rng;
+    if (alive)
+        store_part<LaunchRay, 4>(v.at + RAY_AT, launch_ray(v.c.ray, 0.0, 0));
+    store_loop_part(v);
+    return alive ? STEP_RAY : STEP_ENDED;
+}
+
+// ---------------------------------------------------------------------------------------------
+// What lies in front of a hit
+//
+// A LAYERS trace keeps the LAYERS_KEPT nearest of its candidates past its bound in the slot's
+// front part, sorted, and counts the others; a callable then takes the kept ones in depth order
+// and moves the bound to the last. A ray with more traces again from there, so every candidate is
+// taken once and in order: ties of distance go by instance, cluster and primitive.
+
+// Whether candidate key `a` comes before `b`. Distances are not negative, so their bits order
+// as they do.
+bool layer_before(uint4 a, uint4 b)
+{
+    if (a.x != b.x)
+        return a.x < b.x;
+    if (a.y != b.y)
+        return a.y < b.y;
+    if (a.z != b.z)
+        return a.z < b.z;
+    return a.w < b.w;
+}
+
+// The payload of a LAYERS trace of instance mask `mask` reaching `t_max`, past the candidate of
+// key `bound` where `bounded`.
+public uint4 layers_payload(float t_max, uint mask, bool bounded, uint4 bound)
+{
+    return uint4(asuint(t_max), asuint(positive_infinity()), bounded ? bound.x : 0u, (mask << 8) | (bounded ? LAYERS_BOUNDED : 0u));
+}
+
+// The candidates past the bound a LAYERS trace's `payload` counted.
+public uint layers_met(uint4 payload)
+{
+    return payload.w & 0xff;
+}
+
+// Keeps a LAYERS trace's candidate of key `key` and `more` where it lies before the ray's reach,
+// past the bound, and among the LAYERS_KEPT nearest so far.
+void keep_layer(PathRoot r, inout uint4 payload, uint4 key, uint4 more)
+{
+    float t = asfloat(key.x);
+    if (!(t < asfloat(payload.x)))
+        return;
+    uint4* at = slot_words(r, launch_slot()) + FRONT_AT;
+    if ((payload.w & LAYERS_BOUNDED) != 0)
+    {
+        float bound = asfloat(payload.z);
+        if (t < bound || (t == bound && !layer_before(load_coherent(at + FRONT_BOUND), key)))
+            return;
+    }
+    uint met = payload.w & 0xff;
+    payload.w = (payload.w & ~0xffu) | min(met + 1, 0xffu);
+    if (t > asfloat(payload.y))
+        return;
+    uint kept = min(met, LAYERS_KEPT);
+    uint i = kept;
+    for (; i > 0; i--)
+    {
+        uint4 k = load_coherent(at + 2 * (i - 1));
+        if (!layer_before(key, k))
+            break;
+        if (i < LAYERS_KEPT)
+        {
+            store_coherent(at + 2 * i, k);
+            store_coherent(at + 2 * i + 1, load_coherent(at + 2 * (i - 1) + 1));
+        }
+    }
+    if (i == LAYERS_KEPT)
+        return;
+    store_coherent(at + 2 * i, key);
+    store_coherent(at + 2 * i + 1, more);
+    if (kept + 1 >= LAYERS_KEPT)
+        payload.y = load_coherent(at + 2 * (LAYERS_KEPT - 1)).x;
+}
+
+// A LAYERS trace's triangle candidate, from its any-hit shader: a particle that its mask takes.
+public void layers_triangle(PathRoot r, inout uint4 payload, uint custom_index, uint instance_index, int cluster_id, uint primitive, float t, float2 bary)
+{
+    if (cluster_id < 0)
+        return;
+    uint class_id = class_of(scene_traced(r.scene), custom_index, instance_index, cluster_id);
+    if (class_id != CLASS_PARTICLE || !class_taken(class_id, (payload.w >> 8) & 0xff))
+        return;
+    keep_layer(r, payload, uint4(asuint(t), instance_index, asuint(cluster_id), primitive), uint4(asuint(bary), LAYER_PARTICLE, 0));
+}
+
+// Where the ray from `origin` along unit `dir` first meets the sphere or rect light whose proxy is
+// instance `instance_index`, before `t_max`, in `t`: what its intersection shader reports.
+public bool box_light(PathRoot r, uint instance_index, float3 origin, float3 dir, float t_max, out float t)
+{
+    t = 0.0;
+    uint id = instance_index - r.scene.light_base;
+    float3 radiance;
+    return id < r.scene.light_capacity && light_proxy_hit(r.set, id, origin, dir, t_max, origin, t, radiance);
+}
+
+// A LAYERS trace's light proxy candidate on instance `instance_index`, at `t`.
+public void layers_light(PathRoot r, inout uint4 payload, uint instance_index, float t)
+{
+    keep_layer(r, payload, uint4(asuint(t), instance_index, ~0u, 0), uint4(0, 0, LAYER_LIGHT, 0));
+}
+
+// A LAYERS trace's medium proxy candidate on instance `instance_index` over `span`: one with a
+// volume, which a shadow ray's march takes.
+public void layers_medium(PathRoot r, inout uint4 payload, uint instance_index, uint primitive, float2 span)
+{
+    if (!(span.y > span.x) || scene_proxy(r.scene, instance_index).volume == nullptr)
+        return;
+    keep_layer(r, payload, uint4(asuint(span.x), instance_index, ~0u, primitive), uint4(asuint(span.y), 0, LAYER_MEDIUM, 0));
+}
+
+LayerEntry front_entry(uint4* at, uint k)
+{
+    LayerEntry e = { load_coherent(at + 2 * k), load_coherent(at + 2 * k + 1) };
+    return e;
+}
+
+// The layers callable's body: composites the `kept` candidates a LAYERS trace of `slot`'s path
+// ray, reaching `t_max`, kept in front of its hit, in depth order, as `trace_resolve_translucent`
+// takes them with `PathEmission`, and moves the bound to the last. STEP_ENDED where nothing goes
+// on through them, else 0; the bound's distance in `bound`.
+public uint launch_layers(PathRoot r, uint slot, uint kept, float t_max, out float bound)
+{
+    LaunchVertex v = load_vertex(r, slot);
+    LayerRay ray = v.c.ray;
+    bool adds = v.x.count_bsdf && has(v.p.flags, LOOP_COUNTED);
+    float3 own = ray.lit ? float3(0.0) : has(v.p.flags, LOOP_THROUGH) ? v.p.keep : float3(1.0);
+    LocalLights* ray_local = nullptr;
+    if (ray.local)
+        ray_local = pixel_local_lights(r, v.f.pixel);
+    PathEmission pe = { r.scene, r.set, ray_local, ray.origin, ray.dir, ray.from, ray.normal, v.x.one_technique ? 0.0 : ray.pdf, ray.run, t_max, own, adds };
+    uint4* at = v.at + FRONT_AT;
+    uint4 key = uint4(0);
+    for (uint k = 0; k < kept; k++)
+    {
+        LayerEntry e = front_entry(at, k);
+        key = e.key;
+        Candidate c;
+        c.instance_index = e.key.y;
+        c.custom_index = 0;
+        c.geometry_index = 0;
+        c.class_id = e.more.z == LAYER_LIGHT ? CLASS_LIGHT : CLASS_PARTICLE;
+        c.primitive_index = e.key.w;
+        c.cluster_id = int(e.key.z);
+        c.triangle = e.more.z != LAYER_LIGHT;
+        c.t = asfloat(e.key.x);
+        c.barycentrics = asfloat(e.more.xy);
+        c.front_face = false;
+        c.object_origin = float3(0.0);
+        c.object_direction = float3(0.0);
+        c.object_positions = { float3(0.0), float3(0.0), float3(0.0) };
+        float4 layer = pe.layer(c);
+        if (adds)
+            v.p.radiance += v.c.spectral.color(v.p.throughput * layer.rgb);
+        v.p.throughput *= 1.0 - layer.a;
+    }
+    store_coherent(at + FRONT_BOUND, key);
+    bound = asfloat(key.x);
+    store_loop_part(v);
+    return any(v.p.throughput > 0.0) && all(isfinite(v.p.throughput)) ? 0 : STEP_ENDED;
+}
+
+// The proxy march callable's body: what the `kept` medium proxies with a volume a LAYERS trace of
+// `slot`'s shadow ray kept let through, into its contribution, and the bound moved to the last,
+// whose span's start is in `bound`.
+public void launch_proxy_march(PathRoot r, uint slot, uint kept, out float bound)
+{
+    uint4* words = slot_words(r, slot);
+    uint4* at = words + FRONT_AT;
+    ShadowJob q = load_part<ShadowJob, 3>(words + SHADOW_AT);
+    float3 through = float3(1.0);
+    uint4 key = uint4(0);
+    for (uint k = 0; k < kept; k++)
+    {
+        LayerEntry e = front_entry(at, k);
+        key = e.key;
+        through *= proxy_volume(r.scene, e.key.y, e.key.w, q.origin, q.dir, asfloat(e.key.x), asfloat(e.more.x));
+    }
+    store_coherent(at + FRONT_BOUND, key);
+    bound = asfloat(key.x);
+    q.contribution *= through;
+    store_part<ShadowJob, 3>(words + SHADOW_AT, q);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Finishes
 
 // What a view does with `slot`'s finished path: the pixel's radiance, the sky where its camera
@@ -977,16 +1314,57 @@ public void launch_finish_update(PathRoot r, uint slot)
 // ---------------------------------------------------------------------------------------------
 // The raygen
 
-// Traces the ray of `slot`'s path and runs the shader of what it met, after a reorder by that
-// shader, whether the vertex is the last bounce's, whether its material may be rich and whether
-// it emits: the step it returns.
+// Composites what lies in front of `ray`'s reach, a LAYERS trace of instance mask `mask` for each
+// batch of LAYERS_KEPT layers, at most PARTICLE_CANDIDATES of them: STEP_ENDED where nothing
+// goes on through them, else 0.
+uint trace_layers(PathRoot r, RayDesc ray, uint mask)
+{
+    Payload p;
+    p.words = layers_payload(ray.TMax, mask, false, uint4(0));
+    for (uint taken = 0; taken < PARTICLE_CANDIDATES; taken += LAYERS_KEPT)
+    {
+        trace_hit(r.scene.tlas, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, mask, RAY_TYPE_LAYERS, RAY_TYPES, 0, ray, p);
+        uint met = layers_met(p.words);
+        if (met == 0)
+            return 0;
+        Payload c;
+        c.words = uint4(min(met, LAYERS_KEPT), asuint(ray.TMax), 0, 0);
+        call(CALL_LAYERS, c);
+        if ((c.words.x & STEP_ENDED) != 0 || met <= LAYERS_KEPT)
+            return c.words.x;
+        ray.TMin = asfloat(c.words.y);
+        p.words = layers_payload(ray.TMax, mask, true, c.words.yyyy);
+    }
+    return 0;
+}
+
+// Traces the ray of `slot`'s path, takes what lies in front of its hit and along it, and runs the
+// shader of what it met, after a reorder by that shader, whether the vertex is the last bounce's,
+// whether its material may be rich and whether it emits: the step it returns.
 uint trace_path(PathRoot r, uint slot)
 {
     uint mask;
     bool last;
+    uint front;
     Payload p;
-    RayDesc ray = launch_path_ray(r, slot, mask, p.words, last);
+    RayDesc ray = launch_path_ray(r, slot, mask, p.words, last, front);
     Traced h = trace_hit(r.scene.tlas, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, mask, RAY_TYPE_PATH, RAY_TYPES, 0, ray, p);
+    float reach = h.hit() ? h.t() : ray.TMax;
+    if ((front & 0xff) != 0)
+    {
+        RayDesc layers = ray;
+        layers.TMax = reach;
+        if ((trace_layers(r, layers, front & 0xff) & STEP_ENDED) != 0)
+            return STEP_ENDED;
+    }
+    if ((front & FRONT_SEGMENT) != 0)
+    {
+        Payload c;
+        c.words = uint4(h.hit() ? 1u : 0u, asuint(reach), 0, 0);
+        call(CALL_SEGMENT, c);
+        if (c.words.x != 0)
+            return c.words.x;
+    }
     uint flags = h.hit() ? h.record<HitData>().flags : 0;
     uint hint = (last ? 4u : 0u) | ((flags & HIT_LOBED) != 0 ? 2u : 0u) | ((flags & HIT_EMITS) != 0 ? 1u : 0u);
     h.reorder(hint, 3);
@@ -994,12 +1372,39 @@ uint trace_path(PathRoot r, uint slot)
     return p.words.x;
 }
 
-// Traces the shadow ray of `slot`'s vertex and adds what it lets through.
+// Multiplies what the medium proxies with a volume along `ray`, the shadow ray of `slot`'s vertex,
+// let through into its contribution, by LAYERS traces over MASK_MEDIUM of LAYERS_KEPT proxies
+// each, at most SHADOW_CANDIDATES of them, as many as its shadow trace counts.
+void march_proxies(PathRoot r, RayDesc ray)
+{
+    Payload p;
+    p.words = layers_payload(ray.TMax, MASK_MEDIUM, false, uint4(0));
+    for (uint taken = 0; taken < SHADOW_CANDIDATES; taken += LAYERS_KEPT)
+    {
+        trace_hit(r.scene.tlas, RAY_FLAG_NONE, MASK_MEDIUM, RAY_TYPE_LAYERS, RAY_TYPES, 0, ray, p);
+        uint met = layers_met(p.words);
+        if (met == 0)
+            return;
+        Payload c;
+        c.words = uint4(min(met, LAYERS_KEPT), 0, 0, 0);
+        call(CALL_PROXY_MARCH, c);
+        if (met <= LAYERS_KEPT)
+            return;
+        ray.TMin = asfloat(c.words.y);
+        p.words = layers_payload(ray.TMax, MASK_MEDIUM, true, c.words.yyyy);
+    }
+}
+
+// Traces the shadow ray of `slot`'s vertex and adds what it lets through: where it passed a
+// medium proxy with a volume and nothing blocked it, through the proxies' marches.
 void trace_shadow<M : IMedium>(PathRoot r, uint slot)
 {
     Payload p;
     RayDesc ray = launch_shadow_ray(r, slot, p.words);
     Traced h = trace_hit(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, 0, ray, p);
+    ShadowCover c = { asfloat(p.words.xyz), p.words.w };
+    if (c.has(SHADOW_VOLUME) && any(c.product > 0.0) && (!h.hit() || c.has(SHADOW_OVERFLOW)))
+        march_proxies(r, ray);
     launch_shadow_add<M>(r, slot, p.words, h.hit());
 }
 
@@ -1089,6 +1494,8 @@ uint direct_call(uint step)
         return CALL_DIRECT_EXIT;
     if (kind == CLASS_LEAVE)
         return CALL_DIRECT_LEAVE;
+    if (kind == CLASS_SCATTER)
+        return CALL_DIRECT_MEDIUM;
     return (step & STEP_RICH) != 0 ? CALL_DIRECT_RICH : CALL_DIRECT_PLAIN;
 }
 
@@ -1099,6 +1506,8 @@ uint scatter_call(uint step)
         return CALL_SCATTER_EXIT;
     if (kind == CLASS_LEAVE)
         return CALL_SCATTER_LEAVE;
+    if (kind == CLASS_SCATTER)
+        return CALL_SCATTER_MEDIUM;
     return (step & STEP_RICH) != 0 ? CALL_SCATTER_RICH : CALL_SCATTER_PLAIN;
 }
 

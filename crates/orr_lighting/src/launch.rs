@@ -22,7 +22,7 @@ use crate::{Error, KernelSet, module};
 
 /// `path/launch.slang`'s SLOT_WORDS, WALK_WORDS and INTERIORS_WORDS: the words of a path's slot,
 /// and those of the parts the paths that walk and that track interiors add to it.
-const SLOT_WORDS: u64 = 19;
+const SLOT_WORDS: u64 = 28;
 const WALK_WORDS: u64 = 15;
 const INTERIORS_WORDS: u64 = 7;
 
@@ -39,19 +39,28 @@ fn slot_words(features: u32, view: bool) -> u64 {
 const MAX_SLOTS: u32 = 1 << 20;
 
 /// The stages the pipeline holds one of, first, by index: the raygens, the miss shader, the
-/// medium proxies' intersection and any-hit shaders and the walk meet's closest-hit.
-const FIXED: [&str; 6] = [
+/// medium proxies' intersection and any-hit shaders, the walk meet's closest-hit, and what layer
+/// rays keep of triangles, medium proxies and light proxies.
+const FIXED: [&str; 10] = [
     "path_view",
     "path_update",
     "miss_path",
     "box_medium_hit",
     "proxy_shadow_hit",
     "walk_meet",
+    "cover_layers_hit",
+    "cover_layers_medium_hit",
+    "box_light_hit",
+    "cover_layers_light_hit",
 ];
 const MISS: u32 = 2;
 const MEDIUM_INTERSECTION: u32 = 3;
 const MEDIUM_ANY_HIT: u32 = 4;
 const WALK_MEET: u32 = 5;
+const LAYERS_ANY_HIT: u32 = 6;
+const MEDIUM_LAYERS_ANY_HIT: u32 = 7;
+const LIGHT_INTERSECTION: u32 = 8;
+const LIGHT_LAYERS_ANY_HIT: u32 = 9;
 
 /// What the pipeline holds per pin after those (`HitGroups`): the closest-hit shaders of a copy's
 /// clusters, of a producer entry's clusters and of strands, and the any-hit shaders under path and
@@ -72,8 +81,8 @@ const COVER_SHADOW: usize = 4;
 /// Then the callables, in `path/launch.slang`'s CALL_* order, each with the lobes of the BSDF its
 /// vertices may have: next-event estimation and the scatter are made for a plain surface's and a
 /// rich one's. A walk's ends are made rich, as a walk starts only from a vertex with a subsurface
-/// weight.
-const CALLABLES: [(&str, bool); 14] = [
+/// weight. What lies along a ray and a scatter in a medium shade no surface.
+const CALLABLES: [(&str, bool); 19] = [
     ("start_view", true),
     ("start_update", true),
     ("emission", true),
@@ -88,6 +97,11 @@ const CALLABLES: [(&str, bool); 14] = [
     ("scatter_exit", true),
     ("direct_leave", true),
     ("scatter_leave", true),
+    ("segment", false),
+    ("layers", false),
+    ("march_proxy", false),
+    ("direct_medium", false),
+    ("scatter_medium", false),
 ];
 
 /// The geometry a hit shader runs on, which its stage is made for.
@@ -216,6 +230,17 @@ impl PathPipeline {
             closest_hit: Some(WALK_MEET),
             ..HitGroup::default()
         });
+        for (any_hit, intersection) in [
+            (LAYERS_ANY_HIT, None),
+            (MEDIUM_LAYERS_ANY_HIT, Some(MEDIUM_INTERSECTION)),
+            (LIGHT_LAYERS_ANY_HIT, Some(LIGHT_INTERSECTION)),
+        ] {
+            hit_groups.push(HitGroup {
+                closest_hit: None,
+                any_hit: Some(any_hit),
+                intersection,
+            });
+        }
         let desc = RayPipelineDesc {
             stages: &stages,
             raygens: &[ShaderRecord::new(0), ShaderRecord::new(1)],
@@ -241,6 +266,9 @@ impl PathPipeline {
                 shadow: Some(3 * pins),
                 medium_shadow: Some(4 * pins),
                 walk_meet: Some(4 * pins + 1),
+                layers: Some(4 * pins + 2),
+                medium_layers: Some(4 * pins + 3),
+                light_layers: Some(4 * pins + 4),
                 ..groups
             },
             unlaunched: Mutex::new(HashSet::new()),

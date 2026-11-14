@@ -93,6 +93,9 @@ public static const uint FEATURE_RAY_SHADES = 1 << 3;
 // interior, and may track a plane stack.
 public static const uint FEATURE_INTERIORS = 1 << 4;
 public static const uint FEATURE_STACK = 1 << 5;
+// The pipeline path tracer's segments outside interiors march a medium: the build links one, or
+// the view has froxels. Without either a segment changes nothing but its sampler dimension.
+public static const uint FEATURE_SEGMENTS = 1 << 6;
 
 uint round_now(PathRoot r) { return r.round; }
 uint round_pass(PathRoot r) { return r.round_first; }
@@ -139,7 +142,7 @@ PathRoot update_root(PathRoot r)
     r.light_flags = 0;
     r.dof_background.index = IMAGE_NONE;
     r.dielectric_flags &= DIELECTRIC_DISPERSION;
-    r.features &= FEATURE_INTERIORS | FEATURE_STACK | FEATURE_RAY_SHADES;
+    r.features &= FEATURE_INTERIORS | FEATURE_STACK | FEATURE_RAY_SHADES | FEATURE_SEGMENTS;
     r.pixel_fraction = 1.0;
     return r;
 }
@@ -225,8 +228,8 @@ static const uint LOOP_KEY_SHIFT = 16;
 public static const uint LOOP_CAMERA = 1 << 0;        // the path has no vertex yet: its ray is the camera ray
 static const uint LOOP_WALKED = 1 << 1;
 public static const uint LOOP_DISPERSIVE = 1 << 2;    // the last vertex is a layer with a dispersive side
-static const uint LOOP_THROUGH = 1 << 3;       // the path crossed a chain vertex since it last scattered
-static const uint LOOP_LAST = 1 << 4;          // a scatter took the cache's light
+public static const uint LOOP_THROUGH = 1 << 3;       // the path crossed a chain vertex since it last scattered
+public static const uint LOOP_LAST = 1 << 4;          // a scatter took the cache's light
 public static const uint LOOP_COUNTED = 1 << 5;       // the iteration's light counts toward the mode
 static const uint LOOP_CARRIED = 1 << 6;       // the froxels hold no camera segment through an interior
 public static const uint LOOP_GBUFFER_START = 1 << 7; // the path starts on the G-buffer's surface, its first vertex pending
@@ -2314,6 +2317,30 @@ public bool interior_walk_ended(PathRoot r, inout PathLoop p, inout Interior int
     return true;
 }
 
+// The scatter of a path's ray at `point` inside the medium of interior `medium`, of anisotropy
+// `anisotropy`, as the trace stage makes it: where the scatter is the camera ray's vertex, at
+// `t` m from the eye, the record's view of it; in the cache, the light it holds for the medium,
+// which ends the path past the vertex's next-event estimation; and the end of the iteration that
+// reached it. False where the path ends.
+public bool reach_scatter<R : IVertexRecord>(PathRoot r, inout PathLoop p, ShadeState c, inout R record, PathContext x, float3 point, uint medium, float anisotropy, float t, inout Sampler rng)
+{
+    LayerVertex l = scatter_vertex(r.view, point, c.ray.dir, medium, anisotropy);
+    if (has(p.flags, LOOP_CAMERA))
+        record.arrive(r, l.x, bsdf_unprepared(), t, false);
+    if (x.cache && !x.reference)
+    {
+        if (has(p.flags, LOOP_COUNTED))
+            p.radiance += c.spectral.color(p.throughput * interior_ambient(r, l.x.surface.position, c.ray.dir, rng));
+        set_flag(p.flags, LOOP_LAST, true);
+    }
+    set_flag(p.flags, LOOP_CAMERA, false);
+    p.iteration++;
+    if (!iteration_runs(r, p, VERTEX_SCATTER, true))
+        return false;
+    set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
+    return true;
+}
+
 // The vertex where an interior's walk leaves at `at` with outward normal `n` along `dir`, through a
 // surface of `ior` times the outside's.
 ShadeVertex leave_shade_vertex(ViewConstants* v, float3 at, float3 n, float3 dir, float ior)
@@ -2338,6 +2365,27 @@ public bool shade_leave_scatter<S : ISurfaces, R : IVertexRecord>(PathRoot r, Pa
     bool walking;
     float3 wi;
     return vertex_scatter<S, SHADE_VERTEX, R>(r, f, p, c, record, x, VERTEX_LEAVE, rng, leave_shade_vertex(r.view, at, n, dir, ior), nee, walking, wi);
+}
+
+// Next-event estimation at the scatter at `point` in the medium of interior `medium`, of
+// anisotropy `anisotropy`, reached along `c.ray`: its shadow ray is in `nee`. False where the
+// path ends.
+public bool shade_medium_direct<S : ISurfaces, M : IMedium, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, float3 point, uint medium, float anisotropy, inout Sampler rng, out ShadeNee nee)
+{
+    ShadeVertex sv = no_vertex();
+    sv.l = scatter_vertex(r.view, point, c.ray.dir, medium, anisotropy);
+    return vertex_nee<S, M, SHADE_VERTEX, R>(r, f, p, c, record, x, VERTEX_SCATTER, rng, sv, nee);
+}
+
+// The rest of the iteration from that scatter, past next-event estimation `nee`: its next ray
+// in `c.ray`. False where the path ends.
+public bool shade_medium_scatter<S : ISurfaces, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, float3 point, uint medium, float anisotropy, ShadeNee nee, inout Sampler rng)
+{
+    ShadeVertex sv = no_vertex();
+    sv.l = scatter_vertex(r.view, point, c.ray.dir, medium, anisotropy);
+    bool walking;
+    float3 wi;
+    return vertex_scatter<S, SHADE_VERTEX, R>(r, f, p, c, record, x, VERTEX_SCATTER, rng, sv, nee, walking, wi);
 }
 
 // What shadow ray `nee`, which found `vis` through plane stack `stack`, adds to the path from
