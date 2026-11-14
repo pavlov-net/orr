@@ -17,7 +17,7 @@ use orr_scene::{
 };
 
 use crate::caustics::PhotonMap;
-use crate::launch::{LaunchMemory, PathPipeline, Raygen};
+use crate::launch::{FEATURE_LAYERS, LaunchMemory, PathPipeline, Raygen};
 use crate::media::{
     MediaKernels, MediaSettings, MediaStats, MediaView, fogged, links_medium, readers, shows_media,
 };
@@ -1122,11 +1122,7 @@ fn runs_rays(entry: PathEntry) -> bool {
 fn unlaunched(path_features: u32, pass: &ViewPass) -> Vec<&'static str> {
     let features = pass.scene_features;
     let asks = [
-        (
-            features.contains(SceneFeatures::LAYERS),
-            "dielectric and presence layers",
-        ),
-        (path_features & FEATURE_INTERIORS != 0, "interiors"),
+        (path_features & FEATURE_STACK != 0, "plane stacks"),
         (
             features.contains(SceneFeatures::COATED_EMITTERS),
             "the coats of emitters a shadow ray reaches",
@@ -2300,8 +2296,7 @@ impl LightingKernels {
     /// [`Self::record_paths`] through the pipeline path tracer `launch`, from the view paths' root
     /// `path`: the layer guides and the frame's caustic photons, then the view's paths and its
     /// update paths, then its background layer's, each source in one launch per slice of the
-    /// paths the view's memory holds. The paths hold no interior, plane stack or wavelengths and
-    /// walk only through subsurface materials; what else of the frame they do not render yet
+    /// paths the view's memory holds. The paths track no plane stack; what else of the frame they do not render yet
     /// ([`unlaunched`]) the caller logs once for each mix.
     #[allow(clippy::too_many_arguments)]
     fn record_launched(
@@ -2321,13 +2316,24 @@ impl LightingKernels {
         self.record_layers(list, view, pass, lighting, path)?;
         let reference = lighting.reference.is_some();
         let segments = self.support.masked.linked_medium() || path.froxels != GpuPtr::NULL;
+        let layers = pass.scene_features.contains(SceneFeatures::LAYERS);
+        let features = path.features & (FEATURE_WALK | FEATURE_INTERIORS | FEATURE_DISPERSION)
+            | if segments { FEATURE_SEGMENTS } else { 0 }
+            | if layers { FEATURE_LAYERS } else { 0 };
+        // A path that may meet a layer or lie in an interior takes the dielectric depth's
+        // iterations too.
+        let depth = if layers || features & FEATURE_INTERIORS != 0 {
+            path.dielectric_depth
+        } else {
+            0
+        };
         let root = PathRoot {
-            features: (path.features & FEATURE_WALK) | if segments { FEATURE_SEGMENTS } else { 0 },
-            dielectric_flags: path.dielectric_flags & !DIELECTRIC_DISPERSION,
+            features,
+            dielectric_flags: path.dielectric_flags,
             source: PATH_SOURCE_VIEW,
             round_next: rounds(
                 lighting.max_bounces,
-                0,
+                depth,
                 reference,
                 path.features & FEATURE_WALK != 0,
             )?,
@@ -2340,19 +2346,20 @@ impl LightingKernels {
             let blocks = view.extent.map(|e| e.div_ceil(path.update_block));
             blocks[0] * blocks[1]
         };
-        let features = (root.features, update_root(&root).features);
+        // The update paths keep the view's layers part but split by no wavelength.
+        let update_features = update_root(&root).features | (features & FEATURE_LAYERS);
         if !view
             .launched
             .as_ref()
-            .is_some_and(|m| m.fits(pixels, features.0, update, features.1))
+            .is_some_and(|m| m.fits(pixels, root.features, update, update_features))
         {
             view.launched = None;
             view.launched = Some(LaunchMemory::new(
                 &view.device,
                 pixels,
-                features.0,
+                root.features,
                 update,
-                features.1,
+                update_features,
             )?);
         }
         let root = PathRoot {
@@ -2383,6 +2390,7 @@ impl LightingKernels {
         if update > 0 {
             let update_root = PathRoot {
                 source: PATH_SOURCE_UPDATE,
+                features: update_features,
                 ..update_root(&root)
             };
             launch.record(
@@ -2509,11 +2517,18 @@ impl LightingKernels {
                 self.record_staged_photons(list, view, pass, lighting, &photon_root, may, photons)?;
             }
             PhotonPaths::Launched { launch, hits } => {
+                // Photons that may meet a layer or lie in an interior take the dielectric depth's
+                // iterations too.
+                let layers = photon_root.features & (FEATURE_LAYERS | FEATURE_INTERIORS) != 0;
                 let root = PathRoot {
                     source: PATH_SOURCE_PHOTON,
                     round_next: rounds(
                         photon_root.max_bounces,
-                        0,
+                        if layers {
+                            photon_root.dielectric_depth
+                        } else {
+                            0
+                        },
                         lighting.reference.is_some(),
                         false,
                     )?,

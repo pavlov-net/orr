@@ -96,6 +96,9 @@ public static const uint FEATURE_STACK = 1 << 5;
 // The pipeline path tracer's segments outside interiors march a medium: the build links one, or
 // the view has froxels. Without either a segment changes nothing but its sampler dimension.
 public static const uint FEATURE_SEGMENTS = 1 << 6;
+// And, read by the pipeline path tracer alone, that its paths may meet dielectric or presence
+// layers: their slots hold a layer vertex's words and a shadow ray's crossings.
+public static const uint FEATURE_LAYERS = 1 << 7;
 
 uint round_now(PathRoot r) { return r.round; }
 uint round_pass(PathRoot r) { return r.round_first; }
@@ -109,7 +112,7 @@ bool stack_tracked(PathRoot r)
 }
 
 // Whether paths of `r` may split by wavelength.
-bool spectral_tracked(PathRoot r)
+public bool spectral_tracked(PathRoot r)
 {
     return may(MAY_DISPERSION) && (r.features & FEATURE_DISPERSION) != 0;
 }
@@ -226,12 +229,12 @@ public void count_ray(inout PathLoop p)
 // `PathLoop.flags`. The bits from LOOP_KEY_SHIFT up hold the coherence key of the pending vertex.
 static const uint LOOP_KEY_SHIFT = 16;
 public static const uint LOOP_CAMERA = 1 << 0;        // the path has no vertex yet: its ray is the camera ray
-static const uint LOOP_WALKED = 1 << 1;
+public static const uint LOOP_WALKED = 1 << 1;
 public static const uint LOOP_DISPERSIVE = 1 << 2;    // the last vertex is a layer with a dispersive side
 public static const uint LOOP_THROUGH = 1 << 3;       // the path crossed a chain vertex since it last scattered
 public static const uint LOOP_LAST = 1 << 4;          // a scatter took the cache's light
 public static const uint LOOP_COUNTED = 1 << 5;       // the iteration's light counts toward the mode
-static const uint LOOP_CARRIED = 1 << 6;       // the froxels hold no camera segment through an interior
+public static const uint LOOP_CARRIED = 1 << 6;       // the froxels hold no camera segment through an interior
 public static const uint LOOP_GBUFFER_START = 1 << 7; // the path starts on the G-buffer's surface, its first vertex pending
 static const uint LOOP_MEDIUM = 1 << 8;        // the pending vertex is the trace stage's: a scatter or a way out
 static const uint LOOP_LEAVING = 1 << 9;       // and of those a walk leaving an interior
@@ -310,7 +313,7 @@ static const uint SHADOW_DISPERSION = 1 << 2;
 public static const uint SHADOW_FEEDBACK = 1 << 3;
 public static const uint SHADOW_COUNTED = 1 << 4;
 static const uint SHADOW_BEND = 1 << 5;     // a directional light's ray looks for plane stacks
-static const uint SHADOW_INTO = 1 << 6;     // the ray leaves into the surface the vertex lies on
+public static const uint SHADOW_INTO = 1 << 6;     // the ray leaves into the surface the vertex lies on
 public static const uint SHADOW_DEPTH_SHIFT = 8;
 
 // The direction a walk enters its vertex along, for the walk stage, and what it resolves the
@@ -502,7 +505,7 @@ PathFixed load_fixed(PathRoot r, uint slot)
 }
 
 // Whether `pixel` lies on a tile the view's layer guides traced.
-bool pixel_traced(PathRoot r, uint2 pixel)
+public bool pixel_traced(PathRoot r, uint2 pixel)
 {
     uint2 extent = r.gbuffer.extent;
     return traced_tiles(r.layers, extent)[layer_tile(extent, pixel)] != 0;
@@ -1216,14 +1219,14 @@ public void set_flag(inout uint flags, uint bit, bool on)
 }
 
 // Whether the iteration's light counts toward the root's mode, from the state at its top.
-bool iteration_counted(PathRoot r, PathLoop p)
+public bool iteration_counted(PathRoot r, PathLoop p)
 {
     return path_mode(r) == PATH_DIRECT ? p.depth == 0 : path_mode(r) == PATH_INDIRECT ? p.depth > 0
         : path_mode(r) == PATH_SUBSURFACE ? has(p.flags, LOOP_WALKED) : true;
 }
 
 // The top of an iteration: whether the path goes on into it from vertex kind `kind`.
-bool iteration_runs(PathRoot r, PathLoop p, uint kind, bool alive)
+public bool iteration_runs(PathRoot r, PathLoop p, uint kind, bool alive)
 {
     return alive && p.iteration < path_iterations(r) && (kind == VERTEX_LAYER || p.opaque <= r.max_bounces + 1);
 }
@@ -2393,6 +2396,79 @@ public bool shade_leave_scatter<S : ISurfaces, R : IVertexRecord>(PathRoot r, Pa
     return vertex_scatter<S, SHADE_VERTEX, R>(r, f, p, c, record, x, VERTEX_LEAVE, rng, leave_shade_vertex(r.view, at, n, dir, ior), nee, walking, wi);
 }
 
+// The BSDF of layer vertex `l`, as the path's state at it says: every body that shades the
+// layer prepares it alike.
+Bsdf layer_bsdf<R : IPathRecord>(PathRoot r, PathLoop p, ShadeState c, R record, PathContext x, LayerVertex l)
+{
+    // Coat, fuzz and film collapse once the path has scattered, outside the reference.
+    return prepare_vertex(r.scene, l, c.interior, p.opaque > 0 && !x.reference, false, record.adjoint(), c.spectral.hero());
+}
+
+// Next-event estimation at layer `pl`, reached along `dir` by a ray `t` m long (the camera ray's
+// vertex's distance from the eye where `first` holds), and before it the rest of the iteration
+// that reached it, as `resolve_layer` takes it once the layer is resolved: its wavelengths where
+// it disperses, the record's view of it and its emission. Its shadow ray is in `nee`. False where
+// the path ends.
+public bool shade_layer_direct<S : ISurfaces, M : IMedium, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, PackedLayer pl, float3 dir, float t, bool first, inout Sampler rng, out ShadeNee nee)
+{
+    nee = no_nee(c.spectral);
+    SceneRoot* s = r.scene;
+    LightSetGpu* set = r.set;
+    LayerRay ray = c.ray;
+    bool counted = has(p.flags, LOOP_COUNTED);
+    bool through = has(p.flags, LOOP_THROUGH);
+    float3 own = ray.lit ? float3(0.0) : through ? p.keep : float3(1.0);
+    bool weigh = !x.one_technique && ray.pdf > 0.0;
+    ShadeVertex sv = no_vertex();
+    sv.l = unpack_layer(r.view, pl, dir);
+    if (first)
+        p.cone.width = cone_width(p.cone, sv.l.x.camera_distance);
+    bool dispersive = may(MAY_DISPERSION) && x.disperse && layer_disperses(s, sv.l, c.interior);
+    set_flag(p.flags, LOOP_DISPERSIVE, dispersive);
+    if (dispersive && !c.spectral.on)
+        c.spectral.start(wavelength_sample(r, f.pixel));
+    sv.b = layer_bsdf(r, p, c, record, x, sv.l);
+    if (first)
+        record.arrive(r, sv.l.x, sv.b, t, true);
+    float3 emitted = layer_emission(sv.b, pl);
+    if (may(MAY_EMISSIVE) && (x.count_bsdf || (first && !x.photon)) && counted && any(emitted > 0.0))
+    {
+        PackedSurface ps = pl.surface;
+        EmitterHit emitter = EmitterHit();
+        if (!first && (weigh || any(own != 1.0)))
+            emitter = emitter_hit(set, ps.instance, ps.cluster, ps.primitive, ps.barycentrics, (ps.flags & SURFACE_SWAPPED) != 0);
+        float w = 1.0;
+        if (weigh && emitter.density > 0.0)
+        {
+            LocalLights* ray_local = nullptr;
+            if (ray.local)
+                ray_local = pixel_local_lights(r, f.pixel);
+            float3 toward = emitter.point - ray.from;
+            float distance = length(toward);
+            float cos_to = distance > 0.0 ? dot(emitter.normal, toward / distance) : 0.0;
+            w = mis_balance(ray.pdf, ray.run * nee_emissive_pdf(set, ray_local, ray.normal, emitter, distance, cos_to));
+        }
+        float3 kept = emitter.density > 0.0 ? own : float3(1.0);
+        p.radiance += c.spectral.color(p.throughput * emitted * (w * kept));
+    }
+    if ((sv.l.x.surface.flags & GBUFFER_UNLIT) != 0 || !iteration_runs(r, p, VERTEX_LAYER, true))
+        return false;
+    set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
+    return vertex_nee<S, M, SHADE_VERTEX, R>(r, f, p, c, record, x, VERTEX_LAYER, rng, sv, nee);
+}
+
+// The rest of the iteration from layer `pl`, reached along `dir`, past next-event estimation
+// `nee` (`vertex_scatter`): the interiors past it are the path's from here on.
+public bool shade_layer_scatter<S : ISurfaces, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, PackedLayer pl, float3 dir, ShadeNee nee, inout Sampler rng)
+{
+    ShadeVertex sv = no_vertex();
+    sv.l = unpack_layer(r.view, pl, dir);
+    sv.b = layer_bsdf(r, p, c, record, x, sv.l);
+    bool walking;
+    float3 wi;
+    return vertex_scatter<S, SHADE_VERTEX, R>(r, f, p, c, record, x, VERTEX_LAYER, rng, sv, nee, walking, wi);
+}
+
 // Next-event estimation at the scatter at `point` in the medium of interior `medium`, of
 // anisotropy `anisotropy`, reached along `c.ray`: its shadow ray is in `nee`. False where the
 // path ends.
@@ -2461,10 +2537,11 @@ bool resolve_layer<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, ino
             p.radiance += c.spectral.color(p.throughput * interior_ambient(r, sh.surface.position, ray.dir, rng));
         return false;
     }
-    sv.l = layer_vertex(v, sh, ray.dir);
+    // The layer shades from its packed form, as the pipeline's layer shaders do.
+    PackedLayer pl = pack_layer(r, sh, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, ray.dir);
+    sv.l = unpack_layer(v, pl, ray.dir);
     StackFace face;
     sv.l.stack = may(MAY_STACK) && c.stack.valid && stack_face(s, h, x.disperse, face);
-    sv.l.chains = may(MAY_CAUSTICS) && surface_chains(r, sh.surface);
     if (first)
         p.cone.width = cone_width(p.cone, sv.l.x.camera_distance);
     bool disperse = may(MAY_DISPERSION) && x.disperse;
@@ -2480,7 +2557,8 @@ bool resolve_layer<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, ino
     // Emission, which the hit gives only on a side that emits, weighed against the light set's
     // sampling of the point, which takes its density from the vertex the ray left; a point the
     // light set never draws takes weight 1, and as no photon leaves it, the whole of its light.
-    if (may(MAY_EMISSIVE) && (x.count_bsdf || (first && !x.photon)) && counted && any(sv.b.emission() > 0.0))
+    float3 emitted = layer_emission(sv.b, pl);
+    if (may(MAY_EMISSIVE) && (x.count_bsdf || (first && !x.photon)) && counted && any(emitted > 0.0))
     {
         EmitterHit emitter = EmitterHit();
         if (!first && (weigh || any(own != 1.0)))
@@ -2494,7 +2572,7 @@ bool resolve_layer<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, ino
             w = mis_balance(ray.pdf, ray.run * nee_emissive_pdf(set, ray_local, ray.normal, emitter, distance, cos_to));
         }
         float3 kept = emitter.density > 0.0 ? own : float3(1.0);
-        p.radiance += c.spectral.color(p.throughput * sv.b.emission() * (w * kept));
+        p.radiance += c.spectral.color(p.throughput * emitted * (w * kept));
     }
     return (sv.l.x.surface.flags & GBUFFER_UNLIT) == 0;
 }

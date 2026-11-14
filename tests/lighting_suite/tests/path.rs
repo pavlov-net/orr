@@ -4,11 +4,13 @@
 //! as lights.
 
 use lighting_suite::bed::{
-    Accumulated, Analytic, BLACK_SPHERE, BUMPY_FLOOR, Bed, COATED_EMITTER, EMITTER, EMITTER_FIELD,
-    EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal, GLASS_SPHERE, GLOSSY_FLOOR, Item, MIRROR, NEAR,
-    PLUME, Particle, ParticleLook, Paths, QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR,
-    SUN, Spec, StrandRow, TILED_FLOOR, TINTED_FLOOR, TROUGH, WHITE_FLOOR, assert_close,
-    assert_within_noise, image_mean, luminance, mean_where, pixel_of, reference, surface_mean,
+    Accumulated, Analytic, BLACK_SPHERE, BUMPY_FLOOR, Bed, CLOUD_SPHERE, COATED_EMITTER,
+    DISPERSIVE_SPHERE, EMITTER, EMITTER_FIELD, EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal,
+    FrostGuide, GLASS_SLAB, GLASS_SPHERE, GLOSSY_FLOOR, Item, MASKED_PANE, MILKY_SLAB, MIRROR,
+    NEAR, PLUME, Particle, ParticleLook, Paths, QUADRANT_EMITTER, ROUGH_SLAB, SKINNED_EMITTER, SKY,
+    SMOOTH_FLOOR, SUN, Spec, StrandRow, TILED_FLOOR, TINTED_FLOOR, TINTED_SLAB, TROUGH, WATER_BOX,
+    WHITE_FLOOR, assert_close, assert_within_noise, image_mean, luminance, mean_where, pixel_of,
+    reference, surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
@@ -18,7 +20,7 @@ use lighting_suite::{
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::types::LocalLights;
 use orr_lighting::{
-    DirectionalLight, DiscProfile, DofBackgroundPass, Light, LightId, LightSetGpu,
+    CausticSettings, DirectionalLight, DiscProfile, DofBackgroundPass, Light, LightId, LightSetGpu,
     LightingDebugView, OriginProbes, PathEntry, ReferenceSettings, SceneLightingSettings, ThinLens,
     ViewLighting,
 };
@@ -81,20 +83,41 @@ fn an_albedo_one_sphere_in_a_uniform_environment_returns_the_environment() {
     assert_clean();
 }
 
-/// The pipeline path tracer renders opaque scenes as the staged loop does: a sphere on the ground
-/// under a sun and a sky, the Cornell box lit by its emissive quad, and an alpha-tested quad.
 /// Real-time frames redraw the light tiles, so runs differ by their noise: the pipeline's frames
 /// at the staged loop's seed sit as close to the staged loop's as its frames at another seed do,
 /// and the two means agree over frames that alternate, which see the world cache alike. The
 /// world cache settles over the staged loop's frames first.
+fn assert_pipeline_renders_as_staged(what: &str, bed: &mut Bed, staged: &Paths, launched: &Paths) {
+    bed.set_hit_pipeline(launched.hit_pipeline());
+    render_paths(bed, staged, 32, 3);
+    let piped = render_paths(bed, launched, 32, 1);
+    let same_seed = render_paths(bed, staged, 32, 1);
+    let noise = render_paths(bed, staged, 32, 2);
+    assert_within_noise(what, &piped, &same_seed, &noise, 1.25);
+    let (mut of_staged, mut of_launched) = (Vec::new(), Vec::new());
+    for k in 0..24 {
+        of_staged.push(image_mean(&render_paths(bed, staged, 1, 4 + k))[1]);
+        of_launched.push(image_mean(&render_paths(bed, launched, 1, 4 + k))[1]);
+    }
+    assert_same_mean(what, &of_launched, &of_staged);
+}
+
+/// The pipeline path tracer and the staged loop, both with `settings`.
+fn both(settings: ViewLighting) -> (Paths, Paths) {
+    (
+        Paths::new(&KernelSet::default(), PathEntry::Compute, settings),
+        Paths::new(&KernelSet::default(), PathEntry::Pipeline, settings),
+    )
+}
+
+/// The pipeline path tracer renders opaque scenes as the staged loop does: a sphere on the ground
+/// under a sun and a sky, the Cornell box lit by its emissive quad, and an alpha-tested quad.
 #[test]
 fn the_pipeline_renders_opaque_scenes_as_the_staged_loop_does() {
     if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
         return;
     }
-    let settings = ViewLighting::default();
-    let staged = Paths::new(&KernelSet::default(), PathEntry::Compute, settings);
-    let launched = Paths::new(&KernelSet::default(), PathEntry::Pipeline, settings);
+    let (staged, launched) = both(ViewLighting::default());
     // At a pre-exposure of 1 the sunlit ground passes the HDR ceiling, which would clip the
     // samples that draw the sun.
     for (scene, pre_exposure) in [
@@ -102,23 +125,165 @@ fn the_pipeline_renders_opaque_scenes_as_the_staged_loop_does() {
         (Analytic::CornellBox, 1.0),
         (Analytic::AlphaQuad, 1.0 / 64.0),
     ] {
-        let what = format!("{scene:?}");
         let mut bed = Bed::new(scene);
-        bed.set_hit_pipeline(launched.hit_pipeline());
         bed.set_pre_exposure(pre_exposure);
-        render_paths(&mut bed, &staged, 32, 3);
-        let piped = render_paths(&mut bed, &launched, 32, 1);
-        let same_seed = render_paths(&mut bed, &staged, 32, 1);
-        let noise = render_paths(&mut bed, &staged, 32, 2);
-        assert_within_noise(&what, &piped, &same_seed, &noise, 1.25);
-        let (mut of_staged, mut of_launched) = (Vec::new(), Vec::new());
-        for k in 0..24 {
-            of_staged.push(image_mean(&render_paths(&mut bed, &staged, 1, 4 + k))[1]);
-            of_launched.push(image_mean(&render_paths(&mut bed, &launched, 1, 4 + k))[1]);
-        }
-        assert_same_mean(&what, &of_launched, &of_staged);
+        assert_pipeline_renders_as_staged(&format!("{scene:?}"), &mut bed, &staged, &launched);
     }
     assert_clean();
+}
+
+/// The pipeline path tracer renders glass as the staged loop does, in eight cases: a solid slab and a tinted one
+/// under the sky, from camera rays that the layer guides trace, and with the frosted-glass pass
+/// over a rough one; a thin-walled pane whose sunlit shadow a shadow ray's walk passes; a glass
+/// sphere that focuses the sun's caustic photons on the floor; a dispersive sphere that splits
+/// paths by wavelength; scattering interiors, which scatter and walk; an eye inside water, whose
+/// interiors start the path; and a lens in that water over a slab, whose rays start inside the
+/// interiors at the lens. Only the sphere's scene gathers caustic photons, and no scene puts a
+/// directional light over flat solid glass, which plane stacks would bend. Runs the cases `run`,
+/// in that order.
+fn glass_cases(run: std::ops::Range<usize>) {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    let lit = |copies: Vec<Item>, lights: Vec<Light>, eye: Vec3, target: Vec3| Spec {
+        copies: [vec![at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)], copies].concat(),
+        lights,
+        environment: Some(SKY),
+        eye,
+        target,
+        fov_y: 0.8,
+        focus: None,
+    };
+    let slabs = lit(
+        vec![
+            at(GLASS_SLAB, Mat3::IDENTITY, Vec3::new(-0.5, 0.5, 0.0)),
+            at(TINTED_SLAB, Mat3::IDENTITY, Vec3::new(0.9, 0.4, -0.6)),
+        ],
+        Vec::new(),
+        Vec3::new(0.0, 2.0, 3.5),
+        Vec3::new(0.0, 0.4, 0.0),
+    );
+    let frosted = lit(
+        vec![at(ROUGH_SLAB, Mat3::IDENTITY, Vec3::new(0.0, 0.5, 0.0))],
+        Vec::new(),
+        Vec3::new(0.0, 2.0, 3.5),
+        Vec3::new(0.0, 0.4, 0.0),
+    );
+    let lens = lit(
+        vec![at(GLASS_SPHERE, Mat3::IDENTITY, Vec3::new(0.0, 1.5, 0.0))],
+        vec![Light::Directional(SUN)],
+        Vec3::new(0.0, 3.0, 4.5),
+        Vec3::new(0.0, 0.5, 0.0),
+    );
+    let pane = lit(
+        vec![at(MASKED_PANE, Mat3::IDENTITY, Vec3::new(0.0, 1.1, 0.0))],
+        vec![Light::Directional(SUN)],
+        Vec3::new(0.5, 1.5, 3.5),
+        Vec3::new(0.0, 0.9, 0.0),
+    );
+    let prism = lit(
+        vec![at(
+            DISPERSIVE_SPHERE,
+            Mat3::IDENTITY,
+            Vec3::new(0.0, 1.0, 0.0),
+        )],
+        Vec::new(),
+        Vec3::new(0.0, 2.0, 4.0),
+        Vec3::new(0.0, 0.8, 0.0),
+    );
+    // The water box widened to 24 m, its top 4 m up.
+    let water = lit(
+        vec![
+            at(
+                WATER_BOX,
+                Mat3::from_diagonal(Vec3::new(4.0, 1.0, 4.0)),
+                Vec3::new(0.0, 1.99, 0.0),
+            ),
+            at(TINTED_SLAB, Mat3::IDENTITY, Vec3::new(0.0, 0.6, 0.0)),
+        ],
+        Vec::new(),
+        Vec3::new(0.0, 1.5, 2.0),
+        Vec3::ZERO,
+    );
+    // Scattering interiors: scatters in them, and walks where they scatter densely.
+    let milk = lit(
+        vec![
+            at(MILKY_SLAB, Mat3::IDENTITY, Vec3::new(0.0, 0.5, 0.0)),
+            at(CLOUD_SPHERE, Mat3::IDENTITY, Vec3::new(0.5, 2.3, -0.5)),
+        ],
+        Vec::new(),
+        Vec3::new(0.0, 3.0, 6.0),
+        Vec3::new(0.0, 1.0, 0.0),
+    );
+    let realtime = ViewLighting::default();
+    let thin_lens = ViewLighting {
+        reference: Some(ReferenceSettings {
+            lens: Some(ThinLens {
+                aperture_radius: 0.02,
+                focus_distance: 2.0,
+            }),
+            ..ReferenceSettings::default()
+        }),
+        ..reference(4)
+    };
+    // Each case's scene, whether its eye lies in the water, its settings, and whether it gathers
+    // caustic photons and runs the frosted-glass pass.
+    for (what, spec, under_water, settings, photons, frost) in [
+        ("slabs", slabs, false, realtime, false, false),
+        ("frosted slab", frosted, false, realtime, false, true),
+        ("pane", pane, false, realtime, false, false),
+        ("caustic of a sphere", lens, false, realtime, true, false),
+        ("dispersive sphere", prism, false, realtime, false, false),
+        ("milky slab and cloud", milk, false, realtime, false, false),
+        ("eye in water", water.clone(), true, realtime, false, false),
+        ("lens in water", water, true, thin_lens, false, false),
+    ]
+    .into_iter()
+    .skip(run.start)
+    .take(run.len())
+    {
+        let mut bed = Bed::with(spec);
+        bed.set_pre_exposure(1.0 / 64.0);
+        if !photons {
+            let no_photons = SceneLightingSettings {
+                caustics: CausticSettings {
+                    photons: 0,
+                    ..bed.lighting.settings().caustics
+                },
+                ..*bed.lighting.settings()
+            };
+            bed.lighting.set_settings(&no_photons).unwrap();
+        }
+        let settings = ViewLighting {
+            camera_medium: under_water.then(|| bed.material(WATER_BOX)),
+            ..settings
+        };
+        let (mut staged, mut launched) = both(settings);
+        if frost {
+            staged.frost_guide = Some(FrostGuide::new(0.25));
+            launched.frost_guide = Some(FrostGuide::new(0.25));
+        }
+        assert_pipeline_renders_as_staged(what, &mut bed, &staged, &launched);
+    }
+    assert_clean();
+}
+
+/// The cases of [`glass_cases`] with glass in the open.
+#[test]
+fn the_pipeline_renders_glass_as_the_staged_loop_does() {
+    glass_cases(0..3);
+}
+
+/// The cases of [`glass_cases`] whose glass focuses photons and splits wavelengths.
+#[test]
+fn the_pipeline_renders_caustics_and_dispersion_through_glass_as_the_staged_loop_does() {
+    glass_cases(3..5);
+}
+
+/// The cases of [`glass_cases`] with scattering interiors and water around the eye.
+#[test]
+fn the_pipeline_renders_interiors_as_the_staged_loop_does() {
+    glass_cases(5..8);
 }
 
 /// The pipeline path tracer walks subsurface materials as the staged loop does: the light that

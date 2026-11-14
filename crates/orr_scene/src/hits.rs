@@ -15,7 +15,7 @@ const RAY_TYPES: u32 = 3;
 const HIT_DATA_BYTES: u64 = 16;
 const FIXED_RUNS: u32 = 3;
 const FIXED_KINDS: usize = 5;
-const PINNED_KINDS: usize = 4;
+const PINNED_KINDS: usize = 6;
 
 /// The hit groups of a ray tracing pipeline that a scene's hit records name, by what each
 /// record serves: a group index of the pipeline, or `None` for records of zeros. A record of
@@ -50,6 +50,11 @@ pub struct HitGroups {
     /// The closest-hit a walk's step runs on a triangle it met, in place of the triangle's own,
     /// to read its geometry.
     pub walk_meet: Option<u32>,
+    /// Dielectric and presence layer triangles of copies' clusters under path rays: `path`'s
+    /// any-hit with the closest-hit that resolves a layer.
+    pub layer_path: Option<u32>,
+    /// Dielectric and presence layer triangles of producer entries' clusters under path rays.
+    pub producer_layer_path: Option<u32>,
 }
 
 impl HitGroups {
@@ -73,8 +78,14 @@ impl HitGroups {
             self.light_layers,
             self.walk_meet,
         ];
-        let pinned: [Option<u32>; PINNED_KINDS] =
-            [self.path, self.producer_path, self.strand_path, self.shadow];
+        let pinned: [Option<u32>; PINNED_KINDS] = [
+            self.path,
+            self.producer_path,
+            self.strand_path,
+            self.shadow,
+            self.layer_path,
+            self.producer_layer_path,
+        ];
         let pins = self.pins();
         fixed
             .into_iter()

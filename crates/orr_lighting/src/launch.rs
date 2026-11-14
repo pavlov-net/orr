@@ -16,22 +16,34 @@ use orr_scene::{HitGroups, SceneFeatures};
 use crate::shaders::path::pipeline::{self, Spec};
 use crate::shaders::types::{PathRoot, PathStages};
 use crate::staged::{
-    FEATURE_INTERIORS, FEATURE_WALK, MAY_ALL, MAY_RICH, RECORD_WORDS, UPDATE_RECORD_WORDS,
+    FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_WALK, MAY_ALL, MAY_RICH, RECORD_WORDS,
+    UPDATE_RECORD_WORDS,
 };
 use crate::{Error, KernelSet, module};
 
-/// `path/launch.slang`'s SLOT_WORDS, WALK_WORDS and INTERIORS_WORDS: the words of a path's slot,
-/// and those of the parts the paths that walk and that track interiors add to it.
+/// `path/launch.slang`'s SLOT_WORDS, WALK_WORDS, SLOT_LAYER_PART, SLOT_INTERIOR_PART and
+/// SLOT_SPECTRAL_PART: the words of a path's slot, and those of the parts the paths that walk,
+/// may meet layers, track interiors and split by wavelength add to it.
 const SLOT_WORDS: u64 = 28;
 const WALK_WORDS: u64 = 15;
-const INTERIORS_WORDS: u64 = 7;
+const LAYER_PART: u64 = 7;
+const INTERIOR_PART: u64 = 10;
+const SPECTRAL_PART: u64 = 5;
+
+/// `path/stages.slang`'s FEATURE_LAYERS: paths may meet dielectric or presence layers, which
+/// only the pipeline's slots keep a part for.
+pub(crate) const FEATURE_LAYERS: u32 = 1 << 7;
 
 /// The words of a slot of paths whose root has `features`, of a view's or its background layer's
 /// (`view`) or not, as `path/launch.slang`'s `slot_stride` lays it out.
 fn slot_words(features: u32, view: bool) -> u64 {
     let walk = view && features & (FEATURE_WALK | FEATURE_INTERIORS) != 0;
-    let interiors = features & FEATURE_INTERIORS != 0;
-    SLOT_WORDS + if walk { WALK_WORDS } else { 0 } + if interiors { INTERIORS_WORDS } else { 0 }
+    let part = |on: bool, words: u64| if on { words } else { 0 };
+    SLOT_WORDS
+        + part(walk, WALK_WORDS)
+        + part(features & FEATURE_LAYERS != 0, LAYER_PART)
+        + part(features & FEATURE_INTERIORS != 0, INTERIOR_PART)
+        + part(features & FEATURE_DISPERSION != 0, SPECTRAL_PART)
 }
 
 /// Paths of a source one launch runs at most, which bounds the memory a view's paths keep: a
@@ -68,24 +80,29 @@ const LIGHT_LAYERS_ANY_HIT: u32 = 11;
 /// What the pipeline holds per pin after those (`HitGroups`): the closest-hit shaders of a copy's
 /// clusters, of a producer entry's clusters and of strands, and the any-hit shaders under path and
 /// shadow rays, with what each may meet of the scene's geometry.
-const PINNED: [(&str, Geometry); 5] = [
+const PINNED: [(&str, Geometry); 7] = [
     ("resolve", Geometry::Copies),
     ("resolve", Geometry::Producers),
     ("resolve_strand", Geometry::Any),
     ("cover_path_hit", Geometry::Any),
     ("cover_shadow_hit", Geometry::Any),
+    ("layer_resolve", Geometry::Copies),
+    ("layer_resolve", Geometry::Producers),
 ];
 const RESOLVE_COPIES: usize = 0;
 const RESOLVE_PRODUCERS: usize = 1;
 const RESOLVE_STRANDS: usize = 2;
 const COVER_PATH: usize = 3;
 const COVER_SHADOW: usize = 4;
+const LAYER_COPIES: usize = 5;
+const LAYER_PRODUCERS: usize = 6;
 
 /// Then the callables, in `path/launch.slang`'s CALL_* order, each with the lobes of the BSDF its
 /// vertices may have: next-event estimation and the scatter are made for a plain surface's and a
 /// rich one's. A walk's ends are made rich, as a walk starts only from a vertex with a subsurface
-/// weight. What lies along a ray and a scatter in a medium shade no surface.
-const CALLABLES: [(&str, bool); 25] = [
+/// weight, and so are the layer's and the window's, whose surfaces may have every lobe. What lies
+/// along a ray and a scatter in a medium shade no surface.
+const CALLABLES: [(&str, bool); 29] = [
     ("start_view", true),
     ("start_update", true),
     ("start_photon", true),
@@ -111,6 +128,10 @@ const CALLABLES: [(&str, bool); 25] = [
     ("march_proxy", false),
     ("direct_medium", false),
     ("scatter_medium", false),
+    ("gbuffer_start", true),
+    ("direct_layer", true),
+    ("scatter_layer", true),
+    ("window", true),
 ];
 
 /// The geometry a hit shader runs on, which its stage is made for.
@@ -223,6 +244,8 @@ impl PathPipeline {
             (Some(RESOLVE_PRODUCERS), Some(COVER_PATH)),
             (Some(RESOLVE_STRANDS), None),
             (None, Some(COVER_SHADOW)),
+            (Some(LAYER_COPIES), Some(COVER_PATH)),
+            (Some(LAYER_PRODUCERS), Some(COVER_PATH)),
         ] {
             for pin in 0..pins {
                 hit_groups.push(HitGroup {
@@ -276,11 +299,13 @@ impl PathPipeline {
                 producer_path: Some(pins),
                 strand_path: Some(2 * pins),
                 shadow: Some(3 * pins),
-                medium_shadow: Some(4 * pins),
-                walk_meet: Some(4 * pins + 1),
-                layers: Some(4 * pins + 2),
-                medium_layers: Some(4 * pins + 3),
-                light_layers: Some(4 * pins + 4),
+                layer_path: Some(4 * pins),
+                producer_layer_path: Some(5 * pins),
+                medium_shadow: Some(6 * pins),
+                walk_meet: Some(6 * pins + 1),
+                layers: Some(6 * pins + 2),
+                medium_layers: Some(6 * pins + 3),
+                light_layers: Some(6 * pins + 4),
                 ..groups
             },
             unlaunched: Mutex::new(HashSet::new()),

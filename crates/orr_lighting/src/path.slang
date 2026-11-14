@@ -1114,6 +1114,80 @@ public LayerVertex layer_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
     return l;
 }
 
+// What a layer's surface keeps beside the G-buffer's words, which hold no transmission and the
+// IOR at 8 bits: the IOR as resolved, since the interiors take the material's, the transmission's
+// color and weight as halves, the section and what its medium reads where the ray met it.
+public struct LayerWords
+{
+    public float specular_ior;
+    public uint transmission_rg;
+    public uint transmission_b_weight;
+    public uint section;
+    public float4 medium_point;
+}
+
+// A resolved layer as a path vertex holds it between the shaders of one vertex.
+public struct PackedLayer
+{
+    public PackedSurface surface;
+    public LayerWords layer;
+}
+
+// The layer at resolved hit `sh` of instance `instance`, cluster `cluster`, triangle `primitive`
+// at `bary`, met by a ray along `dir`, packed.
+public PackedLayer pack_layer(PathRoot r, SurfaceHit sh, uint instance, uint cluster, uint primitive, float2 bary, float3 dir)
+{
+    GSurface g = sh.surface;
+    bool front = dot(g.geometric_normal, dir) < 0.0;
+    uint flags = (sh.swapped ? SURFACE_SWAPPED : 0) | (may(MAY_CAUSTICS) && surface_chains(r, g) ? SURFACE_CHAINS : 0) | (front ? SURFACE_FRONT : 0);
+    PackedLayer pl;
+    pl.surface = pack_hit_surface(g, instance, cluster, primitive, bary, sh.geometric_error, sh.depth_offset, flags);
+    BsdfParams p = g.bsdf;
+    pl.layer.specular_ior = p.specular_ior;
+    pl.layer.transmission_rg = pack_half2x16(p.transmission_color.xy);
+    pl.layer.transmission_b_weight = pack_half2x16(float2(p.transmission_color.z, p.transmission_weight));
+    pl.layer.section = sh.section;
+    pl.layer.medium_point = g.medium_point;
+    return pl;
+}
+
+// The layer vertex of `pl`, reached along `dir`, as `layer_vertex` makes it of the surface `pl`
+// holds.
+public LayerVertex unpack_layer(ViewConstants* v, PackedLayer pl, float3 dir)
+{
+    PackedSurface ps = pl.surface;
+    GSurface g = unpack_surface(ps);
+    g.bsdf.specular_ior = pl.layer.specular_ior;
+    float2 rg = unpack_half2x16(pl.layer.transmission_rg);
+    float2 bw = unpack_half2x16(pl.layer.transmission_b_weight);
+    g.bsdf.transmission_color = float3(rg, bw.x);
+    g.bsdf.transmission_weight = bw.y;
+    g.medium_point = pl.layer.medium_point;
+    LayerVertex l;
+    l.kind = VERTEX_LAYER;
+    l.section = pl.layer.section;
+    l.front = (ps.flags & SURFACE_FRONT) != 0;
+    l.anisotropy = 0.0;
+    l.stack = false;
+    l.chains = (ps.flags & SURFACE_CHAINS) != 0;
+    PathVertex x;
+    x.surface = g;
+    x.view = -dir;
+    float side = l.front ? 1.0 : -1.0;
+    x.surface.normal = side * lean_normal(side * g.normal, x.view);
+    x.origin_error = ps.origin_error;
+    x.plane_point = ps.position - dir * ps.depth_offset;
+    x.camera_distance = length(ps.position - v.eye_render.xyz);
+    l.x = x;
+    return l;
+}
+
+// The light layer `pl`, its BSDF `b` prepared, sends toward the path.
+public float3 layer_emission(Bsdf b, PackedLayer pl)
+{
+    return b.emission_layer() * unpack_rgbe(pl.surface.emission);
+}
+
 public LayerVertex opaque_vertex(PathVertex x)
 {
     LayerVertex l;

@@ -1,11 +1,11 @@
 // The pipeline path tracer's shaders (`path.launch`): a raygen per source, the closest-hit shaders
-// that resolve a path ray's hit on triangles and on strands, the walk meet's closest-hit and the
+// that resolve a path ray's opaque, layer or strand hit, the walk meet's closest-hit and the
 // miss shader, the coverage's any-hit shaders and the medium proxies' under shadow rays, what
 // LAYERS rays keep of particles, light proxies and medium proxies, and the callables that start,
-// shade and finish a path, end its walks and take what lies along its rays.
-// `orr_lighting::launch` makes several stages of one entry by its specialization constants
-// (`path_may`, `path_may2`, `hit_surface`): a hit shader per kind of geometry and per linked
-// surface id, and next-event estimation and the scatter per BSDF class.
+// shade and finish a path, end its walks, take what lies along its rays and pass a shadow ray
+// through a window. `orr_lighting::launch` makes several stages of one entry by its
+// specialization constants (`path_may`, `path_may2`, `hit_surface`): a hit shader per kind of
+// geometry and per linked surface id, and next-event estimation and the scatter per BSDF class.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_lighting.environment;
@@ -84,12 +84,31 @@ void walk_meet(inout Payload p, TriangleAttributes a)
     p.words = launch_walk_meet(root, h);
 }
 
+[shader("closesthit")]
+void layer_resolve(inout Payload p, TriangleAttributes a)
+{
+    ORR_OMM(layer_resolve);
+    TriangleHit h = { a };
+    p.words.x = launch_resolve_layer<Surface, TriangleHit>(root, launch_slot(), h);
+}
+
+// A shadow ray's crossing step commits nothing: it keeps the nearest crossing past the last.
 [shader("anyhit")]
 void cover_path_hit(inout Payload p, TriangleAttributes a)
 {
     ORR_OMM(cover_path_hit);
     TriangleHit h = { a };
-    uint d = cover_path<CoverageFeedback<Surface>>(root.scene, root.view, path_cover(p.words), h.world_direction(), h.custom_index(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.barycentrics());
+    PathCover c = path_cover(p.words);
+    uint d = cover_path<CoverageFeedback<Surface>>(root.scene, root.view, c, h.world_direction(), h.custom_index(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.barycentrics());
+    if (c.policy == COVER_CROSSING)
+    {
+        if (d == ANY_HIT_ACCEPT)
+        {
+            float3 corners[3] = { h.corner(0), h.corner(1), h.corner(2) };
+            launch_crossing_candidate(root, launch_slot(), h.t(), h.instance_index(), uint(h.cluster_id()), h.primitive_index(), h.barycentrics(), corners);
+        }
+        IgnoreHit();
+    }
     if (d == ANY_HIT_IGNORE)
         IgnoreHit();
 }
@@ -189,7 +208,14 @@ void start_view(inout Payload p)
 void start_update(inout Payload p)
 {
     ORR_OMM(start_update);
-    p.words.x = launch_start_update(root, launch_slot());
+    p.words.x = launch_start_update<Surface>(root, launch_slot());
+}
+
+[shader("callable")]
+void gbuffer_start(inout Payload p)
+{
+    ORR_OMM(gbuffer_start);
+    p.words.x = launch_gbuffer(root, launch_slot());
 }
 
 [shader("callable")]
@@ -253,7 +279,7 @@ void scatter(inout Payload p)
 void finish_view(inout Payload p)
 {
     ORR_OMM(finish_view);
-    p.words.x = launch_finish_view<Environment, Medium>(root, launch_slot(), p.words.y);
+    p.words.x = launch_finish_view<Surface, Environment, Medium>(root, launch_slot(), p.words.y);
 }
 
 [shader("callable")]
@@ -306,6 +332,21 @@ void scatter_leave(inout Payload p)
 }
 
 [shader("callable")]
+void direct_layer(inout Payload p)
+{
+    ORR_OMM(direct_layer);
+    p.words.x = launch_direct_layer<Surface, Medium>(root, launch_slot());
+}
+
+[shader("callable")]
+void scatter_layer(inout Payload p)
+{
+    ORR_OMM(scatter_layer);
+    p.words.x = launch_scatter_layer<Surface>(root, launch_slot());
+}
+
+// Takes the hit flag and distance in, and hands the step back.
+[shader("callable")]
 void segment(inout Payload p)
 {
     ORR_OMM(segment);
@@ -342,4 +383,11 @@ void scatter_medium(inout Payload p)
 {
     ORR_OMM(scatter_medium);
     p.words.x = launch_scatter_medium<Surface>(root, launch_slot());
+}
+
+[shader("callable")]
+void window(inout Payload p)
+{
+    ORR_OMM(window);
+    p.words.x = launch_window<Surface>(root, launch_slot());
 }

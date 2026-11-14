@@ -34,6 +34,9 @@ public static const uint PRESENCE_DRAWN = 2;     // where a hashed draw from `se
 public static const uint COVER_ALPHA = 0;        // present by the alpha test: `Alpha`
 public static const uint COVER_LAYERS = 1;       // presence layers by `presence`, the rest by the alpha test: `LayerAccept`
 public static const uint COVER_STACK = 2;        // present opaque triangles and cooked solid glass: `StackAccept`
+// A shadow ray's crossing step: present dielectrics by the alpha test, accepted for the shader to
+// take the nearest of, presence layers never.
+public static const uint COVER_CROSSING = 3;
 
 // What a path ray's any-hit reads of its trace, 16 bytes of payload (`path_payload`).
 public struct PathCover
@@ -98,6 +101,8 @@ public uint cover_path<S : ISurfaces>(SceneRoot* s, ViewConstants* v, PathCover 
         else if (class_id != CLASS_OPAQUE)
             return ANY_HIT_IGNORE;
     }
+    else if (c.policy == COVER_CROSSING && class_id != CLASS_DIELECTRIC)
+        return ANY_HIT_IGNORE;
     float coverage = resolve_presence<S>(s, v, dir, instance_index, cluster, primitive, bary, c.context, alpha);
     bool accept;
     if (!layer || c.presence == PRESENCE_ANY)

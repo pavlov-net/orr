@@ -30,7 +30,9 @@ public static const uint KIND_PATH = 0;          // a copy's clusters
 public static const uint KIND_PRODUCER_PATH = 1; // a producer entry's clusters
 public static const uint KIND_STRAND_PATH = 2;   // a strand entry's
 public static const uint KIND_SHADOW = 3;
-public static const uint PINNED_KINDS = 4;
+public static const uint KIND_LAYER_PATH = 4;          // a copy's dielectric and presence layer clusters
+public static const uint KIND_PRODUCER_LAYER_PATH = 5; // a producer entry's
+public static const uint PINNED_KINDS = 6;
 // No group: a record of zeros.
 static const uint SLOT_NONE = 0xffffffff;
 
@@ -68,6 +70,15 @@ uint material_pin(SceneRoot* s, uint material)
             return 0;
     }
     return 1 + id;
+}
+
+// The kind of the path ray groups of a run of class `class_id` on geometry whose path rays take
+// kind `path`: layers on clusters resolve as layers. Strands are opaque.
+uint path_kind(uint path, uint class_id)
+{
+    if (path == KIND_STRAND_PATH || (class_id != CLASS_DIELECTRIC && class_id != CLASS_PRESENCE))
+        return path;
+    return path == KIND_PATH ? KIND_LAYER_PATH : KIND_PRODUCER_LAYER_PATH;
 }
 
 // Writes run `run`'s records: per ray type the handle of slot `slots[type]` and `data`.
@@ -120,7 +131,7 @@ void runs(uint3 id: SV_DispatchThreadID)
         material = s.page_material_sets[run - s.run_pages];
     uint class_id = material == MATERIAL_NONE ? CLASS_OPAQUE : material_class(s.materials + material);
     uint pin = material_pin(s, material);
-    write_run(run, uint3(pinned(KIND_PATH, pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), hit_data(s, material, class_id));
+    write_run(run, uint3(pinned(path_kind(KIND_PATH, class_id), pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), hit_data(s, material, class_id));
 }
 
 // One workgroup per producer entry, a thread per material of a set entry.
@@ -139,6 +150,6 @@ void producer_runs(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
         uint material = p.materials[slot];
         uint class_id = p.opacity == PRODUCER_SECTIONS ? material_class(s.materials + material) : p.class_id;
         uint pin = material_pin(s, material);
-        write_run(s.run_producers + p.runs + slot, uint3(pinned(path, pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), hit_data(s, material, class_id));
+        write_run(s.run_producers + p.runs + slot, uint3(pinned(path_kind(path, class_id), pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), hit_data(s, material, class_id));
     }
 }

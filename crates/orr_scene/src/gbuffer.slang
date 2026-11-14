@@ -470,6 +470,8 @@ public static const uint SURFACE_HIT = 1 << 0;
 public static const uint SURFACE_SWAPPED = 1 << 1;
 // Light leaves the surface as a caustic by its non-diffuse lobes.
 public static const uint SURFACE_CHAINS = 1 << 2;
+// A layer's surface: the ray that reached it met its front.
+public static const uint SURFACE_FRONT = 1 << 3;
 
 // A resolved opaque surface as a path vertex holds it between the shaders of one vertex: the
 // G-buffer's words, so a vertex past the first shades at the G-buffer's precision, and what a
