@@ -97,7 +97,8 @@ pub struct ViewLighting {
     pub specialize: bool,
     /// Whether each stage of the staged path loop and each froxel kernel records in a pass of
     /// its own ("view trace", "view shade", "froxel trace" and so on), so pass timings tell
-    /// them apart.
+    /// them apart; through the ray tracing pipeline, each source's launches ("view paths",
+    /// "update paths", "caustic photons") and the caustic resolve.
     pub stage_passes: bool,
 }
 
@@ -2402,7 +2403,7 @@ impl LightingKernels {
         };
         let memory = view.launched.as_ref().expect("made above");
         list.begin_pass(
-            if update == 0 {
+            if update == 0 || lighting.stage_passes {
                 "view paths"
             } else {
                 "view and update paths"
@@ -2410,6 +2411,10 @@ impl LightingKernels {
             false,
         );
         launch.record(list, &hits, Raygen::View, &root, &memory.view, pixels);
+        if update > 0 && lighting.stage_passes {
+            list.end_pass();
+            list.begin_pass("update paths", false);
+        }
         if update > 0 {
             let update_root = PathRoot {
                 source: PATH_SOURCE_UPDATE,
@@ -2577,6 +2582,10 @@ impl LightingKernels {
                     )?;
                 launch.record(list, hits, Raygen::Photon, &root, memory, photons);
             }
+        }
+        if lighting.stage_passes {
+            list.end_pass();
+            list.begin_pass("caustic resolve", false);
         }
 
         if lighting.reference.is_none() {
