@@ -12,6 +12,8 @@ use super::slang::Library;
 pub(super) const SLANGC_OPTIONS: &[&str] = &[
     "-std",
     "2026",
+    "-validate-uniformity",
+    "-restrictive-capability-check",
     "-target",
     "spirv",
     "-profile",

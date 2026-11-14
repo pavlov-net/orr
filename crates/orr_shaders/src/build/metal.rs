@@ -16,6 +16,10 @@ use super::sys;
 pub(super) const OPTIONS: &[&str] = &[
     "-std",
     "2026",
+    "-validate-uniformity",
+    "-restrictive-capability-check",
+    "-warnings-as-errors",
+    "all",
     "-target",
     "metal",
     "-matrix-layout-row-major",
