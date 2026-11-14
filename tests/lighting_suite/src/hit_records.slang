@@ -36,7 +36,7 @@ void pipeline_paths()
     Payload p;
     p.words = path_payload(path_cover_of(root, r));
     Traced h = trace_hit(root.scene.tlas, path_flags(r), path_mask(r), RAY_TYPE_PATH, RAY_TYPES, 0, ray_of(r), p);
-    PathOut o = (PathOut)0;
+    PathOut o = PathOut();
     if (h.hit())
     {
         o.hit = 1;
@@ -64,7 +64,7 @@ void pipeline_shadows()
     Traced h = trace_hit(root.scene.tlas, r.flags | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, shadow_mask(r), RAY_TYPE_SHADOW, RAY_TYPES, 0, ray_of(r), p);
     c.product = asfloat(p.words.xyz);
     c.word = p.words.w;
-    ShadowOut o = (ShadowOut)0;
+    ShadowOut o = ShadowOut();
     o.counted = c.counted();
     o.flags = c.word & (SHADOW_OVERFLOW | SHADOW_ENDED | SHADOW_SOLID | SHADOW_CROSSES | SHADOW_VOLUME);
     o.product = c.product;

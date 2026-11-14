@@ -34,6 +34,7 @@ import orr_color.luminance;
 import orr_shaders.random;
 import orr_shaders.sampling;
 import orr_shaders.trace;
+import orr_shaders.hits;
 import orr_shaders.coherence;
 import orr_pack.mesh;
 import orr_scene.hit;
@@ -1242,7 +1243,7 @@ void start_state(PathRoot r, uint2 pixel, PathStart start, Sampler rng, bool pho
     c.stack = PathStack();
     c.stack.valid = photon && start.directional && r.set.stack_entries != 0;
     // A photon's stack keeps no vertex's ray: its direction is the one the photon started
-    // along, which `shade_vertex` probes back along.
+    // along, which `vertex_nee` probes back along.
     if (photon)
         c.stack.dir = start.dir;
     c.spectral = Spectral();
@@ -1593,7 +1594,7 @@ public void trace_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
         StackLight stack;
         shadow_add(q, spectral.color(q.contribution * shadow_trace<S, M>(r, q, stack)), p, record);
         set_flag(p.flags, LOOP_SHADOW, false);
-        // The vertex's ray crossed its surface (`shade_vertex`).
+        // The vertex's ray crossed its surface (`vertex_scatter`).
         if (has(p.flags, LOOP_CROSS))
         {
             interior.cross(q.surface, has(p.flags, LOOP_CROSS_FRONT), q.point);
@@ -1846,6 +1847,12 @@ public void trace_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
 
 // ---------------------------------------------------------------------------------------------
 // Shade
+//
+// An opaque vertex is shaded by bodies over its packed surface (`PackedSurface`), each of which
+// prepares what it needs of the vertex anew: `resolve_opaque` resolves the hit, `shade_emission`
+// takes the light the vertex sends along the path, `shade_direct` estimates direct light and
+// `shade_scatter` draws the next ray. Between them the vertex is the packed surface alone. Other
+// vertices hold their layer vertex and BSDF across next-event estimation and the scatter.
 
 // A vertex as a shade stage holds it: its layer vertex, its BSDF and its scatters.
 struct ShadeVertex
@@ -1877,7 +1884,7 @@ struct ShadeState
     Spectral spectral;
 }
 
-// What a shade shades (`shade_vertex`'s `X`): a vertex the trace stage reached, or a walk's exit,
+// What a shade shades (`vertex_nee`'s `X`): a vertex the trace stage reached, or a walk's exit,
 // which scatters by its exit scatter alone.
 static const uint SHADE_VERTEX = 0;
 static const uint SHADE_EXIT = 1;
@@ -1893,18 +1900,17 @@ struct ShadeNee
     bool here;
     PathShadowRay q;
     NeeDraw d;
-    float run;
+    float run;                      // the vertex's probability of running next-event estimation
     bool weight_one;
     float3 throughput;              // the path's at the vertex
     float exterior_ior;             // of the medium the vertex lies in
-    VertexScatter scatter;          // the vertex's, with what a chain keeps of it
-    float3 keep;
+    float3 keep;                    // what a chain keeps of the vertex's scatter
     bool chain;
     Spectral spectral;              // the path's at the vertex
 }
 
-// No shadow ray, at a vertex that scatters by `scatter` on a path with `spectral`.
-ShadeNee no_nee(VertexScatter scatter, Spectral spectral)
+// No shadow ray, on a path with `spectral`.
+ShadeNee no_nee(Spectral spectral)
 {
     ShadeNee nee;
     nee.traced = false;
@@ -1915,20 +1921,215 @@ ShadeNee no_nee(VertexScatter scatter, Spectral spectral)
     nee.weight_one = false;
     nee.throughput = float3(0.0);
     nee.exterior_ior = 0.0;
-    nee.scatter = scatter;
     nee.keep = float3(0.0);
     nee.chain = false;
     nee.spectral = spectral;
     return nee;
 }
 
-// Resolves the vertex the trace stage's ray reached (a layer for `layer`), and takes its
-// emission, the cache's light where the path ends there, and the record's view of it: the rest
-// of the iteration that traced the ray. A `start_vertex` is the G-buffer surface a path starts
-// on, whose throughput is 1 and whose light counts wherever the G-buffer's emission does.
-// `gbuffer_only`, a constant, says the vertex is the G-buffer's surface, as the path's flags do,
-// so the kernel holds no hit resolve. False where the path ends.
-bool resolve_vertex<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, PathPending pending, inout StagedRecord record, PathContext x, bool layer, bool start_vertex, bool gbuffer_only, inout Sampler rng, inout ShadeVertex sv)
+// What next-event estimation weighs light by at `sv`, a vertex of kind `kind`, with `X` a walk's
+// exit.
+VertexScatter vertex_weighs<let X : uint>(ShadeVertex sv, uint kind)
+{
+    VertexScatter f = { sv.b, kind == VERTEX_SCATTER, -sv.l.x.view, sv.l.anisotropy, X == SHADE_EXIT, sv.exit_scatter, kind == VERTEX_LEAVE, sv.leave_scatter, sv.l.x.surface.normal, sv.l.x.surface.geometric_normal };
+    return f;
+}
+
+// The hit the trace stage left a shade, or a walk's last step, as a hit shader reads its hit:
+// `dir` is the ray's. It holds nothing the bodies do not read.
+struct PendingHit : IHit
+{
+    Hit hit;
+    float3 positions[3];
+    float3 dir;
+
+    uint3 launch() { return uint3(0); }
+    uint instance_index() { return hit.instance_index; }
+    uint custom_index() { return hit.custom_index; }
+    uint geometry_index() { return hit.geometry_index; }
+    uint primitive_index() { return hit.primitive_index; }
+    int cluster_id() { return hit.cluster_id; }
+    float t() { return hit.t; }
+    float2 barycentrics() { return hit.barycentrics; }
+    bool front_face() { return hit.front_face; }
+    float3 world_origin() { return float3(0.0); }
+    float3 world_direction() { return dir; }
+    float3 object_origin() { return float3(0.0); }
+    float3 object_direction() { return float3(0.0); }
+    float3 corner(uint i) { return positions[i]; }
+}
+
+PendingHit pending_hit(PathPending pending, float3 dir)
+{
+    PendingHit h = { pending.hit, pending.positions, dir };
+    return h;
+}
+
+// What owns opaque surface `ps` as a walk's steps see it: a hit's slot copy, or its producer
+// entry's instance; the G-buffer's instance slot.
+uint surface_owner(SceneRoot* s, PackedSurface ps)
+{
+    uint copy;
+    if ((ps.flags & SURFACE_HIT) != 0 && hit_copy(s, ps.instance, copy))
+        return copy;
+    return ps.instance;
+}
+
+// The opaque vertex of packed surface `ps`, reached along `dir`, its BSDF prepared as the path's
+// state at the vertex says. Every body that shades the vertex prepares it anew: the state it
+// reads is the vertex's until the path leaves it.
+ShadeVertex packed_vertex(PathRoot r, PathLoop p, ShadeState c, StagedRecord record, PathContext x, PackedSurface ps, float3 dir)
+{
+    ShadeVertex sv = no_vertex();
+    sv.l = opaque_vertex(surface_vertex(r.view, ps, dir));
+    sv.l.chains = (ps.flags & SURFACE_CHAINS) != 0;
+    // Coat, fuzz and film collapse once the path has scattered, outside the reference.
+    uint before = p.opaque - 1;
+    bool collapse = before > 0 && !x.reference;
+    bool walks = may(MAY_WALK) && (r.features & FEATURE_WALK) != 0 && record.walks() && may_walk(r, sv.l.x.surface, before, has(p.flags, LOOP_WALKED), p.cone.width);
+    sv.b = prepare_vertex(r.scene, sv.l, c.interior, collapse, walks, record.adjoint(), c.spectral.hero());
+    return sv;
+}
+
+// The opaque vertex the trace stage's ray reached, or with `gbuffer` the G-buffer's surface the
+// path starts on: its packed surface and the direction the path reached it along, with the
+// loop's account of reaching it. False where the path ends.
+bool reach_opaque<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, ShadeState c, PathPending pending, PathContext x, bool gbuffer, out PackedSurface ps, out float3 dir)
+{
+    ViewConstants* v = r.view;
+    bool first = has(p.flags, LOOP_CAMERA);
+    set_flag(p.flags, LOOP_CAMERA, false);
+    set_flag(p.flags, LOOP_GBUFFER_HIT, false);
+    dir = c.ray.dir;
+    if (gbuffer)
+    {
+        if (!gbuffer_surface(r, f.pixel, ps))
+        {
+            p.sky = p.throughput;
+            return false;
+        }
+        float3 to_eye = v.eye_render.xyz - ps.position;
+        dir = -to_eye / max(length(to_eye), 1e-30);
+    }
+    else
+    {
+        HitContext context = hit_context(first ? HIT_PRIMARY : HIT_SECONDARY, p.depth, p.cone, pending.t, texture_tap(v, f.pixel, r.frame, r.seed, p.depth), x.feedback);
+        if (!resolve_opaque<FeedbackSurface<S>>(r, pending_hit(pending, dir), context, ps))
+            return false;
+        if (!first)
+            p.cone = cone_after_hit(p.cone, pending.t, 0.0);
+    }
+    p.opaque++;
+    if (first)
+        p.cone.width = cone_width(p.cone, length(ps.position - v.eye_render.xyz));
+    set_flag(p.flags, LOOP_DISPERSIVE, false);
+    return true;
+}
+
+// The emission of opaque vertex `ps`, reached along `dir`, toward the path: the camera ray's
+// vertex where `first` holds. A hit's is weighed against the light set's sampling of the point,
+// which takes its density from the vertex the ray left; a point the light set never draws takes
+// weight 1, and as no photon leaves it, the whole of its light. The G-buffer's surface (`gbuffer`)
+// gives the record its emission pre-exposed, wherever the G-buffer's emission counts.
+void shade_emission(PathRoot r, PathFixed f, inout PathLoop p, ShadeState c, inout StagedRecord record, PathContext x, PackedSurface ps, float3 dir, bool first, bool gbuffer)
+{
+    bool counted = has(p.flags, LOOP_COUNTED);
+    if (!surface_emits(ps))
+        return;
+    if (gbuffer)
+    {
+        if (counted)
+            record.expose(p.throughput * packed_vertex(r, p, c, record, x, ps, dir).b.emission());
+        return;
+    }
+    if (!(may(MAY_EMISSIVE) && (x.count_bsdf || (first && !x.photon)) && counted))
+        return;
+    float3 e = packed_vertex(r, p, c, record, x, ps, dir).b.emission_layer() * unpack_rgbe(ps.emission);
+    if (!any(e > 0.0))
+        return;
+    LightSetGpu* set = r.set;
+    LayerRay ray = c.ray;
+    float3 own = ray.lit ? float3(0.0) : has(p.flags, LOOP_THROUGH) ? p.keep : float3(1.0);
+    bool weigh = !x.one_technique && ray.pdf > 0.0;
+    EmitterHit emitter = EmitterHit();
+    if (!first && (weigh || any(own != 1.0)))
+        emitter = emitter_hit(set, ps.instance, ps.cluster, ps.primitive, ps.barycentrics, (ps.flags & SURFACE_SWAPPED) != 0);
+    float w = 1.0;
+    if (weigh && emitter.density > 0.0)
+    {
+        LocalLights* ray_local = nullptr;
+        if (ray.local)
+            ray_local = pixel_local_lights(r, f.pixel);
+        float3 toward = emitter.point - ray.from;
+        float distance = length(toward);
+        float cos_to = distance > 0.0 ? dot(emitter.normal, toward / distance) : 0.0;
+        w = mis_balance(ray.pdf, ray.run * nee_emissive_pdf(set, ray_local, ray.normal, emitter, distance, cos_to));
+    }
+    float3 kept = emitter.density > 0.0 ? own : float3(1.0);
+    p.radiance += c.spectral.color(p.throughput * e * (w * kept));
+}
+
+// Next-event estimation at opaque vertex `ps`, reached along `dir` by a ray `t` m long, and
+// before it the rest of the iteration that reached it: where the path ends at the vertex, in the
+// cache or by the record's choice, and the record's view of the vertex. Its shadow ray is in
+// `nee`. False where the path ends.
+bool shade_direct<S : ISurfaces, M : IMedium>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout StagedRecord record, PathContext x, PackedSurface ps, float3 dir, float t, bool first, inout Sampler rng, out ShadeNee nee)
+{
+    nee = no_nee(c.spectral);
+    ShadeVertex sv = packed_vertex(r, p, c, record, x, ps, dir);
+    bool counted = has(p.flags, LOOP_COUNTED);
+    bool alive = (sv.l.x.surface.flags & GBUFFER_UNLIT) == 0 && (first || path_mode(r) != PATH_DIRECT);
+    // The first vertex of a pixel with no layer runs on the view's share of pixels.
+    if (first && c.interior.count == 0)
+    {
+        alive = alive && runs_path(r, f.pixel);
+        p.throughput /= r.pixel_fraction;
+    }
+    // The cache holds a vertex's light by its albedo, which a caustic through it would count
+    // again in the photons a vertex before it gathers.
+    if (alive && x.cache && !first && !sv.l.chains)
+    {
+        CacheCell cell = cache_cell(r.cache, r.scene, sv.l.x.surface.position, sv.l.x.surface.geometric_normal, rng.next4().xyz, true);
+        float3 cached;
+        if (record.may_end(p.opaque - 1, c.ray.diffuse, p.cone.width > cell.size, p.opaque == r.max_bounces + 2)
+            && t > CACHE_MIN_RAY_CELLS * cell.size && cache_lookup(r.cache, cell.key, cached))
+        {
+            if (counted)
+                p.radiance += c.spectral.color(p.throughput * cache_albedo(sv.b.albedo(), sv.l.x.surface.bsdf) * cached);
+            return false;
+        }
+    }
+    // The last bounce's hit scatters nothing the path estimates.
+    if (alive && p.opaque <= r.max_bounces + 1)
+        record.vertex(r, sv.l.x, sv.b, p.throughput, p.radiance, rng);
+    if (!alive || !iteration_runs(r, p, VERTEX_OPAQUE, true))
+        return false;
+    set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
+    return vertex_nee<S, M, SHADE_VERTEX>(r, f, p, c, record, x, VERTEX_OPAQUE, rng, sv, nee);
+}
+
+// The rest of the iteration from opaque vertex `ps`, reached along `dir`, past next-event
+// estimation `nee` (`vertex_scatter`).
+bool shade_scatter<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout StagedRecord record, PathContext x, PackedSurface ps, float3 dir, ShadeNee nee, inout Sampler rng, out bool walking, out float3 wi)
+{
+    ShadeVertex sv = packed_vertex(r, p, c, record, x, ps, dir);
+    return vertex_scatter<S, SHADE_VERTEX>(r, f, p, c, record, x, VERTEX_OPAQUE, rng, sv, nee, walking, wi);
+}
+
+// What shadow ray `nee`, which found `vis` through plane stack `stack`, adds to the path from
+// the vertex weighed by `f`.
+void nee_add<S : ISurfaces>(PathRoot r, ShadeNee nee, VertexScatter f, float3 vis, StackLight stack, inout PathLoop p, inout StagedRecord record)
+{
+    float scatter_pdf;
+    float3 e = nee_bent(nee.d, f, vis, stack, nee.keep, nee.chain, scatter_pdf);
+    float mis = nee.weight_one ? 1.0 : mis_balance(nee.run * nee.d.chosen.pdf, scatter_pdf);
+    float3 added = nee.throughput * (e * emitter_view<S>(r, nee.d.chosen, nee.exterior_ior, vis) * (nee.d.W * mis / nee.run));
+    shadow_add(nee.q, nee.spectral.color(added), p, record);
+}
+
+// Resolves the layer the trace stage's ray reached, and takes its emission and the record's view
+// of it: the rest of the iteration that traced the ray. False where the path ends.
+bool resolve_layer<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, PathPending pending, inout StagedRecord record, PathContext x, inout Sampler rng, inout ShadeVertex sv)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
@@ -1940,7 +2141,6 @@ bool resolve_vertex<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, in
     // The ray's length, and for the camera ray's vertex its distance from the eye.
     float t = pending.t;
     bool first = has(p.flags, LOOP_CAMERA);
-    bool gbuffer = gbuffer_only || (!layer && has(p.flags, LOOP_GBUFFER_HIT));
     bool counted = has(p.flags, LOOP_COUNTED);
     bool through = has(p.flags, LOOP_THROUGH);
     set_flag(p.flags, LOOP_CAMERA, false);
@@ -1950,75 +2150,43 @@ bool resolve_vertex<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, in
     LocalLights* ray_local = nullptr;
     if (ray.local)
         ray_local = pixel_local_lights(r, pixel);
-    EmitterHit emitter = EmitterHit();
-    bool swapped = false;
-    if (gbuffer)
+    HitContext context = hit_context(first ? HIT_PRIMARY : HIT_SECONDARY, p.depth, p.cone, t, texture_tap(v, pixel, r.frame, r.seed, p.depth), x.feedback);
+    SurfaceHit sh = resolve_hit<FeedbackSurface<S>>(s, v, ray.dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, context);
+    if (!sh.valid)
+        return false;
+    if (!first)
+        p.cone = cone_after_hit(p.cone, t, 0.0);
+    p.layers++;
+    if (p.layers > r.dielectric_depth && !first)
     {
-        PathVertex gx;
-        if (!gbuffer_vertex(s, v, r.gbuffer, pixel, gx))
-        {
-            p.sky = p.throughput;
-            return false;
-        }
-        sv.l = opaque_vertex(gx);
-        sv.l.chains = may(MAY_CAUSTICS) && surface_chains(r, gx.surface);
-        p.opaque++;
+        if (x.cache && counted)
+            p.radiance += c.spectral.color(p.throughput * interior_ambient(r, sh.surface.position, ray.dir, rng));
+        return false;
     }
-    else
-    {
-        HitContext context = hit_context(first ? HIT_PRIMARY : HIT_SECONDARY, p.depth, p.cone, t, texture_tap(v, pixel, r.frame, r.seed, p.depth), x.feedback);
-        SurfaceHit sh = resolve_hit<FeedbackSurface<S>>(s, v, ray.dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, context);
-        if (!sh.valid)
-            return false;
-        if (!first)
-            p.cone = cone_after_hit(p.cone, t, 0.0);
-        if (layer)
-        {
-            p.layers++;
-            if (p.layers > r.dielectric_depth && !first)
-            {
-                if (x.cache && counted)
-                    p.radiance += c.spectral.color(p.throughput * interior_ambient(r, sh.surface.position, ray.dir, rng));
-                return false;
-            }
-            sv.l = layer_vertex(v, sh, ray.dir);
-            StackFace face;
-            sv.l.stack = may(MAY_STACK) && c.stack.valid && stack_face(s, h, x.disperse, face);
-        }
-        else
-        {
-            sv.l = opaque_vertex(hit_vertex(v, sh, ray.dir));
-            p.opaque++;
-        }
-        sv.l.chains = may(MAY_CAUSTICS) && surface_chains(r, sh.surface);
-        swapped = sh.swapped;
-    }
+    sv.l = layer_vertex(v, sh, ray.dir);
+    StackFace face;
+    sv.l.stack = may(MAY_STACK) && c.stack.valid && stack_face(s, h, x.disperse, face);
+    sv.l.chains = may(MAY_CAUSTICS) && surface_chains(r, sh.surface);
     if (first)
         p.cone.width = cone_width(p.cone, sv.l.x.camera_distance);
     bool disperse = may(MAY_DISPERSION) && x.disperse;
-    bool dispersive = layer && disperse && layer_disperses(s, sv.l, c.interior);
+    bool dispersive = disperse && layer_disperses(s, sv.l, c.interior);
     set_flag(p.flags, LOOP_DISPERSIVE, dispersive);
     if (dispersive && !c.spectral.on)
         c.spectral.start(wavelength_sample(r, pixel));
     // Coat, fuzz and film collapse once the path has scattered, outside the reference.
-    uint before = layer ? p.opaque : p.opaque - 1;
-    bool collapse = before > 0 && !x.reference;
-    bool walks = may(MAY_WALK) && (r.features & FEATURE_WALK) != 0 && record.walks() && !layer && may_walk(r, sv.l.x.surface, before, has(p.flags, LOOP_WALKED), p.cone.width);
-    sv.b = prepare_vertex(s, sv.l, c.interior, collapse, walks, record.adjoint(), c.spectral.hero());
+    bool collapse = p.opaque > 0 && !x.reference;
+    sv.b = prepare_vertex(s, sv.l, c.interior, collapse, false, record.adjoint(), c.spectral.hero());
     if (first)
-        record.arrive(r, sv.l.x, sv.b, start_vertex ? 0.0 : gbuffer ? length(sv.l.x.surface.position - v.eye_render.xyz) : t, layer);
+        record.arrive(r, sv.l.x, sv.b, t, true);
     // Emission, which the hit gives only on a side that emits, weighed against the light set's
     // sampling of the point, which takes its density from the vertex the ray left; a point the
     // light set never draws takes weight 1, and as no photon leaves it, the whole of its light.
-    if (gbuffer)
+    if (may(MAY_EMISSIVE) && (x.count_bsdf || (first && !x.photon)) && counted && any(sv.b.emission() > 0.0))
     {
-        if (counted)
-            record.expose(p.throughput * sv.b.emission());
-    }
-    else if (may(MAY_EMISSIVE) && (x.count_bsdf || (first && !x.photon)) && counted && any(sv.b.emission() > 0.0))
-    {
+        EmitterHit emitter = EmitterHit();
         if (!first && (weigh || any(own != 1.0)))
-            emitter = emitter_hit(set, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, swapped);
+            emitter = emitter_hit(set, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, sh.swapped);
         float w = 1.0;
         if (weigh && emitter.density > 0.0)
         {
@@ -2030,48 +2198,19 @@ bool resolve_vertex<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, in
         float3 kept = emitter.density > 0.0 ? own : float3(1.0);
         p.radiance += c.spectral.color(p.throughput * sv.b.emission() * (w * kept));
     }
-    if (layer)
-        return (sv.l.x.surface.flags & GBUFFER_UNLIT) == 0;
-    bool alive = (sv.l.x.surface.flags & GBUFFER_UNLIT) == 0 && (first || path_mode(r) != PATH_DIRECT);
-    // The first vertex of a pixel with no layer runs on the view's share of pixels.
-    if (first && c.interior.count == 0)
-    {
-        alive = alive && runs_path(r, pixel);
-        p.throughput /= r.pixel_fraction;
-    }
-    // The cache holds a vertex's light by its albedo, which a caustic through it would count
-    // again in the photons a vertex before it gathers.
-    if (alive && x.cache && !first && !sv.l.chains)
-    {
-        CacheCell cell = cache_cell(r.cache, s, sv.l.x.surface.position, sv.l.x.surface.geometric_normal, rng.next4().xyz, true);
-        float3 cached;
-        if (record.may_end(p.opaque - 1, ray.diffuse, p.cone.width > cell.size, p.opaque == r.max_bounces + 2)
-            && t > CACHE_MIN_RAY_CELLS * cell.size && cache_lookup(r.cache, cell.key, cached))
-        {
-            if (counted)
-                p.radiance += c.spectral.color(p.throughput * cache_albedo(sv.b.albedo(), sv.l.x.surface.bsdf) * cached);
-            return false;
-        }
-    }
-    // The last bounce's hit scatters nothing the path estimates.
-    if (alive && p.opaque <= r.max_bounces + 1)
-        record.vertex(r, sv.l.x, sv.b, p.throughput, p.radiance, rng);
-    return alive;
+    return (sv.l.x.surface.flags & GBUFFER_UNLIT) == 0;
 }
 
-// One iteration of the path from vertex `sv` of kind `kind`, with `X` a walk's exit
-// (up to its trace): next-event estimation, whose shadow ray `nee`
-// holds for the vertex's stage or the trace stage; the caustic photons' light; and the vertex's
-// next direction, which leaves `c.ray` for the trace stage, or with `walking` starts a walk
-// along `wi`. False where the path ends.
-bool shade_vertex<S : ISurfaces, M : IMedium, let X : uint>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout StagedRecord record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv, out bool walking, out float3 wi, out ShadeNee nee)
+// Next-event estimation at vertex `sv` of kind `kind`, with `X` a walk's exit (up to its trace),
+// whose shadow ray `nee` holds for the vertex's stage or the trace stage, with the vertex's
+// probability of running it. Before it a photon deposits where it meets a surface past a chain.
+// False where the path ends.
+bool vertex_nee<S : ISurfaces, M : IMedium, let X : uint>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout StagedRecord record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv, out ShadeNee nee)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
     LightSetGpu* set = r.set;
     uint2 pixel = f.pixel;
-    walking = false;
-    wi = float3(0.0);
     LayerVertex l = sv.l;
     Bsdf b = sv.b;
     bool reference = x.reference;
@@ -2088,9 +2227,7 @@ bool shade_vertex<S : ISurfaces, M : IMedium, let X : uint>(PathRoot r, PathFixe
     bool medium_vertex = kind == VERTEX_SCATTER;
     bool leaving = kind == VERTEX_LEAVE;
     bool on_layer = kind == VERTEX_LAYER;
-    bool alive = true;
-    VertexScatter vertex_scatter = { b, medium_vertex, -l.x.view, l.anisotropy, at_exit, sv.exit_scatter, leaving, sv.leave_scatter, l.x.surface.normal, l.x.surface.geometric_normal };
-    nee = no_nee(vertex_scatter, c.spectral);
+    nee = no_nee(c.spectral);
     // A photon deposits where it meets a surface after a chain, and goes on only as one. Light
     // that next-event estimation takes through a plane stack is not deposited. No photon walks.
     if (X != SHADE_EXIT && x.photon)
@@ -2105,6 +2242,7 @@ bool shade_vertex<S : ISurfaces, M : IMedium, let X : uint>(PathRoot r, PathFixe
     // reference the way out's ray alone carries light.
     float run = leaving ? (reference ? 0.0 : 1.0) : medium_vertex || at_exit ? 1.0
         : on_layer && !l.front && l.chains && crosses_interior(s, l.section) ? 0.0 : nee_probability(set, l.x.surface);
+    nee.run = run;
     float u_run = rng.next();
     uint candidates = p.depth == 0 ? r.primary_candidates : r.bounce_candidates;
     if (x.count_nee && candidates > 0 && u_run < run && !split)
@@ -2114,14 +2252,13 @@ bool shade_vertex<S : ISurfaces, M : IMedium, let X : uint>(PathRoot r, PathFixe
         PathVertex at = l.x;
         if (on_layer || medium_vertex)
             at.surface.normal = float3(0.0);
-        VertexScatter scatter = { b, medium_vertex, -l.x.view, l.anisotropy, at_exit, sv.exit_scatter, leaving, sv.leave_scatter, l.x.surface.normal, l.x.surface.geometric_normal };
         // The rays of a walk's way out reach no light this estimate is weighed against.
         bool weight_one = x.one_technique || leaving;
         float3 keep = x.one_technique ? float3(1.0) : p.keep;
         bool chain = l.chains && !x.one_technique;
         bool no_environment = leaving && x.count_bsdf;
         float exterior = interior_ior(s, c.interior.innermost());
-        NeeDraw d = nee_draw<S>(r, at, scatter, pixel, local, candidates, keep, chain, rng, no_environment);
+        NeeDraw d = nee_draw<S>(r, at, vertex_weighs<X>(sv, kind), pixel, local, candidates, keep, chain, rng, no_environment);
         if (d.traced)
         {
             count_ray(p);
@@ -2130,16 +2267,36 @@ bool shade_vertex<S : ISurfaces, M : IMedium, let X : uint>(PathRoot r, PathFixe
             nee.here = X != SHADE_EXIT && (stack_tracked(r) || (may(MAY_EMISSIVE) && may2(MAY2_COATED_EMITTERS) && d.chosen.view));
             nee.q = shadow_ray<CoverageFeedback<S>, M>(d, d.W * mis / run, shadow, l.x.surface.position, p.throughput, p.depth, x.feedback, counted);
             nee.d = d;
-            nee.run = run;
             nee.weight_one = weight_one;
             nee.throughput = p.throughput;
             nee.exterior_ior = exterior;
-            nee.scatter = scatter;
             nee.keep = keep;
             nee.chain = chain;
-            nee.spectral = c.spectral;
         }
     }
+    return true;
+}
+
+// The rest of the iteration from vertex `sv` of kind `kind`, with `X` a walk's exit, past its
+// next-event estimation `nee`: the caustic photons' light, and the vertex's next direction, which
+// leaves `c.ray` for the trace stage, or with `walking` starts a walk along `wi`. False where the
+// path ends.
+bool vertex_scatter<S : ISurfaces, let X : uint>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout StagedRecord record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv, ShadeNee nee, out bool walking, out float3 wi)
+{
+    SceneRoot* s = r.scene;
+    LightSetGpu* set = r.set;
+    walking = false;
+    wi = float3(0.0);
+    LayerVertex l = sv.l;
+    Bsdf b = sv.b;
+    bool reference = x.reference;
+    bool counted = has(p.flags, LOOP_COUNTED);
+    bool split = X != SHADE_EXIT && may(MAY_DISPERSION) && has(p.flags, LOOP_DISPERSIVE) && c.spectral.companions();
+    bool at_exit = X == SHADE_EXIT;
+    bool medium_vertex = kind == VERTEX_SCATTER;
+    bool leaving = kind == VERTEX_LEAVE;
+    bool on_layer = kind == VERTEX_LAYER;
+    bool alive = true;
     // The caustic photons' light at the vertex's diffuse lobes, which is indirect.
     bool gathered = path_mode(r) == PATH_DIRECT ? false : path_mode(r) == PATH_INDIRECT ? true : counted;
     if (may(MAY_CAUSTICS) && x.caustics && gathered && !medium_vertex && !leaving)
@@ -2284,7 +2441,7 @@ bool shade_vertex<S : ISurfaces, M : IMedium, let X : uint>(PathRoot r, PathFixe
         if (!null_crossing)
         {
             c.ray.pdf = delta ? 0.0 : pdf;
-            c.ray.run = x.count_nee && !split ? run : 0.0;
+            c.ray.run = x.count_nee && !split ? nee.run : 0.0;
             c.ray.normal = kind == VERTEX_OPAQUE ? l.x.surface.normal : float3(0.0);
             c.ray.from = l.x.surface.position;
             c.ray.diffuse = diffuse;
@@ -2390,62 +2547,81 @@ public void shade_stage<S : ISurfaces, M : IMedium, let K : uint>(PathRoot root,
 // of round `next` traces.
 void shade_slot<S : ISurfaces, M : IMedium, let K : uint>(PathRoot r, uint slot, PathFixed f, PathLoop p, PathPending pending, ShadeState c, uint next)
 {
-    PathStages* st = r.stages;
-    ViewConstants* v = r.view;
     StagedRecord record = staged_record(r, slot);
     PathContext x = path_context(r, record, f.pixel);
     Sampler rng = p.rng;
     ShadeVertex sv = no_vertex();
     WalkEntry reached = WalkEntry();
+    bool opaque = K != QUEUE_OTHER;
+    PackedSurface ps = PackedSurface();
+    float3 dir = float3(0.0);
     uint kind = VERTEX_OPAQUE;
-    if (K == QUEUE_OTHER)
+    if (!opaque)
         kind = !has(p.flags, LOOP_MEDIUM) ? VERTEX_LAYER : has(p.flags, LOOP_LEAVING) ? VERTEX_LEAVE : VERTEX_SCATTER;
 
-    if (K == QUEUE_OTHER && kind != VERTEX_LAYER)
+    bool walking = false;
+    float3 wi = float3(0.0);
+    ShadeNee nee = no_nee(c.spectral);
+    bool alive;
+    if (opaque)
     {
-        // The trace stage made the vertex and ended its iteration.
-        if (kind == VERTEX_SCATTER)
-            sv.l = scatter_vertex(v, pending.point, c.ray.dir, pending.medium, pending.value);
+        reached.cone = p.cone;
+        reached.flags = (has(p.flags, LOOP_CAMERA) ? WALK_FIRST : 0) | (has(p.flags, LOOP_GBUFFER_HIT) ? WALK_GBUFFER : 0);
+        // A path that starts on the G-buffer's surface resolves it before its first iteration.
+        bool start_vertex = has(p.flags, LOOP_GBUFFER_START);
+        set_flag(p.flags, LOOP_GBUFFER_START, false);
+        if (!start_vertex)
+            p.iteration++;
+        bool first = has(p.flags, LOOP_CAMERA);
+        bool gbuffer = K == SHADE_START || has(p.flags, LOOP_GBUFFER_HIT);
+        // The plain opaque queue holds only vertices of standard surfaces (`opaque_queue`), and
+        // the primary stage's start vertex is the G-buffer's, which resolves no hit: neither
+        // resolves its vertex through the linked surfaces.
+        if (K == QUEUE_RICH)
+            alive = reach_opaque<S>(r, f, p, c, pending, x, gbuffer, ps, dir);
         else
+            alive = reach_opaque<StandardSurface>(r, f, p, c, pending, x, gbuffer, ps, dir);
+        if (alive)
         {
-            sv.l = leave_vertex(v, pending.point, pending.normal);
-            sv.leave_scatter = interior_exit(pending.normal, pending.value);
-            sv.leave_dir = pending.dir;
+            if (first)
+            {
+                float3 at = ps.position - r.view.eye_render.xyz;
+                record.arrive(r, surface_vertex(r.view, ps, dir), bsdf_unprepared(), start_vertex ? 0.0 : gbuffer ? length(at) : pending.t, false);
+            }
+            shade_emission(r, f, p, c, record, x, ps, dir, first, gbuffer);
+            alive = shade_direct<S, M>(r, f, p, c, record, x, ps, dir, pending.t, first, rng, nee)
+                && shade_scatter<S>(r, f, p, c, record, x, ps, dir, nee, rng, walking, wi);
         }
     }
     else
     {
-        reached.cone = p.cone;
-        reached.flags = (has(p.flags, LOOP_CAMERA) ? WALK_FIRST : 0) | (K != QUEUE_OTHER && has(p.flags, LOOP_GBUFFER_HIT) ? WALK_GBUFFER : 0);
-        // A path that starts on the G-buffer's surface resolves it before its first iteration.
-        bool start_vertex = K != QUEUE_OTHER && has(p.flags, LOOP_GBUFFER_START);
-        set_flag(p.flags, LOOP_GBUFFER_START, false);
-        if (!start_vertex)
-            p.iteration++;
-        // The plain opaque queue holds only vertices of standard surfaces (`opaque_queue`), and
-        // the primary stage's start vertex is the G-buffer's, which resolves no hit: neither
-        // resolves its vertex through the linked surfaces.
-        bool resolved;
-        if (K == QUEUE_OPAQUE || K == SHADE_START)
-            resolved = resolve_vertex<StandardSurface>(r, f, p, c, pending, record, x, false, start_vertex, K == SHADE_START, rng, sv);
-        else
-            resolved = resolve_vertex<S>(r, f, p, c, pending, record, x, K == QUEUE_OTHER, start_vertex, false, rng, sv);
-        if (!resolved || !iteration_runs(r, p, kind, true))
+        if (kind == VERTEX_LAYER)
         {
-            p.rng = rng;
-            leave_shade(r, slot, f, p, c, false, false, next);
-            return;
+            p.iteration++;
+            alive = resolve_layer<S>(r, f, p, c, pending, record, x, rng, sv) && iteration_runs(r, p, kind, true);
+            if (alive)
+                set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
         }
-        set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
+        else
+        {
+            // The trace stage made the vertex and ended its iteration.
+            alive = true;
+            if (kind == VERTEX_SCATTER)
+                sv.l = scatter_vertex(r.view, pending.point, c.ray.dir, pending.medium, pending.value);
+            else
+            {
+                sv.l = leave_vertex(r.view, pending.point, pending.normal);
+                sv.leave_scatter = interior_exit(pending.normal, pending.value);
+                sv.leave_dir = pending.dir;
+            }
+        }
+        alive = alive && vertex_nee<S, M, SHADE_VERTEX>(r, f, p, c, record, x, kind, rng, sv, nee)
+            && vertex_scatter<S, SHADE_VERTEX>(r, f, p, c, record, x, kind, rng, sv, nee, walking, wi);
     }
-    bool walking;
-    float3 wi;
-    ShadeNee nee;
-    bool alive = shade_vertex<S, M, SHADE_VERTEX>(r, f, p, c, record, x, kind, rng, sv, walking, wi, nee);
     p.rng = rng;
     // Only a vertex with a subsurface lobe, on a path that may walk, starts a walk: a pipeline
     // made for neither holds none of what follows.
-    bool walks = K != QUEUE_OTHER && may(MAY_WALK) && may(MAY_SUBSURFACE) && alive && walking;
+    bool walks = opaque && may(MAY_WALK) && may(MAY_SUBSURFACE) && alive && walking;
     // A walk takes the place of the vertex's ray, and its stage resolves the vertex again from
     // the hit the span holds: the vertex's shadow ray, which would take the span, is traced
     // here, as one that `ShadeNee.here` names is.
@@ -2473,11 +2649,10 @@ void shade_slot<S : ISurfaces, M : IMedium, let K : uint>(PathRoot r, uint slot,
     {
         StackLight stack;
         float3 vis = shadow_trace<S, M>(r, nee.q, stack);
-        float scatter_pdf;
-        float3 e = nee_bent(nee.d, nee.scatter, vis, stack, nee.keep, nee.chain, scatter_pdf);
-        float mis = nee.weight_one ? 1.0 : mis_balance(nee.run * nee.d.chosen.pdf, scatter_pdf);
-        float3 added = nee.throughput * (e * emitter_view<CoverageFeedback<S>>(r, nee.d.chosen, nee.exterior_ior, vis) * (nee.d.W * mis / nee.run));
-        shadow_add(nee.q, nee.spectral.color(added), p, record);
+        // An opaque vertex's scatter is its packed surface's, prepared again.
+        if (opaque)
+            sv = packed_vertex(r, p, c, record, x, ps, dir);
+        nee_add<CoverageFeedback<S>>(r, nee, vertex_weighs<SHADE_VERTEX>(sv, kind), vis, stack, p, record);
     }
     if (walks)
     {
@@ -2516,26 +2691,27 @@ public void walk_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
     Sampler rng = p.rng;
     ShadeVertex sv = no_vertex();
     // The vertex the walk starts from, as its shade resolved it.
+    PackedSurface ps = PackedSurface();
+    float3 dir;
     if (has(entry.flags, WALK_GBUFFER))
     {
-        PathVertex gx;
-        gbuffer_vertex(s, v, r.gbuffer, f.pixel, gx);
-        sv.l = opaque_vertex(gx);
+        gbuffer_surface(r, f.pixel, ps);
+        float3 to_eye = v.eye_render.xyz - ps.position;
+        dir = -to_eye / max(length(to_eye), 1e-30);
     }
     else
     {
         PathPending pending = load_pending(r, slot, false);
-        float3 dir = asfloat(st.words[word_index(st, RAY_FIRST, slot)].xyz);
+        dir = asfloat(st.words[word_index(st, RAY_FIRST, slot)].xyz);
         HitContext context = hit_context(has(entry.flags, WALK_FIRST) ? HIT_PRIMARY : HIT_SECONDARY, p.depth, entry.cone, pending.t, texture_tap(v, f.pixel, r.frame, r.seed, p.depth), x.feedback);
         // The vertex's shade reported its texture feedback: this resolve reports none.
-        SurfaceHit sh = resolve_hit<S>(s, v, dir, pending.hit.instance_index, uint(pending.hit.cluster_id), pending.hit.primitive_index, pending.hit.barycentrics, pending.positions, false, context);
-        sv.l = opaque_vertex(hit_vertex(v, sh, dir));
+        resolve_opaque<S>(r, pending_hit(pending, dir), context, ps);
     }
-    VertexScatter no_scatter = { sv.b, false, float3(0.0), 0.0, true, sv.exit_scatter, false, sv.leave_scatter, float3(0.0), float3(0.0) };
-    ShadeNee nee = no_nee(no_scatter, c.spectral);
+    sv.l = opaque_vertex(surface_vertex(v, ps, dir));
+    ShadeNee nee = no_nee(c.spectral);
 
     Walk walk = walk_from(sv.l.x, vertex_params(sv.l, p.opaque > 1 && !x.reference), entry.wi, rng);
-    walk_part(r, walk, walk_tracer<CoverageFeedback<S>>(r, sv.l.x.surface.instance, p.depth, x.feedback), p.rays);
+    walk_part(r, walk, walk_tracer<CoverageFeedback<S>>(r, surface_owner(s, ps), p.depth, x.feedback), p.rays);
     p.throughput *= walk.throughput;
     // The reference ends a path whose walk reached its cap, and counts it.
     bool capped = walk.kind == WALK_CAP;
@@ -2548,15 +2724,16 @@ public void walk_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
         BsdfParams wp = vertex_params(sv.l, p.opaque > 1 && !x.reference);
         if (walk.kind == WALK_BOUNDARY)
         {
-            Hit h = walk.hit;
-            float3 positions[3] = walk.positions;
-            HitContext context = hit_context(HIT_SECONDARY, p.depth + 1, p.cone, h.t, texture_tap(v, f.pixel, r.frame, r.seed, p.depth + 1), x.feedback);
-            SurfaceHit sh = resolve_hit<FeedbackSurface<S>>(s, v, walk.dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, context);
-            alive = sh.valid;
+            PendingHit h = { walk.hit, walk.positions, walk.dir };
+            HitContext context = hit_context(HIT_SECONDARY, p.depth + 1, p.cone, walk.hit.t, texture_tap(v, f.pixel, r.frame, r.seed, p.depth + 1), x.feedback);
+            PackedSurface exit;
+            alive = resolve_opaque<FeedbackSurface<S>>(r, h, context, exit);
             if (alive)
-                sv.l = opaque_vertex(exit_vertex(v, sh, walk.dir));
-            if (alive && sh.surface.bsdf.subsurface_weight > 0.0)
-                wp = sh.surface.bsdf;
+            {
+                sv.l = opaque_vertex(exit_vertex(v, exit, walk.dir));
+                if (sv.l.x.surface.bsdf.subsurface_weight > 0.0)
+                    wp = sv.l.x.surface.bsdf;
+            }
         }
         else
             sv.l.x.view = sv.l.x.surface.normal;
@@ -2571,7 +2748,8 @@ public void walk_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
         set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
         bool walking;
         float3 wi;
-        alive = shade_vertex<S, M, SHADE_EXIT>(r, f, p, c, record, x, VERTEX_OPAQUE, rng, sv, walking, wi, nee);
+        alive = vertex_nee<S, M, SHADE_EXIT>(r, f, p, c, record, x, VERTEX_OPAQUE, rng, sv, nee)
+            && vertex_scatter<S, SHADE_EXIT>(r, f, p, c, record, x, VERTEX_OPAQUE, rng, sv, nee, walking, wi);
     }
     if (nee.traced)
     {

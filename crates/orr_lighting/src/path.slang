@@ -37,6 +37,7 @@ import orr_color.luminance;
 import orr_shaders.random;
 import orr_shaders.sampling;
 import orr_shaders.trace;
+import orr_shaders.hits;
 import orr_shaders.coherence;
 import orr_pack.mesh;
 import orr_scene.hit;
@@ -368,6 +369,66 @@ public PathVertex hit_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
     x.plane_point = sh.surface.position - dir * sh.depth_offset;
     x.camera_distance = length(sh.surface.position - v.eye_render.xyz);
     return x;
+}
+
+// The vertex of packed surface `ps`, reached along `dir`: a hit's as `hit_vertex` makes it, and
+// the G-buffer's as `gbuffer_vertex` does, `dir` from the eye.
+public PathVertex surface_vertex(ViewConstants* v, PackedSurface ps, float3 dir)
+{
+    PathVertex x;
+    x.surface = unpack_surface(ps);
+    x.view = -dir;
+    x.surface.normal = lean_normal(x.surface.normal, x.view);
+    if ((ps.flags & SURFACE_HIT) != 0 && dot(x.surface.geometric_normal, x.view) < 0.0)
+        x.surface.geometric_normal = -x.surface.geometric_normal;
+    x.origin_error = ps.origin_error;
+    x.plane_point = ps.position - dir * ps.depth_offset;
+    x.camera_distance = length(ps.position - v.eye_render.xyz);
+    return x;
+}
+
+// The opaque surface at hit `h` through `S`, packed, with `context` the hit's: the closest-hit
+// shader's body. A caller that reports the hit's texture feedback passes `FeedbackSurface<S>`.
+// False where the hit names nothing this module resolves.
+public bool resolve_opaque<S : ISurfaces, H : IHit>(PathRoot r, H h, HitContext context, out PackedSurface ps)
+{
+    ps = PackedSurface();
+    float3 positions[3] = { h.corner(0), h.corner(1), h.corner(2) };
+    uint instance = h.instance_index();
+    uint cluster = uint(h.cluster_id());
+    SurfaceHit sh = resolve_hit<S>(r.scene, r.view, h.world_direction(), instance, cluster, h.primitive_index(), h.barycentrics(), positions, false, context);
+    if (!sh.valid)
+        return false;
+    GSurface g = sh.surface;
+    uint flags = (sh.swapped ? SURFACE_SWAPPED : 0) | (may(MAY_CAUSTICS) && surface_chains(r, sh.surface) ? SURFACE_CHAINS : 0);
+    ps = pack_hit_surface(g, instance, cluster, h.primitive_index(), h.barycentrics(), sh.geometric_error, sh.depth_offset, flags);
+    return true;
+}
+
+// The G-buffer's surface at `pixel` packed, the first vertex of its path; false for a sky pixel.
+public bool gbuffer_surface(PathRoot r, uint2 pixel, out PackedSurface ps)
+{
+    ps = PackedSurface();
+    GBufferWords w;
+    GSurface at;
+    if (!load_gwords(r.view, r.gbuffer, pixel, w, at))
+        return false;
+    GSurface g = decode_gsurface(w);
+    g.instance = at.instance;
+    g.cluster = at.cluster;
+    g.material = at.material;
+    ps.position = at.position;
+    ps.origin_error = max(g.raster_error, traced_error(r.scene, at.instance));
+    ps.a = w.a;
+    ps.b = w.b;
+    ps.x = w.x;
+    ps.y = w.y;
+    ps.instance = at.instance;
+    ps.cluster = at.cluster;
+    ps.primitive = at.primitive;
+    ps.material = at.material;
+    ps.flags = may(MAY_CAUSTICS) && surface_chains(r, g) ? SURFACE_CHAINS : 0;
+    return true;
 }
 
 // The error of the cut ray tracing holds for slot copy `copy`, in render space; 0 when the
@@ -816,18 +877,19 @@ public void walk_part<T : IWalkTrace>(PathRoot r, inout Walk walk, T tracer, ino
     walk_steps(walk, tracer, r.sss_max_steps, r.subsurface_table, r.sss_max_steps, share, rays);
 }
 
-// The exit vertex of a walk whose last step along `dir` reached `sh`: its normals face out.
-public PathVertex exit_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
+// The exit vertex of a walk whose last step along `dir` reached opaque surface `ps`: its normals
+// face out.
+public PathVertex exit_vertex(ViewConstants* v, PackedSurface ps, float3 dir)
 {
     PathVertex x;
-    x.surface = sh.surface;
-    float3 ng = dot(sh.surface.geometric_normal, dir) < 0.0 ? -sh.surface.geometric_normal : sh.surface.geometric_normal;
+    x.surface = unpack_surface(ps);
+    float3 ng = dot(x.surface.geometric_normal, dir) < 0.0 ? -x.surface.geometric_normal : x.surface.geometric_normal;
     x.surface.geometric_normal = ng;
-    x.surface.normal = dot(sh.surface.normal, ng) < 0.0 ? -sh.surface.normal : sh.surface.normal;
+    x.surface.normal = dot(x.surface.normal, ng) < 0.0 ? -x.surface.normal : x.surface.normal;
     x.view = x.surface.normal;
-    x.origin_error = sh.geometric_error;
-    x.plane_point = sh.surface.position - dir * sh.depth_offset;
-    x.camera_distance = length(sh.surface.position - v.eye_render.xyz);
+    x.origin_error = ps.origin_error;
+    x.plane_point = ps.position - dir * ps.depth_offset;
+    x.camera_distance = length(ps.position - v.eye_render.xyz);
     return x;
 }
 

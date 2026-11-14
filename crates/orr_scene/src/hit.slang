@@ -934,6 +934,23 @@ void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bo
     i.barycentrics = bary;
 }
 
+// The surface at hit input `i` through `S`, with its depth offset (m along the view ray, at
+// least 0): the surface evaluation the material resolve and every ray hit share, with the
+// origin policy of material `i.material` and producer policy `origin` and the visible triangle
+// set. Position and raster error are the caller's.
+public GSurface hit_surface<S : ISurfaces>(SceneRoot* s, SurfaceInput i, uint origin, bool report, out float depth_offset)
+{
+    GSurface g = S.surface(i, depth_offset, report);
+    depth_offset = max(depth_offset, 0.0);
+    MaterialGpu* m = s.materials + i.material;
+    g.flags = (g.flags & ~GBUFFER_ORIGIN_MASK) | (hit_origin(m, origin) << GBUFFER_ORIGIN_SHIFT);
+    g.instance = i.instance;
+    g.cluster = i.cluster;
+    g.primitive = i.primitive;
+    g.material = i.material;
+    return g;
+}
+
 // The surface at a ray hit through linked surface `S` (the kernel's `Surface`): the
 // committed hit's instance index, cluster id, primitive, barycentrics and fetched
 // object-space positions (`orr_shaders.trace`'s: on a swept-sphere hit the first is the hit point),
@@ -949,19 +966,12 @@ public SurfaceHit resolve_hit<S : ISurfaces>(SceneRoot* s, ViewConstants* v, flo
     if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, true, previous, true, context, h))
         return hit;
     float offset;
-    GSurface g = S.surface(h.input, offset, false);
-    offset = max(offset, 0.0);
+    GSurface g = hit_surface<S>(s, h.input, h.origin, false, offset);
     // The back of a single-sided material emits nothing.
     if (h.input.back_face && (s.materials[h.section].flags & MATERIAL_DOUBLE_SIDED) == 0)
         g.bsdf.emission = float3(0.0);
-    MaterialGpu* m = s.materials + h.input.material;
     g.position = h.input.position + d * offset;
     g.raster_error = 0.0;
-    g.flags = (g.flags & ~GBUFFER_ORIGIN_MASK) | (hit_origin(m, h.origin) << GBUFFER_ORIGIN_SHIFT);
-    g.instance = h.input.instance;
-    g.cluster = h.input.cluster;
-    g.primitive = h.input.primitive;
-    g.material = h.input.material;
     g.medium_point = float4(h.input.uv[0].uv, h.input.uv[1].uv);
     hit.surface = g;
     hit.uv = h.input.uv;

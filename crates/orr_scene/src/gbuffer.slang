@@ -461,6 +461,85 @@ public GSurface decode_gsurface(GBufferWords w)
     return s;
 }
 
+// `PackedSurface.flags`.
+// A ray hit's surface: `geometric_normal` holds the triangle's normal, which turns toward the ray
+// that reached it, and the ids are the hit's. Else the G-buffer's: `b`'s word holds the normal
+// and the ids are the visible triangle's.
+public static const uint SURFACE_HIT = 1 << 0;
+// `material` is the section material's back.
+public static const uint SURFACE_SWAPPED = 1 << 1;
+// Light leaves the surface as a caustic by its non-diffuse lobes.
+public static const uint SURFACE_CHAINS = 1 << 2;
+
+// A resolved opaque surface as a path vertex holds it between the shaders of one vertex: the
+// G-buffer's words, so a vertex past the first shades at the G-buffer's precision, and what a
+// vertex keeps beside them. The G-buffer's surface keeps its emission pre-exposed in `a`; a hit's
+// is `emission`, in nits, whose range has no ceiling.
+public struct PackedSurface
+{
+    public float3 position;         // render space, the depth offset applied
+    public float origin_error;      // m: what the ray origin offset must cover
+    public uint4 a;
+    public uint2 b;
+    public uint geometric_normal;   // `oct_encode_snorm16`, with SURFACE_HIT
+    public float depth_offset;      // m along the ray that reached the surface
+    public uint4 x;
+    public uint4 y;
+    public uint instance;           // a hit's PTLAS instance index, else the visible triangle's instance slot
+    public uint cluster;            // a hit's cluster id, else the visible triangle's mesh cluster
+    public uint primitive;
+    public uint material;
+    public float2 barycentrics;
+    public uint emission;           // a hit's, `pack_rgbe`
+    public uint flags;              // SURFACE_*
+}
+
+// Packs ray hit `g` with what a vertex keeps beside it: its position, material and emission in
+// nits are `g`'s, the ids and the rest of the fields its arguments'.
+public PackedSurface pack_hit_surface(GSurface g, uint instance, uint cluster, uint primitive, float2 barycentrics, float origin_error, float depth_offset, uint flags)
+{
+    uint emission = pack_rgbe(g.bsdf.emission);
+    g.bsdf.emission = float3(0.0);
+    GBufferWords w = encode_gsurface(g, true);
+    PackedSurface ps;
+    ps.position = g.position;
+    ps.origin_error = origin_error;
+    ps.a = w.a;
+    ps.b = w.b;
+    ps.geometric_normal = oct_encode_snorm16(g.geometric_normal);
+    ps.depth_offset = depth_offset;
+    ps.x = w.x;
+    ps.y = w.y;
+    ps.instance = instance;
+    ps.cluster = cluster;
+    ps.primitive = primitive;
+    ps.material = g.material;
+    ps.barycentrics = barycentrics;
+    ps.emission = emission;
+    ps.flags = flags | SURFACE_HIT;
+    return ps;
+}
+
+// Whether `ps` emits: a hit's `emission`, or the G-buffer's rgb9e5 color, whose mantissas are 0
+// where it is.
+public bool surface_emits(PackedSurface ps)
+{
+    return (ps.flags & SURFACE_HIT) != 0 ? ps.emission != 0 : (ps.a.z & 0x07ffffffu) != 0;
+}
+
+// What `ps`'s words hold, its position and material; the shading normal as stored, not leaned.
+// The visible triangle is left 0: a hit's ids are not a `GSurface`'s.
+public GSurface unpack_surface(PackedSurface ps)
+{
+    GBufferWords w = { ps.a, ps.b, ps.x, ps.y };
+    GSurface s = decode_gsurface(w);
+    if ((ps.flags & SURFACE_HIT) != 0)
+        s.geometric_normal = oct_decode_snorm16(ps.geometric_normal);
+    s.position = ps.position;
+    s.material = ps.material;
+    return s;
+}
+
 // The origin policy of `s`: ORIGIN_*.
 public uint gsurface_origin(GSurface s)
 {
@@ -483,32 +562,46 @@ public float3 lean_normal(float3 n, float3 v)
 // geometry (depth 0) returns a surface whose material is MATERIAL_NONE.
 public GSurface load_gsurface(ViewConstants* view, GBufferGpu* g, uint2 pixel)
 {
+    GBufferWords w;
+    GSurface s = GSurface();
+    if (!load_gwords(view, g, pixel, w, s))
+    {
+        s.material = MATERIAL_NONE;
+        return s;
+    }
+    GSurface d = decode_gsurface(w);
+    d.position = s.position;
+    d.normal = lean_normal(d.normal, normalize(view.eye_render.xyz - d.position));
+    d.instance = s.instance;
+    d.cluster = s.cluster;
+    d.primitive = s.primitive;
+    d.material = s.material;
+    return d;
+}
+
+// The words of `pixel`'s G-buffer surface, and in `at` its render-space position from the depth
+// target, its visible triangle and material; false for a pixel with no geometry.
+public bool load_gwords(ViewConstants* view, GBufferGpu* g, uint2 pixel, out GBufferWords w, out GSurface at)
+{
+    w = GBufferWords();
+    at = GSurface();
     uint64_t vis = g.visibility[pixel.y * g.extent.x + pixel.x];
     if (vis == 0)
-    {
-        GSurface none = GSurface();
-        none.material = MATERIAL_NONE;
-        return none;
-    }
+        return false;
     VisibleCluster c = g.clusters[visibility_cluster(vis)];
-    GBufferWords w;
     w.a = g.a.get<Texture2D<uint4>>().Load(int3(pixel, 0));
     w.b = g.b.get<Texture2D<uint2>>().Load(int3(pixel, 0));
-    w.x = uint4(0);
-    w.y = uint4(0);
     uint flags = w.a.w >> 24;
     if ((flags & GBUFFER_EXTENDED) != 0 && g.x.index != IMAGE_NONE)
         w.x = g.x.get<Texture2D<uint4>>().Load(int3(pixel, 0));
     if ((flags & GBUFFER_LAYERS) != 0 && g.y.index != IMAGE_NONE)
         w.y = g.y.get<Texture2D<uint4>>().Load(int3(pixel, 0));
-    GSurface s = decode_gsurface(w);
     float depth = g.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
     float2 uv = (float2(pixel) + 0.5) / float2(g.extent);
-    s.position = render_from_view(view, view_position(view, uv, depth));
-    s.normal = lean_normal(s.normal, normalize(view.eye_render.xyz - s.position));
-    s.instance = c.instance;
-    s.cluster = visible_drawn(c) ? NO_CLUSTER : c.cluster;
-    s.primitive = visibility_triangle(vis);
-    s.material = c.material;
-    return s;
+    at.position = render_from_view(view, view_position(view, uv, depth));
+    at.instance = c.instance;
+    at.cluster = visible_drawn(c) ? NO_CLUSTER : c.cluster;
+    at.primitive = visibility_triangle(vis);
+    at.material = c.material;
+    return true;
 }

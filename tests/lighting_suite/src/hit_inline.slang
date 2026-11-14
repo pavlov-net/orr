@@ -55,7 +55,7 @@ ShadowOut inline_shadow<let MODE : uint>(RayIn r)
     c.crossed = 0;
     c.solid_t = positive_infinity();
     bool overflow;
-    ShadowOut o = (ShadowOut)0;
+    ShadowOut o = ShadowOut();
     o.product = trace_transmittance(scene_traced(root.scene), ray_of(r), shadow_mask(r), r.flags | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, c, SHADOW_CANDIDATES, overflow, o.committed_class, o.committed_t);
     o.flags = (overflow ? SHADOW_OVERFLOW : 0) | (c.solid_t < positive_infinity() ? SHADOW_SOLID : 0);
     if (c.solid_t < positive_infinity())

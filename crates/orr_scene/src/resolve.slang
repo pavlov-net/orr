@@ -138,18 +138,13 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     if (surface_bin(r, m.surface) != bin)
         return;
     material_prepare(m, hit.input.uv);
-    float offset = 0.0;
-    GSurface g = Surface.surface(hit.input, offset, false);
-    offset = max(offset, 0.0);
+    float offset;
+    GSurface g = hit_surface<Surface>(s, hit.input, hit.origin, false, offset);
 
     float3 relative = hit.relative + hit.direction * offset;
     g.position = relative + v.eye_render.xyz;
     g.raster_error = hit.error;
-    g.flags = (g.flags & ~GBUFFER_ORIGIN_MASK) | (hit_origin(m, hit.origin) << GBUFFER_ORIGIN_SHIFT);
     g.instance = vc.instance;
-    g.cluster = hit.input.cluster;
-    g.primitive = hit.input.primitive;
-    g.material = hit.input.material;
     ExposureState* exposure = v.exposure + v.exposure_slot;
     g.bsdf.emission = apply_hdr_ceiling(g.bsdf.emission * exposure.pre_exposure);
 

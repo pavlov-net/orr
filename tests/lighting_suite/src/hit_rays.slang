@@ -109,7 +109,7 @@ public PathCover path_cover_of(HitRaysRoot root, RayIn r)
 
 public PathOut path_out(Hit h)
 {
-    PathOut o = (PathOut)0;
+    PathOut o = PathOut();
     o.hit = h.hit ? 1 : 0;
     o.t = h.hit ? h.t : 0.0;
     o.instance = h.instance_index;
