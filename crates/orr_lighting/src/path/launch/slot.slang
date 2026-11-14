@@ -217,6 +217,9 @@ public struct Scalars
 
 public static const uint SCALARS_INTERIOR = 1 << 0;
 public static const uint SCALARS_SPECTRAL = 1 << 1;
+// The path's plane stack is the one its last scatter started at the ray it left, which the ray
+// words hold (`load_path_stack`), in place of the stack part.
+public static const uint SCALARS_STACK_RAY = 1 << 2;
 // Each scalar's place in the word, for the store of one.
 public static const uint SCALAR_IOR = 0;
 public static const uint SCALAR_SHADOW_IOR = 1;
@@ -261,15 +264,17 @@ public static const uint STACK_WALK_WORDS = 10;
 // The scratch, which holds one of these at a time: the LAYERS_KEPT nearest candidates of a LAYERS
 // trace past its bound, by `layer_before`, as two words each (`LayerEntry`) from FRONT_AT, and the
 // key of the last one a callable took at FRONT_BOUND, which bounds the next trace of the same ray;
-// or a vertex's light candidates, CANDIDATE_WORDS each from the scratch's first word; or the keys
-// of a shadow ray's crossing walk (`CrossingKey`): at CROSSED_AT the crossing it took last, which
-// its window's resolve keeps, and at COMMITTED_AT the one its step's trace has committed so far.
-// The host keeps at least FRONT_WORDS of it.
+// a vertex's light candidates, CANDIDATE_WORDS each from the scratch's first word; what a vertex
+// hands its record's callable, ENTRY_WORDS from the first word; or the keys of a shadow ray's
+// crossing walk (`CrossingKey`): at CROSSED_AT the crossing it took last, which its window's
+// resolve keeps, and at COMMITTED_AT the one its step's trace has committed so far. The host keeps
+// at least FRONT_WORDS of it.
 public static const uint LAYERS_KEPT = 4;
 public static const uint FRONT_AT = 0;
 public static const uint FRONT_BOUND = FRONT_AT + 2 * LAYERS_KEPT;
 [Host] public static const uint FRONT_WORDS = FRONT_BOUND + 1;
-[Host] public static const uint CANDIDATE_WORDS = 3;
+[Host] public static const uint CANDIDATE_WORDS = 4;
+[Host] public static const uint ENTRY_WORDS = 4;
 public static const uint CROSSED_AT = 0;
 public static const uint COMMITTED_AT = 1;
 
@@ -634,7 +639,7 @@ public void store_scalar(uint4* at, uint k, uint bits)
 }
 
 // Sets `bit` of `at`'s scalars' flags to `on`.
-void set_scalar_flag(uint4* at, uint bit, bool on)
+public void set_scalar_flag(uint4* at, uint bit, bool on)
 {
     uint flags = load_scalar(at, SCALAR_FLAGS);
     set_flag(flags, bit, on);
@@ -664,8 +669,38 @@ public void store_tracked_parts(PathRoot r, uint slot, PathLoop p, ShadeState c)
         store_scalar(at, SCALAR_IOR, asuint(interior_ior(r.scene, c.interior.innermost())));
         set_scalar_flag(at, SCALARS_INTERIOR, c.interior.count > 0);
     }
-    if (stack_kept(r))
-        store_part<PathStack, PATH_STACK_WORDS>(stack_words(r, slot), c.stack);
+    keep_path_stack(r, slot, c.stack);
+}
+
+// Keeps `stack` in `slot`'s stack part, where the root keeps one: ahead of a change to the ray
+// words, which may hold it (SCALARS_STACK_RAY).
+public void keep_path_stack(PathRoot r, uint slot, PathStack stack)
+{
+    if (!stack_kept(r))
+        return;
+    store_part<PathStack, PATH_STACK_WORDS>(stack_words(r, slot), stack);
+    set_scalar_flag(hot_words(r, slot), SCALARS_STACK_RAY, false);
+}
+
+// The plane stack of `slot`'s path, where the root keeps one: the stack part, or where the path
+// has crossed no stack face since its last scatter, the stack that scatter started at the ray it
+// left, `ray`, from a vertex of depth `depth` into `interior`. Only a scatter of a path that
+// `tracks` stacks (no photon's, outside a one-technique mode) starts a valid one.
+public PathStack load_path_stack(PathRoot r, uint slot, LaunchRay ray, Interior interior, uint depth, bool tracks)
+{
+    if ((load_scalar(hot_words(r, slot), SCALAR_FLAGS) & SCALARS_STACK_RAY) == 0)
+        return load_part<PathStack, PATH_STACK_WORDS>(stack_words(r, slot));
+    PathStack s = PathStack();
+    s.valid = may(MAY_STACK) && tracks && ray.pdf > 0.0 && r.set.stack_entries != 0;
+    s.crossed = 0;
+    s.origin = ray.origin;
+    s.dir = ray.dir;
+    s.x_normal = ray.normal;
+    s.pdf = ray.pdf;
+    s.run = ray.run;
+    s.ior = interior_ior(r.scene, interior.innermost());
+    s.depth = depth;
+    return s;
 }
 
 // The path's wavelengths, with the scalars they give, where the root splits paths by wavelength.

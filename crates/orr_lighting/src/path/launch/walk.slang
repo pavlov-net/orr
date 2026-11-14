@@ -205,6 +205,9 @@ public uint launch_walk_end(PathRoot r, uint slot)
         return STEP_ENDED;
     if (!leaves)
     {
+        // The ray words may hold the path's plane stack (SCALARS_STACK_RAY), which the walk keeps.
+        if (stack_kept(r) && (load_scalar(at, SCALAR_FLAGS) & SCALARS_STACK_RAY) != 0)
+            keep_path_stack(r, slot, load_path_stack(r, slot, load_launch_ray(at), i.interior, p.depth - 1, !x.photon && !x.one_technique));
         store_launch_ray(at, launch_ray(ray, 0.0, 0));
         store_invoke_cover(at, p, x, false);
         return STEP_INVOKE;

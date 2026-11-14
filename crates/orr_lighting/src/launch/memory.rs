@@ -6,8 +6,8 @@ use orr_scene::orr_gpu::{Allocation, Device, GpuPtr, MemoryKind};
 
 use crate::Error;
 use crate::shaders::consts::{
-    CANDIDATE_WORDS, FRONT_WORDS, HOT_WORDS, PART_NONE, SLOT_INTERIOR_PART, SLOT_LAYER_PART,
-    SLOT_LIGHT_PART, SLOT_SPECTRAL_PART, SLOT_STACK_PART, WALK_WORDS,
+    CANDIDATE_WORDS, ENTRY_WORDS, FRONT_WORDS, HOT_WORDS, PART_NONE, SLOT_INTERIOR_PART,
+    SLOT_LAYER_PART, SLOT_LIGHT_PART, SLOT_SPECTRAL_PART, SLOT_STACK_PART, WALK_WORDS,
 };
 use crate::shaders::types::LaunchHeader;
 use crate::staged::{
@@ -60,7 +60,9 @@ impl SlotLayout {
         let spectral_at = part(features & FEATURE_DISPERSION != 0, SLOT_SPECTRAL_PART);
         Self {
             cold_words,
-            scratch_words: FRONT_WORDS.max(candidates * CANDIDATE_WORDS),
+            scratch_words: FRONT_WORDS
+                .max(candidates * CANDIDATE_WORDS)
+                .max(ENTRY_WORDS),
             walk_at,
             layer_at,
             interior_at,

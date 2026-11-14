@@ -164,7 +164,7 @@ uint trace_segment(PathRoot r, uint slot, out float committed, out uint flags, o
 // Traces the shadow ray of `slot`'s vertex and adds what it lets through, through a coated
 // emitter's view; or, where it is a directional light's that ended at an opaque surface or solid
 // glass, walks the plane stack before that, if any: true where light came through one, which
-// next-event estimation's second phase then adds.
+// the vertex's scatter then adds (SCATTER_BENT).
 public bool trace_shadow(PathRoot r, uint slot)
 {
     float committed;

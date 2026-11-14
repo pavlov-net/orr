@@ -64,12 +64,12 @@ public LaunchVertex load_vertex(PathRoot r, uint slot)
         v.p.entered_at = i.entered_at;
         v.p.entered_normal = i.entered_normal;
     }
-    if (stack_kept(r))
-        v.c.stack = load_part<PathStack, PATH_STACK_WORDS>(stack_words(r, slot));
     if (spectral_tracked(r))
         v.c.spectral = load_part<Spectral, SLOT_SPECTRAL_PART>(spectral_words(r, slot));
     v.record = launch_record(r, slot);
     v.x = path_context(r, v.record, v.f.pixel);
+    if (stack_kept(r))
+        v.c.stack = load_path_stack(r, slot, v.ray, v.c.interior, v.p.depth - 1, !v.x.photon && !v.x.one_technique);
     return v;
 }
 

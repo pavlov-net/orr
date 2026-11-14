@@ -1,7 +1,8 @@
-// Next-event estimation at a vertex as the shade bodies hold it (`ShadeVertex`), and the draw
-// a plane stack bends.
-// The pipeline's own copy of bodies the staged loop keeps in `path/stages.slang`: a fix to one
-// belongs in both, and the pipeline-against-staged tests compare them.
+// Next-event estimation at a vertex as the shade bodies hold it (`ShadeVertex`): the light
+// candidates `lights` draws into the scratch, their weighing by the vertex's scatter, the shadow
+// ray, and the draw a plane stack bends.
+// Built from bodies the staged loop keeps in `path/stages.slang` (`vertex_nee`, `nee_draw`): a
+// fix to one belongs in both, and the pipeline-against-staged tests compare them.
 module nee;
 
 import orr_shaders.packing;
@@ -11,6 +12,7 @@ import orr_color.luminance;
 import orr_shaders.random;
 import orr_shaders.sampling;
 import orr_shaders.trace;
+import orr_shaders.pipeline;
 import orr_shaders.hits;
 import orr_shaders.coherence;
 import orr_pack.mesh;
@@ -33,6 +35,7 @@ import orr_lighting.guides;
 import orr_lighting.path;
 import orr_lighting.specialize;
 import orr_lighting.path.common;
+import orr_lighting.path.launch.slot;
 
 // A vertex as a shade stage holds it: its layer vertex, its BSDF and its scatters.
 public struct ShadeVertex
@@ -71,7 +74,7 @@ public VertexScatter vertex_weighs<let X : uint>(ShadeVertex sv, uint kind)
 // The shadow ray of next-event estimation `d` at a vertex at `start` of depth `depth`, with
 // vertex shadow `shadow`: it adds `throughput` times what it finds to the path's radiance,
 // weighed along the straight way by `scale`. An emitter's coat and fuzz are not in it.
-PathShadowRay shadow_ray<S : ISurfaces, M : IMedium>(NeeDraw d, float scale, PathShadow<S, M> shadow, float3 start, float3 throughput, uint depth, bool feedback, bool counted)
+public PathShadowRay shadow_ray<S : ISurfaces, M : IMedium>(NeeDraw d, float scale, PathShadow<S, M> shadow, float3 start, float3 throughput, uint depth, bool feedback, bool counted)
 {
     PathShadowRay q = PathShadowRay();
     q.contribution = throughput * (d.e * scale);
@@ -120,83 +123,218 @@ public float3 bent_added<F : IScatter>(BentDraw b, F f, StackLight stack, float3
     return b.scale * (e * vis * mis);
 }
 
-// A photon at vertex `sv` of kind `kind`: it deposits where it meets a surface after a chain, and
-// goes on only as one. Light that next-event estimation takes through a plane stack is not
-// deposited. False where the path ends.
-public bool photon_deposit<S : ISurfaces, R : IVertexRecord>(PathRoot r, PathLoop p, ShadeState c, inout R record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv)
+// A light candidate `lights` leaves in the scratch, CANDIDATE_WORDS words: `ResolvedLightSample`
+// with the number its resampling draws.
+public struct LightCandidate
 {
-    LayerVertex l = sv.l;
-    bool disperse = may(MAY_DISPERSION) && x.disperse;
-    if (p.chains > 0 && kind != VERTEX_SCATTER && kind != VERTEX_LEAVE
-        && !(may(MAY_STACK) && record.stack_owned<S>(r, vertex_origin(l.x, -c.stack.dir), -c.stack.dir, c.stack, p.depth, disperse, x.feedback)))
-        record.deposit(r, l, sv.b, c.spectral.color(p.throughput), rng);
-    return l.chains;
+    public float3 dir;
+    public float pdf;
+    public float3 radiance;
+    public float distance;
+    public float3 point;
+    public uint light;
+    public uint kind;                       // LIGHT_SAMPLE_*, and CANDIDATE_VIEW
+    public uint position;
+    public uint triangle;
+    public float u;
 }
 
-// Next-event estimation at vertex `sv` of kind `kind`, with `X` a walk's exit (up to its trace),
-// whose shadow ray `nee` holds for the vertex's stage or the trace stage, with the vertex's
-// probability of running it. Before it a photon deposits where it meets a surface past a chain.
-// False where the path ends.
-public bool vertex_nee<S : ISurfaces, M : IMedium, let X : uint, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv, out ShadeNee nee)
+static const uint CANDIDATE_VIEW = 1 << 8;
+
+LightCandidate light_candidate_of(ResolvedLightSample c, float u)
 {
-    SceneRoot* s = r.scene;
+    LightCandidate k = { c.dir, c.pdf, c.radiance, c.distance, c.point, c.light, c.kind | (c.view ? CANDIDATE_VIEW : 0), c.position, c.triangle, u };
+    return k;
+}
+
+ResolvedLightSample light_sample_of(LightCandidate k)
+{
+    ResolvedLightSample c = no_candidate();
+    c.dir = k.dir;
+    c.distance = k.distance;
+    c.radiance = k.radiance;
+    c.pdf = k.pdf;
+    c.kind = k.kind & ~CANDIDATE_VIEW;
+    c.light = k.light;
+    c.position = k.position;
+    c.triangle = k.triangle;
+    c.view = (k.kind & CANDIDATE_VIEW) != 0;
+    c.point = k.point;
+    return c;
+}
+
+// The light candidates a vertex of depth `depth` draws: the root's for the path's first vertex
+// or its bounces.
+public uint vertex_candidates(PathRoot r, uint depth)
+{
+    return depth == 0 ? r.primary_candidates : r.bounce_candidates;
+}
+
+// The sampler dimensions next-event estimation draws at a vertex that draws `candidates`
+// (`nee_draw`): one, and six per candidate.
+public uint candidate_dimensions(uint candidates)
+{
+    return 1 + 6 * candidates;
+}
+
+// The `lights` shader's body: the light candidates of `slot`'s vertex, whose point its surface
+// words' first holds, with shading normal `normal` (zero for a layer or a point in a medium), into
+// the scratch, drawn from sampler dimension `dimension` on as `nee_draw` draws them: with the
+// vertex's directional share one directional light, else the vertex's candidates. How many it
+// drew.
+public uint launch_lights<S : ISurfaces>(PathRoot r, uint slot, float3 normal, uint dimension)
+{
     LightSetGpu* set = r.set;
-    uint2 pixel = f.pixel;
-    LayerVertex l = sv.l;
-    bool reference = x.reference;
-    bool counted = has(p.flags, LOOP_COUNTED);
-    bool disperse = may(MAY_DISPERSION) && x.disperse;
-    // A dispersive layer with live companions adds no direct light: its BSDF differs by
-    // wavelength, and its rays reach lights at full weight.
-    // A walk's exit follows an opaque vertex, which is no dispersive layer.
-    bool split = X != SHADE_EXIT && may(MAY_DISPERSION) && has(p.flags, LOOP_DISPERSIVE) && c.spectral.companions();
-    bool at_exit = X == SHADE_EXIT;
+    uint4* at = hot_words(r, slot);
+    float3 position = load_coherent((float3*)(at + SURFACE_AT));
+    uint depth = load_word<LoopCounts>(at + LOOP_COUNTS_AT).depth & 0xffffff;
+    uint2 pixel = launch_pixel(r, slot);
     LocalLights* local = nullptr;
-    if (p.depth == 0)
+    if (depth == 0)
         local = pixel_local_lights(r, pixel);
-    bool medium_vertex = kind == VERTEX_SCATTER;
+    Sampler rng = path_sampler(r, pixel);
+    rng.dimension = dimension;
+    NeeVertex v = nee_vertex(set, position, normal, pixel, local);
+    bool directional = rng.next() < v.share;
+    uint drawn = directional ? 1 : vertex_candidates(r, depth);
+    for (uint i = 0; i < drawn; i++)
+    {
+        ResolvedLightSample c = directional ? nee_directional_candidate(set, v, rng) : nee_light_candidate<S>(set, v, rng);
+        float u = rng.next();
+        store_part<LightCandidate, CANDIDATE_WORDS>(candidate_words(r, slot, i), light_candidate_of(c, u));
+    }
+    return drawn;
+}
+
+// The draw of next-event estimation at `x` weighed by `f` among the `drawn` candidates `lights`
+// left in `slot`'s scratch (`nee_draw` past its candidates): resampled by unshadowed luminance,
+// with `no_environment` the environment's counting for nothing; at a `chain` vertex what a light
+// other than the environment gives keeps `keep` of the share outside the vertex's diffuse lobes.
+public NeeDraw weigh_lights<F : IScatter>(PathRoot r, uint slot, PathVertex x, F f, uint drawn, float3 keep, bool chain, bool no_environment)
+{
+    LightSetGpu* set = r.set;
+    NeeDraw d = NeeDraw();
+    if (f.specular_only())
+        return d;
+    ResolvedLightSample chosen = no_candidate();
+    float chosen_target = 0.0;
+    float3 chosen_f = float3(0.0);
+    float3 chosen_diffuse = float3(0.0);
+    float chosen_scatter_pdf = 0.0;
+    float sum = 0.0;
+    for (uint i = 0; i < drawn; i++)
+    {
+        LightCandidate k = load_part<LightCandidate, CANDIDATE_WORDS>(candidate_words(r, slot, i));
+        if (!(k.pdf > 0.0) || (no_environment && (k.kind & ~CANDIDATE_VIEW) == LIGHT_SAMPLE_ENVIRONMENT))
+            continue;
+        float scatter_pdf;
+        float3 dc;
+        float3 fc = f.eval_and_pdf(k.dir, scatter_pdf, dc);
+        float target = luminance_rec2020(fc * k.radiance);
+        float w = target / k.pdf;
+        if (!(w > 0.0) || !isfinite(w))
+            continue;
+        sum += w;
+        if (k.u * sum < w)
+        {
+            chosen = light_sample_of(k);
+            chosen_target = target;
+            chosen_f = fc;
+            chosen_diffuse = dc;
+            chosen_scatter_pdf = scatter_pdf;
+        }
+    }
+    if (!(sum > 0.0))
+        return d;
+    float3 dir = chosen.dir;
+    float3 l = chosen.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, chosen.light, dir) : chosen.radiance;
+    float3 fe = chosen_f;
+    if (chain && chosen.kind != LIGHT_SAMPLE_ENVIRONMENT)
+        fe = chosen_diffuse + max(chosen_f - chosen_diffuse, 0.0) * keep;
+    float3 e = fe * l;
+    if (all(e == 0.0))
+        return d;
+    float3 origin = vertex_origin(x, dir);
+    float t_max = chosen.distance;
+    float3 toward = dir;
+    // A finite light's ray goes from the offset origin to the point drawn on it, stopping
+    // short of it by its rounding.
+    if (isfinite(t_max))
+    {
+        float3 to = chosen.point - origin;
+        float length_to = length(to);
+        toward = length_to > 0.0 ? to / length_to : dir;
+        float magnitude = max(abs(chosen.point.x), max(abs(chosen.point.y), abs(chosen.point.z)));
+        t_max = max(0.0, length_to - max(1e-4 * length_to, magnitude * F32_PRECISION));
+    }
+    d.traced = true;
+    d.chosen = chosen;
+    d.e = e;
+    d.l = l;
+    d.W = sum / (float(drawn) * chosen_target);
+    d.scatter_pdf = chosen_scatter_pdf;
+    d.origin = origin;
+    d.toward = toward;
+    d.t_max = t_max;
+    return d;
+}
+
+// Whether next-event estimation at vertex `sv` of kind `kind`, with `X` a walk's exit, draws
+// lights, from the vertex's probability of running it, in `run`, and its draw of whether to,
+// which it takes. A dispersive layer with live companions adds no direct light: its BSDF differs
+// by wavelength, and its rays reach lights at full weight. A walk's exit follows an opaque vertex,
+// which is no dispersive layer.
+public bool nee_runs<let X : uint>(PathRoot r, PathLoop p, ShadeState c, PathContext x, uint kind, ShadeVertex sv, inout Sampler rng, out float run)
+{
+    LayerVertex l = sv.l;
+    bool split = X != SHADE_EXIT && may(MAY_DISPERSION) && has(p.flags, LOOP_DISPERSIVE) && c.spectral.companions();
     bool leaving = kind == VERTEX_LEAVE;
-    bool on_layer = kind == VERTEX_LAYER;
-    nee = no_nee(c.spectral);
-    // No photon walks.
-    if (X != SHADE_EXIT && x.photon && !photon_deposit<S, R>(r, p, c, record, x, kind, rng, sv))
-        return false;
     // A chain vertex on a solid's back sees lights from inside it, which BSDF rays carry. Next-
     // event estimation at a walk's way out takes the light inside as uniform, so in the
     // reference the way out's ray alone carries light.
-    float run = leaving ? (reference ? 0.0 : 1.0) : medium_vertex || at_exit ? 1.0
-        : on_layer && !l.front && l.chains && crosses_interior(s, l.section) ? 0.0 : nee_probability(set, l.x.surface);
-    nee.run = run;
+    run = leaving ? (x.reference ? 0.0 : 1.0) : kind == VERTEX_SCATTER || X == SHADE_EXIT ? 1.0
+        : kind == VERTEX_LAYER && !l.front && l.chains && crosses_interior(r.scene, l.section) ? 0.0 : nee_probability(r.set, l.x.surface);
     float u_run = rng.next();
-    uint candidates = p.depth == 0 ? r.primary_candidates : r.bounce_candidates;
-    if (x.count_nee && candidates > 0 && u_run < run && !split)
-    {
-        PathShadow<CoverageFeedback<S>, M> shadow = vertex_shadow<CoverageFeedback<S>, M>(r, l, c.interior, disperse);
-        // Layers and scatters light from both sides.
-        PathVertex at = l.x;
-        if (on_layer || medium_vertex)
-            at.surface.normal = float3(0.0);
-        // The rays of a walk's way out reach no light this estimate is weighed against.
-        bool weight_one = x.one_technique || leaving;
-        float3 keep = x.one_technique ? float3(1.0) : p.keep;
-        bool chain = l.chains && !x.one_technique;
-        bool no_environment = leaving && x.count_bsdf;
-        float exterior = interior_ior(s, c.interior.innermost());
-        NeeDraw d = nee_draw<S>(r, at, vertex_weighs<X>(sv, kind), pixel, local, candidates, keep, chain, rng, no_environment);
-        if (d.traced)
-        {
-            count_ray(p);
-            float mis = weight_one ? 1.0 : mis_balance(run * d.chosen.pdf, d.scatter_pdf);
-            nee.traced = true;
-            nee.here = X != SHADE_EXIT && (stack_tracked(r) || (may(MAY_EMISSIVE) && may2(MAY2_COATED_EMITTERS) && d.chosen.view));
-            nee.q = shadow_ray<CoverageFeedback<S>, M>(d, d.W * mis / run, shadow, l.x.surface.position, p.throughput, p.depth, x.feedback, counted);
-            nee.d = d;
-            nee.weight_one = weight_one;
-            nee.throughput = p.throughput;
-            nee.exterior_ior = exterior;
-            nee.keep = keep;
-            nee.chain = chain;
-        }
-    }
-    return true;
+    return x.count_nee && vertex_candidates(r, p.depth) > 0 && u_run < run && !split;
+}
+
+// The shading normal `lights` draws for at vertex `sv` of kind `kind`: layers and scatters take
+// light from both sides.
+public float3 nee_normal(ShadeVertex sv, uint kind)
+{
+    return kind == VERTEX_LAYER || kind == VERTEX_SCATTER ? float3(0.0) : sv.l.x.surface.normal;
+}
+
+// Next-event estimation at vertex `sv` of kind `kind`, with `X` a walk's exit, which `nee_runs`
+// let run with probability `run` and whose `drawn` candidates `lights` left in `slot`'s scratch:
+// its shadow ray in `nee`.
+public ShadeNee vertex_nee<S : ISurfaces, M : IMedium, let X : uint>(PathRoot r, uint slot, inout PathLoop p, ShadeState c, PathContext x, uint kind, ShadeVertex sv, float run, uint drawn)
+{
+    ShadeNee nee = no_nee(c.spectral);
+    nee.run = run;
+    LayerVertex l = sv.l;
+    bool leaving = kind == VERTEX_LEAVE;
+    bool disperse = may(MAY_DISPERSION) && x.disperse;
+    PathShadow<CoverageFeedback<S>, M> shadow = vertex_shadow<CoverageFeedback<S>, M>(r, l, c.interior, disperse);
+    PathVertex at = l.x;
+    at.surface.normal = nee_normal(sv, kind);
+    // The rays of a walk's way out reach no light this estimate is weighed against.
+    bool weight_one = x.one_technique || leaving;
+    float3 keep = x.one_technique ? float3(1.0) : p.keep;
+    bool chain = l.chains && !x.one_technique;
+    bool no_environment = leaving && x.count_bsdf;
+    NeeDraw d = weigh_lights(r, slot, at, vertex_weighs<X>(sv, kind), drawn, keep, chain, no_environment);
+    if (!d.traced)
+        return nee;
+    count_ray(p);
+    float mis = weight_one ? 1.0 : mis_balance(run * d.chosen.pdf, d.scatter_pdf);
+    nee.traced = true;
+    nee.q = shadow_ray<CoverageFeedback<S>, M>(d, d.W * mis / run, shadow, l.x.surface.position, p.throughput, p.depth, x.feedback, has(p.flags, LOOP_COUNTED));
+    nee.d = d;
+    nee.weight_one = weight_one;
+    nee.throughput = p.throughput;
+    nee.exterior_ior = interior_ior(r.scene, c.interior.innermost());
+    nee.keep = keep;
+    nee.chain = chain;
+    return nee;
 }

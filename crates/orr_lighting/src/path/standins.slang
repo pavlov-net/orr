@@ -63,15 +63,49 @@ void emission(uint3 id: SV_DispatchThreadID)
     w[0].x = launch_emission(root, id.x, asfloat(w[0].z), w[0].w);
 }
 
+// What a vertex body's calls hand back, from lane `lane`'s words, which the calls' arguments go
+// to: the callables are measured as stand-ins of their own.
+struct LaneCalls : ICalls
+{
+    uint lane;
+
+    uint lights(float3 normal, uint dimension)
+    {
+        uint4* w = lane_words(lane);
+        w[1] = uint4(asuint(normal), dimension);
+        return w[0].w;
+    }
+
+    float3 gather(inout uint dimension, float width, uint flags, uint word)
+    {
+        uint4* w = lane_words(lane);
+        w[1] = uint4(dimension, asuint(width), flags, word);
+        uint4 back = w[0];
+        dimension = back.w;
+        return asfloat(back.xyz);
+    }
+
+    uint deposit(uint dimension)
+    {
+        uint4* w = lane_words(lane);
+        w[1].x = dimension;
+        return w[0].w;
+    }
+
+    void cache_vertex(uint dimension)
+    {
+        lane_words(lane)[1].y = dimension;
+    }
+}
+
 [shader("compute")]
 [numthreads(STAGE_GROUP, 1, 1)]
 void direct(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(direct);
     uint4* w = lane_words(id.x);
-    uint dimension;
-    w[0].x = launch_direct<AT_PLAIN, Surface, Medium>(root, id.x, w[0].y, asfloat(w[0].z), w[0].w, dimension);
-    w[0].y = dimension;
+    LaneCalls calls = { id.x };
+    w[0] = launch_direct<AT_SURFACE, Surface, Medium, LaneCalls>(root, id.x, w[0].y, asfloat(w[0].z), w[0].w, calls);
 }
 
 [shader("compute")]
@@ -79,7 +113,30 @@ void direct(uint3 id: SV_DispatchThreadID)
 void scatter(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(scatter);
-    lane_words(id.x)[0].x = launch_scatter<AT_PLAIN, Surface>(root, id.x);
+    uint4* w = lane_words(id.x);
+    LaneCalls calls = { id.x };
+    w[0].x = launch_scatter<AT_SURFACE, Surface, LaneCalls>(root, id.x, w[0].y != 0, asfloat(w[0].z), calls);
+}
+
+[shader("compute")]
+[numthreads(STAGE_GROUP, 1, 1)]
+void lights(uint3 id: SV_DispatchThreadID)
+{
+    ORR_OMM(lights);
+    uint4* w = lane_words(id.x);
+    w[0].x = launch_lights<Surface>(root, id.x, asfloat(w[0].xyz), w[0].w);
+}
+
+[shader("compute")]
+[numthreads(STAGE_GROUP, 1, 1)]
+void gather(uint3 id: SV_DispatchThreadID)
+{
+    ORR_OMM(gather);
+    uint4* w = lane_words(id.x);
+    uint4 data = w[0];
+    uint dimension = data.x;
+    float3 g = launch_gather<Surface>(root, id.x, dimension, asfloat(data.y), data.z, data.w);
+    w[0] = uint4(asuint(g), dimension);
 }
 
 [shader("compute")]

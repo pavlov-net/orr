@@ -24,20 +24,20 @@ const OVER: &[(Body, &str)] = &[
         "the emitter's triangle, rebuilt for the light set's density at the hit",
     ),
     (
-        Body::DirectPlain,
-        "light candidates drawn and weighed by the BSDF in one loop",
+        Body::Direct,
+        "the BSDF's preparation, and its evaluation toward each light candidate",
     ),
     (
-        Body::DirectRich,
-        "light candidates drawn and weighed by the BSDF in one loop",
+        Body::Scatter,
+        "the BSDF's preparation and sampling, and with dispersion its preparation per wavelength",
     ),
     (
-        Body::ScatterPlain,
-        "the prepared BSDF's sampling beside the caustic gather",
+        Body::Lights,
+        "an emissive candidate's surface emission and coverage",
     ),
     (
-        Body::ScatterRich,
-        "the prepared BSDF's sampling beside the caustic gather",
+        Body::Gather,
+        "the BSDF the caustic map evaluates per photon",
     ),
     (
         Body::CoverPath,

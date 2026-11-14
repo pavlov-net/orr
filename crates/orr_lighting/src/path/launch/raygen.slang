@@ -29,6 +29,7 @@ import orr_lighting.path.launch.hit;
 import orr_lighting.path.launch.raygen_shadow;
 import orr_lighting.path.launch.raygen_walk;
 import orr_lighting.path.launch.boundary;
+import orr_lighting.path.launch.raygen_vertex;
 
 // Traces the ray of `slot`'s path from the trace half of its ray, which its maker stored ready
 // (`store_path_ray`), takes what lies in front of its hit and along it, and runs the shader of
@@ -114,19 +115,8 @@ uint source_finish(PathRoot r)
     }
 }
 
-// Runs callable `index` of the vertex that `step` reached, `t` m along the ray to it, in `phase`
-// (DIRECT_*), and returns its data: the step it hands back first.
-uint4 vertex_call(uint index, uint phase, float t, uint step)
-{
-    Payload c;
-    c.words = uint4(0, phase, asuint(t), step);
-    call(index, c);
-    return c.words;
-}
-
 // The raygen: the path of the slice's item at the launch index, from its source's start to its
-// finish, which hands back the step of a pass that follows. Each vertex takes direct light, or a
-// photon's its deposit.
+// finish, which hands back the step of a pass that follows.
 public void launch_paths(PathRoot r)
 {
     uint slot = launch_slot();
@@ -155,30 +145,7 @@ public void launch_paths(PathRoot r)
                 step = walk_path(r, slot, t);
             if ((step & STEP_ENDED) != 0)
                 break;
-            // The emission takes the loop's account of reaching the vertex where it runs first.
-            if ((step & STEP_EMITS) != 0)
-                step = vertex_call(CALL_EMISSION, DIRECT_FIRST, t, step).x;
-            uint at = step_at(step);
-            bool opaque = at == AT_PLAIN || at == AT_RICH;
-            // A photon goes on only as a chain, which no medium's vertex is. A layer's next-event
-            // estimation takes its deposit.
-            if (deposits && !opaque && at != AT_LAYER)
-                break;
-            uint index = deposits && opaque ? CALL_DEPOSIT : CALL_DIRECT + at;
-            uint4 direct = vertex_call(index, DIRECT_FIRST, t, step);
-            if ((direct.x & STEP_PROBE) != 0)
-            {
-                trace_probe(r, slot);
-                direct = vertex_call(index, DIRECT_PROBED, t, step);
-            }
-            // The record's callable draws the dimension next-event estimation drew past.
-            if ((direct.x & STEP_RECORD) != 0)
-                step_call(CALL_CACHE_VERTEX, direct.y);
-            if ((direct.x & STEP_SHADOW) != 0 && trace_shadow(r, slot))
-                vertex_call(index, DIRECT_BENT, t, step);
-            if ((direct.x & STEP_ENDED) != 0)
-                break;
-            step = step_call(CALL_SCATTER + at);
+            step = vertex_calls(r, slot, step, t, deposits);
         }
         step = crossed_call(r, slot, finish, pass);
         t = 0.0;

@@ -1320,6 +1320,15 @@ public Bsdf prepare_vertex(SceneRoot* s, LayerVertex l, Interior interior, bool 
     return bsdf_prepare(p, l.x.surface.normal, l.x.view, exterior, adjoint);
 }
 
+// Opaque vertex `l`'s BSDF in a medium of IOR `exterior`, prepared as `prepare_vertex` prepares
+// it up to its fitted coefficients: what its coat and fuzz pass of its emission
+// (`Bsdf.emission_layer`, `Bsdf.emission`), which they do not change.
+public Bsdf opaque_emission_layers(LayerVertex l, float exterior, bool collapse, bool walks, bool adjoint)
+{
+    BsdfLayers layers;
+    return bsdf_prepare_layers(walk_params(vertex_params(l, collapse), walks), l.x.surface.normal, l.x.view, exterior, adjoint, layers);
+}
+
 // A path's wavelengths once it meets a dispersive layer; before that its colors are plain
 // RGB. From there the path follows the hero's refraction, and every companion's estimate is
 // weighed by its own BSDF and density at each direction the hero drew at a dispersive layer,
@@ -1729,10 +1738,17 @@ public struct CacheUpdate : IPathRecord
         float u = rng.next();
         if (count >= UPDATE_VERTICES)
             return;
-        float3 albedo = cache_albedo(b.albedo(), x.surface.bsdf) * throughput;
-        if (!any(albedo > 1e-6))
+        vertex_at(r, cache_albedo(b.albedo(), x.surface.bsdf) * throughput, x.surface.position, x.surface.geometric_normal, radiance, u);
+    }
+
+    // `vertex` of a vertex at `position` with geometric normal `normal` whose albedo, as the cache
+    // holds light by it, times the path's throughput is `albedo`, from its draw `u`.
+    [mutating]
+    public void vertex_at(PathRoot r, float3 albedo, float3 position, float3 normal, float3 radiance, float u)
+    {
+        if (count >= UPDATE_VERTICES || !any(albedo > 1e-6))
             return;
-        CacheCell cell = cache_cell(r.cache, r.scene, x.surface.position, x.surface.geometric_normal, float3(0.5, 0.5, u), false);
+        CacheCell cell = cache_cell(r.cache, r.scene, position, normal, float3(0.5, 0.5, u), false);
         keys[count] = cell.key;
         scale[count] = select(albedo > 1e-6, 1.0 / albedo, float3(0.0));
         before[count] = radiance;
@@ -1751,6 +1767,13 @@ public struct CacheUpdate : IPathRecord
         for (uint i = 0; i < count; i++)
             cache_add(r.cache, keys[i], (radiance - before[i]) * scale[i]);
     }
+}
+
+// The albedo a photon's deposit at a surface prepared as `b` takes: its diffuse and subsurface
+// lobes'.
+public float3 photon_albedo(Bsdf b)
+{
+    return b.diffuse_reflection() + b.diffuse_transmission() + b.albedo().subsurface;
 }
 
 // A caustic photon from caster entry `entry`: it deposits its flux in the caustics of the path
@@ -1807,16 +1830,24 @@ public struct CausticPhoton : IPathRecord
     public void deposit(PathRoot r, LayerVertex l, Bsdf b, float3 flux, inout Sampler rng)
     {
         float4 u = rng.next4();
-        float3 albedo = b.diffuse_reflection() + b.diffuse_transmission() + b.albedo().subsurface;
-        if (!any(albedo > 0.0) || !any(flux > 0.0) || !all(isfinite(flux)))
-            return;
         GSurface g = l.x.surface;
         float3 n = dot(g.geometric_normal, l.x.view) < 0.0 ? -g.geometric_normal : g.geometric_normal;
+        deposit_at(r, any(photon_albedo(b) > 0.0), g.position, n, l.x.view, flux, u);
+    }
+
+    // `deposit` at `position` with geometric normal `n` facing the side the photon arrives from
+    // along `-view`, at a surface with diffuse or subsurface albedo where `albedo`, from its draws
+    // `u`.
+    [mutating]
+    public void deposit_at(PathRoot r, bool albedo, float3 position, float3 n, float3 view, float3 flux, float4 u)
+    {
+        if (!albedo || !any(flux > 0.0) || !all(isfinite(flux)))
+            return;
         CausticsGpu* c = r.caustics;
         if (c.mode == CAUSTICS_MAP)
-            map_deposit(c, g.position, n, flux, l.x.view);
+            map_deposit(c, position, n, flux, view);
         else
-            grid_deposit(c, r.scene, g.position, n, flux, u);
+            grid_deposit(c, r.scene, position, n, flux, u);
         deposited = true;
     }
 

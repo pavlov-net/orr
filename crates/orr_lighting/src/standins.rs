@@ -10,7 +10,7 @@ use std::time::Instant;
 use orr_scene::orr_gpu::{CodeStatistics, Device, ShaderStage, SpecData};
 
 use crate::shaders::path::standins;
-use crate::staged::{MAY_BACKGROUND, MAY_PHOTON, MAY_RICH, MAY_UPDATE, MAY_VIEW, SPEC_ENTRIES};
+use crate::staged::{MAY_BACKGROUND, MAY_PHOTON, MAY_UPDATE, MAY_VIEW, SPEC_ENTRIES};
 use crate::{Error, KernelSet, module};
 
 /// The kind of shader a body runs as, which sets its budget.
@@ -45,14 +45,14 @@ pub enum Body {
     Resolve,
     /// The light an opaque vertex sends along the path.
     Emission,
-    /// Next-event estimation of a surface with no lobe a plain one lacks.
-    DirectPlain,
-    /// Next-event estimation of a surface with every lobe.
-    DirectRich,
-    /// The next ray of a plain surface.
-    ScatterPlain,
-    /// The next ray of a rich surface.
-    ScatterRich,
+    /// An opaque vertex from its arrival to its shadow job.
+    Direct,
+    /// An opaque vertex past its shadow ray to its next ray.
+    Scatter,
+    /// A vertex's light candidates.
+    Lights,
+    /// The caustic photons' light a vertex gathers.
+    Gather,
     /// A path ray's any-hit at a non-opaque triangle.
     CoverPath,
     /// A shadow ray's any-hit at a non-opaque triangle.
@@ -67,10 +67,10 @@ impl Body {
     pub const ALL: [Self; 10] = [
         Self::Resolve,
         Self::Emission,
-        Self::DirectPlain,
-        Self::DirectRich,
-        Self::ScatterPlain,
-        Self::ScatterRich,
+        Self::Direct,
+        Self::Scatter,
+        Self::Lights,
+        Self::Gather,
         Self::CoverPath,
         Self::CoverShadow,
         Self::BoxMedium,
@@ -81,10 +81,10 @@ impl Body {
         match self {
             Self::Resolve => "resolve",
             Self::Emission => "emission",
-            Self::DirectPlain => "direct plain",
-            Self::DirectRich => "direct rich",
-            Self::ScatterPlain => "scatter plain",
-            Self::ScatterRich => "scatter rich",
+            Self::Direct => "direct",
+            Self::Scatter => "scatter",
+            Self::Lights => "lights",
+            Self::Gather => "gather",
             Self::CoverPath => "cover path",
             Self::CoverShadow => "cover shadow",
             Self::BoxMedium => "box medium",
@@ -97,11 +97,9 @@ impl Body {
             Self::Resolve => ShaderKind::ClosestHit,
             Self::CoverPath | Self::CoverShadow | Self::ProxyShadow => ShaderKind::AnyHit,
             Self::BoxMedium => ShaderKind::Intersection,
-            Self::Emission
-            | Self::DirectPlain
-            | Self::DirectRich
-            | Self::ScatterPlain
-            | Self::ScatterRich => ShaderKind::Callable,
+            Self::Emission | Self::Direct | Self::Scatter | Self::Lights | Self::Gather => {
+                ShaderKind::Callable
+            }
         }
     }
 
@@ -109,8 +107,10 @@ impl Body {
         match self {
             Self::Resolve => "resolve",
             Self::Emission => "emission",
-            Self::DirectPlain | Self::DirectRich => "direct",
-            Self::ScatterPlain | Self::ScatterRich => "scatter",
+            Self::Direct => "direct",
+            Self::Scatter => "scatter",
+            Self::Lights => "lights",
+            Self::Gather => "gather",
             Self::CoverPath => "cover_path_hit",
             Self::CoverShadow => "cover_shadow_hit",
             Self::BoxMedium => "box_medium_hit",
@@ -118,15 +118,13 @@ impl Body {
         }
     }
 
-    /// What its stand-in for paths that may meet `may` may meet. The bodies are a view path's:
-    /// the other sources' paths run their own start, record and finish shaders. A plain class's
-    /// surfaces have none of the lobes a rich one may. The pipeline makes its hit shaders for
-    /// every source.
+    /// What its stand-in for paths that may meet `may` may meet. A vertex's next-event
+    /// estimation and scatter are every source's, as the pipeline makes them; the other bodies
+    /// are a view path's.
     fn may(self, may: u64) -> u64 {
-        let view = may & !(MAY_BACKGROUND | MAY_UPDATE | MAY_PHOTON) | MAY_VIEW;
         match self {
-            Self::DirectPlain | Self::ScatterPlain => view & !MAY_RICH,
-            _ => view,
+            Self::Direct | Self::Scatter => may,
+            _ => may & !(MAY_BACKGROUND | MAY_UPDATE | MAY_PHOTON) | MAY_VIEW,
         }
     }
 }

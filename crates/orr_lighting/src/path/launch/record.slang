@@ -25,9 +25,10 @@ import orr_lighting.path;
 import orr_lighting.path.common;
 import orr_lighting.path.launch.slot;
 
-// The record of a path in the pipeline, in its slot of `LaunchHeader.records`, by the root's source.
-// An update path's vertices go to its own callable (`launch_cache_vertex`), which `vertex` asks
-// for.
+// The record of a path in the pipeline, in its slot of `LaunchHeader.records`, by the root's source:
+// its policy and a view's writes. A vertex's shade callable hands an update path's vertex and a
+// photon's deposit to callables made for their sources (`cache_vertex`, `deposit`), so neither
+// is held here.
 public struct LaunchRecord : IVertexRecord
 {
     public bool view;
@@ -35,10 +36,6 @@ public struct LaunchRecord : IVertexRecord
     public bool update;
     public bool caustic;
     public uint4* words;
-    // `vertex` handed the record the vertex, and the sampler dimension it took for it, which the
-    // callable draws.
-    public bool recorded;
-    public uint dimension;
     // The slot's stack hit, where the root keeps the stack part: what the raygen's probe met,
     // which `stack_owned` reads.
     public uint4* probe;
@@ -114,24 +111,10 @@ public struct LaunchRecord : IVertexRecord
     }
 
     [mutating]
-    public void vertex(PathRoot r, PathVertex x, Bsdf b, float3 throughput, float3 radiance, inout Sampler rng)
-    {
-        recorded = update;
-        // `CacheUpdate.vertex` draws one dimension.
-        dimension = rng.dimension;
-        if (update)
-            rng.next();
-    }
+    public void vertex(PathRoot r, PathVertex x, Bsdf b, float3 throughput, float3 radiance, inout Sampler rng) {}
 
     [mutating]
-    public void deposit(PathRoot r, LayerVertex l, Bsdf b, float3 flux, inout Sampler rng)
-    {
-        if (!caustic)
-            return;
-        CausticPhoton c = load_part<CausticPhoton, RECORD_WORDS>(words);
-        c.deposit(r, l, b, flux, rng);
-        store_part<CausticPhoton, RECORD_WORDS>(words, c);
-    }
+    public void deposit(PathRoot r, LayerVertex l, Bsdf b, float3 flux, inout Sampler rng) {}
 
     [mutating]
     public void light(uint id, float contribution)
@@ -167,8 +150,6 @@ public LaunchRecord launch_record(PathRoot r, uint slot)
     record.update = from_update(r);
     record.caustic = from_photon(r);
     record.words = record_words(r, slot);
-    record.recorded = false;
-    record.dimension = 0;
     record.probe = stack_words(r, slot) + STACK_HIT_AT;
     return record;
 }

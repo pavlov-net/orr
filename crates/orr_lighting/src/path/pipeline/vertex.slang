@@ -1,9 +1,7 @@
-// The pipeline path tracer's callables at a path's vertex (`path.launch`): its emission, and its
-// next-event estimation and scatter per vertex class, which `orr_lighting::launch` makes per BSDF
-// class by `path_may`; a photon's deposit, an update path's cache vertex and a walk's end; and a
-// shadow ray's plane stack step and coated emitter's view. The emission, direct and deposit
-// callables take the length of the ray to the vertex in their data's third word and the step that
-// reached it in the fourth.
+// The pipeline path tracer's callables at a path's vertex (`path.launch`): its emission, its
+// next-event estimation and scatter per vertex class, and what those call: light sampling, the
+// caustic photons' gather, a photon's deposit and an update path's cache vertex; a walk's end; and
+// a shadow ray's plane stack step and coated emitter's view.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_lighting.environment;
@@ -27,49 +25,34 @@ void emission(inout Payload p)
     p.words.x = launch_emission(root, launch_slot(), asfloat(p.words.z), p.words.w);
 }
 
-// The direct callable of vertex class `K` (AT_*), and the deposit, take DIRECT_* in their data's
-// second word. A direct callable hands back there the sampler dimension of its record's vertex,
-// which `cache_vertex` takes.
+// The emission and the direct callable of vertex class `K` (AT_*) take DIRECT_* in their data's
+// second word, the length of the ray that reached the vertex in its third and the step that
+// reached it in its fourth; the direct callable hands back its step, with the vertex's probability
+// of running next-event estimation in the last word.
 void direct_of<let K : uint>(inout Payload p)
 {
-    uint dimension;
-    p.words.x = launch_direct<K, Surface, Medium>(root, launch_slot(), p.words.y, asfloat(p.words.z), p.words.w, dimension);
-    p.words.y = dimension;
+    p.words = launch_direct<K, Surface, Medium, CallableCalls>(root, launch_slot(), p.words.y, asfloat(p.words.z), p.words.w, CallableCalls());
+}
+
+// The scatter callable takes SCATTER_BENT in its data's second word, or 0, and that probability
+// in its third.
+void scatter_of<let K : uint>(inout Payload p)
+{
+    p.words.x = launch_scatter<K, Surface, CallableCalls>(root, launch_slot(), p.words.y == SCATTER_BENT, asfloat(p.words.z), CallableCalls());
 }
 
 [shader("callable")]
 void direct(inout Payload p)
 {
     ORR_OMM(direct);
-    direct_of<AT_PLAIN>(p);
-}
-
-[shader("callable")]
-void deposit(inout Payload p)
-{
-    ORR_OMM(deposit);
-    p.words.x = launch_deposit<Surface>(root, launch_slot(), p.words.y == DIRECT_PROBED, asfloat(p.words.z), p.words.w);
-}
-
-[shader("callable")]
-void cache_vertex(inout Payload p)
-{
-    ORR_OMM(cache_vertex);
-    launch_cache_vertex(root, launch_slot(), p.words.y);
+    direct_of<AT_SURFACE>(p);
 }
 
 [shader("callable")]
 void scatter(inout Payload p)
 {
     ORR_OMM(scatter);
-    p.words.x = launch_scatter<AT_PLAIN, Surface>(root, launch_slot());
-}
-
-[shader("callable")]
-void walk_end(inout Payload p)
-{
-    ORR_OMM(walk_end);
-    p.words.x = launch_walk_end(root, launch_slot());
+    scatter_of<AT_SURFACE>(p);
 }
 
 [shader("callable")]
@@ -83,7 +66,7 @@ void direct_exit(inout Payload p)
 void scatter_exit(inout Payload p)
 {
     ORR_OMM(scatter_exit);
-    p.words.x = launch_scatter<AT_EXIT, Surface>(root, launch_slot());
+    scatter_of<AT_EXIT>(p);
 }
 
 [shader("callable")]
@@ -97,21 +80,7 @@ void direct_leave(inout Payload p)
 void scatter_leave(inout Payload p)
 {
     ORR_OMM(scatter_leave);
-    p.words.x = launch_scatter<AT_LEAVE, Surface>(root, launch_slot());
-}
-
-[shader("callable")]
-void direct_layer(inout Payload p)
-{
-    ORR_OMM(direct_layer);
-    direct_of<AT_LAYER>(p);
-}
-
-[shader("callable")]
-void scatter_layer(inout Payload p)
-{
-    ORR_OMM(scatter_layer);
-    p.words.x = launch_scatter<AT_LAYER, Surface>(root, launch_slot());
+    scatter_of<AT_LEAVE>(p);
 }
 
 [shader("callable")]
@@ -125,7 +94,62 @@ void direct_medium(inout Payload p)
 void scatter_medium(inout Payload p)
 {
     ORR_OMM(scatter_medium);
-    p.words.x = launch_scatter<AT_SCATTER, Surface>(root, launch_slot());
+    scatter_of<AT_SCATTER>(p);
+}
+
+[shader("callable")]
+void direct_layer(inout Payload p)
+{
+    ORR_OMM(direct_layer);
+    direct_of<AT_LAYER>(p);
+}
+
+[shader("callable")]
+void scatter_layer(inout Payload p)
+{
+    ORR_OMM(scatter_layer);
+    scatter_of<AT_LAYER>(p);
+}
+
+// Takes the vertex's shading normal in its data's first three words and the sampler dimension it
+// draws from in its last, and hands back how many candidates it drew.
+[shader("callable")]
+void lights(inout Payload p)
+{
+    ORR_OMM(lights);
+    p.words.x = launch_lights<Surface>(root, launch_slot(), asfloat(p.words.xyz), p.words.w);
+}
+
+// Takes the sampler dimension, the footprint, the vertex's flags and word (`ICalls.gather`), and
+// hands back what it gathers and the dimension past its draws.
+[shader("callable")]
+void gather(inout Payload p)
+{
+    ORR_OMM(gather);
+    uint dimension = p.words.x;
+    float3 g = launch_gather<Surface>(root, launch_slot(), dimension, asfloat(p.words.y), p.words.z, p.words.w);
+    p.words = uint4(asuint(g), dimension);
+}
+
+[shader("callable")]
+void deposit(inout Payload p)
+{
+    ORR_OMM(deposit);
+    p.words.x = launch_deposit<Surface>(root, launch_slot(), p.words.x);
+}
+
+[shader("callable")]
+void cache_vertex(inout Payload p)
+{
+    ORR_OMM(cache_vertex);
+    launch_cache_vertex(root, launch_slot(), p.words.x);
+}
+
+[shader("callable")]
+void walk_end(inout Payload p)
+{
+    ORR_OMM(walk_end);
+    p.words.x = launch_walk_end(root, launch_slot());
 }
 
 // Takes the phase in its data's second word, and hands back what follows.

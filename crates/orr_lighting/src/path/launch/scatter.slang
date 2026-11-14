@@ -1,4 +1,4 @@
-// The scatter of a vertex as the shade bodies hold it.
+// The scatter of a vertex as the shade bodies hold it, past its caustic photons' gather.
 // The pipeline's own copy of bodies the staged loop keeps in `path/stages.slang`: a fix to one
 // belongs in both, and the pipeline-against-staged tests compare them.
 module scatter;
@@ -34,16 +34,45 @@ import orr_lighting.specialize;
 import orr_lighting.path.common;
 import orr_lighting.path.launch.nee;
 
-// The rest of the iteration from vertex `sv` of kind `kind`, with `X` a walk's exit, past its
-// next-event estimation `nee`: the caustic photons' light, and the vertex's next direction, which
-// leaves `c.ray` for the trace stage, or with `walking` starts a walk along `wi`. False where the
-// path ends.
-public bool vertex_scatter<S : ISurfaces, let X : uint, R : IPathRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv, ShadeNee nee, out bool walking, out float3 wi)
+// What a vertex's scatter did beside its next ray: it starts a subsurface walk along `wi` in
+// place of the ray; it passed an ideal window, which passes the ray on as it reached it but for
+// its trace half; and how it left the path's plane stack (SCATTER_STACK_*).
+public struct Scattered
 {
+    public bool walking;
+    public float3 wi;
+    public bool passed;
+    public uint stack;
+}
+
+// The stack is the one the scatter started at its ray, which the ray words hold; the scatter
+// crossed a stack face and the stack part holds the stack; or the stack is as it was.
+public static const uint SCATTER_STACK_RAY = 0;
+public static const uint SCATTER_STACK_CROSSED = 1;
+public static const uint SCATTER_STACK_KEPT = 2;
+
+// Whether the caustic photons' light at vertex kind `kind` of path `p` counts: it is indirect,
+// at the vertex's diffuse lobes.
+public bool vertex_gathers(PathRoot r, PathLoop p, PathContext x, uint kind)
+{
+    bool gathered = path_mode(r) == PATH_DIRECT ? false : path_mode(r) == PATH_INDIRECT ? true : has(p.flags, LOOP_COUNTED);
+    return may(MAY_CAUSTICS) && x.caustics && gathered && kind != VERTEX_SCATTER && kind != VERTEX_LEAVE;
+}
+
+// The rest of the iteration from vertex `sv` of kind `kind`, with `X` a walk's exit, past its
+// next-event estimation `nee` and its caustic photons' gather: the vertex's next direction, which
+// leaves `c.ray` for the trace, or starts a walk (`Scattered`). The interiors past the vertex are
+// the path's at once: its shadow ray keeps those it arrived with. False where the path ends.
+public bool vertex_scatter<S : ISurfaces, let X : uint, R : IPathRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, R record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv, ShadeNee nee, out Scattered out_)
+{
+    out_.walking = false;
+    out_.wi = float3(0.0);
+    out_.passed = false;
+    out_.stack = SCATTER_STACK_KEPT;
+    bool walking = false;
+    float3 wi = float3(0.0);
     SceneRoot* s = r.scene;
     LightSetGpu* set = r.set;
-    walking = false;
-    wi = float3(0.0);
     LayerVertex l = sv.l;
     Bsdf b = sv.b;
     bool reference = x.reference;
@@ -54,10 +83,6 @@ public bool vertex_scatter<S : ISurfaces, let X : uint, R : IPathRecord>(PathRoo
     bool leaving = kind == VERTEX_LEAVE;
     bool on_layer = kind == VERTEX_LAYER;
     bool alive = true;
-    // The caustic photons' light at the vertex's diffuse lobes, which is indirect.
-    bool gathered = path_mode(r) == PATH_DIRECT ? false : path_mode(r) == PATH_INDIRECT ? true : counted;
-    if (may(MAY_CAUSTICS) && x.caustics && gathered && !medium_vertex && !leaving)
-        p.radiance += c.spectral.color(p.throughput * caustic_gather<S>(r, l, b, at_exit, sv.exit_scatter, p.cone.width, rng));
     if (has(p.flags, LOOP_LAST))
         return false;
     float pdf;
@@ -173,16 +198,11 @@ public bool vertex_scatter<S : ISurfaces, let X : uint, R : IPathRecord>(PathRoo
     }
     if (alive && !walking)
     {
-        // The interiors past the vertex. A deferred shadow ray reads the ones its vertex arrived
-        // with from the path's, so the trace stage crosses the surface once it has traced it.
         Interior past = c.interior;
         if (crossed)
         {
             past.cross(l.section, l.front, l.x.surface.medium_point);
-            if (nee.traced && !nee.here)
-                p.flags |= LOOP_CROSS | (l.front ? LOOP_CROSS_FRONT : 0);
-            else
-                c.interior = past;
+            c.interior = past;
             if (l.front)
             {
                 p.entered = l.section;
@@ -195,6 +215,7 @@ public bool vertex_scatter<S : ISurfaces, let X : uint, R : IPathRecord>(PathRoo
         c.ray.dir = wi;
         c.ray.chain = kind != VERTEX_OPAQUE;
         // An ideal window passes the ray on as it reached it.
+        out_.passed = null_crossing;
         if (!null_crossing)
         {
             c.ray.pdf = delta ? 0.0 : pdf;
@@ -210,11 +231,16 @@ public bool vertex_scatter<S : ISurfaces, let X : uint, R : IPathRecord>(PathRoo
                 if (c.stack.crossed == 0)
                     c.stack.normal = l.x.surface.normal;
                 c.stack.crossed++;
+                out_.stack = SCATTER_STACK_CROSSED;
             }
             else if (x.photon)
+            {
                 c.stack.valid = false;
+                out_.stack = SCATTER_STACK_RAY;
+            }
             else
             {
+                out_.stack = SCATTER_STACK_RAY;
                 c.stack.valid = may(MAY_STACK) && c.ray.pdf > 0.0 && !x.one_technique && set.stack_entries != 0;
                 c.stack.crossed = 0;
                 c.stack.origin = c.ray.origin;
@@ -228,5 +254,7 @@ public bool vertex_scatter<S : ISurfaces, let X : uint, R : IPathRecord>(PathRoo
         }
         p.cone.spread += spread;
     }
+    out_.walking = walking;
+    out_.wi = wi;
     return alive;
 }

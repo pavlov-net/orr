@@ -9,14 +9,15 @@ use orr_scene::orr_gpu::{
 use orr_scene::{HitGroups, SceneFeatures};
 
 use crate::shaders::consts::{
-    AT_EXIT, AT_LAYER, AT_LEAVE, AT_PLAIN, AT_RICH, AT_SCATTER, CALL_CACHE_VERTEX, CALL_DEPOSIT,
+    AT_EXIT, AT_LAYER, AT_LEAVE, AT_SCATTER, AT_SURFACE, CALL_CACHE_VERTEX, CALL_DEPOSIT,
     CALL_DIRECT, CALL_EMISSION, CALL_EMITTER_VIEW, CALL_FINISH_BACKGROUND, CALL_FINISH_RECORD,
-    CALL_FINISH_VIEW, CALL_GBUFFER, CALL_LAYERS, CALL_PROXY_MARCH, CALL_RESOLVE_GIVEN,
-    CALL_SCATTER, CALL_SEGMENT, CALL_STACK_STEP, CALL_START_BACKGROUND, CALL_START_FIRST_VERTEX,
-    CALL_START_PHOTON, CALL_START_UPDATE, CALL_START_VIEW, CALL_WALK_END, CALLABLES,
+    CALL_FINISH_VIEW, CALL_GATHER, CALL_GBUFFER, CALL_LAYERS, CALL_LIGHTS, CALL_PROXY_MARCH,
+    CALL_RESOLVE_GIVEN, CALL_SCATTER, CALL_SEGMENT, CALL_STACK_STEP, CALL_START_BACKGROUND,
+    CALL_START_FIRST_VERTEX, CALL_START_PHOTON, CALL_START_UPDATE, CALL_START_VIEW, CALL_WALK_END,
+    CALLABLES,
 };
 use crate::shaders::path::pipeline;
-use crate::staged::{MAY_ALL, MAY_RICH};
+use crate::staged::{MAY_ALL, MAY_BACKGROUND, MAY_PHOTON, MAY_RICH, MAY_UPDATE, MAY_VIEW};
 use crate::{Error, KernelSet, module};
 
 /// The pipeline's kernel files (`path/pipeline/*.slang`), which hold its entries by family.
@@ -118,89 +119,136 @@ const RESOLVE_STRANDS: usize = 2;
 const COVER_PATH: usize = 3;
 const COVER_SHADOW: usize = 4;
 
-/// Then the callables, each at its `path/launch/steps.slang` CALL_* index with the lobes of the
-/// BSDF its vertices may have. Next-event estimation and the scatter are made per vertex class
-/// (AT_*), an opaque vertex's for a plain surface's and a rich one's. A walk's ends are made rich,
-/// as a walk starts only from a vertex with a subsurface weight, and so are the layer's and an
-/// emitter's view, whose surfaces may have every lobe. What lies along a ray, a
-/// scatter in a medium and a plane stack's step shade no surface.
-const CALLED: [(u32, Kernel, &str, bool); CALLABLES as usize] = [
-    (CALL_START_VIEW, Kernel::Sources, "start_view", true),
-    (CALL_START_UPDATE, Kernel::Sources, "start_update", true),
-    (CALL_START_PHOTON, Kernel::Sources, "start_photon", true),
+/// Then the callables, each at its `path/launch/steps.slang` CALL_* index with the `path_may` it is
+/// made with. A vertex's next-event estimation and scatter are made per class (AT_*), with every
+/// lobe its surface may have, and so are light sampling, the caustic photons' gather, a walk's end
+/// and an emitter's view. What lies along a ray, a scatter in a medium and a plane stack's step
+/// shade no surface, and are made without the rich lobes and walks. A record's callables are made for their own
+/// source.
+const CALLED: [(u32, Kernel, &str, u64); CALLABLES as usize] = [
+    (CALL_START_VIEW, Kernel::Sources, "start_view", MAY_ALL),
+    (CALL_START_UPDATE, Kernel::Sources, "start_update", MAY_ALL),
+    (CALL_START_PHOTON, Kernel::Sources, "start_photon", MAY_ALL),
     (
         CALL_START_BACKGROUND,
         Kernel::Sources,
         "start_background",
-        true,
+        MAY_ALL,
     ),
-    (CALL_RESOLVE_GIVEN, Kernel::Sources, "resolve_given", true),
-    (CALL_EMISSION, Kernel::Vertex, "emission", true),
-    (CALL_DIRECT + AT_PLAIN, Kernel::Vertex, "direct", false),
-    (CALL_DIRECT + AT_RICH, Kernel::Vertex, "direct", true),
-    (CALL_DIRECT + AT_EXIT, Kernel::Vertex, "direct_exit", true),
-    (CALL_DIRECT + AT_LEAVE, Kernel::Vertex, "direct_leave", true),
+    (
+        CALL_RESOLVE_GIVEN,
+        Kernel::Sources,
+        "resolve_given",
+        MAY_ALL,
+    ),
+    (CALL_EMISSION, Kernel::Vertex, "emission", MAY_ALL),
+    (CALL_DIRECT + AT_SURFACE, Kernel::Vertex, "direct", MAY_ALL),
+    (
+        CALL_DIRECT + AT_EXIT,
+        Kernel::Vertex,
+        "direct_exit",
+        MAY_ALL,
+    ),
+    (
+        CALL_DIRECT + AT_LEAVE,
+        Kernel::Vertex,
+        "direct_leave",
+        MAY_ALL,
+    ),
     (
         CALL_DIRECT + AT_SCATTER,
         Kernel::Vertex,
         "direct_medium",
-        false,
+        PLAIN,
     ),
-    (CALL_DIRECT + AT_LAYER, Kernel::Vertex, "direct_layer", true),
-    (CALL_SCATTER + AT_PLAIN, Kernel::Vertex, "scatter", false),
-    (CALL_SCATTER + AT_RICH, Kernel::Vertex, "scatter", true),
-    (CALL_SCATTER + AT_EXIT, Kernel::Vertex, "scatter_exit", true),
+    (
+        CALL_DIRECT + AT_LAYER,
+        Kernel::Vertex,
+        "direct_layer",
+        MAY_ALL,
+    ),
+    (
+        CALL_SCATTER + AT_SURFACE,
+        Kernel::Vertex,
+        "scatter",
+        MAY_ALL,
+    ),
+    (
+        CALL_SCATTER + AT_EXIT,
+        Kernel::Vertex,
+        "scatter_exit",
+        MAY_ALL,
+    ),
     (
         CALL_SCATTER + AT_LEAVE,
         Kernel::Vertex,
         "scatter_leave",
-        true,
+        MAY_ALL,
     ),
     (
         CALL_SCATTER + AT_SCATTER,
         Kernel::Vertex,
         "scatter_medium",
-        false,
+        PLAIN,
     ),
     (
         CALL_SCATTER + AT_LAYER,
         Kernel::Vertex,
         "scatter_layer",
-        true,
+        MAY_ALL,
     ),
-    (CALL_DEPOSIT, Kernel::Vertex, "deposit", true),
-    (CALL_CACHE_VERTEX, Kernel::Vertex, "cache_vertex", true),
-    (CALL_FINISH_VIEW, Kernel::Sources, "finish_view", true),
-    (CALL_FINISH_RECORD, Kernel::Sources, "finish_record", true),
+    (CALL_LIGHTS, Kernel::Vertex, "lights", MAY_ALL),
+    (CALL_GATHER, Kernel::Vertex, "gather", MAY_ALL),
+    (CALL_DEPOSIT, Kernel::Vertex, "deposit", only(MAY_PHOTON)),
+    (
+        CALL_CACHE_VERTEX,
+        Kernel::Vertex,
+        "cache_vertex",
+        only(MAY_UPDATE),
+    ),
+    (CALL_FINISH_VIEW, Kernel::Sources, "finish_view", MAY_ALL),
+    (
+        CALL_FINISH_RECORD,
+        Kernel::Sources,
+        "finish_record",
+        MAY_ALL,
+    ),
     (
         CALL_FINISH_BACKGROUND,
         Kernel::Sources,
         "finish_background",
-        true,
+        MAY_ALL,
     ),
-    (CALL_WALK_END, Kernel::Vertex, "walk_end", true),
-    (CALL_SEGMENT, Kernel::Sources, "segment", false),
-    (CALL_LAYERS, Kernel::Sources, "layers", false),
-    (CALL_PROXY_MARCH, Kernel::Sources, "march_proxy", false),
-    (CALL_GBUFFER, Kernel::Sources, "gbuffer_start", true),
-    (CALL_STACK_STEP, Kernel::Vertex, "stack_step", false),
-    (CALL_EMITTER_VIEW, Kernel::Vertex, "emitter_view", true),
+    (CALL_WALK_END, Kernel::Vertex, "walk_end", MAY_ALL),
+    (CALL_SEGMENT, Kernel::Sources, "segment", PLAIN),
+    (CALL_LAYERS, Kernel::Sources, "layers", PLAIN),
+    (CALL_PROXY_MARCH, Kernel::Sources, "march_proxy", PLAIN),
+    (CALL_GBUFFER, Kernel::Sources, "gbuffer_start", MAY_ALL),
+    (CALL_STACK_STEP, Kernel::Vertex, "stack_step", PLAIN),
+    (CALL_EMITTER_VIEW, Kernel::Vertex, "emitter_view", MAY_ALL),
     (
         CALL_START_FIRST_VERTEX,
         Kernel::Sources,
         "start_first_vertex",
-        true,
+        MAY_ALL,
     ),
 ];
 
-/// [`CALLED`] in the order of the table: each callable's kernel, entry and whether it is made
-/// rich.
-fn callables() -> [(Kernel, &'static str, bool); CALLABLES as usize] {
-    let mut table = [(Kernel::Vertex, "", false); CALLABLES as usize];
-    for (index, kernel, entry, rich) in CALLED {
+/// `path_may` of a stage that shades no surface.
+const PLAIN: u64 = MAY_ALL & !MAY_RICH;
+
+/// `path_may` of a stage made for the paths of source `source` (`MAY_VIEW`, ...) alone.
+const fn only(source: u64) -> u64 {
+    MAY_ALL & !(MAY_VIEW | MAY_BACKGROUND | MAY_UPDATE | MAY_PHOTON) | source
+}
+
+/// [`CALLED`] in the order of the table: each callable's kernel, entry and `path_may`.
+fn callables() -> [(Kernel, &'static str, u64); CALLABLES as usize] {
+    let mut table = [(Kernel::Vertex, "", 0); CALLABLES as usize];
+    for (index, kernel, entry, may) in CALLED {
         let at = &mut table[index as usize];
         assert!(at.1.is_empty(), "two callables at index {index}");
-        *at = (kernel, entry, rich);
+        *at = (kernel, entry, may);
     }
     table
 }
@@ -266,8 +314,7 @@ impl PathPipeline {
             }
         }
         let first_callable = specs.len() as u32;
-        for (kernel, entry, rich) in callables() {
-            let may = if rich { MAY_ALL } else { MAY_ALL & !MAY_RICH };
+        for (kernel, entry, may) in callables() {
             let constants = Constants {
                 path_may: Some(may as u32),
                 ..Constants::default()
