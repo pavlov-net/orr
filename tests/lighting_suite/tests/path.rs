@@ -81,7 +81,8 @@ fn an_albedo_one_sphere_in_a_uniform_environment_returns_the_environment() {
 }
 
 /// The pipeline path tracer renders opaque scenes as the staged loop does: a sphere on the ground
-/// under a sun and a sky, the Cornell box lit by its emissive quad, and an alpha-tested quad.
+/// under a sun and a sky, the Cornell box lit by its emissive quad, and an alpha-tested quad; and
+/// the box in the debug view of its first vertex's ray origin bias.
 #[test]
 fn the_pipeline_renders_opaque_scenes_as_the_staged_loop_does() {
     if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
@@ -98,6 +99,29 @@ fn the_pipeline_renders_opaque_scenes_as_the_staged_loop_does() {
         let mut bed = Bed::new(scene);
         bed.set_pre_exposure(pre_exposure);
         assert_pipeline_renders_as_staged(&format!("{scene:?}"), &mut bed, &staged, &launched);
+    }
+    // A debug view of the first vertex alone, which the pipeline starts from a callable of its
+    // own. It draws nothing, so the two show the same image.
+    let origin_bias = ViewLighting {
+        debug_view: LightingDebugView::RayOriginBias,
+        ..ViewLighting::default()
+    };
+    let (staged, launched) = both(&KernelSet::default(), origin_bias);
+    let mut bed = Bed::new(Analytic::CornellBox);
+    bed.set_hit_pipeline(launched.hit_pipeline());
+    let a = render_paths(&mut bed, &staged, 1, 1);
+    let b = render_paths(&mut bed, &launched, 1, 1);
+    assert!(
+        b.mean.iter().any(|p| p[0] > 0.0),
+        "origin bias: an empty image"
+    );
+    for (i, (x, y)) in a.mean.iter().zip(&b.mean).enumerate() {
+        for c in 0..4 {
+            assert!(
+                (x[c] - y[c]).abs() <= 1e-5 * x[c].abs().max(1e-6),
+                "origin bias: pixel {i} staged {x:?}, pipeline {y:?}"
+            );
+        }
     }
     assert_clean();
 }

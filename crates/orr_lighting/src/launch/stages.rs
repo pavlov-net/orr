@@ -12,8 +12,8 @@ use crate::shaders::consts::{
     AT_EXIT, AT_LAYER, AT_LEAVE, AT_PLAIN, AT_RICH, AT_SCATTER, CALL_CACHE_VERTEX, CALL_DEPOSIT,
     CALL_DIRECT, CALL_EMISSION, CALL_EMITTER_VIEW, CALL_FINISH_BACKGROUND, CALL_FINISH_RECORD,
     CALL_FINISH_VIEW, CALL_GBUFFER, CALL_LAYERS, CALL_PROXY_MARCH, CALL_RESOLVE_GIVEN,
-    CALL_SCATTER, CALL_SEGMENT, CALL_STACK_STEP, CALL_START_BACKGROUND, CALL_START_PHOTON,
-    CALL_START_UPDATE, CALL_START_VIEW, CALL_WALK_END, CALL_WINDOW, CALLABLES,
+    CALL_SCATTER, CALL_SEGMENT, CALL_STACK_STEP, CALL_START_BACKGROUND, CALL_START_FIRST_VERTEX,
+    CALL_START_PHOTON, CALL_START_UPDATE, CALL_START_VIEW, CALL_WALK_END, CALL_WINDOW, CALLABLES,
 };
 use crate::shaders::path::pipeline;
 use crate::staged::{MAY_ALL, MAY_RICH};
@@ -77,10 +77,9 @@ struct Constants {
 }
 
 /// The stages the pipeline holds one of, first, by index: the raygens in [`Raygen`]'s order, the
-/// miss shader, the medium proxies' intersection and any-hit shaders, the walk meet's
-/// closest-hit, what layer rays keep of triangles, medium proxies and light proxies, and the stack
-/// meet's closest-hit.
-const FIXED: [(Kernel, &str); 13] = [
+/// miss shader, the medium proxies' intersection and any-hit shaders, what layer rays keep of
+/// triangles, medium proxies and light proxies, and the stack meet's closest-hit.
+const FIXED: [(Kernel, &str); 12] = [
     (Kernel::Raygen, "path_view"),
     (Kernel::Raygen, "path_update"),
     (Kernel::Raygen, "path_photon"),
@@ -88,7 +87,6 @@ const FIXED: [(Kernel, &str); 13] = [
     (Kernel::Raygen, "miss_path"),
     (Kernel::Hits, "box_medium_hit"),
     (Kernel::Hits, "proxy_shadow_hit"),
-    (Kernel::Hits, "walk_meet"),
     (Kernel::Hits, "cover_layers_hit"),
     (Kernel::Hits, "cover_layers_medium_hit"),
     (Kernel::Hits, "box_light_hit"),
@@ -99,12 +97,11 @@ const RAYGENS: u32 = 4;
 const MISS: u32 = 4;
 const MEDIUM_INTERSECTION: u32 = 5;
 const MEDIUM_ANY_HIT: u32 = 6;
-const WALK_MEET: u32 = 7;
-const LAYERS_ANY_HIT: u32 = 8;
-const MEDIUM_LAYERS_ANY_HIT: u32 = 9;
-const LIGHT_INTERSECTION: u32 = 10;
-const LIGHT_LAYERS_ANY_HIT: u32 = 11;
-const STACK_MEET: u32 = 12;
+const LAYERS_ANY_HIT: u32 = 7;
+const MEDIUM_LAYERS_ANY_HIT: u32 = 8;
+const LIGHT_INTERSECTION: u32 = 9;
+const LIGHT_LAYERS_ANY_HIT: u32 = 10;
+const STACK_MEET: u32 = 11;
 
 /// What the pipeline holds per pin after those (`HitGroups`): the closest-hit shaders of a copy's
 /// clusters, of a producer entry's clusters and of strands, and the any-hit shaders under path and
@@ -194,6 +191,12 @@ const CALLED: [(u32, Kernel, &str, bool); CALLABLES as usize] = [
     (CALL_WINDOW, Kernel::Vertex, "window", true),
     (CALL_STACK_STEP, Kernel::Vertex, "stack_step", false),
     (CALL_EMITTER_VIEW, Kernel::Vertex, "emitter_view", true),
+    (
+        CALL_START_FIRST_VERTEX,
+        Kernel::Sources,
+        "start_first_vertex",
+        true,
+    ),
 ];
 
 /// [`CALLED`] in the order of the table: each callable's kernel, entry and whether it is made
@@ -337,7 +340,6 @@ impl PathPipeline {
                 Some(MEDIUM_ANY_HIT),
                 Some(MEDIUM_INTERSECTION),
             ),
-            (&mut groups.walk_meet, Some(WALK_MEET), None, None),
             (&mut groups.layers, None, Some(LAYERS_ANY_HIT), None),
             (
                 &mut groups.medium_layers,

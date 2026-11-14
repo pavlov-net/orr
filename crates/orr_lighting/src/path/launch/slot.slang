@@ -292,8 +292,10 @@ public struct LayerEntry
 // `LaunchWalk.kind` above its WALK_*: the walk is an interior's, not a subsurface walk.
 public static const uint LAUNCH_WALK_INTERIOR = 1 << 8;
 
-// A walk in flight, `Walk` as the walk part holds it with what traces its steps. Once it ends, a
-// way out of an interior keeps its point in `origin`, its direction in `dir` and its normal.
+// A walk in flight, `Walk` as the walk part holds it with what traces its steps: first the
+// WALK_MOVING_WORDS its steps change, then what they only read. Once it ends, a way out of an
+// interior keeps its point in `origin`, its direction in `dir` and its normal.
+public static const uint WALK_MOVING_WORDS = 4;
 public struct LaunchWalk
 {
     public float3 origin;
@@ -301,18 +303,18 @@ public struct LaunchWalk
     public float3 dir;
     public uint step;
     public float3 throughput;
-    public float ior;
+    public uint rng_dimension;
+    public float3 normal;
+    public uint rays;                       // the steps' traces
     public float3 extinction;
     public float anisotropy;
     public float3 albedo;
     public uint owner;                      // the instance a subsurface walk stays on; an interior's material
-    public float3 normal;
-    public uint seed;                       // a subsurface walk exit's scatter's, drawn at its next-event estimation
     public uint4 cover;                     // the payload its steps' traces take (`path_payload`)
     public uint rng_index;
     public uint rng_seed;
-    public uint rng_dimension;
-    public uint rays;                       // the steps' traces
+    public float ior;
+    public uint seed;                       // a subsurface walk exit's scatter's, drawn at its next-event estimation
 }
 
 // The rest of `PathShadowRay` for a path that tracks interiors: its vertex's point, and the

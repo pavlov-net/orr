@@ -28,6 +28,7 @@ import orr_lighting.path.launch.slot;
 import orr_lighting.path.launch.hit;
 import orr_lighting.path.launch.raygen_shadow;
 import orr_lighting.path.launch.raygen_walk;
+import orr_lighting.path.launch.boundary;
 
 // Traces the ray of `slot`'s path, takes what lies in front of its hit and along it, and runs the
 // shader of what it met, after a reorder by that shader, whether the vertex is the last bounce's,
@@ -86,7 +87,7 @@ public void launch_paths<M : IMedium>(PathRoot r, uint start, uint finish, bool 
     uint slot = launch_slot();
     if (slot >= r.slice_count)
         return;
-    uint step = step_call(start);
+    uint step = start_path(r, slot, start);
     // The length of the ray that reached the vertex the path is at, 0 for the G-buffer's surface.
     float t = 0.0;
     for (uint pass = 0; (step & STEP_DONE) == 0; pass++)
@@ -132,7 +133,7 @@ public void launch_paths<M : IMedium>(PathRoot r, uint start, uint finish, bool 
                 break;
             step = step_call(CALL_SCATTER + at);
         }
-        step = step_call(finish, pass);
+        step = crossed_call(r, slot, finish, pass);
         t = 0.0;
     }
 }

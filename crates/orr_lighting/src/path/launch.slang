@@ -21,6 +21,7 @@ __exported import orr_lighting.path.launch.steps;
 __exported import orr_lighting.path.launch.slot;
 __exported import orr_lighting.path.launch.record;
 __exported import orr_lighting.path.launch.load;
+__exported import orr_lighting.path.launch.boundary;
 __exported import orr_lighting.path.launch.walk;
 __exported import orr_lighting.path.launch.media;
 __exported import orr_lighting.path.launch.start;

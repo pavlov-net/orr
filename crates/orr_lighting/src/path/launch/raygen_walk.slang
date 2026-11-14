@@ -26,35 +26,39 @@ import orr_lighting.path.common;
 import orr_lighting.path.launch.steps;
 import orr_lighting.path.launch.slot;
 import orr_lighting.path.launch.walk;
-
-// The hit record whose closest-hit shader is the walk meet's (`orr_scene.runs`' RUN_WALK).
-static const uint WALK_MEET_RECORD = RAY_TYPES * RUN_WALK + RAY_TYPE_PATH;
+import orr_lighting.path.launch.boundary;
 
 // Runs the walk of `slot`'s path from its walk part to its end, and returns the step the path
-// goes on with there. Its steps are traced here, a ray each; after every WALK_POINT_STEPS of
-// them the walk is stored, and the thread reorders by whether it still walks. Where its last step
-// met a surface the hit's shader resolved, the length it gave the step in `t`.
+// goes on with there. Its steps are boundary steps traced here, a ray each. What a step changes
+// stays in registers across its trace, and what it only reads is loaded again past it; after every
+// WALK_POINT_STEPS steps the changing words are stored, and the thread reorders by whether it
+// still walks. Where its last step met a surface the hit's shader resolved, the length it gave the
+// step in `t`.
 public uint walk_path(PathRoot r, uint slot, out float t)
 {
     t = 0.0;
     uint4* at = walk_words(r, slot);
     bool share = (r.dielectric_flags & DIELECTRIC_REFERENCE) == 0;
+    WalkMoving m = load_walk_moving(at);
+    bool interior = (m.kind & LAUNCH_WALK_INTERIOR) != 0;
+    uint mask = interior ? MASK_OPAQUE | MASK_DIELECTRIC : MASK_OPAQUE;
     for (;;)
     {
-        LaunchWalk w = load_part<LaunchWalk, WALK_STATE_WORDS>(at);
-        Walk e = walk_of(w);
-        bool interior = (w.kind & LAUNCH_WALK_INTERIOR) != 0;
-        uint mask = interior ? MASK_OPAQUE | MASK_DIELECTRIC : MASK_OPAQUE;
-        for (uint end = min(e.step + WALK_POINT_STEPS, r.sss_max_steps); e.step < end; e.step++)
+        Walk e = walk_of(m, load_walk_fixed(at));
+        for (uint end = min(m.step + WALK_POINT_STEPS, r.sss_max_steps); e.step < end; e.step++)
         {
             WalkDraw d;
             if (!walk_draw(e, d))
                 break;
-            w.rays++;
+            m = moving_of(m, e);
+            m.rays++;
             Payload p;
-            p.words = w.cover;
-            Traced h = trace_hit(r.scene.tlas, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, mask, RAY_TYPE_PATH, RAY_TYPES, 0, path_ray(e.origin, e.dir, d.t), p);
-            if (!h.hit())
+            p.words = load_walk_fixed(at).cover;
+            Traced h = boundary_trace(r.scene, path_ray(m.origin, m.dir, d.t), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, mask, p);
+            Boundary b = boundary_of(h);
+            WalkFixed f = load_walk_fixed(at);
+            e = walk_of(m, f);
+            if (!b.hit)
             {
                 if (!walk_scattered(e, d, share))
                     break;
@@ -62,21 +66,12 @@ public uint walk_path(PathRoot r, uint slot, out float t)
             }
             WalkMeet met = WalkMeet(WALK_BOUNDARY);
             if (!interior)
-                met = WalkMeet(on_instance(r.scene, h.instance_index(), w.owner) ? WALK_BOUNDARY : WALK_NONE);
-            else if (h.hit_kind() == HIT_KIND_TRIANGLE_FRONT_FACE || h.hit_kind() == HIT_KIND_TRIANGLE_BACK_FACE)
-            {
-                // The face's geometry, which only a hit shader reads, from the walk meet's.
-                uint own = h.record_index();
-                h.set_record_index(WALK_MEET_RECORD);
-                Payload m;
-                m.words = uint4(0);
-                h.invoke(m);
-                h.set_record_index(own);
-                met = interior_meet(r.view, w.owner, e.ior, m.words.w, asfloat(m.words.xyz), e.origin, e.dir, h.t(), e.rng);
-            }
-            if (walk_met(e, d, h.t(), met))
+                met = WalkMeet(on_instance(r.scene, b.instance, f.owner) ? WALK_BOUNDARY : WALK_NONE);
+            else if (b.triangle && b.material == f.owner)
+                met = interior_meet(r.view, f.owner, e.ior, b.material, boundary_normal(r.scene, h, b, e.dir), e.origin, e.dir, b.t, e.rng);
+            if (walk_met(e, d, b.t, met))
                 continue;
-            store_part<LaunchWalk, WALK_STATE_WORDS>(at, walk_into(w, e));
+            store_walk_moving(at, e, m.kind, m.rays);
             uint step = step_call(CALL_WALK_END);
             if ((step & STEP_INVOKE) != 0)
             {
@@ -89,7 +84,8 @@ public uint walk_path(PathRoot r, uint slot, out float t)
         }
         if (e.kind == WALK_RUNNING)
             walk_capped(e, r.subsurface_table, r.sss_max_steps, share);
-        store_part<LaunchWalk, WALK_STATE_WORDS>(at, walk_into(w, e));
+        store_walk_moving(at, e, m.kind, m.rays);
+        m = moving_of(m, e);
         bool running = e.kind == WALK_RUNNING;
         reorder(running ? 1u : 0u, 1);
         if (!running)

@@ -50,7 +50,8 @@ import orr_lighting.path.common;
 [Host] public static const uint CALL_WINDOW = 28;
 [Host] public static const uint CALL_STACK_STEP = 29;
 [Host] public static const uint CALL_EMITTER_VIEW = 30;
-[Host] public static const uint CALLABLES = 31;
+[Host] public static const uint CALL_START_FIRST_VERTEX = 31;   // a view's debug view of its first vertex alone
+[Host] public static const uint CALLABLES = 32;
 
 // What the raygen hands a vertex's direct or deposit callable in its data's second word: its
 // first call; its call again once the raygen has traced the probe it asked for (STEP_PROBE); and
@@ -66,6 +67,9 @@ public static const uint STEP_EMITS = 1 << 2;    // which emits
 public static const uint STEP_SHADOW = 1 << 3;   // next-event estimation left a shadow ray
 public static const uint STEP_ENDED = 1 << 4;    // the path ended: its finish runs
 public static const uint STEP_DONE = 1 << 5;     // nothing of the path is left to run: no finish follows
+// A start or a finish asks for the surfaces of an interior that the ray it left in the slot's ray
+// words crosses (`launch/boundary.slang`), before it runs again.
+public static const uint STEP_CROSS = 1 << 6;
 public static const uint STEP_WALK = 1 << 7;     // the path walks from its walk part
 public static const uint STEP_INVOKE = 1 << 8;   // the walk's last step met a surface whose hit shader goes on
 public static const uint STEP_GIVEN = 1 << 9;    // the path starts on the hit its surface words give, once its shadow ray has passed

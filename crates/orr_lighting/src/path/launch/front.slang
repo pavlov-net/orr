@@ -30,7 +30,8 @@ import orr_lighting.path;
 import orr_lighting.path.common;
 import orr_lighting.path.launch.steps;
 import orr_lighting.path.launch.slot;
-import orr_lighting.path.launch.load;
+import orr_lighting.path.launch.record;
+import orr_lighting.path.launch.start;
 
 // A LAYERS trace's payload, 16 bytes: the ray's reach, the distance of the LAYERS_KEPT-th
 // candidate kept (+inf until that many are), the bound's distance, and a word of the candidates
@@ -156,17 +157,23 @@ LayerEntry front_entry(uint4* at, uint k)
 // The layers callable's body: composites the `kept` candidates a LAYERS trace of `slot`'s path
 // ray, reaching `t_max`, kept in front of its hit, in depth order, as `trace_resolve_translucent`
 // takes them with `PathEmission`, and moves the bound to the last. STEP_ENDED where nothing goes
-// on through them, else 0; the bound's distance in `bound`.
+// on through them, else 0; the bound's distance in `bound`. It loads the loop, the ray and the
+// scalars, and the wavelengths where the scalars say the path is split by them.
 public uint launch_layers(PathRoot r, uint slot, uint kept, float t_max, out float bound)
 {
-    LaunchVertex v = load_vertex(r, slot);
-    LayerRay ray = v.c.ray;
-    bool adds = v.x.count_bsdf && has(v.p.flags, LOOP_COUNTED);
-    float3 own = owned_light(v.p, ray);
+    uint4* words = hot_words(r, slot);
+    uint2 pixel = launch_pixel(r, slot);
+    uint reach;
+    PathLoop p = load_path_loop(r, words, pixel, reach);
+    LayerRay ray = layer_ray(load_launch_ray(words));
+    Spectral spectral = path_spectral(r, slot, load_scalar(words, SCALAR_FLAGS));
+    PathContext x = path_context(r, launch_record(r, slot), pixel);
+    bool adds = x.count_bsdf && has(p.flags, LOOP_COUNTED);
+    float3 own = owned_light(p, ray);
     LocalLights* ray_local = nullptr;
     if (ray.local)
-        ray_local = pixel_local_lights(r, v.f.pixel);
-    PathEmission pe = { r.scene, r.set, ray_local, ray.origin, ray.dir, ray.from, ray.normal, v.x.one_technique ? 0.0 : ray.pdf, ray.run, t_max, own, adds };
+        ray_local = pixel_local_lights(r, pixel);
+    PathEmission pe = { r.scene, r.set, ray_local, ray.origin, ray.dir, ray.from, ray.normal, x.one_technique ? 0.0 : ray.pdf, ray.run, t_max, own, adds };
     uint4* at = scratch_words(r, slot) + FRONT_AT;
     uint4 key = uint4(0);
     for (uint k = 0; k < kept; k++)
@@ -189,13 +196,13 @@ public uint launch_layers(PathRoot r, uint slot, uint kept, float t_max, out flo
         c.object_positions = { float3(0.0), float3(0.0), float3(0.0) };
         float4 layer = pe.layer(c);
         if (adds)
-            v.p.radiance += v.c.spectral.color(v.p.throughput * layer.rgb);
-        v.p.throughput *= 1.0 - layer.a;
+            p.radiance += spectral.color(p.throughput * layer.rgb);
+        p.throughput *= 1.0 - layer.a;
     }
     store_coherent(at + FRONT_BOUND, key);
     bound = asfloat(key.x);
-    store_loop_part(v);
-    return carries(v.p.throughput) ? 0 : STEP_ENDED;
+    store_path_loop(words, p, reach);
+    return carries(p.throughput) ? 0 : STEP_ENDED;
 }
 
 // The proxy march callable's body: what the `kept` medium proxies with a volume a LAYERS trace of

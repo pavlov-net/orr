@@ -251,6 +251,7 @@ fn trace_both(
 #[derive(Default, Debug)]
 struct Seen {
     hits: usize,
+    normals: usize,
     hit_classes: [usize; 6],
     overflows: usize,
     solid: usize,
@@ -282,6 +283,22 @@ fn compare(rays: &[RayIn], [inline, piped]: &[Traced; 2]) -> Seen {
             ),
             "path ray {i} {r:?}: inline hit, pipeline hit"
         );
+        // The boundary step's material and normal, from the record and the hit object's corners
+        // and transform, against `hit_geometry`'s from the scene's.
+        assert_eq!(
+            a.material, b.material,
+            "path ray {i} {r:?}: inline material, pipeline material"
+        );
+        if a.material != u32::MAX {
+            let cos: f32 = (0..3).map(|c| a.normal[c] * b.normal[c]).sum();
+            assert!(
+                cos > 1.0 - 1e-5,
+                "path ray {i} {r:?}: inline normal {:?}, pipeline normal {:?}",
+                a.normal,
+                b.normal
+            );
+            seen.normals += 1;
+        }
         if a.hit != 0 {
             seen.hits += 1;
             seen.hit_classes[a.class_id as usize] += 1;
@@ -330,7 +347,8 @@ fn item(model: &'static str, at: Vec3, linear: Mat3) -> Item {
 }
 
 /// Path and shadow rays through the scene's hit records find what the inline handlers find:
-/// the same closest hit of every policy and mask, with the record's class the trace's; and the
+/// the same closest hit of every policy and mask, with the record's class the trace's and, on
+/// copies placed turned, the boundary step's material and geometric normal `hit_geometry`'s; and the
 /// same shadow product, overflow past `SHADOW_CANDIDATES`, solid glass and committed hit, with
 /// what the inline handling bends left to the raygen's walk. On opaque, alpha-tested (with and
 /// without micromaps), presence, solid and thin dielectric and mixed-class copies, a stack of
@@ -427,7 +445,7 @@ fn rays_through_the_hit_records_meet_what_inline_traces_meet() {
     bed.accumulate(1, 0, &mut |_, _| {});
     let traced = trace_both(&mut bed, p, groups, &rays);
     let seen = compare(&rays, &traced);
-    assert!(seen.hits > 10_000, "{seen:?}");
+    assert!(seen.hits > 10_000 && seen.normals > 5000, "{seen:?}");
     assert!(
         seen.hit_classes[0] > 1000 && seen.hit_classes[CLASS_DIELECTRIC as usize] > 100,
         "{seen:?}"

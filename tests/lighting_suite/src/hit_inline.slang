@@ -26,19 +26,24 @@ void inline_paths(uint3 id: SV_DispatchThreadID)
     ViewConstants* v = root.view;
     RayIn r = root.rays[id.x];
     Hit h;
+    float3 positions[3] = { float3(0.0), float3(0.0), float3(0.0) };
     if (r.policy == COVER_LAYERS)
     {
         LayerAccept<Surface> a = { s, v, r.dir, context(root), r.seed, r.presence };
-        h = trace_closest(scene_traced(s), ray_of(r), path_mask(r), path_flags(r), a);
+        h = trace_closest(scene_traced(s), ray_of(r), path_mask(r), path_flags(r), a, positions);
     }
     else if (r.policy == COVER_STACK)
         h = stack_trace<Surface>(s, v, r.origin, r.dir, r.t_max, path_flags(r), context(root));
     else
     {
         Alpha<Surface> a = { s, v, r.dir, context(root) };
-        h = trace_closest(scene_traced(s), ray_of(r), path_mask(r), path_flags(r), a);
+        h = trace_closest(scene_traced(s), ray_of(r), path_mask(r), path_flags(r), a, positions);
     }
-    root.paths[id.x] = path_out(h);
+    PathOut o = path_out(h);
+    uint material;
+    if (h.hit && r.policy != COVER_STACK && h.cluster_id >= 0 && hit_geometry(s, r.dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, o.normal, material))
+        o.material = material;
+    root.paths[id.x] = o;
 }
 
 // Shadow rays through `ShadowCandidates` in mode MODE.

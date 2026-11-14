@@ -1,5 +1,5 @@
 // The pipeline path tracer's hit shaders (`path.launch`): the closest-hit shaders that resolve a
-// path ray's opaque, layer or strand hit, the walk meet's and the stack meet's, the coverage's
+// path ray's opaque, layer or strand hit and the stack meet's, the coverage's
 // any-hit shaders and the medium proxies' under shadow rays, and what LAYERS rays keep of
 // particles, light proxies and medium proxies. `orr_lighting::launch` makes a stage of each
 // resolve and coverage entry per kind of geometry and per linked surface id by its specialization
@@ -49,16 +49,6 @@ void stack_meet(inout Payload p, TriangleAttributes a)
     ORR_OMM(stack_meet);
     TriangleHit h = { a };
     p.words.x = asuint(h.cluster_id());
-}
-
-// The closest-hit of the walk meet's record, which an interior walk's step invokes on the face it
-// met in place of the face's own.
-[shader("closesthit")]
-void walk_meet(inout Payload p, TriangleAttributes a)
-{
-    ORR_OMM(walk_meet);
-    TriangleHit h = { a };
-    p.words = launch_walk_meet(root, h);
 }
 
 [shader("closesthit")]

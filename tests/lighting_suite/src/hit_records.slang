@@ -8,13 +8,15 @@ import orr_scene.hit;
 import orr_scene.surface;
 import orr_scene.candidates;
 import orr_scene.runs;
+import orr_lighting.path.launch.boundary;
 import lighting_suite.hit_rays;
 
 typealias Surface = CoverageFeedback<StandardSurface>;
 
 ORR_ROOT_INLINE(HitRaysRoot);
 
-// Path rays through the pipeline: the hit object's hit and its record's class.
+// Path rays through the pipeline as boundary steps: the hit object's hit, its record's class and
+// material, and its triangle's geometric normal from the hit object's corners and transform.
 [shader("raygeneration")]
 void pipeline_paths()
 {
@@ -24,16 +26,23 @@ void pipeline_paths()
     RayIn r = root.rays[i];
     Payload p;
     p.words = path_payload(path_cover_of(root, r));
-    Traced h = trace_hit(root.scene.tlas, path_flags(r), path_mask(r), RAY_TYPE_PATH, RAY_TYPES, 0, ray_of(r), p);
+    Traced h = boundary_trace(root.scene, ray_of(r), path_flags(r), path_mask(r), p);
+    Boundary b = boundary_of(h);
     PathOut o = PathOut();
-    if (h.hit())
+    o.material = MATERIAL_NONE;
+    if (b.hit)
     {
         o.hit = 1;
-        o.t = h.t();
-        o.instance = h.instance_index();
+        o.t = b.t;
+        o.instance = b.instance;
         o.primitive = h.primitive_index();
         o.geometry = h.geometry_index();
-        o.class_id = h.record<HitData>().flags & HIT_CLASS_MASK;
+        o.class_id = b.flags & HIT_CLASS_MASK;
+    }
+    if (b.triangle && r.policy != COVER_STACK && b.material != MATERIAL_NONE)
+    {
+        o.material = b.material;
+        o.normal = boundary_normal(root.scene, h, b, r.dir);
     }
     root.paths[i] = o;
 }

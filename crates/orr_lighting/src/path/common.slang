@@ -83,7 +83,7 @@ public uint path_mode(PathRoot r)
 }
 
 // Whether the view of `r` has a frosted-glass pass, a thin lens, froxels.
-bool frost_pass(PathRoot r) { return may(MAY_FROST) && (r.dielectric_flags & DIELECTRIC_FROST) != 0; }
+public bool frost_pass(PathRoot r) { return may(MAY_FROST) && (r.dielectric_flags & DIELECTRIC_FROST) != 0; }
 public bool thin_lens(PathRoot r) { return may(MAY_LENS) && r.aperture_radius > 0.0; }
 bool has_froxels(PathRoot r) { return may(MAY_FROXELS) && r.froxels != nullptr; }
 

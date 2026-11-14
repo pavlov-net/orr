@@ -32,7 +32,12 @@ public struct PathOut
     public uint primitive;
     public uint geometry;
     public uint class_id;              // the record's or the inline hit's
+    // Of a triangle hit under a policy other than COVER_STACK: its section material and its
+    // geometric normal, as `hit_geometry` gives them inline and the boundary step from the hit
+    // object; MATERIAL_NONE and 0 otherwise.
+    public uint material;
     public uint _pad0;
+    public float3 normal;
     public uint _pad1;
 }
 
@@ -115,6 +120,7 @@ public PathOut path_out(Hit h)
     o.primitive = h.primitive_index;
     o.geometry = h.geometry_index;
     o.class_id = h.class_id;
+    o.material = MATERIAL_NONE;
     return o;
 }
 

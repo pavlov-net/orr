@@ -193,6 +193,20 @@ public extension HitObject
         return this.GetAttributes<TriangleAttributes>().barycentrics;
     }
 
+    // A triangle hit's corners in object space, as its acceleration structure holds them.
+    public float3[3] corners()
+    {
+        return this.GetTriangleVertexPositions();
+    }
+
+    // The linear part of a hit's object-to-world transform, which takes an object-space direction
+    // `v` to `mul(linear, v)`.
+    public float3x3 object_to_world()
+    {
+        float4x3 m = this.GetObjectToWorld();
+        return transpose(float3x3(m[0], m[1], m[2]));
+    }
+
     // The index of the hit or miss record `invoke` runs.
     public uint record_index()
     {
