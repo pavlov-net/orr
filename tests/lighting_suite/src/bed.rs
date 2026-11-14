@@ -1674,6 +1674,8 @@ pub struct BedFrame<'a> {
     pub target: &'a mut LightingView,
     /// The scene's hit table for the pipeline [`Bed::set_hit_pipeline`] names.
     pub hits: Option<HitTable>,
+    /// The scene's hit table for each pipeline `ORR_TEST_PIPELINE_PATHS` moved paths onto.
+    moved_hits: Vec<(&'static RayPipeline, HitTable)>,
     /// The bed draws particles after the kernel.
     particles: bool,
     roots: &'a mut Roots,
@@ -2721,6 +2723,11 @@ impl Bed {
         let hits = self
             .hit_pipeline
             .map(|(p, g)| f.hit_table(self.scene, p, g).unwrap());
+        let moved = MOVED.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let moved_hits = moved
+            .into_iter()
+            .map(|(p, g)| (p, f.hit_table(self.scene, p, g).unwrap()))
+            .collect();
         let id = f.id();
         self.last_id = id;
         self.last_root = view.scene;
@@ -2750,6 +2757,7 @@ impl Bed {
                 lighting: &self.lighting,
                 target: &mut self.target,
                 hits,
+                moved_hits,
                 particles: self.particles.is_some(),
                 roots: &mut self.roots,
             },
@@ -3012,6 +3020,16 @@ pub struct Paths {
     pub every_tile: bool,
 }
 
+/// Whether paths that ask for the compute or fastest entry run through the ray tracing pipeline
+/// instead: set from `ORR_TEST_PIPELINE_PATHS`, to run every bed's paths on it.
+fn pipeline_paths() -> bool {
+    std::env::var_os("ORR_TEST_PIPELINE_PATHS").is_some()
+}
+
+/// The hit pipelines of the paths `ORR_TEST_PIPELINE_PATHS` moved onto the pipeline: every bed
+/// frame takes a hit table for each.
+static MOVED: Mutex<Vec<(&'static RayPipeline, &'static HitGroups)>> = Mutex::new(Vec::new());
+
 /// Threads that compile a bed's pipelines at once: the machine's.
 fn compile_threads() -> usize {
     std::thread::available_parallelism().map_or(2, std::num::NonZero::get)
@@ -3021,6 +3039,11 @@ impl Paths {
     /// The kernels of a set and entry compile once per process, on threads of their own, and
     /// stay: under the validation layer each compile takes minutes.
     pub fn new(kernels: &KernelSet, entry: PathEntry, settings: ViewLighting) -> Self {
+        let moved = pipeline_paths();
+        let entry = match entry {
+            PathEntry::Compute | PathEntry::Fastest if moved => PathEntry::Pipeline,
+            e => e,
+        };
         type Key = (Vec<usize>, PathEntry);
         type Compiled = (LightingKernels, Arc<orr_scene::Loading>);
         static COMPILED: Mutex<Vec<(Key, &'static OnceLock<Compiled>)>> = Mutex::new(Vec::new());
@@ -3064,6 +3087,12 @@ impl Paths {
             });
             (kernels, loading)
         });
+        if let Some(h) = kernels.hit_pipeline().filter(|_| moved) {
+            let mut all = MOVED.lock().unwrap_or_else(PoisonError::into_inner);
+            if !all.iter().any(|(p, _)| ptr::eq(*p, h.0)) {
+                all.push(h);
+            }
+        }
         Self {
             kernels,
             loading,
@@ -3108,6 +3137,11 @@ impl Paths {
             overlay_front: self.overlay_front,
             ..f.pass()
         };
+        if let Some((p, _)) = self.hit_pipeline()
+            && let Some(&(_, t)) = f.moved_hits.iter().find(|(q, _)| ptr::eq(*q, p))
+        {
+            pass.hits = Some(t);
+        }
         if self.every_tile {
             let mut g = f.view.targets;
             g.layer_tiles = GpuPtr::NULL;
