@@ -1,6 +1,9 @@
-// The pipeline path tracer's shaders (`path.launch`): a raygen per source, the closest-hit that
-// resolves a path ray's hit and the miss shader, the standard coverage's any-hit shaders and the
-// medium proxies' under shadow rays, and the callables that start, shade and finish a path.
+// The pipeline path tracer's shaders (`path.launch`): a raygen per source, the closest-hit shaders
+// that resolve a path ray's hit on triangles and on strands and the miss shader, the coverage's
+// any-hit shaders and the medium proxies' under shadow rays, and the callables that start, shade
+// and finish a path. `orr_lighting::launch` makes several stages of one entry by its
+// specialization constants (`path_may`, `path_may2`, `hit_surface`): a hit shader per kind of
+// geometry and per linked surface id, and next-event estimation and the scatter per BSDF class.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_lighting.environment;
@@ -13,6 +16,7 @@ import orr_lighting.path.launch;
 extern struct Surface : ISurfaces = StandardSurface;
 extern struct Environment : IEnvironment = EnvironmentMap;
 extern struct Medium : IMedium = NoMedium;
+export static const bool PATH_SPECIALIZES = true;
 
 ORR_ROOT_INLINE(PathRoot);
 
@@ -44,6 +48,14 @@ void resolve(inout Payload p, TriangleAttributes a)
     ORR_OMM(resolve);
     TriangleHit h = { a };
     p.words.x = launch_resolve<Surface, TriangleHit>(root, launch_slot(), h);
+}
+
+[shader("closesthit")]
+void resolve_strand(inout Payload p, TriangleAttributes a)
+{
+    ORR_OMM(resolve_strand);
+    BuiltInHit h = { a };
+    p.words.x = launch_resolve<Surface, BuiltInHit>(root, launch_slot(), h);
 }
 
 [shader("anyhit")]

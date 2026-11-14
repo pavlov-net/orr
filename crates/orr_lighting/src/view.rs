@@ -1146,7 +1146,6 @@ fn unlaunched(
                 || features.contains(SceneFeatures::SMOKE),
             "media along path rays",
         ),
-        (features.contains(SceneFeatures::STRANDS), "strands"),
         (caustics, "caustic photons"),
         (
             features.contains(SceneFeatures::COATED_EMITTERS),

@@ -816,7 +816,7 @@ void finish_input(SceneRoot* s, ViewConstants* v, float3 d, uint material, Place
     i.uv[0].tap = i.uv[1].tap = context.tap;
     i.context = context;
     i.material = material;
-    i.surface = m.surface;
+    i.surface = hit_surface_id(m.surface);
     i.position = place(pl, i.object_position);
     world_cell(s.origin_cell.xyz, float3(0.0), i.position, cell_log2, i.cell, i.offset);
     i.view_direction = d;

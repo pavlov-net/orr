@@ -282,6 +282,8 @@ pub const WHITE_FLOOR_ALBEDO: f32 = 0.8;
 pub const WHITE_SPHERE: &str = "white sphere";
 /// A unit sphere with no reflection at all, so only the medium in front of it shows.
 pub const BLACK_SPHERE: &str = "black sphere";
+/// A unit red sphere under a clear coat, a fuzz and a thin film.
+pub const LAYERED_SPHERE: &str = "layered sphere";
 pub const CORNELL: &str = "cornell box";
 pub const TALL_BOX: &str = "tall box";
 pub const SHORT_BOX: &str = "short box";
@@ -1239,6 +1241,20 @@ fn cook() -> Arc<[u8]> {
                     BLACK_SPHERE,
                     mesh(|b| b.sphere(0, 24, 1.0)),
                     vec![diffuse([0.0; 3])],
+                ),
+                model(
+                    LAYERED_SPHERE,
+                    mesh(|b| b.sphere(0, 24, 1.0)),
+                    vec![Material {
+                        base_color: [0.7, 0.1, 0.1],
+                        coat_weight: 1.0,
+                        coat_roughness: 0.1,
+                        fuzz_weight: 0.5,
+                        fuzz_color: [0.9, 0.9, 1.0],
+                        thin_film_weight: 1.0,
+                        thin_film_thickness: 0.4,
+                        ..Material::default()
+                    }],
                 ),
                 model(
                     CORNELL,

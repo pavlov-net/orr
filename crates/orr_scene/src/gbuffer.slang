@@ -527,6 +527,13 @@ public bool surface_emits(PackedSurface ps)
     return (ps.flags & SURFACE_HIT) != 0 ? ps.emission != 0 : (ps.a.z & 0x07ffffffu) != 0;
 }
 
+// Whether `ps` may hold a coat, fuzz, thin film or subsurface weight: its words are extended. One
+// that is not unpacks with none of them.
+public bool surface_lobed(PackedSurface ps)
+{
+    return ((ps.a.w >> 24) & GBUFFER_EXTENDED) != 0;
+}
+
 // What `ps`'s words hold, its position and material; the shading normal as stored, not leaned.
 // The visible triangle is left 0: a hit's ids are not a `GSurface`'s.
 public GSurface unpack_surface(PackedSurface ps)

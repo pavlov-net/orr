@@ -38,6 +38,9 @@ public static const uint HIT_ALPHA_TESTED = 1 << 3;
 public static const uint HIT_THIN_WALL = 1 << 4;      // a dielectric that bounds no interior
 public static const uint HIT_CROSSES_INTERIOR = 1 << 5;
 public static const uint HIT_EMITS = 1 << 6;
+// The material or its back may give its surface a coat, fuzz, thin film or subsurface weight: it
+// has one of their weights above 0, or a linked surface, which may set any.
+public static const uint HIT_LOBED = 1 << 7;
 
 // A hit record's data, after its group's handle: what its shaders start from.
 public struct HitData
@@ -63,7 +66,14 @@ public HitData hit_data(SceneRoot* s, uint material, uint class_id)
         d.flags |= HIT_EMITS;
     if ((flags & MATERIAL_HAS_BACK) != 0)
         d.back = s.materials[material].back;
+    if (material_lobed(s.materials + material) || (d.back != MATERIAL_NONE && material_lobed(s.materials + d.back)))
+        d.flags |= HIT_LOBED;
     return d;
+}
+
+bool material_lobed(MaterialGpu* m)
+{
+    return m.surface != 0 || m.coat_weight > 0.0 || m.fuzz_weight > 0.0 || m.thin_film_weight > 0.0 || m.subsurface_weight > 0.0;
 }
 
 // The data of the medium or light proxies' run.

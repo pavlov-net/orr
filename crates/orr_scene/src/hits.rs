@@ -9,20 +9,33 @@ use orr_gpu::{
 use crate::shaders::sbt::HitTableRoot;
 use crate::{Error, Result, SceneRoot};
 
-/// `runs.slang`'s RAY_TYPES, FIXED_RUNS and the size of `HitData`, and `sbt.slang`'s KINDS.
+/// `runs.slang`'s RAY_TYPES, FIXED_RUNS and the size of `HitData`, and `sbt.slang`'s
+/// FIXED_KINDS and PINNED_KINDS.
 const RAY_TYPES: u32 = 3;
 const HIT_DATA_BYTES: u64 = 16;
 const FIXED_RUNS: u32 = 2;
-const KINDS: usize = 6;
+const FIXED_KINDS: usize = 4;
+const PINNED_KINDS: usize = 4;
 
 /// The hit groups of a ray tracing pipeline that a scene's hit records name, by what each
 /// record serves: a group index of the pipeline, or `None` for records of zeros. A record of
 /// zeros runs no shader and confirms every candidate a trace finds in it.
+///
+/// The path and shadow groups are pinned: each is the first of [`Self::pins`] groups, one after
+/// another, for the materials of one linked surface id (`scene_may.slang`'s `hit_surface`). The
+/// first serves any id, and is what a material whose back shows another id takes; where surfaces
+/// link, the pin of id `k` follows at `k + 1`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct HitGroups {
-    /// Triangles under path rays: an any-hit that decides by `orr_scene.candidates`'s
-    /// `cover_path`.
+    /// The linked surface types the pinned groups serve, ids 1 to `surfaces`.
+    pub surfaces: u32,
+    /// Triangles of copies' clusters under path rays: a closest-hit that resolves the hit and an
+    /// any-hit that decides by `orr_scene.candidates`'s `cover_path`.
     pub path: Option<u32>,
+    /// Triangles of producer entries' clusters under path rays.
+    pub producer_path: Option<u32>,
+    /// Strand entries' segments under path rays.
+    pub strand_path: Option<u32>,
     /// Triangles under shadow rays: an any-hit that decides by `cover_shadow`.
     pub shadow: Option<u32>,
     /// Particle triangles under layer rays.
@@ -36,16 +49,36 @@ pub struct HitGroups {
 }
 
 impl HitGroups {
-    /// In `sbt.slang`'s KIND_* order.
-    fn kinds(&self) -> [Option<u32>; KINDS] {
-        [
-            self.path,
-            self.shadow,
+    /// The groups of each pinned kind: one where no surface links, else one for any id and one
+    /// per id from 0 on.
+    pub fn pins(&self) -> u32 {
+        if self.surfaces == 0 {
+            1
+        } else {
+            self.surfaces + 2
+        }
+    }
+
+    /// In `sbt.slang`'s handle table order: the KIND_* groups held once, then each pinned
+    /// kind's pins.
+    fn slots(&self) -> Vec<Option<u32>> {
+        let fixed: [Option<u32>; FIXED_KINDS] = [
             self.particle_layers,
             self.medium_shadow,
             self.medium_layers,
             self.light_layers,
-        ]
+        ];
+        let pinned: [Option<u32>; PINNED_KINDS] =
+            [self.path, self.producer_path, self.strand_path, self.shadow];
+        let pins = self.pins();
+        fixed
+            .into_iter()
+            .chain(
+                pinned
+                    .into_iter()
+                    .flat_map(|first| (0..pins).map(move |p| first.map(|g| g + p))),
+            )
+            .collect()
     }
 }
 
@@ -84,7 +117,7 @@ pub(crate) struct HitTables {
 }
 
 struct Table {
-    /// The handles of the groups `HitGroups` names, in KIND order, zeros for none.
+    /// The handles of the groups `HitGroups` names, in `sbt.slang`'s order, zeros for none.
     handles: Vec<u8>,
     stride: u64,
     handle_table: Allocation<u8>,
@@ -131,8 +164,9 @@ impl HitTables {
             .hit_stride()
             .max(handle + data)
             .next_multiple_of(u64::from(limits.ray_handle_align));
-        let mut handles = vec![0u8; groups.kinds().len() * handle as usize];
-        for (k, g) in groups.kinds().iter().enumerate() {
+        let slots = groups.slots();
+        let mut handles = vec![0u8; slots.len() * handle as usize];
+        for (k, g) in slots.iter().enumerate() {
             if let Some(g) = *g {
                 handles[k * handle as usize..][..handle as usize]
                     .copy_from_slice(pipeline.hit_handle(g));
@@ -185,6 +219,9 @@ impl HitTables {
             handles: t.handle_table.gpu().cast(),
             stride_words: (stride / 4) as u32,
             handle_words: (handle / 4) as u32,
+            surfaces: groups.surfaces,
+            pins: groups.pins(),
+            _pad: 0,
         })?;
         list.barrier(Stages::RAY, Stages::COMPUTE, Hazards::empty());
         list.dispatch(kernels[0], r, [layout.count.div_ceil(64).max(1), 1, 1]);

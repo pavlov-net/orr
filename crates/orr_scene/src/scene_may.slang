@@ -51,3 +51,23 @@ public bool may2(uint bit)
 {
     return !PATH_SPECIALIZES || (path_may2 & bit) != 0;
 }
+
+// `hit_surface` of a pipeline that shades every surface by the linked surface id of its material.
+public static const uint ANY_SURFACE = 0xffffffffu;
+
+#ifdef ORR_UNSPECIALIZED
+static const uint hit_surface = ANY_SURFACE;
+#else
+// The linked surface id every hit and candidate a pipeline reconstructs shows, where it is made for
+// the hits of one id's materials alone (a ray tracing pipeline's hit shaders, chosen by the
+// material's hit records): what a material of an id nothing links shows is id 0's. A pipeline
+// made with an id runs only on hits whose material's id is that one, so the linked surface switch
+// keeps that id's case alone.
+[vk::constant_id(112)] const uint hit_surface = ANY_SURFACE;
+#endif
+
+// The linked surface id a hit on a material of id `id` shades by.
+public uint hit_surface_id(uint id)
+{
+    return PATH_SPECIALIZES && hit_surface != ANY_SURFACE ? hit_surface : id;
+}

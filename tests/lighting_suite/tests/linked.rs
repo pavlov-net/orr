@@ -1,19 +1,22 @@
 //! Linked kernels through the path kernel, kept in one target because each target compiles
 //! its own linked path pipelines: linked coverage against the equivalent alpha texture, and a
 //! linked surface in a mirror, behind glass and at each bounce. A scene's data against its linked
-//! types.
+//! types. Linked surfaces and coverage, geometry kinds and rich materials through the pipeline
+//! path tracer against the staged loop.
 
 use lighting_suite::bed::{
-    Accumulated, BARE_LEAF, Bed, FLOOR, GLASS_SLAB, Item, MIRROR, PANEL, Paths, RINGS_LEAF, Spec,
-    WHITE_SPHERE, assert_close, assert_within_noise, luminance, mean_where, quad_scene, reference,
+    Accumulated, BARE_LEAF, Bed, FLOOR, GLASS_SLAB, Item, LAYERED_SPHERE, MIRROR, PANEL, Particle,
+    ParticleLook, Paths, RINGS_LEAF, SKINNED_EMITTER, SKY, SUN, Spec, StrandRow, WHITE_SPHERE,
+    assert_close, assert_within_noise, image_mean, luminance, mean_where, quad_scene, reference,
     surface_mean,
 };
-use lighting_suite::{TestScene, assert_clean, linked};
+use lighting_suite::welch::assert_same_mean;
+use lighting_suite::{TestScene, assert_clean, device, linked, require};
 use orr_gpu::{GpuPtr, KernelSet};
 use orr_lighting::{
-    EnvironmentMapGpu, LightingDebugView, PathEntry, ReferenceSettings, ViewLighting,
+    EnvironmentMapGpu, Light, LightingDebugView, PathEntry, ReferenceSettings, ViewLighting,
 };
-use orr_math::{Mat3, Vec3};
+use orr_math::{Affine3, Mat3, Vec3};
 use orr_scene::{EnvironmentData, RendererDesc, SceneDesc, SceneWriter};
 
 fn at(model: &'static str, linear: Mat3, at: Vec3) -> Item {
@@ -236,5 +239,102 @@ fn linked_coverage_casts_the_shadow_of_the_equivalent_alpha_texture() {
         &noise,
         1.1,
     );
+    assert_clean();
+}
+
+/// The pipeline path tracer renders as the staged loop does, under the sun and the sky: a
+/// surface of its own (`Context`, whose resolve the pipeline makes for its id) beside a floor
+/// and a coated, fuzzy, filmed sphere, the rings quad of linked coverage (its id's any-hit
+/// shaders) casting its shadow, a skinned emitter and a row of strands; then a producer entry's
+/// opaque quads with a back of their own. Each scene's frames of the pipeline at the staged loop's
+/// seed sit as close to the staged loop's as its frames at another seed do, and the two means
+/// agree over frames that alternate, as `the_pipeline_renders_opaque_scenes_as_the_staged_loop_does`
+/// compares them.
+#[test]
+fn the_pipeline_renders_linked_types_geometry_kinds_and_rich_materials_as_the_staged_loop_does() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    let settings = ViewLighting::default();
+    let staged = Paths::new(&linked::KERNELS, PathEntry::Compute, settings);
+    let launched = Paths::new(&linked::KERNELS, PathEntry::Pipeline, settings);
+    let lit = |copies: Vec<Item>| Spec {
+        copies: [vec![at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)], copies].concat(),
+        lights: vec![Light::Directional(SUN)],
+        environment: Some(SKY),
+        eye: Vec3::new(0.3, 1.6, 4.2),
+        target: Vec3::new(0.0, 0.7, 0.0),
+        fov_y: 0.9,
+        focus: None,
+    };
+    let mixed = linked_bed(lit(vec![
+        at(PANEL, Mat3::IDENTITY, Vec3::new(-1.4, 0.7, -0.4)),
+        at(
+            LAYERED_SPHERE,
+            Mat3::from_diagonal(Vec3::splat(0.45)),
+            Vec3::new(1.3, 0.45, 0.2),
+        ),
+        at(
+            RINGS_LEAF,
+            Mat3::from_diagonal(Vec3::splat(0.6)),
+            Vec3::new(0.0, 0.7, -1.2),
+        ),
+    ]));
+    let quads = linked_bed(lit(Vec::new()));
+    let mut beds = [
+        ("linked, layered, skinned and strands", mixed),
+        ("producer quads", quads),
+    ];
+    {
+        let bed = &mut beds[0].1;
+        bed.add_skinned(
+            SKINNED_EMITTER,
+            Affine3::from_translation(Vec3::new(0.6, 1.5, 1.0)),
+            &[Affine3::IDENTITY, Affine3::from_rotation_z(-0.5)],
+        );
+        bed.set_strands(StrandRow {
+            count: 12,
+            first: Vec3::new(-0.7, 0.0, 1.0),
+            step: Vec3::new(0.09, 0.0, 0.0),
+            height: 0.8,
+            radius: 0.02,
+            albedo: [0.6, 0.45, 0.2],
+        });
+    }
+    {
+        let quad = |x: f32, y: f32| Particle {
+            center: Vec3::new(x, y, 0.0),
+            size: 0.35,
+        };
+        let look = |albedo: [f32; 3]| ParticleLook {
+            albedo,
+            emission: [0.0; 3],
+            opacity: 1.0,
+            anisotropy: 0.0,
+        };
+        beds[1].1.set_sided_quads(
+            &[quad(-0.9, 0.5), quad(0.0, 0.9), quad(0.9, 0.5)],
+            look([0.7, 0.6, 0.2]),
+            look([0.1, 0.3, 0.7]),
+            Affine3::IDENTITY,
+        );
+    }
+    for (what, bed) in &mut beds {
+        bed.set_hit_pipeline(launched.hit_pipeline());
+        // At a pre-exposure of 1 the sunlit ground passes the HDR ceiling, which would clip the
+        // samples that draw the sun.
+        bed.set_pre_exposure(1.0 / 64.0);
+        render_paths(bed, &staged, 32, 3);
+        let piped = render_paths(bed, &launched, 32, 1);
+        let same_seed = render_paths(bed, &staged, 32, 1);
+        let noise = render_paths(bed, &staged, 32, 2);
+        assert_within_noise(what, &piped, &same_seed, &noise, 1.25);
+        let (mut of_staged, mut of_launched) = (Vec::new(), Vec::new());
+        for k in 0..24 {
+            of_staged.push(image_mean(&render_paths(bed, &staged, 1, 4 + k))[1]);
+            of_launched.push(image_mean(&render_paths(bed, &launched, 1, 4 + k))[1]);
+        }
+        assert_same_mean(what, &of_launched, &of_staged);
+    }
     assert_clean();
 }

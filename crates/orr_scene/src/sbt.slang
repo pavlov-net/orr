@@ -3,6 +3,11 @@
 // section of a material row: `runs` writes those whose material an array of the scene's tables
 // names, `producer_runs` an entry's. Records of unused runs stay as they were: no instance's
 // contribution names them.
+//
+// A run's path and shadow groups are its geometry's (a copy's cooked or skinned clusters, a
+// producer's clusters, strands) for its material's linked surface: the pipeline holds those
+// groups once per pin, a surface id its shaders are made for (`scene_may.slang`'s
+// `hit_surface`), and once for any id, which a material whose back shows another id takes.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.trace;
@@ -12,36 +17,67 @@ import orr_scene.producer;
 import orr_scene.runs;
 import orr_scene.tables;
 
-// What a group serves, the handle table's order (orr_scene::HitGroups).
-public static const uint KIND_PATH = 0;
-public static const uint KIND_SHADOW = 1;
-public static const uint KIND_PARTICLE_LAYERS = 2;
-public static const uint KIND_MEDIUM_SHADOW = 3;
-public static const uint KIND_MEDIUM_LAYERS = 4;
-public static const uint KIND_LIGHT_LAYERS = 5;
-public static const uint KINDS = 6;
+// The groups the handle table holds one of, in its order (orr_scene::HitGroups).
+public static const uint KIND_PARTICLE_LAYERS = 0;
+public static const uint KIND_MEDIUM_SHADOW = 1;
+public static const uint KIND_MEDIUM_LAYERS = 2;
+public static const uint KIND_LIGHT_LAYERS = 3;
+public static const uint FIXED_KINDS = 4;
+// The groups it holds `pins` of after those: one for any surface id, then, where surfaces link,
+// one per pin from id 0 on.
+public static const uint KIND_PATH = 0;          // a copy's clusters
+public static const uint KIND_PRODUCER_PATH = 1; // a producer entry's clusters
+public static const uint KIND_STRAND_PATH = 2;   // a strand entry's
+public static const uint KIND_SHADOW = 3;
+public static const uint PINNED_KINDS = 4;
 // No group: a record of zeros.
-static const uint KIND_NONE = 0xffffffff;
+static const uint SLOT_NONE = 0xffffffff;
 
 public struct HitTableRoot
 {
     public SceneRoot* scene;
     public uint* records;           // the table
-    public uint* handles;           // KINDS handles of `handle_words` words, zero for none
+    public uint* handles;           // FIXED_KINDS + PINNED_KINDS * pins handles of `handle_words` words, zero for none
     public uint stride_words;       // a record's
     public uint handle_words;
+    public uint surfaces;           // linked surface types, ids 1 to `surfaces`
+    public uint pins;               // 1 where none link, else `surfaces` + 2
+    public uint64_t _pad;
 }
 ORR_ROOT(HitTableRoot);
 
-// Writes run `run`'s records: per ray type the handle of group kind `kinds[type]` and `data`.
-void write_run(uint run, uint3 kinds, HitData data)
+// The handle table slot of pinned kind `kind` at pin `pin`.
+uint pinned(uint kind, uint pin)
+{
+    return FIXED_KINDS + kind * root.pins + pin;
+}
+
+// The pin of the groups that shade material `material`: its linked surface id's, or with a back
+// of another id the pin of any id.
+uint material_pin(SceneRoot* s, uint material)
+{
+    if (root.surfaces == 0 || material == MATERIAL_NONE)
+        return 0;
+    MaterialGpu* m = s.materials + material;
+    uint id = m.surface <= root.surfaces ? m.surface : 0;
+    if ((m.flags & MATERIAL_HAS_BACK) != 0)
+    {
+        uint back = s.materials[m.back].surface;
+        if ((back <= root.surfaces ? back : 0) != id)
+            return 0;
+    }
+    return 1 + id;
+}
+
+// Writes run `run`'s records: per ray type the handle of slot `slots[type]` and `data`.
+void write_run(uint run, uint3 slots, HitData data)
 {
     for (uint type = 0; type < RAY_TYPES; type++)
     {
         uint* r = root.records + (RAY_TYPES * run + type) * root.stride_words;
-        uint kind = kinds[type];
+        uint slot = slots[type];
         for (uint w = 0; w < root.handle_words; w++)
-            r[w] = kind == KIND_NONE ? 0 : root.handles[kind * root.handle_words + w];
+            r[w] = slot == SLOT_NONE ? 0 : root.handles[slot * root.handle_words + w];
         uint* d = r + root.handle_words;
         d[0] = data.material;
         d[1] = data.flags;
@@ -61,12 +97,12 @@ void runs(uint3 id: SV_DispatchThreadID)
         return;
     if (run == RUN_MEDIUM)
     {
-        write_run(run, uint3(KIND_NONE, KIND_MEDIUM_SHADOW, KIND_MEDIUM_LAYERS), proxy_data(CLASS_MEDIUM));
+        write_run(run, uint3(SLOT_NONE, KIND_MEDIUM_SHADOW, KIND_MEDIUM_LAYERS), proxy_data(CLASS_MEDIUM));
         return;
     }
     if (run == RUN_LIGHT)
     {
-        write_run(run, uint3(KIND_NONE, KIND_NONE, KIND_LIGHT_LAYERS), proxy_data(CLASS_LIGHT));
+        write_run(run, uint3(SLOT_NONE, SLOT_NONE, KIND_LIGHT_LAYERS), proxy_data(CLASS_LIGHT));
         return;
     }
     uint material;
@@ -77,7 +113,8 @@ void runs(uint3 id: SV_DispatchThreadID)
     else
         material = s.page_material_sets[run - s.run_pages];
     uint class_id = material == MATERIAL_NONE ? CLASS_OPAQUE : material_class(s.materials + material);
-    write_run(run, uint3(KIND_PATH, KIND_SHADOW, KIND_NONE), hit_data(s, material, class_id));
+    uint pin = material_pin(s, material);
+    write_run(run, uint3(pinned(KIND_PATH, pin), pinned(KIND_SHADOW, pin), SLOT_NONE), hit_data(s, material, class_id));
 }
 
 // One workgroup per producer entry, a thread per material of a set entry.
@@ -90,11 +127,13 @@ void producer_runs(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
     if (entry >= s.producer_capacity)
         return;
     ProducerGpu p = s.producers[entry];
+    uint path = p.strands != 0 ? KIND_STRAND_PATH : KIND_PRODUCER_PATH;
     for (uint slot = t; slot < p.material_count; slot += 64)
     {
         uint material = p.materials[slot];
         uint class_id = p.opacity == PRODUCER_SECTIONS ? material_class(s.materials + material) : p.class_id;
-        uint layers = class_id == CLASS_PARTICLE ? KIND_PARTICLE_LAYERS : KIND_NONE;
-        write_run(s.run_producers + p.runs + slot, uint3(KIND_PATH, KIND_SHADOW, layers), hit_data(s, material, class_id));
+        uint layers = class_id == CLASS_PARTICLE ? KIND_PARTICLE_LAYERS : SLOT_NONE;
+        uint pin = material_pin(s, material);
+        write_run(s.run_producers + p.runs + slot, uint3(pinned(path, pin), pinned(KIND_SHADOW, pin), layers), hit_data(s, material, class_id));
     }
 }

@@ -6,16 +6,16 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use orr_scene::HitGroups;
 use orr_scene::orr_gpu::{
     Allocation, CommandList, CompileThreads, Device, GpuPtr, Hazards, HitGroup, HitTable,
     MemoryKind, RayPipeline, RayPipelineDesc, RayPipelineFlags, ShaderRecord, ShaderStage,
     SpecData, Stages,
 };
+use orr_scene::{HitGroups, SceneFeatures};
 
-use crate::shaders::path::pipeline;
+use crate::shaders::path::pipeline::{self, Spec};
 use crate::shaders::types::{PathRoot, PathStages};
-use crate::staged::{RECORD_WORDS, UPDATE_RECORD_WORDS};
+use crate::staged::{MAY_ALL, MAY_RICH, RECORD_WORDS, UPDATE_RECORD_WORDS};
 use crate::{Error, KernelSet, module};
 
 /// `path/launch.slang`'s SLOT_WORDS: the words of a path's slot.
@@ -25,26 +25,71 @@ const SLOT_WORDS: u64 = 19;
 /// source with more runs them in slices.
 const MAX_SLOTS: u32 = 1 << 20;
 
-/// The pipeline's stages, its groups' members by index: the raygens, the miss shader, the hit
-/// groups' shaders and the callables in `path/launch.slang`'s CALL_* order.
-const STAGES: [&str; 15] = [
+/// The stages the pipeline holds one of, first, by index: the raygens, the miss shader and the
+/// medium proxies' intersection and any-hit shaders.
+const FIXED: [&str; 5] = [
     "path_view",
     "path_update",
     "miss_path",
-    "resolve",
-    "cover_path_hit",
-    "cover_shadow_hit",
     "box_medium_hit",
     "proxy_shadow_hit",
-    "start_view",
-    "start_update",
-    "emission",
-    "direct",
-    "scatter",
-    "finish_view",
-    "finish_update",
 ];
-const FIRST_CALLABLE: u32 = 8;
+const MISS: u32 = 2;
+const MEDIUM_INTERSECTION: u32 = 3;
+const MEDIUM_ANY_HIT: u32 = 4;
+
+/// What the pipeline holds per pin after those (`HitGroups`): the closest-hit shaders of a copy's
+/// clusters, of a producer entry's clusters and of strands, and the any-hit shaders under path and
+/// shadow rays, with what each may meet of the scene's geometry.
+const PINNED: [(&str, Geometry); 5] = [
+    ("resolve", Geometry::Copies),
+    ("resolve", Geometry::Producers),
+    ("resolve_strand", Geometry::Any),
+    ("cover_path_hit", Geometry::Any),
+    ("cover_shadow_hit", Geometry::Any),
+];
+const RESOLVE_COPIES: usize = 0;
+const RESOLVE_PRODUCERS: usize = 1;
+const RESOLVE_STRANDS: usize = 2;
+const COVER_PATH: usize = 3;
+const COVER_SHADOW: usize = 4;
+
+/// Then the callables, in `path/launch.slang`'s CALL_* order, each with the lobes of the BSDF its
+/// vertices may have: next-event estimation and the scatter are made for a plain surface's and a
+/// rich one's.
+const CALLABLES: [(&str, bool); 9] = [
+    ("start_view", true),
+    ("start_update", true),
+    ("emission", true),
+    ("direct", false),
+    ("direct", true),
+    ("scatter", false),
+    ("scatter", true),
+    ("finish_view", true),
+    ("finish_update", true),
+];
+
+/// The geometry a hit shader runs on, which its stage is made for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Geometry {
+    /// Copies' clusters, cooked or skinned.
+    Copies,
+    /// Producer entries' clusters, not strands.
+    Producers,
+    Any,
+}
+
+impl Geometry {
+    /// `path_may2` of its stage.
+    fn may2(self) -> u32 {
+        let out = match self {
+            Self::Copies => SceneFeatures::PRODUCERS.0 | SceneFeatures::STRANDS.0,
+            Self::Producers => SceneFeatures::STRANDS.0,
+            Self::Any => 0,
+        };
+        SceneFeatures(!out).surface_may()
+    }
+}
 
 /// A source's raygen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,9 +115,48 @@ impl PathPipeline {
         threads: CompileThreads<'_>,
     ) -> Result<Self, Error> {
         let m = module(kernels, &pipeline::MODULE)?;
-        let stages = STAGES
+        let groups = HitGroups {
+            surfaces: kernels.surfaces,
+            ..HitGroups::default()
+        };
+        let pins = groups.pins();
+        // `hit_surface` of the hit shaders of each pin: any id, then each id from 0 on.
+        let pin_surface = |pin: u32| if pin == 0 { u32::MAX } else { pin - 1 };
+        let mut specs: Vec<(&str, Spec)> = FIXED.iter().map(|&e| (e, Spec::default())).collect();
+        for pin in 0..pins {
+            for &(entry, geometry) in &PINNED {
+                let spec = Spec {
+                    path_may2: geometry.may2(),
+                    hit_surface: pin_surface(pin),
+                    ..Spec::default()
+                };
+                specs.push((entry, spec));
+            }
+        }
+        let first_callable = specs.len() as u32;
+        for &(entry, rich) in &CALLABLES {
+            let may = if rich { MAY_ALL } else { MAY_ALL & !MAY_RICH };
+            let spec = Spec {
+                path_may: may as u32,
+                ..Spec::default()
+            };
+            specs.push((entry, spec));
+        }
+        let bytes: Vec<_> = specs.iter().map(|(_, s)| s.bytes()).collect();
+        let stages = specs
             .iter()
-            .map(|e| ShaderStage::new(m, e, SpecData::default()))
+            .zip(&bytes)
+            .map(|(&(entry, spec), bytes)| {
+                let data = if spec == Spec::default() {
+                    SpecData::default()
+                } else {
+                    SpecData {
+                        entries: Spec::ENTRIES,
+                        bytes,
+                    }
+                };
+                ShaderStage::new(m, entry, data)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let caps = device.caps();
         let mut flags = RayPipelineFlags::CLUSTERS;
@@ -82,29 +166,36 @@ impl PathPipeline {
         if caps.lss {
             flags |= RayPipelineFlags::SWEPT_SPHERES;
         }
-        let callables: Vec<ShaderRecord<'_>> = (FIRST_CALLABLE..STAGES.len() as u32)
+        let callables: Vec<ShaderRecord<'_>> = (first_callable..stages.len() as u32)
             .map(ShaderRecord::new)
             .collect();
+        // Each pinned kind's groups one after another by pin, then the medium proxies'.
+        let pinned = |pin: u32, k: usize| FIXED.len() as u32 + pin * PINNED.len() as u32 + k as u32;
+        let mut hit_groups = Vec::new();
+        for (resolve, any_hit) in [
+            (Some(RESOLVE_COPIES), Some(COVER_PATH)),
+            (Some(RESOLVE_PRODUCERS), Some(COVER_PATH)),
+            (Some(RESOLVE_STRANDS), None),
+            (None, Some(COVER_SHADOW)),
+        ] {
+            for pin in 0..pins {
+                hit_groups.push(HitGroup {
+                    closest_hit: resolve.map(|k| pinned(pin, k)),
+                    any_hit: any_hit.map(|k| pinned(pin, k)),
+                    intersection: None,
+                });
+            }
+        }
+        hit_groups.push(HitGroup {
+            closest_hit: None,
+            any_hit: Some(MEDIUM_ANY_HIT),
+            intersection: Some(MEDIUM_INTERSECTION),
+        });
         let desc = RayPipelineDesc {
             stages: &stages,
             raygens: &[ShaderRecord::new(0), ShaderRecord::new(1)],
-            misses: &[ShaderRecord::new(2)],
-            hit_groups: &[
-                HitGroup {
-                    closest_hit: Some(3),
-                    any_hit: Some(4),
-                    intersection: None,
-                },
-                HitGroup {
-                    any_hit: Some(5),
-                    ..HitGroup::default()
-                },
-                HitGroup {
-                    closest_hit: None,
-                    any_hit: Some(7),
-                    intersection: Some(6),
-                },
-            ],
+            misses: &[ShaderRecord::new(MISS)],
+            hit_groups: &hit_groups,
             callables: &callables,
             max_recursion: 1,
             flags,
@@ -120,9 +211,11 @@ impl PathPipeline {
             pipeline,
             groups: HitGroups {
                 path: Some(0),
-                shadow: Some(1),
-                medium_shadow: Some(2),
-                ..HitGroups::default()
+                producer_path: Some(pins),
+                strand_path: Some(2 * pins),
+                shadow: Some(3 * pins),
+                medium_shadow: Some(4 * pins),
+                ..groups
             },
             unlaunched: Mutex::new(HashSet::new()),
         })

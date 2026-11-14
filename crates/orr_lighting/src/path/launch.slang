@@ -28,14 +28,18 @@ import orr_lighting.specialize;
 import orr_lighting.path;
 import orr_lighting.path.stages;
 
-// The pipeline's callables, in the order of its table (`orr_lighting::launch`).
+// The pipeline's callables, in the order of its table (`orr_lighting::launch`). Next-event
+// estimation and the scatter of a vertex run as a plain surface's, which the pipeline makes
+// without the lobes and walks a plain one lacks, or a rich one's.
 public static const uint CALL_START_VIEW = 0;
 public static const uint CALL_START_UPDATE = 1;
 public static const uint CALL_EMISSION = 2;
-public static const uint CALL_DIRECT = 3;
-public static const uint CALL_SCATTER = 4;
-public static const uint CALL_FINISH_VIEW = 5;
-public static const uint CALL_FINISH_UPDATE = 6;
+public static const uint CALL_DIRECT_PLAIN = 3;
+public static const uint CALL_DIRECT_RICH = 4;
+public static const uint CALL_SCATTER_PLAIN = 5;
+public static const uint CALL_SCATTER_RICH = 6;
+public static const uint CALL_FINISH_VIEW = 7;
+public static const uint CALL_FINISH_UPDATE = 8;
 
 // What a shader hands the raygen in its payload's first word.
 public static const uint STEP_RAY = 1 << 0;      // the path has a ray to trace
@@ -44,6 +48,7 @@ public static const uint STEP_EMITS = 1 << 2;    // which emits
 public static const uint STEP_SHADOW = 1 << 3;   // next-event estimation left a shadow ray
 public static const uint STEP_ENDED = 1 << 4;    // the path ended: its finish runs
 public static const uint STEP_DONE = 1 << 5;     // the start wrote what the path would: no finish
+public static const uint STEP_RICH = 1 << 6;     // the vertex's surface may have a lobe a plain one lacks (`surface_lobed`)
 
 // The words of a path's slot, in this order: its loop (`LaunchLoop`), the ray its last vertex left
 // (`LaunchRay`), the vertex's packed surface and its shadow ray (`ShadowJob`). The path's record
@@ -339,6 +344,12 @@ PackedSurface load_surface_part(LaunchVertex v)
     return load_part<PackedSurface, 7>(v.at + SURFACE_AT);
 }
 
+// What a shader that leaves the path at the vertex of `ps` hands the raygen.
+uint vertex_step(PackedSurface ps)
+{
+    return STEP_VERTEX | (surface_emits(ps) ? STEP_EMITS : 0) | (surface_lobed(ps) ? STEP_RICH : 0);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Starts
 
@@ -379,7 +390,7 @@ uint begin_launch(PathRoot r, uint slot, uint2 pixel, PathStart start, Sampler r
     store_part<PackedSurface, 7>(at + SURFACE_AT, ps);
     store_part<LaunchRay, 4>(at + RAY_AT, launch_ray(c.ray, 0.0, 0));
     store_part<LaunchLoop, 5>(at + LOOP_AT, launch_loop_from(p, 0.0, VERTEX_FIRST | VERTEX_GBUFFER));
-    return STEP_VERTEX | (surface_emits(ps) ? STEP_EMITS : 0);
+    return vertex_step(ps);
 }
 
 // The start of a view's path of the slice's `slot`th pixel: from the G-buffer's surface, or
@@ -449,7 +460,7 @@ public RayDesc launch_path_ray(PathRoot r, uint slot, out uint mask, out uint4 p
 }
 
 // The closest-hit shader's body: resolves the hit `h` of `slot`'s ray into its packed surface,
-// the end of the iteration that traced it and the start of the vertex's. STEP_VERTEX, or
+// the end of the iteration that traced it and the start of the vertex's: `vertex_step`, or
 // STEP_ENDED where the hit names nothing to resolve.
 public uint launch_resolve<S : ISurfaces, H : IHit>(PathRoot r, uint slot, H h)
 {
@@ -483,7 +494,7 @@ public uint launch_resolve<S : ISurfaces, H : IHit>(PathRoot r, uint slot, H h)
     v.vertex = first ? VERTEX_FIRST : 0;
     store_part<PackedSurface, 7>(v.at + SURFACE_AT, ps);
     store_loop_part(v);
-    return STEP_VERTEX | (surface_emits(ps) ? STEP_EMITS : 0);
+    return vertex_step(ps);
 }
 
 // The miss shader's body: what `slot`'s ray that met nothing adds, the environment and the
@@ -622,8 +633,8 @@ public void launch_finish_update(PathRoot r, uint slot)
 // The raygen
 
 // Traces the ray of `slot`'s path and runs the shader of what it met, after a reorder by that
-// shader, whether the vertex is the last bounce's and whether its material emits: the step it
-// returns.
+// shader, whether the vertex is the last bounce's, whether its material may be rich and whether
+// it emits: the step it returns.
 uint trace_path(PathRoot r, uint slot)
 {
     uint mask;
@@ -631,8 +642,9 @@ uint trace_path(PathRoot r, uint slot)
     Payload p;
     RayDesc ray = launch_path_ray(r, slot, mask, p.words, last);
     Traced h = trace_hit(r.scene.tlas, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, mask, RAY_TYPE_PATH, RAY_TYPES, 0, ray, p);
-    uint emits = h.hit() && (h.record<HitData>().flags & HIT_EMITS) != 0 ? 1 : 0;
-    h.reorder((last ? 2u : 0u) | emits, 2);
+    uint flags = h.hit() ? h.record<HitData>().flags : 0;
+    uint hint = (last ? 4u : 0u) | ((flags & HIT_LOBED) != 0 ? 2u : 0u) | ((flags & HIT_EMITS) != 0 ? 1u : 0u);
+    h.reorder(hint, 3);
     h.invoke(p);
     return p.words.x;
 }
@@ -675,12 +687,13 @@ public void launch_paths<M : IMedium>(PathRoot r, uint start, uint finish)
         }
         if ((step & STEP_EMITS) != 0)
             step_call(CALL_EMISSION);
-        step = step_call(CALL_DIRECT);
+        bool rich = (step & STEP_RICH) != 0;
+        step = step_call(rich ? CALL_DIRECT_RICH : CALL_DIRECT_PLAIN);
         if ((step & STEP_SHADOW) != 0)
             trace_shadow<M>(r, slot);
         if ((step & STEP_ENDED) != 0)
             break;
-        step = step_call(CALL_SCATTER);
+        step = step_call(rich ? CALL_SCATTER_RICH : CALL_SCATTER_PLAIN);
     }
     step_call(finish);
 }

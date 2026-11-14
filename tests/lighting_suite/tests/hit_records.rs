@@ -103,6 +103,8 @@ fn create_pipeline() -> (RayPipeline, HitGroups) {
     let p = device().create_ray_pipeline(&desc, "hit records").unwrap();
     let groups = HitGroups {
         path: Some(0),
+        producer_path: Some(0),
+        strand_path: Some(0),
         shadow: Some(1),
         medium_shadow: Some(2),
         ..HitGroups::default()
