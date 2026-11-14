@@ -225,93 +225,20 @@ public Traced traced_nothing()
     return HitObject::MakeNop();
 }
 
-// The hit as built-ins give it, in closest-hit and any-hit shaders of triangle geometry.
-public struct TriangleHit : IHit
-{
-    public TriangleAttributes attributes;
-
-    public uint3 launch()
-    {
-        return DispatchRaysIndex();
-    }
-
-    public uint instance_index()
-    {
-        return InstanceIndex();
-    }
-
-    public uint custom_index()
-    {
-        return InstanceID();
-    }
-
-    public uint geometry_index()
-    {
-        return GeometryIndex();
-    }
-
-    public uint primitive_index()
-    {
-        return PrimitiveIndex();
-    }
-
-    public int cluster_id()
-    {
-        return GetClusterID();
-    }
-
-    public float t()
-    {
-        return RayTCurrent();
-    }
-
-    public float2 barycentrics()
-    {
-        return attributes.barycentrics;
-    }
-
-    public bool front_face()
-    {
-        return HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE;
-    }
-
-    public float3 world_origin()
-    {
-        return WorldRayOrigin();
-    }
-
-    public float3 world_direction()
-    {
-        return WorldRayDirection();
-    }
-
-    public float3 object_origin()
-    {
-        return ObjectRayOrigin();
-    }
-
-    public float3 object_direction()
-    {
-        return ObjectRayDirection();
-    }
-
-    public float3 corner(uint i)
-    {
-        return HitTriangleVertexPosition(i);
-    }
-}
-
-// The hit as built-ins give it in closest-hit and any-hit shaders of geometry that is triangles or
-// linear swept spheres. A swept-sphere hit has no corners, cluster or barycentrics: its first
-// corner is the hit point in object space, the others and its barycentrics 0, and its cluster id
-// -1, as `orr_shaders.trace` gives an inline hit on one.
-public struct BuiltInHit : IHit
+// The hit as built-ins give it in closest-hit and any-hit shaders: `TriangleHit` for geometry of
+// triangles only, `BuiltInHit` for geometry that is triangles or linear swept spheres. A
+// swept-sphere hit has no corners, cluster or barycentrics: its first corner is the hit point in
+// object space, the others and its barycentrics 0, and its cluster id -1, as `orr_shaders.trace`
+// gives an inline hit on one.
+public struct BuiltIns<let SWEPT : bool> : IHit
 {
     public TriangleAttributes attributes;
 
     // Whether the hit is on a triangle.
     public bool triangle()
     {
+        if (!SWEPT)
+            return true;
         uint kind = HitKind();
         return kind == HIT_KIND_TRIANGLE_FRONT_FACE || kind == HIT_KIND_TRIANGLE_BACK_FACE;
     }
@@ -388,3 +315,6 @@ public struct BuiltInHit : IHit
         return i == 0 ? ObjectRayOrigin() + RayTCurrent() * ObjectRayDirection() : float3(0.0);
     }
 }
+
+public typealias TriangleHit = BuiltIns<false>;
+public typealias BuiltInHit = BuiltIns<true>;
