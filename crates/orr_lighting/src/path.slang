@@ -216,7 +216,7 @@ public struct PathRoot
     public PathStages* stages;
     public uint slice_base;
     public uint slice_count;
-    public uint features;           // FEATURE_* (path/stages.slang)
+    public uint features;           // FEATURE_* (path/common.slang)
     // The round a stage runs in, the first round of its pass, where every path of the pass
     // finishes, and the first round of the next pass.
     public uint round;

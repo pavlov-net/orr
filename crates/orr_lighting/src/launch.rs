@@ -28,7 +28,7 @@ use crate::staged::{
 use crate::{Error, KernelSet, module};
 
 /// The words of a slot of paths whose root has `features`, of a view's or its background layer's
-/// (`view`) or not, as `path/launch.slang`'s `slot_stride` lays it out.
+/// (`view`) or not, as `path/launch/slot.slang`'s `slot_stride` lays it out.
 fn slot_words(features: u32, view: bool) -> u64 {
     let walk = view && features & (FEATURE_WALK | FEATURE_INTERIORS) != 0;
     let part = |on: bool, words: u32| if on { u64::from(words) } else { 0 };
@@ -98,12 +98,12 @@ const COVER_SHADOW: usize = 4;
 const LAYER_COPIES: usize = 5;
 const LAYER_PRODUCERS: usize = 6;
 
-/// Then the callables, each at its `path/launch.slang` CALL_* index with the lobes of the BSDF its
-/// vertices may have. Next-event estimation and the scatter are made per vertex class (AT_*), an
-/// opaque vertex's for a plain surface's and a rich one's. A walk's ends are made rich, as a walk
-/// starts only from a vertex with a subsurface weight, and so are the layer's, the window's and an
-/// emitter's view, whose surfaces may have every lobe. What lies along a ray, a scatter in a
-/// medium and a plane stack's step shade no surface.
+/// Then the callables, each at its `path/launch/steps.slang` CALL_* index with the lobes of the
+/// BSDF its vertices may have. Next-event estimation and the scatter are made per vertex class
+/// (AT_*), an opaque vertex's for a plain surface's and a rich one's. A walk's ends are made rich,
+/// as a walk starts only from a vertex with a subsurface weight, and so are the layer's, the
+/// window's and an emitter's view, whose surfaces may have every lobe. What lies along a ray, a
+/// scatter in a medium and a plane stack's step shade no surface.
 const CALLED: [(u32, &str, bool); CALLABLES as usize] = [
     (CALL_START_VIEW, "start_view", true),
     (CALL_START_UPDATE, "start_update", true),

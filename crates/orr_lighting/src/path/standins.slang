@@ -11,7 +11,7 @@ import orr_lighting.media;
 import orr_scene.surface;
 import orr_scene.candidates;
 import orr_lighting.path;
-import orr_lighting.path.stages;
+import orr_lighting.path.common;
 import orr_lighting.path.launch;
 
 extern struct Surface : ISurfaces = StandardSurface;
