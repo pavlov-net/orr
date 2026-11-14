@@ -118,6 +118,10 @@ fn every_lint_has_a_failing_fixture() {
             kernel("CoopVec<half, 4> v = CoopVec<half, 4>(half(root.count)); root.out[id.x] = float4(v[0]);"),
         ),
         (
+            Lint::PointerStep,
+            kernel("float4* p = root.out + id.x + 2 - 1; *p = float4(1.0);"),
+        ),
+        (
             Lint::Atomic64,
             "struct Root { uint64_t* v; uint n; uint pad; }\n[[vk::binding(0, 0)]] ConstantBuffer<Root> root;\n\
              [shader(\"compute\")] [numthreads(32, 1, 1)] void main(uint3 id: SV_DispatchThreadID) { InterlockedAdd(root.v[id.x], 1ull); }\n"

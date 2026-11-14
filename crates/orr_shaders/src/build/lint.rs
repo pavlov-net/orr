@@ -41,6 +41,9 @@ pub enum Lint {
     CoopVec,
     /// Every 64-bit atomic is a max whose result is unused.
     Atomic64,
+    /// No pointer is stepped back by a constant (`p - 1`, `p + N - 1`): NVIDIA's driver adds the
+    /// step's bytes as an unsigned 32-bit offset, 4 GiB past where the pointer should land.
+    PointerStep,
     /// No two shader roots define the same top-level import name: a prefix, or a file or
     /// directory directly under a root without one.
     DuplicateImport,
@@ -328,6 +331,15 @@ pub(super) fn model_lints(
                 );
             }
         }
+    }
+    if model.negative_steps > 0 {
+        push(
+            Lint::PointerStep,
+            format!(
+                "{} pointers stepped back by a constant; fold the constants first, as in `p + (N - 1)`",
+                model.negative_steps
+            ),
+        );
     }
     for op in &model.bad_atomics {
         push(

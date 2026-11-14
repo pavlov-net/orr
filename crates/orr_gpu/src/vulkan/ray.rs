@@ -586,6 +586,49 @@ impl Device {
             started.elapsed().as_secs_f64() * 1e3,
             desc.threads
         );
+        // A shader's stack is what it keeps in memory across its calls and traces, which the driver
+        // reports per group and no pipeline statistic does.
+        if log::log_enabled!(log::Level::Debug) {
+            let mut logged = std::collections::BTreeSet::new();
+            for (i, g) in groups.iter().enumerate() {
+                for (which, stage, kind) in [
+                    (
+                        vk::ShaderGroupShaderKHR::GENERAL,
+                        g.general_shader,
+                        "general",
+                    ),
+                    (
+                        vk::ShaderGroupShaderKHR::CLOSEST_HIT,
+                        g.closest_hit_shader,
+                        "closest-hit",
+                    ),
+                    (
+                        vk::ShaderGroupShaderKHR::ANY_HIT,
+                        g.any_hit_shader,
+                        "any-hit",
+                    ),
+                    (
+                        vk::ShaderGroupShaderKHR::INTERSECTION,
+                        g.intersection_shader,
+                        "intersection",
+                    ),
+                ] {
+                    if stage == vk::SHADER_UNUSED_KHR || !logged.insert(stage) {
+                        continue;
+                    }
+                    // SAFETY: the group and its shader exist in the pipeline just made.
+                    let bytes =
+                        unsafe { rt.get_ray_tracing_shader_group_stack_size(raw, i as u32, which) };
+                    let entry = desc.stages[stage as usize]
+                        .entry
+                        .spirv_name
+                        .to_string_lossy();
+                    log::debug!(
+                        "ray pipeline {name}: {kind} shader {entry} keeps a stack of {bytes} bytes"
+                    );
+                }
+            }
+        }
         // SAFETY: nothing uses the pipeline until it is returned.
         let raw = DropGuard::new(raw, |p| unsafe { shared.device.destroy_pipeline(p, None) });
         // SAFETY: the pipeline has `groups.len()` groups.

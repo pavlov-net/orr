@@ -229,6 +229,8 @@ pub(super) struct Model {
     pub(crate) stray_params: Vec<StrayParam>,
     /// 64-bit atomics other than a max whose result is unused, by opcode.
     pub(super) bad_atomics: Vec<u16>,
+    /// Pointers stepped by a negative constant.
+    pub(super) negative_steps: u32,
     /// An entry point declares the opacity-micromap execution mode.
     pub(super) omm: bool,
     /// The root is held in the push data (`ORR_ROOT_INLINE`).
@@ -542,6 +544,7 @@ impl Extract<'_> {
                 consts: self.decls.consts.clone(),
                 stray_params,
                 bad_atomics,
+                negative_steps: self.spv.negative_steps,
                 omm: !self.spv.omm_entries.is_empty(),
                 inline_root,
                 no_omm_mode,
