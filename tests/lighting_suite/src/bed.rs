@@ -2948,6 +2948,48 @@ pub fn assert_within_noise(
     );
 }
 
+/// `frames` frames of `paths` on `bed` from seed `seed`.
+pub fn render_paths(bed: &mut Bed, paths: &Paths, frames: u32, seed: u32) -> Accumulated {
+    bed.accumulate(frames, seed, &mut |list, f| paths.record(list, f))
+}
+
+/// The staged loop and the pipeline path tracer of `kernels`, both with `settings`.
+pub fn both(kernels: &KernelSet, settings: ViewLighting) -> (Paths, Paths) {
+    (
+        Paths::new(kernels, PathEntry::Compute, settings),
+        Paths::new(kernels, PathEntry::Pipeline, settings),
+    )
+}
+
+/// Real-time frames redraw the light tiles, so runs differ by their noise: the pipeline's frames
+/// at the staged loop's seed sit as close to the staged loop's as its frames at another seed do.
+/// The world cache settles over the staged loop's frames first.
+pub fn assert_pipeline_within_noise(what: &str, bed: &mut Bed, staged: &Paths, launched: &Paths) {
+    bed.set_hit_pipeline(launched.hit_pipeline());
+    render_paths(bed, staged, 32, 3);
+    let piped = render_paths(bed, launched, 32, 1);
+    let same_seed = render_paths(bed, staged, 32, 1);
+    let noise = render_paths(bed, staged, 32, 2);
+    assert_within_noise(what, &piped, &same_seed, &noise, 1.25);
+}
+
+/// [`assert_pipeline_within_noise`], and the two means agree over frames that alternate, which
+/// see the world cache alike.
+pub fn assert_pipeline_renders_as_staged(
+    what: &str,
+    bed: &mut Bed,
+    staged: &Paths,
+    launched: &Paths,
+) {
+    assert_pipeline_within_noise(what, bed, staged, launched);
+    let (mut of_staged, mut of_launched) = (Vec::new(), Vec::new());
+    for k in 0..24 {
+        of_staged.push(image_mean(&render_paths(bed, staged, 1, 4 + k))[1]);
+        of_launched.push(image_mean(&render_paths(bed, launched, 1, 4 + k))[1]);
+    }
+    crate::welch::assert_same_mean(what, &of_launched, &of_staged);
+}
+
 /// orr_lighting's view dispatch and guide resolve recording into bed frames with
 /// `settings`.
 pub struct Paths {

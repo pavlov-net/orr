@@ -496,17 +496,11 @@ impl Build {
             owners.insert(name.clone(), module_owners);
         }
 
-        // The `[Host]` constants the crate's own shader root declares, which every module that
-        // loads them reports alike.
+        // The `[Host]` constants of every module the kernels load, of this crate's shader root
+        // and the roots it builds with, which every module that loads one reports alike.
         let mut consts: BTreeMap<String, &HostConst> = BTreeMap::new();
         for (name, record) in &modules {
             for c in &record.model.consts {
-                if !own_root
-                    .as_ref()
-                    .is_some_and(|r| canonical_lossy(&c.file).starts_with(r))
-                {
-                    continue;
-                }
                 match consts.get(&c.name) {
                     Some(seen) if seen.value != c.value || seen.scalar != c.scalar => {
                         lints.push(LintError {

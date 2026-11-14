@@ -36,8 +36,8 @@ pub(super) struct Kernel<'a> {
     pub(super) plans: &'a HashMap<String, Plan>,
 }
 
-/// The crate's `types` module contents and its extern checks, and the `[Host]` constants of its
-/// shader root, its `consts` module.
+/// The crate's `types` module contents and its extern checks, and the `[Host]` constants of the
+/// shader roots it builds with, its `consts` module.
 pub(super) struct Shared<'a> {
     pub(super) types: BTreeMap<String, (&'a StructDef, &'a Plan)>,
     pub(super) externs: BTreeMap<String, (&'a StructDef, &'a Plan, String)>,

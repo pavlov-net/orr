@@ -10,9 +10,10 @@ module abi;
 
 import orr_shaders.debug;
 
-// Marks a module-scope integer `static const` whose value the build hands the crate's Rust as a
-// `const` of its name (`shaders::consts`): a table or layout that host code shares with shaders
-// takes its numbers from the shader alone.
+// Marks a module-scope integer `static const` whose value the build hands the Rust of every crate
+// whose kernels load its module as a `const` of its name (`shaders::consts`): a table or layout
+// that host code shares with shaders takes its numbers from the shader alone. Names are unique
+// among the constants so marked.
 [__AttributeUsage(_AttributeTargets.Var)]
 public struct HostAttribute
 {

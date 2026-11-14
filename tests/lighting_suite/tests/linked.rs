@@ -7,10 +7,9 @@
 use lighting_suite::bed::{
     Accumulated, BARE_LEAF, Bed, FLOOR, GLASS_SLAB, Item, LAYERED_SPHERE, MIRROR, PANEL, Particle,
     ParticleLook, Paths, RINGS_LEAF, SKINNED_EMITTER, SKY, SUN, Spec, StrandRow, WHITE_SPHERE,
-    assert_close, assert_within_noise, image_mean, luminance, mean_where, quad_scene, reference,
-    surface_mean,
+    assert_close, assert_pipeline_renders_as_staged, assert_within_noise, both, luminance,
+    mean_where, quad_scene, reference, render_paths, surface_mean,
 };
-use lighting_suite::welch::assert_same_mean;
 use lighting_suite::{TestScene, assert_clean, device, linked, require};
 use orr_gpu::{GpuPtr, KernelSet};
 use orr_lighting::{
@@ -21,10 +20,6 @@ use orr_scene::{EnvironmentData, RendererDesc, SceneDesc, SceneWriter};
 
 fn at(model: &'static str, linear: Mat3, at: Vec3) -> Item {
     Item { model, linear, at }
-}
-
-fn render_paths(bed: &mut Bed, paths: &Paths, frames: u32, seed: u32) -> Accumulated {
-    bed.accumulate(frames, seed, &mut |list, f| paths.record(list, f))
 }
 
 fn debug(view: LightingDebugView, max_bounces: u32) -> ViewLighting {
@@ -255,9 +250,7 @@ fn the_pipeline_renders_linked_types_geometry_kinds_and_rich_materials_as_the_st
     if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
         return;
     }
-    let settings = ViewLighting::default();
-    let staged = Paths::new(&linked::KERNELS, PathEntry::Compute, settings);
-    let launched = Paths::new(&linked::KERNELS, PathEntry::Pipeline, settings);
+    let (staged, launched) = both(&linked::KERNELS, ViewLighting::default());
     let lit = |copies: Vec<Item>| Spec {
         copies: [vec![at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)], copies].concat(),
         lights: vec![Light::Directional(SUN)],
@@ -320,21 +313,10 @@ fn the_pipeline_renders_linked_types_geometry_kinds_and_rich_materials_as_the_st
         );
     }
     for (what, bed) in &mut beds {
-        bed.set_hit_pipeline(launched.hit_pipeline());
         // At a pre-exposure of 1 the sunlit ground passes the HDR ceiling, which would clip the
         // samples that draw the sun.
         bed.set_pre_exposure(1.0 / 64.0);
-        render_paths(bed, &staged, 32, 3);
-        let piped = render_paths(bed, &launched, 32, 1);
-        let same_seed = render_paths(bed, &staged, 32, 1);
-        let noise = render_paths(bed, &staged, 32, 2);
-        assert_within_noise(what, &piped, &same_seed, &noise, 1.25);
-        let (mut of_staged, mut of_launched) = (Vec::new(), Vec::new());
-        for k in 0..24 {
-            of_staged.push(image_mean(&render_paths(bed, &staged, 1, 4 + k))[1]);
-            of_launched.push(image_mean(&render_paths(bed, &launched, 1, 4 + k))[1]);
-        }
-        assert_same_mean(what, &of_launched, &of_staged);
+        assert_pipeline_renders_as_staged(what, bed, &staged, &launched);
     }
     assert_clean();
 }

@@ -109,28 +109,7 @@ void cover_path_hit(inout Payload p, TriangleAttributes a)
 {
     ORR_OMM(cover_path_hit);
     TriangleHit h = { a };
-    PathCover c = path_cover(p.words);
-    uint d = cover_path<CoverageFeedback<Surface>>(root.scene, root.view, c, h.world_direction(), h.custom_index(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.barycentrics());
-    if (c.policy == COVER_CROSSING)
-    {
-        if (d == ANY_HIT_ACCEPT)
-        {
-            float3 corners[3] = { h.corner(0), h.corner(1), h.corner(2) };
-            launch_crossing_candidate(root, launch_slot(), h.t(), h.instance_index(), uint(h.cluster_id()), h.primitive_index(), h.barycentrics(), corners);
-        }
-        IgnoreHit();
-    }
-    if (d == ANY_HIT_IGNORE)
-        IgnoreHit();
-}
-
-// Ends with what the decision says, the payload holding the shadow's state.
-void shadow_decided(inout Payload p, ShadowCover c, uint d)
-{
-    p.words = c.words();
-    if (d == ANY_HIT_END)
-        AcceptHitAndEndSearch();
-    IgnoreHit();
+    any_hit_decides(path_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, p.words, h, slot_crossings(root, launch_slot())));
 }
 
 [shader("anyhit")]
@@ -138,14 +117,7 @@ void cover_shadow_hit(inout Payload p, TriangleAttributes a)
 {
     ORR_OMM(cover_shadow_hit);
     TriangleHit h = { a };
-    ShadowCover c = ShadowCover.of_words(p.words);
-    uint d = cover_shadow<CoverageFeedback<Surface>>(root.scene, root.view, c.context(), c, h.world_direction(), h.custom_index(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.barycentrics());
-    shadow_decided(p, c, d);
-}
-
-struct SpanAttributes
-{
-    float2 span;
+    any_hit_decides(shadow_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, p.words, h));
 }
 
 [shader("intersection")]
@@ -161,9 +133,7 @@ void box_medium_hit()
 void proxy_shadow_hit(inout Payload p, SpanAttributes a)
 {
     ORR_OMM(proxy_shadow_hit);
-    ShadowCover c = ShadowCover.of_words(p.words);
-    uint d = proxy_shadow(root.scene, c, InstanceIndex(), a.span);
-    shadow_decided(p, c, d);
+    any_hit_decides(proxy_any_hit(root.scene, p.words, InstanceIndex(), a.span));
 }
 
 [shader("anyhit")]

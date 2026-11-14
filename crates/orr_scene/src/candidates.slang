@@ -12,17 +12,12 @@ import orr_shaders.abi;
 import orr_shaders.math;
 import orr_shaders.random;
 import orr_shaders.trace;
+import orr_shaders.hits;
 import orr_pack.mesh;
 import orr_scene.hit;
 import orr_scene.material;
 import orr_scene.tables;
 import orr_scene.scene_may;
-
-// What an any-hit shader does with its candidate: ignore it, accept it, or accept it and end the
-// search.
-public static const uint ANY_HIT_IGNORE = 0;
-public static const uint ANY_HIT_ACCEPT = 1;
-public static const uint ANY_HIT_END = 2;
 
 // Non-opaque candidates of rays that may meet layers: presence layers commit by `presence`,
 // the rest by the alpha test.
@@ -31,9 +26,9 @@ public static const uint PRESENCE_ANY = 1;       // wherever its opacity is abov
 public static const uint PRESENCE_DRAWN = 2;     // where a hashed draw from `seed` falls below its opacity
 
 // How a path ray commits a non-opaque triangle candidate (`PathCover.policy`).
-public static const uint COVER_ALPHA = 0;        // present by the alpha test: `Alpha`
-public static const uint COVER_LAYERS = 1;       // presence layers by `presence`, the rest by the alpha test: `LayerAccept`
-public static const uint COVER_STACK = 2;        // present opaque triangles and cooked solid glass: `StackAccept`
+[Host] public static const uint COVER_ALPHA = 0;        // present by the alpha test: `Alpha`
+[Host] public static const uint COVER_LAYERS = 1;       // presence layers by `presence`, the rest by the alpha test: `LayerAccept`
+[Host] public static const uint COVER_STACK = 2;        // present opaque triangles and cooked solid glass: `StackAccept`
 // A shadow ray's crossing step: present dielectrics by the alpha test, accepted for the shader to
 // take the nearest of, presence layers never.
 public static const uint COVER_CROSSING = 3;
@@ -120,11 +115,62 @@ public bool cover_decision<S : ISurfaces>(SceneRoot* s, ViewConstants* v, uint p
     return unit_float(pcg(seed ^ pcg(instance_index ^ pcg(cluster ^ pcg(primitive))))) < coverage;
 }
 
+// Where a path ray's crossing step (COVER_CROSSING) keeps the present dielectric candidates it
+// meets, which it commits none of: `t` m along it on triangle `primitive` of cluster `cluster` of
+// instance `instance` at `bary`, with corners `corners`.
+public interface ICrossings
+{
+    void met(float t, uint instance, uint cluster, uint primitive, float2 bary, float3 corners[3]);
+}
+
+// A path ray's any-hit at triangle candidate `h` under the cover its `payload` holds, as `S`
+// resolves surfaces: ANY_HIT_ACCEPT or ANY_HIT_IGNORE. A crossing step ignores every candidate
+// and hands the present dielectrics to `crossings`.
+public uint path_any_hit<S : ISurfaces, H : IHit, C : ICrossings>(SceneRoot* s, ViewConstants* v, uint4 payload, H h, C crossings)
+{
+    PathCover c = path_cover(payload);
+    uint d = cover_path<S>(s, v, c, h.world_direction(), h.custom_index(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.barycentrics());
+    if (c.policy != COVER_CROSSING)
+        return d;
+    if (d == ANY_HIT_ACCEPT)
+    {
+        float3 corners[3] = { h.corner(0), h.corner(1), h.corner(2) };
+        crossings.met(h.t(), h.instance_index(), uint(h.cluster_id()), h.primitive_index(), h.barycentrics(), corners);
+    }
+    return ANY_HIT_IGNORE;
+}
+
+// A shadow ray's any-hit at triangle candidate `h`, the shadow's state in `payload`, its
+// candidates of the context the state gives: ANY_HIT_END or ANY_HIT_IGNORE.
+public uint shadow_any_hit<S : ISurfaces, H : IHit>(SceneRoot* s, ViewConstants* v, inout uint4 payload, H h)
+{
+    ShadowCover c = ShadowCover.of_words(payload);
+    uint d = cover_shadow<S>(s, v, c.context(), c, h.world_direction(), h.custom_index(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.barycentrics());
+    payload = c.words();
+    return d;
+}
+
+// What a medium proxy's intersection reports: its span along the ray.
+public struct SpanAttributes
+{
+    public float2 span;
+}
+
+// A shadow ray's any-hit at medium proxy instance `instance` over `span`, the shadow's state in
+// `payload` (`proxy_shadow`).
+public uint proxy_any_hit(SceneRoot* s, inout uint4 payload, uint instance, float2 span)
+{
+    ShadowCover c = ShadowCover.of_words(payload);
+    uint d = proxy_shadow(s, c, instance, span);
+    payload = c.words();
+    return d;
+}
+
 // `visibility` modes of shadow rays, and the thin tracer's probe for a dielectric in front of a
 // plane stack's face.
-public static const uint SHADOW_PATH = 0;
-public static const uint SHADOW_PHOTON = 1;
-public static const uint SHADOW_UNBENT = 2;
+[Host] public static const uint SHADOW_PATH = 0;
+[Host] public static const uint SHADOW_PHOTON = 1;
+[Host] public static const uint SHADOW_UNBENT = 2;
 public static const uint SHADOW_PROBE = 3;
 
 // Non-opaque candidates a shadow ray multiplies before it ends with the product so far.
@@ -132,10 +178,10 @@ public static const uint SHADOW_PROBE = 3;
 public static const uint SHADOW_CANDIDATES = 16;
 
 // `ShadowCover` flags.
-public static const uint SHADOW_OVERFLOW = 1 << 15;  // a counted candidate came past SHADOW_CANDIDATES; the product is the one before it
+[Host] public static const uint SHADOW_OVERFLOW = 1 << 15;  // a counted candidate came past SHADOW_CANDIDATES; the product is the one before it
 public static const uint SHADOW_ENDED = 1 << 16;     // an any-hit ended the search: the hit is no opaque one the AS committed
-public static const uint SHADOW_SOLID = 1 << 17;     // a path's ray met cooked solid glass, which ends it as an opaque hit would
-public static const uint SHADOW_CROSSES = 1 << 18;   // it passed a dielectric whose crossing the raygen walks
+[Host] public static const uint SHADOW_SOLID = 1 << 17;     // a path's ray met cooked solid glass, which ends it as an opaque hit would
+[Host] public static const uint SHADOW_CROSSES = 1 << 18;   // it passed a dielectric whose crossing the raygen walks
 public static const uint SHADOW_VOLUME = 1 << 19;    // it passed a medium proxy with a volume, which a march takes
 
 // What a shadow ray's any-hit shaders read and write, 16 bytes of payload: the product of what

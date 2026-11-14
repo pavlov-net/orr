@@ -2,7 +2,7 @@
 //! candidate handlers and through a ray tracing pipeline whose any-hit and intersection shaders
 //! the scene's hit table selects (`orr_scene.candidates`), on copies opaque, alpha-tested with and
 //! without micromaps, presence layers, solid glass, a thin window, a mixed-class model, particles,
-//! strands and a medium proxy; and those shaders' bodies against their register budget.
+//! strands and a medium proxy.
 
 use std::sync::OnceLock;
 
@@ -10,35 +10,25 @@ use lighting_suite::bed::{
     BARE_LEAF, Bed, FLOOR, Item, LEAF, MASKED_PANE, MIXED_SLAB, PRESENCE_VEIL, Particle,
     ParticleLook, SUN, Spec, StrandRow, TINTED_SLAB,
 };
+use lighting_suite::shaders::consts::{
+    CLASS_DIELECTRIC, COVER_ALPHA, COVER_LAYERS, COVER_STACK, MASK_DIELECTRIC, MASK_MEDIUM,
+    MASK_OPAQUE, MASK_PARTICLE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, SHADOW_CROSSES,
+    SHADOW_OVERFLOW, SHADOW_PATH, SHADOW_PHOTON, SHADOW_SOLID, SHADOW_UNBENT,
+};
 use lighting_suite::shaders::types::{HitRaysRoot, PathOut, RayIn, ShadowOut};
 use lighting_suite::shaders::{hit_inline, hit_records};
 use lighting_suite::{assert_clean, device, pipeline, readback, require, upload};
 use orr_gpu::{
-    Allocation, CompileThreads, GpuPtr, Hazards, HitGroup, RayPipeline, RayPipelineDesc,
-    RayPipelineFlags, ShaderRecord, ShaderStage, SpecData, Stages,
+    Allocation, CompileThreads, Hazards, HitGroup, RayPipeline, RayPipelineDesc, RayPipelineFlags,
+    ShaderRecord, ShaderStage, SpecData, Stages,
 };
 use orr_lighting::Light;
 use orr_math::{Mat3, Quat, Vec3};
 use orr_scene::{HitGroups, MediumProxy, MediumProxyId, Opacity, ProxyDensity};
 
-// orr_shaders.trace masks and classes, orr_scene.candidates policies, modes and flags.
-const MASK_OPAQUE: u32 = 0x01;
-const MASK_PARTICLE: u32 = 0x02;
-const MASK_MEDIUM: u32 = 0x04;
-const MASK_DIELECTRIC: u32 = 0x80;
 const SHADOW_MASK: u32 = MASK_OPAQUE | MASK_PARTICLE | MASK_MEDIUM | MASK_DIELECTRIC;
-const CLASS_DIELECTRIC: u32 = 1;
-const COVER_ALPHA: u32 = 0;
-const COVER_LAYERS: u32 = 1;
-const COVER_STACK: u32 = 2;
-const SHADOW_PATH: u32 = 0;
-const SHADOW_PHOTON: u32 = 1;
-const SHADOW_UNBENT: u32 = 2;
-const SHADOW_OVERFLOW: u32 = 1 << 15;
-const SHADOW_SOLID: u32 = 1 << 17;
-const SHADOW_CROSSES: u32 = 1 << 18;
+/// The ray flag of a trace that sees every candidate as non-opaque.
 const RAY_FLAG_FORCE_NON_OPAQUE: u32 = 0x02;
-const RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE: u32 = 0x400;
 
 // The suite pipeline's stages and groups.
 const STAGES: [&str; 7] = [
@@ -52,18 +42,6 @@ const STAGES: [&str; 7] = [
 ];
 const RAYGEN_PATHS: u32 = 0;
 const RAYGEN_SHADOWS: u32 = 1;
-
-fn pipeline_flags() -> RayPipelineFlags {
-    let caps = device().caps();
-    let mut flags = RayPipelineFlags::CLUSTERS;
-    if caps.omm {
-        flags |= RayPipelineFlags::OPACITY_MICROMAPS;
-    }
-    if caps.lss {
-        flags |= RayPipelineFlags::SWEPT_SPHERES;
-    }
-    flags
-}
 
 /// The pipeline, and the groups the scene's records name: one for the process.
 fn ray_pipeline() -> &'static (RayPipeline, HitGroups) {
@@ -97,7 +75,7 @@ fn create_pipeline() -> (RayPipeline, HitGroups) {
         ],
         callables: &[],
         max_recursion: 1,
-        flags: pipeline_flags(),
+        flags: RayPipelineFlags::scene(device().caps()),
         threads: CompileThreads::default(),
     };
     let p = device().create_ray_pipeline(&desc, "hit records").unwrap();
@@ -232,11 +210,12 @@ fn trace_both(
             rays: input.gpu(),
             paths: paths.gpu(),
             shadows: shadows.gpu(),
-            stand_ins: GpuPtr::NULL,
             count: n as u32,
             depth: 1,
             cone_width: 1e-3,
             cone_spread: 2e-3,
+            _pad0: 0,
+            _pad1: 0,
         };
         list.barrier(
             Stages::ALL,
@@ -497,20 +476,4 @@ fn strands_through_the_hit_records_match_inline_traces() {
     let seen = compare(&rays, &traced);
     assert!(seen.hits > 1000, "{seen:?}");
     assert_clean();
-}
-
-/// The medium proxy's intersection and any-hit shaders fit their budget as compute stand-ins: 64
-/// registers, no local or shared memory. The standard coverage's any-hits do not yet: the hit
-/// reconstruction their presence resolve shares with the inline handlers holds more.
-#[test]
-fn proxy_shaders_fit_their_register_budget() {
-    for entry in ["box_medium_stand_in", "proxy_shadow_stand_in"] {
-        let Some(stats) = pipeline(&hit_records::MODULE, entry).statistics() else {
-            return;
-        };
-        assert!(
-            stats.registers <= 64 && stats.local_bytes == 0 && stats.shared_bytes == 0,
-            "{entry}: {stats:?}"
-        );
-    }
 }

@@ -1,7 +1,7 @@
 //! Descriptions of ray tracing pipelines and their binding tables, alike on every backend.
 //! Only the Vulkan backend creates them (`Caps::ray_dispatch`).
 
-use crate::{GpuAddress, ShaderStage};
+use crate::{Caps, GpuAddress, ShaderStage};
 
 bitflags::bitflags! {
     /// What a [`RayPipelineDesc`]'s traces may meet, and what its binding table never holds.
@@ -26,6 +26,21 @@ bitflags::bitflags! {
         const NO_NULL_MISS = 1 << 7;
         /// No procedural hit record that a trace reaches has a zero intersection handle.
         const NO_NULL_INTERSECTION = 1 << 8;
+    }
+}
+
+impl RayPipelineFlags {
+    /// What traces of a scene's acceleration structures may meet on a device of `caps`: cluster
+    /// structures, and the opacity micromaps and swept spheres it has.
+    pub fn scene(caps: &Caps) -> Self {
+        let mut flags = Self::CLUSTERS;
+        if caps.omm {
+            flags |= Self::OPACITY_MICROMAPS;
+        }
+        if caps.lss {
+            flags |= Self::SWEPT_SPHERES;
+        }
+        flags
     }
 }
 

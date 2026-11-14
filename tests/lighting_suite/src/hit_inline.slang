@@ -4,12 +4,13 @@ import orr_shaders.abi;
 import orr_shaders.trace;
 import orr_scene.hit;
 import orr_scene.candidates;
+import orr_scene.surface;
 import orr_lighting.media;
 import orr_lighting.path;
 import orr_lighting.shadow;
 import lighting_suite.hit_rays;
 
-typealias Surface = StandardSurface;
+typealias Surface = CoverageFeedback<StandardSurface>;
 
 ORR_ROOT_INLINE(HitRaysRoot);
 
@@ -49,7 +50,7 @@ ShadowOut inline_shadow<let MODE : uint>(RayIn r)
     c.origin = r.origin;
     c.dir = r.dir;
     c.t_max = r.t_max;
-    c.context = context(root);
+    c.context = shadow_cover_of(root, r).context();
     c.environment = false;
     c.exterior_ior = 1.0;
     c.crossed = 0;

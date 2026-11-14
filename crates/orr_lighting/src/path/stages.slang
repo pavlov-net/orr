@@ -968,25 +968,6 @@ void store_spectral(PathRoot r, uint slot, Spectral v)
         store_words<Spectral, SPECTRAL_WORDS>(r.stages.words, r.stages.capacity, spectral_first(r), slot, v);
 }
 
-// The words of a vertex's packed surface, which the bodies that shade an opaque vertex hand on
-// where they are shaders of their own: past the parts a slot holds, which no staged path keeps.
-static const uint SURFACE_WORDS = 7;
-
-uint surface_first(PathRoot r)
-{
-    return spectral_first(r) + ((r.features & FEATURE_DISPERSION) != 0 ? SPECTRAL_WORDS : 0);
-}
-
-PackedSurface load_surface(PathRoot r, uint slot)
-{
-    return load_words<PackedSurface, SURFACE_WORDS>(r.stages.words, r.stages.capacity, surface_first(r), slot);
-}
-
-void store_surface(PathRoot r, uint slot, PackedSurface v)
-{
-    store_words<PackedSurface, SURFACE_WORDS>(r.stages.words, r.stages.capacity, surface_first(r), slot, v);
-}
-
 // Whether `queue`'s stage runs as a ray dispatch, whose workgroups are rows of rays.
 bool ray_queue(PathRoot r, uint queue)
 {
@@ -3270,99 +3251,6 @@ public void walk_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
     }
     p.rng = rng;
     leave_shade(r, slot, f, p, c, alive, false, round_now(r) + 1);
-}
-
-// ---------------------------------------------------------------------------------------------
-// Stand-ins
-//
-// The bodies that shade an opaque vertex as the shaders of the pipeline path tracer run them:
-// each loads the parts of the path's state its shader loads, runs the body and stores what the
-// shader hands on, so a compute pipeline of it reports the registers and memory the shader
-// takes. A slot is a lane's. They are compiled for their statistics and never run: the resolve's
-// hit stands at the slot's place in the records' memory, and the vertex's next-event probability
-// crosses from `direct` to `scatter` in the ray's.
-
-public void resolve_standin<S : ISurfaces>(PathRoot root, uint slot)
-{
-    PathRoot r = slot_root(specialized(root), slot);
-    PathFixed f = load_fixed(r, slot);
-    PathLoop p = load_loop(r, slot);
-    StoredHit h = { (HitInputs*)r.stages.records + slot };
-    bool feedback = !from_photon(r) && texture_feedback_drawn(f.pixel, r.frame);
-    HitContext context = hit_context(has(p.flags, LOOP_CAMERA) ? HIT_PRIMARY : HIT_SECONDARY, p.depth, p.cone, h.t(), texture_tap(r.view, f.pixel, r.frame, r.seed, p.depth), feedback);
-    PackedSurface ps;
-    if (resolve_opaque<FeedbackSurface<S>>(r, h, context, ps))
-        store_surface(r, slot, ps);
-}
-
-// What a body of `slot`'s vertex loads of the path's state.
-void standin_state(PathRoot r, uint slot, out PathFixed f, out PathLoop p, out ShadeState c, out StagedRecord record, out PathContext x)
-{
-    f = load_fixed(r, slot);
-    p = load_loop(r, slot);
-    c.ray = load_ray(r, slot, true);
-    c.interior = load_interior(r, slot);
-    c.stack = load_stack(r, slot);
-    c.spectral = load_spectral(r, slot);
-    record = staged_record(r, slot);
-    x = path_context(r, record, f.pixel);
-}
-
-public void emission_standin(PathRoot root, uint slot)
-{
-    PathRoot r = slot_root(specialized(root), slot);
-    PathFixed f;
-    PathLoop p;
-    ShadeState c;
-    StagedRecord record;
-    PathContext x;
-    standin_state(r, slot, f, p, c, record, x);
-    shade_emission(r, f, p, c, record, x, load_surface(r, slot), c.ray.dir, has(p.flags, LOOP_CAMERA), false);
-    store_loop(r, slot, p);
-}
-
-public void direct_standin<S : ISurfaces, M : IMedium>(PathRoot root, uint slot)
-{
-    PathRoot r = slot_root(specialized(root), slot);
-    PathFixed f;
-    PathLoop p;
-    ShadeState c;
-    StagedRecord record;
-    PathContext x;
-    standin_state(r, slot, f, p, c, record, x);
-    Sampler rng = p.rng;
-    PathStages* st = r.stages;
-    float t = asfloat(st.words[word_index(st, SPAN_FIRST + 1, slot)].z);
-    ShadeNee nee;
-    bool alive = shade_direct<S, M, StagedRecord>(r, f, p, c, record, x, load_surface(r, slot), c.ray.dir, t, has(p.flags, LOOP_CAMERA), rng, nee);
-    p.rng = rng;
-    set_flag(p.flags, LOOP_ENDED, !alive);
-    set_flag(p.flags, LOOP_SHADOW, nee.traced);
-    if (nee.traced)
-        store_shadow(r, slot, nee.q);
-    st.words[word_index(st, RAY_FIRST + 2, slot)].w = asuint(nee.run);
-    store_loop(r, slot, p);
-}
-
-public void scatter_standin<S : ISurfaces>(PathRoot root, uint slot)
-{
-    PathRoot r = slot_root(specialized(root), slot);
-    PathFixed f;
-    PathLoop p;
-    ShadeState c;
-    StagedRecord record;
-    PathContext x;
-    standin_state(r, slot, f, p, c, record, x);
-    Sampler rng = p.rng;
-    ShadeNee nee = no_nee(c.spectral);
-    nee.run = c.ray.run;
-    bool walking;
-    float3 wi;
-    bool alive = shade_scatter<S, StagedRecord>(r, f, p, c, record, x, load_surface(r, slot), c.ray.dir, nee, rng, walking, wi);
-    p.rng = rng;
-    set_flag(p.flags, LOOP_ENDED, !alive);
-    store_shade(r, slot, c, alive, false);
-    store_loop(r, slot, p);
 }
 
 // ---------------------------------------------------------------------------------------------

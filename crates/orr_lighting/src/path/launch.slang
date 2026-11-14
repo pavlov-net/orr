@@ -1841,6 +1841,25 @@ public void launch_crossing_candidate(PathRoot r, uint slot, float t, uint insta
     store_part<Crossing, CROSSING_WORDS>(at, c);
 }
 
+// Where a step of `slot`'s shadow ray's walk keeps the crossings it meets
+// (`launch_crossing_candidate`).
+public struct SlotCrossings : ICrossings
+{
+    public PathRoot r;
+    public uint slot;
+
+    public void met(float t, uint instance, uint cluster, uint primitive, float2 bary, float3 corners[3])
+    {
+        launch_crossing_candidate(r, slot, t, instance, cluster, primitive, bary, corners);
+    }
+}
+
+public SlotCrossings slot_crossings(PathRoot r, uint slot)
+{
+    SlotCrossings c = { r, slot };
+    return c;
+}
+
 // The window shader's body: what the crossing the walk's step found lets through, by the thin
 // wall's straight transmission where it is an ideal window and else nothing, into `slot`'s shadow
 // ray's contribution. STEP_ENDED where the step found none or nothing passes.

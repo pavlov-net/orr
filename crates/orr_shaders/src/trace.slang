@@ -9,17 +9,23 @@ module trace;
 import orr_shaders.abi;
 
 // TLAS instance mask bits.
-public static const uint MASK_OPAQUE = 0x01;     // opaque and alpha-tested geometry
-public static const uint MASK_PARTICLE = 0x02;   // particle batches
-public static const uint MASK_MEDIUM = 0x04;     // medium proxies (AABBs)
+// What an any-hit shader does with its candidate: ignore it, accept it, or accept it and end the
+// search.
+public static const uint ANY_HIT_IGNORE = 0;
+public static const uint ANY_HIT_ACCEPT = 1;
+public static const uint ANY_HIT_END = 2;
+
+[Host] public static const uint MASK_OPAQUE = 0x01;     // opaque and alpha-tested geometry
+[Host] public static const uint MASK_PARTICLE = 0x02;   // particle batches
+[Host] public static const uint MASK_MEDIUM = 0x04;     // medium proxies (AABBs)
 public static const uint MASK_LIGHT = 0x08;      // sphere and rect light proxies (AABBs)
-public static const uint MASK_DIELECTRIC = 0x80; // dielectric and presence surfaces
+[Host] public static const uint MASK_DIELECTRIC = 0x80; // dielectric and presence surfaces
 
 // Candidate classes. An instance with a custom index holds its class there; under one with custom
 // index 0, whose mask covers every class it shows, each cluster has its own (`ITraced`) and other
 // geometry is CLASS_OPAQUE.
 public static const uint CLASS_OPAQUE = 0; // opaque or alpha-tested
-public static const uint CLASS_DIELECTRIC = 1;
+[Host] public static const uint CLASS_DIELECTRIC = 1;
 public static const uint CLASS_PRESENCE = 2;
 public static const uint CLASS_PARTICLE = 3;
 public static const uint CLASS_MEDIUM = 4;
@@ -88,7 +94,7 @@ public uint class_mask(uint class_id)
 
 // Ray flags beside Slang's `RAY_FLAG_*`: opacity micromaps forced to two states. Builds
 // without micromaps drop it.
-public static const uint RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE = 0x400;
+[Host] public static const uint RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE = 0x400;
 
 // A non-opaque candidate as the candidate handlers see it.
 public struct Candidate

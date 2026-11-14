@@ -1,9 +1,9 @@
 //! The shader bodies of the ray tracing pipeline path tracer as compute stand-ins
 //! (`path/standins.slang`). A launch of a ray tracing pipeline runs every thread at the register
 //! count of its largest linked shader, capped at 128, and the driver reports nothing of those
-//! pipelines, so each body is compiled as a compute kernel that loads what its shader loads and
-//! stores what it hands on, and the driver's statistics of that kernel say whether the shader
-//! fits its kind's budget.
+//! pipelines, so each shader's body, the one the pipeline ships, is compiled as a compute kernel
+//! that takes its inputs from memory and stores what it hands on, and the driver's statistics of
+//! that kernel say whether the shader fits its kind's budget.
 
 use std::time::Instant;
 
@@ -38,12 +38,12 @@ impl ShaderKind {
     }
 }
 
-/// A shader body of an opaque vertex.
+/// A shader body of the pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Body {
-    /// A hit into the packed surface: the closest-hit shader.
+    /// An opaque hit into the packed surface: the closest-hit shader.
     Resolve,
-    /// The light the vertex sends along the path.
+    /// The light an opaque vertex sends along the path.
     Emission,
     /// Next-event estimation of a surface with no lobe a plain one lacks.
     DirectPlain,
@@ -53,16 +53,28 @@ pub enum Body {
     ScatterPlain,
     /// The next ray of a rich surface.
     ScatterRich,
+    /// A path ray's any-hit at a non-opaque triangle.
+    CoverPath,
+    /// A shadow ray's any-hit at a non-opaque triangle.
+    CoverShadow,
+    /// A medium proxy's intersection.
+    BoxMedium,
+    /// A shadow ray's any-hit at a medium proxy.
+    ProxyShadow,
 }
 
 impl Body {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 10] = [
         Self::Resolve,
         Self::Emission,
         Self::DirectPlain,
         Self::DirectRich,
         Self::ScatterPlain,
         Self::ScatterRich,
+        Self::CoverPath,
+        Self::CoverShadow,
+        Self::BoxMedium,
+        Self::ProxyShadow,
     ];
 
     pub fn name(self) -> &'static str {
@@ -73,13 +85,23 @@ impl Body {
             Self::DirectRich => "direct rich",
             Self::ScatterPlain => "scatter plain",
             Self::ScatterRich => "scatter rich",
+            Self::CoverPath => "cover path",
+            Self::CoverShadow => "cover shadow",
+            Self::BoxMedium => "box medium",
+            Self::ProxyShadow => "proxy shadow",
         }
     }
 
     pub fn kind(self) -> ShaderKind {
         match self {
             Self::Resolve => ShaderKind::ClosestHit,
-            _ => ShaderKind::Callable,
+            Self::CoverPath | Self::CoverShadow | Self::ProxyShadow => ShaderKind::AnyHit,
+            Self::BoxMedium => ShaderKind::Intersection,
+            Self::Emission
+            | Self::DirectPlain
+            | Self::DirectRich
+            | Self::ScatterPlain
+            | Self::ScatterRich => ShaderKind::Callable,
         }
     }
 
@@ -89,12 +111,17 @@ impl Body {
             Self::Emission => "emission",
             Self::DirectPlain | Self::DirectRich => "direct",
             Self::ScatterPlain | Self::ScatterRich => "scatter",
+            Self::CoverPath => "cover_path_hit",
+            Self::CoverShadow => "cover_shadow_hit",
+            Self::BoxMedium => "box_medium_hit",
+            Self::ProxyShadow => "proxy_shadow_hit",
         }
     }
 
     /// What its stand-in for paths that may meet `may` may meet. The bodies are a view path's:
     /// the other sources' paths run their own start, record and finish shaders. A plain class's
-    /// surfaces have none of the lobes a rich one may.
+    /// surfaces have none of the lobes a rich one may. The pipeline makes its hit shaders for
+    /// every source.
     fn may(self, may: u64) -> u64 {
         let view = may & !(MAY_BACKGROUND | MAY_UPDATE | MAY_PHOTON) | MAY_VIEW;
         match self {

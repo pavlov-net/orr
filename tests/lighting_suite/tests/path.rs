@@ -9,8 +9,9 @@ use lighting_suite::bed::{
     FrostGuide, GLASS_SLAB, GLASS_SPHERE, GLOSSY_FLOOR, Item, MASKED_PANE, MILKY_SLAB, MIRROR,
     NEAR, PLUME, Particle, ParticleLook, Paths, QUADRANT_EMITTER, ROUGH_SLAB, SKINNED_EMITTER, SKY,
     SMOOTH_FLOOR, SUN, Spec, StrandRow, TILED_FLOOR, TINTED_FLOOR, TINTED_SLAB, TROUGH, WATER_BOX,
-    WHITE_FLOOR, assert_close, assert_within_noise, image_mean, luminance, mean_where, pixel_of,
-    reference, surface_mean,
+    WHITE_FLOOR, assert_close, assert_pipeline_renders_as_staged, assert_pipeline_within_noise,
+    assert_within_noise, both, image_mean, luminance, mean_where, pixel_of, reference,
+    render_paths, surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
@@ -29,10 +30,6 @@ use orr_scene::{MediumProxy, MediumProxyId, Opacity, Projection, ProxyDensity, R
 
 fn paths(settings: ViewLighting) -> Paths {
     Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
-}
-
-fn render_paths(bed: &mut Bed, paths: &Paths, frames: u32, seed: u32) -> Accumulated {
-    bed.accumulate(frames, seed, &mut |list, f| paths.record(list, f))
 }
 
 fn debug(view: LightingDebugView, max_bounces: u32) -> ViewLighting {
@@ -83,33 +80,6 @@ fn an_albedo_one_sphere_in_a_uniform_environment_returns_the_environment() {
     assert_clean();
 }
 
-/// Real-time frames redraw the light tiles, so runs differ by their noise: the pipeline's frames
-/// at the staged loop's seed sit as close to the staged loop's as its frames at another seed do,
-/// and the two means agree over frames that alternate, which see the world cache alike. The
-/// world cache settles over the staged loop's frames first.
-fn assert_pipeline_renders_as_staged(what: &str, bed: &mut Bed, staged: &Paths, launched: &Paths) {
-    bed.set_hit_pipeline(launched.hit_pipeline());
-    render_paths(bed, staged, 32, 3);
-    let piped = render_paths(bed, launched, 32, 1);
-    let same_seed = render_paths(bed, staged, 32, 1);
-    let noise = render_paths(bed, staged, 32, 2);
-    assert_within_noise(what, &piped, &same_seed, &noise, 1.25);
-    let (mut of_staged, mut of_launched) = (Vec::new(), Vec::new());
-    for k in 0..24 {
-        of_staged.push(image_mean(&render_paths(bed, staged, 1, 4 + k))[1]);
-        of_launched.push(image_mean(&render_paths(bed, launched, 1, 4 + k))[1]);
-    }
-    assert_same_mean(what, &of_launched, &of_staged);
-}
-
-/// The pipeline path tracer and the staged loop, both with `settings`.
-fn both(settings: ViewLighting) -> (Paths, Paths) {
-    (
-        Paths::new(&KernelSet::default(), PathEntry::Compute, settings),
-        Paths::new(&KernelSet::default(), PathEntry::Pipeline, settings),
-    )
-}
-
 /// The pipeline path tracer renders opaque scenes as the staged loop does: a sphere on the ground
 /// under a sun and a sky, the Cornell box lit by its emissive quad, and an alpha-tested quad.
 #[test]
@@ -117,7 +87,7 @@ fn the_pipeline_renders_opaque_scenes_as_the_staged_loop_does() {
     if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
         return;
     }
-    let (staged, launched) = both(ViewLighting::default());
+    let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
     // At a pre-exposure of 1 the sunlit ground passes the HDR ceiling, which would clip the
     // samples that draw the sun.
     for (scene, pre_exposure) in [
@@ -257,7 +227,7 @@ fn glass_cases(run: std::ops::Range<usize>) {
             camera_medium: under_water.then(|| bed.material(WATER_BOX)),
             ..settings
         };
-        let (mut staged, mut launched) = both(settings);
+        let (mut staged, mut launched) = both(&KernelSet::default(), settings);
         if frost {
             staged.frost_guide = Some(FrostGuide::new(0.25));
             launched.frost_guide = Some(FrostGuide::new(0.25));
@@ -314,7 +284,7 @@ fn the_pipeline_renders_plane_stacks_and_coated_emitters_as_the_staged_loop_does
     };
     let mut bed = Bed::with(spec);
     bed.set_pre_exposure(1.0 / 64.0);
-    let (staged, launched) = both(ViewLighting::default());
+    let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
     assert_pipeline_renders_as_staged("slab and coated emitter", &mut bed, &staged, &launched);
     assert_clean();
 }
@@ -328,12 +298,7 @@ fn the_pipeline_walks_subsurface_materials_as_the_staged_loop_does() {
     if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
         return;
     }
-    let mut staged = paths(ViewLighting::default());
-    let mut launched = Paths::new(
-        &KernelSet::default(),
-        PathEntry::Pipeline,
-        ViewLighting::default(),
-    );
+    let (mut staged, mut launched) = both(&KernelSet::default(), ViewLighting::default());
     let real_time = ViewLighting {
         debug_view: LightingDebugView::Subsurface,
         ..ViewLighting::default()
@@ -345,19 +310,8 @@ fn the_pipeline_walks_subsurface_materials_as_the_staged_loop_does() {
         staged.settings = settings;
         launched.settings = settings;
         let mut bed = Bed::new(Analytic::SubsurfaceSlab);
-        bed.set_hit_pipeline(launched.hit_pipeline());
         bed.set_pre_exposure(1.0 / 64.0);
-        render_paths(&mut bed, &staged, 32, 3);
-        let piped = render_paths(&mut bed, &launched, 32, 1);
-        let same_seed = render_paths(&mut bed, &staged, 32, 1);
-        let noise = render_paths(&mut bed, &staged, 32, 2);
-        assert_within_noise(what, &piped, &same_seed, &noise, 1.25);
-        let (mut of_staged, mut of_launched) = (Vec::new(), Vec::new());
-        for k in 0..24 {
-            of_staged.push(image_mean(&render_paths(&mut bed, &staged, 1, 4 + k))[1]);
-            of_launched.push(image_mean(&render_paths(&mut bed, &launched, 1, 4 + k))[1]);
-        }
-        assert_same_mean(what, &of_launched, &of_staged);
+        assert_pipeline_renders_as_staged(what, &mut bed, &staged, &launched);
     }
     assert_clean();
 }
@@ -372,9 +326,7 @@ fn the_pipeline_renders_layers_and_media_as_the_staged_loop_does() {
     if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
         return;
     }
-    let settings = ViewLighting::default();
-    let staged = Paths::new(&KernelSet::default(), PathEntry::Compute, settings);
-    let launched = Paths::new(&KernelSet::default(), PathEntry::Pipeline, settings);
+    let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
     let particles = || {
         let mut bed = Bed::with(Spec {
             copies: vec![at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
@@ -448,19 +400,8 @@ fn the_pipeline_renders_layers_and_media_as_the_staged_loop_does() {
     ];
     for (what, make, pre_exposure) in scenes {
         let mut bed = make();
-        bed.set_hit_pipeline(launched.hit_pipeline());
         bed.set_pre_exposure(pre_exposure);
-        render_paths(&mut bed, &staged, 32, 3);
-        let piped = render_paths(&mut bed, &launched, 32, 1);
-        let same_seed = render_paths(&mut bed, &staged, 32, 1);
-        let noise = render_paths(&mut bed, &staged, 32, 2);
-        assert_within_noise(what, &piped, &same_seed, &noise, 1.25);
-        let (mut of_staged, mut of_launched) = (Vec::new(), Vec::new());
-        for k in 0..24 {
-            of_staged.push(image_mean(&render_paths(&mut bed, &staged, 1, 4 + k))[1]);
-            of_launched.push(image_mean(&render_paths(&mut bed, &launched, 1, 4 + k))[1]);
-        }
-        assert_same_mean(what, &of_launched, &of_staged);
+        assert_pipeline_renders_as_staged(what, &mut bed, &staged, &launched);
     }
     assert_clean();
 }
@@ -476,12 +417,6 @@ fn the_pipeline_renders_photons_and_the_background_layer_as_the_staged_loop_does
     if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
         return;
     }
-    let both = |settings: ViewLighting| {
-        (
-            Paths::new(&KernelSet::default(), PathEntry::Compute, settings),
-            Paths::new(&KernelSet::default(), PathEntry::Pipeline, settings),
-        )
-    };
     let sun = -SUN.direction_to_light.normalize();
     let mirror = |center: Vec3, normal: Vec3| {
         let x = Vec3::Y.cross(normal).normalize();
@@ -512,10 +447,13 @@ fn the_pipeline_renders_photons_and_the_background_layer_as_the_staged_loop_does
     let lit = pixel_of(&spec, patch);
     let mut bed = Bed::with(spec);
 
-    let (staged, launched) = both(ViewLighting {
-        debug_view: LightingDebugView::Caustics,
-        ..reference(2)
-    });
+    let (staged, launched) = both(
+        &KernelSet::default(),
+        ViewLighting {
+            debug_view: LightingDebugView::Caustics,
+            ..reference(2)
+        },
+    );
     bed.set_hit_pipeline(launched.hit_pipeline());
     let patch_means = |bed: &mut Bed, paths: &Paths, seed: u32| {
         (0..12)
@@ -530,12 +468,8 @@ fn the_pipeline_renders_photons_and_the_background_layer_as_the_staged_loop_does
     );
     assert_same_mean("the photons' patch", &of_launched, &of_staged);
 
-    let (staged, launched) = both(ViewLighting::default());
-    render_paths(&mut bed, &staged, 32, 3);
-    let piped = render_paths(&mut bed, &launched, 32, 1);
-    let same_seed = render_paths(&mut bed, &staged, 32, 1);
-    let noise = render_paths(&mut bed, &staged, 32, 2);
-    assert_within_noise("real-time photons", &piped, &same_seed, &noise, 1.25);
+    let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
+    assert_pipeline_within_noise("real-time photons", &mut bed, &staged, &launched);
     drop(bed);
 
     let background = Analytic::SunAndGround.spec();
@@ -565,7 +499,7 @@ fn the_pipeline_renders_photons_and_the_background_layer_as_the_staged_loop_does
         .collect();
     let mask = texture(EXTENT[0], EXTENT[1], &mask, "dof mask");
     let focus = upload(&[5.0f32], "focus distance");
-    let (mut staged, mut launched) = both(reference(2));
+    let (mut staged, mut launched) = both(&KernelSet::default(), reference(2));
     for p in [&mut staged, &mut launched] {
         p.dof_background = Some(DofBackgroundPass {
             mask: mask.index,

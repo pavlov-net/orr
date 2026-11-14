@@ -55,17 +55,25 @@ public struct HitRaysRoot
     public RayIn* rays;
     public PathOut* paths;
     public ShadowOut* shadows;
-    public uint8_t* stand_ins;       // hit_records' StandIn
     public uint count;
     public uint depth;                 // the hit context's
     public float cone_width;
     public float cone_spread;
+    public uint _pad0;
+    public uint _pad1;
 }
 
 public HitContext context(HitRaysRoot root)
 {
     RayCone cone = { root.cone_width, root.cone_spread };
     return hit_context(HIT_SECONDARY, root.depth, cone, 0.0);
+}
+
+// A shadow ray's state as the path pipeline's shadow rays start it, whose candidates take a
+// shadow ray's context at the root's depth.
+public ShadowCover shadow_cover_of(HitRaysRoot root, RayIn r)
+{
+    return shadow_cover(r.mode, shadow_mask(r), root.depth, false);
 }
 
 public RayDesc ray_of(RayIn r)

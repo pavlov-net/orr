@@ -91,6 +91,17 @@ uint ray_flags(uint flags)
 #endif
 }
 
+// Ends an any-hit shader by its decision `d` (ANY_HIT_*): ignores the candidate, accepts it, or
+// accepts it and ends the search.
+[ForceInline]
+public void any_hit_decides(uint d)
+{
+    if (d == ANY_HIT_END)
+        AcceptHitAndEndSearch();
+    if (d == ANY_HIT_IGNORE)
+        IgnoreHit();
+}
+
 // Traces `ray` and runs the closest-hit or miss shader it finds, from a raygen, closest-hit or
 // miss shader.
 [ForceInline]

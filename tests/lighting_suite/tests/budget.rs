@@ -1,6 +1,6 @@
-//! The shader bodies of the pipeline path tracer against their kinds' register budgets,
-//! compiled as compute stand-ins for paths that may meet everything and for the bench's walk,
-//! with orr_lighting's own kernels and with the suite's linked surfaces.
+//! The shader bodies of the pipeline path tracer, as it ships them, against their kinds' register
+//! budgets, compiled as compute stand-ins for paths that may meet everything and for the bench's
+//! walk, with orr_lighting's own kernels and with the suite's linked surfaces.
 
 use lighting_suite::{device, linked, require};
 use orr_gpu::KernelSet;
@@ -38,6 +38,14 @@ const OVER: &[(Body, &str)] = &[
     (
         Body::ScatterRich,
         "the prepared BSDF's sampling beside the caustic gather",
+    ),
+    (
+        Body::CoverPath,
+        "the hit reconstruction its presence resolve shares with the inline handlers",
+    ),
+    (
+        Body::CoverShadow,
+        "the hit reconstruction its presence resolve shares with the inline handlers",
     ),
 ];
 
