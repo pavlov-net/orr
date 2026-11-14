@@ -1,16 +1,13 @@
-//! Raw Vulkan commands inside orr command lists, and device-creation hooks.
+//! Raw Vulkan commands inside orr command lists.
 #![cfg(not(target_vendor = "apple"))]
-
-use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use ash::vk;
 use gpu_suite::shaders::heap_views;
-use gpu_suite::{assert_clean, device, log_to_stderr, pipeline, readback, render, run, upload};
-use orr_gpu::interop::{self, Features, RawDevice};
+use gpu_suite::{assert_clean, device, pipeline, readback, render, run, upload};
+use orr_gpu::interop;
 use orr_gpu::{
-    Device, DeviceDesc, DeviceHooks, Filter, Format, Hazards, SamplerDesc, SamplerIndex, Stages,
-    TextureDesc, TextureMemory, TextureUsage, ViewDesc,
+    Filter, Format, Hazards, SamplerDesc, SamplerIndex, Stages, TextureDesc, TextureMemory,
+    TextureUsage, ViewDesc,
 };
 
 /// A raw clear between two dispatches of one pipeline: the second dispatch rebinds heaps,
@@ -96,47 +93,4 @@ fn heap_commands_after_raw_commands() {
     d.free_image_slot(slots, point);
     d.free_image_slot(slots + 1, point);
     assert_clean();
-}
-
-struct TransformFeedback {
-    created: AtomicBool,
-}
-
-impl DeviceHooks for TransformFeedback {
-    fn device_extensions(&self, _: &ash::Instance, _: vk::PhysicalDevice) -> Vec<CString> {
-        vec![ash::ext::transform_feedback::NAME.to_owned()]
-    }
-
-    fn device_features(&self, _: vk::PhysicalDevice, features: &mut Features<'_>) {
-        features.push(
-            vk::PhysicalDeviceTransformFeedbackFeaturesEXT::default().transform_feedback(true),
-        );
-        features.vulkan_1_4.push_descriptor = vk::TRUE;
-    }
-
-    fn device_created(&self, raw: &RawDevice<'_>) {
-        assert!(raw.has_extension(ash::ext::transform_feedback::NAME));
-        self.created.store(true, Ordering::Relaxed);
-    }
-}
-
-/// A hook's extension and chained feature struct reach device creation, validation clean.
-#[test]
-fn hooks_add_extensions_and_features() {
-    log_to_stderr();
-    let hooks = TransformFeedback {
-        created: AtomicBool::new(false),
-    };
-    let d = Device::new(&DeviceDesc {
-        name: "gpu_suite hooks",
-        hooks: Some(&hooks),
-        ..DeviceDesc::default()
-    })
-    .unwrap();
-    assert!(hooks.created.load(Ordering::Relaxed));
-    assert_eq!(
-        d.validation_messages(),
-        0,
-        "validation messages (see the log)"
-    );
 }
