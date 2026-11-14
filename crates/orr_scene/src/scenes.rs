@@ -2760,7 +2760,8 @@ impl<'a> Frame<'a> {
     /// the runs of the rows they show, and a hit's geometry index the run of its section. The
     /// frame's list writes the table whole, after the traces recorded before the call; a trace
     /// recorded after it reads this frame's rows and materials. Runs `update_scenes` first when
-    /// the consumer did not.
+    /// the consumer did not. Fails with [`Error::NotListed`] for a scene the frame does not list,
+    /// whose root and run layout this frame does not write.
     pub fn hit_table(
         &mut self,
         scene: SceneId,
@@ -2768,6 +2769,9 @@ impl<'a> Frame<'a> {
         groups: &HitGroups,
     ) -> Result<HitTable> {
         self.ensure_updated()?;
+        if !self.listed.contains(&scene) {
+            return Err(Error::NotListed(scene));
+        }
         let device = self.device;
         let core = &*self.core;
         let window = &core.windows[self.window];

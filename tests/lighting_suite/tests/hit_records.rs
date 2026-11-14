@@ -4,6 +4,8 @@
 //! without micromaps, presence layers, solid glass, a thin window, a mixed-class model, particles,
 //! strands and a medium proxy; and those shaders' bodies against their register budget.
 
+use std::sync::OnceLock;
+
 use lighting_suite::bed::{
     BARE_LEAF, Bed, FLOOR, Item, LEAF, MASKED_PANE, MIXED_SLAB, PRESENCE_VEIL, Particle,
     ParticleLook, SUN, Spec, StrandRow, TINTED_SLAB,
@@ -63,8 +65,13 @@ fn pipeline_flags() -> RayPipelineFlags {
     flags
 }
 
-/// The pipeline, and the groups the scene's records name.
-fn ray_pipeline() -> (RayPipeline, HitGroups) {
+/// The pipeline, and the groups the scene's records name: one for the process.
+fn ray_pipeline() -> &'static (RayPipeline, HitGroups) {
+    static PIPELINE: OnceLock<(RayPipeline, HitGroups)> = OnceLock::new();
+    PIPELINE.get_or_init(create_pipeline)
+}
+
+fn create_pipeline() -> (RayPipeline, HitGroups) {
     let stages: Vec<ShaderStage<'_>> = STAGES
         .iter()
         .map(|e| ShaderStage::new(&hit_records::MODULE, e, SpecData::default()).unwrap())
@@ -426,7 +433,7 @@ fn rays_through_the_hit_records_meet_what_inline_traces_meet() {
     let (p, groups) = ray_pipeline();
     // The first frame builds the scene's structures; the second traces them.
     bed.accumulate(1, 0, &mut |_, _| {});
-    let traced = trace_both(&mut bed, &p, &groups, &rays);
+    let traced = trace_both(&mut bed, p, groups, &rays);
     let seen = compare(&rays, &traced);
     assert!(seen.hits > 10_000, "{seen:?}");
     assert!(
@@ -476,7 +483,7 @@ fn strands_through_the_hit_records_match_inline_traces() {
     );
     let (p, groups) = ray_pipeline();
     bed.accumulate(1, 0, &mut |_, _| {});
-    let traced = trace_both(&mut bed, &p, &groups, &rays);
+    let traced = trace_both(&mut bed, p, groups, &rays);
     let seen = compare(&rays, &traced);
     assert!(seen.hits > 1000, "{seen:?}");
     assert_clean();
