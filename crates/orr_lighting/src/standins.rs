@@ -10,7 +10,7 @@ use std::time::Instant;
 use orr_scene::orr_gpu::{CodeStatistics, Device, ShaderStage, SpecData};
 
 use crate::shaders::path::standins;
-use crate::staged::{MAY_BACKGROUND, MAY_PHOTON, MAY_UPDATE, MAY_VIEW, SPEC_ENTRIES};
+use crate::staged::SPEC_ENTRIES;
 use crate::{Error, KernelSet, module};
 
 /// The kind of shader a body runs as, which sets its budget.
@@ -117,12 +117,6 @@ impl Body {
             Self::ProxyShadow => "proxy_shadow_hit",
         }
     }
-
-    /// What its stand-in for paths that may meet `may` may meet: a view's paths alone, as the
-    /// view's pipeline makes its stages.
-    fn may(self, may: u64) -> u64 {
-        may & !(MAY_BACKGROUND | MAY_UPDATE | MAY_PHOTON) | MAY_VIEW
-    }
 }
 
 /// What the driver reports of a stand-in, and how long its pipeline took to create.
@@ -143,7 +137,8 @@ impl BodyStatistics {
 }
 
 /// Compiles `body`'s stand-in for paths that may meet `may` (`path_may` in the low word,
-/// `path_may2` in the high one); `None` where the device reports no statistics.
+/// `path_may2` in the high one), as the pipeline made for that mask folds its shader; `None`
+/// where the device reports no statistics.
 pub fn compile_body(
     device: &Device,
     kernels: &KernelSet,
@@ -151,17 +146,15 @@ pub fn compile_body(
     may: u64,
 ) -> Result<Option<BodyStatistics>, Error> {
     let m = module(kernels, &standins::MODULE)?;
-    let bytes = body.may(may).to_le_bytes();
+    let bytes = may.to_le_bytes();
     let spec = SpecData {
         entries: &SPEC_ENTRIES,
         bytes: &bytes,
     };
     let stage = ShaderStage::new(m, body.entry(), spec)?;
     let started = Instant::now();
-    let pipeline = device.create_compute_pipeline(
-        &stage,
-        &format!("stand-in {} {:#x}", body.name(), body.may(may)),
-    )?;
+    let pipeline =
+        device.create_compute_pipeline(&stage, &format!("stand-in {} {may:#x}", body.name()))?;
     let seconds = started.elapsed().as_secs_f64();
     Ok(pipeline
         .statistics()

@@ -57,6 +57,7 @@ mod bsdf;
 mod caustics;
 mod environment;
 mod launch;
+mod mask_sets;
 mod media;
 pub mod openpbr;
 mod particles;
@@ -102,6 +103,18 @@ use orr_scene::orr_gpu::{ComputePipeline, Device, ShaderModule, ShaderStage, Spe
 /// dependents' shader builds generate.
 pub mod types {
     pub use crate::shaders::types::*;
+}
+
+/// `specialize.slang`'s bits of `path_may`, what the paths of a path pipeline may meet, which
+/// the low word of [`PathsRan`]'s masks holds.
+pub mod path_may {
+    pub use crate::shaders::consts::{
+        MAY_BACKGROUND, MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG,
+        MAY_DIRECTIONAL, MAY_DISPERSION, MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ,
+        MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES,
+        MAY_PHOTON, MAY_PROXIES, MAY_REFERENCE, MAY_SMOKE, MAY_STACK, MAY_SUBSURFACE, MAY_UPDATE,
+        MAY_VIEW, MAY_WALK,
+    };
 }
 
 /// orr_lighting's compiled-in kernel modules.

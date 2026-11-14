@@ -2745,45 +2745,88 @@ impl<'a> Frame<'a> {
         self.core.mounts.streaming.device_out_of_memory(e);
     }
 
-    /// `scene`'s hit table for ray tracing pipeline `pipeline`, its records naming `groups`:
-    /// per run of the scene's material rows (a section of a model's materials, of a material set
-    /// or of a producer entry's materials, and the medium and light proxies' runs) a record per
-    /// ray type, the group's handle and the run's `HitData`. Its instances' contributions select
-    /// the runs of the rows they show, and a hit's geometry index the run of its section. The
-    /// frame's list writes the records that changed since the table last served a frame, after
-    /// the traces recorded before the call, so a second call in a frame writes nothing; a trace
-    /// recorded after it reads this frame's rows and materials. Runs `update_scenes` first when
-    /// the consumer did not. Fails with [`Error::NotListed`] for a scene the frame does not list,
-    /// whose root and run layout this frame does not write.
+    /// `scene`'s hit table for ray tracing pipeline `pipeline`, its records naming `groups`, as
+    /// [`HitTableWriter::table`] writes it into the frame's list. Runs `update_scenes` first
+    /// when the consumer did not. Fails with [`Error::NotListed`] for a scene the frame does not
+    /// list.
     pub fn hit_table(
         &mut self,
         scene: SceneId,
         pipeline: &RayPipeline,
         groups: &HitGroups,
     ) -> Result<HitTable> {
+        let (list, hits) = self.list_and_hits(scene)?;
+        hits.table(list, pipeline, groups)
+    }
+
+    /// The frame's command list, and what writes `scene`'s hit tables into it for the
+    /// pipelines its paths come to trace through. Runs `update_scenes` first when the consumer
+    /// did not. Fails with [`Error::NotListed`] for a scene the frame does not list, whose root
+    /// and run layout this frame does not write.
+    pub fn list_and_hits(
+        &mut self,
+        scene: SceneId,
+    ) -> Result<(&mut CommandList<'a>, HitTableWriter<'_>)> {
         self.ensure_updated()?;
-        if !self.listed.contains(&scene) {
-            return Err(Error::NotListed(scene));
-        }
-        let device = self.device;
-        let core = &*self.core;
-        let window = &core.windows[self.window];
-        let s = core.scene(scene)?;
-        let cpu = &mut *s.cpu.lock().unwrap();
-        let kernel = self.pipelines.get(self.pipelines.own.hit_runs);
-        let list = self.list.as_mut().expect("frame list");
-        cpu.hits.table(
+        let Self {
             device,
-            list,
+            pipelines,
+            core,
+            id,
+            listed,
             window,
-            kernel,
-            s.tables.root.gpu(),
-            s.tables.runs.capacity(),
-            core.materials.hit_epoch(),
-            pipeline,
-            groups,
-            self.id,
-        )
+            list,
+            ..
+        } = self;
+        let hits = HitTableWriter::new(
+            device,
+            pipelines,
+            &core.scenes,
+            &core.windows[*window],
+            &core.materials,
+            *id,
+            listed,
+            scene,
+        )?;
+        Ok((list.as_mut().expect("frame list"), hits))
+    }
+
+    /// [`Self::list_and_arena`] of view `history`, and what writes the hit tables of `scene`,
+    /// the view's, into the list ([`Self::list_and_hits`]).
+    pub fn list_arena_and_hits(
+        &mut self,
+        history: ViewHistoryId,
+        scene: SceneId,
+    ) -> Result<(&mut CommandList<'a>, &mut ViewArena, HitTableWriter<'_>)> {
+        self.ensure_updated()?;
+        let Self {
+            device,
+            pipelines,
+            core,
+            id,
+            listed,
+            window,
+            list,
+            ..
+        } = self;
+        let core: &mut Core = core;
+        let arena = &mut core
+            .histories
+            .get_mut(history.0 as usize)
+            .and_then(Option::as_mut)
+            .ok_or(Error::UnknownViewHistory(history))?
+            .arena;
+        let hits = HitTableWriter::new(
+            device,
+            pipelines,
+            &core.scenes,
+            &core.windows[*window],
+            &core.materials,
+            *id,
+            listed,
+            scene,
+        )?;
+        Ok((list.as_mut().expect("frame list"), arena, hits))
     }
 
     /// What `scene` may hold now: [`RasterView::features`] before the view is rastered.
@@ -3456,5 +3499,76 @@ impl Drop for Scenes {
         {
             std::panic::resume_unwind(panic);
         }
+    }
+}
+
+/// Writes one listed scene's hit tables into a frame's list ([`Frame::list_and_hits`]): per
+/// run of the scene's material rows (a section of a model's materials, of a material set or of
+/// a producer entry's materials, and the medium and light proxies' runs) a record per ray type,
+/// the group's handle and the run's `HitData`.
+pub struct HitTableWriter<'f> {
+    device: &'f Device,
+    kernel: &'f ComputePipeline,
+    scene: &'f Scene,
+    window: &'f UploadWindow,
+    epoch: u64,
+    frame: u64,
+}
+
+impl<'f> HitTableWriter<'f> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        device: &'f Device,
+        pipelines: &'f Pipelines,
+        scenes: &'f [Option<Scene>],
+        window: &'f UploadWindow,
+        materials: &MaterialTable,
+        frame: u64,
+        listed: &[SceneId],
+        scene: SceneId,
+    ) -> Result<Self> {
+        if !listed.contains(&scene) {
+            return Err(Error::NotListed(scene));
+        }
+        let s = scenes
+            .get(scene.0 as usize)
+            .and_then(Option::as_ref)
+            .ok_or(Error::UnknownScene(scene))?;
+        Ok(Self {
+            device,
+            kernel: pipelines.get(pipelines.own.hit_runs),
+            scene: s,
+            window,
+            epoch: materials.hit_epoch(),
+            frame,
+        })
+    }
+
+    /// The scene's hit table for ray tracing pipeline `pipeline`, its records naming `groups`.
+    /// Its instances' contributions select the runs of the rows they show, and a hit's geometry
+    /// index the run of its section. `list`, the frame's, writes the records that changed since
+    /// the table last served a frame, after the traces recorded before the call, so a second
+    /// call in a frame writes nothing; a trace recorded after it reads this frame's rows and
+    /// materials.
+    pub fn table(
+        &self,
+        list: &mut CommandList<'_>,
+        pipeline: &RayPipeline,
+        groups: &HitGroups,
+    ) -> Result<HitTable> {
+        let s = self.scene;
+        let cpu = &mut *s.cpu.lock().unwrap();
+        cpu.hits.table(
+            self.device,
+            list,
+            self.window,
+            self.kernel,
+            s.tables.root.gpu(),
+            s.tables.runs.capacity(),
+            self.epoch,
+            pipeline,
+            groups,
+            self.frame,
+        )
     }
 }

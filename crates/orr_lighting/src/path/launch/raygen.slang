@@ -75,7 +75,7 @@ uint trace_path(PathRoot r, uint slot, out float t)
     uint flags = h.hit() ? h.record<HitData>().flags : 0;
     uint class_id = flags & HIT_CLASS_MASK;
     bool layer = h.hit() && (class_id == CLASS_DIELECTRIC || class_id == CLASS_PRESENCE);
-    if ((d.word & LAUNCH_GBUFFER) != 0 && !layer)
+    if (may(MAY_VIEW) && (d.word & LAUNCH_GBUFFER) != 0 && !layer)
         return step_call(CALL_GBUFFER);
     if (!h.hit())
     {

@@ -1,16 +1,17 @@
 //! The shader bodies of the pipeline path tracer, as it ships them, against their kinds' register
-//! budgets, compiled as compute stand-ins for paths that may meet everything and for the bench's
-//! walk, with orr_lighting's own kernels and with the suite's linked surfaces.
+//! budgets, compiled as compute stand-ins for the pipeline that may meet everything and for the
+//! bench walk's view pipeline, with orr_lighting's own kernels and with the suite's linked
+//! surfaces.
 
 use lighting_suite::{device, linked, require};
 use orr_gpu::KernelSet;
 use orr_lighting::standins::{Body, compile_body};
 
-/// `path_may` and `path_may2` of the bench's synthetic walk: a view's paths, update paths and
-/// photons over cooked clusters and producer entries, with interiors, layers, particles,
-/// coverage, caustics, a plane stack, local light samplers, froxels, the cache, directional and
-/// emissive lights.
-const BENCH_MAY: u64 = 0xffff_fc30_0378_706d;
+/// `path_may` and `path_may2` of the pipeline of the bench's synthetic walk that runs a view's
+/// paths, the widest of its sources': over cooked clusters and producer entries, with interiors,
+/// layers, particles, coverage, caustics, a plane stack, local light samplers, froxels, the
+/// cache, directional and emissive lights.
+const BENCH_MAY: u64 = 0xffff_fc30_0378_700d;
 
 /// The bodies that do not fit yet, with what holds their registers: each must exceed its budget
 /// somewhere, so the list cannot outlive the redesign that takes a body off it.

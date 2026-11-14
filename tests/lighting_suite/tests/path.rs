@@ -19,6 +19,10 @@ use lighting_suite::{
     assert_clean, device, pipeline, read, readback, render, require, run, texture, upload,
 };
 use orr_gpu::{Hazards, KernelSet, Stages};
+use orr_lighting::path_may::{
+    MAY_COVERAGE, MAY_DIRECTIONAL, MAY_EMISSIVE, MAY_LAYERS, MAY_STACK, MAY_SUBSURFACE, MAY_VIEW,
+    MAY_WALK,
+};
 use orr_lighting::types::LocalLights;
 use orr_lighting::{
     CausticSettings, DirectionalLight, DiscProfile, DofBackgroundPass, Light, LightId, LightSetGpu,
@@ -26,7 +30,9 @@ use orr_lighting::{
     ViewLighting,
 };
 use orr_math::{Affine3, DVec3, Mat3, Quat, Vec2, Vec3};
-use orr_scene::{MediumProxy, MediumProxyId, Opacity, Projection, ProxyDensity, RendererDesc};
+use orr_scene::{
+    MediumProxy, MediumProxyId, Opacity, Projection, ProxyDensity, RendererDesc, SceneFeatures,
+};
 
 fn paths(settings: ViewLighting) -> Paths {
     Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
@@ -108,7 +114,6 @@ fn the_pipeline_renders_opaque_scenes_as_the_staged_loop_does() {
     };
     let (staged, launched) = both(&KernelSet::default(), origin_bias);
     let mut bed = Bed::new(Analytic::CornellBox);
-    bed.set_hit_pipeline(launched.hit_pipeline());
     let a = render_paths(&mut bed, &staged, 1, 1);
     let b = render_paths(&mut bed, &launched, 1, 1);
     assert!(
@@ -292,24 +297,7 @@ fn the_pipeline_renders_plane_stacks_and_coated_emitters_as_the_staged_loop_does
     if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
         return;
     }
-    let spec = Spec {
-        copies: vec![
-            at(FLOOR, Mat3::IDENTITY, Vec3::ZERO),
-            at(TINTED_SLAB, Mat3::IDENTITY, Vec3::new(0.0, 0.8, 0.0)),
-            at(
-                COATED_EMITTER,
-                Mat3::from_rotation_x(-0.6),
-                Vec3::new(-1.4, 0.9, -0.4),
-            ),
-        ],
-        lights: vec![Light::Directional(SUN)],
-        environment: Some(SKY),
-        eye: Vec3::new(0.0, 2.0, 3.5),
-        target: Vec3::new(0.0, 0.4, 0.0),
-        fov_y: 0.8,
-        focus: None,
-    };
-    let mut bed = Bed::with(spec);
+    let mut bed = Bed::with(plane_stack_spec(true));
     bed.set_pre_exposure(1.0 / 64.0);
     let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
     assert_pipeline_renders_as_staged("slab and coated emitter", &mut bed, &staged, &launched);
@@ -481,7 +469,6 @@ fn the_pipeline_renders_photons_and_the_background_layer_as_the_staged_loop_does
             ..reference(2)
         },
     );
-    bed.set_hit_pipeline(launched.hit_pipeline());
     let patch_means = |bed: &mut Bed, paths: &Paths, seed: u32| {
         (0..12)
             .map(|k| render_paths(bed, paths, 4, seed * 1000 + k).around(lit, 4)[1])
@@ -509,7 +496,6 @@ fn the_pipeline_renders_photons_and_the_background_layer_as_the_staged_loop_does
     ));
     let mut bed = Bed::with(spec);
     bed.set_pre_exposure(1.0 / 64.0);
-    bed.set_hit_pipeline(launched.hit_pipeline());
     bed.accumulate_background_layer(true);
     // Pixels left of `MARKED` start their background rays 2 m along the view axis, past the
     // mirror and before the ground.
@@ -538,6 +524,187 @@ fn the_pipeline_renders_photons_and_the_background_layer_as_the_staged_loop_does
     let same_seed = render_paths(&mut bed, &staged, 32, 1);
     let noise = render_paths(&mut bed, &staged, 32, 2);
     assert_within_noise("the background layer", &piped, &same_seed, &noise, 1.25);
+    assert_clean();
+}
+
+/// Code of the pipeline path tracer that not every scene runs, behind `path_may` and `path_may2`
+/// bits (`bits`, the second word in the high one), and a scene whose paths run it, rendered with
+/// `settings`. Its images through two pipelines agree pixel for pixel where `pixels` holds: its
+/// lights are drawn without the light tiles, which follow the scene's frame id and so the wait
+/// for a pipeline. Else their means agree.
+struct Gate {
+    what: &'static str,
+    bits: u64,
+    bed: fn() -> Bed,
+    settings: ViewLighting,
+    pixels: bool,
+}
+
+/// The bit of `path_may2`, in the high word, that `feature` decides.
+fn may2(feature: SceneFeatures) -> u64 {
+    u64::from(!SceneFeatures(!feature.0).surface_may()) << 32
+}
+
+/// The gates [`specialized_pipelines_launch_the_paths_the_general_one_does`] covers. BSDF rays
+/// alone, and next-event estimation of a directional light alone, read no light tile.
+fn gates() -> Vec<Gate> {
+    let real_time = ViewLighting::default();
+    let bsdf_rays = ViewLighting {
+        debug_view: LightingDebugView::BsdfOnly,
+        ..real_time
+    };
+    let sun_alone = ViewLighting {
+        debug_view: LightingDebugView::NeeOnly,
+        max_bounces: 0,
+        ..real_time
+    };
+    vec![
+        Gate {
+            what: "sun and ground",
+            bits: u64::from(MAY_DIRECTIONAL),
+            bed: || {
+                dim(Bed::with(sphere_on_ground(
+                    vec![Light::Directional(SUN)],
+                    None,
+                )))
+            },
+            settings: sun_alone,
+            pixels: true,
+        },
+        Gate {
+            what: "emissive quad",
+            bits: u64::from(MAY_EMISSIVE),
+            bed: || Bed::new(Analytic::CornellBox),
+            settings: bsdf_rays,
+            pixels: true,
+        },
+        Gate {
+            what: "alpha-tested quad",
+            bits: u64::from(MAY_COVERAGE),
+            bed: || dim(Bed::new(Analytic::AlphaQuad)),
+            settings: bsdf_rays,
+            pixels: true,
+        },
+        Gate {
+            what: "subsurface walks",
+            bits: u64::from(MAY_WALK | MAY_SUBSURFACE),
+            bed: || dim(Bed::new(Analytic::SubsurfaceSlab)),
+            settings: ViewLighting {
+                max_bounces: 2,
+                ..bsdf_rays
+            },
+            pixels: true,
+        },
+        Gate {
+            what: "plane stack",
+            bits: u64::from(MAY_STACK | MAY_LAYERS),
+            bed: || dim(Bed::with(plane_stack_spec(false))),
+            settings: sun_alone,
+            pixels: true,
+        },
+        Gate {
+            what: "coated emitter",
+            bits: may2(SceneFeatures::COATED_EMITTERS),
+            bed: || dim(Bed::with(plane_stack_spec(true))),
+            settings: real_time,
+            pixels: false,
+        },
+    ]
+}
+
+/// `bed` at a pre-exposure that keeps the sunlit ground under the HDR ceiling.
+fn dim(mut bed: Bed) -> Bed {
+    bed.set_pre_exposure(1.0 / 64.0);
+    bed
+}
+
+/// A tinted slab over the floor under the sun, whose shadow the sun's light through both faces
+/// fills; with `emitter`, under a sky too, beside an emitter with a coat and fuzz.
+fn plane_stack_spec(emitter: bool) -> Spec {
+    let mut copies = vec![
+        at(FLOOR, Mat3::IDENTITY, Vec3::ZERO),
+        at(TINTED_SLAB, Mat3::IDENTITY, Vec3::new(0.0, 0.8, 0.0)),
+    ];
+    if emitter {
+        copies.push(at(
+            COATED_EMITTER,
+            Mat3::from_rotation_x(-0.6),
+            Vec3::new(-1.4, 0.9, -0.4),
+        ));
+    }
+    Spec {
+        copies,
+        lights: vec![Light::Directional(SUN)],
+        environment: emitter.then_some(SKY),
+        eye: Vec3::new(0.0, 2.0, 3.5),
+        target: Vec3::new(0.0, 0.4, 0.0),
+        fov_y: 0.8,
+        focus: None,
+    }
+}
+
+/// The largest relative difference between two images' channels. Each shader that shades a vertex
+/// prepares its BSDF, and the driver may round those copies apart in two specializations: a path
+/// can drift by its last bits, where a feature a mask left out would change its light.
+fn drift(a: &Accumulated, b: &Accumulated) -> f32 {
+    a.mean
+        .iter()
+        .zip(&b.mean)
+        .flat_map(|(a, b)| a.iter().zip(b))
+        .map(|(a, b)| {
+            if a.to_bits() == b.to_bits() {
+                return 0.0;
+            }
+            let d = (a - b).abs() / a.abs().max(b.abs()).max(f32::MIN_POSITIVE);
+            if d.is_nan() { f32::INFINITY } else { d }
+        })
+        .fold(0.0, f32::max)
+}
+
+/// The pipelines made for exactly what a scene and its settings may meet hold the code its
+/// paths run behind each gate of [`gates`]: its scene renders through them as through the
+/// pipeline that may meet everything, which with one of the gate's bits forced clear it does
+/// not, and the pipeline its view's paths ran holds the gate's bits.
+#[test]
+fn specialized_pipelines_launch_the_paths_the_general_one_does() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    for gate in gates() {
+        let mut paths = Paths::exactly(&KernelSet::default(), PathEntry::Pipeline, gate.settings);
+        paths.specialize = false;
+        let general = render_paths(&mut (gate.bed)(), &paths, 4, 1);
+        paths.specialize = true;
+        let mut bed = (gate.bed)();
+        let specialized = render_paths(&mut bed, &paths, 4, 1);
+        let ran = bed.view().paths_ran().expect("the paths ran");
+        let view = ran
+            .ran
+            .iter()
+            .find(|&&may| may & u64::from(MAY_VIEW) != 0)
+            .expect("a pipeline ran the view's paths");
+        assert!(
+            view & gate.bits == gate.bits,
+            "{}: the view's pipeline {view:#x} lacks {:#x}",
+            gate.what,
+            gate.bits & !view
+        );
+        if gate.pixels {
+            let drift = drift(&general, &specialized);
+            assert!(
+                drift <= 1e-3,
+                "{}: the specialized pipelines changed the image by {drift} of a channel",
+                gate.what
+            );
+        } else {
+            assert_close(
+                gate.what,
+                image_mean(&specialized),
+                image_mean(&general),
+                5e-3,
+            );
+        }
+    }
     assert_clean();
 }
 

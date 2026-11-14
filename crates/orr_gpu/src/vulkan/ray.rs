@@ -308,10 +308,10 @@ fn vk_stage(stage: Stage) -> vk::ShaderStageFlags {
     }
 }
 
-/// One region of the pipeline's own table: its records' groups and data, and its stride.
+/// One region of the pipeline's own table: each record's group and data, `None` for zeros, and
+/// its stride.
 struct Region<'a> {
-    first_group: usize,
-    records: &'a [ShaderRecord<'a>],
+    records: Vec<Option<(usize, &'a [u8])>>,
     stride: u64,
 }
 
@@ -454,39 +454,49 @@ impl Device {
                     .intersection_shader(isect),
             );
         }
+        let mut callables = Vec::with_capacity(desc.callables.len());
         for r in desc.callables {
-            record(r, Stage::Callable)?;
-            groups.push(general(r.stage));
+            callables.push(match r {
+                Some(r) => {
+                    record(r, Stage::Callable)?;
+                    groups.push(general(r.stage));
+                    Some((groups.len() - 1, r.data))
+                }
+                None => None,
+            });
         }
         let handle_bytes = limits.ray_handle_bytes as usize;
         let handle_align = u64::from(limits.ray_handle_align);
         let base = u64::from(limits.ray_table_align);
-        let data = |records: &[ShaderRecord<'_>]| {
-            records
+        fn region(records: Vec<Option<(usize, &[u8])>>, align: u64, handle: u64) -> Region<'_> {
+            let data = records
                 .iter()
-                .map(|r| r.data.len() as u64)
+                .flatten()
+                .map(|r| r.1.len() as u64)
                 .max()
-                .unwrap_or(0)
-        };
-        let stride = |records: &[ShaderRecord<'_>], align: u64| {
-            (handle_bytes as u64 + data(records)).next_multiple_of(align)
-        };
+                .unwrap_or(0);
+            Region {
+                records,
+                stride: (handle + data).next_multiple_of(align),
+            }
+        }
+        let handle = handle_bytes as u64;
+        let raygens = desc.raygens.iter().enumerate();
+        let misses = desc.misses.iter().enumerate();
         let regions = [
-            Region {
-                first_group: 0,
-                records: desc.raygens,
-                stride: stride(desc.raygens, base),
-            },
-            Region {
-                first_group: desc.raygens.len(),
-                records: desc.misses,
-                stride: stride(desc.misses, handle_align),
-            },
-            Region {
-                first_group: groups.len() - desc.callables.len(),
-                records: desc.callables,
-                stride: stride(desc.callables, handle_align),
-            },
+            region(
+                raygens.map(|(i, r)| Some((i, r.data))).collect(),
+                base,
+                handle,
+            ),
+            region(
+                misses
+                    .map(|(i, r)| Some((desc.raygens.len() + i, r.data)))
+                    .collect(),
+                handle_align,
+                handle,
+            ),
+            region(callables, handle_align, handle),
         ];
         let hit_stride = (handle_bytes as u64
             + u64::from(hit_records.iter().copied().max().unwrap_or(0)))
@@ -609,7 +619,10 @@ impl Device {
         })?;
         for (r, start) in regions.iter().zip(starts) {
             for (i, rec) in r.records.iter().enumerate() {
-                let group = r.first_group + i;
+                // Upload memory is zeroed, which a record of zeros leaves as it is.
+                let Some((group, data)) = *rec else {
+                    continue;
+                };
                 let at = (start + r.stride * i as u64) as usize;
                 let handle = &handles[group * handle_bytes..][..handle_bytes];
                 // SAFETY: the record lies inside the mapped buffer, which nothing else
@@ -617,11 +630,7 @@ impl Device {
                 unsafe {
                     let dst = ptr.as_ptr().add(at);
                     std::ptr::copy_nonoverlapping(handle.as_ptr(), dst, handle_bytes);
-                    std::ptr::copy_nonoverlapping(
-                        rec.data.as_ptr(),
-                        dst.add(handle_bytes),
-                        rec.data.len(),
-                    );
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), dst.add(handle_bytes), data.len());
                 }
             }
         }

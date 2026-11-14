@@ -29,11 +29,12 @@ use orr_pack::{AssetId, Span, Target};
 use orr_scene::testing::{FlipError, Image, Pixels, flip, mount_pending};
 use orr_scene::{
     ClusterTopology, Decal, DecalChannels, DecalId, FrameDesc, FrameTime, GroupWriter, HitGroups,
-    InstanceFlags, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, MediumProxy,
-    MediumProxyId, ModelId, MountId, Opacity, PackSource, ProducerDesc, ProducerId, ProducerUpdate,
-    Projection, RasterView, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter,
-    Scenes, SkinStateGpu, SkinnedDesc, SlotStateGpu, TextureFilter, TransformGroupDesc,
-    TransformGroupId, Urgency, ViewArena, ViewDesc, ViewHistoryId, VolumeRef, material_flags,
+    HitTableWriter, InstanceFlags, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId,
+    MediumProxy, MediumProxyId, ModelId, MountId, Opacity, PackSource, ProducerDesc, ProducerId,
+    ProducerUpdate, Projection, RasterView, RendererDesc, SceneCompute, SceneDesc, SceneId,
+    SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, SlotStateGpu, TextureFilter,
+    TransformGroupDesc, TransformGroupId, Urgency, ViewArena, ViewDesc, ViewHistoryId, VolumeRef,
+    material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 
@@ -1674,8 +1675,8 @@ pub struct BedFrame<'a> {
     pub target: &'a mut LightingView,
     /// The scene's hit table for the pipeline [`Bed::set_hit_pipeline`] names.
     pub hits: Option<HitTable>,
-    /// The scene's hit table for each pipeline `ORR_TEST_PIPELINE_PATHS` moved paths onto.
-    moved_hits: Vec<(&'static RayPipeline, HitTable)>,
+    /// What writes the scene's hit tables for the pipelines the frame's paths run through.
+    pub scene_hits: &'a HitTableWriter<'a>,
     /// The bed draws particles after the kernel.
     particles: bool,
     roots: &'a mut Roots,
@@ -1698,7 +1699,6 @@ impl BedFrame<'_> {
             overlay_front: false,
             scene_features: self.view.features,
             particle_lighting: self.particles,
-            hits: self.hits,
         }
     }
 
@@ -2631,8 +2631,7 @@ impl Bed {
     }
 
     /// Gives every frame from the next on the scene's hit table for `pipeline`'s groups in
-    /// [`BedFrame::hits`], as the paths of [`Paths::hit_pipeline`] trace through; `None` gives
-    /// none.
+    /// [`BedFrame::hits`]; `None` gives none.
     pub fn set_hit_pipeline(
         &mut self,
         pipeline: Option<(&'static RayPipeline, &'static HitGroups)>,
@@ -2756,18 +2755,13 @@ impl Bed {
             .unwrap();
         }
         let view = f.raster_view(&desc).unwrap();
-        let hits = self
-            .hit_pipeline
-            .map(|(p, g)| f.hit_table(self.scene, p, g).unwrap());
-        let moved = MOVED.lock().unwrap_or_else(PoisonError::into_inner).clone();
-        let moved_hits = moved
-            .into_iter()
-            .map(|(p, g)| (p, f.hit_table(self.scene, p, g).unwrap()))
-            .collect();
         let id = f.id();
         self.last_id = id;
         self.last_root = view.scene;
-        let list = f.list().unwrap();
+        let (list, scene_hits) = f.list_and_hits(self.scene).unwrap();
+        let hits = self
+            .hit_pipeline
+            .map(|(p, g)| scene_hits.table(list, p, g).unwrap());
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         self.lighting
             .record(
@@ -2793,7 +2787,7 @@ impl Bed {
                 lighting: &self.lighting,
                 target: &mut self.target,
                 hits,
-                moved_hits,
+                scene_hits: &scene_hits,
                 particles: self.particles.is_some(),
                 roots: &mut self.roots,
             },
@@ -3009,7 +3003,6 @@ pub fn both(kernels: &KernelSet, settings: ViewLighting) -> (Paths, Paths) {
 /// at the staged loop's seed sit as close to the staged loop's as its frames at another seed do.
 /// The world cache settles over the staged loop's frames first.
 pub fn assert_pipeline_within_noise(what: &str, bed: &mut Bed, staged: &Paths, launched: &Paths) {
-    bed.set_hit_pipeline(launched.hit_pipeline());
     render_paths(bed, staged, 32, 3);
     let piped = render_paths(bed, launched, 32, 1);
     let same_seed = render_paths(bed, staged, 32, 1);
@@ -3069,28 +3062,15 @@ pub fn moved_entry(entry: PathEntry) -> PathEntry {
     }
 }
 
-/// The hit pipelines of the paths `ORR_TEST_PIPELINE_PATHS` moved onto the pipeline: every bed
-/// frame takes a hit table for each.
-static MOVED: Mutex<Vec<(&'static RayPipeline, &'static HitGroups)>> = Mutex::new(Vec::new());
-
 /// Threads that compile a bed's pipelines at once: the machine's.
 fn compile_threads() -> usize {
     std::thread::available_parallelism().map_or(2, std::num::NonZero::get)
 }
 
 impl Paths {
-    /// The paths of [`moved_entry`]`(entry)`. Every bed frame takes a hit table for paths that
-    /// moved to the pipeline.
+    /// The paths of [`moved_entry`]`(entry)`.
     pub fn new(kernels: &KernelSet, entry: PathEntry, settings: ViewLighting) -> Self {
-        let moved = moved_entry(entry);
-        let paths = Self::exactly(kernels, moved, settings);
-        if let Some(h) = paths.hit_pipeline().filter(|_| moved != entry) {
-            let mut all = MOVED.lock().unwrap_or_else(PoisonError::into_inner);
-            if !all.iter().any(|(p, _)| ptr::eq(*p, h.0)) {
-                all.push(h);
-            }
-        }
-        paths
+        Self::exactly(kernels, moved_entry(entry), settings)
     }
 
     /// The paths of `entry` whatever `ORR_TEST_PIPELINE_PATHS` says, for tests that compare
@@ -3152,13 +3132,6 @@ impl Paths {
         }
     }
 
-    /// The ray tracing pipeline the paths trace through and the groups its hit table names, with
-    /// [`PathEntry::Pipeline`]: a bed whose frames run them gives each its hit table
-    /// ([`Bed::set_hit_pipeline`]).
-    pub fn hit_pipeline(&self) -> Option<(&'static RayPipeline, &'static HitGroups)> {
-        self.kernels.hit_pipeline()
-    }
-
     /// Starts the view's frame, then records the froxel passes, the view's paths, media apply,
     /// the guide resolve and, with a frost guide, the frosted-glass term.
     pub fn record(&self, list: &mut CommandList<'_>, f: &mut BedFrame<'_>) {
@@ -3184,11 +3157,6 @@ impl Paths {
             overlay_front: self.overlay_front,
             ..f.pass()
         };
-        if let Some((p, _)) = self.hit_pipeline()
-            && let Some(&(_, t)) = f.moved_hits.iter().find(|(q, _)| ptr::eq(*q, p))
-        {
-            pass.hits = Some(t);
-        }
         if self.every_tile {
             let mut g = f.view.targets;
             g.layer_tiles = GpuPtr::NULL;
@@ -3241,7 +3209,7 @@ impl Paths {
             .record_media(list, lighting, target, pass, settings)
             .unwrap();
         self.kernels
-            .record_paths(list, lighting, target, pass, settings)
+            .record_paths(list, lighting, target, pass, settings, Some(f.scene_hits))
             .unwrap();
         // A frame that waited for its pipelines runs the ones made for exactly what it asked.
         if let Some(ran) = target.paths_ran().filter(|_| settings.specialize) {

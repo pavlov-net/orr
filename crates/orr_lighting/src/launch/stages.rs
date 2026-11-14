@@ -1,13 +1,16 @@
-//! The pipeline's stages, its hit groups and its creation.
+//! The pipelines of the path tracer: one for each mask a source's paths may meet, its stages
+//! linked by what the mask holds and each folded with it, its hit groups, and its creation.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use orr_scene::orr_gpu::{
     CompileThreads, Device, HitGroup, RayPipeline, RayPipelineDesc, RayPipelineFlags, ShaderModule,
     ShaderRecord, ShaderStage, SpecData, SpecEntry,
 };
-use orr_scene::{HitGroups, SceneFeatures};
+use orr_scene::{HitGroups, Loading, SceneFeatures};
 
+use crate::mask_sets::Members;
 use crate::shaders::consts::{
     AT_EXIT, AT_LAYER, AT_LEAVE, AT_SCATTER, AT_SURFACE, CALL_ARRIVE, CALL_BENT, CALL_CACHE_VERTEX,
     CALL_DEPOSIT, CALL_EMISSION, CALL_EMITTER_VIEW, CALL_FINISH_BACKGROUND, CALL_FINISH_RECORD,
@@ -17,11 +20,15 @@ use crate::shaders::consts::{
     CALLABLES,
 };
 use crate::shaders::path::pipeline;
-use crate::staged::{MAY_ALL, MAY_BACKGROUND, MAY_PHOTON, MAY_RICH, MAY_UPDATE, MAY_VIEW};
+use crate::staged::{
+    MAY_BACKGROUND, MAY_CAUSTICS, MAY_DEBUG, MAY_EMISSIVE, MAY_INTERIORS, MAY_LAYERS,
+    MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PHOTON, MAY_PROXIES, MAY_RICH, MAY_STACK, MAY_UPDATE,
+    MAY_VIEW, MAY_WALK,
+};
 use crate::{Error, KernelSet, module};
 
 /// The pipeline's kernel files (`path/pipeline/*.slang`), which hold its entries by family.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Kernel {
     Raygen,
     Hits,
@@ -51,8 +58,8 @@ impl Kernel {
                 use pipeline::$file::Spec;
                 let d = Spec::default();
                 let s = Spec {
-                    path_may: c.path_may.unwrap_or(d.path_may),
-                    path_may2: c.path_may2.unwrap_or(d.path_may2),
+                    path_may: c.may as u32,
+                    path_may2: (c.may >> 32) as u32,
                     hit_surface: c.hit_surface.unwrap_or(d.hit_surface),
                     ..d
                 };
@@ -68,177 +75,123 @@ impl Kernel {
     }
 }
 
-/// The constants a stage of the pipeline is made with, where it is not made with its file's
-/// default.
-#[derive(Clone, Copy, Default)]
+/// The constants a stage of the pipeline is made with: what it may meet (`path_may` in the low
+/// word, `path_may2` in the high one) and, for a hit shader made for one linked surface id, that
+/// id.
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Constants {
-    path_may: Option<u32>,
-    path_may2: Option<u32>,
+    may: u64,
     hit_surface: Option<u32>,
 }
 
-/// The stages the pipeline holds one of, first, by index: the raygen, which runs every source's
-/// paths by its root's, the miss shader, the medium proxies' intersection and any-hit shaders, what
-/// layer rays keep of triangles, medium proxies and light proxies, and the stack meet's
-/// closest-hit.
-const FIXED: [(Kernel, &str); 9] = [
-    (Kernel::Raygen, "paths"),
-    (Kernel::Raygen, "miss_path"),
-    (Kernel::Hits, "box_medium_hit"),
-    (Kernel::Hits, "proxy_shadow_hit"),
-    (Kernel::Hits, "cover_layers_hit"),
-    (Kernel::Hits, "cover_layers_medium_hit"),
-    (Kernel::Hits, "box_light_hit"),
-    (Kernel::Hits, "cover_layers_light_hit"),
-    (Kernel::Hits, "stack_meet"),
-];
-const RAYGEN: u32 = 0;
-const MISS: u32 = 1;
-const MEDIUM_INTERSECTION: u32 = 2;
-const MEDIUM_ANY_HIT: u32 = 3;
-const LAYERS_ANY_HIT: u32 = 4;
-const MEDIUM_LAYERS_ANY_HIT: u32 = 5;
-const LIGHT_INTERSECTION: u32 = 6;
-const LIGHT_LAYERS_ANY_HIT: u32 = 7;
-const STACK_MEET: u32 = 8;
-
-/// What the pipeline holds per pin after those (`HitGroups`): the closest-hit shaders of a copy's
-/// clusters, of a producer entry's clusters and of strands, each resolving opaque surfaces and
-/// layers by its record's class, and the any-hit shaders under path and shadow rays, with what
-/// each may meet of the scene's geometry, all of [`Kernel::Hits`].
-const PINNED: [(&str, Geometry); 5] = [
-    ("resolve", Geometry::Copies),
-    ("resolve", Geometry::Producers),
-    ("resolve_strand", Geometry::Any),
-    ("cover_path_hit", Geometry::Any),
-    ("cover_shadow_hit", Geometry::Any),
-];
-const RESOLVE_COPIES: usize = 0;
-const RESOLVE_PRODUCERS: usize = 1;
-const RESOLVE_STRANDS: usize = 2;
-const COVER_PATH: usize = 3;
-const COVER_SHADOW: usize = 4;
-
-/// Then the callables, each at its `path/launch/steps.slang` CALL_* index with the `path_may` it is
-/// made with. A vertex's arrival and shade are made per class (AT_*), with every lobe its surface
-/// may have, and so are a walk's end and an emitter's view. What lies along a ray, a scatter in a
-/// medium and a plane stack's step shade no surface, and are made without the rich lobes and
-/// walks. A record's callables are made for their own source.
-const CALLED: [(u32, Kernel, &str, u64); CALLABLES as usize] = [
-    (CALL_START_VIEW, Kernel::Sources, "start_view", MAY_ALL),
-    (CALL_START_UPDATE, Kernel::Sources, "start_update", MAY_ALL),
-    (CALL_START_PHOTON, Kernel::Sources, "start_photon", MAY_ALL),
-    (
-        CALL_START_BACKGROUND,
-        Kernel::Sources,
-        "start_background",
-        MAY_ALL,
-    ),
-    (
-        CALL_RESOLVE_GIVEN,
-        Kernel::Sources,
-        "resolve_given",
-        MAY_ALL,
-    ),
-    (CALL_EMISSION, Kernel::Vertex, "emission", MAY_ALL),
-    (CALL_ARRIVE + AT_SURFACE, Kernel::Vertex, "arrive", MAY_ALL),
-    (
-        CALL_ARRIVE + AT_EXIT,
-        Kernel::Vertex,
-        "arrive_exit",
-        MAY_ALL,
-    ),
-    (
-        CALL_ARRIVE + AT_LEAVE,
-        Kernel::Vertex,
-        "arrive_leave",
-        MAY_ALL,
-    ),
-    (
-        CALL_ARRIVE + AT_SCATTER,
-        Kernel::Vertex,
-        "arrive_medium",
-        PLAIN,
-    ),
-    (
-        CALL_ARRIVE + AT_LAYER,
-        Kernel::Vertex,
-        "arrive_layer",
-        MAY_ALL,
-    ),
-    (CALL_SHADE + AT_SURFACE, Kernel::Vertex, "shade", MAY_ALL),
-    (CALL_SHADE + AT_EXIT, Kernel::Vertex, "shade_exit", MAY_ALL),
-    (
-        CALL_SHADE + AT_LEAVE,
-        Kernel::Vertex,
-        "shade_leave",
-        MAY_ALL,
-    ),
-    (
-        CALL_SHADE + AT_SCATTER,
-        Kernel::Vertex,
-        "shade_medium",
-        PLAIN,
-    ),
-    (
-        CALL_SHADE + AT_LAYER,
-        Kernel::Vertex,
-        "shade_layer",
-        MAY_ALL,
-    ),
-    (CALL_GATHER, Kernel::Vertex, "gather", PLAIN),
-    (CALL_DEPOSIT, Kernel::Vertex, "deposit", only(MAY_PHOTON)),
-    (
-        CALL_CACHE_VERTEX,
-        Kernel::Vertex,
-        "cache_vertex",
-        only(MAY_UPDATE),
-    ),
-    (CALL_BENT, Kernel::Vertex, "bent", MAY_ALL),
-    (CALL_FINISH_VIEW, Kernel::Sources, "finish_view", MAY_ALL),
-    (
-        CALL_FINISH_RECORD,
-        Kernel::Sources,
-        "finish_record",
-        MAY_ALL,
-    ),
-    (
-        CALL_FINISH_BACKGROUND,
-        Kernel::Sources,
-        "finish_background",
-        MAY_ALL,
-    ),
-    (CALL_WALK_END, Kernel::Vertex, "walk_end", MAY_ALL),
-    (CALL_SEGMENT, Kernel::Sources, "segment", PLAIN),
-    (CALL_LAYERS, Kernel::Sources, "layers", PLAIN),
-    (CALL_PROXY_MARCH, Kernel::Sources, "march_proxy", PLAIN),
-    (CALL_GBUFFER, Kernel::Sources, "gbuffer_start", MAY_ALL),
-    (CALL_STACK_STEP, Kernel::Vertex, "stack_step", PLAIN),
-    (CALL_STACK_MISS, Kernel::Vertex, "stack_miss", PLAIN),
-    (CALL_EMITTER_VIEW, Kernel::Vertex, "emitter_view", MAY_ALL),
-    (
-        CALL_START_FIRST_VERTEX,
-        Kernel::Sources,
-        "start_first_vertex",
-        MAY_ALL,
-    ),
-];
-
-/// `path_may` of a stage that shades no surface.
-const PLAIN: u64 = MAY_ALL & !MAY_RICH;
-
-/// `path_may` of a stage made for the paths of source `source` (`MAY_VIEW`, ...) alone.
-const fn only(source: u64) -> u64 {
-    MAY_ALL & !(MAY_VIEW | MAY_BACKGROUND | MAY_UPDATE | MAY_PHOTON) | source
+/// What a pipeline is made for: what its paths may meet.
+#[derive(Clone, Copy)]
+struct Mask {
+    may: u64,
 }
 
-/// [`CALLED`] in the order of the table: each callable's kernel, entry and `path_may`.
-fn callables() -> [(Kernel, &'static str, u64); CALLABLES as usize] {
-    let mut table = [(Kernel::Vertex, "", 0); CALLABLES as usize];
-    for (index, kernel, entry, may) in CALLED {
-        let at = &mut table[index as usize];
-        assert!(at.1.is_empty(), "two callables at index {index}");
-        *at = (kernel, entry, may);
+impl Mask {
+    /// Whether its paths may meet any of `bits`.
+    fn any(self, bits: u64) -> bool {
+        self.may & bits != 0
+    }
+
+    /// Whether they may meet all of `bits`.
+    fn all(self, bits: u64) -> bool {
+        self.may & bits == bits
+    }
+
+    /// Whether they may meet what `feature` decides of `path_may2`.
+    fn may2(self, feature: SceneFeatures) -> bool {
+        self.any(may2(feature))
+    }
+}
+
+/// The bit of `path_may2`, in the high word, that `feature` decides.
+fn may2(feature: SceneFeatures) -> u64 {
+    u64::from(!SceneFeatures(!feature.0).surface_may()) << 32
+}
+
+/// The `path_may` bits of every source.
+const SOURCES: u64 = MAY_VIEW | MAY_BACKGROUND | MAY_UPDATE | MAY_PHOTON;
+
+/// A callable of the table: its index (`path/launch/steps.slang`'s CALL_*), its kernel file and
+/// entry, the bits it is made without beyond its pipeline's, and whether a pipeline made for a
+/// mask links it. A pipeline that does not link a callable holds a record of zeros at its index,
+/// so each call site of it must lie behind a fold of the bits its row tests or a value that only
+/// a scene with them makes.
+#[derive(Clone, Copy)]
+struct Callable {
+    index: u32,
+    kernel: Kernel,
+    entry: &'static str,
+    without: u64,
+    linked: fn(Mask) -> bool,
+}
+
+const fn row(
+    index: u32,
+    kernel: Kernel,
+    entry: &'static str,
+    without: u64,
+    linked: fn(Mask) -> bool,
+) -> Callable {
+    Callable {
+        index,
+        kernel,
+        entry,
+        without,
+        linked,
+    }
+}
+
+use Kernel::{Sources as S, Vertex as V};
+
+/// The callables, one row each. A record's callables are made for their own source; what shades
+/// no surface is made without the rich lobes and walks.
+#[rustfmt::skip]
+const CALLED: [Callable; CALLABLES as usize] = [
+    row(CALL_START_VIEW, S, "start_view", 0, |m| m.any(MAY_VIEW)),
+    row(CALL_START_UPDATE, S, "start_update", 0, |m| m.any(MAY_UPDATE)),
+    row(CALL_START_PHOTON, S, "start_photon", 0, |m| m.any(MAY_PHOTON)),
+    row(CALL_START_BACKGROUND, S, "start_background", 0, |m| m.any(MAY_BACKGROUND)),
+    row(CALL_RESOLVE_GIVEN, S, "resolve_given", 0, |m| m.any(MAY_PHOTON)),
+    row(CALL_EMISSION, V, "emission", 0, |m| m.any(MAY_EMISSIVE)),
+    row(CALL_ARRIVE + AT_SURFACE, V, "arrive", 0, |_| true),
+    row(CALL_ARRIVE + AT_EXIT, V, "arrive_exit", 0, |m| m.any(MAY_WALK)),
+    row(CALL_ARRIVE + AT_LEAVE, V, "arrive_leave", 0, |m| m.any(MAY_INTERIORS)),
+    row(CALL_ARRIVE + AT_SCATTER, V, "arrive_medium", MAY_RICH, |m| m.any(MAY_INTERIORS)),
+    row(CALL_ARRIVE + AT_LAYER, V, "arrive_layer", 0, |m| m.any(MAY_LAYERS)),
+    row(CALL_SHADE + AT_SURFACE, V, "shade", 0, |_| true),
+    row(CALL_SHADE + AT_EXIT, V, "shade_exit", 0, |m| m.any(MAY_WALK)),
+    row(CALL_SHADE + AT_LEAVE, V, "shade_leave", 0, |m| m.any(MAY_INTERIORS)),
+    row(CALL_SHADE + AT_SCATTER, V, "shade_medium", MAY_RICH, |m| m.any(MAY_INTERIORS)),
+    row(CALL_SHADE + AT_LAYER, V, "shade_layer", 0, |m| m.any(MAY_LAYERS)),
+    row(CALL_GATHER, V, "gather", MAY_RICH, |m| m.any(MAY_CAUSTICS)),
+    row(CALL_DEPOSIT, V, "deposit", SOURCES & !MAY_PHOTON, |m| m.any(MAY_PHOTON)),
+    row(CALL_CACHE_VERTEX, V, "cache_vertex", SOURCES & !MAY_UPDATE, |m| m.any(MAY_UPDATE)),
+    row(CALL_BENT, V, "bent", 0, |m| m.any(MAY_STACK)),
+    row(CALL_FINISH_VIEW, S, "finish_view", 0, |m| m.any(MAY_VIEW)),
+    row(CALL_FINISH_RECORD, S, "finish_record", 0, |m| m.any(MAY_UPDATE | MAY_PHOTON)),
+    row(CALL_FINISH_BACKGROUND, S, "finish_background", 0, |m| m.any(MAY_BACKGROUND)),
+    row(CALL_WALK_END, V, "walk_end", 0, |m| m.any(MAY_WALK | MAY_INTERIORS)),
+    row(CALL_SEGMENT, S, "segment", MAY_RICH, |m| m.any(MAY_INTERIORS)),
+    row(CALL_LAYERS, S, "layers", MAY_RICH, |m| m.any(MAY_PARTICLES | MAY_LOCAL_LIGHTS)),
+    row(CALL_PROXY_MARCH, S, "march_proxy", MAY_RICH, |m| m.any(MAY_PROXIES)),
+    row(CALL_GBUFFER, S, "gbuffer_start", 0, |m| m.any(MAY_VIEW)),
+    row(CALL_STACK_STEP, V, "stack_step", MAY_RICH, |m| m.any(MAY_STACK)),
+    row(CALL_STACK_MISS, V, "stack_miss", MAY_RICH, |m| m.any(MAY_STACK)),
+    row(CALL_EMITTER_VIEW, V, "emitter_view", 0, |m| m.any(MAY_EMISSIVE) && m.may2(SceneFeatures::COATED_EMITTERS)),
+    row(CALL_START_FIRST_VERTEX, S, "start_first_vertex", 0, |m| m.all(MAY_VIEW | MAY_DEBUG)),
+];
+
+/// [`CALLED`] in the order of the table, checked to name each index once.
+fn callables() -> [Option<Callable>; CALLABLES as usize] {
+    let mut table = [None; CALLABLES as usize];
+    for c in CALLED {
+        let at = &mut table[c.index as usize];
+        assert!(at.is_none(), "two callables at index {}", c.index);
+        *at = Some(c);
     }
     table
 }
@@ -254,67 +207,192 @@ enum Geometry {
 }
 
 impl Geometry {
-    /// `path_may2` of its stage.
-    fn may2(self) -> u32 {
-        let out = match self {
-            Self::Copies => SceneFeatures::PRODUCERS.0 | SceneFeatures::STRANDS.0,
-            Self::Producers => SceneFeatures::STRANDS.0,
+    /// The `path_may2` bits (in the high word) its stage is made without.
+    fn without(self) -> u64 {
+        let producers = may2(SceneFeatures::PRODUCERS);
+        let strands = may2(SceneFeatures::STRANDS);
+        match self {
+            Self::Copies => producers | strands,
+            Self::Producers => strands,
             Self::Any => 0,
-        };
-        SceneFeatures(!out).surface_may()
+        }
     }
 }
 
-/// The ray tracing pipeline of the path tracer, and the groups a scene's hit records name.
+/// The stages of a pipeline being listed, each once.
+struct Listed {
+    specs: Vec<(Kernel, &'static str, Constants)>,
+}
+
+impl Listed {
+    /// The index of the stage of `entry` of `kernel` made with `constants`.
+    fn stage(&mut self, kernel: Kernel, entry: &'static str, constants: Constants) -> u32 {
+        let spec = (kernel, entry, constants);
+        let at = self
+            .specs
+            .iter()
+            .position(|s| (s.0, s.1, s.2) == (spec.0, spec.1, spec.2));
+        at.unwrap_or_else(|| {
+            self.specs.push(spec);
+            self.specs.len() - 1
+        }) as u32
+    }
+}
+
+/// A ray tracing pipeline of the path tracer, made for what its paths may meet, and the groups a
+/// scene's hit records name.
 pub(crate) struct PathPipeline {
     pub(super) pipeline: RayPipeline,
     groups: HitGroups,
 }
 
 impl PathPipeline {
-    /// Compiles the pipeline from `kernels` on `threads`.
+    /// Compiles the pipeline from `kernels` on `threads` for paths that may meet `may`: the
+    /// stages a scene of that mask can reach, each folded with it.
     pub(crate) fn new(
         device: &Device,
         kernels: &KernelSet,
         threads: CompileThreads<'_>,
+        may: u64,
     ) -> Result<Self, Error> {
         let mut modules = [&pipeline::raygen::MODULE; Kernel::ALL.len()];
         for k in Kernel::ALL {
             modules[k as usize] = module(kernels, k.own())?;
         }
+        let mask = Mask { may };
         let mut groups = HitGroups {
             surfaces: kernels.surfaces,
             ..HitGroups::default()
         };
         let pins = groups.pins();
+        let mut listed = Listed { specs: Vec::new() };
+        let folded = Constants {
+            may,
+            hit_surface: None,
+        };
+        let raygen = listed.stage(Kernel::Raygen, "paths", folded);
+        let miss = listed.stage(Kernel::Raygen, "miss_path", folded);
         // `hit_surface` of the hit shaders of each pin: any id, then each id from 0 on.
-        let pin_surface = |pin: u32| if pin == 0 { u32::MAX } else { pin - 1 };
-        let mut specs: Vec<(Kernel, &str, Constants)> = FIXED
-            .iter()
-            .map(|&(k, e)| (k, e, Constants::default()))
-            .collect();
-        for pin in 0..pins {
-            for &(entry, geometry) in &PINNED {
-                let constants = Constants {
-                    path_may2: Some(geometry.may2()),
-                    hit_surface: Some(pin_surface(pin)),
-                    ..Constants::default()
-                };
-                specs.push((Kernel::Hits, entry, constants));
+        let pinned = |pin: u32, geometry: Geometry| Constants {
+            may: may & !geometry.without(),
+            hit_surface: Some(if pin == 0 { u32::MAX } else { pin - 1 }),
+        };
+        let mut hit_groups = Vec::new();
+        // Each pinned kind's groups one after another by pin, the first named in `groups`.
+        for (first, resolve, any_hit, geometry, linked) in [
+            (
+                &mut groups.path,
+                Some("resolve"),
+                Some("cover_path_hit"),
+                Geometry::Copies,
+                true,
+            ),
+            (
+                &mut groups.producer_path,
+                Some("resolve"),
+                Some("cover_path_hit"),
+                Geometry::Producers,
+                mask.any(may2(SceneFeatures::PRODUCERS)),
+            ),
+            (
+                &mut groups.strand_path,
+                Some("resolve_strand"),
+                None,
+                Geometry::Any,
+                mask.any(may2(SceneFeatures::STRANDS)),
+            ),
+            (
+                &mut groups.shadow,
+                None,
+                Some("cover_shadow_hit"),
+                Geometry::Any,
+                true,
+            ),
+        ] {
+            if !linked {
+                continue;
+            }
+            *first = Some(hit_groups.len() as u32);
+            for pin in 0..pins {
+                // The coverage's any-hit shaders are made for any geometry, once per pin.
+                let (c, any) = (pinned(pin, geometry), pinned(pin, Geometry::Any));
+                hit_groups.push(HitGroup {
+                    closest_hit: resolve.map(|e| listed.stage(Kernel::Hits, e, c)),
+                    any_hit: any_hit.map(|e| listed.stage(Kernel::Hits, e, any)),
+                    intersection: None,
+                });
             }
         }
-        let first_callable = specs.len() as u32;
-        for (kernel, entry, may) in callables() {
-            let constants = Constants {
-                path_may: Some(may as u32),
-                ..Constants::default()
-            };
-            specs.push((kernel, entry, constants));
+        // The groups held once: the medium proxies' under shadow and layer rays, what layer rays
+        // keep of particles and of light proxies, and the stack meet's closest-hit.
+        let medium = mask.any(MAY_PROXIES);
+        for (group, closest_hit, any_hit, intersection, linked) in [
+            (
+                &mut groups.medium_shadow,
+                None,
+                Some("proxy_shadow_hit"),
+                Some("box_medium_hit"),
+                medium,
+            ),
+            (
+                &mut groups.layers,
+                None,
+                Some("cover_layers_hit"),
+                None,
+                mask.any(MAY_PARTICLES),
+            ),
+            (
+                &mut groups.medium_layers,
+                None,
+                Some("cover_layers_medium_hit"),
+                Some("box_medium_hit"),
+                medium,
+            ),
+            (
+                &mut groups.light_layers,
+                None,
+                Some("cover_layers_light_hit"),
+                Some("box_light_hit"),
+                mask.any(MAY_LOCAL_LIGHTS),
+            ),
+            (
+                &mut groups.stack_meet,
+                Some("stack_meet"),
+                None,
+                None,
+                mask.any(MAY_STACK),
+            ),
+        ] {
+            if !linked {
+                continue;
+            }
+            let mut stage =
+                |e: Option<&'static str>| e.map(|e| listed.stage(Kernel::Hits, e, folded));
+            *group = Some(hit_groups.len() as u32);
+            hit_groups.push(HitGroup {
+                closest_hit: stage(closest_hit),
+                any_hit: stage(any_hit),
+                intersection: stage(intersection),
+            });
         }
-        let bytes: Vec<_> = specs.iter().map(|&(k, _, c)| k.spec(c)).collect();
-        // Every stage takes its constants, default or not: a stage with none is handed the whole
-        // module, with every other entry point in it.
-        let stages = specs
+        let records: Vec<Option<u32>> = callables()
+            .into_iter()
+            .map(|c| {
+                let c = c.expect("a callable at every index");
+                (c.linked)(mask).then(|| {
+                    let constants = Constants {
+                        may: may & !c.without,
+                        hit_surface: None,
+                    };
+                    listed.stage(c.kernel, c.entry, constants)
+                })
+            })
+            .collect();
+        let bytes: Vec<_> = listed.specs.iter().map(|&(k, _, c)| k.spec(c)).collect();
+        // Every stage takes its constants: a stage with none is handed the whole module, with
+        // every other entry point in it.
+        let stages = listed
+            .specs
             .iter()
             .zip(&bytes)
             .map(|(&(kernel, entry, _), (bytes, entries))| {
@@ -322,83 +400,67 @@ impl PathPipeline {
                 ShaderStage::new(modules[kernel as usize], entry, data)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let flags = RayPipelineFlags::scene(device.caps());
-        let callables: Vec<ShaderRecord<'_>> = (first_callable..stages.len() as u32)
-            .map(ShaderRecord::new)
-            .collect();
-        // Each pinned kind's groups one after another by pin, then the medium proxies'.
-        let pinned = |pin: u32, k: usize| FIXED.len() as u32 + pin * PINNED.len() as u32 + k as u32;
-        // Each group's index is its place in the list, which `groups` names.
-        let mut hit_groups = Vec::new();
-        for (first, resolve, any_hit) in [
-            (&mut groups.path, Some(RESOLVE_COPIES), Some(COVER_PATH)),
-            (
-                &mut groups.producer_path,
-                Some(RESOLVE_PRODUCERS),
-                Some(COVER_PATH),
-            ),
-            (&mut groups.strand_path, Some(RESOLVE_STRANDS), None),
-            (&mut groups.shadow, None, Some(COVER_SHADOW)),
-        ] {
-            *first = Some(hit_groups.len() as u32);
-            for pin in 0..pins {
-                hit_groups.push(HitGroup {
-                    closest_hit: resolve.map(|k| pinned(pin, k)),
-                    any_hit: any_hit.map(|k| pinned(pin, k)),
-                    intersection: None,
-                });
-            }
-        }
-        for (group, closest_hit, any_hit, intersection) in [
-            (
-                &mut groups.medium_shadow,
-                None,
-                Some(MEDIUM_ANY_HIT),
-                Some(MEDIUM_INTERSECTION),
-            ),
-            (&mut groups.layers, None, Some(LAYERS_ANY_HIT), None),
-            (
-                &mut groups.medium_layers,
-                None,
-                Some(MEDIUM_LAYERS_ANY_HIT),
-                Some(MEDIUM_INTERSECTION),
-            ),
-            (
-                &mut groups.light_layers,
-                None,
-                Some(LIGHT_LAYERS_ANY_HIT),
-                Some(LIGHT_INTERSECTION),
-            ),
-            (&mut groups.stack_meet, Some(STACK_MEET), None, None),
-        ] {
-            *group = Some(hit_groups.len() as u32);
-            hit_groups.push(HitGroup {
-                closest_hit,
-                any_hit,
-                intersection,
-            });
-        }
-        let raygens = [ShaderRecord::new(RAYGEN)];
+        let callables: Vec<_> = records.iter().map(|r| r.map(ShaderRecord::new)).collect();
         let desc = RayPipelineDesc {
             stages: &stages,
-            raygens: &raygens,
-            misses: &[ShaderRecord::new(MISS)],
+            raygens: &[ShaderRecord::new(raygen)],
+            misses: &[ShaderRecord::new(miss)],
             hit_groups: &hit_groups,
             callables: &callables,
             max_recursion: 1,
-            flags,
+            flags: RayPipelineFlags::scene(device.caps()),
             threads,
         };
         let started = Instant::now();
-        let pipeline = device.create_ray_pipeline(&desc, "path pipeline")?;
+        let name = format!("path pipeline {may:#x}");
+        let pipeline = device.create_ray_pipeline(&desc, &name)?;
         log::debug!(
-            "path pipeline made in {:.1} s",
+            "{name}: {} stages, {} of {CALLABLES} callables, made in {:.1} s",
+            stages.len(),
+            records.iter().flatten().count(),
             started.elapsed().as_secs_f64()
         );
         Ok(Self { pipeline, groups })
     }
 
+    /// The pipeline whose hit table its launches trace through, and the groups the table names.
     pub(crate) fn hit_pipeline(&self) -> (&RayPipeline, &HitGroups) {
         (&self.pipeline, &self.groups)
+    }
+}
+
+/// The path tracer's pipelines as [`crate::mask_sets::MaskSets`] members: one per mask.
+pub(crate) struct PathPipelines {
+    pub(crate) kernels: KernelSet,
+}
+
+impl Members for PathPipelines {
+    type Pipeline = PathPipeline;
+
+    fn names(&self) -> &'static [&'static str] {
+        &["path pipeline"]
+    }
+
+    fn runs(&self, _: u64, _: &[usize]) -> Vec<usize> {
+        vec![0]
+    }
+
+    fn compile(
+        &self,
+        device: &Device,
+        loading: Option<&Arc<Loading>>,
+        _: usize,
+        may: u64,
+    ) -> Result<PathPipeline, Error> {
+        // The driver compiles the pipeline's shaders on the loading workers that join it.
+        let Some(pool) = loading else {
+            return PathPipeline::new(device, &self.kernels, CompileThreads::default(), may);
+        };
+        let spawn = |task: Box<dyn FnOnce() + Send>| pool.spawn(task);
+        let threads = CompileThreads::Pool {
+            spawn: &spawn,
+            max: std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
+        };
+        PathPipeline::new(device, &self.kernels, threads, may)
     }
 }

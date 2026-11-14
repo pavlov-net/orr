@@ -123,8 +123,8 @@ pub use scene::{
     SceneWriter, SkinnedPageRef, TransformGroupDesc, TransformGroupId,
 };
 pub use scenes::{
-    Budgets, ConsumerMarker, DetailStats, Frame, FrameDesc, FrameStats, PoolSize, RendererDesc,
-    SceneCompute, Scenes,
+    Budgets, ConsumerMarker, DetailStats, Frame, FrameDesc, FrameStats, HitTableWriter, PoolSize,
+    RendererDesc, SceneCompute, Scenes,
 };
 pub use shaders::pixel_probe::{ProbeGpu, ProbeTexture};
 pub(crate) use shaders::types::{

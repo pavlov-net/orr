@@ -6,18 +6,19 @@ use std::sync::Arc;
 
 use orr_math::{DVec3, Quat};
 use orr_scene::orr_gpu::{
-    self, Allocation, CommandList, CompileThreads, ComputePipeline, Device, DispatchArgs, Format,
-    GpuPtr, Hazards, HitTable, MemoryKind, RayPipeline, Stages, StorageImageIndex, Texture,
-    TextureDesc, TextureIndex, TextureMemory, TextureUsage,
+    self, Allocation, CommandList, ComputePipeline, Device, DispatchArgs, Format, GpuPtr, Hazards,
+    MemoryKind, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
+    TextureUsage,
 };
 use orr_scene::{
-    ArenaRequest, ArenaTexture, GBufferGpu, HitGroups, JobResult, LightTables, Loading, MaterialId,
-    RasterGpu, SceneFeatures, SceneRoot, Span, Urgency, ViewArena, ViewConstants, ViewDesc,
-    ViewStep,
+    ArenaRequest, ArenaTexture, GBufferGpu, HitTableWriter, JobResult, LightTables, Loading,
+    MaterialId, RasterGpu, SceneFeatures, SceneRoot, Span, Urgency, ViewArena, ViewConstants,
+    ViewDesc, ViewStep,
 };
 
 use crate::caustics::PhotonMap;
-use crate::launch::{LaunchMemory, PathPipeline, SlotLayout};
+use crate::launch::{LaunchMemory, PathPipeline, PathPipelines, SlotLayout, SourceMemory};
+use crate::mask_sets::{MaskSet, MaskSets};
 use crate::media::{
     MediaKernels, MediaSettings, MediaStats, MediaView, fogged, links_medium, readers, shows_media,
 };
@@ -582,6 +583,17 @@ pub struct LightingView {
     staged_photons: Option<StagedMemory>,
     /// What the view's paths keep in the pipeline path tracer, made at their first frame.
     launched: Option<LaunchMemory>,
+    /// The pipelines the view's last frame launched paths through, kept until its next.
+    launched_ran: LaunchedRan,
+}
+
+/// The pipelines a view's frame launched its sources' paths through: what the view asked them
+/// to hold, and each one it ran, held until the view's next frame so that it outlives the
+/// commands that run it.
+#[derive(Default)]
+struct LaunchedRan {
+    asked: u64,
+    held: Vec<Arc<MaskSet<PathPipeline>>>,
 }
 
 impl LightingView {
@@ -683,6 +695,7 @@ impl LightingView {
             staged: None,
             staged_photons: None,
             launched: None,
+            launched_ran: LaunchedRan::default(),
             media: MediaView::new(device)?,
             dof: None,
             overlay_front: None,
@@ -883,16 +896,19 @@ impl LightingView {
         self.media.stats(frame)
     }
 
-    /// The path pipelines the view's last [`LightingKernels::record_paths`] ran, where the
-    /// staged loop ran them.
+    /// The path pipelines the view's last [`LightingKernels::record_paths`] ran.
     pub fn paths_ran(&self) -> Option<PathsRan> {
-        self.staged.as_ref().map(|m| {
+        if let Some(m) = &self.staged {
             let (asked, mut ran) = m.ran();
             // The photons ran the sets their own memory holds.
             if let Some(photons) = &self.staged_photons {
                 ran.extend(photons.ran().1);
             }
-            PathsRan { asked, ran }
+            return Some(PathsRan { asked, ran });
+        }
+        self.launched.as_ref().map(|_| PathsRan {
+            asked: self.launched_ran.asked,
+            ran: self.launched_ran.held.iter().map(|s| s.may()).collect(),
         })
     }
 
@@ -973,9 +989,6 @@ pub struct ViewPass {
     /// Something reads the frame's [`LightingView::particle_lighting`], as a transparency hook
     /// that shades particles does; `false` leaves it null.
     pub particle_lighting: bool,
-    /// The scene's hit table for [`LightingKernels::hit_pipeline`], which the frame's paths
-    /// trace through where the kernels run the pipeline path tracer; `None` elsewhere.
-    pub hits: Option<HitTable>,
 }
 
 /// What the background layer behind out-of-focus foreground reads in one frame. Each marked
@@ -1119,47 +1132,110 @@ fn runs_rays(entry: PathEntry) -> bool {
 }
 
 /// How a frame's caustic photons run: through the staged loop's stages for what they may meet,
-/// or through the pipeline path tracer over the scene's hit records.
+/// or through the pipeline path tracer's pipeline made for what they may meet, over the scene's
+/// hit records.
 enum PhotonPaths<'a> {
     Staged {
         paths: &'a StagedPaths,
         may: u64,
     },
     Launched {
-        launch: &'a PathPipeline,
-        hits: &'a HitTable,
+        paths: &'a PipelinePaths,
+        hits: &'a HitTableWriter<'a>,
+        may: u64,
     },
 }
 
-/// What runs a view's paths: the staged loop, whose pipelines compile when paths first ask for
-/// them, or the pipeline path tracer ([`PathEntry::Pipeline`]), as `P` holds it.
-enum Paths<P> {
-    Staged(Arc<StagedPaths>),
-    Pipeline(P),
+/// The pipeline path tracer's pipelines that a frame's paths run through, and what writes the
+/// scene's hit table of each.
+#[derive(Clone, Copy)]
+struct Launched<'a> {
+    paths: &'a PipelinePaths,
+    hits: &'a HitTableWriter<'a>,
 }
 
-type PathBackend = Paths<Box<PathPipeline>>;
-/// [`PathBackend`] while the kernels compile.
-type CompilingPaths = Paths<JobResult<Result<PathPipeline, Error>>>;
+/// What runs a view's paths: the staged loop or the pipeline path tracer
+/// ([`PathEntry::Pipeline`]), whose pipelines compile when paths first ask for them.
+#[derive(Clone)]
+enum Paths {
+    Staged(Arc<StagedPaths>),
+    Pipeline(Arc<PipelinePaths>),
+}
 
-impl<P> Paths<P> {
-    fn staged(&self) -> Option<&StagedPaths> {
+impl Paths {
+    /// How many of the path pipelines that a frame or a caller waits for are still compiling.
+    fn outstanding(&self, exact: bool) -> u32 {
         match self {
-            Self::Staged(paths) => Some(paths),
-            Self::Pipeline(_) => None,
+            Self::Staged(paths) => paths.stages.outstanding(exact),
+            Self::Pipeline(paths) => paths.sets.outstanding(exact),
         }
     }
 
-    /// How many of the staged loop's pipelines that a frame or a caller waits for are still
-    /// compiling; none for the pipeline path tracer.
-    fn outstanding(&self, exact: bool) -> u32 {
-        self.staged()
-            .map_or(0, |paths| paths.stages.outstanding(exact))
+    /// Makes later pipelines on `device` as jobs on `loading`.
+    fn attach(&self, device: &Device, loading: &Arc<Loading>) {
+        match self {
+            Self::Staged(paths) => paths.stages.attach(device, loading),
+            Self::Pipeline(paths) => paths.sets.attach(device, loading),
+        }
+    }
+
+    /// Queues the pipelines that may meet everything.
+    fn start_general(&self) {
+        match self {
+            Self::Staged(paths) => paths.start_general(),
+            Self::Pipeline(paths) => paths.start_general(),
+        }
+    }
+
+    /// Asks for the pipelines a view's frame with `needs` takes under `lighting`, and says
+    /// whether they are ready.
+    fn ask(
+        &self,
+        scene: &SceneLighting,
+        needs: PathNeeds,
+        lighting: &ViewLighting,
+    ) -> Result<bool, Error> {
+        match self {
+            Self::Staged(k) => {
+                let (wanted, stages) = k.wanted(scene, needs, lighting);
+                k.ask(wanted, &stages, lighting)
+            }
+            Self::Pipeline(k) => k.ask(&k.wanted(scene, needs, lighting), lighting),
+        }
+    }
+
+    /// Waits for the pipelines made for exactly what a view's frame with `needs` takes under
+    /// `lighting`.
+    fn wait_exact(
+        &self,
+        scene: &SceneLighting,
+        needs: PathNeeds,
+        lighting: &ViewLighting,
+    ) -> Result<WaitedPaths, Error> {
+        match self {
+            Self::Staged(k) => {
+                let (wanted, stages) = k.wanted(scene, needs, lighting);
+                Ok(WaitedPaths {
+                    _staged: Some(k.stages.wait_exact(wanted, &stages)?),
+                    _launched: Vec::new(),
+                })
+            }
+            Self::Pipeline(k) => {
+                let wanted = k.wanted(scene, needs, lighting);
+                let launched = wanted
+                    .iter()
+                    .map(|&may| k.sets.wait_exact(may, &PIPELINE))
+                    .collect::<Result<_, _>>()?;
+                Ok(WaitedPaths {
+                    _staged: None,
+                    _launched: launched,
+                })
+            }
+        }
     }
 }
 
 const SUPPORT: &str = "lighting compute kernels";
-const LAUNCH: &str = "the path tracing pipeline";
 
 /// A compile job's result, or how it failed. Call once it finished.
 fn compiled<T>(job: &JobResult<Result<T, Error>>, kernel: &'static str) -> Result<T, Error> {
@@ -1180,9 +1256,9 @@ pub struct CompilingKernels {
     device: Device,
     kernels: &'static KernelSet,
     loading: Arc<Loading>,
-    /// The staged loop's pipelines compile when paths first ask for them, which a view may
-    /// while the other kernels compile; the pipeline path tracer's is a job.
-    paths: CompilingPaths,
+    /// The path pipelines compile when paths first ask for them, which a view may while the
+    /// other kernels compile.
+    paths: Paths,
     /// One job per support pipeline, in [`SupportKernels::pipelines`]' order.
     support: Vec<JobResult<Result<ComputePipeline, Error>>>,
     /// The support kernels made per mask, which a view asks for as it does its path pipelines.
@@ -1192,14 +1268,7 @@ pub struct CompilingKernels {
 
 impl CompilingKernels {
     fn jobs(&self) -> Vec<&dyn JobState> {
-        self.support
-            .iter()
-            .map(|j| j as &dyn JobState)
-            .chain(match &self.paths {
-                Paths::Pipeline(job) => Some(job as &dyn JobState),
-                Paths::Staged(_) => None,
-            })
-            .collect()
+        self.support.iter().map(|j| j as &dyn JobState).collect()
     }
 
     /// How many jobs have not finished.
@@ -1217,10 +1286,7 @@ impl CompilingKernels {
         needs: PathNeeds,
         lighting: &ViewLighting,
     ) -> Result<(), Error> {
-        if let Some(paths) = self.paths.staged() {
-            let (wanted, stages) = paths.wanted(scene, needs, lighting);
-            paths.ask(wanted, &stages, lighting)?;
-        }
+        self.paths.ask(scene, needs, lighting)?;
         ask_support(&self.masked, needs, lighting)?;
         Ok(())
     }
@@ -1251,12 +1317,8 @@ impl CompilingKernels {
         for job in &self.support {
             support.push(compiled(job, SUPPORT)?);
         }
-        let paths = match &self.paths {
-            Paths::Staged(paths) => Paths::Staged(Arc::clone(paths)),
-            Paths::Pipeline(job) => Paths::Pipeline(Box::new(compiled(job, LAUNCH)?)),
-        };
         let out = LightingKernels {
-            paths,
+            paths: self.paths.clone(),
             support: SupportKernels::assemble(
                 &self.device,
                 self.kernels,
@@ -1319,7 +1381,8 @@ impl PathsRan {
 /// The path pipelines [`LightingKernels::wait_paths`] waited for, which stay while this does.
 #[must_use = "the pipelines waited for stay only while this is held"]
 pub struct WaitedPaths {
-    _set: Option<Arc<StageSet>>,
+    _staged: Option<Arc<StageSet>>,
+    _launched: Vec<Arc<MaskSet<PathPipeline>>>,
 }
 
 /// What decides the path pipelines of a view's frame, known before the view is rastered.
@@ -1601,6 +1664,133 @@ fn ask_support(
     masked.ask(may, runs, lighting.specialize)
 }
 
+/// What the paths of a frame with `needs` under `lighting`, under kernels that link a medium where
+/// `linked_medium`, may meet: what a view asks pipelines for, and what
+/// [`LightingKernels::record_paths`] runs each of its sources with.
+fn predict(
+    linked_medium: bool,
+    scene: &SceneLighting,
+    needs: PathNeeds,
+    lighting: &ViewLighting,
+) -> PathMay {
+    if !lighting.specialize {
+        return PathMay::ALL;
+    }
+    let features = needs.features;
+    let reference = lighting.reference.is_some();
+    let lens = traces_lens(lighting);
+    let froxels = !reference && fogged(linked_medium, features, lighting);
+    let path = path_features(features, lighting);
+    let shared = scene_may(features)
+        | bit(gathers_caustics(scene, features, lighting), MAY_CAUSTICS)
+        | bit(lens, MAY_LENS)
+        | bit(froxels, MAY_FROXELS);
+    let layer = lighting.debug_view == LightingDebugView::DielectricLayer;
+    let background = shared
+        | features_may(path)
+        | bit(layer, MAY_DEBUG)
+        | bit(reference, MAY_REFERENCE)
+        | bit(needs.frosted_glass, MAY_FROST)
+        | bit(local_share(lighting) > 0.0, MAY_LOCAL)
+        | bit(!reference, MAY_CACHE);
+    PathMay {
+        view: background | bit(path_mode(lighting) != 0, MAY_DEBUG),
+        background,
+        // Update paths run outside the reference and end in the cache.
+        update: shared | features_may(path & UPDATE_FEATURES) | MAY_CACHE,
+        photons: shared | features_may(path & !FEATURE_WALK) | bit(reference, MAY_REFERENCE),
+    }
+}
+
+/// The pipeline path tracer's pipelines: for each source a frame runs, one made for what its
+/// paths may meet, which runs that source's paths alone; and behind those the one that may meet
+/// everything, which runs any source while a source's own compiles.
+struct PipelinePaths {
+    sets: MaskSets<PathPipelines>,
+    linked_medium: bool,
+}
+
+/// The one member of a [`PathPipelines`] set.
+const PIPELINE: [usize; 1] = [0];
+
+impl PipelinePaths {
+    fn new(device: &Device, kernels: &KernelSet) -> Self {
+        Self {
+            sets: MaskSets::new(device, PathPipelines { kernels: *kernels }),
+            linked_medium: links_medium(kernels),
+        }
+    }
+
+    /// Queues, behind the pipelines a view cannot render without and ahead of mounts, the one
+    /// that may meet everything: it runs a scene that comes to hold more than its own were made
+    /// for, which would wait in black for new ones otherwise.
+    fn start_general(&self) {
+        self.sets.start_general(&PIPELINE);
+    }
+
+    /// What the pipelines each source of a frame with `needs` takes under `lighting` may meet:
+    /// its own source's bit, and what its paths may meet.
+    fn wanted(&self, scene: &SceneLighting, needs: PathNeeds, lighting: &ViewLighting) -> Vec<u64> {
+        let may = predict(self.linked_medium, scene, needs, lighting);
+        let mut wanted = vec![may.view | Source::View.may()];
+        if needs.dof_background {
+            wanted.push(may.background | Source::Background.may());
+        }
+        // Update paths run outside the reference.
+        if lighting.reference.is_none() {
+            wanted.push(may.update | Source::Update.may());
+        }
+        if gathers_caustics(scene, needs.features, lighting) {
+            wanted.push(may.photons | Source::Photon.may());
+        }
+        wanted
+    }
+
+    /// Asks for pipelines that hold each of `wanted`, as [`Self::wanted`] gives them, and says
+    /// whether some are ready for each.
+    fn ask(&self, wanted: &[u64], lighting: &ViewLighting) -> Result<bool, Error> {
+        let mut ready = true;
+        for &may in wanted {
+            ready &= self.sets.prepare(may, &PIPELINE)?;
+        }
+        if lighting.specialize {
+            self.start_general();
+        }
+        Ok(ready)
+    }
+
+    /// Records `items` paths of `root`'s source in slices of `memory`'s slots through the
+    /// pipeline made for what they may meet, `may`, or the ready one that holds the least beyond
+    /// it, after waiting for it where none is ready; its hit table, which `hits` writes, before
+    /// them. The pipeline joins `ran`.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &self,
+        list: &mut CommandList<'_>,
+        hits: &HitTableWriter<'_>,
+        ran: &mut LaunchedRan,
+        features: SceneFeatures,
+        root: &PathRoot,
+        may: u64,
+        memory: &SourceMemory,
+        items: u32,
+    ) -> Result<(), Error> {
+        // A pipeline leaves out what its mask rules out whatever a root says.
+        let asks = scene_may(features) | root_may(root);
+        assert!(
+            asks & !may == 0,
+            "a path root asks for {asks:#x}, beyond the {may:#x} its pipeline holds"
+        );
+        let set = self.sets.wait(may, may, &PIPELINE)?;
+        let launch = set.member(0).get().expect("the set's pipeline is ready");
+        let (pipeline, groups) = launch.hit_pipeline();
+        let table = hits.table(list, pipeline, groups)?;
+        launch.record(list, &table, root, memory, items);
+        ran.held.push(Arc::clone(&set));
+        Ok(())
+    }
+}
+
 impl StagedPaths {
     fn new(stages: StagedKernels, linked_medium: bool) -> Self {
         Self {
@@ -1619,36 +1809,9 @@ impl StagedPaths {
         self.stages.start_general(&stages);
     }
 
-    /// What the paths of a frame with `needs` under `lighting` may meet: what a view asks
-    /// pipelines for, and what [`LightingKernels::record_paths`] runs each of its sources with.
+    /// [`predict`] under the kernels' medium.
     fn predict(&self, scene: &SceneLighting, needs: PathNeeds, lighting: &ViewLighting) -> PathMay {
-        if !lighting.specialize {
-            return PathMay::ALL;
-        }
-        let features = needs.features;
-        let reference = lighting.reference.is_some();
-        let lens = traces_lens(lighting);
-        let froxels = !reference && fogged(self.linked_medium, features, lighting);
-        let path = path_features(features, lighting);
-        let shared = scene_may(features)
-            | bit(gathers_caustics(scene, features, lighting), MAY_CAUSTICS)
-            | bit(lens, MAY_LENS)
-            | bit(froxels, MAY_FROXELS);
-        let layer = lighting.debug_view == LightingDebugView::DielectricLayer;
-        let background = shared
-            | features_may(path)
-            | bit(layer, MAY_DEBUG)
-            | bit(reference, MAY_REFERENCE)
-            | bit(needs.frosted_glass, MAY_FROST)
-            | bit(local_share(lighting) > 0.0, MAY_LOCAL)
-            | bit(!reference, MAY_CACHE);
-        PathMay {
-            view: background | bit(path_mode(lighting) != 0, MAY_DEBUG),
-            background,
-            // Update paths run outside the reference and end in the cache.
-            update: shared | features_may(path & UPDATE_FEATURES) | MAY_CACHE,
-            photons: shared | features_may(path & !FEATURE_WALK) | bit(reference, MAY_REFERENCE),
-        }
+        predict(self.linked_medium, scene, needs, lighting)
     }
 
     /// The path pipelines a view's frame with `needs` takes under `lighting`: what they may
@@ -1694,7 +1857,7 @@ impl StagedPaths {
 
 /// The per-view lighting kernels of one device.
 pub struct LightingKernels {
-    paths: PathBackend,
+    paths: Paths,
     support: SupportKernels,
     _tables: BsdfTables,
 }
@@ -1712,11 +1875,7 @@ impl LightingKernels {
         entry: PathEntry,
     ) -> Result<Self, Error> {
         let paths = if entry == PathEntry::Pipeline {
-            Paths::Pipeline(Box::new(PathPipeline::new(
-                device,
-                kernels,
-                CompileThreads::default(),
-            )?))
+            Paths::Pipeline(Arc::new(PipelinePaths::new(device, kernels)))
         } else {
             Paths::Staged(Arc::new(StagedPaths::new(
                 StagedKernels::new(device, kernels, runs_rays(entry)),
@@ -1744,24 +1903,14 @@ impl LightingKernels {
         let masked = Arc::new(MaskedSupport::new(device, kernels));
         masked.attach(device, loading);
         let paths = if entry == PathEntry::Pipeline {
-            // The driver compiles the pipeline's shaders on the loading workers that join it.
-            let pool = Arc::clone(loading);
-            Paths::Pipeline(loading.compile_job(device, Urgency::Needed, move |d| {
-                let spawn = |task: Box<dyn FnOnce() + Send>| pool.spawn(task);
-                let threads = CompileThreads::Pool {
-                    spawn: &spawn,
-                    max: std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
-                };
-                PathPipeline::new(d, kernels, threads)
-            }))
+            Paths::Pipeline(Arc::new(PipelinePaths::new(device, kernels)))
         } else {
-            let paths = Arc::new(StagedPaths::new(
+            Paths::Staged(Arc::new(StagedPaths::new(
                 StagedKernels::new(device, kernels, runs_rays(entry)),
                 links_medium(kernels),
-            ));
-            paths.stages.attach(device, loading);
-            Paths::Staged(paths)
+            )))
         };
+        paths.attach(device, loading);
         CompilingKernels {
             device: device.clone(),
             kernels,
@@ -1782,9 +1931,7 @@ impl LightingKernels {
     /// [`CompilingKernels::finish`] calls it; kernels from [`Self::new`] compile their later
     /// pipelines on the calling thread until this call.
     pub fn attach(&self, device: &Device, loading: &Arc<Loading>) {
-        if let Some(paths) = self.paths.staged() {
-            paths.stages.attach(device, loading);
-        }
+        self.paths.attach(device, loading);
         self.support.masked.attach(device, loading);
     }
 
@@ -1792,20 +1939,8 @@ impl LightingKernels {
     /// behind a view's own. A caller that compiles ahead of its first frame calls this
     /// and runs the loading side's jobs.
     pub fn compile_rest(&self) {
-        if let Some(paths) = self.paths.staged() {
-            paths.start_general();
-        }
+        self.paths.start_general();
         self.support.masked.start_general();
-    }
-
-    /// The ray tracing pipeline whose hit table a view's frame passes in [`ViewPass::hits`],
-    /// and the groups the table names, where the kernels run the pipeline path tracer
-    /// ([`PathEntry::Pipeline`]).
-    pub fn hit_pipeline(&self) -> Option<(&RayPipeline, &HitGroups)> {
-        match &self.paths {
-            Paths::Pipeline(launch) => Some(launch.hit_pipeline()),
-            Paths::Staged(_) => None,
-        }
     }
 
     /// The masked support kernels with the mask of `pass`'s frame under `lighting`, and
@@ -1840,11 +1975,7 @@ impl LightingKernels {
         lighting: &ViewLighting,
     ) -> Result<bool, Error> {
         let support = ask_support(&self.support.masked, needs, lighting)?;
-        let Some(k) = self.paths.staged() else {
-            return Ok(support);
-        };
-        let (wanted, stages) = k.wanted(scene, needs, lighting);
-        Ok(k.ask(wanted, &stages, lighting)? && support)
+        Ok(self.paths.ask(scene, needs, lighting)? && support)
     }
 
     /// Waits for the kernels paths do without until they are ready and then for the pipelines
@@ -1861,13 +1992,7 @@ impl LightingKernels {
         let _zone = orr_scene::orr_gpu::zone!("wait for path pipelines");
         // The masked support kernels compile beside the path pipelines waited for first.
         ask_support(&self.support.masked, needs, lighting)?;
-        let waited = match self.paths.staged() {
-            Some(k) => {
-                let (wanted, stages) = k.wanted(scene, needs, lighting);
-                Some(k.stages.wait_exact(wanted, &stages)?)
-            }
-            None => None,
-        };
+        let waited = self.paths.wait_exact(scene, needs, lighting)?;
         let masked = &self.support.masked;
         let may = support_may(
             masked.linked_medium(),
@@ -1878,7 +2003,7 @@ impl LightingKernels {
         let particle_lighting = needs.particle_lighting || masked.particle_lighting();
         let runs = support_runs(masked, needs.features, particle_lighting, lighting);
         masked.wait_exact(may, runs)?;
-        Ok(WaitedPaths { _set: waited })
+        Ok(waited)
     }
 
     /// How many pipelines a frame or a caller waits for are still compiling: not those made for
@@ -1979,6 +2104,11 @@ impl LightingKernels {
     /// first layer take that first layer as their front layer. With [`ViewPass::frosted_glass`]
     /// the view keeps each pixel's background and rough-transmission blur for
     /// [`Self::record_frosted_glass`].
+    ///
+    /// Kernels that run the pipeline path tracer ([`PathEntry::Pipeline`]) write the scene's
+    /// hit table of each pipeline the frame's paths run through with `hits`, which the staged
+    /// loop needs none of.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_paths(
         &self,
         list: &mut CommandList<'_>,
@@ -1986,6 +2116,7 @@ impl LightingKernels {
         view: &mut LightingView,
         pass: &ViewPass,
         lighting: &ViewLighting,
+        hits: Option<&HitTableWriter<'_>>,
     ) -> Result<(), Error> {
         let _zone = orr_scene::orr_gpu::zone!("record paths");
         let (roulette_depth, lens) = match lighting.reference {
@@ -2161,7 +2292,15 @@ impl LightingKernels {
         };
         let k = match &self.paths {
             Paths::Pipeline(launch) => {
-                return self.record_launched(list, scene, view, pass, lighting, launch, &path_root);
+                let hits = hits.ok_or(Error::Settings(
+                    "a view whose paths run through the ray tracing pipeline takes what writes \
+                     the scene's hit tables",
+                ))?;
+                let frame = Launched {
+                    paths: launch,
+                    hits,
+                };
+                return self.record_launched(list, scene, view, pass, lighting, frame, &path_root);
             }
             Paths::Staged(k) => k,
         };
@@ -2311,10 +2450,11 @@ impl LightingKernels {
         Ok(())
     }
 
-    /// [`Self::record_paths`] through the pipeline path tracer `launch`, from the view paths' root
-    /// `path`: the layer guides and the frame's caustic photons, then the view's paths and its
-    /// update paths, then its background layer's, each source in one launch per slice of the
-    /// paths the view's memory holds.
+    /// [`Self::record_paths`] through the pipeline path tracer's pipelines, from the view paths'
+    /// root `path`: the layer guides and the frame's caustic photons, then the view's paths and
+    /// its update paths, then its background layer's, each source through the pipeline made for
+    /// what its paths may meet, or the ready one that holds the least beyond that, in one launch
+    /// per slice of the paths the view's memory holds.
     #[allow(clippy::too_many_arguments)]
     fn record_launched(
         &self,
@@ -2323,13 +2463,26 @@ impl LightingKernels {
         view: &mut LightingView,
         pass: &ViewPass,
         lighting: &ViewLighting,
-        launch: &PathPipeline,
+        frame: Launched<'_>,
         path: &PathRoot,
     ) -> Result<(), Error> {
-        let hits = pass.hits.ok_or(Error::Settings(
-            "a view whose paths run through the ray tracing pipeline takes the scene's hit table \
-             in ViewPass::hits",
-        ))?;
+        let Launched {
+            paths: launch,
+            hits,
+        } = frame;
+        let needs = PathNeeds {
+            features: pass.scene_features,
+            frosted_glass: pass.frosted_glass,
+            dof_background: pass.dof_background.is_some(),
+            particle_lighting: pass.particle_lighting,
+        };
+        let wanted = launch.wanted(scene, needs, lighting);
+        launch.ask(&wanted, lighting)?;
+        view.launched_ran = LaunchedRan {
+            asked: wanted.iter().fold(0, |all, may| all | may),
+            held: Vec::new(),
+        };
+        let predicted = predict(launch.linked_medium, scene, needs, lighting);
         self.record_layers(list, view, pass, lighting, path)?;
         let reference = lighting.reference.is_some();
         let segments = self.support.masked.linked_medium() || path.froxels != GpuPtr::NULL;
@@ -2395,8 +2548,9 @@ impl LightingKernels {
                 lighting,
                 &root,
                 PhotonPaths::Launched {
-                    launch,
-                    hits: &hits,
+                    paths: launch,
+                    hits,
+                    may: predicted.photons | Source::Photon.may(),
                 },
             )?,
             ..root
@@ -2410,7 +2564,10 @@ impl LightingKernels {
             },
             false,
         );
-        launch.record(list, &hits, &root, &memory.view, pixels);
+        let features = pass.scene_features;
+        let ran = &mut view.launched_ran;
+        let may = predicted.view | Source::View.may();
+        launch.record(list, hits, ran, features, &root, may, &memory.view, pixels)?;
         if update > 0 && lighting.stage_passes {
             list.end_pass();
             list.begin_pass("update paths", false);
@@ -2421,7 +2578,17 @@ impl LightingKernels {
                 features: update_features,
                 ..update_root(&root)
             };
-            launch.record(list, &hits, &update_root, &memory.update, update);
+            let may = predicted.update | Source::Update.may();
+            launch.record(
+                list,
+                hits,
+                ran,
+                features,
+                &update_root,
+                may,
+                &memory.update,
+                update,
+            )?;
         }
         list.end_pass();
         if pass.dof_background.is_some() {
@@ -2435,7 +2602,9 @@ impl LightingKernels {
                 source: PATH_SOURCE_BACKGROUND,
                 ..root
             };
-            launch.record(list, &hits, &background_root, &memory.view, pixels);
+            let may = predicted.background | Source::Background.may();
+            let root = &background_root;
+            launch.record(list, hits, ran, features, root, may, &memory.view, pixels)?;
             list.end_pass();
         }
         list.barrier(Stages::RAY, Stages::COMPUTE | Stages::RAY, Hazards::empty());
@@ -2539,7 +2708,7 @@ impl LightingKernels {
                     photons,
                 )?;
             }
-            PhotonPaths::Launched { launch, hits } => {
+            PhotonPaths::Launched { paths, hits, may } => {
                 // Photons that may meet a layer or lie in an interior take the dielectric depth's
                 // iterations too.
                 let layers = photon_root.features & (FEATURE_LAYERS | FEATURE_INTERIORS) != 0;
@@ -2566,7 +2735,9 @@ impl LightingKernels {
                         slots,
                         SlotLayout::new(root.features, false, 0),
                     )?;
-                launch.record(list, hits, &root, memory, photons);
+                let ran = &mut view.launched_ran;
+                let features = pass.scene_features;
+                paths.record(list, hits, ran, features, &root, may, memory, photons)?;
             }
         }
         if lighting.stage_passes {

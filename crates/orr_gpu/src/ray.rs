@@ -108,7 +108,8 @@ impl std::fmt::Debug for CompileThreads<'_> {
 /// may meet. The pipeline's groups are numbered in the order given: raygens, misses, hit
 /// groups, callables; [`crate::CommandList::trace_rays`] picks a raygen by its index in
 /// `raygens`, a trace a miss record by its index in `misses`, a callable by its index in
-/// `callables`, and a [`HitTable`] holds hit groups by their index in `hit_groups`. A stage
+/// `callables` (a record of zeros makes no group), and a [`HitTable`] holds hit groups by their
+/// index in `hit_groups`. A stage
 /// may serve several groups.
 ///
 /// Every stage declares its root with `ORR_ROOT_INLINE` over one root type, or no root.
@@ -118,7 +119,9 @@ pub struct RayPipelineDesc<'a> {
     pub raygens: &'a [ShaderRecord<'a>],
     pub misses: &'a [ShaderRecord<'a>],
     pub hit_groups: &'a [HitGroup],
-    pub callables: &'a [ShaderRecord<'a>],
+    /// By callable index. `None` is a record of zeros, for an index the pipeline's shaders never
+    /// call.
+    pub callables: &'a [Option<ShaderRecord<'a>>],
     /// How deep traces nest: 1 where only raygens trace, 2 where a closest-hit or miss shader
     /// traces too. A raygen's invoke of a hit object counts as its trace's level.
     pub max_recursion: u32,

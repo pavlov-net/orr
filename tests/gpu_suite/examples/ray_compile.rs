@@ -47,7 +47,9 @@ fn create(d: &Device, size: &str, salt: u32, callables: u32, threads: u32) -> (R
         stage("hit", &specs[0]),
     ];
     stages.extend(specs[1..].iter().map(|s| stage(size, s)));
-    let calls: Vec<ShaderRecord<'_>> = (0..callables).map(|i| ShaderRecord::new(3 + i)).collect();
+    let calls: Vec<_> = (0..callables)
+        .map(|i| Some(ShaderRecord::new(3 + i)))
+        .collect();
     let started = Instant::now();
     let p = d
         .create_ray_pipeline(
