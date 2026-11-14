@@ -400,8 +400,8 @@ void want(uint3 id: SV_DispatchThreadID)
     // chain can replace a step's model, and a model past step 0 shows other materials,
     // sections and no pose.
     bool stepped = written && (((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) != near || st.rt_model != inst.model);
-    // A copy that shows another row of hit records (a material set, or runs that moved) takes
-    // its contribution now, so traces through the records never read another row's.
+    // A copy that shows another row of hit records (another material set) takes its contribution
+    // now, so traces through the records never read another row's.
     bool rerun = written && st.rt_run != copy_run(s, inst);
     bool restep = stepped || (written && ((st.rt_flags & RT_FADING) != 0) != fading) || rerun;
     bool has_focus = root.focus_cell.w != 0;

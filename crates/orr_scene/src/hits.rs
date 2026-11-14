@@ -1,19 +1,22 @@
 //! Scenes' hit tables: for one ray tracing pipeline, a hit record per ray type for each run of a
-//! scene's material rows (`runs.slang`), which `sbt.slang` writes from the scene's tables.
+//! scene's material rows (`runs.slang`), which `sbt.slang` writes from the scene's runs. A table
+//! is written where it changed: the runs logged since it last wrote, or all of them when it is
+//! new, has grown, has new handles or a material's hit records changed.
 
 use orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, GpuPtr, Hazards, HitTable, MemoryKind,
     RayPipeline, Stages,
 };
 
+use crate::memory::UploadWindow;
 use crate::shaders::consts::{
-    FIXED_KINDS, FIXED_RUNS, HIT_DATA_BYTES, KIND_LAYER_PATH, KIND_LAYERS, KIND_LIGHT_LAYERS,
+    FIXED_KINDS, HIT_DATA_BYTES, KIND_LAYER_PATH, KIND_LAYERS, KIND_LIGHT_LAYERS,
     KIND_MEDIUM_LAYERS, KIND_MEDIUM_SHADOW, KIND_PATH, KIND_PRODUCER_LAYER_PATH,
     KIND_PRODUCER_PATH, KIND_SHADOW, KIND_STACK_MEET, KIND_STRAND_PATH, KIND_WALK_MEET,
-    PINNED_KINDS, RAY_TYPES,
+    PINNED_KINDS, RAY_TYPES, RUNS_PER_GROUP,
 };
 use crate::shaders::sbt::HitTableRoot;
-use crate::{Error, Result, SceneRoot};
+use crate::{Result, SceneRoot};
 
 /// The hit groups of a ray tracing pipeline that a scene's hit records name, by what each
 /// record serves: a group index of the pipeline, or `None` for records of zeros. A record of
@@ -106,38 +109,15 @@ impl HitGroups {
     }
 }
 
-/// Where a scene's runs start this frame (`SceneRoot::run_*`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct RunLayout {
-    pub(crate) models: u32,
-    pub(crate) sets: u32,
-    pub(crate) producers: u32,
-    pub(crate) pages: u32,
-    pub(crate) count: u32,
-}
-
-impl RunLayout {
-    /// The runs of `models` section materials of the mounts, `sets` material set entries,
-    /// `producers` producer runs and `pages` page material set entries.
-    pub(crate) fn new(models: u32, sets: u32, producers: u32, pages: u32) -> Self {
-        let models_at = FIXED_RUNS;
-        let sets_at = models_at.saturating_add(models);
-        let producers_at = sets_at.saturating_add(sets);
-        let pages_at = producers_at.saturating_add(producers);
-        Self {
-            models: models_at,
-            sets: sets_at,
-            producers: producers_at,
-            pages: pages_at,
-            count: pages_at.saturating_add(pages),
-        }
-    }
-}
-
-/// A scene's hit tables, one per pipeline's handles that a frame asked for.
+/// A scene's hit tables, one per pipeline's handles that a frame asked for, and the runs written
+/// since the oldest of them last wrote.
 #[derive(Default)]
 pub(crate) struct HitTables {
     tables: Vec<Table>,
+    /// Ranges of runs written, from position `logged` on: each table writes those past its own
+    /// position.
+    log: Vec<(u32, u32)>,
+    logged: u64,
 }
 
 struct Table {
@@ -146,8 +126,12 @@ struct Table {
     stride: u64,
     handle_table: Allocation<u8>,
     records: Allocation<u8>,
-    /// Records `records` holds room for.
-    room: u64,
+    /// Runs `records` holds room for.
+    room: u32,
+    /// The log position up to which it holds the runs.
+    applied: u64,
+    /// The material table's hit epoch it holds the runs of.
+    epoch: u64,
     /// The frame that last asked for it.
     used: u64,
 }
@@ -156,31 +140,41 @@ struct Table {
 const KEEP_FRAMES: u64 = 8;
 
 impl HitTables {
-    /// The table of `pipeline`'s `groups` over a scene laid out as `layout` with
-    /// `producer_entries` producer entries, whose root is `root`: written whole by `list`'s next
-    /// work, after the traces before it and before those after it.
+    /// Logs that runs `first..first + count` hold other records from the frame's update on.
+    pub(crate) fn note(&mut self, first: u32, count: u32) {
+        if count > 0 && !self.tables.is_empty() {
+            self.log.push((first, count));
+        }
+    }
+
+    /// Drops the tables no frame asked for in [`KEEP_FRAMES`] by `frame`, and the log every
+    /// table left holds.
+    pub(crate) fn retire(&mut self, frame: u64) {
+        self.tables.retain(|t| t.used + KEEP_FRAMES >= frame);
+        let end = self.logged + self.log.len() as u64;
+        let held = self.tables.iter().map(|t| t.applied).min().unwrap_or(end);
+        self.log.drain(..(held - self.logged) as usize);
+        self.logged = held;
+    }
+
+    /// The table of `pipeline`'s `groups` over a scene of `runs` runs (below what an instance's
+    /// 24-bit contribution names, as the scene's run table keeps them), whose root is `root`, at
+    /// material hit epoch `epoch`: what has changed in it is written by `list`'s next work, after
+    /// the traces before it and before those after it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn table(
         &mut self,
         device: &Device,
         list: &mut CommandList<'_>,
-        roots: &dyn Fn(&HitTableRoot) -> Result<GpuPtr<HitTableRoot>>,
-        kernels: [&ComputePipeline; 2],
+        window: &UploadWindow,
+        kernel: &ComputePipeline,
         root: GpuPtr<SceneRoot>,
-        layout: RunLayout,
-        producer_entries: u32,
+        runs: u32,
+        epoch: u64,
         pipeline: &RayPipeline,
         groups: &HitGroups,
         frame: u64,
     ) -> Result<HitTable> {
-        // An instance's contribution, 24 bits, names every run's records or the table is none.
-        let limit = (1u32 << 24) / RAY_TYPES;
-        if layout.count > limit {
-            return Err(Error::Capacity {
-                what: "hit table runs",
-                capacity: limit,
-            });
-        }
         let limits = &device.caps().limits;
         let handle = u64::from(limits.ray_handle_bytes);
         let data = u64::from(HIT_DATA_BYTES);
@@ -196,7 +190,8 @@ impl HitTables {
                     .copy_from_slice(pipeline.hit_handle(g));
             }
         }
-        self.tables.retain(|t| t.used + KEEP_FRAMES >= frame);
+        self.retire(frame);
+        let end = self.logged + self.log.len() as u64;
         let at = match self
             .tables
             .iter()
@@ -222,7 +217,9 @@ impl HitTables {
                         stride,
                         "hit table",
                     )?,
-                    room: 1,
+                    room: 0,
+                    applied: end,
+                    epoch,
                     used: frame,
                 });
                 self.tables.len() - 1
@@ -230,31 +227,74 @@ impl HitTables {
         };
         let t = &mut self.tables[at];
         t.used = frame;
-        let records = u64::from(layout.count) * u64::from(RAY_TYPES);
-        if records > t.room {
-            let room = records.max(2 * t.room);
-            t.records =
-                device.gpu_malloc::<u8>(MemoryKind::DeviceLocal, room * stride, "hit table")?;
+        let mut whole = t.room == 0 || t.epoch != epoch;
+        if runs > t.room {
+            let room = runs.max(2 * t.room);
+            t.records = device.gpu_malloc::<u8>(
+                MemoryKind::DeviceLocal,
+                u64::from(room) * u64::from(RAY_TYPES) * stride,
+                "hit table",
+            )?;
             t.room = room;
+            whole = true;
         }
-        let r = roots(&HitTableRoot {
-            scene: root,
-            records: t.records.gpu().cast(),
-            handles: t.handle_table.gpu().cast(),
-            stride_words: (stride / 4) as u32,
-            handle_words: (handle / 4) as u32,
-            surfaces: groups.surfaces,
-            pins: groups.pins(),
-            _pad: 0,
-        })?;
-        list.barrier(Stages::RAY, Stages::COMPUTE, Hazards::empty());
-        list.dispatch(kernels[0], r, [layout.count.div_ceil(64).max(1), 1, 1]);
-        list.dispatch(kernels[1], r, [producer_entries.max(1), 1, 1]);
-        list.barrier(Stages::COMPUTE, Stages::RAY, Hazards::empty());
-        Ok(HitTable {
+        let mut ranges: Vec<(u32, u32)> = if whole {
+            vec![(0, runs)]
+        } else {
+            self.log[(t.applied - self.logged) as usize..].to_vec()
+        };
+        t.applied = end;
+        t.epoch = epoch;
+        let table = HitTable {
             address: t.records.gpu().address(),
             stride,
-            count: records,
-        })
+            count: u64::from(runs) * u64::from(RAY_TYPES),
+        };
+        let groups_of = split(&mut ranges);
+        if groups_of.is_empty() {
+            return Ok(table);
+        }
+        let (at_ranges, out) = window.slice::<[u32; 2]>(device, groups_of.len() as u32)?;
+        for (o, &(first, count)) in out.iter_mut().zip(&groups_of) {
+            *o = [first, count];
+        }
+        let r = window.put(
+            device,
+            &HitTableRoot {
+                scene: root,
+                records: t.records.gpu().cast(),
+                handles: t.handle_table.gpu().cast(),
+                ranges: at_ranges.cast(),
+                stride_words: (stride / 4) as u32,
+                handle_words: (handle / 4) as u32,
+                surfaces: groups.surfaces,
+                pins: groups.pins(),
+            },
+        )?;
+        list.barrier(Stages::RAY, Stages::COMPUTE, Hazards::empty());
+        list.dispatch(kernel, r, [groups_of.len() as u32, 1, 1]);
+        list.barrier(Stages::COMPUTE, Stages::RAY, Hazards::empty());
+        Ok(table)
     }
+}
+
+/// `ranges` merged where they overlap or touch, cut into the ranges of one workgroup each.
+fn split(ranges: &mut [(u32, u32)]) -> Vec<(u32, u32)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for &(first, count) in ranges.iter().filter(|r| r.1 > 0) {
+        match merged.last_mut() {
+            Some((f, n)) if first <= *f + *n => *n = (*n).max(first + count - *f),
+            _ => merged.push((first, count)),
+        }
+    }
+    merged
+        .into_iter()
+        .flat_map(|(first, count)| {
+            (0..count.div_ceil(RUNS_PER_GROUP)).map(move |k| {
+                let at = k * RUNS_PER_GROUP;
+                (first + at, (count - at).min(RUNS_PER_GROUP))
+            })
+        })
+        .collect()
 }

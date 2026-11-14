@@ -76,24 +76,34 @@ void miss(inout Payload p)
 }
 
 // The rays here take no crossing step.
-struct NoCrossings : ICrossings
+struct NoCrossings : ICrossingKeys
 {
-    void met(float t, uint instance, uint cluster, uint primitive, float2 bary, float3 corners[3]) {}
+    CrossingKey last()
+    {
+        return CrossingKey();
+    }
+
+    CrossingKey committed()
+    {
+        return CrossingKey();
+    }
+
+    void commit(CrossingKey key) {}
 }
 
 [shader("anyhit")]
-void cover_path_hit(inout Payload p, TriangleAttributes a)
+void cover_path_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     TriangleHit h = { a };
     NoCrossings none;
-    any_hit_decides(path_any_hit<Surface>(root.scene, root.view, p.words, h, none));
+    any_hit_decides(path_any_hit<Surface>(root.scene, root.view, p.words, data, h, none));
 }
 
 [shader("anyhit")]
-void cover_shadow_hit(inout Payload p, TriangleAttributes a)
+void cover_shadow_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     TriangleHit h = { a };
-    any_hit_decides(shadow_any_hit<Surface>(root.scene, root.view, p.words, h));
+    any_hit_decides(shadow_any_hit<Surface>(root.scene, root.view, p.words, data, h));
 }
 
 [shader("intersection")]

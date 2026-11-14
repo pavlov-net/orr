@@ -25,7 +25,7 @@ use crate::decals::{self, build_bins};
 use crate::detail::{Detail, Sample};
 use crate::drawn::OpaqueHook;
 use crate::features::SceneFeatures;
-use crate::hits::{HitGroups, RunLayout};
+use crate::hits::HitGroups;
 use crate::lights::LightTables;
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
@@ -1189,7 +1189,8 @@ impl Scenes {
 
     /// A new scene with empty tables.
     pub fn create_scene(&mut self, desc: &SceneDesc) -> Result<SceneId> {
-        let scene = Scene::new(&self.device, desc)?;
+        let seq = self.core.next_seq();
+        let scene = Scene::new(&self.device, desc, seq)?;
         Ok(SceneId(insert(&mut self.core.scenes, scene)))
     }
 
@@ -1984,6 +1985,8 @@ impl<'a> Frame<'a> {
                 "{id:?} has no data for the medium its kernels link: call set_medium"
             );
             cpu.last_update = self.id;
+            scene.sync_model_rows(cpu, device, window, &core.seq, &core.mounts)?;
+            cpu.hits.retire(self.id);
             records.append(&mut cpu.records);
             masks.extend(std::mem::take(&mut cpu.masks));
             for p in cpu.producers.iter().flatten() {
@@ -2111,13 +2114,6 @@ impl<'a> Frame<'a> {
                 cpu.decal_globals = bins.globals;
                 cpu.decals_changed = false;
             }
-            let runs = RunLayout::new(
-                core.mounts.model_materials.capacity(),
-                t.material_sets.capacity(),
-                cpu.producer_run_room,
-                t.page_sets.capacity(),
-            );
-            cpu.runs = runs;
             let root = SceneRoot {
                 instances: t.instances.gpu(),
                 slot_state: t.slot_state.gpu(),
@@ -2173,12 +2169,8 @@ impl<'a> Frame<'a> {
                     + cpu.ptlas.producer_entries()
                     + cpu.ptlas.proxy_entries(),
                 emissive_lists: t.emissive_lists.gpu().cast(),
-                run_models: runs.models,
-                run_sets: runs.sets,
-                run_producers: runs.producers,
-                run_pages: runs.pages,
-                run_count: runs.count,
-                _pad_runs: 0,
+                runs: t.runs.gpu(),
+                model_runs: t.model_runs.gpu(),
             };
             let src = window.put(device, &root)?;
             records.push(Record::values(core.next_seq(), t.root.gpu(), src, 1));
@@ -2758,7 +2750,8 @@ impl<'a> Frame<'a> {
     /// or of a producer entry's materials, and the medium and light proxies' runs) a record per
     /// ray type, the group's handle and the run's `HitData`. Its instances' contributions select
     /// the runs of the rows they show, and a hit's geometry index the run of its section. The
-    /// frame's list writes the table whole, after the traces recorded before the call; a trace
+    /// frame's list writes the records that changed since the table last served a frame, after
+    /// the traces recorded before the call, so a second call in a frame writes nothing; a trace
     /// recorded after it reads this frame's rows and materials. Runs `update_scenes` first when
     /// the consumer did not. Fails with [`Error::NotListed`] for a scene the frame does not list,
     /// whose root and run layout this frame does not write.
@@ -2777,21 +2770,16 @@ impl<'a> Frame<'a> {
         let window = &core.windows[self.window];
         let s = core.scene(scene)?;
         let cpu = &mut *s.cpu.lock().unwrap();
-        let own = &self.pipelines.own;
-        let kernels = [
-            self.pipelines.get(own.hit_runs),
-            self.pipelines.get(own.hit_producer_runs),
-        ];
+        let kernel = self.pipelines.get(self.pipelines.own.hit_runs);
         let list = self.list.as_mut().expect("frame list");
-        let runs = cpu.runs;
         cpu.hits.table(
             device,
             list,
-            &|root| window.put(device, root),
-            kernels,
+            window,
+            kernel,
             s.tables.root.gpu(),
-            runs,
-            s.tables.producers.capacity(),
+            s.tables.runs.capacity(),
+            core.materials.hit_epoch(),
             pipeline,
             groups,
             self.id,

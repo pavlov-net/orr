@@ -84,6 +84,8 @@ public struct InstanceGpu
     public uint first_emissive; // in SceneRoot.emissive, or NO_EMISSIVE
     // Entries from it: one per emissive section rank of its model, then one per caster rank.
     public uint emissive_count;
+    public uint run;           // with a material set, the first run of the row its set shows (`orr_scene.runs`)
+    public uint _pad1;
 }
 
 public float instance_rt_range(InstanceGpu inst)
@@ -425,6 +427,13 @@ public struct ModelGpu
     public uint _pad;
 }
 
+// One run of `SceneRoot.runs` (`orr_scene.runs`' ROW_*).
+public struct RunGpu
+{
+    public uint source;            // by ROW_*: an entry of the table that holds its material, or a producer entry
+    public uint word;              // ROW_*, and a copy's cooked class or a producer's material slot
+}
+
 public struct SceneRoot
 {
     public InstanceGpu* instances;
@@ -478,15 +487,8 @@ public struct SceneRoot
     public uint proxy_capacity;
     public uint light_base;          // PTLAS index of the proxy of LightId 0
     public uint* emissive_lists;     // per entry of `emissive`: an instance entry's gathered list (`gathered_list`)
-    // The runs of the scene's hit tables (orr_scene.runs): the proxies' fixed runs, then from each
-    // of these a run per entry of `model_materials`, `material_sets`, the producer entries' rows
-    // and `page_material_sets`, up to `run_count`.
-    public uint run_models;
-    public uint run_sets;
-    public uint run_producers;
-    public uint run_pages;
-    public uint run_count;
-    public uint _pad_runs;
+    public RunGpu* runs;             // the runs of the scene's hit tables (orr_scene.runs)
+    public uint* model_runs;         // by ModelId: the first run of the model's own row in this scene
 }
 
 // The entry of `SceneRoot.emissive` that producer entry `p` holds; false where the producer

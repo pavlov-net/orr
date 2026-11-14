@@ -104,18 +104,6 @@ public uint launch_shadow_take(PathRoot r, uint slot, uint4 payload, bool hit)
     return (walks ? TAKE_WALKS : 0) | (has(q.flags, SHADOW_VIEW) ? TAKE_VIEW : 0);
 }
 
-// Whether crossing `a` lies before `b`.
-bool crossing_before(CrossingKey a, CrossingKey b)
-{
-    if (a.t != b.t)
-        return a.t < b.t;
-    if (a.instance != b.instance)
-        return a.instance < b.instance;
-    if (a.cluster != b.cluster)
-        return a.cluster < b.cluster;
-    return a.primitive < b.primitive;
-}
-
 // The ray of a step of `slot`'s shadow ray's walk, which looks for the nearest present dielectric
 // past the crossing the walk took last, with the payload its any-hit shaders read. Every step
 // traces the whole ray, since candidates arrive in no order.
@@ -126,40 +114,40 @@ public RayDesc launch_crossing_ray(PathRoot r, uint slot, out uint4 payload)
     none.key.t = positive_infinity();
     store_part<Crossing, CROSSING_WORDS>(crossing_words(r, slot), none);
     PathCover cover = new_path_cover(MASK_DIELECTRIC, COVER_CROSSING, PRESENCE_NONE, 0, shadow_context(q.flags));
-    payload = path_payload(cover);
+    CrossingKey last = load_part<CrossingKey, CROSSED_WORDS>(crossed_words(r, slot));
+    payload = crossing_payload(path_payload(cover).x, last.t);
     return path_ray(q.origin, q.dir, q.t_max);
 }
 
-// Keeps a present dielectric candidate of a step of `slot`'s shadow ray's walk where it is the
-// nearest so far past the walk's last crossing.
-void keep_crossing(PathRoot r, uint slot, float t, uint instance, uint cluster, uint primitive, float2 bary, float3 corners[3])
-{
-    CrossingKey key = { t, instance, cluster, primitive };
-    if (!crossing_before(load_part<CrossingKey, CROSSED_WORDS>(crossed_words(r, slot)), key))
-        return;
-    uint4* at = crossing_words(r, slot);
-    Crossing best = load_part<Crossing, CROSSING_WORDS>(at);
-    if (!crossing_before(key, best.key))
-        return;
-    Crossing c = { key, bary, corners };
-    store_part<Crossing, CROSSING_WORDS>(at, c);
-}
-
-// Where a step of `slot`'s shadow ray's walk keeps the crossings it meets (`keep_crossing`).
-public struct SlotCrossings : ICrossings
+// Where a step of `slot`'s shadow ray's walk at candidate `h` reads the walk's last crossing and
+// keeps the one it commits, with the hit's barycentrics and corners the window resolves.
+public struct SlotCrossings<H : IHit> : ICrossingKeys
 {
     public PathRoot r;
     public uint slot;
+    public H h;
 
-    public void met(float t, uint instance, uint cluster, uint primitive, float2 bary, float3 corners[3])
+    public CrossingKey last()
     {
-        keep_crossing(r, slot, t, instance, cluster, primitive, bary, corners);
+        return load_part<CrossingKey, CROSSED_WORDS>(crossed_words(r, slot));
+    }
+
+    public CrossingKey committed()
+    {
+        return load_part<CrossingKey, CROSSED_WORDS>(crossing_words(r, slot));
+    }
+
+    public void commit(CrossingKey key)
+    {
+        float3 corners[3] = { h.corner(0), h.corner(1), h.corner(2) };
+        Crossing c = { key, h.barycentrics(), corners };
+        store_part<Crossing, CROSSING_WORDS>(crossing_words(r, slot), c);
     }
 }
 
-public SlotCrossings slot_crossings(PathRoot r, uint slot)
+public SlotCrossings<H> slot_crossings<H : IHit>(PathRoot r, uint slot, H h)
 {
-    SlotCrossings c = { r, slot };
+    SlotCrossings<H> c = { r, slot, h };
     return c;
 }
 

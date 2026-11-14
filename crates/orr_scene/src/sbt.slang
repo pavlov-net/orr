@@ -1,8 +1,7 @@
 // A scene's hit table for one ray tracing pipeline: per run, a record per ray type, each the
-// handle of the pipeline's group for what the run serves and the run's `HitData`. A run is one
-// section of a material row: `runs` writes those whose material an array of the scene's tables
-// names, `producer_runs` an entry's. Records of unused runs stay as they were: no instance's
-// contribution names them.
+// handle of the pipeline's group for what the run serves and the run's `HitData`. The host writes
+// the runs a table has not seen yet, by ranges: those of rows made, changed or gone since it last
+// wrote, or all of them. A run no row holds writes a record of zeros, which runs no shader.
 //
 // A run's path and shadow groups are its geometry's (a copy's cooked or skinned clusters, a
 // producer's clusters, strands) for its material's linked surface: the pipeline holds those
@@ -37,16 +36,19 @@ import orr_scene.tables;
 // No group: a record of zeros.
 static const uint SLOT_NONE = 0xffffffff;
 
+// The runs one workgroup of `runs` writes at most: a range of the table's dispatch.
+[Host] public static const uint RUNS_PER_GROUP = 4096;
+
 public struct HitTableRoot
 {
     public SceneRoot* scene;
     public uint* records;           // the table
     public uint* handles;           // FIXED_KINDS + PINNED_KINDS * pins handles of `handle_words` words, zero for none
+    public uint2* ranges;           // per workgroup, the first run it writes and how many, RUNS_PER_GROUP at most
     public uint stride_words;       // a record's
     public uint handle_words;
     public uint surfaces;           // linked surface types, ids 1 to `surfaces`
     public uint pins;               // 1 where none link, else `surfaces` + 2
-    public uint64_t _pad;
 }
 ORR_ROOT(HitTableRoot);
 
@@ -95,62 +97,60 @@ void write_run(uint run, uint3 slots, HitData data)
         d[0] = data.material;
         d[1] = data.flags;
         d[2] = data.back;
-        d[3] = data._spare;
+        d[3] = data.attributes;
     }
 }
 
-// One thread per run outside the producer rows.
-[shader("compute")]
-[numthreads(64, 1, 1)]
-void runs(uint3 id: SV_DispatchThreadID)
+// The records of run `run` as `SceneRoot.runs` describes it.
+void write_records(SceneRoot* s, uint run)
 {
-    SceneRoot* s = root.scene;
-    uint run = id.x;
-    if (run >= s.run_count || (run >= s.run_producers && run < s.run_pages))
-        return;
-    if (run == RUN_MEDIUM)
+    RunGpu g = s.runs[run];
+    uint kind = g.word & ROW_KIND_MASK;
+    uint3 none = uint3(SLOT_NONE);
+    if (kind == ROW_NONE)
     {
-        write_run(run, uint3(SLOT_NONE, KIND_MEDIUM_SHADOW, KIND_MEDIUM_LAYERS), proxy_data(CLASS_MEDIUM));
-        return;
-    }
-    if (run == RUN_LIGHT)
-    {
-        write_run(run, uint3(SLOT_NONE, SLOT_NONE, KIND_LIGHT_LAYERS), proxy_data(CLASS_LIGHT));
+        write_run(run, none, proxy_data(CLASS_OPAQUE));
         return;
     }
-    if (run == RUN_WALK)
+    if (kind == ROW_FIXED)
     {
-        write_run(run, uint3(KIND_WALK_MEET, KIND_STACK_MEET, SLOT_NONE), proxy_data(CLASS_OPAQUE));
+        if (run == RUN_MEDIUM)
+            write_run(run, uint3(SLOT_NONE, KIND_MEDIUM_SHADOW, KIND_MEDIUM_LAYERS), proxy_data(CLASS_MEDIUM));
+        else if (run == RUN_LIGHT)
+            write_run(run, uint3(SLOT_NONE, SLOT_NONE, KIND_LIGHT_LAYERS), proxy_data(CLASS_LIGHT));
+        else
+            write_run(run, uint3(KIND_WALK_MEET, KIND_STACK_MEET, SLOT_NONE), proxy_data(CLASS_OPAQUE));
         return;
     }
     uint material;
-    if (run < s.run_sets)
-        material = s.model_materials[run - s.run_models];
-    else if (run < s.run_producers)
-        material = s.material_sets[run - s.run_sets];
+    uint class_id;
+    uint attributes = 0;
+    uint path = KIND_PATH;
+    if (kind == ROW_PRODUCER)
+    {
+        // The entry's record and its row change together, a run per material.
+        ProducerGpu p = s.producers[g.source];
+        material = p.materials[g.word >> ROW_SLOT_SHIFT];
+        class_id = p.opacity == PRODUCER_SECTIONS ? material_class(s.materials + material) : p.class_id;
+        path = p.strands != 0 ? KIND_STRAND_PATH : KIND_PRODUCER_PATH;
+    }
     else
-        material = s.page_material_sets[run - s.run_pages];
-    uint class_id = material == MATERIAL_NONE ? CLASS_OPAQUE : material_class(s.materials + material);
+    {
+        material = kind == ROW_MODEL ? s.model_materials[g.source] : kind == ROW_SET ? s.material_sets[g.source] : s.page_material_sets[g.source];
+        class_id = (g.word >> ROW_CLASS_SHIFT) & HIT_CLASS_MASK;
+        attributes = (g.word >> ROW_ATTRIBUTES_SHIFT) & 0xff;
+    }
     uint pin = material_pin(s, material);
-    write_run(run, uint3(pinned(path_kind(KIND_PATH, class_id), pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), hit_data(s, material, class_id));
+    HitData data = hit_data(s, material, class_id, (g.word & ROW_SOLID) != 0, attributes);
+    write_run(run, uint3(pinned(path_kind(path, class_id), pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), data);
 }
 
-// One workgroup per producer entry, a thread per material of a set entry.
+// One workgroup per range of runs.
 [shader("compute")]
 [numthreads(64, 1, 1)]
-void producer_runs(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
+void runs(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
 {
-    SceneRoot* s = root.scene;
-    uint entry = group.x;
-    if (entry >= s.producer_capacity)
-        return;
-    ProducerGpu p = s.producers[entry];
-    uint path = p.strands != 0 ? KIND_STRAND_PATH : KIND_PRODUCER_PATH;
-    for (uint slot = t; slot < p.material_count; slot += 64)
-    {
-        uint material = p.materials[slot];
-        uint class_id = p.opacity == PRODUCER_SECTIONS ? material_class(s.materials + material) : p.class_id;
-        uint pin = material_pin(s, material);
-        write_run(s.run_producers + p.runs + slot, uint3(pinned(path_kind(path, class_id), pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), hit_data(s, material, class_id));
-    }
+    uint2 range = root.ranges[group.x];
+    for (uint k = t; k < range.y; k += 64)
+        write_records(root.scene, range.x + k);
 }

@@ -205,7 +205,6 @@ pub(crate) struct Own {
     pub(crate) page_motion: PipelineId,
     /// `sbt.slang`'s writers of a hit table's runs and of its producer rows.
     pub(crate) hit_runs: PipelineId,
-    pub(crate) hit_producer_runs: PipelineId,
 }
 
 pub(crate) struct Pipelines {
@@ -235,7 +234,6 @@ impl Pipelines {
                 animate: PipelineId(0),
                 composite: PipelineId(0),
                 hit_runs: PipelineId(0),
-                hit_producer_runs: PipelineId(0),
             },
         };
         let none = SpecData::default();
@@ -252,7 +250,6 @@ impl Pipelines {
             animate: p.create(device, kernels, &animation::MODULE, "animate", none)?,
             composite: p.create(device, kernels, &transparency::MODULE, "composite", none)?,
             hit_runs: p.create(device, kernels, &sbt::MODULE, "runs", none)?,
-            hit_producer_runs: p.create(device, kernels, &sbt::MODULE, "producer_runs", none)?,
         };
         Ok(p)
     }

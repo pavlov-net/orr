@@ -335,16 +335,6 @@ public struct LaunchInterior
     public float3 start;
 }
 
-// A shadow ray's dielectric candidate, by its distance and then its ids, which orders crossings
-// at one distance too.
-public struct CrossingKey
-{
-    public float t;
-    public uint instance;
-    public uint cluster;
-    public uint primitive;
-}
-
 // The nearest crossing a step of a shadow ray's walk found past the last it took.
 public struct Crossing
 {

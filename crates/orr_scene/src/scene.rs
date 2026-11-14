@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use bytemuck::{Pod, Zeroable};
 use orr_gpu::{Allocation, Device, GpuAddress, GpuPtr, KernelSet, MemoryKind, MemoryPriority};
 use orr_math::{DVec3, IVec3};
+use orr_pack::mesh::{Section, SurfaceClass};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::decals::{Bins, Decal, DecalId, Listing, decal_gpu, listing};
@@ -17,12 +18,17 @@ use crate::lights::{
 use crate::material::{MaterialId, MaterialTable};
 use crate::medium_proxy::{MediumProxy, MediumProxyId, proxy_gpu};
 use crate::memory::{RangeAllocator, UploadWindow};
-use crate::mount::{InstancePage, Mounts, PageId, PagePrototype};
+use crate::mount::{InstancePage, ModelRow, Mounts, PageId, PagePrototype};
 use crate::producer::{self, Opacity, Producer, ProducerDesc, ProducerId, ProducerUpdate};
 use crate::producer_blocks::ClusterBlocks;
 use crate::ptlas::{CopyRuns, Ptlas, run_class};
+use crate::shaders::consts::{
+    FIXED_RUNS, RAY_TYPES, ROW_ATTRIBUTES_SHIFT, ROW_CLASS_SHIFT, ROW_FIXED, ROW_MODEL, ROW_PAGE,
+    ROW_PRODUCER, ROW_SET, ROW_SLOT_SHIFT, ROW_SOLID,
+};
 use crate::shaders::emissive::EmissiveBlock;
 use crate::shaders::instance_page::{PageEntriesGpu, PagePrototypeGpu};
+use crate::shaders::types::RunGpu;
 use crate::skin::{CopyArrays, SkinFrame, SkinnedDesc};
 use crate::subd::{self, ModelCage, SubdBuild, SubdDesc};
 use crate::table::{Column, Table, TableCopy, grown, grown_to_hold};
@@ -324,6 +330,12 @@ pub(crate) struct Tables {
     pub(crate) material_sets: Column<MaterialId>,
     /// The material sets of placed pages' prototypes, below the 2^31 a base names.
     pub(crate) page_sets: Table<MaterialId>,
+    /// The runs of the scene's hit tables (`orr_scene.runs`), by run: the fixed runs, then each
+    /// row's from when it was made until it goes. Below what an instance's 24-bit contribution
+    /// names.
+    pub(crate) runs: Table<RunGpu>,
+    /// By `ModelId`, the first of the model's own runs (`model_rows`).
+    pub(crate) model_runs: Column<u32>,
     /// By `LightId`: an entry for every id set.
     pub(crate) lights: Column<LightGpu>,
     /// The entries of producers and of copies, from one allocator. By entry, like
@@ -578,6 +590,8 @@ pub(crate) struct PagePlacement {
     pub(crate) sets: (u32, u32),
     /// Per prototype, its model, its records and the class of the body run each copy may hold.
     pub(crate) runs: Vec<(u32, u32, Option<u8>)>,
+    /// The set rows its prototypes with a material set show.
+    pub(crate) rows: Vec<SetKey>,
 }
 
 impl PagePlacement {
@@ -672,8 +686,10 @@ struct SlotHold {
     /// Its entries of the emissive list; none on a page, which holds its copies' entries.
     first_entry: u32,
     entries: u32,
-    /// Its copy's `InstanceGpu::material_base`.
+    /// Its copy's `InstanceGpu::material_base`, and with a base the set its variant shows: the
+    /// set row it holds.
     material_base: u32,
+    set: u8,
 }
 
 impl SlotHold {
@@ -686,8 +702,40 @@ impl SlotHold {
             first_entry: 0,
             entries: 0,
             material_base: NO_MATERIAL_SET,
+            set: 0,
         }
     }
+
+    /// The set row it holds, if any.
+    fn row(&self) -> Option<SetKey> {
+        (self.material_base != NO_MATERIAL_SET).then_some((
+            self.model,
+            self.material_base,
+            self.set,
+        ))
+    }
+}
+
+/// A row of runs that copies with a material set show: of a model's sections, from a base of
+/// the consumer's material sets or with PAGE_MATERIAL_SET of the pages', at one set.
+type SetKey = (u32, u32, u8);
+
+/// A row of runs and what holds it.
+pub(crate) struct SetRow {
+    first: u32,
+    count: u32,
+    /// The copies and pages that show it.
+    refs: u32,
+    /// A section of its model cooked as a dielectric, which may show a set's material that bounds
+    /// no interior.
+    glass: bool,
+}
+
+/// A model's own row of runs in a scene, from `Mounts::rows`' row made at `made`.
+pub(crate) struct ModelRows {
+    first: u32,
+    count: u32,
+    made: u64,
 }
 
 impl SceneCpu {
@@ -711,6 +759,10 @@ impl SceneCpu {
         }
         if self.hung || self.skinned_high_water > 0 {
             out |= crate::SceneFeatures::SKINNING;
+        }
+        // A set shows what the consumer writes into it, which no record of it here vouches for.
+        if self.glass_rows > 0 {
+            out |= crate::SceneFeatures::THIN_DIELECTRICS;
         }
         out
     }
@@ -745,11 +797,14 @@ pub(crate) struct SceneCpu {
     pub(crate) producers: Vec<Option<Producer>>,
     /// Entries of the producer table.
     pub(crate) producer_entries: RangeAllocator,
-    /// The producer entries' rows of hit table runs, `producer_run_room` of them.
-    pub(crate) producer_runs: RangeAllocator,
-    pub(crate) producer_run_room: u32,
-    /// Where this frame's runs start, as `SceneRoot` holds them.
-    pub(crate) runs: crate::hits::RunLayout,
+    /// The runs of each resident model's own materials, by `ModelId`, as of `Mounts::rows_epoch`
+    /// `rows_epoch`.
+    model_rows: FxHashMap<u32, ModelRows>,
+    rows_epoch: u64,
+    /// The rows of material sets copies show, and how many of them are over sections cooked
+    /// as dielectrics.
+    set_rows: FxHashMap<SetKey, SetRow>,
+    glass_rows: u32,
     /// The hit tables frames asked for.
     pub(crate) hits: crate::hits::HitTables,
     /// The entry each of the consumer's producers holds, by `ProducerId`.
@@ -1119,6 +1174,184 @@ impl Scene {
             .expect("the grown tables have a free run of `count`"))
     }
 
+    /// The first of `rows.len()` runs taken for a row whose runs serve `rows`, written in the
+    /// frame's update with sequence `seq`. Fails, taking none, past what the runs can hold or
+    /// without memory.
+    fn take_runs(
+        &self,
+        cpu: &mut SceneCpu,
+        device: &Device,
+        window: &UploadWindow,
+        seq: u64,
+        rows: &[RunGpu],
+    ) -> Result<u32> {
+        let n = rows.len() as u32;
+        let (src, out) = window.slice::<RunGpu>(device, n)?;
+        let first = self.tables.runs.alloc(device, n)?;
+        out.copy_from_slice(rows);
+        cpu.records
+            .push(Record::values(seq, self.tables.runs.entry(first), src, n));
+        cpu.hits.note(first, n);
+        Ok(first)
+    }
+
+    /// Gives back `count` runs from `first`, which serve nothing from the frame's update on.
+    fn free_runs(&self, cpu: &mut SceneCpu, seq: u64, first: u32, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let at = self.tables.runs.entry(first).address().0;
+        cpu.records
+            .push(Record::fill(seq, at, count * words(size_of::<RunGpu>()), 0));
+        self.tables.runs.free(first, count);
+        cpu.hits.note(first, count);
+    }
+
+    /// One more hold of `refs` on the set row of `key`, over `sections` sections of a model whose
+    /// own row is `model`, which takes its runs the first time: its first run.
+    #[allow(clippy::too_many_arguments)]
+    fn hold_set_row(
+        &self,
+        cpu: &mut SceneCpu,
+        device: &Device,
+        window: &UploadWindow,
+        seq: u64,
+        key: SetKey,
+        sections: u32,
+        model: &ModelRow,
+        refs: u32,
+    ) -> Result<u32> {
+        if let Some(row) = cpu.set_rows.get_mut(&key) {
+            row.refs += refs;
+            return Ok(row.first);
+        }
+        let (_, base, set) = key;
+        let (kind, base) = if base & PAGE_MATERIAL_SET != 0 {
+            (ROW_PAGE, base & !PAGE_MATERIAL_SET)
+        } else {
+            (ROW_SET, base)
+        };
+        let at = base + u32::from(set) * sections;
+        let rows: Vec<RunGpu> = (0..sections)
+            .map(|i| RunGpu {
+                source: at + i,
+                word: kind | copy_word(model, i),
+            })
+            .collect();
+        let first = self.take_runs(cpu, device, window, seq, &rows)?;
+        let glass = model
+            .cooked
+            .iter()
+            .any(|&c| SurfaceClass::from_flags(c) == Some(SurfaceClass::Dielectric));
+        cpu.glass_rows += u32::from(glass);
+        cpu.set_rows.insert(
+            key,
+            SetRow {
+                first,
+                count: sections,
+                refs,
+                glass,
+            },
+        );
+        Ok(first)
+    }
+
+    /// Drops `refs` holds on the set row of `key`; the last frees its runs.
+    fn release_set_row(&self, cpu: &mut SceneCpu, seq: u64, key: SetKey, refs: u32) {
+        let row = cpu.set_rows.get_mut(&key).expect("a held set row");
+        row.refs -= refs;
+        if row.refs == 0 {
+            let (first, count) = (row.first, row.count);
+            cpu.glass_rows -= u32::from(row.glass);
+            cpu.set_rows.remove(&key);
+            self.free_runs(cpu, seq, first, count);
+        }
+    }
+
+    /// Logs the set rows that read entries `first..first + count` of the consumer's material
+    /// sets, which a write changed.
+    fn note_material_sets(cpu: &mut SceneCpu, first: u32, count: u32) {
+        let end = u64::from(first) + u64::from(count);
+        let rows: Vec<(u32, u32)> = cpu
+            .set_rows
+            .iter()
+            .filter(|((_, base, set), row)| {
+                let at = u64::from(*base) + u64::from(*set) * u64::from(row.count);
+                base & PAGE_MATERIAL_SET == 0
+                    && at < end
+                    && u64::from(first) < at + u64::from(row.count)
+            })
+            .map(|(_, row)| (row.first, row.count))
+            .collect();
+        for (first, count) in rows {
+            cpu.hits.note(first, count);
+        }
+    }
+
+    /// Gives every model of `mounts.rows` its own row of runs and takes them from the models it
+    /// no longer holds, where those changed since the scene last looked, with records in the
+    /// order of `seq`.
+    pub(crate) fn sync_model_rows(
+        &self,
+        cpu: &mut SceneCpu,
+        device: &Device,
+        window: &UploadWindow,
+        seq: &AtomicU64,
+        mounts: &Mounts,
+    ) -> Result<()> {
+        let next = || seq.fetch_add(1, Ordering::Relaxed);
+        if cpu.rows_epoch == mounts.rows_epoch {
+            return Ok(());
+        }
+        self.tables
+            .model_runs
+            .reserve(device, mounts.models.capacity())?;
+        let gone: Vec<u32> = cpu
+            .model_rows
+            .iter()
+            .filter(|(m, r)| {
+                mounts
+                    .rows
+                    .get(&ModelId(**m))
+                    .is_none_or(|row| row.made != r.made)
+            })
+            .map(|(&m, _)| m)
+            .collect();
+        for m in gone {
+            let r = cpu.model_rows.remove(&m).expect("listed above");
+            self.free_runs(cpu, next(), r.first, r.count);
+        }
+        for (model, row) in &mounts.rows {
+            if cpu.model_rows.contains_key(&model.0) {
+                continue;
+            }
+            let rows: Vec<RunGpu> = (0..row.cooked.len() as u32)
+                .map(|i| RunGpu {
+                    source: row.materials + i,
+                    word: ROW_MODEL | copy_word(row, i),
+                })
+                .collect();
+            let first = self.take_runs(cpu, device, window, next(), &rows)?;
+            let src = window.put(device, &first)?;
+            cpu.records.push(Record::values(
+                next(),
+                self.tables.model_runs.entry(model.0),
+                src,
+                1,
+            ));
+            cpu.model_rows.insert(
+                model.0,
+                ModelRows {
+                    first,
+                    count: rows.len() as u32,
+                    made: row.made,
+                },
+            );
+        }
+        cpu.rows_epoch = mounts.rows_epoch;
+        Ok(())
+    }
+
     /// Gives back `count` skinned-copy entries from `first`, which the PTLAS counts no more.
     pub(crate) fn free_skinned(&self, cpu: &mut SceneCpu, first: u32, count: u32) {
         cpu.skinned.free(first, count);
@@ -1139,6 +1372,8 @@ impl Scene {
         self.tables.groups.land(frame, copies, records);
         self.tables.material_sets.land(frame, copies, records);
         self.tables.page_sets.land(frame, copies, records);
+        self.tables.runs.land(frame, copies, records);
+        self.tables.model_runs.land(frame, copies, records);
         self.tables.decals.land(frame, copies, records);
         self.tables.skinned.land(frame, copies, records);
         self.tables.skin_state.land(frame, copies, records);
@@ -1161,6 +1396,8 @@ impl Scene {
         self.tables.groups.retire(completed);
         self.tables.material_sets.retire(completed);
         self.tables.page_sets.retire(completed);
+        self.tables.runs.retire(completed);
+        self.tables.model_runs.retire(completed);
         self.tables.decals.retire(completed);
         self.tables.skinned.retire(completed);
         self.tables.skin_state.retire(completed);
@@ -1214,6 +1451,9 @@ impl Scene {
             for &(model, records, body) in &p.runs {
                 cpu.leave_copies(model, body, records);
             }
+            for &key in &p.rows {
+                self.release_set_row(cpu, seq, key, 1);
+            }
             self.clear_group(cpu, frame, p.group, seq);
             let n = page_entries(&p.entries);
             if n > 0 {
@@ -1256,8 +1496,12 @@ impl Scene {
             };
             cpu.skins_removed.push((frame, entry, n, arrays));
         }
+        let mut rows: FxHashMap<SetKey, u32> = FxHashMap::default();
         let holds = &mut cpu.slot_holds[range.first as usize..end as usize];
         for hold in holds {
+            if let Some(key) = hold.row() {
+                *rows.entry(key).or_default() += 1;
+            }
             match entries.last_mut() {
                 Some((first, count)) if *first + *count == hold.first_entry => {
                     *count += hold.entries;
@@ -1272,6 +1516,9 @@ impl Scene {
             let n = count * words(size_of::<EmissiveGpu>());
             cpu.records.push(Record::fill(seq, at, n, 0));
             cpu.emissive_removed.push((frame, entry, count));
+        }
+        for (key, refs) in rows {
+            self.release_set_row(cpu, seq, key, refs);
         }
     }
 
@@ -1407,7 +1654,7 @@ impl Scene {
                 model,
                 first_entry: first,
                 entries: stride,
-                material_base: hold.material_base,
+                ..hold
             };
             cpu.entry_jobs.push([slot, first, stride, 0]);
         }
@@ -1447,11 +1694,21 @@ impl Scene {
             .filter(|p| holds(p.0))
             .map(|p| p.1)
             .collect();
+        // A page's slots leave the rows they hold here, and hold no gone model below.
+        let mut rows: FxHashMap<SetKey, u32> = FxHashMap::default();
         for &r in &ranges {
             let slots = r.first as usize..(r.first + r.count) as usize;
-            cpu.slot_holds[slots]
-                .iter_mut()
-                .for_each(|h| h.model = NO_MODEL);
+            for h in &mut cpu.slot_holds[slots] {
+                if let Some(key) = h.row() {
+                    *rows.entry(key).or_default() += 1;
+                }
+                h.model = NO_MODEL;
+                h.material_base = NO_MATERIAL_SET;
+            }
+        }
+        let released = seq.fetch_add(1, Ordering::Relaxed);
+        for (key, refs) in rows {
+            self.release_set_row(cpu, released, key, refs);
         }
         let held = |&(_, h): &(usize, &SlotHold)| gone.contains(&h.model);
         let mut run: Option<InstanceRange> = None;
@@ -1488,7 +1745,7 @@ impl Scene {
         let Some(old) = cpu.producers[i].take() else {
             return;
         };
-        free_producer_runs(cpu, old.runs.0, old.runs.1);
+        self.free_runs(cpu, seq, old.runs.0, old.runs.1);
         let t = &self.tables;
         let at = i as u32;
         let state = t.producer_state.entry(at).address().0;
@@ -1651,7 +1908,9 @@ impl Scene {
             .expect("the grown list has a free run of `count`"))
     }
 
-    pub(crate) fn new(device: &Device, desc: &SceneDesc) -> Result<Self> {
+    /// A scene whose first records take sequence `seq`, after the zeroing of the tables they
+    /// write.
+    pub(crate) fn new(device: &Device, desc: &SceneDesc, seq: u64) -> Result<Self> {
         let dl = MemoryKind::DeviceLocal;
         let tables = Tables {
             root: device.gpu_malloc(dl, 1, "scene root")?,
@@ -1659,14 +1918,20 @@ impl Scene {
             slot_state: Column::new(device, MemoryPriority::Normal, "slot state", true)?,
             groups: Column::new(device, MemoryPriority::Normal, "transform groups", true)?,
             material_sets: Column::new(device, MemoryPriority::Normal, "material sets", true)?,
-            // Hit tables read every entry up to the capacity as a material, free ones too.
             page_sets: Table::below(
                 device,
                 MemoryPriority::Normal,
                 "page material sets",
                 PAGE_MATERIAL_SET,
+            )?,
+            runs: Table::below(
+                device,
+                MemoryPriority::Normal,
+                "hit table runs",
+                (1 << 24) / RAY_TYPES,
             )?
             .zeroed(),
+            model_runs: Column::new(device, MemoryPriority::Normal, "model runs", false)?,
             lights: Column::new(device, MemoryPriority::Normal, "lights", true)?,
             emissive: Column::new(device, MemoryPriority::Normal, "emissive list", true)?,
             emissive_lists: Column::new(
@@ -1690,12 +1955,21 @@ impl Scene {
         tables.groups.reserve(device, 1)?;
         // The sky statistics start zeroed, before any write (sequence 0).
         let sky = &tables.sky_stats;
-        let records = vec![Record::fill(
+        let mut records = vec![Record::fill(
             0,
             sky.gpu().address().0,
             words(sky.size() as usize),
             0,
         )];
+        // The fixed runs, by their index.
+        let fixed = tables.runs.alloc(device, FIXED_RUNS)?;
+        records.push(Record {
+            seq,
+            dst: tables.runs.entry(fixed).address().0 + std::mem::offset_of!(RunGpu, word) as u64,
+            count: FIXED_RUNS,
+            stride: words(size_of::<RunGpu>()),
+            op: Op::Fill(ROW_FIXED),
+        });
         Ok(Self {
             desc: *desc,
             tables,
@@ -1713,9 +1987,10 @@ impl Scene {
                 entry_jobs: Vec::new(),
                 producers: Vec::new(),
                 producer_entries: RangeAllocator::new(0),
-                producer_runs: RangeAllocator::new(0),
-                producer_run_room: 0,
-                runs: crate::hits::RunLayout::default(),
+                model_rows: FxHashMap::default(),
+                rows_epoch: 0,
+                set_rows: FxHashMap::default(),
+                glass_rows: 0,
                 hits: crate::hits::HitTables::default(),
                 producer_ids: FxHashMap::default(),
                 producers_removed: Vec::new(),
@@ -2016,7 +2291,7 @@ impl<'f> SceneWriter<'f> {
         } else {
             0
         };
-        let (first, entry, partitions, table) = {
+        let (first, entry, partitions, table, run) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
             let cell = cpu
                 .groups
@@ -2039,6 +2314,14 @@ impl<'f> SceneWriter<'f> {
                     return Err(e);
                 }
             };
+            let run = match self.hold_row(cpu, desc.model, desc.material_set, 0, desc.copies) {
+                Ok(run) => run,
+                Err(e) => {
+                    cpu.slots.free(first, desc.copies);
+                    cpu.emissive.free(entry, desc.copies * ranks);
+                    return Err(e);
+                }
+            };
             let slots = first as usize..(first + desc.copies) as usize;
             cpu.slot_runs[slots.clone()].fill((desc.model.0, body));
             cpu.hold_copies(desc.model.0, model.chained, body, desc.copies);
@@ -2049,10 +2332,11 @@ impl<'f> SceneWriter<'f> {
                     first_entry: entry + copy * ranks,
                     entries: ranks,
                     material_base: desc.material_set.unwrap_or(NO_MATERIAL_SET),
+                    set: 0,
                 };
             }
             let partitions = cpu.ptlas.place(first, desc.copies, cell, cost);
-            (first, entry, partitions, cpu.ptlas.slot_table.gpu())
+            (first, entry, partitions, cpu.ptlas.slot_table.gpu(), run)
         };
         partitions_out.copy_from_slice(&partitions);
         self.push(Record::values(
@@ -2105,6 +2389,8 @@ impl<'f> SceneWriter<'f> {
                 debug_lod: 0,
                 user_tag: desc.user_tag,
                 variant: 0,
+                run,
+                _pad1: 0,
             };
         }
         self.reset_slot_state(range);
@@ -2226,6 +2512,42 @@ impl<'f> SceneWriter<'f> {
                 return Err(e);
             }
         };
+        // Each prototype with a material set shows its row: the consumer's named one or the
+        // page's own set from `set_base` on.
+        let first_set = PAGE_MATERIAL_SET | set_base;
+        let mut bases = Vec::with_capacity(protos.len());
+        let mut at = 0;
+        for (p, &named) in protos.iter().zip(named) {
+            bases.push(match (named, &p.sets) {
+                (Some(base), _) => base,
+                (None, Some(set)) => {
+                    at += set.len();
+                    first_set + (at - set.len()) as u32
+                }
+                (None, None) => NO_MATERIAL_SET,
+            });
+        }
+        let mut rows: Vec<SetKey> = Vec::new();
+        let mut runs_of = Vec::with_capacity(protos.len());
+        for (p, &base) in protos.iter().zip(&bases) {
+            let base = (base != NO_MATERIAL_SET).then_some(base);
+            match self.hold_row(cpu, p.model, base, 0, 1) {
+                Ok(run) => {
+                    runs_of.push(run);
+                    rows.extend(base.map(|b| (p.model.0, b, 0)));
+                }
+                Err(e) => {
+                    let seq = self.next_seq();
+                    for key in rows {
+                        self.scene.release_set_row(cpu, seq, key, 1);
+                    }
+                    cpu.slots.free(first, count);
+                    self.scene.tables.page_sets.free(set_base, set_entries);
+                    cpu.emissive.free(entry, emissive);
+                    return Err(e);
+                }
+            }
+        }
         if emissive > 0 {
             let at = self.scene.emissive_entry(entry).address().0;
             let n = emissive * words(size_of::<EmissiveGpu>());
@@ -2234,20 +2556,15 @@ impl<'f> SceneWriter<'f> {
         cpu.slot_holds[first as usize..(first + count) as usize].fill(SlotHold::FREE);
 
         let mut copies = Vec::with_capacity(protos.len());
-        let first_set = PAGE_MATERIAL_SET | set_base;
         let mut at = 0;
-        for (p, &named) in protos.iter().zip(named) {
-            let base = match (named, &p.sets) {
-                (Some(base), _) => base,
-                (None, Some(set)) => {
-                    for (o, m) in sets_out[at..at + set.len()].iter_mut().zip(set) {
-                        *o = m.0;
-                    }
-                    at += set.len();
-                    first_set + (at - set.len()) as u32
+        for ((p, &named), (&base, &run)) in protos.iter().zip(named).zip(bases.iter().zip(&runs_of))
+        {
+            if let (None, Some(set)) = (named, &p.sets) {
+                for (o, m) in sets_out[at..at + set.len()].iter_mut().zip(set) {
+                    *o = m.0;
                 }
-                (None, None) => NO_MATERIAL_SET,
-            };
+                at += set.len();
+            }
             let pose = r.poses.iter().find(|(m, _)| *m == p.model).map(|&(_, q)| q);
             let flags = if p.flags == 0 {
                 r.flags.0
@@ -2277,6 +2594,8 @@ impl<'f> SceneWriter<'f> {
                     variant: u32::from(p.pose) | u32::from(p.mask) << 16,
                     first_emissive: NO_EMISSIVE,
                     emissive_count: 0,
+                    run,
+                    _pad1: 0,
                 },
                 records: p.records,
                 _pad: [0; 3],
@@ -2319,6 +2638,7 @@ impl<'f> SceneWriter<'f> {
             entries_stale: false,
             sets: (set_base, set_entries),
             runs: part_runs,
+            rows,
         });
         slots_out.copy_from_slice(&partitions);
         cpu.records.push(Record::values(
@@ -2634,7 +2954,7 @@ impl<'f> SceneWriter<'f> {
             .window
             .slice::<SkinStateGpu>(self.device, desc.copies)?;
         let body = model.body_run(true);
-        let (first, entry, emissive) = {
+        let (first, entry, emissive, run) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
             let runs = cpu.copy_runs(desc.model.0, model.chained, body);
             cpu.ptlas.check_runs([(runs, desc.copies)])?;
@@ -2657,6 +2977,15 @@ impl<'f> SceneWriter<'f> {
                     return Err(e);
                 }
             };
+            let run = match self.hold_row(cpu, desc.model, desc.material_set, 0, desc.copies) {
+                Ok(run) => run,
+                Err(e) => {
+                    cpu.slots.free(first, desc.copies);
+                    self.scene.free_skinned(cpu, entry, desc.copies);
+                    cpu.emissive.free(emissive, desc.copies * ranks);
+                    return Err(e);
+                }
+            };
             cpu.skinned_high_water = cpu.skinned_high_water.max(entry + desc.copies);
             cpu.skinned_sections = cpu.skinned_sections.max(model.sections);
             let holds = &mut cpu.slot_holds[first as usize..(first + desc.copies) as usize];
@@ -2666,6 +2995,7 @@ impl<'f> SceneWriter<'f> {
                     first_entry: emissive + copy * ranks,
                     entries: ranks,
                     material_base: desc.material_set.unwrap_or(NO_MATERIAL_SET),
+                    set: 0,
                 };
             }
             if section_mask != 0 {
@@ -2675,7 +3005,7 @@ impl<'f> SceneWriter<'f> {
             cpu.slot_runs[first as usize..(first + desc.copies) as usize]
                 .fill((desc.model.0, body));
             cpu.hold_copies(desc.model.0, model.chained, body, desc.copies);
-            (first, entry, emissive)
+            (first, entry, emissive, run)
         };
         if let Some(room) = entries {
             self.put_entries(room, first, emissive, ranks);
@@ -2715,6 +3045,8 @@ impl<'f> SceneWriter<'f> {
                 debug_lod: 0,
                 user_tag: desc.user_tag,
                 variant: u32::from(section_mask) << 16,
+                run,
+                _pad1: 0,
             };
         }
         self.push(Record::values(
@@ -2894,9 +3226,39 @@ impl<'f> SceneWriter<'f> {
         }
         self.scene.reserve_material_sets(self.device, end)?;
         let (src, out) = self.window.slice::<CopyVariant>(self.device, count)?;
+        let (runs_src, runs_out) = self.window.slice::<u32>(self.device, count)?;
         out.copy_from_slice(variants);
         let cpu = &mut *self.scene.cpu.lock().unwrap();
-        for (v, hold) in variants.iter().zip(&holds) {
+        // What a copy holds once its variant shows another set.
+        let moved = |v: &CopyVariant, h: &SlotHold| {
+            let to = SlotHold {
+                set: v.material_set,
+                ..*h
+            };
+            (h.row() != to.row()).then_some(to)
+        };
+        // The rows of the sets copies turn to, held before any copy leaves its own.
+        let mut wanted: FxHashMap<SetKey, u32> = FxHashMap::default();
+        for (v, h) in variants.iter().zip(&holds) {
+            if let Some(key) = moved(v, h).and_then(|to| to.row()) {
+                *wanted.entry(key).or_default() += 1;
+            }
+        }
+        let mut held: Vec<(SetKey, u32)> = Vec::with_capacity(wanted.len());
+        for (key, refs) in wanted {
+            match self.hold_row(cpu, ModelId(key.0), Some(key.1), key.2, refs) {
+                Ok(_) => held.push((key, refs)),
+                Err(e) => {
+                    let seq = self.next_seq();
+                    for (key, refs) in held {
+                        self.scene.release_set_row(cpu, seq, key, refs);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let seq = self.next_seq();
+        for (i, (v, hold)) in variants.iter().zip(&holds).enumerate() {
             let sections = self
                 .model_cpu
                 .get(hold.model as usize)
@@ -2905,18 +3267,60 @@ impl<'f> SceneWriter<'f> {
             if mask != 0 {
                 cpu.masks.insert((ModelId(hold.model), mask as u16));
             }
+            let at = slot as usize + i;
+            if let Some(to) = moved(v, hold) {
+                let from = hold.row().expect("a copy that changes rows has a base");
+                self.scene.release_set_row(cpu, seq, from, 1);
+                cpu.slot_holds[at] = to;
+            }
+            runs_out[i] = cpu.slot_holds[at]
+                .row()
+                .map_or(0, |key| cpu.set_rows[&key].first);
         }
-        cpu.records.push(Record {
-            seq: self.next_seq(),
-            dst: self.instance_word(
-                range.first + first,
-                std::mem::offset_of!(InstanceGpu, variant),
-            ),
-            count,
-            stride: words(size_of::<InstanceGpu>()),
-            op: Op::Copy(src.address().0),
-        });
+        for (field, src) in [
+            (std::mem::offset_of!(InstanceGpu, variant), src.address().0),
+            (std::mem::offset_of!(InstanceGpu, run), runs_src.address().0),
+        ] {
+            cpu.records.push(Record {
+                seq: self.next_seq(),
+                dst: self.instance_word(range.first + first, field),
+                count,
+                stride: words(size_of::<InstanceGpu>()),
+                op: Op::Copy(src),
+            });
+        }
         Ok(())
+    }
+
+    /// The first run of the set row that copies of `model` with material set base `base` show at
+    /// set `set`, held `refs` more times; 0 without a base, whose copies show the model's own row.
+    fn hold_row(
+        &self,
+        cpu: &mut SceneCpu,
+        model: ModelId,
+        base: Option<u32>,
+        set: u8,
+        refs: u32,
+    ) -> Result<u32> {
+        let Some(base) = base else {
+            return Ok(0);
+        };
+        let row = self
+            .mounts
+            .rows
+            .get(&model)
+            .expect("a placeable model has a row");
+        let sections = self.model_cpu[model.0 as usize].sections;
+        self.scene.hold_set_row(
+            cpu,
+            self.device,
+            self.window,
+            self.next_seq(),
+            (model.0, base, set),
+            sections,
+            row,
+            refs,
+        )
     }
 
     /// Entries `first..first + count` of the scene's material sets, which hold every entry a
@@ -2924,7 +3328,9 @@ impl<'f> SceneWriter<'f> {
     pub fn material_sets(&mut self, first: u32, count: u32) -> Result<&'f mut [MaterialId]> {
         let end = u64::from(first) + u64::from(count);
         self.scene.reserve_material_sets(self.device, end)?;
-        self.upload(self.scene.tables.material_sets.entry(first), count)
+        let out = self.upload(self.scene.tables.material_sets.entry(first), count)?;
+        Scene::note_material_sets(&mut self.scene.cpu.lock().unwrap(), first, count);
+        Ok(out)
     }
 
     /// Empties the slots of `range` and their emissive list entries; they are reused once
@@ -3083,17 +3489,40 @@ impl<'f> SceneWriter<'f> {
         } else {
             room
         };
+        // A run per material: one set again keeps its row while its materials keep their count,
+        // and its runs take its new materials. A new row's runs come first, so nothing fails once
+        // the entry is taken.
+        let count = d.materials.len() as u32;
+        let kept = held.map(|h| h.3).filter(|&(_, n)| n == count);
+        let fresh = match kept {
+            Some(_) => None,
+            None => {
+                let (src, out) = self.window.slice::<RunGpu>(self.device, count)?;
+                Some((t.runs.alloc(self.device, count)?, src, out))
+            }
+        };
         let (index, emissive) = match held {
             // A producer set again keeps its entries.
             Some((index, emissive, ..)) => (index, emissive),
             None => {
-                let room = self.scene.producer_room(cpu, self.device)?;
-                match self.scene.take_entries(cpu, self.device, 1) {
-                    Ok(emissive) => (self.scene.take_producer(cpu, room), emissive),
+                let taken = self
+                    .scene
+                    .producer_room(cpu, self.device)
+                    .and_then(|room| match self.scene.take_entries(cpu, self.device, 1) {
+                        Ok(emissive) => Ok((self.scene.take_producer(cpu, room), emissive)),
+                        Err(e) => {
+                            let (entry, held) = (room.entry, room.held);
+                            self.scene
+                                .release_producer(cpu, entry, held, room.tables.as_ref());
+                            Err(e)
+                        }
+                    });
+                match taken {
+                    Ok(taken) => taken,
                     Err(e) => {
-                        let (entry, held) = (room.entry, room.held);
-                        self.scene
-                            .release_producer(cpu, entry, held, room.tables.as_ref());
+                        if let Some((first, ..)) = fresh {
+                            t.runs.free(first, count);
+                        }
                         return Err(e);
                     }
                 }
@@ -3102,17 +3531,23 @@ impl<'f> SceneWriter<'f> {
         cpu.producer_ids.insert(id.0, index);
         cpu.producer_clusters = clusters;
         cpu.producer_cluster_room = cluster_room;
-        // A run per material: one set again keeps its row while its materials keep their count.
-        let count = d.materials.len() as u32;
-        let runs = match held.map(|h| h.3) {
-            Some((first, n)) if n == count => first,
-            old => {
-                if let Some((first, n)) = old {
-                    free_producer_runs(cpu, first, n);
+        let runs = match fresh {
+            Some((first, src, out)) => {
+                if let Some((old, n)) = held.map(|h| h.3) {
+                    self.scene.free_runs(cpu, self.next_seq(), old, n);
                 }
-                take_producer_runs(cpu, count)
+                out.copy_from_slice(&producer_rows(index, count));
+                cpu.records.push(Record::values(
+                    self.next_seq(),
+                    t.runs.entry(first),
+                    src,
+                    count,
+                ));
+                first
             }
+            None => kept.expect("a kept row").0,
         };
+        cpu.hits.note(runs, count);
         record[0] = ProducerGpu {
             emissive,
             runs,
@@ -3124,6 +3559,14 @@ impl<'f> SceneWriter<'f> {
             ..Zeroable::zeroed()
         };
         let mut producer = b.producer;
+        // Its clusters trace as glass whatever their material.
+        if d.opacity == Opacity::Dielectric
+            && d.materials
+                .iter()
+                .any(|&m| !self.materials.bounds_interior(m))
+        {
+            producer.features |= crate::SceneFeatures::THIN_DIELECTRICS;
+        }
         producer.emissive = emissive;
         producer.runs = (runs, count);
         producer.id = Some(id);
@@ -3322,26 +3765,25 @@ impl<'f> SceneWriter<'f> {
     }
 }
 
-/// The first of `count` free producer runs, the runs growing to hold them where none are free. No
-/// runs take none, from 0.
-fn take_producer_runs(cpu: &mut SceneCpu, count: u32) -> u32 {
-    if count == 0 {
-        return 0;
-    }
-    if let Some(first) = cpu.producer_runs.alloc(count) {
-        return first;
-    }
-    let held = cpu.producer_run_room;
-    let room = held.saturating_add(count).max(held.saturating_mul(2));
-    cpu.producer_runs.grow(held, room);
-    cpu.producer_run_room = room;
-    cpu.producer_runs
-        .alloc(count)
-        .expect("the grown runs have a free run of `count`")
+/// `RunGpu::word` past its kind for section `section` of a copy of the model of `row`: the class
+/// and solid bits it cooked with and its mesh's vertex attributes.
+fn copy_word(row: &ModelRow, section: u32) -> u32 {
+    let cooked = row.cooked[section as usize];
+    let class = u32::from(cooked & Section::CLASS_MASK) >> Section::CLASS_SHIFT;
+    let solid = if cooked & Section::SOLID != 0 {
+        ROW_SOLID
+    } else {
+        0
+    };
+    class << ROW_CLASS_SHIFT | solid | u32::from(row.attributes) << ROW_ATTRIBUTES_SHIFT
 }
 
-fn free_producer_runs(cpu: &mut SceneCpu, first: u32, count: u32) {
-    if count > 0 {
-        cpu.producer_runs.free(first, count);
-    }
+/// The runs of producer entry `entry`'s row: one per material slot.
+fn producer_rows(entry: u32, materials: u32) -> Vec<RunGpu> {
+    (0..materials)
+        .map(|slot| RunGpu {
+            source: entry,
+            word: ROW_PRODUCER | slot << ROW_SLOT_SHIFT,
+        })
+        .collect()
 }

@@ -10,6 +10,7 @@ import orr_lighting.environment;
 import orr_lighting.media;
 import orr_scene.surface;
 import orr_scene.candidates;
+import orr_scene.runs;
 import orr_lighting.path;
 import orr_lighting.path.launch;
 
@@ -70,21 +71,23 @@ void layer_resolve(inout Payload p, TriangleAttributes a)
     p.words.y = asuint(t);
 }
 
-// A shadow ray's crossing step commits nothing: it keeps the nearest crossing past the last.
+// The any-hit shaders start from their record's data (`orr_scene.runs`' `HitData`): the class
+// their candidate traces as and its section material. A shadow ray's crossing step commits the
+// nearest crossing past the walk's last.
 [shader("anyhit")]
-void cover_path_hit(inout Payload p, TriangleAttributes a)
+void cover_path_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(cover_path_hit);
     TriangleHit h = { a };
-    any_hit_decides(path_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, p.words, h, slot_crossings(root, launch_slot())));
+    any_hit_decides(path_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, p.words, data, h, slot_crossings(root, launch_slot(), h)));
 }
 
 [shader("anyhit")]
-void cover_shadow_hit(inout Payload p, TriangleAttributes a)
+void cover_shadow_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(cover_shadow_hit);
     TriangleHit h = { a };
-    any_hit_decides(shadow_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, p.words, h));
+    any_hit_decides(shadow_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, p.words, data, h));
 }
 
 [shader("intersection")]
@@ -104,11 +107,11 @@ void proxy_shadow_hit(inout Payload p, SpanAttributes a)
 }
 
 [shader("anyhit")]
-void cover_layers_hit(inout Payload p, TriangleAttributes a)
+void cover_layers_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(cover_layers_hit);
     TriangleHit h = { a };
-    layers_triangle(root, p.words, h.custom_index(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.t(), h.barycentrics());
+    layers_triangle(root, p.words, data, h.instance_index(), h.cluster_id(), h.primitive_index(), h.t(), h.barycentrics());
     IgnoreHit();
 }
 

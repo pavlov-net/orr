@@ -30,10 +30,10 @@ use orr_scene::testing::{FlipError, Image, Pixels, flip, mount_pending};
 use orr_scene::{
     ClusterTopology, Decal, DecalChannels, DecalId, FrameDesc, FrameTime, GroupWriter, HitGroups,
     InstanceFlags, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, MediumProxy,
-    MediumProxyId, MountId, Opacity, PackSource, ProducerDesc, ProducerId, ProducerUpdate,
+    MediumProxyId, ModelId, MountId, Opacity, PackSource, ProducerDesc, ProducerId, ProducerUpdate,
     Projection, RasterView, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter,
-    Scenes, SkinStateGpu, SkinnedDesc, TextureFilter, TransformGroupDesc, TransformGroupId,
-    Urgency, ViewArena, ViewDesc, ViewHistoryId, VolumeRef, material_flags,
+    Scenes, SkinStateGpu, SkinnedDesc, SlotStateGpu, TextureFilter, TransformGroupDesc,
+    TransformGroupId, Urgency, ViewArena, ViewDesc, ViewHistoryId, VolumeRef, material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 
@@ -2241,6 +2241,42 @@ impl Bed {
         render()
             .wait_while_completing(point, Duration::from_secs(10))
             .unwrap();
+    }
+
+    /// The bed's model `name`.
+    pub fn model(&self, name: &str) -> ModelId {
+        self.scenes
+            .model(self.mount, AssetId::from_name(name))
+            .unwrap_or_else(|e| panic!("model {name}: {e}"))
+    }
+
+    /// Runs one frame of no view in which `write` changes the scene.
+    pub fn write(&mut self, write: impl FnOnce(&mut SceneWriter<'_>)) {
+        self.frame += 1;
+        let list = [self.scene];
+        let f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        write(&mut f.scene(self.scene).unwrap());
+        let point = f.end(&[]).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
+    }
+
+    /// The root of the scene at the last frame run.
+    pub fn scene_root(&self) -> SceneRoot {
+        read(self.last_root, 1)[0]
+    }
+
+    /// The state the last frame left instance slot `slot` in.
+    pub fn slot_state(&self, slot: u32) -> SlotStateGpu {
+        read(self.scene_root().slot_state.offset(u64::from(slot)), 1)[0]
     }
 
     /// The state the last frame left skinned entry `entry` in, the bed's skinned copies taking

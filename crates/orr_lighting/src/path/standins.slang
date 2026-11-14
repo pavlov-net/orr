@@ -10,6 +10,7 @@ import orr_lighting.environment;
 import orr_lighting.media;
 import orr_scene.surface;
 import orr_scene.candidates;
+import orr_scene.runs;
 import orr_lighting.path;
 import orr_lighting.path.common;
 import orr_lighting.path.launch;
@@ -32,6 +33,14 @@ StoredHit lane_hit(uint lane)
 {
     StoredHit h = { (HitInputs*)root.stages.queues + lane };
     return h;
+}
+
+// Lane `lane`'s hit record data.
+HitData lane_data(uint lane)
+{
+    uint4 w = lane_words(lane)[1];
+    HitData d = { w.x, w.y, w.z, w.w };
+    return d;
 }
 
 [shader("compute")]
@@ -78,7 +87,11 @@ void cover_path_hit(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(cover_path_hit);
     uint4* w = lane_words(id.x);
-    w[1].x = path_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, w[0], lane_hit(id.x), slot_crossings(root, id.x));
+    HitData data = lane_data(id.x);
+    uint4 payload = w[0];
+    StoredHit h = lane_hit(id.x);
+    w[1].x = path_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, payload, data, h, slot_crossings(root, id.x, h));
+    w[0] = payload;
 }
 
 [shader("compute")]
@@ -88,7 +101,8 @@ void cover_shadow_hit(uint3 id: SV_DispatchThreadID)
     ORR_OMM(cover_shadow_hit);
     uint4* w = lane_words(id.x);
     uint4 payload = w[0];
-    w[1].x = shadow_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, payload, lane_hit(id.x));
+    HitData data = lane_data(id.x);
+    w[1].x = shadow_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, payload, data, lane_hit(id.x));
     w[0] = payload;
 }
 

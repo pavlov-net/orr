@@ -1,11 +1,11 @@
 // The runs of a scene's hit tables. A run is one section of a material row: a model's section
-// materials, a set of a copy's material sets or a page's, or a producer entry's materials. It holds
-// a hit record per ray type; a trace's record is its instance's contribution, RAY_TYPES times
+// materials, one set of a copy's material set or of a page's, or a producer entry's materials. It
+// holds a hit record per ray type; a trace's record is its instance's contribution, RAY_TYPES times
 // the first run of the row it shows, plus RAY_TYPES times the hit's geometry index (its cluster's
-// section, or its producer cluster's material) plus the ray type. Runs are laid out as
-// `SceneRoot.run_*` give: the medium proxies' and the light proxies' runs and the walk meet's,
-// then a run per entry of `model_materials`, of `material_sets`, of the producer rows and of
-// `page_material_sets`.
+// section, or its producer cluster's material) plus the ray type. A row takes its runs from the
+// scene's one allocator when it is made and keeps them until it goes, so a table that grows moves
+// no run and no instance takes another contribution for it. `SceneRoot.runs` says per run where
+// its material is and what its geometry is: the hit tables' kernels write records from it.
 module runs;
 
 import orr_shaders.abi;
@@ -31,37 +31,70 @@ public uint contribution(uint run)
 
 // The runs every medium proxy and every light proxy shows, and the run no instance shows, whose
 // records a raygen sets on a traced hit to run a meet's closest-hit on it: the walk meet's at
-// RAY_TYPE_PATH, the stack meet's at RAY_TYPE_SHADOW.
+// RAY_TYPE_PATH, the stack meet's at RAY_TYPE_SHADOW. Every scene takes them first.
 public static const uint RUN_MEDIUM = 0;
 public static const uint RUN_LIGHT = 1;
 public static const uint RUN_WALK = 2;
 [Host] public static const uint FIXED_RUNS = 3;
 
-// `HitData.flags`: the CLASS_* of the run's material in the low bits, then HIT_*.
+// What a run serves (`RunGpu.word` bits 0-3).
+[Host] public static const uint ROW_NONE = 0;     // nothing: a record of zeros, as free runs hold
+[Host] public static const uint ROW_FIXED = 1;    // RUN_MEDIUM, RUN_LIGHT or RUN_WALK, by its index
+[Host] public static const uint ROW_MODEL = 2;    // a copy's section of `model_materials[source]`
+[Host] public static const uint ROW_SET = 3;      // a copy's section of `material_sets[source]`
+[Host] public static const uint ROW_PAGE = 4;     // a copy's section of `page_material_sets[source]`
+[Host] public static const uint ROW_PRODUCER = 5; // material `word >> 16` of producer entry `source`
+[Host] public static const uint ROW_KIND_MASK = 15;
+// A copy's row: the CLASS_* its section cooked with in bits 4-6, and ROW_SOLID where the section
+// is solid glass (`CLUSTER_SOLID`). Its clusters trace by them, whatever material a set shows.
+[Host] public static const uint ROW_CLASS_SHIFT = 4;
+[Host] public static const uint ROW_SOLID = 1 << 7;
+// A copy's row: its mesh's MESH_* vertex attributes in bits 8-15, which its coverage reads.
+[Host] public static const uint ROW_ATTRIBUTES_SHIFT = 8;
+// A producer's row: the material slot in bits 16-31.
+[Host] public static const uint ROW_SLOT_SHIFT = 16;
+
+// `HitData.flags`: the CLASS_* its candidates and hits take in the low bits, then HIT_*. The class
+// is what the hit's geometry traces as: a copy's section's cooked class, which a material set
+// does not change, or a producer entry's (the material's with PRODUCER_SECTIONS). Candidates are
+// filtered by it, as the instance masks and opacity follow it, and the vertex shades as it.
 public static const uint HIT_CLASS_MASK = 7;
 public static const uint HIT_ALPHA_TESTED = 1 << 3;
-public static const uint HIT_THIN_WALL = 1 << 4;      // a dielectric that bounds no interior
+public static const uint HIT_THIN_WALL = 1 << 4;      // of the dielectric class, its material bounds no interior
 public static const uint HIT_CROSSES_INTERIOR = 1 << 5;
 public static const uint HIT_EMITS = 1 << 6;
 // The material or its back may give its surface a coat, fuzz, thin film or subsurface weight: it
 // has one of their weights above 0, or a linked surface, which may set any.
 public static const uint HIT_LOBED = 1 << 7;
+// Solid glass, a section cooked as a dielectric with an interior: a plane stack's ray stops at it.
+public static const uint HIT_SOLID = 1 << 8;
 
 // A hit record's data, after its group's handle: what its shaders start from, HIT_DATA_BYTES of it.
 [Host] public static const uint HIT_DATA_BYTES = 16;
 public struct HitData
 {
     public uint material;          // the section's MaterialId, MATERIAL_NONE for none
-    public uint flags;             // HIT_* and the material's class
+    public uint flags;             // HIT_* and the class
     public uint back;              // the material's back, MATERIAL_NONE for none
-    public uint _spare;
+    public uint attributes;        // a copy's mesh's MESH_* vertex attributes, which its coverage reads; 0 on producer geometry
+
+    public uint class_id()
+    {
+        return flags & HIT_CLASS_MASK;
+    }
+
+    public bool has(uint flag)
+    {
+        return (flags & flag) != 0;
+    }
 }
 
-// The data of a run of material `material` and class `class_id`.
-public HitData hit_data(SceneRoot* s, uint material, uint class_id)
+// The data of a run of material `material` on geometry of class `class_id` with vertex
+// `attributes`, solid glass where `solid`.
+public HitData hit_data(SceneRoot* s, uint material, uint class_id, bool solid, uint attributes)
 {
     static_assert(sizeof(HitData) == HIT_DATA_BYTES, "a run's data is not HIT_DATA_BYTES");
-    HitData d = { material, class_id, MATERIAL_NONE, 0 };
+    HitData d = { material, class_id | (solid ? HIT_SOLID : 0), MATERIAL_NONE, attributes };
     if (material == MATERIAL_NONE)
         return d;
     uint flags = s.materials[material].flags;
@@ -91,20 +124,15 @@ public HitData proxy_data(uint class_id)
 }
 
 // The first run of the row copy record `inst` (at its chain step) shows: run `first + section`
-// holds `section_material(s, inst, model, section)`.
+// holds `section_material(s, inst, model, section)`. A record past chain step 0 shows its model's
+// own materials.
 public uint copy_run(SceneRoot* s, InstanceGpu inst)
 {
-    ModelGpu* model = s.models + inst.model;
-    if (inst.material_base == NO_MATERIAL_SET)
-        return s.run_models + model.materials;
-    uint at = ((inst.variant >> 8) & 0xff) * model.section_count;
-    if ((inst.material_base & PAGE_MATERIAL_SET) != 0)
-        return s.run_pages + (inst.material_base & ~PAGE_MATERIAL_SET) + at;
-    return s.run_sets + inst.material_base + at;
+    return inst.material_base == NO_MATERIAL_SET ? s.model_runs[inst.model] : inst.run;
 }
 
 // The first run of producer record `p`'s row: run `first + material` holds its material.
 public uint producer_run(SceneRoot* s, ProducerGpu p)
 {
-    return s.run_producers + p.runs;
+    return p.runs;
 }

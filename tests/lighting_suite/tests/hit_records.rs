@@ -2,7 +2,7 @@
 //! candidate handlers and through a ray tracing pipeline whose any-hit and intersection shaders
 //! the scene's hit table selects (`orr_scene.candidates`), on copies opaque, alpha-tested with and
 //! without micromaps, presence layers, solid glass, a thin window, a mixed-class model, particles,
-//! strands and a medium proxy.
+//! strands and a medium proxy; and over a hit table that grows and changes under live copies.
 
 use std::sync::OnceLock;
 
@@ -23,8 +23,11 @@ use orr_gpu::{
     ShaderRecord, ShaderStage, SpecData, Stages,
 };
 use orr_lighting::Light;
-use orr_math::{Mat3, Quat, Vec3};
-use orr_scene::{HitGroups, MediumProxy, MediumProxyId, Opacity, ProxyDensity};
+use orr_math::{Affine3, DVec3, Mat3, Quat, Vec3};
+use orr_scene::{
+    GroupWriter, HitGroups, InstanceFlags, InstanceRange, InstancesDesc, MediumProxy,
+    MediumProxyId, ModelId, Opacity, ProxyDensity, SceneWriter, TransformGroupDesc,
+};
 
 const SHADOW_MASK: u32 = MASK_OPAQUE | MASK_PARTICLE | MASK_MEDIUM | MASK_DIELECTRIC;
 /// The ray flag of a trace that sees every candidate as non-opaque.
@@ -475,5 +478,161 @@ fn strands_through_the_hit_records_match_inline_traces() {
     let traced = trace_both(&mut bed, p, groups, &rays);
     let seen = compare(&rays, &traced);
     assert!(seen.hits > 1000, "{seen:?}");
+    assert_clean();
+}
+
+/// The traced hits of `traced`'s pipeline side, for comparing launches over the same rays.
+fn piped_hits(traced: &[Traced; 2]) -> Vec<(u32, u32, u32, u32, u32)> {
+    traced[1]
+        .paths
+        .iter()
+        .map(|p| (p.hit, p.t.to_bits(), p.instance, p.primitive, p.class_id))
+        .collect()
+}
+
+/// Copies at `at` of `model`, one each, showing material set base `bases[i]`, ray traced.
+fn add_with_sets(
+    w: &mut SceneWriter<'_>,
+    model: ModelId,
+    at: &[Vec3],
+    bases: &[u32],
+) -> Vec<InstanceRange> {
+    let group = w
+        .create_transform_group(&TransformGroupDesc {
+            count: at.len() as u32,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    let out = w.transforms(group, 0, at.len() as u32).unwrap();
+    for (o, &p) in out.iter_mut().zip(at) {
+        *o = Affine3::from_translation(p).into();
+    }
+    (0..at.len() as u32)
+        .zip(bases)
+        .map(|(i, &base)| {
+            w.add_instances(&InstancesDesc {
+                model,
+                copies: 1,
+                transforms: group,
+                first: i,
+                pose: None,
+                material_set: Some(base),
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: 1000.0,
+                animation_range: 0.0,
+                user_tag: 0,
+            })
+            .unwrap()
+        })
+        .collect()
+}
+
+/// A scene's hit table grows and changes under live copies and still holds what a fresh one
+/// would: rays meet what inline traces meet after a frame takes more runs than the table had
+/// room for (written whole), and after frames that free and take runs within its room and
+/// rewrite a material set's entry (written where they changed). No copy whose row stayed takes
+/// another contribution. Copies whose material set shows a material of another class than their
+/// sections cooked with trace as their sections, as inline traces do.
+#[test]
+fn hit_tables_hold_their_runs_as_they_grow_and_change() {
+    if !require(device().caps().ray_dispatch, "ray tracing pipelines") {
+        return;
+    }
+    let copies = vec![
+        item(FLOOR, Vec3::ZERO, Mat3::IDENTITY),
+        item(LEAF, Vec3::new(0.0, 1.1, 0.0), Mat3::IDENTITY),
+        item(MASKED_PANE, Vec3::new(6.0, 2.5, 0.0), Mat3::IDENTITY),
+        item(TINTED_SLAB, Vec3::new(9.0, 1.1, 0.0), Mat3::IDENTITY),
+        item(MIXED_SLAB, Vec3::new(12.0, 1.1, 0.0), Mat3::IDENTITY),
+    ];
+    let placed = copies.len() as u32;
+    let spec = Spec {
+        copies,
+        lights: vec![Light::Directional(SUN)],
+        environment: None,
+        eye: Vec3::new(6.0, 6.0, 16.0),
+        target: Vec3::new(6.0, 1.0, 0.0),
+        fov_y: 1.0,
+        focus: None,
+    };
+    let mut bed = Bed::with(spec);
+    let mut d = Draw(0x7ab1e);
+    let mut rays = Vec::new();
+    for x in [0.0, 6.0, 9.0, 12.0] {
+        rays_around(
+            &mut d,
+            Vec3::new(x + 1.0, 1.3, 0.0),
+            Vec3::new(2.0, 1.5, 1.5),
+            4000,
+            &mut rays,
+        );
+    }
+    let (p, groups) = ray_pipeline();
+    bed.accumulate(1, 0, &mut |_, _| {});
+    let check = |bed: &mut Bed, what: &str| {
+        let traced = trace_both(bed, p, groups, &rays);
+        let seen = compare(&rays, &traced);
+        assert!(seen.hits > 4000, "{what}: {seen:?}");
+        traced
+    };
+    let first = check(&mut bed, "first");
+    let held: Vec<u32> = (0..placed).map(|s| bed.slot_state(s).rt_run).collect();
+    let runs_of = |bed: &Bed| bed.scene_root().runs.address();
+
+    // More runs than the table holds: each far copy shows a set row of its own.
+    let leaf = bed.material(LEAF);
+    let glass = bed.material(TINTED_SLAB);
+    const FAR: u32 = 600;
+    const STRIDE: u32 = 4;
+    let mut far = Vec::new();
+    let before = runs_of(&bed);
+    let (leaf_model, slab_model) = (bed.model(LEAF), bed.model(TINTED_SLAB));
+    bed.write(|w| {
+        w.material_sets(0, FAR * STRIDE).unwrap().fill(leaf);
+        let at: Vec<Vec3> = (0..FAR)
+            .map(|i| {
+                Vec3::new(
+                    100.0 + 2.0 * (i % 30) as f32,
+                    1.0,
+                    100.0 + 2.0 * (i / 30) as f32,
+                )
+            })
+            .collect();
+        let bases: Vec<u32> = (0..FAR).map(|i| i * STRIDE).collect();
+        far = add_with_sets(w, leaf_model, &at, &bases);
+    });
+    let grown = check(&mut bed, "grown");
+    assert_ne!(runs_of(&bed), before, "the runs grew");
+    assert_eq!(
+        piped_hits(&first),
+        piped_hits(&grown),
+        "rays meet what they met"
+    );
+
+    // Within the table's room: half the far copies leave their rows, and copies in the rays'
+    // reach take freed runs for rows that show the other class's material.
+    let near = FAR * STRIDE;
+    let before = runs_of(&bed);
+    bed.write(|w| {
+        for &r in far.iter().step_by(2) {
+            w.remove(r);
+        }
+        let sets = w.material_sets(near, 2 * STRIDE).unwrap();
+        sets[..STRIDE as usize].fill(glass);
+        sets[STRIDE as usize..].fill(leaf);
+        add_with_sets(w, leaf_model, &[Vec3::new(1.0, 1.6, 0.8)], &[near]);
+        add_with_sets(w, slab_model, &[Vec3::new(9.0, 1.6, 0.8)], &[near + STRIDE]);
+    });
+    check(&mut bed, "changed within the room");
+    assert_eq!(runs_of(&bed), before, "the runs stayed in their room");
+
+    // A material set's entry rewritten: the glass leaf shows the leaf again.
+    bed.write(|w| {
+        w.material_sets(near, STRIDE).unwrap().fill(leaf);
+    });
+    check(&mut bed, "a set entry rewritten");
+    let after: Vec<u32> = (0..placed).map(|s| bed.slot_state(s).rt_run).collect();
+    assert_eq!(held, after, "copies whose rows stayed keep their runs");
     assert_clean();
 }

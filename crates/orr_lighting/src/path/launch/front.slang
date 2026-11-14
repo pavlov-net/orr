@@ -110,12 +110,13 @@ void keep_layer(PathRoot r, inout uint4 payload, uint4 key, uint4 more)
         payload.y = load_coherent(at + 2 * (LAYERS_KEPT - 1)).x;
 }
 
-// A LAYERS trace's triangle candidate, from its any-hit shader: a particle that its mask takes.
-public void layers_triangle(PathRoot r, inout uint4 payload, uint custom_index, uint instance_index, int cluster_id, uint primitive, float t, float2 bary)
+// A LAYERS trace's triangle candidate with hit record data `d`, from its any-hit shader: a
+// particle that its mask takes.
+public void layers_triangle(PathRoot r, inout uint4 payload, HitData d, uint instance_index, int cluster_id, uint primitive, float t, float2 bary)
 {
     if (cluster_id < 0)
         return;
-    uint class_id = class_of(scene_traced(r.scene), custom_index, instance_index, cluster_id);
+    uint class_id = d.class_id();
     if (class_id != CLASS_PARTICLE || !class_taken(class_id, (payload.w >> 8) & 0xff))
         return;
     keep_layer(r, payload, uint4(asuint(t), instance_index, asuint(cluster_id), primitive), uint4(asuint(bary), LAYER_PARTICLE, 0));
