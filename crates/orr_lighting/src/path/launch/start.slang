@@ -41,12 +41,12 @@ uint reach_gbuffer(PathRoot r, uint4* at, inout PathLoop p, LayerRay ray, inout 
     PackedSurface ps;
     if (!arrive_gbuffer(r, f, p, record, start, ps, ray.dir))
     {
-        store_part<LaunchLoop, LOOP_WORDS>(at + LOOP_AT, launch_loop_from(p, 0.0, 0));
+        store_path_loop(at, p, 0);
         return STEP_ENDED;
     }
     store_part<PackedSurface, SURFACE_WORDS>(at + SURFACE_AT, ps);
-    store_part<LaunchRay, RAY_WORDS>(at + RAY_AT, launch_ray(ray, 0.0, 0));
-    store_part<LaunchLoop, LOOP_WORDS>(at + LOOP_AT, launch_loop_from(p, 0.0, REACH_FIRST | REACH_GBUFFER));
+    store_launch_ray(at, launch_ray(ray, 0.0, 0));
+    store_path_loop(at, p, REACH_FIRST | REACH_GBUFFER);
     return vertex_step(ps);
 }
 
@@ -59,13 +59,14 @@ public uint begin_launch(PathRoot r, uint slot, uint2 pixel, PathStart start, Sa
     ShadeState c;
     start_state(r, pixel, start, rng, record.photon(), f, p, c);
     p.rays = rays;
-    uint4* at = slot_words(r, slot);
-    store_tracked_parts(r, at, p, c);
-    store_spectral_part(r, at, c.spectral);
+    uint4* at = hot_words(r, slot);
+    store_start_scalars(r, at, c);
+    store_tracked_parts(r, slot, p, c);
+    store_spectral_part(r, slot, c.spectral);
     if (start.mask != 0)
     {
-        store_part<LaunchRay, RAY_WORDS>(at + RAY_AT, launch_ray(c.ray, start.t_max, start.mask, start.gbuffer ? LAUNCH_GBUFFER : 0));
-        store_part<LaunchLoop, LOOP_WORDS>(at + LOOP_AT, launch_loop_from(p, 0.0, 0));
+        store_launch_ray(at, launch_ray(c.ray, start.t_max, start.mask, start.gbuffer ? LAUNCH_GBUFFER : 0));
+        store_path_loop(at, p, 0);
         return STEP_RAY;
     }
     return reach_gbuffer(r, at, p, c.ray, record, pixel, true);
@@ -129,7 +130,7 @@ public uint launch_start_photon<S : ISurfaces>(PathRoot r, uint slot)
     LaunchRecord record = launch_record(r, slot);
     store_part<CausticPhoton, RECORD_WORDS>(record.words, CausticPhoton(p.entry));
     begin_launch(r, slot, pixel, photon_path_start(p), rng, 0, record);
-    uint4* at = slot_words(r, slot);
+    uint4* at = hot_words(r, slot);
     ValueHit given = value_hit(p.hit, p.positions, p.dir);
     store_part<ValueHit, GIVEN_WORDS>(at + SURFACE_AT, given);
     // What the interiors around the start take of the flux on the way to the light, as its

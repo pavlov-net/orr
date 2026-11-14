@@ -31,7 +31,7 @@ void emission(inout Payload p)
 void direct_of<let K : uint>(inout Payload p)
 {
     uint dimension;
-    p.words.x = launch_direct<K, Surface, Medium>(root, launch_slot(), p.words.y, dimension);
+    p.words.x = launch_direct<K, Surface, Medium>(root, launch_slot(), p.words.y, asfloat(p.words.z), dimension);
     p.words.y = dimension;
 }
 
@@ -46,7 +46,7 @@ void direct(inout Payload p)
 void deposit(inout Payload p)
 {
     ORR_OMM(deposit);
-    p.words.x = launch_deposit<Surface>(root, launch_slot(), p.words.y == DIRECT_PROBED);
+    p.words.x = launch_deposit<Surface>(root, launch_slot(), p.words.y == DIRECT_PROBED, asfloat(p.words.z));
 }
 
 [shader("callable")]

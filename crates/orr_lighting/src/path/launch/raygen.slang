@@ -31,9 +31,11 @@ import orr_lighting.path.launch.raygen_walk;
 
 // Traces the ray of `slot`'s path, takes what lies in front of its hit and along it, and runs the
 // shader of what it met, after a reorder by that shader, whether the vertex is the last bounce's,
-// whether its material may be rich and whether it emits: the step it returns.
-uint trace_path(PathRoot r, uint slot)
+// whether its material may be rich and whether it emits: the step it returns, and in `t` the
+// length a resolve gave the ray to its vertex.
+uint trace_path(PathRoot r, uint slot, out float t)
 {
+    t = 0.0;
     uint mask;
     bool last;
     uint front;
@@ -72,6 +74,7 @@ uint trace_path(PathRoot r, uint slot)
         p.words.x = STEP_PROBE;
         h.invoke(p);
     }
+    t = asfloat(p.words.y);
     return p.words.x;
 }
 
@@ -84,20 +87,24 @@ public void launch_paths<M : IMedium>(PathRoot r, uint start, uint finish, bool 
     if (slot >= r.slice_count)
         return;
     uint step = step_call(start);
+    // The length of the ray that reached the vertex the path is at, 0 for the G-buffer's surface.
+    float t = 0.0;
     for (uint pass = 0; (step & STEP_DONE) == 0; pass++)
     {
         if ((step & STEP_GIVEN) != 0)
         {
             if ((trace_light<M>(r, slot) & STEP_DONE) != 0)
                 return;
-            step = step_call(CALL_RESOLVE_GIVEN);
+            uint4 given = data_call(CALL_RESOLVE_GIVEN);
+            step = given.x;
+            t = asfloat(given.y);
         }
         while ((step & STEP_ENDED) == 0)
         {
             if ((step & STEP_RAY) != 0)
-                step = trace_path(r, slot);
+                step = trace_path(r, slot, t);
             if ((step & STEP_WALK) != 0)
-                step = walk_path(r, slot);
+                step = walk_path(r, slot, t);
             if ((step & STEP_ENDED) != 0)
                 break;
             if ((step & STEP_EMITS) != 0)
@@ -109,11 +116,11 @@ public void launch_paths<M : IMedium>(PathRoot r, uint start, uint finish, bool 
             if (deposits && !opaque && at != AT_LAYER)
                 break;
             uint vertex_call = deposits && opaque ? CALL_DEPOSIT : CALL_DIRECT + at;
-            uint4 direct = data_call(vertex_call, DIRECT_FIRST);
+            uint4 direct = data_call(vertex_call, DIRECT_FIRST, t);
             if ((direct.x & STEP_PROBE) != 0)
             {
                 trace_probe(r, slot);
-                direct = data_call(vertex_call, DIRECT_PROBED);
+                direct = data_call(vertex_call, DIRECT_PROBED, t);
             }
             step = direct.x;
             // The record's callable draws the dimension next-event estimation drew past.
@@ -126,5 +133,6 @@ public void launch_paths<M : IMedium>(PathRoot r, uint start, uint finish, bool 
             step = step_call(CALL_SCATTER + at);
         }
         step = step_call(finish, pass);
+        t = 0.0;
     }
 }

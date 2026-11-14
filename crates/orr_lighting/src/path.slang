@@ -140,6 +140,26 @@ public struct PathStages
     public uint _pad0;
 }
 
+// Where a pipeline launch's paths keep their state (path/launch/slot.slang): every slot's
+// HOT_WORDS hot words at a fixed stride, its cold words, `cold_words` a slot, with the first word
+// of each cold part a root's source and features keep (PART_NONE for one it does not), its scratch,
+// `scratch_words` a slot, and its record. The host lays them out from the root alone.
+public struct LaunchHeader
+{
+    public uint4* hot;
+    public uint4* cold;
+    public uint4* scratch;
+    public uint4* records;              // RECORD_WORDS a slot, UPDATE_RECORD_WORDS an update path's
+    public uint cold_words;
+    public uint scratch_words;
+    public uint walk_at;
+    public uint layer_at;
+    public uint interior_at;
+    public uint stack_at;
+    public uint light_at;
+    public uint spectral_at;
+}
+
 // A queue of path slots in one round: the workgroups its stage runs over, which whoever
 // appends to the queue counts, and the slots appended.
 public struct StageQueue
@@ -222,8 +242,8 @@ public struct PathRoot
     public uint round;
     public uint round_first;
     public uint round_next;
-    public uint _pad0;
-    public uint _pad1;
+    // A pipeline launch's slots and records.
+    public LaunchHeader* launch;
 }
 
 // A pixel's front layer over the G-buffer: the top 24 bits of the reverse-Z device depth, so

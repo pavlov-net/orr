@@ -19,7 +19,7 @@ impl PathPipeline {
         items: u32,
     ) {
         let mut root = PathRoot {
-            stages: memory.header.gpu(),
+            launch: memory.header.gpu(),
             ..*root
         };
         let mut base = 0;

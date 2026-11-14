@@ -63,21 +63,22 @@ public RayDesc launch_path_ray(PathRoot r, uint slot, out uint mask, out uint4 p
 
 // The closest-hit shader's body: resolves the hit `h` of `slot`'s ray into its packed surface,
 // the end of the iteration that traced it and the start of the vertex's: `vertex_step`, or
-// STEP_ENDED where the hit names nothing to resolve.
-public uint launch_resolve<S : ISurfaces, H : IHit>(PathRoot r, uint slot, H h)
+// STEP_ENDED where the hit names nothing to resolve. The ray's length to the vertex, which its
+// next-event estimation takes, in `t`.
+public uint launch_resolve<S : ISurfaces, H : IHit>(PathRoot r, uint slot, H h, out float t)
 {
     LaunchVertex v = load_vertex(r, slot);
+    t = 0.0;
     if ((v.reach & REACH_EXIT) != 0)
         return resolve_exit<S, H>(r, v, h);
     bool first = has(v.p.flags, LOOP_CAMERA);
-    float t = end_ray(r, v, h.t());
+    t = end_ray(r, v, h.t());
     PackedSurface ps;
     if (!arrive_hit<S, H>(r, v.f, v.p, v.record, v.x, h, t, ps))
     {
         store_loop_part(v);
         return STEP_ENDED;
     }
-    v.t = t;
     v.reach = first ? REACH_FIRST : 0;
     store_part<PackedSurface, SURFACE_WORDS>(v.at + SURFACE_AT, ps);
     store_loop_part(v);
@@ -122,7 +123,7 @@ uint resolve_exit<S : ISurfaces, H : IHit>(PathRoot r, LaunchVertex v, H h)
         return STEP_ENDED;
     if (!(unpack_surface(exit).bsdf.subsurface_weight > 0.0))
     {
-        store_part<PackedSurface, SURFACE_WORDS>(v.at + WALK_AT + ENTRY_AT, load_surface_part(v));
+        store_part<PackedSurface, SURFACE_WORDS>(walk_words(r, v.slot) + ENTRY_AT, load_surface_part(v));
         v.reach |= REACH_ENTRY_PARAMS;
         store_loop_part(v);
     }
@@ -132,28 +133,29 @@ uint resolve_exit<S : ISurfaces, H : IHit>(PathRoot r, LaunchVertex v, H h)
 
 // `launch_resolve` or `launch_resolve_layer`, by the class of its cluster, of the hit a photon's
 // start gave `slot`'s path, which no ray found.
-public uint launch_resolve_given<S : ISurfaces>(PathRoot r, uint slot)
+public uint launch_resolve_given<S : ISurfaces>(PathRoot r, uint slot, out float t)
 {
-    ValueHit h = load_part<ValueHit, GIVEN_WORDS>(slot_words(r, slot) + SURFACE_AT);
+    ValueHit h = load_part<ValueHit, GIVEN_WORDS>(hot_words(r, slot) + SURFACE_AT);
     uint class_id = h.cluster < 0 ? CLASS_OPAQUE : class_of(scene_traced(r.scene), h.custom, h.instance, h.cluster);
     if (class_id == CLASS_DIELECTRIC || class_id == CLASS_PRESENCE)
-        return launch_resolve_layer<S, ValueHit>(r, slot, h);
-    return launch_resolve<S, ValueHit>(r, slot, h);
+        return launch_resolve_layer<S, ValueHit>(r, slot, h, t);
+    return launch_resolve<S, ValueHit>(r, slot, h, t);
 }
 
 // The closest-hit shader's body for a layer: resolves the hit `h` of `slot`'s ray into its packed
 // layer and ends the iteration that traced it, as `resolve_layer` does up to the layer's vertex.
 // STEP_VERTEX with AT_LAYER, or STEP_ENDED where the hit names nothing to resolve or the path
-// passed as many layers as the root allows.
-public uint launch_resolve_layer<S : ISurfaces, H : IHit>(PathRoot r, uint slot, H h)
+// passed as many layers as the root allows. The ray's length to the layer in `t`.
+public uint launch_resolve_layer<S : ISurfaces, H : IHit>(PathRoot r, uint slot, H h, out float t)
 {
     LaunchVertex v = load_vertex(r, slot);
+    t = 0.0;
     // A subsurface walk leaves through any surface of its instance as an opaque one, solid glass
     // too, whose record resolves a layer.
     if ((v.reach & REACH_EXIT) != 0)
         return resolve_exit<S, H>(r, v, h);
     bool first = has(v.p.flags, LOOP_CAMERA);
-    float t = end_ray(r, v, h.t());
+    t = end_ray(r, v, h.t());
     Sampler rng = v.p.rng;
     PackedLayer pl;
     bool alive = resolve_layer_hit<S, H>(r, v.f, v.p, v.c, v.x, h, t, stack_face_at(r, v, h), rng, pl);
@@ -164,8 +166,7 @@ public uint launch_resolve_layer<S : ISurfaces, H : IHit>(PathRoot r, uint slot,
         return STEP_ENDED;
     }
     store_part<PackedSurface, SURFACE_WORDS>(v.at + SURFACE_AT, pl.surface);
-    store_part<LayerWords, LAYER_WORDS>(v.at + layer_at(r), pl.layer);
-    v.t = t;
+    store_part<LayerWords, LAYER_WORDS>(layer_words(r, slot), pl.layer);
     v.reach = first ? REACH_FIRST : 0;
     store_loop_part(v);
     return STEP_VERTEX | (AT_LAYER << STEP_AT_SHIFT);

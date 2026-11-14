@@ -1,4 +1,4 @@
-// A path's record in the pipeline, in its slot of `PathStages.records`.
+// A path's record in the pipeline, in its slot of `LaunchHeader.records`.
 module record;
 
 import orr_shaders.abi;
@@ -25,7 +25,7 @@ import orr_lighting.path;
 import orr_lighting.path.common;
 import orr_lighting.path.launch.slot;
 
-// The record of a path in the pipeline, in its slot of `PathStages.records`, by the root's source.
+// The record of a path in the pipeline, in its slot of `LaunchHeader.records`, by the root's source.
 // An update path's vertices go to its own callable (`launch_cache_vertex`), which `vertex` asks
 // for.
 public struct LaunchRecord : IVertexRecord
@@ -166,11 +166,10 @@ public LaunchRecord launch_record(PathRoot r, uint slot)
     record.background = from_background(r);
     record.update = from_update(r);
     record.caustic = from_photon(r);
-    // The records' stride is layout, which the source gives alone.
-    record.words = r.stages.records + slot * (r.source == PATH_SOURCE_UPDATE ? UPDATE_RECORD_WORDS : RECORD_WORDS);
+    record.words = record_words(r, slot);
     record.recorded = false;
     record.dimension = 0;
-    record.probe = slot_words(r, slot) + stack_at(r) + STACK_HIT_AT;
+    record.probe = stack_words(r, slot) + STACK_HIT_AT;
     return record;
 }
 

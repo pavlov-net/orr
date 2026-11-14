@@ -6,5 +6,5 @@ mod memory;
 mod record;
 mod stages;
 
-pub(crate) use memory::LaunchMemory;
+pub(crate) use memory::{LaunchMemory, SlotLayout};
 pub(crate) use stages::{PathPipeline, Raygen};

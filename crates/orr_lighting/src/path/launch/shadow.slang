@@ -40,7 +40,7 @@ public bool shadow_bends(PathRoot r, uint flags)
 // light), its candidates of the context of a ray at path depth `depth`.
 public RayDesc launch_shadow(PathRoot r, uint slot, uint mode, out uint4 payload)
 {
-    ShadowJob q = load_part<ShadowJob, SHADOW_WORDS>(slot_words(r, slot) + SHADOW_AT);
+    ShadowJob q = load_part<ShadowJob, SHADOW_WORDS>(hot_words(r, slot) + SHADOW_AT);
     ShadowCover c = mode == SHADOW_PHOTON ? shadow_cover(mode, SHADOW_MASK, 0, false)
         : shadow_cover(mode, SHADOW_MASK, (q.flags >> SHADOW_DEPTH_SHIFT) + 1, has(q.flags, SHADOW_FEEDBACK));
     payload = c.words();
@@ -72,12 +72,12 @@ float3 shadow_seen<M : IMedium>(PathRoot r, ShadowJob q, uint4 payload, bool hit
 // its flux: STEP_GIVEN, or STEP_DONE where none is left.
 public uint launch_light_add<M : IMedium>(PathRoot r, uint slot, uint4 payload, bool hit)
 {
-    uint4* at = slot_words(r, slot);
+    uint4* at = hot_words(r, slot);
     ShadowJob q = load_part<ShadowJob, SHADOW_WORDS>(at + SHADOW_AT);
-    LaunchLoop l = load_part<LaunchLoop, LOOP_WORDS>(at + LOOP_AT);
-    l.v.throughput *= q.contribution * shadow_seen<M>(r, q, payload, hit);
-    store_part<LaunchLoop, LOOP_WORDS>(at + LOOP_AT, l);
-    return any(l.v.throughput > 0.0) ? STEP_GIVEN : STEP_DONE;
+    LoopThroughput l = load_word<LoopThroughput>(at + LOOP_THROUGHPUT_AT);
+    l.throughput *= q.contribution * shadow_seen<M>(r, q, payload, hit);
+    store_word(at + LOOP_THROUGHPUT_AT, l);
+    return any(l.throughput > 0.0) ? STEP_GIVEN : STEP_DONE;
 }
 
 // Takes what `slot`'s shadow ray let through into its contribution: the product of its candidates
@@ -86,7 +86,7 @@ public uint launch_light_add<M : IMedium>(PathRoot r, uint slot, uint4 payload, 
 public uint launch_shadow_take(PathRoot r, uint slot, uint4 payload, bool hit)
 {
     ShadowCover c = ShadowCover.of_words(payload);
-    uint4* at = slot_words(r, slot);
+    uint4* at = hot_words(r, slot);
     ShadowJob q = load_part<ShadowJob, SHADOW_WORDS>(at + SHADOW_AT);
     float3 passed = shadow_passed(r, c, hit);
     // The AS committed what it met, or an any-hit ended the search at solid glass, which stands
@@ -121,7 +121,7 @@ bool crossing_before(CrossingKey a, CrossingKey b)
 // traces the whole ray, since candidates arrive in no order.
 public RayDesc launch_crossing_ray(PathRoot r, uint slot, out uint4 payload)
 {
-    ShadowJob q = load_part<ShadowJob, SHADOW_WORDS>(slot_words(r, slot) + SHADOW_AT);
+    ShadowJob q = load_part<ShadowJob, SHADOW_WORDS>(hot_words(r, slot) + SHADOW_AT);
     Crossing none = Crossing();
     none.key.t = positive_infinity();
     store_part<Crossing, CROSSING_WORDS>(crossing_words(r, slot), none);
@@ -168,7 +168,7 @@ public SlotCrossings slot_crossings(PathRoot r, uint slot)
 // ray's contribution. STEP_ENDED where the step found none or nothing passes.
 public uint launch_window<S : ISurfaces>(PathRoot r, uint slot)
 {
-    uint4* at = slot_words(r, slot);
+    uint4* at = hot_words(r, slot);
     Crossing c = load_part<Crossing, CROSSING_WORDS>(crossing_words(r, slot));
     if (!(c.key.t < positive_infinity()))
         return STEP_ENDED;
@@ -177,14 +177,14 @@ public uint launch_window<S : ISurfaces>(PathRoot r, uint slot)
     // A plane stack's leg lies inside the interiors its walk holds.
     Interior inside;
     if (has(q.flags, SHADOW_LEG))
-        inside = load_part<StackWalk, STACK_WALK_WORDS>(at + stack_at(r) + STACK_WALK_AT).inside;
+        inside = load_part<StackWalk, STACK_WALK_WORDS>(stack_words(r, slot) + STACK_WALK_AT).inside;
     else
     {
         Interior arrived = Interior();
         if (interiors_tracked(r))
-            arrived = load_part<LaunchInterior, SLOT_INTERIOR_WORDS>(at + interior_at(r)).interior;
+            arrived = load_part<LaunchInterior, SLOT_INTERIOR_WORDS>(interior_words(r, slot)).interior;
         float3 start;
-        inside = shadow_inside(r, at, arrived, q.origin, q.flags, start);
+        inside = shadow_inside(r, slot, arrived, q.origin, q.flags, start);
     }
     float exterior = interior_ior(r.scene, inside.innermost());
     SurfaceHit sh = resolve_hit<CoverageFeedback<S>>(r.scene, r.view, q.dir, c.key.instance, c.key.cluster, c.key.primitive, c.barycentrics, c.corners, false, shadow_context(q.flags));
@@ -209,7 +209,7 @@ public void launch_shadow_add<M : IMedium>(PathRoot r, uint slot)
         if (!has(q.flags, SHADOW_ENVIRONMENT))
             vis *= medium_transmittance<M>(r.scene.medium, q.origin, q.dir, q.t_max);
         float3 start;
-        Interior inside = shadow_inside(r, v.at, v.c.interior, q.origin, q.flags, start);
+        Interior inside = shadow_inside(r, slot, v.c.interior, q.origin, q.flags, start);
         float scale;
         float3 depth = straight_depth(r.scene, inside, q.t_max, false, scale);
         if (q.t_max > 0.0 && isfinite(q.t_max))
@@ -228,11 +228,11 @@ public void launch_shadow_add<M : IMedium>(PathRoot r, uint slot)
 // reached pass of its light toward the vertex (`emitter_view`), into its contribution.
 public void launch_emitter_view<S : ISurfaces>(PathRoot r, uint slot)
 {
-    uint4* at = slot_words(r, slot);
+    uint4* at = hot_words(r, slot);
     ShadowJob q = load_part<ShadowJob, SHADOW_WORDS>(at + SHADOW_AT);
     if (!any(q.contribution > 0.0))
         return;
-    LightView l = load_part<LightView, SLOT_LIGHT_PART>(at + light_at(r));
+    LightView l = load_part<LightView, SLOT_LIGHT_PART>(light_words(r, slot));
     ResolvedLightSample c = no_candidate();
     c.dir = l.dir;
     c.light = l.light;

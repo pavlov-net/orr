@@ -89,7 +89,7 @@ public LaunchWalk new_walk(Walk e, uint flags, uint owner, PathCover cover, uint
 public uint launch_walk_end(PathRoot r, uint slot)
 {
     LaunchVertex v = load_vertex(r, slot);
-    LaunchWalk w = load_walk_part(v);
+    LaunchWalk w = load_walk_part(r, v);
     Walk e = walk_of(w);
     v.p.rays += w.rays;
     if ((w.kind & LAUNCH_WALK_INTERIOR) == 0)
@@ -111,14 +111,14 @@ public uint launch_walk_end(PathRoot r, uint slot)
         return STEP_ENDED;
     if (!leaves)
     {
-        store_part<LaunchRay, RAY_WORDS>(v.at + RAY_AT, launch_ray(v.c.ray, 0.0, 0));
+        store_ray_part(v);
         return STEP_INVOKE;
     }
-    store_tracked_parts(r, v.at, v.p, v.c);
+    store_tracked_parts(r, slot, v.p, v.c);
     w.origin = at;
     w.normal = n;
     w.dir = dir;
-    store_part<LaunchWalk, WALK_STATE_WORDS>(v.at + WALK_AT, w);
+    store_part<LaunchWalk, WALK_STATE_WORDS>(walk_words(r, slot), w);
     return STEP_VERTEX | (AT_LEAVE << STEP_AT_SHIFT);
 }
 

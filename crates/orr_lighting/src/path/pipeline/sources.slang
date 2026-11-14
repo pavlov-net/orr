@@ -55,7 +55,9 @@ void start_background(inout Payload p)
 void resolve_given(inout Payload p)
 {
     ORR_OMM(resolve_given);
-    p.words.x = launch_resolve_given<Surface>(root, launch_slot());
+    float t;
+    p.words.x = launch_resolve_given<Surface>(root, launch_slot(), t);
+    p.words.y = asuint(t);
 }
 
 // Each finish has the path's pass in its data's second word.

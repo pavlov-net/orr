@@ -6,9 +6,11 @@
 // vertex's emission, next-event estimation and scatter, tracing the shadow ray between the last
 // two, walking the thin walls it passed, marching the medium proxies with a volume it passed and
 // walking a directional light's ray through the plane stack it comes through.
-// Every wider value lives in the path's slot of `PathStages.words`, found from the launch index,
+// Every wider value lives in the path's slot (`launch/slot.slang`), found from the launch index,
 // which each shader loads and stores in the parts it reads and writes; across a trace, reorder,
-// invoke or call that memory is coherent at device scope. A vertex is shaded by the pipeline's own
+// invoke or call that memory is coherent at device scope. What crosses in registers beside the
+// step is the length of the ray to the vertex a resolve reached, which the raygen hands the
+// vertex's next-event estimation. A vertex is shaded by the pipeline's own
 // copies of the staged loop's bodies (`launch/shade_surface.slang`, `shade_other.slang`,
 // `nee.slang`, `scatter.slang`) over its packed surface: an opaque one's, a layer's or a scatter's
 // in an interior. The modules of `launch/` hold the loop by family; this one exports them to the

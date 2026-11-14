@@ -40,7 +40,7 @@ uint begin_interior_walk(PathRoot r, LaunchVertex v, uint medium, InteriorMedium
     uint seed;
     Walk e = interior_walk_from(v.p, v.x, im, ior, at, dir, rng, seed);
     PathCover cover = new_path_cover(MASK_OPAQUE | MASK_DIELECTRIC, COVER_LAYERS, PRESENCE_DRAWN, seed, HitContext());
-    store_part<LaunchWalk, WALK_STATE_WORDS>(v.at + WALK_AT, new_walk(e, LAUNCH_WALK_INTERIOR, medium, cover, v.p.depth, v.x.feedback));
+    store_part<LaunchWalk, WALK_STATE_WORDS>(walk_words(r, v.slot), new_walk(e, LAUNCH_WALK_INTERIOR, medium, cover, v.p.depth, v.x.feedback));
     return STEP_WALK;
 }
 

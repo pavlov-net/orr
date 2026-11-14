@@ -39,7 +39,10 @@ StoredHit lane_hit(uint lane)
 void resolve(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(resolve);
-    lane_words(id.x)[0].x = launch_resolve<Surface, StoredHit>(root, id.x, lane_hit(id.x));
+    float t;
+    uint4* w = lane_words(id.x);
+    w[0].x = launch_resolve<Surface, StoredHit>(root, id.x, lane_hit(id.x), t);
+    w[0].y = asuint(t);
 }
 
 [shader("compute")]
@@ -57,7 +60,7 @@ void direct(uint3 id: SV_DispatchThreadID)
     ORR_OMM(direct);
     uint4* w = lane_words(id.x);
     uint dimension;
-    w[0].x = launch_direct<AT_PLAIN, Surface, Medium>(root, id.x, w[0].y, dimension);
+    w[0].x = launch_direct<AT_PLAIN, Surface, Medium>(root, id.x, w[0].y, asfloat(w[0].z), dimension);
     w[0].y = dimension;
 }
 

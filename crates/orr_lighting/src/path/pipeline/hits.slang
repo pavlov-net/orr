@@ -25,7 +25,9 @@ void resolve(inout Payload p, TriangleAttributes a)
 {
     ORR_OMM(resolve);
     TriangleHit h = { a };
-    p.words.x = launch_resolve<Surface, TriangleHit>(root, launch_slot(), h);
+    float t;
+    p.words.x = launch_resolve<Surface, TriangleHit>(root, launch_slot(), h, t);
+    p.words.y = asuint(t);
 }
 
 [shader("closesthit")]
@@ -33,7 +35,9 @@ void resolve_strand(inout Payload p, TriangleAttributes a)
 {
     ORR_OMM(resolve_strand);
     BuiltInHit h = { a };
-    p.words.x = launch_resolve<Surface, BuiltInHit>(root, launch_slot(), h);
+    float t;
+    p.words.x = launch_resolve<Surface, BuiltInHit>(root, launch_slot(), h, t);
+    p.words.y = asuint(t);
 }
 
 // The closest-hit of the stack meet's record, which a plane stack's trace invokes on a dielectric
@@ -61,7 +65,9 @@ void layer_resolve(inout Payload p, TriangleAttributes a)
 {
     ORR_OMM(layer_resolve);
     TriangleHit h = { a };
-    p.words.x = launch_resolve_layer<Surface, TriangleHit>(root, launch_slot(), h);
+    float t;
+    p.words.x = launch_resolve_layer<Surface, TriangleHit>(root, launch_slot(), h, t);
+    p.words.y = asuint(t);
 }
 
 // A shadow ray's crossing step commits nothing: it keeps the nearest crossing past the last.

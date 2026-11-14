@@ -78,7 +78,7 @@ void keep_layer(PathRoot r, inout uint4 payload, uint4 key, uint4 more)
     float t = asfloat(key.x);
     if (!(t < asfloat(payload.x)))
         return;
-    uint4* at = slot_words(r, launch_slot()) + FRONT_AT;
+    uint4* at = scratch_words(r, launch_slot()) + FRONT_AT;
     if ((payload.w & LAYERS_BOUNDED) != 0)
     {
         float bound = asfloat(payload.z);
@@ -166,7 +166,7 @@ public uint launch_layers(PathRoot r, uint slot, uint kept, float t_max, out flo
     if (ray.local)
         ray_local = pixel_local_lights(r, v.f.pixel);
     PathEmission pe = { r.scene, r.set, ray_local, ray.origin, ray.dir, ray.from, ray.normal, v.x.one_technique ? 0.0 : ray.pdf, ray.run, t_max, own, adds };
-    uint4* at = v.at + FRONT_AT;
+    uint4* at = scratch_words(r, slot) + FRONT_AT;
     uint4 key = uint4(0);
     for (uint k = 0; k < kept; k++)
     {
@@ -202,8 +202,8 @@ public uint launch_layers(PathRoot r, uint slot, uint kept, float t_max, out flo
 // whose span's start is in `bound`. STEP_ENDED where nothing is left of it, else 0.
 public uint launch_proxy_march(PathRoot r, uint slot, uint kept, out float bound)
 {
-    uint4* words = slot_words(r, slot);
-    uint4* at = words + FRONT_AT;
+    uint4* words = hot_words(r, slot);
+    uint4* at = scratch_words(r, slot) + FRONT_AT;
     ShadowJob q = load_part<ShadowJob, SHADOW_WORDS>(words + SHADOW_AT);
     float3 through = float3(1.0);
     uint4 key = uint4(0);

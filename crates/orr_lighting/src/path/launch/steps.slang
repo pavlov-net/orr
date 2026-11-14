@@ -114,12 +114,12 @@ public static const uint STACK_ON = 1 << 0;
 public static const uint STACK_PROBED = 1 << 1;
 public static const uint STACK_LIT = 1 << 2;
 
-// Runs callable `index` with `word` in its data's second word, and returns its data: the step it
-// hands back first.
-public uint4 data_call(uint index, uint word = 0)
+// Runs callable `index` with `word` in its data's second word and `t` in its third, and returns
+// its data: the step it hands back first.
+public uint4 data_call(uint index, uint word = 0, float t = 0.0)
 {
     Payload c;
-    c.words = uint4(0, word, 0, 0);
+    c.words = uint4(0, word, asuint(t), 0);
     call(index, c);
     return c.words;
 }

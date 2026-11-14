@@ -32,10 +32,12 @@ static const uint WALK_MEET_RECORD = RAY_TYPES * RUN_WALK + RAY_TYPE_PATH;
 
 // Runs the walk of `slot`'s path from its walk part to its end, and returns the step the path
 // goes on with there. Its steps are traced here, a ray each; after every WALK_POINT_STEPS of
-// them the walk is stored, and the thread reorders by whether it still walks.
-public uint walk_path(PathRoot r, uint slot)
+// them the walk is stored, and the thread reorders by whether it still walks. Where its last step
+// met a surface the hit's shader resolved, the length it gave the step in `t`.
+public uint walk_path(PathRoot r, uint slot, out float t)
 {
-    uint4* at = slot_words(r, slot) + WALK_AT;
+    t = 0.0;
+    uint4* at = walk_words(r, slot);
     bool share = (r.dielectric_flags & DIELECTRIC_REFERENCE) == 0;
     for (;;)
     {
@@ -81,6 +83,7 @@ public uint walk_path(PathRoot r, uint slot)
                 h.reorder();
                 h.invoke(p);
                 step = p.words.x;
+                t = asfloat(p.words.y);
             }
             return step;
         }

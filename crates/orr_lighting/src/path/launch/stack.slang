@@ -40,7 +40,7 @@ import orr_lighting.path.launch.record;
 // surfaces and dielectrics, as `stack_trace` traces it.
 public RayDesc launch_stack_ray(PathRoot r, uint slot, float t_max, out uint4 payload)
 {
-    ShadowJob q = load_part<ShadowJob, SHADOW_WORDS>(slot_words(r, slot) + SHADOW_AT);
+    ShadowJob q = load_part<ShadowJob, SHADOW_WORDS>(hot_words(r, slot) + SHADOW_AT);
     PathCover cover = new_path_cover(MASK_OPAQUE | MASK_DIELECTRIC, COVER_STACK, PRESENCE_NONE, 0, shadow_context(q.flags));
     payload = path_payload(cover);
     return path_ray(q.origin, q.dir, t_max);
@@ -59,9 +59,9 @@ public RayDesc launch_probe_ray(PathRoot r, uint slot, float committed, out uint
 // The leg along it, the slot's shadow ray, ends there, short of it by its rounding.
 public void keep_stack_hit(PathRoot r, uint slot, bool hit, bool triangle, uint class_id, float t, uint instance, int cluster, uint primitive, float2 bary, RayDesc ray)
 {
-    uint4* at = slot_words(r, slot);
+    uint4* at = hot_words(r, slot);
     StackHit h = { t, instance, cluster, primitive, bary, class_id, (hit ? STACK_HIT_MET : 0) | (triangle ? STACK_HIT_TRIANGLE : 0) };
-    store_part<StackHit, STACK_HIT_WORDS>(at + stack_at(r) + STACK_HIT_AT, h);
+    store_part<StackHit, STACK_HIT_WORDS>(stack_words(r, slot) + STACK_HIT_AT, h);
     float leg = positive_infinity();
     if (hit)
     {
@@ -79,10 +79,10 @@ public void keep_stack_hit(PathRoot r, uint slot, bool hit, bool triangle, uint 
 // next.
 public uint launch_stack_step<M : IMedium>(PathRoot r, uint slot, uint phase)
 {
-    uint4* at = slot_words(r, slot);
-    uint4* walk_at = at + stack_at(r) + STACK_WALK_AT;
+    uint4* at = hot_words(r, slot);
+    uint4* walk_at = stack_words(r, slot) + STACK_WALK_AT;
     ShadowJob q = load_part<ShadowJob, SHADOW_WORDS>(at + SHADOW_AT);
-    Hit h = stack_hit(load_part<StackHit, STACK_HIT_WORDS>(at + stack_at(r) + STACK_HIT_AT));
+    Hit h = stack_hit(load_part<StackHit, STACK_HIT_WORDS>(stack_words(r, slot) + STACK_HIT_AT));
     StackFace face;
     bool on_face = stack_face(r.scene, h, has(q.flags, SHADOW_DISPERSION), face);
     if (phase == STACK_PROBE)
@@ -92,8 +92,8 @@ public uint launch_stack_step<M : IMedium>(PathRoot r, uint slot, uint phase)
         StackWalk w;
         Interior arrived = Interior();
         if (interiors_tracked(r))
-            arrived = load_part<LaunchInterior, SLOT_INTERIOR_WORDS>(at + interior_at(r)).interior;
-        w.inside = shadow_inside(r, at, arrived, q.origin, q.flags, w.from);
+            arrived = load_part<LaunchInterior, SLOT_INTERIOR_WORDS>(interior_words(r, slot)).interior;
+        w.inside = shadow_inside(r, slot, arrived, q.origin, q.flags, w.from);
         w.dir = q.dir;
         w.normal = face.normal;
         if (dot(face.geometric_normal, w.dir) > 0.0 && !w.inside.holds(face.material))

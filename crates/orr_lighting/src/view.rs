@@ -17,7 +17,7 @@ use orr_scene::{
 };
 
 use crate::caustics::PhotonMap;
-use crate::launch::{LaunchMemory, PathPipeline, Raygen};
+use crate::launch::{LaunchMemory, PathPipeline, Raygen, SlotLayout};
 use crate::media::{
     MediaKernels, MediaSettings, MediaStats, MediaView, fogged, links_medium, readers, shows_media,
 };
@@ -2156,8 +2156,7 @@ impl LightingKernels {
             round: 0,
             round_first: 0,
             round_next: 0,
-            _pad0: 0,
-            _pad1: 0,
+            launch: GpuPtr::NULL,
         };
         let k = match &self.paths {
             Paths::Pipeline(launch) => {
@@ -2369,18 +2368,21 @@ impl LightingKernels {
         // The update paths keep the view's layers and light parts but split by no wavelength.
         let update_features =
             update_root(&root).features | (features & (FEATURE_LAYERS | FEATURE_COATED_EMITTERS));
+        let candidates = root.primary_candidates.max(root.bounce_candidates);
+        let view_layout = SlotLayout::new(root.features, true, candidates);
+        let update_layout = SlotLayout::new(update_features, false, candidates);
         if !view
             .launched
             .as_ref()
-            .is_some_and(|m| m.fits(pixels, root.features, update, update_features))
+            .is_some_and(|m| m.fits(pixels, view_layout, update, update_layout))
         {
             view.launched = None;
             view.launched = Some(LaunchMemory::new(
                 &view.device,
                 pixels,
-                root.features,
+                view_layout,
                 update,
-                update_features,
+                update_layout,
             )?);
         }
         let root = PathRoot {
@@ -2568,7 +2570,11 @@ impl LightingKernels {
                     .launched
                     .as_mut()
                     .expect("made by record_launched")
-                    .photons(&view.device, slots, root.features)?;
+                    .photons(
+                        &view.device,
+                        slots,
+                        SlotLayout::new(root.features, false, 0),
+                    )?;
                 launch.record(list, hits, Raygen::Photon, &root, memory, photons);
             }
         }
