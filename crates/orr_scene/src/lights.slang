@@ -2,6 +2,7 @@
 module lights;
 
 import orr_shaders.abi;
+import orr_shaders.math;
 
 // `LightGpu.kind`.
 public static const uint LIGHT_NONE = 0;
@@ -43,6 +44,17 @@ public struct LightGpu
     public float3 up;             // DISC_TEXTURED: the albedo's up on the disc
     public uint _pad5;
     public uint4 lit_by;          // DISC_TEXTURED: directional lights lighting the disc, or NO_LIGHT
+}
+
+// Whether `l` is a sphere light that emits: a sphere of radius above 0 whose squared radius
+// `r2` is a normal f32 and whose `radiance`, its intensity over the area of its disc, is
+// finite. Another sphere stays dark, with no samples, proxy or hits.
+public bool sphere_light(LightGpu l, out float r2, out float3 radiance)
+{
+    r2 = l.radius * l.radius;
+    float area = PI * r2;
+    radiance = l.color / area;
+    return l.kind == LIGHT_SPHERE && l.radius > 0.0 && r2 >= F32_MIN_NORMAL && isfinite(area) && all(isfinite(radiance));
 }
 
 // `EmissiveGpu.kind`.

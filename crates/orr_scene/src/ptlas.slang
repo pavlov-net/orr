@@ -1050,14 +1050,16 @@ void producer_emit(uint3 id: SV_DispatchThreadID)
 // A proxy job naming light `job & ~LIGHT_JOB`.
 public static const uint LIGHT_JOB = 0x80000000;
 
-// The placement of light `l`'s proxy: the proxy BLAS's cube [-1, 1]^3 around a sphere of
-// its stored radius, or flat around a rect, a little larger so its box holds every point
-// light sampling and hits test.
+// The placement of light `l`'s proxy: the proxy BLAS's cube [-1, 1]^3 around a `sphere_light`,
+// or flat around a rect, a little larger so its box holds every point light sampling and hits
+// test.
 bool light_placement(LightGpu l, out Placement pl)
 {
     pl = Placement();
     pl.translation = l.position;
-    if (l.kind == LIGHT_SPHERE && l.radius > 0.0)
+    float r2;
+    float3 radiance;
+    if (sphere_light(l, r2, radiance))
     {
         float r = l.radius * 1.001;
         pl.linear = float3x3(r, 0.0, 0.0, 0.0, r, 0.0, 0.0, 0.0, r);

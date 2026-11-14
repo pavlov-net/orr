@@ -7,11 +7,11 @@ use lighting_suite::bed::{
     Accumulated, Analytic, BLACK_SPHERE, BUMPY_FLOOR, Bed, COATED_EMITTER, EMITTER, EMITTER_FIELD,
     EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal, GLASS_SPHERE, GLOSSY_FLOOR, Item, MIRROR, NEAR,
     Particle, ParticleLook, Paths, QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR, SUN, Spec,
-    StrandRow, TILED_FLOOR, TINTED_FLOOR, TROUGH, assert_close, image_mean, luminance, mean_where,
-    pixel_of, reference, surface_mean,
+    StrandRow, TILED_FLOOR, TINTED_FLOOR, TROUGH, WHITE_FLOOR, assert_close, image_mean, luminance,
+    mean_where, pixel_of, reference, surface_mean,
 };
 use lighting_suite::shaders::origins;
-use lighting_suite::welch::assert_same_mean;
+use lighting_suite::welch::{assert_mean, assert_same_mean};
 use lighting_suite::{
     assert_clean, device, pipeline, read, readback, render, run, texture, upload,
 };
@@ -1555,6 +1555,45 @@ fn sphere_and_rect_lights_reach_bsdf_rays_through_their_proxies() {
         }),
     );
     lit(&mut bed, "after the tables grew");
+    assert_clean();
+}
+
+/// A sphere light lights the floor below it alike at any radius that keeps it clear of the
+/// floor's horizon, a radius below the smallest half included.
+#[test]
+fn a_sphere_light_smaller_than_any_half_lights_like_a_larger_one() {
+    let spec = |radius: f32| Spec {
+        copies: vec![at(WHITE_FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
+        lights: vec![Light::Sphere {
+            position: DVec3::new(0.0, 1.0, 0.0),
+            radius,
+            intensity: Vec3::splat(40.0),
+            cone: None,
+        }],
+        environment: None,
+        eye: Vec3::new(0.0, 1.0, 3.0),
+        target: Vec3::new(0.0, 0.0, 0.0),
+        fov_y: 0.8,
+        focus: None,
+    };
+    let patch = pixel_of(&spec(0.1), Vec3::new(0.3, 0.0, 0.4));
+    let mut means = Vec::new();
+    for radius in [0.1, 1e-9] {
+        let mut bed = Bed::with(spec(radius));
+        means.push(patch_means(
+            &mut bed,
+            &paths(debug(LightingDebugView::NeeOnly, 1)),
+            patch,
+            16,
+            8,
+            1,
+        ));
+    }
+    let larger = means[0].iter().sum::<f64>() / means[0].len() as f64;
+    assert!(larger > 0.0, "the light lit nothing");
+    // The nearly noiseless point takes a tolerance: tile samples round each light's radiance to
+    // 9 bits, differently at each radius.
+    assert_mean("1 nm against 10 cm", &means[1], larger, 0.005);
     assert_clean();
 }
 

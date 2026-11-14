@@ -38,7 +38,9 @@ pub struct LightTables {
 pub enum Light {
     Directional(DirectionalLight),
     /// A sphere emitting `intensity` candela, optionally limited to a cone. Only the BSDF rays
-    /// of paths see its body: the camera does not, and it casts no shadow.
+    /// of paths see its body: the camera does not, and it casts no shadow. It stays dark where
+    /// f32 cannot hold its radiance, `intensity` over π `radius`², or `radius`² as a normal
+    /// number.
     Sphere {
         position: DVec3,
         radius: f32,

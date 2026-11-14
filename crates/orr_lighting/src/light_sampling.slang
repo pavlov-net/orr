@@ -125,7 +125,7 @@ public struct LightSample
     // The light's feedback id (`feedback_environment`).
     public uint light;
     // Bits 0-1: LIGHT_SAMPLE_*. Bit 2: LIGHT_SAMPLE_TWO_SIDED. Bit 3: LIGHT_SAMPLE_VIEW.
-    // Bits 8-15: the radiance exponent + 128. Bits 16-31: the sphere radius, half float.
+    // Bits 8-15: the radiance exponent + 128. A sphere's radius is its light's.
     public uint bits;
     // Emissive: the position drawn in its entry's list; 0 for other lights.
     public uint position;
@@ -628,7 +628,8 @@ uint2 encode_radiance(float3 c)
     if (!(m > 0.0) || !isfinite(m))
         return uint2(0, 128);
     int e = int((asuint(m) >> 23) & 0xff) - 127;
-    int k = clamp(e - 14, -128, 127);
+    // 2^-k and 2^k stay normal f32s, which the encode and decode scale by.
+    int k = clamp(e - 14, -126, 127);
     return uint2(pack_rgb9e5(c * exp2(float(-k))), uint(k + 128));
 }
 
@@ -984,13 +985,8 @@ public EmitterHit emitter_hit(LightSetGpu* set, uint instance_index, uint cluste
     return h;
 }
 
-// A sphere light's radius as tile samples store it.
-float sample_radius(float radius)
-{
-    return unpack_half2x16(pack_half2x16(float2(radius, 0.0))).x;
-}
-
-// Sample of sphere or rect light `id` from `u`, the light chosen with `probability`.
+// Sample of sphere or rect light `id` from `u`, the light chosen with `probability`: one that
+// `candidate` weighs, so a sphere is a `sphere_light`.
 LightSample local_sample(LightSetGpu* set, uint id, float2 u, float probability)
 {
     LightGpu l = set.scene.lights[id];
@@ -1001,11 +997,11 @@ LightSample local_sample(LightSetGpu* set, uint id, float2 u, float probability)
         float3 x = l.position + (u.x - 0.5) * l.edge_x + (u.y - 0.5) * l.edge_y;
         return light_sample(LIGHT_SAMPLE_RECT, id, x, n / area, l.color, probability / area);
     }
-    float r = sample_radius(l.radius);
+    float r2;
+    float3 radiance;
+    sphere_light(l, r2, radiance);
     float3 axis = l.cone_cos_outer > -1.0 ? l.direction : float3(0.0, 0.0, 1.0);
-    LightSample s = light_sample(LIGHT_SAMPLE_SPHERE, id, l.position, axis, l.color / (PI * r * r), probability);
-    s.bits |= (pack_half2x16(float2(r, 0.0)) & 0xffff) << 16;
-    return s;
+    return light_sample(LIGHT_SAMPLE_SPHERE, id, l.position, axis, radiance, probability);
 }
 
 // The environment's feedback id. Sphere and rect lights take their LightId, and emissive
@@ -1178,21 +1174,24 @@ public ResolvedLightSample resolve_light_sample(LightSetGpu* set, LightSample s,
     }
     if (kind == LIGHT_SAMPLE_SPHERE)
     {
-        float radius = unpack_half2x16(s.bits >> 16).x;
+        LightGpu* light = set.scene.lights + s.light;
         float3 to_center = s.point - x;
         float d2 = dot(to_center, to_center);
-        float r2 = radius * radius;
+        float r2 = light.radius * light.radius;
         if (!(d2 > r2))
             return no_candidate();
         float sin2 = r2 / d2;
         float one_minus_cos = sin2 / (1.0 + sqrt(1.0 - sin2));
+        // A cone narrower than f32 holds has no density; `local_light_density` agrees, so BSDF
+        // rays take such a light whole.
+        if (!(one_minus_cos >= F32_MIN_NORMAL))
+            return no_candidate();
         float3 axis = to_center * rsqrt(d2);
         r.dir = cone_direction(axis, one_minus_cos, u);
         float b = dot(to_center, r.dir);
         float3 h = to_center - b * r.dir;
         r.distance = b - sqrt(max(0.0, r2 - dot(h, h)));
         r.point = x + r.dir * r.distance;
-        LightGpu* light = set.scene.lights + s.light;
         float c = dot(oct_decode_snorm16(s.normal), -axis);
         r.radiance = l * spot_falloff(c, light.cone_cos_inner, light.cone_cos_outer);
         r.pdf = s.pdf * cone_pdf(one_minus_cos);
@@ -1394,18 +1393,19 @@ public float nee_emissive_pdf(LightSetGpu* set, LocalLights* local, float3 norma
 public float local_light_density(LightSetGpu* set, uint id, float3 x, float3 dir)
 {
     LightGpu l = set.scene.lights[id];
-    if (l.kind == LIGHT_SPHERE)
+    float r2;
+    float3 emitted;
+    if (sphere_light(l, r2, emitted))
     {
-        float r = sample_radius(l.radius);
         float3 to_center = l.position - x;
         float d2 = dot(to_center, to_center);
-        float r2 = r * r;
         float b = dot(to_center, dir);
         float3 h = to_center - b * dir;
         if (!(d2 > r2) || b <= 0.0 || dot(h, h) > r2)
             return 0.0;
         float sin2 = r2 / d2;
-        return 1.0 / (TWO_PI * sin2 / (1.0 + sqrt(1.0 - sin2)));
+        float one_minus_cos = sin2 / (1.0 + sqrt(1.0 - sin2));
+        return one_minus_cos >= F32_MIN_NORMAL ? cone_pdf(one_minus_cos) : 0.0;
     }
     if (l.kind != LIGHT_RECT)
         return 0.0;
@@ -1432,13 +1432,14 @@ public bool light_proxy_hit(LightSetGpu* set, uint id, float3 origin, float3 dir
     LightGpu l = set.scene.lights[id];
     t = 0.0;
     radiance = float3(0.0);
-    if (l.kind == LIGHT_SPHERE)
+    float r2;
+    float3 emitted;
+    if (sphere_light(l, r2, emitted))
     {
-        float r = sample_radius(l.radius);
         float3 oc = origin - l.position;
         float b = dot(oc, dir);
         float3 h = oc - b * dir;
-        float disc = r * r - dot(h, h);
+        float disc = r2 - dot(h, h);
         if (!(disc >= 0.0))
             return false;
         float q = sqrt(disc);
@@ -1451,7 +1452,7 @@ public bool light_proxy_hit(LightSetGpu* set, uint id, float3 origin, float3 dir
         // The axis as tile samples store it.
         float3 axis = oct_decode_snorm16(oct_encode_snorm16(l.cone_cos_outer > -1.0 ? l.direction : float3(0.0, 0.0, 1.0)));
         float c = dot(axis, normalize(away));
-        radiance = l.color / (PI * r * r) * spot_falloff(c, l.cone_cos_inner, l.cone_cos_outer);
+        radiance = emitted * spot_falloff(c, l.cone_cos_inner, l.cone_cos_outer);
         return true;
     }
     if (l.kind != LIGHT_RECT)
