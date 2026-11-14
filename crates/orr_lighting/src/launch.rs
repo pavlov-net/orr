@@ -110,11 +110,11 @@ const LAYER_COPIES: usize = 5;
 const LAYER_PRODUCERS: usize = 6;
 
 /// Then the callables, in `path/launch.slang`'s CALL_* order, each with the lobes of the BSDF its
-/// vertices may have: next-event estimation and the scatter are made for a plain surface's and a
-/// rich one's. A walk's ends are made rich, as a walk starts only from a vertex with a subsurface
-/// weight, and so are the layer's, the window's and an emitter's view, whose surfaces may have
-/// every lobe. What lies along a ray, a scatter in a medium and a plane stack's step shade no
-/// surface.
+/// vertices may have. Next-event estimation and the scatter are made per vertex class (`AT_*`), an
+/// opaque vertex's for a plain surface's and a rich one's. A walk's ends are made rich, as a walk
+/// starts only from a vertex with a subsurface weight, and so are the layer's, the window's and an
+/// emitter's view, whose surfaces may have every lobe. What lies along a ray, a scatter in a
+/// medium and a plane stack's step shade no surface.
 const CALLABLES: [(&str, bool); 31] = [
     ("start_view", true),
     ("start_update", true),
@@ -124,26 +124,26 @@ const CALLABLES: [(&str, bool); 31] = [
     ("emission", true),
     ("direct", false),
     ("direct", true),
-    ("deposit", true),
-    ("cache_vertex", true),
+    ("direct_exit", true),
+    ("direct_leave", true),
+    ("direct_medium", false),
+    ("direct_layer", true),
     ("scatter", false),
     ("scatter", true),
+    ("scatter_exit", true),
+    ("scatter_leave", true),
+    ("scatter_medium", false),
+    ("scatter_layer", true),
+    ("deposit", true),
+    ("cache_vertex", true),
     ("finish_view", true),
     ("finish_record", true),
     ("finish_background", true),
     ("walk_end", true),
-    ("direct_exit", true),
-    ("scatter_exit", true),
-    ("direct_leave", true),
-    ("scatter_leave", true),
     ("segment", false),
     ("layers", false),
     ("march_proxy", false),
-    ("direct_medium", false),
-    ("scatter_medium", false),
     ("gbuffer_start", true),
-    ("direct_layer", true),
-    ("scatter_layer", true),
     ("window", true),
     ("stack_step", false),
     ("emitter_view", true),

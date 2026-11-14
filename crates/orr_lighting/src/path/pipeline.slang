@@ -127,7 +127,7 @@ void cover_path_hit(inout Payload p, TriangleAttributes a)
 // Ends with what the decision says, the payload holding the shadow's state.
 void shadow_decided(inout Payload p, ShadowCover c, uint d)
 {
-    p.words = uint4(asuint(c.product), c.word);
+    p.words = c.words();
     if (d == ANY_HIT_END)
         AcceptHitAndEndSearch();
     IgnoreHit();
@@ -138,7 +138,7 @@ void cover_shadow_hit(inout Payload p, TriangleAttributes a)
 {
     ORR_OMM(cover_shadow_hit);
     TriangleHit h = { a };
-    ShadowCover c = { asfloat(p.words.xyz), p.words.w };
+    ShadowCover c = ShadowCover.of_words(p.words);
     uint d = cover_shadow<CoverageFeedback<Surface>>(root.scene, root.view, c.context(), c, h.world_direction(), h.custom_index(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.barycentrics());
     shadow_decided(p, c, d);
 }
@@ -161,7 +161,7 @@ void box_medium_hit()
 void proxy_shadow_hit(inout Payload p, SpanAttributes a)
 {
     ORR_OMM(proxy_shadow_hit);
-    ShadowCover c = { asfloat(p.words.xyz), p.words.w };
+    ShadowCover c = ShadowCover.of_words(p.words);
     uint d = proxy_shadow(root.scene, c, InstanceIndex(), a.span);
     shadow_decided(p, c, d);
 }
@@ -257,15 +257,21 @@ void emission(inout Payload p)
     launch_emission(root, launch_slot());
 }
 
-// Each direct and the deposit take DIRECT_* in their data's second word. An opaque vertex's hands
-// back there the sampler dimension of its record's vertex, which `cache_vertex` takes.
+// The direct callable of vertex class `K` (AT_*), and the deposit, take DIRECT_* in their data's
+// second word. A direct callable hands back there the sampler dimension of its record's vertex,
+// which `cache_vertex` takes.
+void direct_of<let K : uint>(inout Payload p)
+{
+    uint dimension;
+    p.words.x = launch_direct<K, Surface, Medium>(root, launch_slot(), p.words.y, dimension);
+    p.words.y = dimension;
+}
+
 [shader("callable")]
 void direct(inout Payload p)
 {
     ORR_OMM(direct);
-    uint dimension;
-    p.words.x = launch_direct<Surface, Medium>(root, launch_slot(), p.words.y, dimension);
-    p.words.y = dimension;
+    direct_of<AT_PLAIN>(p);
 }
 
 [shader("callable")]
@@ -286,7 +292,7 @@ void cache_vertex(inout Payload p)
 void scatter(inout Payload p)
 {
     ORR_OMM(scatter);
-    p.words.x = launch_scatter<Surface>(root, launch_slot());
+    p.words.x = launch_scatter<AT_PLAIN, Surface>(root, launch_slot());
 }
 
 // Each finish has the path's pass in its data's second word.
@@ -322,42 +328,42 @@ void walk_end(inout Payload p)
 void direct_exit(inout Payload p)
 {
     ORR_OMM(direct_exit);
-    p.words.x = launch_direct_exit<Surface, Medium>(root, launch_slot(), p.words.y);
+    direct_of<AT_EXIT>(p);
 }
 
 [shader("callable")]
 void scatter_exit(inout Payload p)
 {
     ORR_OMM(scatter_exit);
-    p.words.x = launch_scatter_exit<Surface>(root, launch_slot());
+    p.words.x = launch_scatter<AT_EXIT, Surface>(root, launch_slot());
 }
 
 [shader("callable")]
 void direct_leave(inout Payload p)
 {
     ORR_OMM(direct_leave);
-    p.words.x = launch_direct_leave<Surface, Medium>(root, launch_slot(), p.words.y);
+    direct_of<AT_LEAVE>(p);
 }
 
 [shader("callable")]
 void scatter_leave(inout Payload p)
 {
     ORR_OMM(scatter_leave);
-    p.words.x = launch_scatter_leave<Surface>(root, launch_slot());
+    p.words.x = launch_scatter<AT_LEAVE, Surface>(root, launch_slot());
 }
 
 [shader("callable")]
 void direct_layer(inout Payload p)
 {
     ORR_OMM(direct_layer);
-    p.words.x = launch_direct_layer<Surface, Medium>(root, launch_slot(), p.words.y);
+    direct_of<AT_LAYER>(p);
 }
 
 [shader("callable")]
 void scatter_layer(inout Payload p)
 {
     ORR_OMM(scatter_layer);
-    p.words.x = launch_scatter_layer<Surface>(root, launch_slot());
+    p.words.x = launch_scatter<AT_LAYER, Surface>(root, launch_slot());
 }
 
 // Takes the hit flag and distance in, and hands the step back.
@@ -390,14 +396,14 @@ void march_proxy(inout Payload p)
 void direct_medium(inout Payload p)
 {
     ORR_OMM(direct_medium);
-    p.words.x = launch_direct_medium<Surface, Medium>(root, launch_slot(), p.words.y);
+    direct_of<AT_SCATTER>(p);
 }
 
 [shader("callable")]
 void scatter_medium(inout Payload p)
 {
     ORR_OMM(scatter_medium);
-    p.words.x = launch_scatter_medium<Surface>(root, launch_slot());
+    p.words.x = launch_scatter<AT_SCATTER, Surface>(root, launch_slot());
 }
 
 [shader("callable")]

@@ -469,6 +469,7 @@ static const uint RAY_CHAIN = 1 << 1;
 static const uint RAY_SCATTER = 1 << 2;
 static const uint RAY_LOCAL = 1 << 3;
 static const uint RAY_LIT = 1 << 4;
+public static const uint RAY_FLAG_BITS = 5;
 
 // Word `word` of `slot`'s state.
 uint word_index(PathStages* st, uint word, uint slot)
@@ -812,18 +813,30 @@ LayerRay load_ray(PathRoot r, uint slot, bool after)
     ray.run = v.run;
     ray.normal = v.normal;
     ray.from = v.from;
+    set_ray_flags(ray, flags);
+    return ray;
+}
+
+// `ray`'s flags as one word holds them: RAY_*, in the bits below RAY_FLAG_BITS.
+public uint ray_flags(LayerRay ray)
+{
+    return (ray.diffuse ? RAY_DIFFUSE : 0) | (ray.chain ? RAY_CHAIN : 0) | (ray.scatter ? RAY_SCATTER : 0) | (ray.local ? RAY_LOCAL : 0) | (ray.lit ? RAY_LIT : 0);
+}
+
+// Sets `ray`'s flags from `ray_flags`' word `flags`.
+public void set_ray_flags(inout LayerRay ray, uint flags)
+{
     ray.diffuse = (flags & RAY_DIFFUSE) != 0;
     ray.chain = (flags & RAY_CHAIN) != 0;
     ray.scatter = (flags & RAY_SCATTER) != 0;
     ray.local = (flags & RAY_LOCAL) != 0;
     ray.lit = (flags & RAY_LIT) != 0;
-    return ray;
 }
 
 void store_ray(PathRoot r, uint slot, LayerRay ray)
 {
     PathStages* st = r.stages;
-    uint flags = (ray.diffuse ? RAY_DIFFUSE : 0) | (ray.chain ? RAY_CHAIN : 0) | (ray.scatter ? RAY_SCATTER : 0) | (ray.local ? RAY_LOCAL : 0) | (ray.lit ? RAY_LIT : 0);
+    uint flags = ray_flags(ray);
     st.words[word_index(st, RAY_FIRST, slot)].xyz = asuint(ray.dir);
     st.words[word_index(st, RAY_FIRST + 1, slot)] = uint4(asuint(ray.normal), asuint(ray.pdf));
     st.words[word_index(st, RAY_FIRST + 2, slot)] = uint4(asuint(ray.from), asuint(ray.run));
@@ -1629,9 +1642,15 @@ float3 shadow_trace<S : ISurfaces, M : IMedium>(PathRoot r, PathShadowRay q, out
     shadow.normal = has(q.flags, SHADOW_INTO) ? -q.dir : q.dir;
     shadow.dispersion = has(q.flags, SHADOW_DISPERSION);
     shadow.bend = has(q.flags, SHADOW_BEND);
+    return shadow.transmittance(q.start, q.origin, q.dir, q.t_max, shadow_context(q.flags), has(q.flags, SHADOW_ENVIRONMENT), has(q.flags, SHADOW_DIRECTIONAL), stack);
+}
+
+// The hit context of the candidates of a shadow ray of flags `flags` (SHADOW_*, with its vertex's
+// depth): a secondary ray's, of no cone.
+public HitContext shadow_context(uint flags)
+{
     RayCone cone = { 0.0, 0.0 };
-    HitContext context = hit_context(HIT_SECONDARY, (q.flags >> SHADOW_DEPTH_SHIFT) + 1, cone, 0.0, float2(-1.0), has(q.flags, SHADOW_FEEDBACK));
-    return shadow.transmittance(q.start, q.origin, q.dir, q.t_max, context, has(q.flags, SHADOW_ENVIRONMENT), has(q.flags, SHADOW_DIRECTIONAL), stack);
+    return hit_context(HIT_SECONDARY, (flags >> SHADOW_DEPTH_SHIFT) + 1, cone, 0.0, float2(-1.0), has(flags, SHADOW_FEEDBACK));
 }
 
 // Adds what shadow ray `q` gave, `added`, to the path.
@@ -2083,34 +2102,9 @@ VertexScatter vertex_weighs<let X : uint>(ShadeVertex sv, uint kind)
     return f;
 }
 
-// The hit the trace stage left a shade, or a walk's last step, as a hit shader reads its hit:
-// `dir` is the ray's. It holds nothing the bodies do not read.
-struct PendingHit : IHit
+ValueHit pending_hit(PathPending pending, float3 dir)
 {
-    Hit hit;
-    float3 positions[3];
-    float3 dir;
-
-    uint3 launch() { return uint3(0); }
-    uint instance_index() { return hit.instance_index; }
-    uint custom_index() { return hit.custom_index; }
-    uint geometry_index() { return hit.geometry_index; }
-    uint primitive_index() { return hit.primitive_index; }
-    int cluster_id() { return hit.cluster_id; }
-    float t() { return hit.t; }
-    float2 barycentrics() { return hit.barycentrics; }
-    bool front_face() { return hit.front_face; }
-    float3 world_origin() { return float3(0.0); }
-    float3 world_direction() { return dir; }
-    float3 object_origin() { return float3(0.0); }
-    float3 object_direction() { return float3(0.0); }
-    float3 corner(uint i) { return positions[i]; }
-}
-
-PendingHit pending_hit(PathPending pending, float3 dir)
-{
-    PendingHit h = { pending.hit, pending.positions, dir };
-    return h;
+    return value_hit(pending.hit, pending.positions, dir);
 }
 
 // What owns opaque surface `ps` as a walk's steps see it: a hit's slot copy, or its producer
@@ -3250,8 +3244,7 @@ public void walk_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
     bool own = true;
     if (alive && walk.kind == WALK_BOUNDARY)
     {
-        PendingHit h = { walk.hit, walk.positions, walk.dir };
-        alive = resolve_walk_exit<S>(r, f, p, x, h, exit);
+        alive = resolve_walk_exit<S>(r, f, p, x, value_hit(walk.hit, walk.positions, walk.dir), exit);
         exit_dir = walk.dir;
         own = unpack_surface(exit).bsdf.subsurface_weight > 0.0;
     }

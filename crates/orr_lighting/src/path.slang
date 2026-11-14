@@ -387,6 +387,13 @@ public PathVertex hit_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
     return facing_vertex(v, sh.surface, sh.geometric_error, sh.depth_offset, dir, true);
 }
 
+// Inline trace hit `h`, with its triangle's corners `positions`, reached along `dir`, as a value.
+public ValueHit value_hit(Hit h, float3 positions[3], float3 dir)
+{
+    ValueHit v = { h.instance_index, h.custom_index, h.cluster_id, h.primitive_index, h.barycentrics, h.t, dir, positions };
+    return v;
+}
+
 // The vertex of packed surface `ps`, reached along `dir`: a hit's as `hit_vertex` makes it, and
 // the G-buffer's as `gbuffer_vertex` does, `dir` from the eye.
 public PathVertex surface_vertex(ViewConstants* v, PackedSurface ps, float3 dir)

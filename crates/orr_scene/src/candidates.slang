@@ -145,6 +145,17 @@ public static const uint SHADOW_VOLUME = 1 << 19;    // it passed a medium proxy
 // (from bit 21).
 public struct ShadowCover
 {
+    public static ShadowCover of_words(uint4 payload)
+    {
+        ShadowCover c = { asfloat(payload.xyz), payload.w };
+        return c;
+    }
+
+    public uint4 words()
+    {
+        return uint4(asuint(product), word);
+    }
+
     public float3 product;
     public uint word;
 
@@ -173,6 +184,13 @@ public struct ShadowCover
     public bool has(uint flag)
     {
         return (word & flag) != 0;
+    }
+
+    // Whether the ray passed a medium proxy with a volume that a march takes, where it committed
+    // a hit where `hit`: light is left, and no opaque hit ended it before every candidate counted.
+    public bool marches(bool hit)
+    {
+        return has(SHADOW_VOLUME) && any(product > 0.0) && (!hit || has(SHADOW_OVERFLOW));
     }
 
     // Multiplies a candidate's `transmittance` in, counted or not, ending the search past
