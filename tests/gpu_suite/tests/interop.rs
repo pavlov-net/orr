@@ -98,23 +98,24 @@ fn heap_commands_after_raw_commands() {
     assert_clean();
 }
 
-struct ShaderClock {
+struct TransformFeedback {
     created: AtomicBool,
 }
 
-impl DeviceHooks for ShaderClock {
+impl DeviceHooks for TransformFeedback {
     fn device_extensions(&self, _: &ash::Instance, _: vk::PhysicalDevice) -> Vec<CString> {
-        vec![ash::khr::shader_clock::NAME.to_owned()]
+        vec![ash::ext::transform_feedback::NAME.to_owned()]
     }
 
     fn device_features(&self, _: vk::PhysicalDevice, features: &mut Features<'_>) {
-        features
-            .push(vk::PhysicalDeviceShaderClockFeaturesKHR::default().shader_subgroup_clock(true));
+        features.push(
+            vk::PhysicalDeviceTransformFeedbackFeaturesEXT::default().transform_feedback(true),
+        );
         features.vulkan_1_4.push_descriptor = vk::TRUE;
     }
 
     fn device_created(&self, raw: &RawDevice<'_>) {
-        assert!(raw.has_extension(ash::khr::shader_clock::NAME));
+        assert!(raw.has_extension(ash::ext::transform_feedback::NAME));
         self.created.store(true, Ordering::Relaxed);
     }
 }
@@ -123,7 +124,7 @@ impl DeviceHooks for ShaderClock {
 #[test]
 fn hooks_add_extensions_and_features() {
     log_to_stderr();
-    let hooks = ShaderClock {
+    let hooks = TransformFeedback {
         created: AtomicBool::new(false),
     };
     let d = Device::new(&DeviceDesc {

@@ -23,6 +23,12 @@ const REQUIRED_EXTENSIONS: &[&CStr] = &[
     ash::ext::memory_budget::NAME,
     ash::khr::maintenance8::NAME,
     ash::khr::shader_maximal_reconvergence::NAME,
+    ash::khr::shader_clock::NAME,
+    ash::ext::shader_atomic_float::NAME,
+    ash::ext::shader_image_atomic_int64::NAME,
+    ash::khr::shader_quad_control::NAME,
+    ash::khr::shader_subgroup_uniform_control_flow::NAME,
+    ash::khr::shader_relaxed_extended_instruction::NAME,
 ];
 
 /// Required on devices that present (`QueueRequest::present`).
@@ -125,6 +131,12 @@ pub(crate) struct FeatureChain {
     ptlas: vk::PhysicalDevicePartitionedAccelerationStructureFeaturesNV<'static>,
     maintenance8: vk::PhysicalDeviceMaintenance8FeaturesKHR<'static>,
     reconvergence: vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR<'static>,
+    clock: vk::PhysicalDeviceShaderClockFeaturesKHR<'static>,
+    atomic_float: vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT<'static>,
+    image_int64: vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT<'static>,
+    quad_control: vk::PhysicalDeviceShaderQuadControlFeaturesKHR<'static>,
+    uniform_control_flow: vk::PhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR<'static>,
+    relaxed_extended: vk::PhysicalDeviceShaderRelaxedExtendedInstructionFeaturesKHR<'static>,
     omm: vk::PhysicalDeviceOpacityMicromapFeaturesKHR<'static>,
     address_commands: vk::PhysicalDeviceDeviceAddressCommandsFeaturesKHR<'static>,
     indirect_copy: vk::PhysicalDeviceCopyMemoryIndirectFeaturesKHR<'static>,
@@ -178,6 +190,12 @@ impl FeatureChain {
             ptr(&mut self.ptlas),
             ptr(&mut self.maintenance8),
             ptr(&mut self.reconvergence),
+            ptr(&mut self.clock),
+            ptr(&mut self.atomic_float),
+            ptr(&mut self.image_int64),
+            ptr(&mut self.quad_control),
+            ptr(&mut self.uniform_control_flow),
+            ptr(&mut self.relaxed_extended),
         ]);
         if opt.ray_dispatch {
             chain.push(ptr(&mut self.ray_pipeline));
@@ -444,7 +462,7 @@ pub(super) fn select(
     };
 
     let c = &q.core.features;
-    let required: [(&str, vk::Bool32); 46] = [
+    let required: [(&str, vk::Bool32); 76] = [
         ("shaderInt64", c.shader_int64),
         // Slang declares the Geometry capability for SV_PrimitiveID in mesh and pixel stages.
         ("geometryShader", c.geometry_shader),
@@ -528,6 +546,93 @@ pub(super) fn select(
         (
             "shaderMaximalReconvergence",
             q.reconvergence.shader_maximal_reconvergence,
+        ),
+        ("shaderImageGatherExtended", c.shader_image_gather_extended),
+        (
+            "shaderStorageImageExtendedFormats",
+            c.shader_storage_image_extended_formats,
+        ),
+        ("shaderDrawParameters", q.v11.shader_draw_parameters),
+        (
+            "uniformAndStorageBuffer16BitAccess",
+            q.v11.uniform_and_storage_buffer16_bit_access,
+        ),
+        (
+            "shaderSubgroupExtendedTypes",
+            q.v12.shader_subgroup_extended_types,
+        ),
+        (
+            "uniformAndStorageBuffer8BitAccess",
+            q.v12.uniform_and_storage_buffer8_bit_access,
+        ),
+        (
+            "shaderSharedInt64Atomics",
+            q.v12.shader_shared_int64_atomics,
+        ),
+        (
+            "subgroupBroadcastDynamicId",
+            q.v12.subgroup_broadcast_dynamic_id,
+        ),
+        ("samplerFilterMinmax", q.v12.sampler_filter_minmax),
+        (
+            "shaderDemoteToHelperInvocation",
+            q.v13.shader_demote_to_helper_invocation,
+        ),
+        (
+            "shaderTerminateInvocation",
+            q.v13.shader_terminate_invocation,
+        ),
+        ("subgroupSizeControl", q.v13.subgroup_size_control),
+        ("computeFullSubgroups", q.v13.compute_full_subgroups),
+        (
+            "shaderZeroInitializeWorkgroupMemory",
+            q.v13.shader_zero_initialize_workgroup_memory,
+        ),
+        ("shaderSubgroupRotate", q.v14.shader_subgroup_rotate),
+        (
+            "shaderSubgroupRotateClustered",
+            q.v14.shader_subgroup_rotate_clustered,
+        ),
+        ("shaderFloatControls2", q.v14.shader_float_controls2),
+        ("shaderExpectAssume", q.v14.shader_expect_assume),
+        ("shaderSubgroupClock", q.clock.shader_subgroup_clock),
+        ("shaderDeviceClock", q.clock.shader_device_clock),
+        (
+            "shaderBufferFloat32Atomics",
+            q.atomic_float.shader_buffer_float32_atomics,
+        ),
+        (
+            "shaderBufferFloat32AtomicAdd",
+            q.atomic_float.shader_buffer_float32_atomic_add,
+        ),
+        (
+            "shaderSharedFloat32Atomics",
+            q.atomic_float.shader_shared_float32_atomics,
+        ),
+        (
+            "shaderSharedFloat32AtomicAdd",
+            q.atomic_float.shader_shared_float32_atomic_add,
+        ),
+        (
+            "shaderImageFloat32Atomics",
+            q.atomic_float.shader_image_float32_atomics,
+        ),
+        (
+            "shaderImageFloat32AtomicAdd",
+            q.atomic_float.shader_image_float32_atomic_add,
+        ),
+        (
+            "shaderImageInt64Atomics",
+            q.image_int64.shader_image_int64_atomics,
+        ),
+        ("shaderQuadControl", q.quad_control.shader_quad_control),
+        (
+            "shaderSubgroupUniformControlFlow",
+            q.uniform_control_flow.shader_subgroup_uniform_control_flow,
+        ),
+        (
+            "shaderRelaxedExtendedInstruction",
+            q.relaxed_extended.shader_relaxed_extended_instruction,
         ),
     ];
     if let Some((name, _)) = required.iter().find(|(_, v)| *v == vk::FALSE) {
@@ -618,9 +723,13 @@ pub(super) fn select(
         sparse_residency_buffer: 1,
         sparse_residency_image2_d: 1,
         shader_resource_min_lod: 1,
+        shader_image_gather_extended: 1,
+        shader_storage_image_extended_formats: 1,
         ..Default::default()
     };
     e.v11.storage_buffer16_bit_access = 1;
+    e.v11.uniform_and_storage_buffer16_bit_access = 1;
+    e.v11.shader_draw_parameters = 1;
     e.v12 = e
         .v12
         .buffer_device_address(true)
@@ -634,17 +743,31 @@ pub(super) fn select(
         .storage_buffer8_bit_access(true)
         .draw_indirect_count(true)
         .shader_buffer_int64_atomics(true)
-        .host_query_reset(true);
+        .host_query_reset(true)
+        .shader_subgroup_extended_types(true)
+        .uniform_and_storage_buffer8_bit_access(true)
+        .shader_shared_int64_atomics(true)
+        .subgroup_broadcast_dynamic_id(true)
+        .sampler_filter_minmax(true);
     e.v13 = e
         .v13
         .synchronization2(true)
         .pipeline_creation_cache_control(true)
         .dynamic_rendering(true)
         .maintenance4(true)
-        .shader_integer_dot_product(true);
+        .shader_integer_dot_product(true)
+        .shader_demote_to_helper_invocation(true)
+        .shader_terminate_invocation(true)
+        .subgroup_size_control(true)
+        .compute_full_subgroups(true)
+        .shader_zero_initialize_workgroup_memory(true);
     e.v14 = e
         .v14
         .maintenance5(true)
+        .shader_subgroup_rotate(true)
+        .shader_subgroup_rotate_clustered(true)
+        .shader_float_controls2(true)
+        .shader_expect_assume(true)
         .host_image_copy(opt.host_image_copy);
     e.heap.descriptor_heap = 1;
     e.untyped.shader_untyped_pointers = 1;
@@ -660,6 +783,22 @@ pub(super) fn select(
     e.ptlas.partitioned_acceleration_structure = 1;
     e.maintenance8.maintenance8 = 1;
     e.reconvergence.shader_maximal_reconvergence = 1;
+    e.clock = e
+        .clock
+        .shader_subgroup_clock(true)
+        .shader_device_clock(true);
+    e.atomic_float = e
+        .atomic_float
+        .shader_buffer_float32_atomics(true)
+        .shader_buffer_float32_atomic_add(true)
+        .shader_shared_float32_atomics(true)
+        .shader_shared_float32_atomic_add(true)
+        .shader_image_float32_atomics(true)
+        .shader_image_float32_atomic_add(true);
+    e.image_int64.shader_image_int64_atomics = 1;
+    e.quad_control.shader_quad_control = 1;
+    e.uniform_control_flow.shader_subgroup_uniform_control_flow = 1;
+    e.relaxed_extended.shader_relaxed_extended_instruction = 1;
     e.ray_pipeline.ray_tracing_pipeline = 1;
     e.ray_pipeline.ray_tracing_pipeline_trace_rays_indirect = 1;
     e.reorder.ray_tracing_invocation_reorder = 1;
