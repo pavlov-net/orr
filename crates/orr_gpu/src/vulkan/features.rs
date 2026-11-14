@@ -462,7 +462,7 @@ pub(super) fn select(
     };
 
     let c = &q.core.features;
-    let required: [(&str, vk::Bool32); 76] = [
+    let required: [(&str, vk::Bool32); 91] = [
         ("shaderInt64", c.shader_int64),
         // Slang declares the Geometry capability for SV_PrimitiveID in mesh and pixel stages.
         ("geometryShader", c.geometry_shader),
@@ -634,6 +634,27 @@ pub(super) fn select(
             "shaderRelaxedExtendedInstruction",
             q.relaxed_extended.shader_relaxed_extended_instruction,
         ),
+        ("textureCompressionBC", c.texture_compression_bc),
+        ("imageCubeArray", c.image_cube_array),
+        ("shaderFloat64", c.shader_float64),
+        ("sparseResidencyImage3D", c.sparse_residency_image3_d),
+        ("sparseResidencyAliased", c.sparse_residency_aliased),
+        ("shaderClipDistance", c.shader_clip_distance),
+        ("shaderCullDistance", c.shader_cull_distance),
+        ("depthClamp", c.depth_clamp),
+        ("multiViewport", c.multi_viewport),
+        ("storagePushConstant16", q.v11.storage_push_constant16),
+        ("storagePushConstant8", q.v12.storage_push_constant8),
+        ("shaderOutputLayer", q.v12.shader_output_layer),
+        (
+            "shaderOutputViewportIndex",
+            q.v12.shader_output_viewport_index,
+        ),
+        (
+            "samplerMirrorClampToEdge",
+            q.v12.sampler_mirror_clamp_to_edge,
+        ),
+        ("indexTypeUint8", q.v14.index_type_uint8),
     ];
     if let Some((name, _)) = required.iter().find(|(_, v)| *v == vk::FALSE) {
         return Err((*name).to_owned());
@@ -725,11 +746,21 @@ pub(super) fn select(
         shader_resource_min_lod: 1,
         shader_image_gather_extended: 1,
         shader_storage_image_extended_formats: 1,
+        texture_compression_bc: 1,
+        image_cube_array: 1,
+        shader_float64: 1,
+        sparse_residency_image3_d: 1,
+        sparse_residency_aliased: 1,
+        shader_clip_distance: 1,
+        shader_cull_distance: 1,
+        depth_clamp: 1,
+        multi_viewport: 1,
         ..Default::default()
     };
     e.v11.storage_buffer16_bit_access = 1;
     e.v11.uniform_and_storage_buffer16_bit_access = 1;
     e.v11.shader_draw_parameters = 1;
+    e.v11.storage_push_constant16 = 1;
     e.v12 = e
         .v12
         .buffer_device_address(true)
@@ -748,7 +779,11 @@ pub(super) fn select(
         .uniform_and_storage_buffer8_bit_access(true)
         .shader_shared_int64_atomics(true)
         .subgroup_broadcast_dynamic_id(true)
-        .sampler_filter_minmax(true);
+        .sampler_filter_minmax(true)
+        .storage_push_constant8(true)
+        .shader_output_layer(true)
+        .shader_output_viewport_index(true)
+        .sampler_mirror_clamp_to_edge(true);
     e.v13 = e
         .v13
         .synchronization2(true)
@@ -768,6 +803,7 @@ pub(super) fn select(
         .shader_subgroup_rotate_clustered(true)
         .shader_float_controls2(true)
         .shader_expect_assume(true)
+        .index_type_uint8(true)
         .host_image_copy(opt.host_image_copy);
     e.heap.descriptor_heap = 1;
     e.untyped.shader_untyped_pointers = 1;
