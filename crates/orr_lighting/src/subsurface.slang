@@ -180,6 +180,13 @@ public Walk walk_start(float3 origin, float3 dir, SubsurfaceVolume volume, float
     return e;
 }
 
+// Ends walk `e` with nothing.
+void walk_end(inout Walk e)
+{
+    e.kind = WALK_NONE;
+    e.throughput = float3(0.0);
+}
+
 // Runs up to `steps` more steps of running walk `e`, at most `max_steps` in all, each traced
 // through `tracer`, and counts its queries in `rays`. A walk stopped at `max_steps` keeps
 // `table`'s share of its throughput if `share`, else its throughput as it is. Without `share`, a
@@ -197,8 +204,7 @@ public void walk_steps<T : IWalkTrace>(inout Walk e, T tracer, uint steps, Subsu
         // Division by a denormal has no precision bound, and a device may keep denormals.
         if (!(total >= F32_MIN_NORMAL) || !isfinite(total))
         {
-            e.kind = WALK_NONE;
-            e.throughput = float3(0.0);
+            walk_end(e);
             return;
         }
         float3 choose = e.throughput / total;
@@ -213,12 +219,19 @@ public void walk_steps<T : IWalkTrace>(inout Walk e, T tracer, uint steps, Subsu
             WalkMeet met = tracer.meet(h, e.origin, e.dir, positions, e.rng);
             if (met.kind == WALK_NONE)
             {
-                e.kind = WALK_NONE;
-                e.throughput = float3(0.0);
+                walk_end(e);
                 return;
             }
             float3 a = exp(-excess * h.t);
-            e.throughput = e.throughput * a / dot(choose, a);
+            // The mix holds the hero's share times at least exp(-17), so it falls below the
+            // smallest normal float only for a hero a sample of 0 drew at a share near none.
+            float mix = dot(choose, a);
+            if (!(mix >= F32_MIN_NORMAL))
+            {
+                walk_end(e);
+                return;
+            }
+            e.throughput = e.throughput * a / mix;
             if (met.kind == WALK_REFLECT)
             {
                 e.origin = met.origin;
@@ -235,16 +248,23 @@ public void walk_steps<T : IWalkTrace>(inout Walk e, T tracer, uint steps, Subsu
             return;
         }
         float3 a = exp(-excess * t);
-        e.throughput *= e.volume.albedo * sigma * a / dot(choose, sigma * a);
+        // The hero's share times its density times at least exp(-17).
+        float mix = dot(choose, sigma * a);
+        if (!(mix >= F32_MIN_NORMAL))
+        {
+            walk_end(e);
+            return;
+        }
+        e.throughput *= e.volume.albedo * sigma * a / mix;
         e.origin += e.dir * t;
         e.dir = sample_hg(e.volume.anisotropy, e.dir, u.zw);
         if (!share)
         {
             float q = min(1.0, max_component(e.throughput));
-            if (!(e.rng.next() < q))
+            // A sample of 0 passes a denormal `q` too, which nothing may divide by.
+            if (!(e.rng.next() < q) || q < F32_MIN_NORMAL)
             {
-                e.kind = WALK_NONE;
-                e.throughput = float3(0.0);
+                walk_end(e);
                 return;
             }
             e.throughput /= q;

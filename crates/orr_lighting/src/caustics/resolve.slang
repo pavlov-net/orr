@@ -5,6 +5,7 @@
 // its lists.
 #include "orr_root.h"
 import orr_color.luminance;
+import orr_shaders.math;
 import orr_shaders.packing;
 import orr_scene.tables;
 import orr_lighting.caustics;
@@ -161,7 +162,9 @@ void finish()
     {
         float sum = float(n[CAUSTIC_SUM_HIGH]) * 4294967296.0 + float(n[CAUSTIC_SUM_LOW]);
         float next = sum / float(deposits) * quantum / CAUSTIC_QUANTA;
-        if (next > 0.0 && isfinite(next))
+        // Every flux divides by the quantum, which a denormal has no precision for: the one
+        // held stays, and `grid_deposit`'s random rounding keeps smaller fluxes unbiased.
+        if (next >= F32_MIN_NORMAL && isfinite(next))
             n[CAUSTIC_QUANTUM] = asuint(next);
     }
 }
