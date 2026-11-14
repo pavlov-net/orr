@@ -209,7 +209,12 @@ struct Traced {
 }
 
 /// Traces `rays` inline and through `p` over the scene's hit table, at the bed's next frame.
-fn trace_both(bed: &mut Bed, p: &RayPipeline, groups: &HitGroups, rays: &[RayIn]) -> [Traced; 2] {
+fn trace_both(
+    bed: &mut Bed,
+    p: &'static RayPipeline,
+    groups: &'static HitGroups,
+    rays: &[RayIn],
+) -> [Traced; 2] {
     let n = rays.len() as u64;
     let input = upload(rays, "hit record rays");
     let out = |name| (readback::<PathOut>(n, name), readback::<ShadowOut>(n, name));
@@ -217,7 +222,8 @@ fn trace_both(bed: &mut Bed, p: &RayPipeline, groups: &HitGroups, rays: &[RayIn]
     let (piped_paths, piped_shadows) = out("pipeline");
     let paths = pipeline(&hit_inline::MODULE, "inline_paths");
     let shadows = pipeline(&hit_inline::MODULE, "inline_shadows");
-    bed.accumulate_hits(p, groups, &mut |list, f| {
+    bed.set_hit_pipeline(Some((p, groups)));
+    bed.accumulate(1, 0, &mut |list, f| {
         let pass = f.pass();
         let hits = f.hits.expect("the bed's hit table");
         let root = |paths: &Allocation<PathOut>, shadows: &Allocation<ShadowOut>| HitRaysRoot {

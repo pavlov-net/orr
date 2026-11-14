@@ -1672,7 +1672,7 @@ pub struct BedFrame<'a> {
     pub lighting: &'a SceneLighting,
     /// The radiance target the kernel writes, at [`EXTENT`].
     pub target: &'a mut LightingView,
-    /// The scene's hit table for the pipeline [`Bed::accumulate_hits`] names.
+    /// The scene's hit table for the pipeline [`Bed::set_hit_pipeline`] names.
     pub hits: Option<HitTable>,
     /// The bed draws particles after the kernel.
     particles: bool,
@@ -2506,15 +2506,7 @@ impl Bed {
     ) -> Accumulated {
         assert!(frames > 0);
         for k in 0..frames {
-            self.run_frame(
-                first + k,
-                seed,
-                k == 0,
-                k == 0,
-                k + 1 == frames,
-                None,
-                kernel,
-            );
+            self.run_frame(first + k, seed, k == 0, k == 0, k + 1 == frames, kernel);
         }
         self.mean(frames)
     }
@@ -2530,29 +2522,9 @@ impl Bed {
     ) -> Accumulated {
         assert!(frames > 0);
         for k in 0..frames {
-            self.run_frame(
-                first + k,
-                seed,
-                false,
-                k == 0,
-                k + 1 == frames,
-                None,
-                kernel,
-            );
+            self.run_frame(first + k, seed, false, k == 0, k + 1 == frames, kernel);
         }
         self.mean(frames)
-    }
-
-    /// Renders one frame as [`Self::accumulate`] does, `kernel` given the scene's hit table for
-    /// `pipeline`'s `groups` in [`BedFrame::hits`]; returns its radiance.
-    pub fn accumulate_hits(
-        &mut self,
-        pipeline: &RayPipeline,
-        groups: &HitGroups,
-        kernel: &mut dyn FnMut(&mut CommandList<'_>, &mut BedFrame<'_>),
-    ) -> Accumulated {
-        self.run_frame(0, 0, true, true, true, Some((pipeline, groups)), kernel);
-        self.mean(1)
     }
 
     /// Moves the camera to `eye`, looking at `target`, and renders one frame as the view's
@@ -2566,7 +2538,7 @@ impl Bed {
     ) -> Accumulated {
         self.spec.eye = eye;
         self.spec.target = target;
-        self.run_frame(index, 0, false, true, true, None, kernel);
+        self.run_frame(index, 0, false, true, true, kernel);
         self.mean(1)
     }
 
@@ -2649,7 +2621,7 @@ impl Bed {
     /// Renders later frames at pre-exposure `p`, as the output's meter would set it.
     pub fn set_pre_exposure(&mut self, p: f32) {
         self.pre_exposure = p;
-        self.run_frame(0, 0, true, true, false, None, &mut |_, _| {});
+        self.run_frame(0, 0, true, true, false, &mut |_, _| {});
     }
 
     /// Renders the frames after the next at pre-exposure `p`, with no frame of its own, as the
@@ -2680,7 +2652,6 @@ impl Bed {
         cut: bool,
         first: bool,
         last: bool,
-        hits: Option<(&RayPipeline, &HitGroups)>,
         kernel: &mut dyn FnMut(&mut CommandList<'_>, &mut BedFrame<'_>),
     ) {
         let eye = self.spec.eye;
@@ -2747,8 +2718,8 @@ impl Bed {
             .unwrap();
         }
         let view = f.raster_view(&desc).unwrap();
-        let hits = hits
-            .or(self.hit_pipeline)
+        let hits = self
+            .hit_pipeline
             .map(|(p, g)| f.hit_table(self.scene, p, g).unwrap());
         let id = f.id();
         self.last_id = id;
