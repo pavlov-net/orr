@@ -26,14 +26,28 @@ ORR_ROOT_INLINE(PathRoot);
 void path_view()
 {
     ORR_OMM(path_view);
-    launch_paths<Medium>(root, CALL_START_VIEW, CALL_FINISH_VIEW);
+    launch_paths<Medium>(root, CALL_START_VIEW, CALL_FINISH_VIEW, false);
 }
 
 [shader("raygeneration")]
 void path_update()
 {
     ORR_OMM(path_update);
-    launch_paths<Medium>(root, CALL_START_UPDATE, CALL_FINISH_UPDATE);
+    launch_paths<Medium>(root, CALL_START_UPDATE, CALL_FINISH_RECORD, false);
+}
+
+[shader("raygeneration")]
+void path_photon()
+{
+    ORR_OMM(path_photon);
+    launch_paths<Medium>(root, CALL_START_PHOTON, CALL_FINISH_RECORD, true);
+}
+
+[shader("raygeneration")]
+void path_background()
+{
+    ORR_OMM(path_background);
+    launch_paths<Medium>(root, CALL_START_BACKGROUND, CALL_FINISH_BACKGROUND, false);
 }
 
 [shader("miss")]
@@ -179,6 +193,27 @@ void start_update(inout Payload p)
 }
 
 [shader("callable")]
+void start_photon(inout Payload p)
+{
+    ORR_OMM(start_photon);
+    p.words.x = launch_start_photon<Surface>(root, launch_slot());
+}
+
+[shader("callable")]
+void start_background(inout Payload p)
+{
+    ORR_OMM(start_background);
+    p.words.x = launch_start_background(root, launch_slot());
+}
+
+[shader("callable")]
+void resolve_given(inout Payload p)
+{
+    ORR_OMM(resolve_given);
+    p.words.x = launch_resolve_given<Surface>(root, launch_slot());
+}
+
+[shader("callable")]
 void emission(inout Payload p)
 {
     ORR_OMM(emission);
@@ -193,24 +228,46 @@ void direct(inout Payload p)
 }
 
 [shader("callable")]
+void deposit(inout Payload p)
+{
+    ORR_OMM(deposit);
+    p.words.x = launch_deposit<Surface>(root, launch_slot());
+}
+
+[shader("callable")]
+void cache_vertex(inout Payload p)
+{
+    ORR_OMM(cache_vertex);
+    launch_cache_vertex(root, launch_slot());
+}
+
+[shader("callable")]
 void scatter(inout Payload p)
 {
     ORR_OMM(scatter);
     p.words.x = launch_scatter<Surface>(root, launch_slot());
 }
 
+// Each finish has the path's pass in its data's second word.
 [shader("callable")]
 void finish_view(inout Payload p)
 {
     ORR_OMM(finish_view);
-    launch_finish_view<Environment, Medium>(root, launch_slot());
+    p.words.x = launch_finish_view<Environment, Medium>(root, launch_slot(), p.words.y);
 }
 
 [shader("callable")]
-void finish_update(inout Payload p)
+void finish_record(inout Payload p)
 {
-    ORR_OMM(finish_update);
-    launch_finish_update(root, launch_slot());
+    ORR_OMM(finish_record);
+    p.words.x = launch_finish_record(root, launch_slot());
+}
+
+[shader("callable")]
+void finish_background(inout Payload p)
+{
+    ORR_OMM(finish_background);
+    p.words.x = launch_finish_background<Environment, Medium>(root, launch_slot());
 }
 
 [shader("callable")]

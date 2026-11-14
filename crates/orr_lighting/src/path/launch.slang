@@ -38,23 +38,29 @@ import orr_lighting.path.stages;
 // without the lobes and walks a plain one lacks, or a rich one's.
 public static const uint CALL_START_VIEW = 0;
 public static const uint CALL_START_UPDATE = 1;
-public static const uint CALL_EMISSION = 2;
-public static const uint CALL_DIRECT_PLAIN = 3;
-public static const uint CALL_DIRECT_RICH = 4;
-public static const uint CALL_SCATTER_PLAIN = 5;
-public static const uint CALL_SCATTER_RICH = 6;
-public static const uint CALL_FINISH_VIEW = 7;
-public static const uint CALL_FINISH_UPDATE = 8;
-public static const uint CALL_WALK_END = 9;
-public static const uint CALL_DIRECT_EXIT = 10;
-public static const uint CALL_SCATTER_EXIT = 11;
-public static const uint CALL_DIRECT_LEAVE = 12;
-public static const uint CALL_SCATTER_LEAVE = 13;
-public static const uint CALL_SEGMENT = 14;
-public static const uint CALL_LAYERS = 15;
-public static const uint CALL_PROXY_MARCH = 16;
-public static const uint CALL_DIRECT_MEDIUM = 17;
-public static const uint CALL_SCATTER_MEDIUM = 18;
+public static const uint CALL_START_PHOTON = 2;
+public static const uint CALL_START_BACKGROUND = 3;
+public static const uint CALL_RESOLVE_GIVEN = 4;
+public static const uint CALL_EMISSION = 5;
+public static const uint CALL_DIRECT_PLAIN = 6;
+public static const uint CALL_DIRECT_RICH = 7;
+public static const uint CALL_DEPOSIT = 8;
+public static const uint CALL_CACHE_VERTEX = 9;
+public static const uint CALL_SCATTER_PLAIN = 10;
+public static const uint CALL_SCATTER_RICH = 11;
+public static const uint CALL_FINISH_VIEW = 12;
+public static const uint CALL_FINISH_RECORD = 13;
+public static const uint CALL_FINISH_BACKGROUND = 14;
+public static const uint CALL_WALK_END = 15;
+public static const uint CALL_DIRECT_EXIT = 16;
+public static const uint CALL_SCATTER_EXIT = 17;
+public static const uint CALL_DIRECT_LEAVE = 18;
+public static const uint CALL_SCATTER_LEAVE = 19;
+public static const uint CALL_SEGMENT = 20;
+public static const uint CALL_LAYERS = 21;
+public static const uint CALL_PROXY_MARCH = 22;
+public static const uint CALL_DIRECT_MEDIUM = 23;
+public static const uint CALL_SCATTER_MEDIUM = 24;
 
 // What a shader hands the raygen in its payload's first word.
 public static const uint STEP_RAY = 1 << 0;      // the path has a ray to trace
@@ -62,20 +68,23 @@ public static const uint STEP_VERTEX = 1 << 1;   // the path is at the vertex it
 public static const uint STEP_EMITS = 1 << 2;    // which emits
 public static const uint STEP_SHADOW = 1 << 3;   // next-event estimation left a shadow ray
 public static const uint STEP_ENDED = 1 << 4;    // the path ended: its finish runs
-public static const uint STEP_DONE = 1 << 5;     // the start wrote what the path would: no finish
+public static const uint STEP_DONE = 1 << 5;     // nothing of the path is left to run: no finish follows
 public static const uint STEP_RICH = 1 << 6;     // the vertex's surface may have a lobe a plain one lacks (`surface_lobed`)
 public static const uint STEP_WALK = 1 << 7;     // the path walks from its walk part
 public static const uint STEP_INVOKE = 1 << 8;   // the walk's last step met a surface whose hit shader goes on
+public static const uint STEP_GIVEN = 1 << 9;    // the path starts on the hit its surface words give, once its shadow ray has passed
+public static const uint STEP_RECORD = 1 << 10;  // the record takes the vertex: an update path's cache vertex
 // From STEP_CLASS_SHIFT, with STEP_VERTEX, the class of a vertex past a walk or a segment, which
 // selects its direct and scatter callables in place of STEP_RICH.
-static const uint STEP_CLASS_SHIFT = 9;
+static const uint STEP_CLASS_SHIFT = 11;
 static const uint CLASS_SURFACE = 0;             // an opaque vertex, plain or rich
 static const uint CLASS_EXIT = 1;                // a subsurface walk's exit
 static const uint CLASS_LEAVE = 2;               // an interior's walk leaving it
 static const uint CLASS_SCATTER = 3;             // a scatter in an interior's medium, its surface words a `MediumVertex`
 
 // The words of a path's slot, in this order: its loop (`LaunchLoop`), the ray its last vertex left
-// (`LaunchRay`), the vertex's packed surface or `MediumVertex`, its shadow ray (`ShadowJob`) and
+// (`LaunchRay`), the vertex's packed surface or `MediumVertex` (before a photon's first vertex
+// resolves, its given hit), its shadow ray (`ShadowJob`; a photon's toward its light first) and
 // what a LAYERS trace keeps (FRONT_AT); then the parts of the paths that walk (`WALK_WORDS`) and
 // that track interiors (`INTERIORS_WORDS`), where the root's features name them. The path's record
 // is apart, in `PathStages.records`: RECORD_WORDS for a view's, UPDATE_RECORD_WORDS for an update
@@ -222,6 +231,35 @@ struct LaunchInteriors
     float3 entered_normal;
 }
 
+// A photon's first hit, which no ray found, as its start gives it: the triangle and point of its
+// caster where its light first meets the scene, reached along `dir`.
+struct GivenHit : IHit
+{
+    uint instance;
+    uint custom;
+    int cluster;
+    uint primitive;
+    float2 bary;
+    uint front;
+    float3 dir;
+    float3 positions[3];
+
+    uint3 launch() { return DispatchRaysIndex(); }
+    uint instance_index() { return instance; }
+    uint custom_index() { return custom; }
+    uint geometry_index() { return 0; }
+    uint primitive_index() { return primitive; }
+    int cluster_id() { return cluster; }
+    float t() { return 0.0; }
+    float2 barycentrics() { return bary; }
+    bool front_face() { return front != 0; }
+    float3 world_origin() { return float3(0.0); }
+    float3 world_direction() { return dir; }
+    float3 object_origin() { return float3(0.0); }
+    float3 object_direction() { return float3(0.0); }
+    float3 corner(uint i) { return positions[i]; }
+}
+
 struct Parts<let N : int>
 {
     uint4 w[N];
@@ -252,11 +290,12 @@ public uint launch_slot()
     return DispatchRaysIndex().x;
 }
 
-// Whether the slots of `r`'s paths hold the walk part: a view's paths walk where a material may
-// walk or where they may lie in an interior, whose scatters walk.
+// Whether the slots of `r`'s paths hold the walk part: a view's paths and its background
+// layer's walk where a material may walk or where they may lie in an interior, whose scatters
+// walk.
 bool walk_kept(PathRoot r)
 {
-    return from_view(r) && (r.features & (FEATURE_WALK | FEATURE_INTERIORS)) != 0;
+    return (from_view(r) || from_background(r)) && (r.features & (FEATURE_WALK | FEATURE_INTERIORS)) != 0;
 }
 
 static const uint WALK_AT = SLOT_WORDS;
@@ -283,6 +322,8 @@ uint2 launch_pixel(PathRoot r, uint slot)
     uint index = r.slice_base + slot;
     if (from_update(r))
         return update_pixel(r, index);
+    if (from_photon(r))
+        return uint2(index % PHOTON_ROW, index / PHOTON_ROW);
     uint2 extent = r.gbuffer.extent;
     return uint2(index % extent.x, index / extent.x);
 }
@@ -340,32 +381,45 @@ ShadeState launch_state(LayerRay ray)
 }
 
 // The record of a path in the pipeline, in its slot of `PathStages.records`, by the root's source.
+// An update path's vertices go to its own callable (`launch_cache_vertex`), which `vertex` asks
+// for.
 public struct LaunchRecord : IVertexRecord
 {
     public bool view;
+    public bool background;
     public bool update;
+    public bool caustic;
     public uint4* words;
+    // `vertex` handed the record the vertex.
+    public bool recorded;
+
+    bool view_record()
+    {
+        return view || background;
+    }
 
     public bool may_end(uint scattered, bool diffuse, bool wide, bool last)
     {
         if (update)
             return scattered >= 2;
+        if (caustic)
+            return false;
         return scattered >= 1 && (diffuse || wide || last);
     }
 
     public bool walks()
     {
-        return view;
+        return view_record();
     }
 
     public bool adjoint()
     {
-        return false;
+        return caustic;
     }
 
     public bool photon()
     {
-        return false;
+        return caustic;
     }
 
     public bool spectral()
@@ -381,7 +435,7 @@ public struct LaunchRecord : IVertexRecord
     [mutating]
     public void arrive(PathRoot r, PathVertex x, Bsdf b, float t, bool layer)
     {
-        if (!view)
+        if (!view_record())
             return;
         StoredView p = load_part<StoredView, RECORD_WORDS>(words);
         view_arrive(p, x, b, t, layer);
@@ -391,7 +445,7 @@ public struct LaunchRecord : IVertexRecord
     [mutating]
     public void expose(float3 e)
     {
-        if (!view)
+        if (!view_record())
             return;
         StoredView p = load_part<StoredView, RECORD_WORDS>(words);
         p.own += e;
@@ -401,20 +455,23 @@ public struct LaunchRecord : IVertexRecord
     [mutating]
     public void vertex(PathRoot r, PathVertex x, Bsdf b, float3 throughput, float3 radiance, inout Sampler rng)
     {
-        if (!update)
-            return;
-        CacheUpdate u = load_part<CacheUpdate, UPDATE_RECORD_WORDS>(words);
-        u.vertex(r, x, b, throughput, radiance, rng);
-        store_part<CacheUpdate, UPDATE_RECORD_WORDS>(words, u);
+        recorded = update;
     }
 
     [mutating]
-    public void deposit(PathRoot r, LayerVertex l, Bsdf b, float3 flux, inout Sampler rng) {}
+    public void deposit(PathRoot r, LayerVertex l, Bsdf b, float3 flux, inout Sampler rng)
+    {
+        if (!caustic)
+            return;
+        CausticPhoton c = load_part<CausticPhoton, RECORD_WORDS>(words);
+        c.deposit(r, l, b, flux, rng);
+        store_part<CausticPhoton, RECORD_WORDS>(words, c);
+    }
 
     [mutating]
     public void light(uint id, float contribution)
     {
-        if (!view || !view_light_counts(contribution))
+        if (!view_record() || !view_light_counts(contribution))
             return;
         StoredViewLights p = load_part<StoredViewLights, 1>(words);
         view_light(p, id, contribution);
@@ -424,10 +481,16 @@ public struct LaunchRecord : IVertexRecord
     [mutating]
     public void finish(PathRoot r, float3 radiance, uint layers)
     {
-        if (!update)
-            return;
-        CacheUpdate u = load_part<CacheUpdate, UPDATE_RECORD_WORDS>(words);
-        u.finish(r, radiance, layers);
+        if (update)
+        {
+            CacheUpdate u = load_part<CacheUpdate, UPDATE_RECORD_WORDS>(words);
+            u.finish(r, radiance, layers);
+        }
+        else if (caustic)
+        {
+            CausticPhoton c = load_part<CausticPhoton, RECORD_WORDS>(words);
+            c.finish(r, radiance, layers);
+        }
     }
 }
 
@@ -435,8 +498,11 @@ LaunchRecord launch_record(PathRoot r, uint slot)
 {
     LaunchRecord record;
     record.view = from_view(r);
+    record.background = from_background(r);
     record.update = from_update(r);
+    record.caustic = from_photon(r);
     record.words = r.stages.records + slot * (record.update ? UPDATE_RECORD_WORDS : RECORD_WORDS);
+    record.recorded = false;
     return record;
 }
 
@@ -581,14 +647,15 @@ uint begin_interior_walk(PathRoot r, LaunchVertex v, uint medium, InteriorMedium
 // ---------------------------------------------------------------------------------------------
 // Starts
 
-// Starts `slot`'s path of `pixel` from `start` with `rng`: its camera ray, or its first vertex on
-// the G-buffer's surface, resolved here.
-uint begin_launch(PathRoot r, uint slot, uint2 pixel, PathStart start, Sampler rng, inout LaunchRecord record)
+// Starts `slot`'s path of `pixel` from `start` with `rng`, counting `rays` rays already: its
+// camera ray, or its first vertex on the G-buffer's surface, resolved here.
+uint begin_launch(PathRoot r, uint slot, uint2 pixel, PathStart start, Sampler rng, uint rays, inout LaunchRecord record)
 {
     PathFixed f;
     PathLoop p;
     ShadeState c;
     start_state(r, pixel, start, rng, false, f, p, c);
+    p.rays = rays;
     uint4* at = slot_words(r, slot);
     if (start.mask != 0)
     {
@@ -642,7 +709,7 @@ public uint launch_start_view<S : ISurfaces>(PathRoot r, uint slot)
         start = pinhole_start(r.view, r.gbuffer, pixel, false);
     LaunchRecord record = launch_record(r, slot);
     store_part<StoredView, RECORD_WORDS>(record.words, new_view_record(pcg3d(uint3(pixel, r.frame ^ r.seed)).x));
-    return begin_launch(r, slot, pixel, start, rng, record);
+    return begin_launch(r, slot, pixel, start, rng, 0, record);
 }
 
 // The update path of the slice's `slot`th block: from its pixel's G-buffer surface.
@@ -655,7 +722,68 @@ public uint launch_start_update(PathRoot r, uint slot)
     PathStart start = pinhole_start(r.view, r.gbuffer, pixel, false);
     LaunchRecord record = launch_record(r, slot);
     store_part<CacheUpdate, UPDATE_RECORD_WORDS>(record.words, CacheUpdate());
-    return begin_launch(r, slot, pixel, start, rng, record);
+    return begin_launch(r, slot, pixel, start, rng, 0, record);
+}
+
+// The background layer's path of the slice's `slot`th pixel: on a marked pixel its lens ray past
+// the mask's depth, the full path at the view path's settings; else its texel, (0, 0, 0, -1).
+public uint launch_start_background(PathRoot r, uint slot)
+{
+    uint2 pixel = launch_pixel(r, slot);
+    float mask = r.dof_mask.get<Texture2D<float>>().Load(int3(pixel, 0));
+    if (!(mask > 0.0))
+    {
+        r.dof_background.get<RWTexture2D<float4>>()[pixel] = float4(0.0, 0.0, 0.0, -1.0);
+        return STEP_DONE;
+    }
+    float near = r.view.clip_from_view[2][3];
+    Sampler rng = Sampler(pixel, r.frame, r.seed ^ DOF_STREAM);
+    PathStart start = lens_start(r, pixel, r.dof_aperture, *r.dof_focus, near / mask, MASK_OPAQUE | MASK_DIELECTRIC, rng);
+    LaunchRecord record = launch_record(r, slot);
+    store_part<StoredView, RECORD_WORDS>(record.words, new_view_record(pcg3d(uint3(pixel, r.frame ^ r.seed ^ DOF_STREAM)).x));
+    return begin_launch(r, slot, pixel, start, rng, 0, record);
+}
+
+// Caustic photon `r.slice_base + slot`: its start up to its shadow ray toward its light, which
+// the raygen traces before the photon's first vertex resolves from its given hit, adjoint,
+// depositing in `r.caustics`.
+public uint launch_start_photon<S : ISurfaces>(PathRoot r, uint slot)
+{
+    uint index = r.slice_base + slot;
+    if (index >= r.caustics.photon_count || !(r.caustics.source.total > 0.0))
+        return STEP_DONE;
+    uint2 pixel = launch_pixel(r, slot);
+    Sampler rng = Sampler(pixel, r.frame, r.seed ^ PHOTON_STREAM);
+    PhotonStart p;
+    PhotonRay light;
+    if (!photon_emit<S>(r, index, rng, p, light))
+        return STEP_DONE;
+    PathStart start = PathStart();
+    start.origin = p.point;
+    start.dir = p.dir;
+    start.mask = MASK_OPAQUE | MASK_DIELECTRIC;
+    start.interior = p.interior;
+    start.throughput = p.flux;
+    start.given = true;
+    PathFixed f;
+    PathLoop l;
+    ShadeState c;
+    start_state(r, pixel, start, rng, true, f, l, c);
+    uint4* at = slot_words(r, slot);
+    store_part<CausticPhoton, RECORD_WORDS>(launch_record(r, slot).words, CausticPhoton(p.entry));
+    // The given hit lies at the ray's origin, from which no light density is taken.
+    c.ray.from = float3(0.0);
+    store_part<LaunchRay, 4>(at + RAY_AT, launch_ray(c.ray, 0.0, start.mask));
+    store_part<LaunchLoop, 5>(at + LOOP_AT, launch_loop_from(l, 0.0, 0));
+    GivenHit given = { p.hit.instance_index, p.hit.custom_index, p.hit.cluster_id, p.hit.primitive_index, p.hit.barycentrics, p.hit.front_face ? 1u : 0u, p.dir, p.positions };
+    store_part<GivenHit, 5>(at + SURFACE_AT, given);
+    // What the interiors around the start take of the flux on the way to the light, as its
+    // trace in mode SHADOW_PHOTON takes it beside the candidates' product.
+    float scale;
+    float3 beer = exp(-straight_depth(r.scene, p.interior, light.t_max, false, scale));
+    ShadowJob job = { beer, NO_LIGHT, light.origin, light.t_max, light.dir, 0 };
+    store_part<ShadowJob, 3>(at + SHADOW_AT, job);
+    return STEP_GIVEN;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -759,6 +887,13 @@ uint resolve_exit<S : ISurfaces, H : IHit>(PathRoot r, LaunchVertex v, H h)
     return STEP_VERTEX | (CLASS_EXIT << STEP_CLASS_SHIFT);
 }
 
+// `launch_resolve` of the hit a photon's start gave `slot`'s path, which no ray found.
+public uint launch_resolve_given<S : ISurfaces>(PathRoot r, uint slot)
+{
+    GivenHit h = load_part<GivenHit, 5>(slot_words(r, slot) + SURFACE_AT);
+    return launch_resolve<S, GivenHit>(r, slot, h);
+}
+
 // The miss shader's body: what `slot`'s ray that met nothing adds, the environment and the
 // directional lights' discs, or for the camera ray the sky its finish adds. The path ends.
 public void launch_miss<S : ISurfaces, M : IMedium>(PathRoot r, uint slot)
@@ -807,7 +942,7 @@ public uint launch_direct<S : ISurfaces, M : IMedium>(PathRoot r, uint slot)
 // and the vertex's probability of running it in the ray's.
 uint direct_left(LaunchVertex v, bool alive, ShadeNee nee)
 {
-    uint step = alive ? 0 : STEP_ENDED;
+    uint step = (alive ? 0 : STEP_ENDED) | (v.record.recorded ? STEP_RECORD : 0);
     if (nee.traced)
     {
         PathShadowRay q = nee.q;
@@ -951,11 +1086,41 @@ public uint4 launch_walk_meet<H : IHit>(PathRoot r, H h)
     return uint4(asuint(normal), m);
 }
 
-// The shadow ray `slot`'s vertex left, with the payload its any-hit shaders read.
-public RayDesc launch_shadow_ray(PathRoot r, uint slot, out uint4 payload)
+// A photon at `slot`'s vertex in place of next-event estimation: its deposit there
+// (`shade_deposit`), or STEP_ENDED.
+public uint launch_deposit<S : ISurfaces>(PathRoot r, uint slot)
+{
+    LaunchVertex v = load_vertex(r, slot);
+    PackedSurface ps = load_surface_part(v);
+    Sampler rng = v.p.rng;
+    bool alive = shade_deposit<S, LaunchRecord>(r, v.f, v.p, v.c, v.record, v.x, ps, v.c.ray.dir, v.t, (v.vertex & VERTEX_FIRST) != 0, rng);
+    v.p.rng = rng;
+    store_loop_part(v);
+    return alive ? 0 : STEP_ENDED;
+}
+
+// What an update path's record takes of `slot`'s vertex, which `launch_direct` handed it: the
+// cell the vertex lies in and the light it scatters from here on, over its albedo.
+public void launch_cache_vertex(PathRoot r, uint slot)
+{
+    LaunchVertex v = load_vertex(r, slot);
+    PackedSurface ps = load_surface_part(v);
+    PathVertex x;
+    Bsdf b;
+    prepared_vertex(r, v.p, v.c, v.record, v.x, ps, v.c.ray.dir, x, b);
+    CacheUpdate u = load_part<CacheUpdate, UPDATE_RECORD_WORDS>(v.record.words);
+    u.vertex(r, x, b, v.p.throughput, v.p.radiance, v.p.rng);
+    store_part<CacheUpdate, UPDATE_RECORD_WORDS>(v.record.words, u);
+    store_loop_part(v);
+}
+
+// The shadow ray in `slot`'s words as a ray, with the payload its any-hit shaders read: in mode
+// `mode` (SHADOW_*), its candidates of the context of a ray at path depth `depth`.
+RayDesc launch_shadow(PathRoot r, uint slot, uint mode, out uint4 payload)
 {
     ShadowJob q = load_part<ShadowJob, 3>(slot_words(r, slot) + SHADOW_AT);
-    ShadowCover c = shadow_cover(SHADOW_PATH, SHADOW_MASK, (q.flags >> SHADOW_DEPTH_SHIFT) + 1, has(q.flags, SHADOW_FEEDBACK));
+    ShadowCover c = mode == SHADOW_PHOTON ? shadow_cover(mode, SHADOW_MASK, 0, false)
+        : shadow_cover(mode, SHADOW_MASK, (q.flags >> SHADOW_DEPTH_SHIFT) + 1, has(q.flags, SHADOW_FEEDBACK));
     payload = uint4(asuint(c.product), c.word);
     RayDesc ray;
     ray.Origin = q.origin;
@@ -965,21 +1130,52 @@ public RayDesc launch_shadow_ray(PathRoot r, uint slot, out uint4 payload)
     return ray;
 }
 
-// Adds what `slot`'s shadow ray let through to its path: the product of its candidates in
-// `payload`, 0 where it met an opaque surface (`hit`) but past SHADOW_CANDIDATES counted ones,
-// times the linked medium's transmittance unless it went to the environment.
-public void launch_shadow_add<M : IMedium>(PathRoot r, uint slot, uint4 payload, bool hit)
+// The shadow ray `slot`'s vertex left, with the payload its any-hit shaders read.
+public RayDesc launch_shadow_ray(PathRoot r, uint slot, out uint4 payload)
+{
+    return launch_shadow(r, slot, SHADOW_PATH, payload);
+}
+
+// A photon's shadow ray toward its light from `slot`'s start, with the payload its any-hit
+// shaders read.
+public RayDesc launch_light_ray(PathRoot r, uint slot, out uint4 payload)
+{
+    return launch_shadow(r, slot, SHADOW_PHOTON, payload);
+}
+
+// What shadow ray `q` let through: the product of its candidates in `payload`, 0 where it met an
+// opaque surface (`hit`) but past SHADOW_CANDIDATES counted ones, times the linked medium's
+// transmittance unless it went to the environment.
+float3 shadow_seen<M : IMedium>(PathRoot r, ShadowJob q, uint4 payload, bool hit)
 {
     ShadowCover c = { asfloat(payload.xyz), payload.w };
     bool overflow = c.has(SHADOW_OVERFLOW);
     if (overflow)
         InterlockedAdd(*r.set.shadow_overflows, 1u);
     float3 vis = hit && !overflow ? float3(0.0) : c.product;
-    LaunchVertex v = load_vertex(r, slot);
-    ShadowJob q = load_part<ShadowJob, 3>(v.at + SHADOW_AT);
     if (any(vis > 0.0) && !has(q.flags, SHADOW_ENVIRONMENT))
         vis *= medium_transmittance<M>(r.scene.medium, q.origin, q.dir, q.t_max);
-    float3 added = q.contribution * vis;
+    return vis;
+}
+
+// What a photon's shadow ray toward its light, which found `payload` and `hit`, lets through of
+// its flux: STEP_GIVEN, or STEP_DONE where none is left.
+public uint launch_light_add<M : IMedium>(PathRoot r, uint slot, uint4 payload, bool hit)
+{
+    uint4* at = slot_words(r, slot);
+    ShadowJob q = load_part<ShadowJob, 3>(at + SHADOW_AT);
+    LaunchLoop l = load_part<LaunchLoop, 5>(at + LOOP_AT);
+    l.v.throughput *= q.contribution * shadow_seen<M>(r, q, payload, hit);
+    store_part<LaunchLoop, 5>(at + LOOP_AT, l);
+    return any(l.v.throughput > 0.0) ? STEP_GIVEN : STEP_DONE;
+}
+
+// Adds what `slot`'s shadow ray let through to its path (`shadow_seen`).
+public void launch_shadow_add<M : IMedium>(PathRoot r, uint slot, uint4 payload, bool hit)
+{
+    LaunchVertex v = load_vertex(r, slot);
+    ShadowJob q = load_part<ShadowJob, 3>(v.at + SHADOW_AT);
+    float3 added = q.contribution * shadow_seen<M>(r, q, payload, hit);
     if (has(q.flags, SHADOW_COUNTED))
         v.p.radiance += added;
     if (q.light != NO_LIGHT)
@@ -1288,27 +1484,79 @@ public void launch_proxy_march(PathRoot r, uint slot, uint kept, out float bound
 }
 
 // ---------------------------------------------------------------------------------------------
-// Finishes
+// Finishes, each STEP_DONE but where a path runs again
 
-// What a view does with `slot`'s finished path: the pixel's radiance, the sky where its camera
-// ray met nothing, its layer memory and light feedback.
-public void launch_finish_view<E : IEnvironment, M : IMedium>(PathRoot r, uint slot)
+// What a view does with `slot`'s finished path in pass `pass`: the pixel's radiance, the sky
+// where its camera ray met nothing, its layer memory and light feedback, and with frost the
+// background's luminance. A frosted pixel's first pass starts the second from the G-buffer's
+// surface, with the sampler, rays and record the first left: the step it starts with.
+public uint launch_finish_view<E : IEnvironment, M : IMedium>(PathRoot r, uint slot, uint pass)
 {
     LaunchVertex v = load_vertex(r, slot);
     ViewConstants* view = r.view;
+    uint2 pixel = v.f.pixel;
     StoredView record = load_part<StoredView, RECORD_WORDS>(v.record.words);
     float pre_exposure = view.exposure[view.exposure_slot].pre_exposure;
     float3 pixel_radiance = view_exposed(record) + pre_exposure * v.p.radiance;
-    if (any(v.p.sky > 0.0) && path_mode(r) != PATH_INDIRECT && path_mode(r) != PATH_SUBSURFACE)
-        pixel_radiance += pre_exposure * v.p.sky * sky_radiance<E, M>(r.set, view.eye_render.xyz, camera_start(r, v.f.pixel).dir);
-    view_outputs(r, v.f, v.p, record, pixel_radiance);
+    bool sky = any(v.p.sky > 0.0) && path_mode(r) != PATH_INDIRECT && path_mode(r) != PATH_SUBSURFACE;
+    bool two = two_passes(r, pixel);
+    bool second = pass != 0;
+    PathStart camera_ray = PathStart();
+    if (sky || (two && !second))
+        camera_ray = camera_start(r, pixel);
+    if (sky)
+        pixel_radiance += pre_exposure * v.p.sky * sky_radiance<E, M>(r.set, view.eye_render.xyz, camera_ray.dir);
+    if (!second)
+        view_outputs(r, v.f, v.p, record, pixel_radiance);
+    else
+    {
+        // The pixel's rays count both passes.
+        if (path_mode(r) == PATH_RAYS)
+        {
+            float4 out = r.radiance.get<RWTexture2D<float4>>()[pixel];
+            r.radiance.get<RWTexture2D<float4>>()[pixel] = float4(float(v.p.rays), out.yzw);
+        }
+        r.layers[pixel.y * r.gbuffer.extent.x + pixel.x].background = guide_luminance(pixel_radiance);
+    }
+    if (!two || second)
+        return STEP_DONE;
+    PathStart start = thin_lens(r) ? PathStart() : pinhole_start(view, r.gbuffer, pixel, true);
+    start.dir = camera_ray.dir;
+    start.throughput = float3(1.0);
+    start.mask = 0;
+    start.gbuffer = true;
+    // The second pass's path takes the G-buffer's emission anew.
+    record.own = float3(0.0);
+    store_part<StoredView, RECORD_WORDS>(v.record.words, record);
+    return begin_launch(r, slot, pixel, start, v.p.rng, v.p.rays, v.record);
 }
 
-// An update path's end: its record adds to the cache.
-public void launch_finish_update(PathRoot r, uint slot)
+// The end of an update path, whose record adds to the cache, or of a photon, which its entry's
+// yield counts where it deposited.
+public uint launch_finish_record(PathRoot r, uint slot)
 {
     LaunchVertex v = load_vertex(r, slot);
     v.record.finish(r, v.p.radiance, v.p.layers);
+    return STEP_DONE;
+}
+
+// What the background layer does with `slot`'s finished path: its texel, the pre-exposed radiance
+// in RGB and the reverse-Z depth of its hit in A (0 on a miss).
+public uint launch_finish_background<E : IEnvironment, M : IMedium>(PathRoot r, uint slot)
+{
+    LaunchVertex v = load_vertex(r, slot);
+    ViewConstants* view = r.view;
+    float pre_exposure = view.exposure[view.exposure_slot].pre_exposure;
+    float near = view.clip_from_view[2][3];
+    StoredView record = load_part<StoredView, RECORD_WORDS>(v.record.words);
+    PathStart camera_ray = camera_start(r, v.f.pixel);
+    float4 texel;
+    if (!(record.first_distance > 0.0))
+        texel = float4(apply_hdr_ceiling(pre_exposure * sky_radiance<E, M>(r.set, view.eye_render.xyz, camera_ray.dir)), 0.0);
+    else
+        texel = float4(apply_hdr_ceiling(pre_exposure * v.p.radiance), near / (camera_ray.axis * view_first_t(record)));
+    r.dof_background.get<RWTexture2D<float4>>()[v.f.pixel] = texel;
+    return STEP_DONE;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1408,11 +1656,24 @@ void trace_shadow<M : IMedium>(PathRoot r, uint slot)
     launch_shadow_add<M>(r, slot, p.words, h.hit());
 }
 
-// Runs callable `index` and returns the step it hands back.
-uint step_call(uint index)
+// Traces the shadow ray of `slot`'s photon toward its light: STEP_GIVEN where flux is left.
+uint trace_light<M : IMedium>(PathRoot r, uint slot)
+{
+    Payload p;
+    RayDesc ray = launch_light_ray(r, slot, p.words);
+    Traced h = trace_hit(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, 0, ray, p);
+    ShadowCover c = { asfloat(p.words.xyz), p.words.w };
+    if (c.has(SHADOW_VOLUME) && any(c.product > 0.0) && (!h.hit() || c.has(SHADOW_OVERFLOW)))
+        march_proxies(r, ray);
+    return launch_light_add<M>(r, slot, p.words, h.hit());
+}
+
+// Runs callable `index` with `word` in its data's second word, and returns the step it hands
+// back.
+uint step_call(uint index, uint word = 0)
 {
     Payload c;
-    c.words = uint4(0);
+    c.words = uint4(0, word, 0, 0);
     call(index, c);
     return c.words.x;
 }
@@ -1512,32 +1773,45 @@ uint scatter_call(uint step)
 }
 
 // A source's raygen: the path of the slice's item at the launch index from callable `start` to
-// callable `finish`.
-public void launch_paths<M : IMedium>(PathRoot r, uint start, uint finish)
+// callable `finish`, which hands back the step of a pass that follows. Each vertex takes direct
+// light, or where `deposits` its photon's deposit.
+public void launch_paths<M : IMedium>(PathRoot r, uint start, uint finish, bool deposits)
 {
     uint slot = launch_slot();
     if (slot >= r.slice_count)
         return;
     uint step = step_call(start);
-    if ((step & STEP_DONE) != 0)
-        return;
-    while ((step & STEP_ENDED) == 0)
+    for (uint pass = 0; (step & STEP_DONE) == 0; pass++)
     {
-        if ((step & STEP_RAY) != 0)
-            step = trace_path(r, slot);
-        if ((step & STEP_WALK) != 0)
-            step = walk_path(r, slot);
-        if ((step & STEP_ENDED) != 0)
-            break;
-        if ((step & STEP_EMITS) != 0)
-            step_call(CALL_EMISSION);
-        uint reached = step;
-        step = step_call(direct_call(reached));
-        if ((step & STEP_SHADOW) != 0)
-            trace_shadow<M>(r, slot);
-        if ((step & STEP_ENDED) != 0)
-            break;
-        step = step_call(scatter_call(reached));
+        if ((step & STEP_GIVEN) != 0)
+        {
+            if ((trace_light<M>(r, slot) & STEP_DONE) != 0)
+                return;
+            step = step_call(CALL_RESOLVE_GIVEN);
+        }
+        while ((step & STEP_ENDED) == 0)
+        {
+            if ((step & STEP_RAY) != 0)
+                step = trace_path(r, slot);
+            if ((step & STEP_WALK) != 0)
+                step = walk_path(r, slot);
+            if ((step & STEP_ENDED) != 0)
+                break;
+            if ((step & STEP_EMITS) != 0)
+                step_call(CALL_EMISSION);
+            uint reached = step;
+            // A photon goes on only as a chain, which no medium's vertex is.
+            if (deposits && (reached >> STEP_CLASS_SHIFT) != CLASS_SURFACE)
+                break;
+            step = step_call(deposits ? CALL_DEPOSIT : direct_call(reached));
+            if ((step & STEP_RECORD) != 0)
+                step_call(CALL_CACHE_VERTEX);
+            if ((step & STEP_SHADOW) != 0)
+                trace_shadow<M>(r, slot);
+            if ((step & STEP_ENDED) != 0)
+                break;
+            step = step_call(scatter_call(reached));
+        }
+        step = step_call(finish, pass);
     }
-    step_call(finish);
 }

@@ -2026,7 +2026,34 @@ public struct PhotonStart
 // both densities and the frame's photon count. False for a photon that starts with no flux.
 public bool photon_start<S : ISurfaces, M : IMedium>(PathRoot r, uint index, inout Sampler rng, out PhotonStart p)
 {
+    PhotonRay ray;
+    if (!photon_emit<S>(r, index, rng, p, ray))
+        return false;
+    p.flux *= visibility<S, M, SHADOW_PHOTON>(r.scene, r.view, ray.origin, ray.dir, ray.t_max, RAY_FLAG_NONE, photon_ray_context(), false, p.interior, r.set.shadow_overflows);
+    return any(p.flux > 0.0);
+}
+
+// The shadow ray from a photon's start toward its light, in mode SHADOW_PHOTON.
+public struct PhotonRay
+{
+    public float3 origin;
+    public float3 dir;
+    public float t_max;
+}
+
+// The context of a photon's start and its shadow ray.
+public HitContext photon_ray_context()
+{
+    RayCone cone = { 0.0, 0.0 };
+    return hit_context(HIT_SECONDARY, 0, cone, 0.0);
+}
+
+// `photon_start` but for its shadow ray, which `ray` holds: `p.flux` is the photon's before what
+// the ray lets through. False for a photon that starts with no flux.
+public bool photon_emit<S : ISurfaces>(PathRoot r, uint index, inout Sampler rng, out PhotonStart p, out PhotonRay ray)
+{
     p = PhotonStart();
+    ray = PhotonRay();
     SceneRoot* s = r.scene;
     CausticsGpu* g = r.caustics;
     PhotonSourceGpu* source = g.source;
@@ -2087,8 +2114,7 @@ public bool photon_start<S : ISurfaces, M : IMedium>(PathRoot r, uint index, ino
     h.class_id = class_of(scene_traced(s), h.custom_index, instance_index, h.cluster_id);
     p.hit = h;
     p.positions = t.corners.position;
-    RayCone cone = { 0.0, 0.0 };
-    HitContext context = hit_context(HIT_SECONDARY, 0, cone, 0.0);
+    HitContext context = photon_ray_context();
     if (!resolve_alpha<S>(s, r.view, p.dir, instance_index, cluster_id, triangle, bary, context))
         return false;
     if ((s.materials[t.material].flags & MATERIAL_PRESENCE) != 0)
@@ -2105,8 +2131,10 @@ public bool photon_start<S : ISurfaces, M : IMedium>(PathRoot r, uint index, ino
         float magnitude = max(abs(c.point.x), max(abs(c.point.y), abs(c.point.z)));
         t_max = max(0.0, length_to - max(1e-4 * length_to, magnitude * F32_PRECISION));
     }
-    flux *= visibility<S, M, SHADOW_PHOTON>(s, r.view, origin, toward, t_max, RAY_FLAG_NONE, context, false, p.interior, set.shadow_overflows);
-    if (c.view && any(flux > 0.0))
+    ray.origin = origin;
+    ray.dir = toward;
+    ray.t_max = t_max;
+    if (c.view)
         flux *= emitter_view_layer<S>(set, c, interior_ior(s, p.interior.innermost()));
     p.flux = flux;
     return any(flux > 0.0);

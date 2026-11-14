@@ -127,9 +127,9 @@ bool has_froxels(PathRoot r) { return may(MAY_FROXELS) && r.froxels != nullptr; 
 
 // Whether the paths of `r` are of `source`, which the pipeline may not run at all.
 public bool from_view(PathRoot r) { return may(MAY_VIEW) && r.source == PATH_SOURCE_VIEW; }
-bool from_background(PathRoot r) { return may(MAY_BACKGROUND) && r.source == PATH_SOURCE_BACKGROUND; }
+public bool from_background(PathRoot r) { return may(MAY_BACKGROUND) && r.source == PATH_SOURCE_BACKGROUND; }
 public bool from_update(PathRoot r) { return may(MAY_UPDATE) && r.source == PATH_SOURCE_UPDATE; }
-bool from_photon(PathRoot r) { return may(MAY_PHOTON) && r.source == PATH_SOURCE_PHOTON; }
+public bool from_photon(PathRoot r) { return may(MAY_PHOTON) && r.source == PATH_SOURCE_PHOTON; }
 
 // The root an update path runs under, from its view's `r`: every vertex in full, without the
 // view's local light samplers, debug views, depth-of-field layer or walk points, and with the
@@ -509,7 +509,7 @@ bool pixel_traced(PathRoot r, uint2 pixel)
 }
 
 // Whether a view's `pixel` also runs a path for the frosted-glass term, in a second pass.
-bool two_passes(PathRoot r, uint2 pixel)
+public bool two_passes(PathRoot r, uint2 pixel)
 {
     if (!frost_pass(r) || !pixel_traced(r, pixel))
         return false;
@@ -994,7 +994,7 @@ bool view_first_layer(StoredView v)
     return (asuint(v.first_t) >> 31) != 0;
 }
 
-float view_first_t(StoredView v)
+public float view_first_t(StoredView v)
 {
     return asfloat(asuint(v.first_t) & 0x7fffffff);
 }
@@ -2143,6 +2143,32 @@ public bool shade_direct<S : ISurfaces, M : IMedium, R : IVertexRecord>(PathRoot
 {
     nee = no_nee(c.spectral);
     ShadeVertex sv = packed_vertex(r, p, c, record, x, ps, dir);
+    return arrive_opaque(r, f, p, c, record, x, sv, t, first, rng)
+        && vertex_nee<S, M, SHADE_VERTEX, R>(r, f, p, c, record, x, VERTEX_OPAQUE, rng, sv, nee);
+}
+
+// A photon's opaque vertex `ps`, reached along `dir` by a ray `t` m long, in place of next-event
+// estimation: the rest of the iteration that reached it, and its deposit (`photon_deposit`).
+// False where the path ends.
+public bool shade_deposit<S : ISurfaces, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, PackedSurface ps, float3 dir, float t, bool first, inout Sampler rng)
+{
+    ShadeVertex sv = packed_vertex(r, p, c, record, x, ps, dir);
+    return arrive_opaque(r, f, p, c, record, x, sv, t, first, rng)
+        && photon_deposit<S, R>(r, p, c, record, x, VERTEX_OPAQUE, rng, sv);
+}
+
+// Opaque vertex `ps`, reached along `dir`, prepared as the shade bodies prepare it.
+public void prepared_vertex<R : IPathRecord>(PathRoot r, PathLoop p, ShadeState c, R record, PathContext x, PackedSurface ps, float3 dir, out PathVertex vertex, out Bsdf b)
+{
+    ShadeVertex sv = packed_vertex(r, p, c, record, x, ps, dir);
+    vertex = sv.l.x;
+    b = sv.b;
+}
+
+// The rest of the iteration that reached opaque vertex `sv` by a ray `t` m long, before its
+// next-event estimation (`shade_direct`). False where the path ends.
+bool arrive_opaque<R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, ShadeState c, inout R record, PathContext x, ShadeVertex sv, float t, bool first, inout Sampler rng)
+{
     bool counted = has(p.flags, LOOP_COUNTED);
     bool alive = (sv.l.x.surface.flags & GBUFFER_UNLIT) == 0 && (first || path_mode(r) != PATH_DIRECT);
     // The first vertex of a pixel with no layer runs on the view's share of pixels.
@@ -2171,7 +2197,7 @@ public bool shade_direct<S : ISurfaces, M : IMedium, R : IVertexRecord>(PathRoot
     if (!alive || !iteration_runs(r, p, VERTEX_OPAQUE, true))
         return false;
     set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
-    return vertex_nee<S, M, SHADE_VERTEX, R>(r, f, p, c, record, x, VERTEX_OPAQUE, rng, sv, nee);
+    return true;
 }
 
 // The rest of the iteration from opaque vertex `ps`, reached along `dir`, past next-event
@@ -2473,6 +2499,19 @@ bool resolve_layer<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, ino
     return (sv.l.x.surface.flags & GBUFFER_UNLIT) == 0;
 }
 
+// A photon at vertex `sv` of kind `kind`: it deposits where it meets a surface after a chain, and
+// goes on only as one. Light that next-event estimation takes through a plane stack is not
+// deposited. False where the path ends.
+bool photon_deposit<S : ISurfaces, R : IPathRecord>(PathRoot r, PathLoop p, ShadeState c, inout R record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv)
+{
+    LayerVertex l = sv.l;
+    bool disperse = may(MAY_DISPERSION) && x.disperse;
+    if (p.chains > 0 && kind != VERTEX_SCATTER && kind != VERTEX_LEAVE
+        && !(may(MAY_STACK) && stack_owns<S>(r.scene, r.view, vertex_origin(l.x, -c.stack.dir), -c.stack.dir, c.stack, p.depth, disperse, x.feedback)))
+        record.deposit(r, l, sv.b, c.spectral.color(p.throughput), rng);
+    return l.chains;
+}
+
 // Next-event estimation at vertex `sv` of kind `kind`, with `X` a walk's exit (up to its trace),
 // whose shadow ray `nee` holds for the vertex's stage or the trace stage, with the vertex's
 // probability of running it. Before it a photon deposits where it meets a surface past a chain.
@@ -2480,11 +2519,9 @@ bool resolve_layer<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, ino
 bool vertex_nee<S : ISurfaces, M : IMedium, let X : uint, R : IPathRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv, out ShadeNee nee)
 {
     SceneRoot* s = r.scene;
-    ViewConstants* v = r.view;
     LightSetGpu* set = r.set;
     uint2 pixel = f.pixel;
     LayerVertex l = sv.l;
-    Bsdf b = sv.b;
     bool reference = x.reference;
     bool counted = has(p.flags, LOOP_COUNTED);
     bool disperse = may(MAY_DISPERSION) && x.disperse;
@@ -2500,15 +2537,9 @@ bool vertex_nee<S : ISurfaces, M : IMedium, let X : uint, R : IPathRecord>(PathR
     bool leaving = kind == VERTEX_LEAVE;
     bool on_layer = kind == VERTEX_LAYER;
     nee = no_nee(c.spectral);
-    // A photon deposits where it meets a surface after a chain, and goes on only as one. Light
-    // that next-event estimation takes through a plane stack is not deposited. No photon walks.
-    if (X != SHADE_EXIT && x.photon)
-    {
-        if (p.chains > 0 && !medium_vertex && !leaving && !(may(MAY_STACK) && stack_owns<S>(s, v, vertex_origin(l.x, -c.stack.dir), -c.stack.dir, c.stack, p.depth, disperse, x.feedback)))
-            record.deposit(r, l, b, c.spectral.color(p.throughput), rng);
-        if (!l.chains)
-            return false;
-    }
+    // No photon walks.
+    if (X != SHADE_EXIT && x.photon && !photon_deposit<S, R>(r, p, c, record, x, kind, rng, sv))
+        return false;
     // A chain vertex on a solid's back sees lights from inside it, which BSDF rays carry. Next-
     // event estimation at a walk's way out takes the light inside as uniform, so in the
     // reference the way out's ray alone carries light.

@@ -26,8 +26,8 @@ const SLOT_WORDS: u64 = 28;
 const WALK_WORDS: u64 = 15;
 const INTERIORS_WORDS: u64 = 7;
 
-/// The words of a slot of paths whose root has `features`, of a view's (`view`) or not, as
-/// `path/launch.slang`'s `slot_stride` lays it out.
+/// The words of a slot of paths whose root has `features`, of a view's or its background layer's
+/// (`view`) or not, as `path/launch.slang`'s `slot_stride` lays it out.
 fn slot_words(features: u32, view: bool) -> u64 {
     let walk = view && features & (FEATURE_WALK | FEATURE_INTERIORS) != 0;
     let interiors = features & FEATURE_INTERIORS != 0;
@@ -38,12 +38,14 @@ fn slot_words(features: u32, view: bool) -> u64 {
 /// source with more runs them in slices.
 const MAX_SLOTS: u32 = 1 << 20;
 
-/// The stages the pipeline holds one of, first, by index: the raygens, the miss shader, the
-/// medium proxies' intersection and any-hit shaders, the walk meet's closest-hit, and what layer
-/// rays keep of triangles, medium proxies and light proxies.
-const FIXED: [&str; 10] = [
+/// The stages the pipeline holds one of, first, by index: the raygens in [`Raygen`]'s order, the
+/// miss shader, the medium proxies' intersection and any-hit shaders, the walk meet's
+/// closest-hit, and what layer rays keep of triangles, medium proxies and light proxies.
+const FIXED: [&str; 12] = [
     "path_view",
     "path_update",
+    "path_photon",
+    "path_background",
     "miss_path",
     "box_medium_hit",
     "proxy_shadow_hit",
@@ -53,14 +55,15 @@ const FIXED: [&str; 10] = [
     "box_light_hit",
     "cover_layers_light_hit",
 ];
-const MISS: u32 = 2;
-const MEDIUM_INTERSECTION: u32 = 3;
-const MEDIUM_ANY_HIT: u32 = 4;
-const WALK_MEET: u32 = 5;
-const LAYERS_ANY_HIT: u32 = 6;
-const MEDIUM_LAYERS_ANY_HIT: u32 = 7;
-const LIGHT_INTERSECTION: u32 = 8;
-const LIGHT_LAYERS_ANY_HIT: u32 = 9;
+const RAYGENS: u32 = 4;
+const MISS: u32 = 4;
+const MEDIUM_INTERSECTION: u32 = 5;
+const MEDIUM_ANY_HIT: u32 = 6;
+const WALK_MEET: u32 = 7;
+const LAYERS_ANY_HIT: u32 = 8;
+const MEDIUM_LAYERS_ANY_HIT: u32 = 9;
+const LIGHT_INTERSECTION: u32 = 10;
+const LIGHT_LAYERS_ANY_HIT: u32 = 11;
 
 /// What the pipeline holds per pin after those (`HitGroups`): the closest-hit shaders of a copy's
 /// clusters, of a producer entry's clusters and of strands, and the any-hit shaders under path and
@@ -82,16 +85,22 @@ const COVER_SHADOW: usize = 4;
 /// vertices may have: next-event estimation and the scatter are made for a plain surface's and a
 /// rich one's. A walk's ends are made rich, as a walk starts only from a vertex with a subsurface
 /// weight. What lies along a ray and a scatter in a medium shade no surface.
-const CALLABLES: [(&str, bool); 19] = [
+const CALLABLES: [(&str, bool); 25] = [
     ("start_view", true),
     ("start_update", true),
+    ("start_photon", true),
+    ("start_background", true),
+    ("resolve_given", true),
     ("emission", true),
     ("direct", false),
     ("direct", true),
+    ("deposit", true),
+    ("cache_vertex", true),
     ("scatter", false),
     ("scatter", true),
     ("finish_view", true),
-    ("finish_update", true),
+    ("finish_record", true),
+    ("finish_background", true),
     ("walk_end", true),
     ("direct_exit", true),
     ("scatter_exit", true),
@@ -131,6 +140,8 @@ impl Geometry {
 pub(crate) enum Raygen {
     View = 0,
     Update = 1,
+    Photon = 2,
+    Background = 3,
 }
 
 /// The ray tracing pipeline of the path tracer, and the groups a scene's hit records name.
@@ -241,9 +252,10 @@ impl PathPipeline {
                 intersection,
             });
         }
+        let raygens: Vec<ShaderRecord<'_>> = (0..RAYGENS).map(ShaderRecord::new).collect();
         let desc = RayPipelineDesc {
             stages: &stages,
-            raygens: &[ShaderRecord::new(0), ShaderRecord::new(1)],
+            raygens: &raygens,
             misses: &[ShaderRecord::new(MISS)],
             hit_groups: &hit_groups,
             callables: &callables,
@@ -381,10 +393,13 @@ fn slots(items: u32) -> u32 {
     items.clamp(1, MAX_SLOTS)
 }
 
-/// What a view's paths keep in the pipeline: its own paths' slots and its update paths'.
+/// What a view's paths keep in the pipeline: its own paths' slots, which its background layer's
+/// paths take after them, its update paths' and, where the view's are fewer than a frame's
+/// photons take, its photons'.
 pub(crate) struct LaunchMemory {
     pub(crate) view: SourceMemory,
     pub(crate) update: SourceMemory,
+    photons: Option<SourceMemory>,
 }
 
 impl LaunchMemory {
@@ -412,6 +427,7 @@ impl LaunchMemory {
                 UPDATE_RECORD_WORDS,
                 "launched update",
             )?,
+            photons: None,
         };
         log::debug!(
             "launched paths: {} view slots of {} bytes and {} update slots of {} bytes",
@@ -435,5 +451,35 @@ impl LaunchMemory {
             && self.view.slot_words == slot_words(features, true)
             && self.update.slots == slots(update)
             && self.update.slot_words == slot_words(update_features, false)
+    }
+
+    /// The slots photons whose root has `features` run in, `photons` of them a launch at least:
+    /// the view's where it holds as many, else memory of their own.
+    pub(crate) fn photons(
+        &mut self,
+        device: &Device,
+        photons: u32,
+        features: u32,
+    ) -> Result<&SourceMemory, Error> {
+        let words = slot_words(features, false);
+        if self.view.slots >= photons && self.view.slot_words >= words {
+            self.photons = None;
+            return Ok(&self.view);
+        }
+        if !self
+            .photons
+            .as_ref()
+            .is_some_and(|m| m.slots == slots(photons) && m.slot_words == words)
+        {
+            self.photons = None;
+            self.photons = Some(SourceMemory::new(
+                device,
+                photons,
+                words,
+                RECORD_WORDS,
+                "launched photons",
+            )?);
+        }
+        Ok(self.photons.as_ref().expect("made above"))
     }
 }

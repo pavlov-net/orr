@@ -267,6 +267,121 @@ fn the_pipeline_renders_layers_and_media_as_the_staged_loop_does() {
     assert_clean();
 }
 
+/// The pipeline path tracer renders the other sources as the staged loop does. Caustic photons:
+/// the sun off one mirror, level to a second and down from it lights a patch of the floor, which
+/// the reference's photons give its first vertex alike by Welch's test, and real-time frames show
+/// alike, with the grid's photons and the world cache's update paths, within the noise between
+/// seeds. The background layer: behind a mirror before the eye, its pixels past a mask's depth
+/// show alike within the noise between seeds.
+#[test]
+fn the_pipeline_renders_photons_and_the_background_layer_as_the_staged_loop_does() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    let both = |settings: ViewLighting| {
+        (
+            Paths::new(&KernelSet::default(), PathEntry::Compute, settings),
+            Paths::new(&KernelSet::default(), PathEntry::Pipeline, settings),
+        )
+    };
+    let sun = -SUN.direction_to_light.normalize();
+    let mirror = |center: Vec3, normal: Vec3| {
+        let x = Vec3::Y.cross(normal).normalize();
+        at(
+            MIRROR,
+            Mat3::from_cols(x, normal.cross(x), normal) * 0.4,
+            center,
+        )
+    };
+    let first = Vec3::new(-1.5, 1.0, -1.0);
+    let level = Vec3::X;
+    let second = first + 2.0 * level;
+    let patch = Vec3::new(1.5, 0.0, -0.5);
+    let down = (patch - second).normalize();
+    let spec = Spec {
+        copies: vec![
+            at(WHITE_FLOOR, Mat3::IDENTITY, Vec3::ZERO),
+            mirror(first, (level - sun).normalize()),
+            mirror(second, (down - level).normalize()),
+        ],
+        lights: vec![Light::Directional(SUN)],
+        environment: None,
+        eye: Vec3::new(0.0, 3.0, 4.0),
+        target: Vec3::new(0.5, 0.0, -0.5),
+        fov_y: 0.9,
+        focus: None,
+    };
+    let lit = pixel_of(&spec, patch);
+    let mut bed = Bed::with(spec);
+
+    let (staged, launched) = both(ViewLighting {
+        debug_view: LightingDebugView::Caustics,
+        ..reference(2)
+    });
+    bed.set_hit_pipeline(launched.hit_pipeline());
+    let patch_means = |bed: &mut Bed, paths: &Paths, seed: u32| {
+        (0..12)
+            .map(|k| render_paths(bed, paths, 4, seed * 1000 + k).around(lit, 4)[1])
+            .collect::<Vec<_>>()
+    };
+    let of_staged = patch_means(&mut bed, &staged, 1);
+    let of_launched = patch_means(&mut bed, &launched, 2);
+    assert!(
+        of_launched.iter().sum::<f64>() > 0.0,
+        "no photon reached the floor by both mirrors"
+    );
+    assert_same_mean("the photons' patch", &of_launched, &of_staged);
+
+    let (staged, launched) = both(ViewLighting::default());
+    render_paths(&mut bed, &staged, 32, 3);
+    let piped = render_paths(&mut bed, &launched, 32, 1);
+    let same_seed = render_paths(&mut bed, &staged, 32, 1);
+    let noise = render_paths(&mut bed, &staged, 32, 2);
+    assert_within_noise("real-time photons", &piped, &same_seed, &noise, 1.25);
+    drop(bed);
+
+    let background = Analytic::SunAndGround.spec();
+    let forward = (background.target - background.eye).normalize();
+    let mut spec = background;
+    spec.copies.push(at(
+        MIRROR,
+        Mat3::from_diagonal(Vec3::splat(0.3)),
+        spec.eye + 1.2 * forward + Vec3::new(-0.25, 0.0, 0.0),
+    ));
+    let mut bed = Bed::with(spec);
+    bed.set_pre_exposure(1.0 / 64.0);
+    bed.set_hit_pipeline(launched.hit_pipeline());
+    bed.accumulate_background_layer(true);
+    // Pixels left of `MARKED` start their background rays 2 m along the view axis, past the
+    // mirror and before the ground.
+    const MARKED: u32 = 96;
+    let mask: Vec<[f32; 4]> = (0..EXTENT[0] * EXTENT[1])
+        .map(|i| {
+            let start = if i % EXTENT[0] < MARKED {
+                NEAR / 2.0
+            } else {
+                0.0
+            };
+            [start, 0.0, 0.0, 0.0]
+        })
+        .collect();
+    let mask = texture(EXTENT[0], EXTENT[1], &mask, "dof mask");
+    let focus = upload(&[5.0f32], "focus distance");
+    let (mut staged, mut launched) = both(reference(2));
+    for p in [&mut staged, &mut launched] {
+        p.dof_background = Some(DofBackgroundPass {
+            mask: mask.index,
+            aperture_radius: 0.05,
+            focus_distance: focus.gpu(),
+        });
+    }
+    let piped = render_paths(&mut bed, &launched, 32, 1);
+    let same_seed = render_paths(&mut bed, &staged, 32, 1);
+    let noise = render_paths(&mut bed, &staged, 32, 2);
+    assert_within_noise("the background layer", &piped, &same_seed, &noise, 1.25);
+    assert_clean();
+}
+
 #[test]
 fn reference_error_halves_with_four_times_the_frames() {
     let mut bed = Bed::new(Analytic::CornellBox);

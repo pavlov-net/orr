@@ -34,9 +34,9 @@ use crate::staged::{
     MAX_ROUNDS, MAY_ALL, MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG,
     MAY_DIRECTIONAL, MAY_DISPERSION, MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ,
     MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES,
-    MAY_REFERENCE, MAY_SMOKE, MAY_STACK, MAY_SUBSURFACE, MAY_WALK, PATH_SOURCE_UPDATE,
-    PATH_SOURCE_VIEW, Source, SourcePaths, Stage, StageSet, StagedKernels, StagedMemory,
-    StateParts,
+    MAY_REFERENCE, MAY_SMOKE, MAY_STACK, MAY_SUBSURFACE, MAY_WALK, PATH_SOURCE_BACKGROUND,
+    PATH_SOURCE_PHOTON, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, Source, SourcePaths, Stage, StageSet,
+    StagedKernels, StagedMemory, StateParts,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::support::{Masked, MaskedFrame, MaskedSupport, Runs};
@@ -1118,8 +1118,8 @@ fn runs_rays(entry: PathEntry) -> bool {
 
 /// What the scene and settings of a frame ask of the pipeline path tracer that it does not
 /// render yet, which its paths do without: each by name. `path_features` are the view path
-/// root's (`path_features`), and `caustics` says whether the frame gathers caustic photons.
-fn unlaunched(path_features: u32, caustics: bool, pass: &ViewPass) -> Vec<&'static str> {
+/// root's (`path_features`).
+fn unlaunched(path_features: u32, pass: &ViewPass) -> Vec<&'static str> {
     let features = pass.scene_features;
     let asks = [
         (
@@ -1127,17 +1127,26 @@ fn unlaunched(path_features: u32, caustics: bool, pass: &ViewPass) -> Vec<&'stat
             "dielectric and presence layers",
         ),
         (path_features & FEATURE_INTERIORS != 0, "interiors"),
-        (caustics, "caustic photons"),
         (
             features.contains(SceneFeatures::COATED_EMITTERS),
             "the coats of emitters a shadow ray reaches",
         ),
-        (pass.dof_background.is_some(), "the background layer"),
-        (pass.frosted_glass, "the frosted-glass pass"),
     ];
     asks.into_iter()
         .filter_map(|(asked, what)| asked.then_some(what))
         .collect()
+}
+
+/// How a frame's caustic photons run: through the staged loop's stages for what they may meet,
+/// or through the pipeline path tracer over the scene's hit records.
+enum PhotonPaths<'a> {
+    Staged {
+        may: u64,
+    },
+    Launched {
+        launch: &'a PathPipeline,
+        hits: &'a HitTable,
+    },
 }
 
 const SUPPORT: &str = "lighting compute kernels";
@@ -2141,12 +2150,8 @@ impl LightingKernels {
             _pad1: 0,
         };
         if let Some(launch) = &self.launch {
-            launch.note_unlaunched(unlaunched(
-                features,
-                gathers_caustics(scene, pass.scene_features, lighting),
-                pass,
-            ));
-            return self.record_launched(list, view, pass, lighting, launch, &path_root);
+            launch.note_unlaunched(unlaunched(features, pass));
+            return self.record_launched(list, scene, view, pass, lighting, launch, &path_root);
         }
         // Asked for together, the sources that run in the stages share their pipelines.
         let needs = PathNeeds {
@@ -2211,8 +2216,15 @@ impl LightingKernels {
         };
         let photons = predicted.photons;
         let path_root = PathRoot {
-            caustics: self
-                .record_photons(list, scene, view, pass, lighting, &path_root, photons)?,
+            caustics: self.record_photons(
+                list,
+                scene,
+                view,
+                pass,
+                lighting,
+                &path_root,
+                PhotonPaths::Staged { may: photons },
+            )?,
             ..path_root
         };
         self.record_layers(list, view, pass, lighting, &path_root)?;
@@ -2286,14 +2298,16 @@ impl LightingKernels {
     }
 
     /// [`Self::record_paths`] through the pipeline path tracer `launch`, from the view paths' root
-    /// `path`: the layer guides, then the view's paths and its update paths, each source in one
-    /// launch per slice of the paths the view's memory holds. The paths hold no interior, plane
-    /// stack or wavelengths, walk only through subsurface materials, gather no photons and take
-    /// one pass; what else of the frame they do not render yet ([`unlaunched`]) the caller logs
-    /// once for each mix.
+    /// `path`: the layer guides and the frame's caustic photons, then the view's paths and its
+    /// update paths, then its background layer's, each source in one launch per slice of the
+    /// paths the view's memory holds. The paths hold no interior, plane stack or wavelengths and
+    /// walk only through subsurface materials; what else of the frame they do not render yet
+    /// ([`unlaunched`]) the caller logs once for each mix.
+    #[allow(clippy::too_many_arguments)]
     fn record_launched(
         &self,
         list: &mut CommandList<'_>,
+        scene: &SceneLighting,
         view: &mut LightingView,
         pass: &ViewPass,
         lighting: &ViewLighting,
@@ -2309,8 +2323,7 @@ impl LightingKernels {
         let segments = self.support.masked.linked_medium() || path.froxels != GpuPtr::NULL;
         let root = PathRoot {
             features: (path.features & FEATURE_WALK) | if segments { FEATURE_SEGMENTS } else { 0 },
-            dielectric_flags: path.dielectric_flags & !(DIELECTRIC_FROST | DIELECTRIC_DISPERSION),
-            caustics: GpuPtr::NULL,
+            dielectric_flags: path.dielectric_flags & !DIELECTRIC_DISPERSION,
             source: PATH_SOURCE_VIEW,
             round_next: rounds(
                 lighting.max_bounces,
@@ -2327,11 +2340,7 @@ impl LightingKernels {
             let blocks = view.extent.map(|e| e.div_ceil(path.update_block));
             blocks[0] * blocks[1]
         };
-        let update_root = PathRoot {
-            source: PATH_SOURCE_UPDATE,
-            ..update_root(&root)
-        };
-        let features = (root.features, update_root.features);
+        let features = (root.features, update_root(&root).features);
         if !view
             .launched
             .as_ref()
@@ -2346,6 +2355,21 @@ impl LightingKernels {
                 features.1,
             )?);
         }
+        let root = PathRoot {
+            caustics: self.record_photons(
+                list,
+                scene,
+                view,
+                pass,
+                lighting,
+                &root,
+                PhotonPaths::Launched {
+                    launch,
+                    hits: &hits,
+                },
+            )?,
+            ..root
+        };
         let memory = view.launched.as_ref().expect("made above");
         list.begin_pass(
             if update == 0 {
@@ -2357,6 +2381,10 @@ impl LightingKernels {
         );
         launch.record(list, &hits, Raygen::View, &root, &memory.view, pixels);
         if update > 0 {
+            let update_root = PathRoot {
+                source: PATH_SOURCE_UPDATE,
+                ..update_root(&root)
+            };
             launch.record(
                 list,
                 &hits,
@@ -2367,14 +2395,35 @@ impl LightingKernels {
             );
         }
         list.end_pass();
+        if pass.dof_background.is_some() {
+            // The background layer's paths take the view's slots once its paths are done.
+            list.barrier(Stages::RAY, Stages::RAY, Hazards::empty());
+            list.begin_pass("background paths", false);
+            // The background layer's path is the full one at the view path's other settings.
+            let background_root = PathRoot {
+                mode: 0,
+                pixel_fraction: 1.0,
+                source: PATH_SOURCE_BACKGROUND,
+                ..root
+            };
+            launch.record(
+                list,
+                &hits,
+                Raygen::Background,
+                &background_root,
+                &memory.view,
+                pixels,
+            );
+            list.end_pass();
+        }
         list.barrier(Stages::RAY, Stages::COMPUTE | Stages::RAY, Hazards::empty());
         Ok(())
     }
 
-    /// Records the frame's caustic photons where `view` traces them, and returns the caustics
-    /// its paths gather from: the scene's grid, whose photons and resolve the scene's first
-    /// real-time view of the frame records, or under the reference the view's own map, filled
-    /// each frame; null with caustics off.
+    /// Records the frame's caustic photons where `view` traces them, through `paths`, from the
+    /// view paths' root `path`, and returns the caustics its paths gather from: the scene's grid,
+    /// whose photons and resolve the scene's first real-time view of the frame records, or under
+    /// the reference the view's own map, filled each frame; null with caustics off.
     #[allow(clippy::too_many_arguments)]
     fn record_photons(
         &self,
@@ -2384,7 +2433,7 @@ impl LightingKernels {
         pass: &ViewPass,
         lighting: &ViewLighting,
         path: &PathRoot,
-        may: u64,
+        paths: PhotonPaths<'_>,
     ) -> Result<GpuPtr<CausticsGpu>, Error> {
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         let caustics = scene.caustics();
@@ -2451,13 +2500,68 @@ impl LightingKernels {
             ..*path
         };
         list.begin_pass("caustic photons", false);
-        let parts = StateParts::of(photon_root.features);
-        let own = view.staged.as_ref().expect("made by record_paths");
         // As many slots as the photons of a frame at its default count: more photons
         // than that run in slices that each hold as many.
         let slots = photons.min(PHOTON_SLOTS);
+        match paths {
+            PhotonPaths::Staged { may } => {
+                let photons = (photons, slots);
+                self.record_staged_photons(list, view, pass, lighting, &photon_root, may, photons)?;
+            }
+            PhotonPaths::Launched { launch, hits } => {
+                let root = PathRoot {
+                    source: PATH_SOURCE_PHOTON,
+                    round_next: rounds(
+                        photon_root.max_bounces,
+                        0,
+                        lighting.reference.is_some(),
+                        false,
+                    )?,
+                    ..photon_root
+                };
+                let memory = view
+                    .launched
+                    .as_mut()
+                    .expect("made by record_launched")
+                    .photons(&view.device, slots, root.features)?;
+                launch.record(list, hits, Raygen::Photon, &root, memory, photons);
+            }
+        }
+
+        if lighting.reference.is_none() {
+            list.barrier(
+                Stages::COMPUTE | Stages::RAY,
+                Stages::COMPUTE,
+                Hazards::empty(),
+            );
+            caustics.record_resolve(list, slot);
+        }
+        list.barrier(
+            Stages::COMPUTE | Stages::RAY,
+            Stages::COMPUTE | Stages::RAY,
+            Hazards::empty(),
+        );
+        list.end_pass();
+        Ok(root)
+    }
+
+    /// Records `photons.0` photons of `photon_root` in slices of `photons.1` through the staged
+    /// loop's stages for what they may meet, `may`.
+    #[allow(clippy::too_many_arguments)]
+    fn record_staged_photons(
+        &self,
+        list: &mut CommandList<'_>,
+        view: &mut LightingView,
+        pass: &ViewPass,
+        lighting: &ViewLighting,
+        photon_root: &PathRoot,
+        may: u64,
+        (photons, slots): (u32, u32),
+    ) -> Result<(), Error> {
+        let parts = StateParts::of(photon_root.features);
+        let own = view.staged.as_ref().expect("made by record_paths");
         // Photons do not walk, whatever pipelines they run.
-        let rounds = path_rounds(&photon_root, may & !MAY_WALK);
+        let rounds = path_rounds(photon_root, may & !MAY_WALK);
         let queues = rounds + 1;
         if own.holds(slots, parts, queues) {
             view.staged_photons = None;
@@ -2475,7 +2579,7 @@ impl LightingKernels {
             memory.begin_frame(own.ran().0);
         }
         let k = &self.paths;
-        let asks = scene_may(pass.scene_features) | root_may(&photon_root);
+        let asks = scene_may(pass.scene_features) | root_may(photon_root);
         assert!(
             asks & !may == 0,
             "the photons' root asks for {asks:#x}, beyond the {may:#x} its pipelines hold"
@@ -2484,7 +2588,7 @@ impl LightingKernels {
             list,
             &SourcePaths {
                 memory: view.staged_photons.as_ref().unwrap_or(own),
-                root: &photon_root,
+                root: photon_root,
                 source: Source::Photon,
                 may,
                 items: photons,
@@ -2494,22 +2598,7 @@ impl LightingKernels {
             },
             lighting.stage_passes,
         )?;
-
-        if lighting.reference.is_none() {
-            list.barrier(
-                Stages::COMPUTE | Stages::RAY,
-                Stages::COMPUTE,
-                Hazards::empty(),
-            );
-            caustics.record_resolve(list, slot);
-        }
-        list.barrier(
-            Stages::COMPUTE | Stages::RAY,
-            Stages::COMPUTE | Stages::RAY,
-            Hazards::empty(),
-        );
-        list.end_pass();
-        Ok(root)
+        Ok(())
     }
 
     /// Records the tiles of `pass` that hold layers and the layer guides over them, before any
