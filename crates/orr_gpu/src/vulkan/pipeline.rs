@@ -225,9 +225,9 @@ impl<'a> StageParts<'a> {
         } else {
             Cow::Borrowed(s.spirv)
         };
-        let code = if s.spec.entries.is_empty() {
-            code
-        } else {
+        // A stage with no constants is still pruned to its entry: the driver and the validation
+        // layer otherwise read every other entry point's code once per stage.
+        let code = {
             let _zone = crate::zone!("specialize");
             let started = Instant::now();
             let folded = specialize::specialize(

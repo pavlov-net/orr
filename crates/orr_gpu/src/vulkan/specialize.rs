@@ -345,8 +345,8 @@ fn mark_defined(inst: &[u32], defined: &mut [bool]) {
 
 /// `code` with the constants `entries` name set to their values in `bytes`, the blocks of its
 /// functions those values leave unreachable removed, and only entry point `entry` left.
-/// `None` where `entries` names no constant of the module or the module is not laid out as
-/// the pass expects, so the caller keeps `code`.
+/// `None` where there is nothing to fold or prune, or the module is not laid out as the pass
+/// expects, so the caller keeps `code`.
 pub(super) fn specialize(
     code: &[u32],
     entry: &[u8],
