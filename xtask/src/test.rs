@@ -326,6 +326,39 @@ fn workspace() -> Result<Workspace, String> {
     Ok(ws)
 }
 
+/// The features the workspace pass turns on in each workspace package, by package name.
+fn features_on(ws: &Workspace) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    let features: Vec<&str> = WORKSPACE
+        .iter()
+        .copied()
+        .filter(|a| *a != "--workspace")
+        .collect();
+    let output = cargo()
+        .args(["metadata", "--locked", "--format-version=1"])
+        .args(features)
+        .current_dir(&ws.root)
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("cargo metadata: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("cargo metadata: {}", output.status));
+    }
+    let meta: Value =
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("cargo metadata: {e}"))?;
+    Ok(meta["resolve"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            let name = ws.packages.get(node["id"].as_str()?)?;
+            Some((
+                name.clone(),
+                strings(&node["features"]).into_iter().collect(),
+            ))
+        })
+        .collect())
+}
+
 /// Cargo's target selection for the selected targets.
 fn selection(targets: &[&Target]) -> Vec<String> {
     let mut args = BTreeSet::new();
@@ -357,8 +390,23 @@ fn build(
         .filter(|t| PASSES.iter().all(|p| p.only != Some(t.name.as_str())))
         .collect();
     // With every target selected cargo chooses, so the build also covers what `cargo test`
-    // builds without running, such as examples.
-    let narrow = (ws.selected(options).count() < ws.targets.len()).then(|| selection(&shared));
+    // builds without running, such as examples. A named target whose required features the
+    // build leaves off fails the build, where cargo skips it unnamed.
+    let narrow = if ws.selected(options).count() < ws.targets.len() {
+        let on = features_on(ws)?;
+        let named: Vec<&Target> = shared
+            .iter()
+            .copied()
+            .filter(|t| {
+                t.required_features
+                    .iter()
+                    .all(|f| on.get(&t.package).is_some_and(|on| on.contains(f)))
+            })
+            .collect();
+        Some(selection(&named))
+    } else {
+        None
+    };
     let mut exes = BTreeMap::new();
     let mut features: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for pass in PASSES {
