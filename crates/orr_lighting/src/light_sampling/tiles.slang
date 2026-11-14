@@ -319,10 +319,13 @@ void select(uint lane: SV_GroupIndex)
     GroupMemoryBarrierWithGroupSync();
     float power = carry_w;
     float fed = carry_h + environment_feedback;
-    float a = fed > 0.0 ? clamp(root.feedback_share, 0.0, 1.0) : 0.0;
+    // Weights that stop growing halve into denormals, which a device may keep and nothing may
+    // divide by: feedback that small is none.
+    bool feedback_held = fed >= F32_MIN_NORMAL;
+    float a = feedback_held ? clamp(root.feedback_share, 0.0, 1.0) : 0.0;
     float env0 = environment ? (power > 0.0 ? ENVIRONMENT_SHARE : 1.0) : 0.0;
     float power_scale = power > 0.0 ? (1.0 - a) * (1.0 - env0) / power : 0.0;
-    float fed_scale = fed > 0.0 ? a / fed : 0.0;
+    float fed_scale = feedback_held ? a / fed : 0.0;
     float env = (1.0 - a) * env0 + fed_scale * environment_feedback;
     float carry = 0.0;
     for (uint base = 0; base < n; base += SELECT_GROUP)
