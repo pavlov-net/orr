@@ -11,7 +11,9 @@ import orr_shaders.sampling;
 import orr_scene.tables;
 
 // An environment linked into orr's kernels. `data` is the address the scene was given for
-// it. Radiance in nits, linear Rec.2020, without directional light discs.
+// it. Radiance in nits, linear Rec.2020, without directional light discs. `eye_render` is the
+// same for every invocation of a dispatch (the camera eye or the bake focus), so heap slots
+// chosen from it are read as uniform.
 public interface IEnvironment
 {
     static float3 radiance(uint64_t data, float3 dir, float3 eye_render);

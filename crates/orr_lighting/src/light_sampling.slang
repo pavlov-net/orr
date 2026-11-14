@@ -376,7 +376,7 @@ float3 textured_shape(SceneRoot* scene, LightGpu l, float3 right, float3 up, flo
     }
     if (l.albedo.index == IMAGE_NONE)
         return lit * INV_PI;
-    Texture2D<float4> albedo = l.albedo.get<Texture2D<float4>>();
+    Texture2D<float4> albedo = l.albedo.get_nonuniform<Texture2D<float4>>();
     uint2 size;
     albedo.GetDimensions(size.x, size.y);
     float2 q = float2(0.5 + 0.5 * p.x, 0.5 - 0.5 * p.y) * float2(size) - 0.5;

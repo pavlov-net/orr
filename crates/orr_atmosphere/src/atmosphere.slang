@@ -481,7 +481,8 @@ public uint atmosphere_sky_view_index(AtmosphereGpu* a, float h)
 
 // Sky radiance along `dir` from the nearest sky-view LUT, blended with the focus LUT by its
 // weight: nits, linear Rec.2020, the medium beyond `near_range` and the virtual ground below
-// the horizon, no light discs.
+// the horizon, no light discs. `eye_render` is the same for every invocation that calls it,
+// since it chooses the LUT the heap read takes as uniform.
 public float3 atmosphere_sky_view(AtmosphereGpu* a, float3 dir, float3 eye_render)
 {
     uint i = atmosphere_sky_view_index(a, atmosphere_altitude(a, eye_render));

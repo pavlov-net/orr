@@ -26,6 +26,13 @@ public struct TextureIndex
     {
         return heap_view<T>(index);
     }
+
+    // `get` for an index that can differ between the invocations that read it.
+    [ForceInline]
+    public T get_nonuniform<T : IOpaqueDescriptor>()
+    {
+        return heap_view<T>(index, true);
+    }
 }
 
 // A storage image view in the resource heap, in the slot space of `TextureIndex`.
@@ -40,6 +47,13 @@ public struct StorageImageIndex
     {
         return heap_view<T>(index);
     }
+
+    // `get` for an index that can differ between the invocations that read it.
+    [ForceInline]
+    public T get_nonuniform<T : IOpaqueDescriptor>()
+    {
+        return heap_view<T>(index, true);
+    }
 }
 
 // A sampler in the sampler heap.
@@ -50,13 +64,14 @@ public struct SamplerIndex
     [ForceInline]
     public SamplerState get()
     {
-        __target_switch
-        {
-        case metal:
-            return metal_sampler(metal_samplers, index);
-        default:
-            return getDescriptorFromHandle(DescriptorHandle<SamplerState>(uint2(index, 0)));
-        }
+        return heap_sampler(index);
+    }
+
+    // `get` for an index that can differ between the invocations that read it.
+    [ForceInline]
+    public SamplerState get_nonuniform()
+    {
+        return heap_sampler(index, true);
     }
 }
 
@@ -93,16 +108,38 @@ struct MetalSampler
 }
 [[vk::binding(2, 0)]] StructuredBuffer<MetalSampler> metal_samplers;
 
-// The view of type `T` in resource heap slot `index`.
+// The view of type `T` in resource heap slot `index`; `varying` when invocations can read
+// different slots. An undecorated heap access is non-uniform, and Slang emits no decoration
+// for `nonuniform` on a heap handle, so the mark changes no SPIR-V: it names the accesses
+// that must stay non-uniform should the compiler decorate the others Uniform.
 [ForceInline]
-T heap_view<T : IOpaqueDescriptor>(uint index)
+T heap_view<T : IOpaqueDescriptor>(uint index, bool varying = false)
 {
     __target_switch
     {
     case metal:
         return metal_resource<T>(metal_texture_pool + uint64_t(index));
     default:
-        return getDescriptorFromHandle(DescriptorHandle<T>(uint2(index, 0)));
+        DescriptorHandle<T> handle = DescriptorHandle<T>(uint2(index, 0));
+        if (varying)
+            return getDescriptorFromHandle(nonuniform(handle));
+        return getDescriptorFromHandle(handle);
+    }
+}
+
+// The sampler in sampler heap slot `index`, marked as `heap_view` marks views.
+[ForceInline]
+SamplerState heap_sampler(uint index, bool varying = false)
+{
+    __target_switch
+    {
+    case metal:
+        return metal_sampler(metal_samplers, index);
+    default:
+        DescriptorHandle<SamplerState> handle = DescriptorHandle<SamplerState>(uint2(index, 0));
+        if (varying)
+            return getDescriptorFromHandle(nonuniform(handle));
+        return getDescriptorFromHandle(handle);
     }
 }
 

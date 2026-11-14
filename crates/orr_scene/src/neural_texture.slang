@@ -56,8 +56,8 @@ void neural_decode(NeuralSetGpu* n, uint2 texel, uint mip)
     NeuralMipGpu c = n.color_mips[mip];
     uint2 size = max(n.size >> mip, uint2(1));
     float2 uv = (float2(texel) + 0.5) / float2(size);
-    Texture2DArray<float4> latents = n.latents.get<Texture2DArray<float4>>();
-    SamplerState s = n.sampler.get();
+    Texture2DArray<float4> latents = n.latents.get_nonuniform<Texture2DArray<float4>>();
+    SamplerState s = n.sampler.get_nonuniform();
     Vector<NEURAL_WIDTH> x = Vector<NEURAL_WIDTH>(half(0.0));
     [unroll]
     for (int level = 0; level < 2; level++)

@@ -433,7 +433,7 @@ public bool box_occluded(ViewConstants* v, RasterGpu* r, Placement p, float3 lo,
     uint2 top = max(r.gbuffer.extent >> mip, 1) - 1;
     uint2 a = min(uint2(rect_min) >> mip, top);
     uint2 b = min(uint2(rect_max) >> mip, top);
-    RWTexture2D<float> hzb = r.hzb[mip].get<RWTexture2D<float>>();
+    RWTexture2D<float> hzb = r.hzb[mip].get_nonuniform<RWTexture2D<float>>();
     float farthest = 1.0;
     for (uint y = a.y; y <= b.y; y++)
         for (uint x = a.x; x <= b.x; x++)

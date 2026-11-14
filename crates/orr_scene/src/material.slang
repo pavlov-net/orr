@@ -688,7 +688,7 @@ public void texture_feedback(TextureIndex t, TextureSamplerGpu s, UvFootprint f,
     {
         uint width;
         uint height;
-        t.get<Texture2D<float4>>().GetDimensions(width, height);
+        t.get_nonuniform<Texture2D<float4>>().GetDimensions(width, height);
         lod = texture_wanted_lod(s.modes, f, float2(width, height));
     }
     texture_stream_feedback(stream, texture_place(f.uv, s.modes), s.modes, 0, lod);
@@ -712,7 +712,7 @@ public float4 texture_footprint(TextureIndex t, TextureSamplerGpu s, UvFootprint
     }
 #endif
     TextureStreamGpu* stream = texture_stream(streams, t);
-    Texture2D<float4> texture = t.get<Texture2D<float4>>();
+    Texture2D<float4> texture = t.get_nonuniform<Texture2D<float4>>();
     bool one_mip = (s.modes & TEXTURE_ONE_MIP) != 0;
     float min_lod = 0.0;
     bool streamed = may2(MAY2_STREAMS) && stream != nullptr;
@@ -729,7 +729,7 @@ public float4 texture_footprint(TextureIndex t, TextureSamplerGpu s, UvFootprint
         }
         float2 texel_uv;
         if (min_lod == 0.0 && (s.modes & TEXTURE_MAG_NEAREST) == 0 && stochastic_texel(f, size, texel_uv))
-            return texture.SampleLevel(s.sampler.get(), texel_uv, 0.0);
+            return texture.SampleLevel(s.sampler.get_nonuniform(), texel_uv, 0.0);
         if (one_mip)
         {
             // A level above 0 takes the min filter, and the sampler's nearest mip filter rounds
@@ -738,10 +738,10 @@ public float4 texture_footprint(TextureIndex t, TextureSamplerGpu s, UvFootprint
             float2 dx = f.dx * size;
             float2 dy = f.dy * size;
             float minified = max(dot(dx, dx), dot(dy, dy)) > 1.0 ? 0.25 : 0.0;
-            return texture.SampleLevel(s.sampler.get(), f.uv, max(minified, min_lod));
+            return texture.SampleLevel(s.sampler.get_nonuniform(), f.uv, max(minified, min_lod));
         }
     }
-    return texture.SampleGrad(s.sampler.get(), f.uv, f.dx, f.dy, int2(0), min_lod);
+    return texture.SampleGrad(s.sampler.get_nonuniform(), f.uv, f.dx, f.dy, int2(0), min_lod);
 }
 
 public bool material_bound(MaterialGpu* m, uint slot)
