@@ -23,7 +23,8 @@ public static const uint KIND_MEDIUM_SHADOW = 1;
 public static const uint KIND_MEDIUM_LAYERS = 2;
 public static const uint KIND_LIGHT_LAYERS = 3;
 public static const uint KIND_WALK_MEET = 4;
-public static const uint FIXED_KINDS = 5;
+public static const uint KIND_STACK_MEET = 5;
+public static const uint FIXED_KINDS = 6;
 // The groups it holds `pins` of after those: one for any surface id, then, where surfaces link,
 // one per pin from id 0 on.
 public static const uint KIND_PATH = 0;          // a copy's clusters
@@ -119,7 +120,7 @@ void runs(uint3 id: SV_DispatchThreadID)
     }
     if (run == RUN_WALK)
     {
-        write_run(run, uint3(KIND_WALK_MEET, SLOT_NONE, SLOT_NONE), proxy_data(CLASS_OPAQUE));
+        write_run(run, uint3(KIND_WALK_MEET, KIND_STACK_MEET, SLOT_NONE), proxy_data(CLASS_OPAQUE));
         return;
     }
     uint material;

@@ -29,7 +29,8 @@ public uint contribution(uint run)
 }
 
 // The runs every medium proxy and every light proxy shows, and the run no instance shows, whose
-// path record a raygen sets on a traced hit to run the walk meet's closest-hit on it.
+// records a raygen sets on a traced hit to run a meet's closest-hit on it: the walk meet's at
+// RAY_TYPE_PATH, the stack meet's at RAY_TYPE_SHADOW.
 public static const uint RUN_MEDIUM = 0;
 public static const uint RUN_LIGHT = 1;
 public static const uint RUN_WALK = 2;

@@ -2,8 +2,6 @@
 //! source's paths from their start to their end, a launch per slice of them, through the scene's
 //! hit records; and the memory a view's paths keep in it.
 
-use std::collections::HashSet;
-use std::sync::Mutex;
 use std::time::Instant;
 
 use orr_scene::orr_gpu::{
@@ -16,23 +14,29 @@ use orr_scene::{HitGroups, SceneFeatures};
 use crate::shaders::path::pipeline::{self, Spec};
 use crate::shaders::types::{PathRoot, PathStages};
 use crate::staged::{
-    FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_WALK, MAY_ALL, MAY_RICH, RECORD_WORDS,
-    UPDATE_RECORD_WORDS,
+    FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_STACK, FEATURE_WALK, MAY_ALL, MAY_RICH,
+    RECORD_WORDS, UPDATE_RECORD_WORDS,
 };
 use crate::{Error, KernelSet, module};
 
-/// `path/launch.slang`'s SLOT_WORDS, WALK_WORDS, SLOT_LAYER_PART, SLOT_INTERIOR_PART and
-/// SLOT_SPECTRAL_PART: the words of a path's slot, and those of the parts the paths that walk,
-/// may meet layers, track interiors and split by wavelength add to it.
+/// `path/launch.slang`'s SLOT_WORDS, WALK_WORDS, SLOT_LAYER_PART, SLOT_INTERIOR_PART,
+/// SLOT_STACK_PART, SLOT_LIGHT_PART and SLOT_SPECTRAL_PART: the words of a path's slot, and those
+/// of the parts the paths that walk, may meet layers, track interiors, may cross plane stacks,
+/// whose shadow rays' lights take their draws at the rays' ends, and that split by wavelength add
+/// to it.
 const SLOT_WORDS: u64 = 28;
 const WALK_WORDS: u64 = 15;
 const LAYER_PART: u64 = 7;
 const INTERIOR_PART: u64 = 10;
+const STACK_PART: u64 = 17;
+const LIGHT_PART: u64 = 3;
 const SPECTRAL_PART: u64 = 5;
 
-/// `path/stages.slang`'s FEATURE_LAYERS: paths may meet dielectric or presence layers, which
-/// only the pipeline's slots keep a part for.
+/// `path/stages.slang`'s FEATURE_LAYERS and FEATURE_COATED_EMITTERS, which only the pipeline's
+/// slots keep parts for: paths may meet dielectric or presence layers, and next-event estimation
+/// may draw an emitter with a coat or fuzz.
 pub(crate) const FEATURE_LAYERS: u32 = 1 << 7;
+pub(crate) const FEATURE_COATED_EMITTERS: u32 = 1 << 8;
 
 /// The words of a slot of paths whose root has `features`, of a view's or its background layer's
 /// (`view`) or not, as `path/launch.slang`'s `slot_stride` lays it out.
@@ -43,6 +47,11 @@ fn slot_words(features: u32, view: bool) -> u64 {
         + part(walk, WALK_WORDS)
         + part(features & FEATURE_LAYERS != 0, LAYER_PART)
         + part(features & FEATURE_INTERIORS != 0, INTERIOR_PART)
+        + part(features & FEATURE_STACK != 0, STACK_PART)
+        + part(
+            features & (FEATURE_STACK | FEATURE_COATED_EMITTERS) != 0,
+            LIGHT_PART,
+        )
         + part(features & FEATURE_DISPERSION != 0, SPECTRAL_PART)
 }
 
@@ -52,8 +61,9 @@ const MAX_SLOTS: u32 = 1 << 20;
 
 /// The stages the pipeline holds one of, first, by index: the raygens in [`Raygen`]'s order, the
 /// miss shader, the medium proxies' intersection and any-hit shaders, the walk meet's
-/// closest-hit, and what layer rays keep of triangles, medium proxies and light proxies.
-const FIXED: [&str; 12] = [
+/// closest-hit, what layer rays keep of triangles, medium proxies and light proxies, and the stack
+/// meet's closest-hit.
+const FIXED: [&str; 13] = [
     "path_view",
     "path_update",
     "path_photon",
@@ -66,6 +76,7 @@ const FIXED: [&str; 12] = [
     "cover_layers_medium_hit",
     "box_light_hit",
     "cover_layers_light_hit",
+    "stack_meet",
 ];
 const RAYGENS: u32 = 4;
 const MISS: u32 = 4;
@@ -76,6 +87,7 @@ const LAYERS_ANY_HIT: u32 = 8;
 const MEDIUM_LAYERS_ANY_HIT: u32 = 9;
 const LIGHT_INTERSECTION: u32 = 10;
 const LIGHT_LAYERS_ANY_HIT: u32 = 11;
+const STACK_MEET: u32 = 12;
 
 /// What the pipeline holds per pin after those (`HitGroups`): the closest-hit shaders of a copy's
 /// clusters, of a producer entry's clusters and of strands, and the any-hit shaders under path and
@@ -100,9 +112,10 @@ const LAYER_PRODUCERS: usize = 6;
 /// Then the callables, in `path/launch.slang`'s CALL_* order, each with the lobes of the BSDF its
 /// vertices may have: next-event estimation and the scatter are made for a plain surface's and a
 /// rich one's. A walk's ends are made rich, as a walk starts only from a vertex with a subsurface
-/// weight, and so are the layer's and the window's, whose surfaces may have every lobe. What lies
-/// along a ray and a scatter in a medium shade no surface.
-const CALLABLES: [(&str, bool); 29] = [
+/// weight, and so are the layer's, the window's and an emitter's view, whose surfaces may have
+/// every lobe. What lies along a ray, a scatter in a medium and a plane stack's step shade no
+/// surface.
+const CALLABLES: [(&str, bool); 31] = [
     ("start_view", true),
     ("start_update", true),
     ("start_photon", true),
@@ -132,6 +145,8 @@ const CALLABLES: [(&str, bool); 29] = [
     ("direct_layer", true),
     ("scatter_layer", true),
     ("window", true),
+    ("stack_step", false),
+    ("emitter_view", true),
 ];
 
 /// The geometry a hit shader runs on, which its stage is made for.
@@ -169,9 +184,6 @@ pub(crate) enum Raygen {
 pub(crate) struct PathPipeline {
     pipeline: RayPipeline,
     groups: HitGroups,
-    /// The mixes of what frames asked of it that it does not render, each logged once: views
-    /// of different scenes or settings ask for different mixes in the same frames.
-    unlaunched: Mutex<HashSet<Vec<&'static str>>>,
 }
 
 impl PathPipeline {
@@ -210,17 +222,15 @@ impl PathPipeline {
             specs.push((entry, spec));
         }
         let bytes: Vec<_> = specs.iter().map(|(_, s)| s.bytes()).collect();
+        // Every stage takes its constants, default or not: a stage with none is handed the whole
+        // module, with every other entry point in it.
         let stages = specs
             .iter()
             .zip(&bytes)
-            .map(|(&(entry, spec), bytes)| {
-                let data = if spec == Spec::default() {
-                    SpecData::default()
-                } else {
-                    SpecData {
-                        entries: Spec::ENTRIES,
-                        bytes,
-                    }
+            .map(|(&(entry, _), bytes)| {
+                let data = SpecData {
+                    entries: Spec::ENTRIES,
+                    bytes,
                 };
                 ShaderStage::new(m, entry, data)
             })
@@ -275,6 +285,10 @@ impl PathPipeline {
                 intersection,
             });
         }
+        hit_groups.push(HitGroup {
+            closest_hit: Some(STACK_MEET),
+            ..HitGroup::default()
+        });
         let raygens: Vec<ShaderRecord<'_>> = (0..RAYGENS).map(ShaderRecord::new).collect();
         let desc = RayPipelineDesc {
             stages: &stages,
@@ -306,25 +320,10 @@ impl PathPipeline {
                 layers: Some(6 * pins + 2),
                 medium_layers: Some(6 * pins + 3),
                 light_layers: Some(6 * pins + 4),
+                stack_meet: Some(6 * pins + 5),
                 ..groups
             },
-            unlaunched: Mutex::new(HashSet::new()),
         })
-    }
-
-    /// Logs what a frame asks of the pipeline that it does not render yet, once for each mix.
-    pub(crate) fn note_unlaunched(&self, what: Vec<&'static str>) {
-        if what.is_empty() {
-            return;
-        }
-        let mut logged = self.unlaunched.lock().unwrap();
-        if !logged.contains(&what) {
-            log::warn!(
-                "the path tracing pipeline renders this scene without: {}",
-                what.join(", ")
-            );
-            logged.insert(what);
-        }
     }
 
     pub(crate) fn hit_pipeline(&self) -> (&RayPipeline, &HitGroups) {

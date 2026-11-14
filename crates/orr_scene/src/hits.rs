@@ -14,7 +14,7 @@ use crate::{Error, Result, SceneRoot};
 const RAY_TYPES: u32 = 3;
 const HIT_DATA_BYTES: u64 = 16;
 const FIXED_RUNS: u32 = 3;
-const FIXED_KINDS: usize = 5;
+const FIXED_KINDS: usize = 6;
 const PINNED_KINDS: usize = 6;
 
 /// The hit groups of a ray tracing pipeline that a scene's hit records name, by what each
@@ -50,6 +50,9 @@ pub struct HitGroups {
     /// The closest-hit a walk's step runs on a triangle it met, in place of the triangle's own,
     /// to read its geometry.
     pub walk_meet: Option<u32>,
+    /// The closest-hit a plane stack's trace runs on a dielectric triangle it met, in place of the
+    /// triangle's own, to read its cluster.
+    pub stack_meet: Option<u32>,
     /// Dielectric and presence layer triangles of copies' clusters under path rays: `path`'s
     /// any-hit with the closest-hit that resolves a layer.
     pub layer_path: Option<u32>,
@@ -77,6 +80,7 @@ impl HitGroups {
             self.medium_layers,
             self.light_layers,
             self.walk_meet,
+            self.stack_meet,
         ];
         let pinned: [Option<u32>; PINNED_KINDS] = [
             self.path,

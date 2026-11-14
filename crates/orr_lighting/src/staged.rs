@@ -43,9 +43,9 @@ const STAGE_GROUP: u32 = 32;
 /// the state its view keeps.
 const MAX_SLOTS: u32 = 65535 * STAGE_GROUP;
 /// Rounds a source's paths may ask for at most: a deferred shadow ray keeps its vertex's depth
-/// in the 24 bits beside its flags (`SHADOW_DEPTH_SHIFT`). The queues of that many rounds take
+/// in the 23 bits beside its flags (`SHADOW_DEPTH_SHIFT`). The queues of that many rounds take
 /// more memory than a device has, so no root gets there.
-pub(crate) const MAX_ROUNDS: u32 = 1 << 24;
+pub(crate) const MAX_ROUNDS: u32 = 1 << 23;
 
 /// `PathRoot.source`.
 pub(crate) const PATH_SOURCE_VIEW: u32 = 0;

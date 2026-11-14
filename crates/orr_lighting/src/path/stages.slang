@@ -97,8 +97,11 @@ public static const uint FEATURE_STACK = 1 << 5;
 // the view has froxels. Without either a segment changes nothing but its sampler dimension.
 public static const uint FEATURE_SEGMENTS = 1 << 6;
 // And, read by the pipeline path tracer alone, that its paths may meet dielectric or presence
-// layers: their slots hold a layer vertex's words and a shadow ray's crossings.
+// layers: their slots hold a layer vertex's words and a shadow ray's crossings; and that their
+// next-event estimation may draw an emitter with a coat or fuzz, whose sample their slots keep
+// for the shadow ray's end.
 public static const uint FEATURE_LAYERS = 1 << 7;
+public static const uint FEATURE_COATED_EMITTERS = 1 << 8;
 
 uint round_now(PathRoot r) { return r.round; }
 uint round_pass(PathRoot r) { return r.round_first; }
@@ -308,13 +311,17 @@ public struct PathShadowRay
 }
 
 public static const uint SHADOW_ENVIRONMENT = 1 << 0;
-static const uint SHADOW_DIRECTIONAL = 1 << 1;
-static const uint SHADOW_DISPERSION = 1 << 2;
+public static const uint SHADOW_DIRECTIONAL = 1 << 1;
+public static const uint SHADOW_DISPERSION = 1 << 2;
 public static const uint SHADOW_FEEDBACK = 1 << 3;
 public static const uint SHADOW_COUNTED = 1 << 4;
-static const uint SHADOW_BEND = 1 << 5;     // a directional light's ray looks for plane stacks
+public static const uint SHADOW_BEND = 1 << 5;     // a directional light's ray looks for plane stacks
 public static const uint SHADOW_INTO = 1 << 6;     // the ray leaves into the surface the vertex lies on
-public static const uint SHADOW_DEPTH_SHIFT = 8;
+public static const uint SHADOW_VIEW = 1 << 7;     // the light is an emitter whose coat and fuzz its light passes (`emitter_view`)
+// Read by the pipeline path tracer alone: the ray is a leg of a plane stack's walk, inside the
+// interiors the walk holds.
+public static const uint SHADOW_LEG = 1 << 8;
+public static const uint SHADOW_DEPTH_SHIFT = 9;
 
 // The direction a walk enters its vertex along, for the walk stage, and what it resolves the
 // vertex again with: the hit the span still holds, with the cone that reached it, or the
@@ -1036,11 +1043,14 @@ public void view_light(inout StoredViewLights p, uint id, float contribution)
 }
 
 // What the shade bodies hand a path's events to: its record, and the G-buffer's emission its
-// first vertex gives toward the eye, pre-exposed.
+// first vertex gives toward the eye, pre-exposed; and what decides whether a path's light
+// through a plane stack is next-event estimation's.
 public interface IVertexRecord : IPathRecord
 {
     [mutating]
     void expose(float3 e);
+    // `stack_owns` of a vertex of depth `depth` whose probe leaves `origin` along `dir`.
+    bool stack_owned<S : ISurfaces>(PathRoot r, float3 origin, float3 dir, PathStack stack, uint depth, bool dispersion, bool feedback);
 }
 
 // The record of a staged path, in its slot of `PathStages.records`, by the root's source.
@@ -1113,6 +1123,12 @@ public struct StagedRecord : IVertexRecord
         StoredView p = load_record<StoredView>(st, slot);
         p.own += e;
         store_record(st, slot, p);
+    }
+
+    // The probe is traced here.
+    public bool stack_owned<S : ISurfaces>(PathRoot r, float3 origin, float3 dir, PathStack stack, uint depth, bool dispersion, bool feedback)
+    {
+        return stack_owns<S>(r.scene, r.view, origin, dir, stack, depth, dispersion, feedback);
     }
 
     [mutating]
@@ -1502,7 +1518,8 @@ PathShadowRay shadow_ray<S : ISurfaces, M : IMedium>(NeeDraw d, float scale, Pat
     q.start = start;
     q.flags = (d.chosen.kind == LIGHT_SAMPLE_ENVIRONMENT ? SHADOW_ENVIRONMENT : 0) | (d.chosen.kind == LIGHT_SAMPLE_DIRECTIONAL ? SHADOW_DIRECTIONAL : 0)
         | (shadow.dispersion ? SHADOW_DISPERSION : 0) | (feedback ? SHADOW_FEEDBACK : 0) | (counted ? SHADOW_COUNTED : 0)
-        | (shadow.bend ? SHADOW_BEND : 0) | (dot(d.toward, shadow.normal) < 0.0 ? SHADOW_INTO : 0) | (depth << SHADOW_DEPTH_SHIFT);
+        | (shadow.bend ? SHADOW_BEND : 0) | (dot(d.toward, shadow.normal) < 0.0 ? SHADOW_INTO : 0)
+        | (may(MAY_EMISSIVE) && may2(MAY2_COATED_EMITTERS) && d.chosen.view ? SHADOW_VIEW : 0) | (depth << SHADOW_DEPTH_SHIFT);
     q.origin = d.origin;
     q.t_max = d.t_max;
     q.dir = d.toward;
@@ -1547,10 +1564,8 @@ void shadow_add(PathShadowRay q, float3 added, inout PathLoop p, inout StagedRec
 
 // What a ray of the path that met nothing adds: the environment and the directional lights'
 // discs, weighed against next-event estimation at the vertex the ray left.
-public void miss_light<S : ISurfaces, M : IMedium, R : IPathRecord>(PathRoot r, PathFixed f, inout PathLoop p, LayerRay ray, Spectral spectral, PathContext x, inout R record, PathStack stack)
+public void miss_light<S : ISurfaces, M : IMedium, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, LayerRay ray, Spectral spectral, PathContext x, inout R record, PathStack stack)
 {
-    SceneRoot* s = r.scene;
-    ViewConstants* v = r.view;
     LightSetGpu* set = r.set;
     bool through = has(p.flags, LOOP_THROUGH);
     float3 own = ray.lit ? float3(0.0) : through ? p.keep : float3(1.0);
@@ -1572,7 +1587,7 @@ public void miss_light<S : ISurfaces, M : IMedium, R : IPathRecord>(PathRoot r, 
                 continue;
             // Through a plane stack next-event estimation at the vertex before it reaches the
             // light too, by all of the vertex's lobes.
-            if (stack_owns<S>(s, v, stack.origin, ray.dir, stack, stack.depth, x.disperse, x.feedback))
+            if (record.stack_owned<S>(r, stack.origin, ray.dir, stack, stack.depth, x.disperse, x.feedback))
             {
                 float jacobian = abs(dot(ray.dir, stack.normal)) / abs(dot(stack.dir, stack.normal));
                 e += d * mis_balance(stack.pdf * jacobian / (stack.ior * stack.ior), stack.run * nee_directional_pdf(set, stack.x_normal, id, ray.dir));
@@ -2273,7 +2288,12 @@ public bool shade_exit_direct<S : ISurfaces, M : IMedium, R : IVertexRecord>(Pat
     if (!iteration_runs(r, p, VERTEX_OPAQUE, true))
         return false;
     set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
-    return vertex_nee<S, M, SHADE_EXIT, R>(r, f, p, c, record, x, VERTEX_OPAQUE, rng, sv, nee);
+    bool alive = vertex_nee<S, M, SHADE_EXIT, R>(r, f, p, c, record, x, VERTEX_OPAQUE, rng, sv, nee);
+    // The exit's scatter takes light only along a way its normals agree on, which the walk stage
+    // asks of the way the light reaches it.
+    if (nee.traced && !sides_agree(sv.l.x.surface.normal, sv.l.x.surface.geometric_normal, nee.q.dir))
+        nee.q.contribution = float3(0.0);
+    return alive;
 }
 
 // The rest of the iteration from a subsurface walk's exit, past next-event estimation `nee`
@@ -2490,6 +2510,69 @@ public bool shade_medium_scatter<S : ISurfaces, R : IVertexRecord>(PathRoot r, P
     return vertex_scatter<S, SHADE_VERTEX, R>(r, f, p, c, record, x, VERTEX_SCATTER, rng, sv, nee, walking, wi);
 }
 
+// What next-event estimation weighs light by at each kind of vertex, prepared as its shade bodies
+// prepare it: opaque vertex `ps` and layer `pl` reached along `dir`, a scatter in a medium, an
+// interior's way out and a subsurface walk's exit, of the arguments of their `shade_*_direct`.
+public VertexScatter opaque_weighs<R : IPathRecord>(PathRoot r, PathLoop p, ShadeState c, R record, PathContext x, PackedSurface ps, float3 dir)
+{
+    return vertex_weighs<SHADE_VERTEX>(packed_vertex(r, p, c, record, x, ps, dir), VERTEX_OPAQUE);
+}
+
+public VertexScatter layer_weighs<R : IPathRecord>(PathRoot r, PathLoop p, ShadeState c, R record, PathContext x, PackedLayer pl, float3 dir)
+{
+    ShadeVertex sv = no_vertex();
+    sv.l = unpack_layer(r.view, pl, dir);
+    sv.b = layer_bsdf(r, p, c, record, x, sv.l);
+    return vertex_weighs<SHADE_VERTEX>(sv, VERTEX_LAYER);
+}
+
+public VertexScatter medium_weighs(PathRoot r, ShadeState c, float3 point, uint medium, float anisotropy)
+{
+    ShadeVertex sv = no_vertex();
+    sv.l = scatter_vertex(r.view, point, c.ray.dir, medium, anisotropy);
+    return vertex_weighs<SHADE_VERTEX>(sv, VERTEX_SCATTER);
+}
+
+public VertexScatter leave_weighs(PathRoot r, float3 at, float3 n, float3 dir, float ior)
+{
+    return vertex_weighs<SHADE_VERTEX>(leave_shade_vertex(r.view, at, n, dir, ior), VERTEX_LEAVE);
+}
+
+public VertexScatter exit_weighs(PathRoot r, PathLoop p, PathContext x, PackedSurface at, float3 dir, bool capped, PackedSurface entry, bool own, uint seed)
+{
+    return vertex_weighs<SHADE_EXIT>(walk_exit_vertex(r, p, x, at, dir, capped, entry, own, seed), VERTEX_OPAQUE);
+}
+
+// What next-event estimation keeps of a draw toward a directional light to weigh it again where
+// a plane stack bends the light (`nee_add`).
+public struct BentDraw
+{
+    public float3 scale;            // the path's throughput at the vertex x the draw's resampling weight, over the vertex's probability of running it
+    public float pdf;               // that probability x the light's density in the vertex's mixture
+    public float3 l;                // the light's radiance
+    public uint flags;              // BENT_*
+    public float3 keep;             // what a chain keeps of the vertex's scatter
+}
+
+static const uint BENT_ONE = 1 << 0;       // the draw weighs 1 against BSDF rays
+static const uint BENT_CHAIN = 1 << 1;     // the vertex is a chain's
+
+public BentDraw bent_draw(ShadeNee nee)
+{
+    BentDraw b = { nee.throughput * (nee.d.W / nee.run), nee.run * nee.d.chosen.pdf, nee.d.l, (nee.weight_one ? BENT_ONE : 0) | (nee.chain ? BENT_CHAIN : 0), nee.keep };
+    return b;
+}
+
+// What draw `b` adds to the path, before its colors, from a vertex weighed by `f` where its
+// shadow ray let `vis` through a plane stack that bent it as `stack`: `nee_add`'s value.
+public float3 bent_added<F : IScatter>(BentDraw b, F f, StackLight stack, float3 vis)
+{
+    float scatter_pdf;
+    float3 e = bent_value(f, b.l, stack, b.keep, (b.flags & BENT_CHAIN) != 0, scatter_pdf);
+    float mis = (b.flags & BENT_ONE) != 0 ? 1.0 : mis_balance(b.pdf, scatter_pdf);
+    return b.scale * (e * vis * mis);
+}
+
 // What shadow ray `nee`, which found `vis` through plane stack `stack`, adds to the path from
 // the vertex weighed by `f`.
 void nee_add<S : ISurfaces>(PathRoot r, ShadeNee nee, VertexScatter f, float3 vis, StackLight stack, inout PathLoop p, inout StagedRecord record)
@@ -2538,10 +2621,10 @@ bool resolve_layer<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, ino
         return false;
     }
     // The layer shades from its packed form, as the pipeline's layer shaders do.
-    PackedLayer pl = pack_layer(r, sh, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, ray.dir);
-    sv.l = unpack_layer(v, pl, ray.dir);
     StackFace face;
-    sv.l.stack = may(MAY_STACK) && c.stack.valid && stack_face(s, h, x.disperse, face);
+    bool stack = may(MAY_STACK) && c.stack.valid && stack_face(s, h, x.disperse, face);
+    PackedLayer pl = pack_layer(r, sh, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, ray.dir, stack);
+    sv.l = unpack_layer(v, pl, ray.dir);
     if (first)
         p.cone.width = cone_width(p.cone, sv.l.x.camera_distance);
     bool disperse = may(MAY_DISPERSION) && x.disperse;
@@ -2580,12 +2663,12 @@ bool resolve_layer<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, ino
 // A photon at vertex `sv` of kind `kind`: it deposits where it meets a surface after a chain, and
 // goes on only as one. Light that next-event estimation takes through a plane stack is not
 // deposited. False where the path ends.
-bool photon_deposit<S : ISurfaces, R : IPathRecord>(PathRoot r, PathLoop p, ShadeState c, inout R record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv)
+bool photon_deposit<S : ISurfaces, R : IVertexRecord>(PathRoot r, PathLoop p, ShadeState c, inout R record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv)
 {
     LayerVertex l = sv.l;
     bool disperse = may(MAY_DISPERSION) && x.disperse;
     if (p.chains > 0 && kind != VERTEX_SCATTER && kind != VERTEX_LEAVE
-        && !(may(MAY_STACK) && stack_owns<S>(r.scene, r.view, vertex_origin(l.x, -c.stack.dir), -c.stack.dir, c.stack, p.depth, disperse, x.feedback)))
+        && !(may(MAY_STACK) && record.stack_owned<S>(r, vertex_origin(l.x, -c.stack.dir), -c.stack.dir, c.stack, p.depth, disperse, x.feedback)))
         record.deposit(r, l, sv.b, c.spectral.color(p.throughput), rng);
     return l.chains;
 }
@@ -2594,7 +2677,7 @@ bool photon_deposit<S : ISurfaces, R : IPathRecord>(PathRoot r, PathLoop p, Shad
 // whose shadow ray `nee` holds for the vertex's stage or the trace stage, with the vertex's
 // probability of running it. Before it a photon deposits where it meets a surface past a chain.
 // False where the path ends.
-bool vertex_nee<S : ISurfaces, M : IMedium, let X : uint, R : IPathRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv, out ShadeNee nee)
+bool vertex_nee<S : ISurfaces, M : IMedium, let X : uint, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, uint kind, inout Sampler rng, ShadeVertex sv, out ShadeNee nee)
 {
     SceneRoot* s = r.scene;
     LightSetGpu* set = r.set;

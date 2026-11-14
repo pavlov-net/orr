@@ -138,9 +138,8 @@ fn the_pipeline_renders_opaque_scenes_as_the_staged_loop_does() {
 /// sphere that focuses the sun's caustic photons on the floor; a dispersive sphere that splits
 /// paths by wavelength; scattering interiors, which scatter and walk; an eye inside water, whose
 /// interiors start the path; and a lens in that water over a slab, whose rays start inside the
-/// interiors at the lens. Only the sphere's scene gathers caustic photons, and no scene puts a
-/// directional light over flat solid glass, which plane stacks would bend. Runs the cases `run`,
-/// in that order.
+/// interiors at the lens. Only the sphere's scene gathers caustic photons. Runs the cases `run`, in
+/// that order.
 fn glass_cases(run: std::ops::Range<usize>) {
     if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
         return;
@@ -284,6 +283,40 @@ fn the_pipeline_renders_caustics_and_dispersion_through_glass_as_the_staged_loop
 #[test]
 fn the_pipeline_renders_interiors_as_the_staged_loop_does() {
     glass_cases(5..8);
+}
+
+/// The pipeline path tracer bends the sun through a plane stack and passes a coated emitter's
+/// light through its coat as the staged loop does: a tinted slab over the floor under the sun and
+/// a sky, whose shadow the sun's light through both faces fills by next-event estimation, by BSDF
+/// rays that the stack leaves to it, and by caustic photons, beside an emitter with a coat and
+/// fuzz. Compared as the opaque scenes are.
+#[test]
+fn the_pipeline_renders_plane_stacks_and_coated_emitters_as_the_staged_loop_does() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    let spec = Spec {
+        copies: vec![
+            at(FLOOR, Mat3::IDENTITY, Vec3::ZERO),
+            at(TINTED_SLAB, Mat3::IDENTITY, Vec3::new(0.0, 0.8, 0.0)),
+            at(
+                COATED_EMITTER,
+                Mat3::from_rotation_x(-0.6),
+                Vec3::new(-1.4, 0.9, -0.4),
+            ),
+        ],
+        lights: vec![Light::Directional(SUN)],
+        environment: Some(SKY),
+        eye: Vec3::new(0.0, 2.0, 3.5),
+        target: Vec3::new(0.0, 0.4, 0.0),
+        fov_y: 0.8,
+        focus: None,
+    };
+    let mut bed = Bed::with(spec);
+    bed.set_pre_exposure(1.0 / 64.0);
+    let (staged, launched) = both(ViewLighting::default());
+    assert_pipeline_renders_as_staged("slab and coated emitter", &mut bed, &staged, &launched);
+    assert_clean();
 }
 
 /// The pipeline path tracer walks subsurface materials as the staged loop does: the light that

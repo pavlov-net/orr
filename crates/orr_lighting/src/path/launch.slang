@@ -4,7 +4,8 @@
 // hit by LAYERS traces, calls the segment that runs along it, inside an interior or outside every
 // one, reorders on the hit and invokes the hit's resolve or the miss shader, then calls the
 // vertex's emission, next-event estimation and scatter, tracing the shadow ray between the last
-// two, walking the thin walls it passed and marching the medium proxies with a volume it passed.
+// two, walking the thin walls it passed, marching the medium proxies with a volume it passed and
+// walking a directional light's ray through the plane stack it comes through.
 // Every wider value lives in the path's slot of `PathStages.words`, found from the launch index,
 // which each shader loads and stores in the parts it reads and writes; across a trace, reorder,
 // invoke or call that memory is coherent at device scope. A vertex is shaded by the staged loop's
@@ -66,6 +67,15 @@ public static const uint CALL_GBUFFER = 25;
 public static const uint CALL_DIRECT_LAYER = 26;
 public static const uint CALL_SCATTER_LAYER = 27;
 public static const uint CALL_WINDOW = 28;
+public static const uint CALL_STACK_STEP = 29;
+public static const uint CALL_EMITTER_VIEW = 30;
+
+// What the raygen hands a vertex's direct or deposit callable in its data's second word: its
+// first call; its call again once the raygen has traced the probe it asked for (STEP_PROBE); and
+// its second phase, which takes a directional light that a plane stack bent.
+public static const uint DIRECT_FIRST = 0;
+public static const uint DIRECT_PROBED = 1;
+public static const uint DIRECT_BENT = 2;
 
 // What a shader hands the raygen in its payload's first word.
 public static const uint STEP_RAY = 1 << 0;      // the path has a ray to trace
@@ -79,9 +89,12 @@ public static const uint STEP_WALK = 1 << 7;     // the path walks from its walk
 public static const uint STEP_INVOKE = 1 << 8;   // the walk's last step met a surface whose hit shader goes on
 public static const uint STEP_GIVEN = 1 << 9;    // the path starts on the hit its surface words give, once its shadow ray has passed
 public static const uint STEP_RECORD = 1 << 10;  // the record takes the vertex: an update path's cache vertex
+// The shader decided nothing and asks the raygen for a plane stack's probe, whose ray it left in
+// the slot's shadow ray, before it runs again.
+public static const uint STEP_PROBE = 1 << 11;
 // From STEP_CLASS_SHIFT, with STEP_VERTEX, the class of a vertex past a walk or a segment, which
 // selects its direct and scatter callables in place of STEP_RICH.
-static const uint STEP_CLASS_SHIFT = 11;
+static const uint STEP_CLASS_SHIFT = 12;
 static const uint CLASS_SURFACE = 0;             // an opaque vertex, plain or rich
 static const uint CLASS_EXIT = 1;                // a subsurface walk's exit
 static const uint CLASS_LEAVE = 2;               // an interior's walk leaving it
@@ -94,9 +107,11 @@ static const uint CLASS_LAYER = 4;               // a dielectric or presence lay
 // what a LAYERS trace keeps (FRONT_AT); then the parts of paths of a root whose features name
 // them, in this order: the walk in flight (`WALK_WORDS`), a layer's words beside its packed surface
 // and the crossing a shadow ray's walk is at (FEATURE_LAYERS), the path's interiors with its shadow
-// ray's vertex (FEATURE_INTERIORS) and its wavelengths (FEATURE_DISPERSION). The path's record is
-// apart, in `PathStages.records`: RECORD_WORDS for a view's, UPDATE_RECORD_WORDS for an update
-// path's.
+// ray's vertex (FEATURE_INTERIORS), its plane stack with what the last stack trace met and the
+// walk of a shadow ray through a stack (FEATURE_STACK), what its shadow ray's light takes at the
+// ray's end, a directional light's draw or a coated emitter's sample (FEATURE_STACK or
+// FEATURE_COATED_EMITTERS), and its wavelengths (FEATURE_DISPERSION). The path's record is apart,
+// in `PathStages.records`: RECORD_WORDS for a view's, UPDATE_RECORD_WORDS for an update path's.
 static const uint LOOP_AT = 0;
 static const uint RAY_AT = 5;
 static const uint SURFACE_AT = 9;
@@ -115,6 +130,15 @@ public static const uint SLOT_LAYER_PART = LAYER_WORDS + CROSSING_WORDS + CROSSE
 static const uint SLOT_INTERIOR_WORDS = 8;
 static const uint SLOT_SHADOW_INTERIOR_WORDS = 2;
 public static const uint SLOT_INTERIOR_PART = SLOT_INTERIOR_WORDS + SLOT_SHADOW_INTERIOR_WORDS;
+// The stack part: `PathStack`, then `StackHit` and `StackWalk`.
+static const uint PATH_STACK_WORDS = 5;
+static const uint STACK_HIT_AT = PATH_STACK_WORDS;
+static const uint STACK_HIT_WORDS = 2;
+static const uint STACK_WALK_AT = STACK_HIT_AT + STACK_HIT_WORDS;
+static const uint STACK_WALK_WORDS = 10;
+public static const uint SLOT_STACK_PART = STACK_WALK_AT + STACK_WALK_WORDS;
+// The light part: `BentDraw` or `LightView`.
+public static const uint SLOT_LIGHT_PART = 3;
 public static const uint SLOT_SPECTRAL_PART = 5;
 
 // `LaunchLoop.vertex`: the vertex is the path's first, and is the G-buffer's surface; the path is
@@ -274,6 +298,52 @@ struct Crossing
     float3 corners[3];
 }
 
+// What a plane stack's probe or leg met: the nearest opaque surface or solid glass, as
+// `stack_trace` finds it.
+struct StackHit
+{
+    float t;
+    uint instance;
+    int cluster;                    // -1 but on a dielectric triangle, whose face `stack_face` reads
+    uint primitive;
+    float2 barycentrics;
+    uint class_id;
+    uint flags;                     // STACK_HIT_*
+}
+
+static const uint STACK_HIT_MET = 1 << 0;
+static const uint STACK_HIT_TRIANGLE = 1 << 1;
+
+// A shadow ray's walk through a plane stack, `path_light`'s past its probe: the light's direction
+// outside the stack, its direction at the vertex with the densities that bend gives, the faces'
+// normal and how many the legs crossed, and of the leg in flight, whose ray is the slot's shadow
+// ray, the interiors around it, the surface point its origin is offset from, and the optical depth
+// of the legs before it.
+struct StackWalk
+{
+    Interior inside;
+    float3 dir;
+    uint crossed;
+    float3 normal;
+    float jacobian;
+    float3 bent;
+    float density;
+    float3 from;
+    float3 depth;
+}
+
+// A coated emitter's light sample, as `emitter_view_layer` reads it, with the IOR of the medium
+// around the vertex that drew it.
+struct LightView
+{
+    float3 point;
+    uint light;
+    float3 dir;
+    uint position;
+    uint triangle;
+    float exterior_ior;
+}
+
 // A photon's first hit, which no ray found, as its start gives it: the triangle and point of its
 // caster where its light first meets the scene, reached along `dir`.
 struct GivenHit : IHit
@@ -358,9 +428,32 @@ uint interior_at(PathRoot r)
     return layer_at(r) + (layers_kept(r) ? SLOT_LAYER_PART : 0);
 }
 
-uint spectral_at(PathRoot r)
+// Whether the slots of `r`'s paths hold the stack part: they may cross a plane stack.
+bool stack_kept(PathRoot r)
+{
+    return (r.features & FEATURE_STACK) != 0;
+}
+
+// Whether they hold the light part: next-event estimation may draw a light whose shadow ray takes
+// the draw again at its end.
+bool light_kept(PathRoot r)
+{
+    return (r.features & (FEATURE_STACK | FEATURE_COATED_EMITTERS)) != 0;
+}
+
+uint stack_at(PathRoot r)
 {
     return interior_at(r) + (interiors_tracked(r) ? SLOT_INTERIOR_PART : 0);
+}
+
+uint light_at(PathRoot r)
+{
+    return stack_at(r) + (stack_kept(r) ? SLOT_STACK_PART : 0);
+}
+
+uint spectral_at(PathRoot r)
+{
+    return light_at(r) + (light_kept(r) ? SLOT_LIGHT_PART : 0);
 }
 
 // The words of a slot of `r`'s paths (`orr_lighting::launch::slot_words`).
@@ -461,6 +554,9 @@ public struct LaunchRecord : IVertexRecord
     public uint4* words;
     // `vertex` handed the record the vertex.
     public bool recorded;
+    // The slot's stack hit, where the root keeps the stack part: what the raygen's probe met,
+    // which `stack_owned` reads.
+    public uint4* probe;
 
     bool view_record()
     {
@@ -521,6 +617,17 @@ public struct LaunchRecord : IVertexRecord
         store_part<StoredView, RECORD_WORDS>(words, p);
     }
 
+    // The probe a shader asks for of a stack the path crossed (STEP_PROBE) is the raygen's,
+    // traced before the shader runs again.
+    public bool stack_owned<S : ISurfaces>(PathRoot r, float3 origin, float3 dir, PathStack stack, uint depth, bool dispersion, bool feedback)
+    {
+        if (!stack.valid || stack.crossed == 0)
+            return false;
+        StackFace face;
+        return stack_face(r.scene, stack_hit(load_part<StackHit, STACK_HIT_WORDS>(probe)), dispersion, face)
+            && abs(dot(face.normal, stack.normal)) >= STACK_PARALLEL;
+    }
+
     [mutating]
     public void vertex(PathRoot r, PathVertex x, Bsdf b, float3 throughput, float3 radiance, inout Sampler rng)
     {
@@ -572,7 +679,23 @@ LaunchRecord launch_record(PathRoot r, uint slot)
     record.caustic = from_photon(r);
     record.words = r.stages.records + slot * (record.update ? UPDATE_RECORD_WORDS : RECORD_WORDS);
     record.recorded = false;
+    record.probe = slot_words(r, slot) + stack_at(r) + STACK_HIT_AT;
     return record;
+}
+
+// The hit `h` holds, as `stack_face` reads it.
+Hit stack_hit(StackHit h)
+{
+    Hit k = Hit();
+    k.hit = (h.flags & STACK_HIT_MET) != 0;
+    k.triangle = (h.flags & STACK_HIT_TRIANGLE) != 0;
+    k.t = h.t;
+    k.instance_index = h.instance;
+    k.class_id = h.class_id;
+    k.primitive_index = h.primitive;
+    k.cluster_id = h.cluster;
+    k.barycentrics = h.barycentrics;
+    return k;
 }
 
 // What a shader of a path's vertex loads: its pixel, loop, ray, interiors, wavelengths, record and
@@ -610,6 +733,8 @@ LaunchVertex load_vertex(PathRoot r, uint slot)
         v.p.entered_at = i.entered_at;
         v.p.entered_normal = i.entered_normal;
     }
+    if (stack_kept(r))
+        v.c.stack = load_part<PathStack, PATH_STACK_WORDS>(v.at + stack_at(r));
     if (spectral_tracked(r))
         v.c.spectral = load_part<Spectral, SLOT_SPECTRAL_PART>(v.at + spectral_at(r));
     v.record = launch_record(r, slot);
@@ -627,13 +752,17 @@ void store_ray_part(LaunchVertex v)
     store_part<LaunchRay, 4>(v.at + RAY_AT, launch_ray(v.c.ray, 0.0, 0));
 }
 
-// The path's interiors, where it entered and its ray's start, where the root tracks interiors.
-void store_interior_part(PathRoot r, uint4* at, PathLoop p, ShadeState c)
+// The path's interiors, where it entered and its ray's start, where the root tracks interiors,
+// and its plane stack where the root keeps one.
+void store_tracked_parts(PathRoot r, uint4* at, PathLoop p, ShadeState c)
 {
-    if (!interiors_tracked(r))
-        return;
-    LaunchInterior i = { c.interior, p.entered, p.entered_at, p.entered_normal, c.ray.start };
-    store_part<LaunchInterior, SLOT_INTERIOR_WORDS>(at + interior_at(r), i);
+    if (interiors_tracked(r))
+    {
+        LaunchInterior i = { c.interior, p.entered, p.entered_at, p.entered_normal, c.ray.start };
+        store_part<LaunchInterior, SLOT_INTERIOR_WORDS>(at + interior_at(r), i);
+    }
+    if (stack_kept(r))
+        store_part<PathStack, PATH_STACK_WORDS>(at + stack_at(r), c.stack);
 }
 
 void store_spectral_part(PathRoot r, uint4* at, Spectral s)
@@ -810,7 +939,7 @@ uint begin_launch(PathRoot r, uint slot, uint2 pixel, PathStart start, Sampler r
     start_state(r, pixel, start, rng, false, f, p, c);
     p.rays = rays;
     uint4* at = slot_words(r, slot);
-    store_interior_part(r, at, p, c);
+    store_tracked_parts(r, at, p, c);
     store_spectral_part(r, at, c.spectral);
     if (start.mask != 0)
     {
@@ -909,12 +1038,13 @@ public uint launch_start_photon<S : ISurfaces>(PathRoot r, uint slot)
     start.interior = p.interior;
     start.throughput = p.flux;
     start.given = true;
+    start.directional = p.directional;
     PathFixed f;
     PathLoop l;
     ShadeState c;
     start_state(r, pixel, start, rng, true, f, l, c);
     uint4* at = slot_words(r, slot);
-    store_interior_part(r, at, l, c);
+    store_tracked_parts(r, at, l, c);
     store_spectral_part(r, at, c.spectral);
     store_part<CausticPhoton, RECORD_WORDS>(launch_record(r, slot).words, CausticPhoton(p.entry));
     // The given hit lies at the ray's origin, from which no light density is taken.
@@ -1096,7 +1226,22 @@ public uint launch_resolve_layer<S : ISurfaces, H : IHit>(PathRoot r, uint slot,
         store_loop_part(v);
         return STEP_ENDED;
     }
-    PackedLayer pl = pack_layer(r, sh, instance, cluster, h.primitive_index(), h.barycentrics(), dir);
+    // A plane stack the path tracks takes a layer on one of its faces.
+    bool stack = false;
+    if (stack_kept(r) && v.c.stack.valid)
+    {
+        Hit face_hit = Hit();
+        face_hit.hit = true;
+        face_hit.triangle = true;
+        face_hit.instance_index = instance;
+        face_hit.cluster_id = h.cluster_id();
+        face_hit.primitive_index = h.primitive_index();
+        face_hit.barycentrics = h.barycentrics();
+        face_hit.class_id = class_of(scene_traced(r.scene), h.custom_index(), instance, h.cluster_id());
+        StackFace face;
+        stack = stack_face(r.scene, face_hit, v.x.disperse, face);
+    }
+    PackedLayer pl = pack_layer(r, sh, instance, cluster, h.primitive_index(), h.barycentrics(), dir, stack);
     store_part<PackedSurface, 7>(v.at + SURFACE_AT, pl.surface);
     store_part<LayerWords, LAYER_WORDS>(v.at + layer_at(r), pl.layer);
     v.t = t;
@@ -1106,22 +1251,57 @@ public uint launch_resolve_layer<S : ISurfaces, H : IHit>(PathRoot r, uint slot,
 }
 
 // The miss shader's body: what `slot`'s ray that met nothing adds, the environment and the
-// directional lights' discs, or for the camera ray the sky its finish adds. The path ends.
-public void launch_miss<S : ISurfaces, M : IMedium>(PathRoot r, uint slot)
+// directional lights' discs, or for the camera ray the sky its finish adds: STEP_ENDED. A disc
+// the ray sees past a plane stack its path crossed takes the stack's probe from the vertex before
+// the stack, which the raygen traces where it is not `probed` yet (STEP_PROBE).
+public uint launch_miss<S : ISurfaces, M : IMedium>(PathRoot r, uint slot, bool probed)
 {
     LaunchVertex v = load_vertex(r, slot);
     if (has(v.p.flags, LOOP_CAMERA))
         v.p.sky = v.p.throughput;
     else
     {
+        bool adds = v.x.count_bsdf && has(v.p.flags, LOOP_COUNTED);
+        if (adds && !probed && sees_stacked_disc<M>(r, v))
+        {
+            PathStack s = v.c.stack;
+            store_probe(v.at, s.origin, v.c.ray.dir, s.depth, v.x.feedback);
+            return STEP_PROBE;
+        }
         // The march's jitter, drawn where no segment ran.
         if ((v.vertex & VERTEX_SEGMENTED) == 0)
             v.p.rng.next();
-        if (v.x.count_bsdf && has(v.p.flags, LOOP_COUNTED))
+        if (adds)
             miss_light<S, M, LaunchRecord>(r, v.f, v.p, v.c.ray, v.c.spectral, v.x, v.record, v.c.stack);
     }
     set_flag(v.p.flags, LOOP_CAMERA, false);
     store_loop_part(v);
+    return STEP_ENDED;
+}
+
+// Whether `v`'s ray, which met nothing, sees a directional light's disc while its path tracks a
+// plane stack it crossed: where `miss_light` asks the record whether the stack owns the light.
+bool sees_stacked_disc<M : IMedium>(PathRoot r, LaunchVertex v)
+{
+    PathStack s = v.c.stack;
+    LightSetGpu* set = r.set;
+    if (!stack_kept(r) || !s.valid || s.crossed == 0 || !may(MAY_DIRECTIONAL))
+        return false;
+    for (uint k = 0; k < set.directional_count; k++)
+    {
+        if (any(directional_disc<M>(set, set.directional_ids[k], v.c.ray.origin, v.c.ray.dir) > 0.0))
+            return true;
+    }
+    return false;
+}
+
+// Leaves the ray of a plane stack's probe in the shadow ray words at `at`, which no shadow ray
+// holds while a shader asks for one: from `origin` along `dir`, its candidates of the context of a
+// ray at path depth `depth` that reports texture feedback where `feedback` holds.
+void store_probe(uint4* at, float3 origin, float3 dir, uint depth, bool feedback)
+{
+    ShadowJob q = { float3(0.0), NO_LIGHT, origin, positive_infinity(), dir, (feedback ? SHADOW_FEEDBACK : 0) | (depth << SHADOW_DEPTH_SHIFT) };
+    store_part<ShadowJob, 3>(at + SHADOW_AT, q);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1137,11 +1317,14 @@ public void launch_emission(PathRoot r, uint slot)
 }
 
 // Next-event estimation at `slot`'s vertex, and before it where the path ends there: its shadow
-// ray in the slot, and the vertex's probability of running it in the ray's for the scatter.
-public uint launch_direct<S : ISurfaces, M : IMedium>(PathRoot r, uint slot)
+// ray in the slot, and the vertex's probability of running it in the ray's for the scatter. In
+// `phase` DIRECT_BENT, the light its shadow ray let through bent by a plane stack.
+public uint launch_direct<S : ISurfaces, M : IMedium>(PathRoot r, uint slot, uint phase)
 {
     LaunchVertex v = load_vertex(r, slot);
     PackedSurface ps = load_surface_part(v);
+    if (phase == DIRECT_BENT)
+        return direct_bent(r, v, opaque_weighs(r, v.p, v.c, v.record, v.x, ps, v.c.ray.dir));
     Sampler rng = v.p.rng;
     ShadeNee nee;
     bool alive = shade_direct<S, M, LaunchRecord>(r, v.f, v.p, v.c, v.record, v.x, ps, v.c.ray.dir, v.t, (v.vertex & VERTEX_FIRST) != 0, rng, nee);
@@ -1150,13 +1333,15 @@ public uint launch_direct<S : ISurfaces, M : IMedium>(PathRoot r, uint slot)
 }
 
 // What next-event estimation at `v`'s vertex leaves the raygen and the scatter: its shadow ray,
-// and the vertex's probability of running it in the ray's.
+// with what its light takes at the ray's end, and the vertex's probability of running it in the
+// ray's.
 uint direct_left(PathRoot r, LaunchVertex v, bool alive, ShadeNee nee)
 {
     uint step = (alive ? 0 : STEP_ENDED) | (v.record.recorded ? STEP_RECORD : 0);
     if (nee.traced)
     {
         store_shadow_part(r, v, nee.q);
+        store_light_part(r, v.at, nee);
         step |= STEP_SHADOW;
     }
     v.c.ray.run = nee.run;
@@ -1165,12 +1350,60 @@ uint direct_left(PathRoot r, LaunchVertex v, bool alive, ShadeNee nee)
     return step;
 }
 
+// Whether the shadow ray of flags `flags` of a path of `r` is a directional light's that a plane
+// stack may bend (`path_light`'s `bend`).
+bool shadow_bends(PathRoot r, uint flags)
+{
+    return stack_kept(r) && has(flags, SHADOW_DIRECTIONAL) && has(flags, SHADOW_BEND);
+}
+
+// What the light of next-event estimation `nee`'s shadow ray takes at the ray's end: a coated
+// emitter's sample, for its view, and a draw that a plane stack may bend, to weigh it again.
+void store_light_part(PathRoot r, uint4* at, ShadeNee nee)
+{
+    if (has(nee.q.flags, SHADOW_VIEW))
+    {
+        ResolvedLightSample c = nee.d.chosen;
+        LightView l = { c.point, c.light, c.dir, c.position, c.triangle, nee.exterior_ior };
+        store_part<LightView, SLOT_LIGHT_PART>(at + light_at(r), l);
+    }
+    else if (shadow_bends(r, nee.q.flags))
+        store_part<BentDraw, SLOT_LIGHT_PART>(at + light_at(r), bent_draw(nee));
+}
+
+// The second phase of next-event estimation at `v`'s vertex, weighed by `f`: adds the light its
+// shadow ray let through a plane stack (`StackWalk`), from the way the stack bent it.
+uint direct_bent<F : IScatter>(PathRoot r, LaunchVertex v, F f)
+{
+    ShadowJob q = load_part<ShadowJob, 3>(v.at + SHADOW_AT);
+    StackWalk w = load_part<StackWalk, STACK_WALK_WORDS>(v.at + stack_at(r) + STACK_WALK_AT);
+    StackLight stack = straight_light(w.dir);
+    stack.bent = w.bent;
+    stack.jacobian = w.jacobian;
+    stack.density = w.density;
+    stack.normal = w.normal;
+    BentDraw b = load_part<BentDraw, SLOT_LIGHT_PART>(v.at + light_at(r));
+    // A directional light has no feedback id.
+    if (has(q.flags, SHADOW_COUNTED))
+        v.p.radiance += v.c.spectral.color(bent_added(b, f, stack, q.contribution));
+    store_loop_part(v);
+    return 0;
+}
+
 // Next-event estimation at `slot`'s layer, and before it the rest of the iteration that reached
-// it: its wavelengths, the record's view of it and its emission.
-public uint launch_direct_layer<S : ISurfaces, M : IMedium>(PathRoot r, uint slot)
+// it: its wavelengths, the record's view of it and its emission. A photon deposits in its place,
+// whose probe of a plane stack it crossed the raygen traces first (STEP_PROBE).
+public uint launch_direct_layer<S : ISurfaces, M : IMedium>(PathRoot r, uint slot, uint phase)
 {
     LaunchVertex v = load_vertex(r, slot);
     PackedLayer pl = load_layer_part(r, v);
+    if (phase == DIRECT_BENT)
+        return direct_bent(r, v, layer_weighs(r, v.p, v.c, v.record, v.x, pl, v.c.ray.dir));
+    if (phase != DIRECT_PROBED && deposit_probes(r, v))
+    {
+        PathVertex x = unpack_layer(r.view, pl, v.c.ray.dir).x;
+        return ask_deposit_probe(v, x);
+    }
     Sampler rng = v.p.rng;
     ShadeNee nee;
     bool alive = shade_layer_direct<S, M, LaunchRecord>(r, v.f, v.p, v.c, v.record, v.x, pl, v.c.ray.dir, v.t, (v.vertex & VERTEX_FIRST) != 0, rng, nee);
@@ -1194,14 +1427,16 @@ float3 exit_dir(LaunchVertex v, LaunchWalk w)
 }
 
 // Next-event estimation at the exit of `slot`'s subsurface walk.
-public uint launch_direct_exit<S : ISurfaces, M : IMedium>(PathRoot r, uint slot)
+public uint launch_direct_exit<S : ISurfaces, M : IMedium>(PathRoot r, uint slot, uint phase)
 {
     LaunchVertex v = load_vertex(r, slot);
     LaunchWalk w = load_walk_part(v);
     PackedSurface ps = load_surface_part(v);
+    bool own = (v.vertex & VERTEX_ENTRY_PARAMS) == 0;
+    if (phase == DIRECT_BENT)
+        return direct_bent(r, v, exit_weighs(r, v.p, v.x, ps, exit_dir(v, w), (v.vertex & VERTEX_EXIT_CAP) != 0, exit_entry(v, ps), own, w.seed));
     Sampler rng = v.p.rng;
     ShadeNee nee;
-    bool own = (v.vertex & VERTEX_ENTRY_PARAMS) == 0;
     bool alive = shade_exit_direct<S, M, LaunchRecord>(r, v.f, v.p, v.c, v.record, v.x, ps, exit_dir(v, w), (v.vertex & VERTEX_EXIT_CAP) != 0, exit_entry(v, ps), own, rng, w.seed, nee);
     v.p.rng = rng;
     store_part<LaunchWalk, WALK_STATE_WORDS>(v.at + WALK_AT, w);
@@ -1226,7 +1461,7 @@ public uint launch_scatter_exit<S : ISurfaces>(PathRoot r, uint slot)
     if (alive)
     {
         store_ray_part(v);
-        store_interior_part(r, v.at, v.p, v.c);
+        store_tracked_parts(r, v.at, v.p, v.c);
     }
     store_loop_part(v);
     return alive ? STEP_RAY : STEP_ENDED;
@@ -1234,10 +1469,12 @@ public uint launch_scatter_exit<S : ISurfaces>(PathRoot r, uint slot)
 
 // Next-event estimation where `slot`'s interior walk leaves the interior, from the way out its
 // walk part holds.
-public uint launch_direct_leave<S : ISurfaces, M : IMedium>(PathRoot r, uint slot)
+public uint launch_direct_leave<S : ISurfaces, M : IMedium>(PathRoot r, uint slot, uint phase)
 {
     LaunchVertex v = load_vertex(r, slot);
     LaunchWalk w = load_walk_part(v);
+    if (phase == DIRECT_BENT)
+        return direct_bent(r, v, leave_weighs(r, w.origin, w.normal, w.dir, w.ior));
     Sampler rng = v.p.rng;
     ShadeNee nee;
     bool alive = shade_leave_direct<S, M, LaunchRecord>(r, v.f, v.p, v.c, v.record, v.x, w.origin, w.normal, w.dir, w.ior, rng, nee);
@@ -1258,7 +1495,7 @@ public uint launch_scatter_leave<S : ISurfaces>(PathRoot r, uint slot)
     if (alive)
     {
         store_ray_part(v);
-        store_interior_part(r, v.at, v.p, v.c);
+        store_tracked_parts(r, v.at, v.p, v.c);
     }
     store_loop_part(v);
     return alive ? STEP_RAY : STEP_ENDED;
@@ -1295,7 +1532,7 @@ public uint launch_walk_end(PathRoot r, uint slot)
         store_part<LaunchRay, 4>(v.at + RAY_AT, launch_ray(v.c.ray, 0.0, 0));
         return STEP_INVOKE;
     }
-    store_interior_part(r, v.at, v.p, v.c);
+    store_tracked_parts(r, v.at, v.p, v.c);
     w.origin = at;
     w.normal = n;
     w.dir = dir;
@@ -1315,12 +1552,31 @@ public uint4 launch_walk_meet<H : IHit>(PathRoot r, H h)
     return uint4(asuint(normal), m);
 }
 
+// Whether a photon's deposit at `v`'s vertex, past a chain, asks whether its light is next-event
+// estimation's through the plane stack it crossed from its light (`photon_deposit`).
+bool deposit_probes(PathRoot r, LaunchVertex v)
+{
+    return stack_kept(r) && v.record.photon() && v.p.chains > 0 && v.c.stack.valid && v.c.stack.crossed > 0;
+}
+
+// Asks the raygen for the probe of `v`'s photon at vertex `x`: back along the direction its light
+// left the stack.
+uint ask_deposit_probe(LaunchVertex v, PathVertex x)
+{
+    float3 dir = -v.c.stack.dir;
+    store_probe(v.at, vertex_origin(x, dir), dir, v.p.depth, v.x.feedback);
+    return STEP_PROBE;
+}
+
 // A photon at `slot`'s vertex in place of next-event estimation: its deposit there
-// (`shade_deposit`), or STEP_ENDED.
-public uint launch_deposit<S : ISurfaces>(PathRoot r, uint slot)
+// (`shade_deposit`), or STEP_ENDED; first the probe of a plane stack it crossed (STEP_PROBE),
+// where the raygen has not `probed` it.
+public uint launch_deposit<S : ISurfaces>(PathRoot r, uint slot, bool probed)
 {
     LaunchVertex v = load_vertex(r, slot);
     PackedSurface ps = load_surface_part(v);
+    if (!probed && deposit_probes(r, v))
+        return ask_deposit_probe(v, surface_vertex(r.view, ps, v.c.ray.dir));
     Sampler rng = v.p.rng;
     bool alive = shade_deposit<S, LaunchRecord>(r, v.f, v.p, v.c, v.record, v.x, ps, v.c.ray.dir, v.t, (v.vertex & VERTEX_FIRST) != 0, rng);
     v.p.rng = rng;
@@ -1399,17 +1655,29 @@ public uint launch_light_add<M : IMedium>(PathRoot r, uint slot, uint4 payload, 
     return any(l.v.throughput > 0.0) ? STEP_GIVEN : STEP_DONE;
 }
 
+// What `launch_shadow_take` hands the raygen: the ray passed thin walls that its walk crosses, and
+// the walk is at its start; its light is a coated emitter's, whose view its end takes; it is a
+// directional light's that ended at an opaque surface or solid glass, before which a plane stack's
+// probe looks for a face, its contribution left as it was.
+public static const uint TAKE_WALKS = 1 << 0;
+public static const uint TAKE_VIEW = 1 << 1;
+public static const uint TAKE_BENDS = 1 << 2;
+
 // Takes what `slot`'s shadow ray let through into its contribution: the product of its candidates
 // in `payload`, 0 where it met an opaque surface (`hit`) but past SHADOW_CANDIDATES counted ones.
-// True where it passed thin walls that its walk crosses, and the walk is at its start.
-public bool launch_shadow_take(PathRoot r, uint slot, uint4 payload, bool hit)
+// The TAKE_* of what follows.
+public uint launch_shadow_take(PathRoot r, uint slot, uint4 payload, bool hit)
 {
     ShadowCover c = { asfloat(payload.xyz), payload.w };
+    uint4* at = slot_words(r, slot);
+    ShadowJob q = load_part<ShadowJob, 3>(at + SHADOW_AT);
+    // The AS committed what it met, or an any-hit ended the search at solid glass, which stands
+    // for it.
+    if (hit && (!c.has(SHADOW_ENDED) || c.has(SHADOW_SOLID)) && shadow_bends(r, q.flags))
+        return TAKE_BENDS;
     bool overflow = c.has(SHADOW_OVERFLOW);
     if (overflow)
         InterlockedAdd(*r.set.shadow_overflows, 1u);
-    uint4* at = slot_words(r, slot);
-    ShadowJob q = load_part<ShadowJob, 3>(at + SHADOW_AT);
     q.contribution *= hit && !overflow ? float3(0.0) : c.product;
     store_part<ShadowJob, 3>(at + SHADOW_AT, q);
     bool walks = layers_kept(r) && c.has(SHADOW_CROSSES) && any(q.contribution > 0.0);
@@ -1418,7 +1686,7 @@ public bool launch_shadow_take(PathRoot r, uint slot, uint4 payload, bool hit)
         CrossingKey none = { -positive_infinity(), 0, 0, 0 };
         store_part<CrossingKey, CROSSED_WORDS>(crossed_words(r, slot), none);
     }
-    return walks;
+    return (walks ? TAKE_WALKS : 0) | (has(q.flags, SHADOW_VIEW) ? TAKE_VIEW : 0);
 }
 
 // Whether crossing `a` lies before `b`.
@@ -1485,11 +1753,19 @@ public uint launch_window<S : ISurfaces>(PathRoot r, uint slot)
         return STEP_ENDED;
     store_part<CrossingKey, CROSSED_WORDS>(crossed_words(r, slot), c.key);
     ShadowJob q = load_part<ShadowJob, 3>(at + SHADOW_AT);
-    Interior arrived = Interior();
-    if (interiors_tracked(r))
-        arrived = load_part<LaunchInterior, SLOT_INTERIOR_WORDS>(at + interior_at(r)).interior;
-    float3 start;
-    float exterior = interior_ior(r.scene, shadow_inside(r, at, arrived, q.origin, q.flags, start).innermost());
+    // A plane stack's leg lies inside the interiors its walk holds.
+    Interior inside;
+    if (has(q.flags, SHADOW_LEG))
+        inside = load_part<StackWalk, STACK_WALK_WORDS>(at + stack_at(r) + STACK_WALK_AT).inside;
+    else
+    {
+        Interior arrived = Interior();
+        if (interiors_tracked(r))
+            arrived = load_part<LaunchInterior, SLOT_INTERIOR_WORDS>(at + interior_at(r)).interior;
+        float3 start;
+        inside = shadow_inside(r, at, arrived, q.origin, q.flags, start);
+    }
+    float exterior = interior_ior(r.scene, inside.innermost());
     RayCone cone = { 0.0, 0.0 };
     HitContext context = hit_context(HIT_SECONDARY, (q.flags >> SHADOW_DEPTH_SHIFT) + 1, cone, 0.0, float2(-1.0), has(q.flags, SHADOW_FEEDBACK));
     SurfaceHit sh = resolve_hit<CoverageFeedback<S>>(r.scene, r.view, q.dir, c.key.instance, c.key.cluster, c.key.primitive, c.barycentrics, c.corners, false, context);
@@ -1529,6 +1805,187 @@ public void launch_shadow_add<M : IMedium>(PathRoot r, uint slot)
     store_loop_part(v);
 }
 
+// The emitter view shader's body: what the coat and fuzz of the emitter `slot`'s shadow ray
+// reached pass of its light toward the vertex (`emitter_view`), into its contribution.
+public void launch_emitter_view<S : ISurfaces>(PathRoot r, uint slot)
+{
+    uint4* at = slot_words(r, slot);
+    ShadowJob q = load_part<ShadowJob, 3>(at + SHADOW_AT);
+    if (!any(q.contribution > 0.0))
+        return;
+    LightView l = load_part<LightView, SLOT_LIGHT_PART>(at + light_at(r));
+    ResolvedLightSample c = no_candidate();
+    c.dir = l.dir;
+    c.light = l.light;
+    c.position = l.position;
+    c.triangle = l.triangle;
+    c.point = l.point;
+    c.view = true;
+    q.contribution *= emitter_view_layer<CoverageFeedback<S>>(r.set, c, l.exterior_ior);
+    store_part<ShadowJob, 3>(at + SHADOW_AT, q);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plane stacks
+//
+// A directional light's shadow ray that ends at an opaque surface or solid glass may come through
+// a plane stack, as `path_light` takes it: a probe along the light's direction up to the end looks
+// for a stack face, then legs go face to face along the bent directions. The raygen traces the
+// probe and each leg's stack ray, keeping what each met in the slot's stack hit, and each leg's
+// segment as a shadow ray, through the slot's shadow job, which holds the leg in flight;
+// `launch_stack_step` goes from one to the next. The same probe decides whether a BSDF ray's or a
+// photon's light through a stack is next-event estimation's (`stack_owns`).
+
+// The ray of a plane stack's probe or leg from `slot`'s shadow job's origin along its direction,
+// reaching `t_max`, with the payload its any-hit shaders read: the stack policy over opaque
+// surfaces and dielectrics, as `stack_trace` traces it.
+public RayDesc launch_stack_ray(PathRoot r, uint slot, float t_max, out uint4 payload)
+{
+    ShadowJob q = load_part<ShadowJob, 3>(slot_words(r, slot) + SHADOW_AT);
+    PathCover cover;
+    cover.mask = MASK_OPAQUE | MASK_DIELECTRIC;
+    cover.policy = COVER_STACK;
+    cover.presence = PRESENCE_NONE;
+    cover.seed = 0;
+    RayCone cone = { 0.0, 0.0 };
+    cover.context = hit_context(HIT_SECONDARY, (q.flags >> SHADOW_DEPTH_SHIFT) + 1, cone, 0.0, float2(-1.0), has(q.flags, SHADOW_FEEDBACK));
+    payload = path_payload(cover);
+    RayDesc ray;
+    ray.Origin = q.origin;
+    ray.Direction = q.dir;
+    ray.TMin = 0.0;
+    ray.TMax = t_max;
+    return ray;
+}
+
+// The probe of the plane stack before the opaque surface or solid glass that `slot`'s shadow ray
+// ended at, `committed` m along it: it reaches past it by its rounding, since the ray ends at the
+// first such surface it finds, which need not be the nearest.
+public RayDesc launch_probe_ray(PathRoot r, uint slot, float committed, out uint4 payload)
+{
+    return launch_stack_ray(r, slot, committed * (1.0 + 1e-4) + T_MIN_BASE, payload);
+}
+
+// Keeps what stack ray `ray` of `slot`'s path met, `t` m along it: the instance, cluster,
+// triangle and barycentrics of a hit of class `class_id` where `hit`, a triangle where `triangle`.
+// The leg along it, the slot's shadow ray, ends there, short of it by its rounding.
+public void keep_stack_hit(PathRoot r, uint slot, bool hit, bool triangle, uint class_id, float t, uint instance, int cluster, uint primitive, float2 bary, RayDesc ray)
+{
+    uint4* at = slot_words(r, slot);
+    StackHit h = { t, instance, cluster, primitive, bary, class_id, (hit ? STACK_HIT_MET : 0) | (triangle ? STACK_HIT_TRIANGLE : 0) };
+    store_part<StackHit, STACK_HIT_WORDS>(at + stack_at(r) + STACK_HIT_AT, h);
+    float leg = positive_infinity();
+    if (hit)
+    {
+        float3 p = ray.Origin + ray.Direction * t;
+        float magnitude = max(abs(p.x), max(abs(p.y), abs(p.z)));
+        leg = max(0.0, t - max(1e-4 * t, magnitude * F32_PRECISION));
+    }
+    ShadowJob q = load_part<ShadowJob, 3>(at + SHADOW_AT);
+    q.t_max = leg;
+    store_part<ShadowJob, 3>(at + SHADOW_AT, q);
+}
+
+// `launch_stack_step`'s phases, its data's second word: the probe's hit is in the slot; a leg's
+// stack ray and segment have run.
+public static const uint STACK_PROBE = 0;
+public static const uint STACK_LEG = 1;
+
+// What it hands the raygen: a leg follows, whose ray the shadow job holds; its stack hit is the
+// probe's, which the slot holds already; the light came through, and next-event estimation's
+// second phase takes it (`direct_bent`). None of them: no light came through.
+public static const uint STACK_ON = 1 << 0;
+public static const uint STACK_PROBED = 1 << 1;
+public static const uint STACK_LIT = 1 << 2;
+
+// The stack step shader's body: the walk of `slot`'s shadow ray through a plane stack from its
+// probe's hit, in `phase` STACK_PROBE, or from a leg's, where `path_light` goes from one to the
+// next.
+public uint launch_stack_step<M : IMedium>(PathRoot r, uint slot, uint phase)
+{
+    uint4* at = slot_words(r, slot);
+    uint4* walk_at = at + stack_at(r) + STACK_WALK_AT;
+    ShadowJob q = load_part<ShadowJob, 3>(at + SHADOW_AT);
+    Hit h = stack_hit(load_part<StackHit, STACK_HIT_WORDS>(at + stack_at(r) + STACK_HIT_AT));
+    StackFace face;
+    bool on_face = stack_face(r.scene, h, has(q.flags, SHADOW_DISPERSION), face);
+    if (phase == STACK_PROBE)
+    {
+        if (!on_face)
+            return 0;
+        StackWalk w;
+        Interior arrived = Interior();
+        if (interiors_tracked(r))
+            arrived = load_part<LaunchInterior, SLOT_INTERIOR_WORDS>(at + interior_at(r)).interior;
+        w.inside = shadow_inside(r, at, arrived, q.origin, q.flags, w.from);
+        w.dir = q.dir;
+        w.normal = face.normal;
+        if (dot(face.geometric_normal, w.dir) > 0.0 && !w.inside.holds(face.material))
+            w.inside.nest(face.material, w.inside, face.medium_point);
+        float ior = interior_ior(r.scene, w.inside.innermost());
+        float3 d;
+        if (!stack_direction(w.dir, w.normal, ior, d))
+            return 0;
+        w.bent = d;
+        w.jacobian = abs(dot(w.dir, w.normal)) / abs(dot(d, w.normal));
+        w.density = w.jacobian / (ior * ior);
+        w.crossed = 0;
+        w.depth = float3(0.0);
+        store_part<StackWalk, STACK_WALK_WORDS>(walk_at, w);
+        // The legs carry what they let through, and bend no further.
+        q.contribution = float3(1.0);
+        q.dir = d;
+        q.flags = (q.flags & ~SHADOW_BEND) | SHADOW_LEG;
+        store_part<ShadowJob, 3>(at + SHADOW_AT, q);
+        // The probe's hit is the first leg's along an unbent direction.
+        return STACK_ON | (all(d == w.dir) ? STACK_PROBED : 0);
+    }
+    StackWalk w = load_part<StackWalk, STACK_WALK_WORDS>(walk_at);
+    float leg = q.t_max;
+    float3 t = q.contribution;
+    if (all(t == 0.0))
+        return 0;
+    t *= medium_transmittance<M>(r.scene.medium, q.origin, q.dir, leg);
+    float scale;
+    float3 leg_depth = straight_depth(r.scene, w.inside, leg, false, scale);
+    if (leg > 0.0 && isfinite(leg))
+        leg_depth *= segment_length(w.from, q.origin, q.dir, leg) / leg;
+    w.depth += leg_depth;
+    if (!h.hit)
+    {
+        // The light reaches the vertex where its last leg leaves every interior.
+        if (interior_ior(r.scene, w.inside.innermost()) != AMBIENT_IOR)
+            return 0;
+        q.contribution = t * exp(-w.depth);
+        store_part<ShadowJob, 3>(at + SHADOW_AT, q);
+        store_part<StackWalk, STACK_WALK_WORDS>(walk_at, w);
+        return any(q.contribution > 0.0) ? STACK_LIT : 0;
+    }
+    if (h.class_id != CLASS_DIELECTRIC)
+        return 0;
+    uint m = face.material;
+    uint exterior = w.inside.outside(m, m);
+    if (w.crossed == STACK_CROSSINGS || !on_face || !(abs(dot(face.normal, w.normal)) >= STACK_PARALLEL))
+        return 0;
+    w.crossed++;
+    bool front = dot(face.geometric_normal, q.dir) < 0.0;
+    Interior next = w.inside;
+    next.cross(m, front, face.medium_point);
+    float3 after;
+    if (!stack_direction(w.dir, w.normal, interior_ior(r.scene, next.innermost()), after))
+        return 0;
+    // Fresnel takes the direction on the exterior side.
+    t *= straight_transmission(straight_surface(face.bsdf, face.geometric_normal, front ? q.dir : after), interior_ior(r.scene, exterior));
+    w.inside = next;
+    w.from = face.position;
+    store_part<StackWalk, STACK_WALK_WORDS>(walk_at, w);
+    q.origin = ray_origin(face.position, face.position, face.geometric_normal, after, ORIGIN_DEFAULT, face.error, 0.0);
+    q.dir = after;
+    q.contribution = t;
+    store_part<ShadowJob, 3>(at + SHADOW_AT, q);
+    return STACK_ON;
+}
+
 // The rest of the iteration from `slot`'s vertex: its next ray, STEP_RAY, or STEP_ENDED.
 public uint launch_scatter<S : ISurfaces>(PathRoot r, uint slot)
 {
@@ -1556,7 +2013,7 @@ public uint launch_scatter<S : ISurfaces>(PathRoot r, uint slot)
     if (alive)
     {
         store_ray_part(v);
-        store_interior_part(r, v.at, v.p, v.c);
+        store_tracked_parts(r, v.at, v.p, v.c);
     }
     store_loop_part(v);
     return !alive ? STEP_ENDED : walking ? STEP_WALK : STEP_RAY;
@@ -1568,7 +2025,7 @@ uint leave_scatter(PathRoot r, LaunchVertex v, bool alive, bool spectral)
     if (alive)
     {
         store_ray_part(v);
-        store_interior_part(r, v.at, v.p, v.c);
+        store_tracked_parts(r, v.at, v.p, v.c);
     }
     if (spectral)
         store_spectral_part(r, v.at, v.c.spectral);
@@ -1693,10 +2150,12 @@ uint reach_medium_vertex(PathRoot r, inout LaunchVertex v, float3 point, uint me
 }
 
 // Next-event estimation at `slot`'s scatter in a medium.
-public uint launch_direct_medium<S : ISurfaces, M : IMedium>(PathRoot r, uint slot)
+public uint launch_direct_medium<S : ISurfaces, M : IMedium>(PathRoot r, uint slot, uint phase)
 {
     LaunchVertex v = load_vertex(r, slot);
     MediumVertex m = load_part<MediumVertex, 2>(v.at + SURFACE_AT);
+    if (phase == DIRECT_BENT)
+        return direct_bent(r, v, medium_weighs(r, v.c, m.point, m.medium, m.anisotropy));
     Sampler rng = v.p.rng;
     ShadeNee nee;
     bool alive = shade_medium_direct<S, M, LaunchRecord>(r, v.f, v.p, v.c, v.record, v.x, m.point, m.medium, m.anisotropy, rng, nee);
@@ -2050,8 +2509,49 @@ uint trace_path(PathRoot r, uint slot)
         return step_call(CALL_GBUFFER);
     uint hint = (last ? 4u : 0u) | ((flags & HIT_LOBED) != 0 ? 2u : 0u) | ((flags & HIT_EMITS) != 0 ? 1u : 0u);
     h.reorder(hint, 3);
+    // The miss shader reads in the payload's first word whether the probe it asks for ran.
+    p.words.x = 0;
     h.invoke(p);
+    if ((p.words.x & STEP_PROBE) != 0)
+    {
+        trace_probe(r, slot);
+        p.words.x = STEP_PROBE;
+        h.invoke(p);
+    }
     return p.words.x;
+}
+
+// The hit record whose closest-hit shader is the stack meet's (`orr_scene.runs`' RUN_WALK).
+static const uint STACK_MEET_RECORD = RAY_TYPES * RUN_WALK + RAY_TYPE_SHADOW;
+
+// Traces stack ray `ray` of `slot`'s path with `payload` and keeps what it met in the slot.
+void trace_stack(PathRoot r, uint slot, RayDesc ray, uint4 payload)
+{
+    Payload p;
+    p.words = payload;
+    Traced h = trace_hit(r.scene.tlas, RAY_FLAG_NONE, MASK_OPAQUE | MASK_DIELECTRIC, RAY_TYPE_PATH, RAY_TYPES, 0, ray, p);
+    bool hit = h.hit();
+    uint class_id = hit ? h.record<HitData>().flags & HIT_CLASS_MASK : CLASS_OPAQUE;
+    bool triangle = hit && (h.hit_kind() == HIT_KIND_TRIANGLE_FRONT_FACE || h.hit_kind() == HIT_KIND_TRIANGLE_BACK_FACE);
+    int cluster = -1;
+    if (triangle && class_id == CLASS_DIELECTRIC)
+    {
+        // The face's cluster, which only a hit shader reads, from the stack meet's.
+        h.set_record_index(STACK_MEET_RECORD);
+        Payload m;
+        m.words = uint4(0);
+        h.invoke(m);
+        cluster = int(m.words.x);
+    }
+    keep_stack_hit(r, slot, hit, triangle, class_id, h.t(), hit ? h.instance_index() : 0, cluster, hit ? h.primitive_index() : 0, triangle ? h.barycentrics() : float2(0.0), ray);
+}
+
+// Traces the probe a shader of `slot`'s path asked for (STEP_PROBE).
+void trace_probe(PathRoot r, uint slot)
+{
+    Payload p;
+    RayDesc ray = launch_stack_ray(r, slot, positive_infinity(), p.words);
+    trace_stack(r, slot, ray, p.words);
 }
 
 // Multiplies what the medium proxies with a volume along `ray`, the shadow ray of `slot`'s vertex,
@@ -2077,19 +2577,24 @@ void march_proxies(PathRoot r, RayDesc ray)
     }
 }
 
-// Traces the shadow ray of `slot`'s vertex and adds what it lets through: where nothing blocked
-// it, through the proxies' marches where it passed a medium proxy with a volume, and through the
-// thin walls it passed, walked in order.
-void trace_shadow<M : IMedium>(PathRoot r, uint slot)
+// Traces the shadow ray in `slot`'s shadow job and takes what it lets through into the job's
+// contribution: where nothing blocked it, through the proxies' marches where it passed a medium
+// proxy with a volume, and through the thin walls it passed, walked in order. The TAKE_* of the
+// trace; with TAKE_BENDS, the distance of the surface it ended at in `committed`, and nothing
+// taken.
+uint trace_segment(PathRoot r, uint slot, out float committed)
 {
     Payload p;
     RayDesc ray = launch_shadow_ray(r, slot, p.words);
     Traced h = trace_hit(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, 0, ray, p);
+    committed = h.t();
     ShadowCover c = { asfloat(p.words.xyz), p.words.w };
-    bool walks = launch_shadow_take(r, slot, p.words, h.hit());
+    uint took = launch_shadow_take(r, slot, p.words, h.hit());
+    if ((took & TAKE_BENDS) != 0)
+        return took;
     if (c.has(SHADOW_VOLUME) && any(c.product > 0.0) && (!h.hit() || c.has(SHADOW_OVERFLOW)))
         march_proxies(r, ray);
-    if (walks)
+    if ((took & TAKE_WALKS) != 0)
     {
         for (uint k = 0; k < SHADOW_CANDIDATES; k++)
         {
@@ -2101,7 +2606,41 @@ void trace_shadow<M : IMedium>(PathRoot r, uint slot)
                 break;
         }
     }
-    launch_shadow_add<M>(r, slot);
+    return took;
+}
+
+// Traces the shadow ray of `slot`'s vertex and adds what it lets through, through a coated
+// emitter's view; or, where it is a directional light's that ended at an opaque surface or solid
+// glass, walks the plane stack before that, if any: true where light came through one, which
+// next-event estimation's second phase then adds.
+bool trace_shadow<M : IMedium>(PathRoot r, uint slot)
+{
+    float committed;
+    uint took = trace_segment(r, slot, committed);
+    if ((took & TAKE_BENDS) == 0)
+    {
+        if ((took & TAKE_VIEW) != 0)
+            step_call(CALL_EMITTER_VIEW);
+        launch_shadow_add<M>(r, slot);
+        return false;
+    }
+    Payload p;
+    RayDesc ray = launch_probe_ray(r, slot, committed, p.words);
+    trace_stack(r, slot, ray, p.words);
+    uint step = step_call(CALL_STACK_STEP, STACK_PROBE);
+    // Each leg crosses a face, at most STACK_CROSSINGS of them, before the last.
+    for (uint k = 0; k <= STACK_CROSSINGS && (step & STACK_ON) != 0; k++)
+    {
+        if ((step & STACK_PROBED) == 0)
+        {
+            ray = launch_stack_ray(r, slot, positive_infinity(), p.words);
+            trace_stack(r, slot, ray, p.words);
+        }
+        float unused;
+        trace_segment(r, slot, unused);
+        step = step_call(CALL_STACK_STEP, STACK_LEG);
+    }
+    return (step & STACK_LIT) != 0;
 }
 
 // Traces the shadow ray of `slot`'s photon toward its light: STEP_GIVEN where flux is left.
@@ -2257,11 +2796,17 @@ public void launch_paths<M : IMedium>(PathRoot r, uint start, uint finish, bool 
             uint kind = reached >> STEP_CLASS_SHIFT;
             if (deposits && kind != CLASS_SURFACE && kind != CLASS_LAYER)
                 break;
-            step = step_call(deposits && kind == CLASS_SURFACE ? CALL_DEPOSIT : direct_call(reached));
+            uint vertex_call = deposits && kind == CLASS_SURFACE ? CALL_DEPOSIT : direct_call(reached);
+            step = step_call(vertex_call, DIRECT_FIRST);
+            if ((step & STEP_PROBE) != 0)
+            {
+                trace_probe(r, slot);
+                step = step_call(vertex_call, DIRECT_PROBED);
+            }
             if ((step & STEP_RECORD) != 0)
                 step_call(CALL_CACHE_VERTEX);
-            if ((step & STEP_SHADOW) != 0)
-                trace_shadow<M>(r, slot);
+            if ((step & STEP_SHADOW) != 0 && trace_shadow<M>(r, slot))
+                step_call(vertex_call, DIRECT_BENT);
             if ((step & STEP_ENDED) != 0)
                 break;
             step = step_call(scatter_call(reached));

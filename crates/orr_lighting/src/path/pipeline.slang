@@ -1,9 +1,10 @@
 // The pipeline path tracer's shaders (`path.launch`): a raygen per source, the closest-hit shaders
-// that resolve a path ray's opaque, layer or strand hit, the walk meet's closest-hit and the
-// miss shader, the coverage's any-hit shaders and the medium proxies' under shadow rays, what
-// LAYERS rays keep of particles, light proxies and medium proxies, and the callables that start,
-// shade and finish a path, end its walks, take what lies along its rays and pass a shadow ray
-// through a window. `orr_lighting::launch` makes several stages of one entry by its
+// that resolve a path ray's opaque, layer or strand hit, the walk meet's and the stack meet's
+// closest-hit and the miss shader, the coverage's any-hit shaders and the medium proxies' under
+// shadow rays, what LAYERS rays keep of particles, light proxies and medium proxies, and the
+// callables that start, shade and finish a path, end its walks, take what lies along its rays,
+// pass a shadow ray through a window, walk it through a plane stack and through a coated
+// emitter's view. `orr_lighting::launch` makes several stages of one entry by its
 // specialization constants (`path_may`, `path_may2`, `hit_surface`): a hit shader per kind of
 // geometry and per linked surface id, and next-event estimation and the scatter per BSDF class.
 #include "orr_root.h"
@@ -50,12 +51,12 @@ void path_background()
     launch_paths<Medium>(root, CALL_START_BACKGROUND, CALL_FINISH_BACKGROUND, false);
 }
 
+// Reads in the payload's first word whether the raygen traced the probe it asked for.
 [shader("miss")]
 void miss_path(inout Payload p)
 {
     ORR_OMM(miss_path);
-    launch_miss<Surface, Medium>(root, launch_slot());
-    p.words.x = STEP_ENDED;
+    p.words.x = launch_miss<Surface, Medium>(root, launch_slot(), p.words.x == STEP_PROBE);
 }
 
 [shader("closesthit")]
@@ -72,6 +73,16 @@ void resolve_strand(inout Payload p, TriangleAttributes a)
     ORR_OMM(resolve_strand);
     BuiltInHit h = { a };
     p.words.x = launch_resolve<Surface, BuiltInHit>(root, launch_slot(), h);
+}
+
+// The closest-hit of the stack meet's record, which a plane stack's trace invokes on a dielectric
+// face it met in place of the face's own: the face's cluster.
+[shader("closesthit")]
+void stack_meet(inout Payload p, TriangleAttributes a)
+{
+    ORR_OMM(stack_meet);
+    TriangleHit h = { a };
+    p.words.x = asuint(h.cluster_id());
 }
 
 // The closest-hit of the walk meet's record, which an interior walk's step invokes on the face it
@@ -246,18 +257,19 @@ void emission(inout Payload p)
     launch_emission(root, launch_slot());
 }
 
+// Each direct and the deposit take DIRECT_* in their data's second word.
 [shader("callable")]
 void direct(inout Payload p)
 {
     ORR_OMM(direct);
-    p.words.x = launch_direct<Surface, Medium>(root, launch_slot());
+    p.words.x = launch_direct<Surface, Medium>(root, launch_slot(), p.words.y);
 }
 
 [shader("callable")]
 void deposit(inout Payload p)
 {
     ORR_OMM(deposit);
-    p.words.x = launch_deposit<Surface>(root, launch_slot());
+    p.words.x = launch_deposit<Surface>(root, launch_slot(), p.words.y == DIRECT_PROBED);
 }
 
 [shader("callable")]
@@ -307,7 +319,7 @@ void walk_end(inout Payload p)
 void direct_exit(inout Payload p)
 {
     ORR_OMM(direct_exit);
-    p.words.x = launch_direct_exit<Surface, Medium>(root, launch_slot());
+    p.words.x = launch_direct_exit<Surface, Medium>(root, launch_slot(), p.words.y);
 }
 
 [shader("callable")]
@@ -321,7 +333,7 @@ void scatter_exit(inout Payload p)
 void direct_leave(inout Payload p)
 {
     ORR_OMM(direct_leave);
-    p.words.x = launch_direct_leave<Surface, Medium>(root, launch_slot());
+    p.words.x = launch_direct_leave<Surface, Medium>(root, launch_slot(), p.words.y);
 }
 
 [shader("callable")]
@@ -335,7 +347,7 @@ void scatter_leave(inout Payload p)
 void direct_layer(inout Payload p)
 {
     ORR_OMM(direct_layer);
-    p.words.x = launch_direct_layer<Surface, Medium>(root, launch_slot());
+    p.words.x = launch_direct_layer<Surface, Medium>(root, launch_slot(), p.words.y);
 }
 
 [shader("callable")]
@@ -375,7 +387,7 @@ void march_proxy(inout Payload p)
 void direct_medium(inout Payload p)
 {
     ORR_OMM(direct_medium);
-    p.words.x = launch_direct_medium<Surface, Medium>(root, launch_slot());
+    p.words.x = launch_direct_medium<Surface, Medium>(root, launch_slot(), p.words.y);
 }
 
 [shader("callable")]
@@ -390,4 +402,19 @@ void window(inout Payload p)
 {
     ORR_OMM(window);
     p.words.x = launch_window<Surface>(root, launch_slot());
+}
+
+// Takes the phase in its data's second word, and hands back what follows.
+[shader("callable")]
+void stack_step(inout Payload p)
+{
+    ORR_OMM(stack_step);
+    p.words.x = launch_stack_step<Medium>(root, launch_slot(), p.words.y);
+}
+
+[shader("callable")]
+void emitter_view(inout Payload p)
+{
+    ORR_OMM(emitter_view);
+    launch_emitter_view<Surface>(root, launch_slot());
 }

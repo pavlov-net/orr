@@ -17,7 +17,7 @@ use orr_scene::{
 };
 
 use crate::caustics::PhotonMap;
-use crate::launch::{FEATURE_LAYERS, LaunchMemory, PathPipeline, Raygen};
+use crate::launch::{FEATURE_COATED_EMITTERS, FEATURE_LAYERS, LaunchMemory, PathPipeline, Raygen};
 use crate::media::{
     MediaKernels, MediaSettings, MediaStats, MediaView, fogged, links_medium, readers, shows_media,
 };
@@ -1116,23 +1116,6 @@ fn runs_rays(entry: PathEntry) -> bool {
     }
 }
 
-/// What the scene and settings of a frame ask of the pipeline path tracer that it does not
-/// render yet, which its paths do without: each by name. `path_features` are the view path
-/// root's (`path_features`).
-fn unlaunched(path_features: u32, pass: &ViewPass) -> Vec<&'static str> {
-    let features = pass.scene_features;
-    let asks = [
-        (path_features & FEATURE_STACK != 0, "plane stacks"),
-        (
-            features.contains(SceneFeatures::COATED_EMITTERS),
-            "the coats of emitters a shadow ray reaches",
-        ),
-    ];
-    asks.into_iter()
-        .filter_map(|(asked, what)| asked.then_some(what))
-        .collect()
-}
-
 /// How a frame's caustic photons run: through the staged loop's stages for what they may meet,
 /// or through the pipeline path tracer over the scene's hit records.
 enum PhotonPaths<'a> {
@@ -2146,7 +2129,6 @@ impl LightingKernels {
             _pad1: 0,
         };
         if let Some(launch) = &self.launch {
-            launch.note_unlaunched(unlaunched(features, pass));
             return self.record_launched(list, scene, view, pass, lighting, launch, &path_root);
         }
         // Asked for together, the sources that run in the stages share their pipelines.
@@ -2296,8 +2278,7 @@ impl LightingKernels {
     /// [`Self::record_paths`] through the pipeline path tracer `launch`, from the view paths' root
     /// `path`: the layer guides and the frame's caustic photons, then the view's paths and its
     /// update paths, then its background layer's, each source in one launch per slice of the
-    /// paths the view's memory holds. The paths track no plane stack; what else of the frame they do not render yet
-    /// ([`unlaunched`]) the caller logs once for each mix.
+    /// paths the view's memory holds.
     #[allow(clippy::too_many_arguments)]
     fn record_launched(
         &self,
@@ -2317,9 +2298,12 @@ impl LightingKernels {
         let reference = lighting.reference.is_some();
         let segments = self.support.masked.linked_medium() || path.froxels != GpuPtr::NULL;
         let layers = pass.scene_features.contains(SceneFeatures::LAYERS);
-        let features = path.features & (FEATURE_WALK | FEATURE_INTERIORS | FEATURE_DISPERSION)
+        let coated = pass.scene_features.contains(SceneFeatures::COATED_EMITTERS);
+        let features = path.features
+            & (FEATURE_WALK | FEATURE_INTERIORS | FEATURE_DISPERSION | FEATURE_STACK)
             | if segments { FEATURE_SEGMENTS } else { 0 }
-            | if layers { FEATURE_LAYERS } else { 0 };
+            | if layers { FEATURE_LAYERS } else { 0 }
+            | if coated { FEATURE_COATED_EMITTERS } else { 0 };
         // A path that may meet a layer or lie in an interior takes the dielectric depth's
         // iterations too.
         let depth = if layers || features & FEATURE_INTERIORS != 0 {
@@ -2346,8 +2330,9 @@ impl LightingKernels {
             let blocks = view.extent.map(|e| e.div_ceil(path.update_block));
             blocks[0] * blocks[1]
         };
-        // The update paths keep the view's layers part but split by no wavelength.
-        let update_features = update_root(&root).features | (features & FEATURE_LAYERS);
+        // The update paths keep the view's layers and light parts but split by no wavelength.
+        let update_features =
+            update_root(&root).features | (features & (FEATURE_LAYERS | FEATURE_COATED_EMITTERS));
         if !view
             .launched
             .as_ref()

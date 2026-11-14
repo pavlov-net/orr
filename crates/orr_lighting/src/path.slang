@@ -748,13 +748,22 @@ public float3 nee_bent<F : IScatter>(NeeDraw d, F f, float3 vis, StackLight stac
     scatter_pdf = d.scatter_pdf;
     if (!any(stack.bent != d.toward) || !any(vis > 0.0))
         return d.e;
+    return bent_value(f, d.l, stack, keep, chain, scatter_pdf);
+}
+
+// What a vertex weighed by `f` gives of a directional light of radiance `l` that reaches it
+// through plane stack `stack`, along its bent direction, before a resampling weight; at a
+// `chain` vertex its share outside the diffuse lobes keeps `keep`. `scatter_pdf` is the
+// vertex's density of the way the light takes.
+public float3 bent_value<F : IScatter>(F f, float3 l, StackLight stack, float3 keep, bool chain, out float scatter_pdf)
+{
     float3 db;
     float3 fb = f.eval_and_pdf(stack.bent, scatter_pdf, db);
     scatter_pdf *= stack.density;
     float3 fe = fb;
     if (chain)
         fe = db + max(fb - db, 0.0) * keep;
-    return fe * d.l * stack.jacobian;
+    return fe * l * stack.jacobian;
 }
 
 // Whether a vertex on `s` at path depth `depth` walks its subsurface share, on a path that
@@ -1134,12 +1143,14 @@ public struct PackedLayer
 }
 
 // The layer at resolved hit `sh` of instance `instance`, cluster `cluster`, triangle `primitive`
-// at `bary`, met by a ray along `dir`, packed.
-public PackedLayer pack_layer(PathRoot r, SurfaceHit sh, uint instance, uint cluster, uint primitive, float2 bary, float3 dir)
+// at `bary`, met by a ray along `dir`, packed; on a plane stack face (`LayerVertex.stack`) where
+// `stack` holds.
+public PackedLayer pack_layer(PathRoot r, SurfaceHit sh, uint instance, uint cluster, uint primitive, float2 bary, float3 dir, bool stack)
 {
     GSurface g = sh.surface;
     bool front = dot(g.geometric_normal, dir) < 0.0;
-    uint flags = (sh.swapped ? SURFACE_SWAPPED : 0) | (may(MAY_CAUSTICS) && surface_chains(r, g) ? SURFACE_CHAINS : 0) | (front ? SURFACE_FRONT : 0);
+    uint flags = (sh.swapped ? SURFACE_SWAPPED : 0) | (may(MAY_CAUSTICS) && surface_chains(r, g) ? SURFACE_CHAINS : 0) | (front ? SURFACE_FRONT : 0)
+        | (stack ? SURFACE_STACK : 0);
     PackedLayer pl;
     pl.surface = pack_hit_surface(g, instance, cluster, primitive, bary, sh.geometric_error, sh.depth_offset, flags);
     BsdfParams p = g.bsdf;
@@ -1168,7 +1179,7 @@ public LayerVertex unpack_layer(ViewConstants* v, PackedLayer pl, float3 dir)
     l.section = pl.layer.section;
     l.front = (ps.flags & SURFACE_FRONT) != 0;
     l.anisotropy = 0.0;
-    l.stack = false;
+    l.stack = (ps.flags & SURFACE_STACK) != 0;
     l.chains = (ps.flags & SURFACE_CHAINS) != 0;
     PathVertex x;
     x.surface = g;
