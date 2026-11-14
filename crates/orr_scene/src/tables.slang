@@ -143,10 +143,12 @@ public struct SlotStateGpu
     public uint2 rt_key;            // hash of the transform, model and shown sections it was written with
     public uint rt_age;             // frames its pending PTLAS work has waited
     public uint rt_model;           // the model it holds while RT_WRITTEN
+    public uint rt_run;             // the first run of the hit records it was written with (`copy_run`)
     public uint part_run;           // first part instance of the run it holds
     public uint part_count;         // part instances in the run; 0: none
     public uint far_part;           // 1 + the part instance tracing its far chain step; 0: none
     public uint far_model;          // the model that part instance holds
+    public uint far_run;            // the first run of the hit records that part instance was written with
 }
 
 // A transform group: `count` transforms relative to the group's anchor. A null `current`
@@ -476,6 +478,15 @@ public struct SceneRoot
     public uint proxy_capacity;
     public uint light_base;          // PTLAS index of the proxy of LightId 0
     public uint* emissive_lists;     // per entry of `emissive`: an instance entry's gathered list (`gathered_list`)
+    // The runs of the scene's hit tables (orr_scene.runs): the proxies' fixed runs, then from each
+    // of these a run per entry of `model_materials`, `material_sets`, the producer entries' rows
+    // and `page_material_sets`, up to `run_count`.
+    public uint run_models;
+    public uint run_sets;
+    public uint run_producers;
+    public uint run_pages;
+    public uint run_count;
+    public uint _pad_runs;
 }
 
 // The entry of `SceneRoot.emissive` that producer entry `p` holds; false where the producer

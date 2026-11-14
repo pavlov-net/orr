@@ -33,15 +33,6 @@ __exported import orr_lighting.interiors;
 // The mask shadow rays trace.
 public static const uint SHADOW_MASK = MASK_OPAQUE | MASK_PARTICLE | MASK_MEDIUM | MASK_DIELECTRIC;
 
-// `visibility` modes.
-public static const uint SHADOW_PATH = 0;
-public static const uint SHADOW_PHOTON = 1;
-public static const uint SHADOW_UNBENT = 2;
-
-// Non-opaque candidates a shadow ray multiplies before it ends with the product so far.
-// Alpha-tested candidates do not count.
-public static const uint SHADOW_CANDIDATES = 16;
-
 // Steps a medium proxy's march takes at most over the ray's span inside it; spans longer than
 // this many voxels step farther than a voxel.
 public static const uint PROXY_STEPS = 64;
@@ -325,10 +316,7 @@ public bool proxy_unmarched(SceneRoot* s, Candidate c, float t_max, out float3 t
     if (!proxy_span(c.object_origin, c.object_direction, t_max, t0, t1))
         return true;
     p = scene_proxy(s, c.instance_index);
-    if (p.volume != nullptr)
-        return false;
-    t = exp(-max(p.extinction, 0.0) * (t1 - t0));
-    return true;
+    return proxy_beer(p, t0, t1, t);
 }
 
 // The interiors' optical depth along a ray from `t_max` that crosses no interior surface, inside

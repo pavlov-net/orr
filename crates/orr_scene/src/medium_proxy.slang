@@ -105,6 +105,17 @@ public bool proxy_span(float3 o, float3 d, float t_max, out float t0, out float 
     return t1 > t0;
 }
 
+// What a ray's span from `t0` to `t1` m inside proxy `p` lets through, in `t`, where that needs
+// no march: Beer's law for a proxy without a volume. False for one with a volume.
+public bool proxy_beer(MediumProxyGpu p, float t0, float t1, out float3 t)
+{
+    t = float3(1.0);
+    if (p.volume != nullptr)
+        return false;
+    t = exp(-max(p.extinction, 0.0) * (t1 - t0));
+    return true;
+}
+
 // What a `proxy_march` walks and steps through.
 public interface IProxyStep
 {

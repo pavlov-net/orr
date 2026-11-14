@@ -8,6 +8,7 @@ import orr_shaders.random;
 import orr_shaders.trace;
 import orr_scene.hit;
 import orr_scene.visibility;
+__exported import orr_scene.candidates;
 
 // Interior list entries a path keeps.
 public static const uint INTERIOR_ENTRIES = 4;
@@ -187,12 +188,8 @@ public struct EyeInterior
     }
 }
 
-// Non-opaque candidates of rays that may meet layers: presence layers commit by `presence`,
-// the rest by the alpha test.
-public static const uint PRESENCE_NONE = 0;      // never: rays that look for dielectrics only
-public static const uint PRESENCE_ANY = 1;       // wherever its opacity is above 0
-public static const uint PRESENCE_DRAWN = 2;     // where a hashed draw from `seed` falls below its opacity
-
+// Non-opaque candidates of rays that may meet layers: presence layers commit by `presence`
+// (PRESENCE_*), the rest by the alpha test.
 public struct LayerAccept<S : ISurfaces> : IAnyHit
 {
     public SceneRoot* scene;

@@ -249,6 +249,12 @@ impl<T: Pod> Table<T> {
         })
     }
 
+    /// The table, its entries that a grow adds reading as zero until a record writes them.
+    pub(crate) fn zeroed(mut self) -> Self {
+        self.column.zeroed = true;
+        self
+    }
+
     /// Where entry 0 is written and read from the next upload on.
     pub(crate) fn gpu(&self) -> GpuPtr<T> {
         self.column.gpu()

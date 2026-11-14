@@ -11,7 +11,7 @@ use orr_gpu::{
 
 use crate::Result;
 use crate::shaders::{
-    animation, emissive, instance_page, page_motion, transparency, upload, world,
+    animation, emissive, instance_page, page_motion, sbt, transparency, upload, world,
 };
 
 /// A compute pipeline of [`crate::Scenes::compute_pipeline`].
@@ -203,6 +203,9 @@ pub(crate) struct Own {
     pub(crate) composite: PipelineId,
     pub(crate) expand_page: PipelineId,
     pub(crate) page_motion: PipelineId,
+    /// `sbt.slang`'s writers of a hit table's runs and of its producer rows.
+    pub(crate) hit_runs: PipelineId,
+    pub(crate) hit_producer_runs: PipelineId,
 }
 
 pub(crate) struct Pipelines {
@@ -231,6 +234,8 @@ impl Pipelines {
                 emissive_entries: PipelineId(0),
                 animate: PipelineId(0),
                 composite: PipelineId(0),
+                hit_runs: PipelineId(0),
+                hit_producer_runs: PipelineId(0),
             },
         };
         let none = SpecData::default();
@@ -246,6 +251,8 @@ impl Pipelines {
             emissive_entries: p.create(device, kernels, &emissive::MODULE, "entries", none)?,
             animate: p.create(device, kernels, &animation::MODULE, "animate", none)?,
             composite: p.create(device, kernels, &transparency::MODULE, "composite", none)?,
+            hit_runs: p.create(device, kernels, &sbt::MODULE, "runs", none)?,
+            hit_producer_runs: p.create(device, kernels, &sbt::MODULE, "producer_runs", none)?,
         };
         Ok(p)
     }

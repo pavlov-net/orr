@@ -48,7 +48,7 @@ fn spec(copies: Vec<Item>) -> Spec {
 /// `MATERIAL_NONE`.
 const NONE: u32 = u32::MAX;
 
-/// `shadow.slang`'s `SHADOW_PATH` and `SHADOW_UNBENT`.
+/// orr_scene `candidates.slang`'s `SHADOW_PATH` and `SHADOW_UNBENT`.
 const PATH: u32 = 0;
 const UNBENT: u32 = 2;
 

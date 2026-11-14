@@ -388,6 +388,9 @@ pub(crate) struct Producer {
     pub(crate) model: Option<ModelId>,
     /// Its entry of its scene's emissive list, which the scene gives it.
     pub(crate) emissive: u32,
+    /// Its row of hit table runs, a run per material, from the scene's producer runs: first
+    /// and count.
+    pub(crate) runs: (u32, u32),
     /// The consumer's name for it.
     pub(crate) id: Option<ProducerId>,
     accel: Option<Accel>,
@@ -972,7 +975,7 @@ pub(crate) fn build(
             strands: u32::from(strands),
             drawn: u32::from(desc.drawn),
             emissive: 0,
-            _pad: 0,
+            runs: 0,
         },
         batch: drawn_batch,
         patches,
@@ -1016,6 +1019,7 @@ pub(crate) fn build(
             subd: subd.map(|s| (copy_ptr, s.shape)),
             model: None,
             emissive: 0,
+            runs: (0, desc.materials.len() as u32),
             id: None,
             accel,
             _memory: memory,

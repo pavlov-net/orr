@@ -745,6 +745,13 @@ pub(crate) struct SceneCpu {
     pub(crate) producers: Vec<Option<Producer>>,
     /// Entries of the producer table.
     pub(crate) producer_entries: RangeAllocator,
+    /// The producer entries' rows of hit table runs, `producer_run_room` of them.
+    pub(crate) producer_runs: RangeAllocator,
+    pub(crate) producer_run_room: u32,
+    /// Where this frame's runs start, as `SceneRoot` holds them.
+    pub(crate) runs: crate::hits::RunLayout,
+    /// The hit tables frames asked for.
+    pub(crate) hits: crate::hits::HitTables,
     /// The entry each of the consumer's producers holds, by `ProducerId`.
     pub(crate) producer_ids: FxHashMap<u32, u32>,
     /// Producer entries cleared in a frame as (frame, first, count), freed once that frame has
@@ -1481,6 +1488,7 @@ impl Scene {
         let Some(old) = cpu.producers[i].take() else {
             return;
         };
+        free_producer_runs(cpu, old.runs.0, old.runs.1);
         let t = &self.tables;
         let at = i as u32;
         let state = t.producer_state.entry(at).address().0;
@@ -1651,12 +1659,14 @@ impl Scene {
             slot_state: Column::new(device, MemoryPriority::Normal, "slot state", true)?,
             groups: Column::new(device, MemoryPriority::Normal, "transform groups", true)?,
             material_sets: Column::new(device, MemoryPriority::Normal, "material sets", true)?,
+            // Hit tables read every entry up to the capacity as a material, free ones too.
             page_sets: Table::below(
                 device,
                 MemoryPriority::Normal,
                 "page material sets",
                 PAGE_MATERIAL_SET,
-            )?,
+            )?
+            .zeroed(),
             lights: Column::new(device, MemoryPriority::Normal, "lights", true)?,
             emissive: Column::new(device, MemoryPriority::Normal, "emissive list", true)?,
             emissive_lists: Column::new(
@@ -1703,6 +1713,10 @@ impl Scene {
                 entry_jobs: Vec::new(),
                 producers: Vec::new(),
                 producer_entries: RangeAllocator::new(0),
+                producer_runs: RangeAllocator::new(0),
+                producer_run_room: 0,
+                runs: crate::hits::RunLayout::default(),
+                hits: crate::hits::HitTables::default(),
                 producer_ids: FxHashMap::default(),
                 producers_removed: Vec::new(),
                 retired: Vec::new(),
@@ -3054,7 +3068,7 @@ impl<'f> SceneWriter<'f> {
         let held = cpu.producer_ids.get(&id.0).map(|&index| {
             let held = cpu.producers[index as usize].as_ref();
             let held = held.expect("a named entry holds a producer");
-            (index, held.emissive, held.max_clusters)
+            (index, held.emissive, held.max_clusters, held.runs)
         });
         // The lists kept per producer cluster count the set producers' clusters in 32 bits.
         let clusters = u64::from(cpu.producer_clusters) - held.map_or_default(|h| u64::from(h.2))
@@ -3071,7 +3085,7 @@ impl<'f> SceneWriter<'f> {
         };
         let (index, emissive) = match held {
             // A producer set again keeps its entries.
-            Some((index, emissive, _)) => (index, emissive),
+            Some((index, emissive, ..)) => (index, emissive),
             None => {
                 let room = self.scene.producer_room(cpu, self.device)?;
                 match self.scene.take_entries(cpu, self.device, 1) {
@@ -3088,8 +3102,20 @@ impl<'f> SceneWriter<'f> {
         cpu.producer_ids.insert(id.0, index);
         cpu.producer_clusters = clusters;
         cpu.producer_cluster_room = cluster_room;
+        // A run per material: one set again keeps its row while its materials keep their count.
+        let count = d.materials.len() as u32;
+        let runs = match held.map(|h| h.3) {
+            Some((first, n)) if n == count => first,
+            old => {
+                if let Some((first, n)) = old {
+                    free_producer_runs(cpu, first, n);
+                }
+                take_producer_runs(cpu, count)
+            }
+        };
         record[0] = ProducerGpu {
             emissive,
+            runs,
             ..b.record
         };
         entry[0] = EmissiveGpu {
@@ -3099,6 +3125,7 @@ impl<'f> SceneWriter<'f> {
         };
         let mut producer = b.producer;
         producer.emissive = emissive;
+        producer.runs = (runs, count);
         producer.id = Some(id);
         let state = t.producer_state.entry(index).address().0;
         let blas = std::mem::offset_of!(ProducerStateGpu, blas) as u64;
@@ -3292,5 +3319,29 @@ impl<'f> SceneWriter<'f> {
     /// The eye of the scene's per-frame work and the anchor of its render origin.
     pub fn set_focus(&mut self, focus: DVec3) {
         self.scene.cpu.lock().unwrap().focus = Some(focus);
+    }
+}
+
+/// The first of `count` free producer runs, the runs growing to hold them where none are free. No
+/// runs take none, from 0.
+fn take_producer_runs(cpu: &mut SceneCpu, count: u32) -> u32 {
+    if count == 0 {
+        return 0;
+    }
+    if let Some(first) = cpu.producer_runs.alloc(count) {
+        return first;
+    }
+    let held = cpu.producer_run_room;
+    let room = held.saturating_add(count).max(held.saturating_mul(2));
+    cpu.producer_runs.grow(held, room);
+    cpu.producer_run_room = room;
+    cpu.producer_runs
+        .alloc(count)
+        .expect("the grown runs have a free run of `count`")
+}
+
+fn free_producer_runs(cpu: &mut SceneCpu, first: u32, count: u32) {
+    if count > 0 {
+        cpu.producer_runs.free(first, count);
     }
 }

@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 
 use orr_gpu::{
     Allocation, ClearColor, ColorAttachment, ColorLoad, CommandList, ComputePipeline,
-    DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM, Device, GpuAddress, GpuPtr, Hazards, KernelSet,
-    LatencyMarker, LowLatency, MemoryKind, MeshPipeline, PassResult, QueueKind, Rendering,
-    SamplerDesc, SamplerIndex, ShaderModule, SpecData, Stages, StorageImageIndex, TextureIndex,
-    TimelinePoint,
+    DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM, Device, GpuAddress, GpuPtr, Hazards, HitTable, KernelSet,
+    LatencyMarker, LowLatency, MemoryKind, MeshPipeline, PassResult, QueueKind, RayPipeline,
+    Rendering, SamplerDesc, SamplerIndex, ShaderModule, SpecData, Stages, StorageImageIndex,
+    TextureIndex, TimelinePoint,
 };
 use orr_math::{DVec3, Vec3};
 use orr_pack::AssetId;
@@ -25,6 +25,7 @@ use crate::decals::{self, build_bins};
 use crate::detail::{Detail, Sample};
 use crate::drawn::OpaqueHook;
 use crate::features::SceneFeatures;
+use crate::hits::{HitGroups, RunLayout};
 use crate::lights::LightTables;
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
@@ -2110,6 +2111,13 @@ impl<'a> Frame<'a> {
                 cpu.decal_globals = bins.globals;
                 cpu.decals_changed = false;
             }
+            let runs = RunLayout::new(
+                core.mounts.model_materials.capacity(),
+                t.material_sets.capacity(),
+                cpu.producer_run_room,
+                t.page_sets.capacity(),
+            );
+            cpu.runs = runs;
             let root = SceneRoot {
                 instances: t.instances.gpu(),
                 slot_state: t.slot_state.gpu(),
@@ -2165,6 +2173,12 @@ impl<'a> Frame<'a> {
                     + cpu.ptlas.producer_entries()
                     + cpu.ptlas.proxy_entries(),
                 emissive_lists: t.emissive_lists.gpu().cast(),
+                run_models: runs.models,
+                run_sets: runs.sets,
+                run_producers: runs.producers,
+                run_pages: runs.pages,
+                run_count: runs.count,
+                _pad_runs: 0,
             };
             let src = window.put(device, &root)?;
             records.push(Record::values(core.next_seq(), t.root.gpu(), src, 1));
@@ -2737,6 +2751,47 @@ impl<'a> Frame<'a> {
     /// make room where they govern its kind, as they do for the scenes' own.
     pub fn out_of_memory(&mut self, e: &orr_gpu::Error) {
         self.core.mounts.streaming.device_out_of_memory(e);
+    }
+
+    /// `scene`'s hit table for ray tracing pipeline `pipeline`, its records naming `groups`:
+    /// per run of the scene's material rows (a section of a model's materials, of a material set
+    /// or of a producer entry's materials, and the medium and light proxies' runs) a record per
+    /// ray type, the group's handle and the run's `HitData`. Its instances' contributions select
+    /// the runs of the rows they show, and a hit's geometry index the run of its section. The
+    /// frame's list writes the table whole, after the traces recorded before the call; a trace
+    /// recorded after it reads this frame's rows and materials. Runs `update_scenes` first when
+    /// the consumer did not.
+    pub fn hit_table(
+        &mut self,
+        scene: SceneId,
+        pipeline: &RayPipeline,
+        groups: &HitGroups,
+    ) -> Result<HitTable> {
+        self.ensure_updated()?;
+        let device = self.device;
+        let core = &*self.core;
+        let window = &core.windows[self.window];
+        let s = core.scene(scene)?;
+        let cpu = &mut *s.cpu.lock().unwrap();
+        let own = &self.pipelines.own;
+        let kernels = [
+            self.pipelines.get(own.hit_runs),
+            self.pipelines.get(own.hit_producer_runs),
+        ];
+        let list = self.list.as_mut().expect("frame list");
+        let runs = cpu.runs;
+        cpu.hits.table(
+            device,
+            list,
+            &|root| window.put(device, root),
+            kernels,
+            s.tables.root.gpu(),
+            runs,
+            s.tables.producers.capacity(),
+            pipeline,
+            groups,
+            self.id,
+        )
     }
 
     /// What `scene` may hold now: [`RasterView::features`] before the view is rastered.

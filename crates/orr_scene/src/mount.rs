@@ -2861,7 +2861,9 @@ impl Mounts {
             accel: Arc::clone(accel),
             models: Table::new(device, MemoryPriority::Normal, "models")?,
             meshes: Table::new(device, MemoryPriority::Normal, "meshes")?,
-            model_materials: Table::new(device, MemoryPriority::Normal, "model materials")?,
+            // Hit tables read every entry up to the capacity as a material, free ones too.
+            model_materials: Table::new(device, MemoryPriority::Normal, "model materials")?
+                .zeroed(),
             pages: Vec::new(),
             page_keys: Vec::new(),
             page_generations: Vec::new(),

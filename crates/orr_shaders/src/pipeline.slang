@@ -128,7 +128,7 @@ public extension HitObject
     // The hit's distance; on a miss, the ray's TMax.
     public float t()
     {
-        return this.GetRayTCurrent();
+        return this.GetRayDesc().TMax;
     }
 
     public uint instance_index()
