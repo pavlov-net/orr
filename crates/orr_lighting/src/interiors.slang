@@ -201,16 +201,7 @@ public struct LayerAccept<S : ISurfaces> : IAnyHit
 
     public bool accept(Candidate c)
     {
-        if (c.cluster_id < 0)
-            return false;
-        bool layer = c.class_id == CLASS_PRESENCE;
-        if (layer && presence == PRESENCE_NONE)
-            return false;
-        float coverage = resolve_presence<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context, !layer);
-        if (!layer || presence == PRESENCE_ANY)
-            return coverage > 0.0;
-        uint h = pcg(seed ^ pcg(c.instance_index ^ pcg(uint(c.cluster_id) ^ pcg(c.primitive_index))));
-        return unit_float(h) < coverage;
+        return c.cluster_id >= 0 && cover_decision<S>(scene, view, COVER_LAYERS, presence, seed, context, dir, c.class_id, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics);
     }
 }
 

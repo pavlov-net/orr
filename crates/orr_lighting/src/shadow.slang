@@ -171,35 +171,20 @@ public struct ShadowCandidates<S : ISurfaces, M : IMedium, let MODE : uint> : IC
         }
         if (c.cluster_id < 0)
             return float3(1.0);
-        bool layer = (may(MAY_LAYERS) && c.class_id == CLASS_PRESENCE) || (may(MAY_PARTICLES) && c.class_id == CLASS_PARTICLE);
-        uint section;
-        float present = resolve_presence_section<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context, !layer, section);
-        if (layer)
-        {
-            counted = true;
-            return float3(1.0 - saturate(present));
-        }
-        if (!may(MAY_LAYERS) || c.class_id != CLASS_DIELECTRIC)
-            return present > 0.0 ? float3(0.0) : float3(1.0);
-        if (!(present > 0.0))
-            return float3(1.0);
-        counted = true;
-        return dielectric(c, section);
+        uint flags;
+        float3 t = thin_candidate<S>(scene, view, context, MODE, dir, c.class_id, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, may(MAY_LAYERS), may(MAY_PARTICLES), counted, flags);
+        // Solid glass ends a path's shadow ray whatever its surface is.
+        if ((flags & SHADOW_SOLID) != 0)
+            solid_t = c.t;
+        if ((flags & SHADOW_CROSSES) == 0)
+            return t;
+        return dielectric(c);
     }
 
-    // A dielectric candidate of section material `section` that is present.
+    // A present dielectric candidate that `thin_candidate` passes with SHADOW_CROSSES.
     [mutating]
-    float3 dielectric(Candidate c, uint section)
+    float3 dielectric(Candidate c)
     {
-        if (MODE == SHADOW_PHOTON)
-            return float3(0.0);
-        bool thin = may2(MAY2_THIN_DIELECTRICS) && !crosses_interior(scene, section);
-        // Solid glass ends a path's shadow ray whatever its surface is.
-        if (MODE == SHADOW_PATH && !thin)
-        {
-            solid_t = c.t;
-            return float3(0.0);
-        }
         SurfaceHit sh = resolve_hit<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, c.object_positions, false, context);
         if (!sh.valid)
             return float3(1.0);
@@ -212,6 +197,7 @@ public struct ShadowCandidates<S : ISurfaces, M : IMedium, let MODE : uint> : IC
         }
         if (crossed < SHADOW_CANDIDATES)
         {
+            bool thin = may2(MAY2_THIN_DIELECTRICS) && !crosses_interior(scene, sh.section);
             uint at = crossed;
             for (; at > 0 && crossings[at - 1].t > c.t; at--)
                 crossings[at] = crossings[at - 1];
@@ -642,18 +628,7 @@ struct StackAccept<S : ISurfaces> : IAnyHit
 
     bool accept(Candidate c)
     {
-        if (c.cluster_id < 0)
-            return false;
-        uint entry;
-        if (c.class_id == CLASS_DIELECTRIC && !hit_producer(scene, c.instance_index, entry))
-        {
-            ClusterRef r = scene.clusters[uint(c.cluster_id)];
-            if ((load_cluster(r.page, r.local).flags & CLUSTER_SOLID) == 0)
-                return false;
-        }
-        else if (c.class_id != CLASS_OPAQUE)
-            return false;
-        return resolve_alpha<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context);
+        return c.cluster_id >= 0 && cover_decision<S>(scene, view, COVER_STACK, PRESENCE_NONE, 0, context, dir, c.class_id, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics);
     }
 }
 

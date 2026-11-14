@@ -75,41 +75,49 @@ public uint cover_path<S : ISurfaces>(SceneRoot* s, ViewConstants* v, PathCover 
 {
     if (cluster_id < 0)
         return ANY_HIT_IGNORE;
-    uint cluster = uint(cluster_id);
     uint class_id = class_of(scene_traced(s), custom_index, instance_index, cluster_id);
     if (!class_taken(class_id, c.mask))
         return ANY_HIT_IGNORE;
+    bool accept = cover_decision<S>(s, v, c.policy, c.presence, c.seed, c.context, dir, class_id, instance_index, uint(cluster_id), primitive, bary);
+    return accept ? ANY_HIT_ACCEPT : ANY_HIT_IGNORE;
+}
+
+// Whether a path ray under `policy` (COVER_*) commits the non-opaque triangle candidate of class
+// `class_id` on cluster `cluster` of instance `instance_index` along unit `dir`, the trace's mask
+// having taken its class: `cover_path`'s decision, and the inline handlers' (`Alpha`,
+// `LayerAccept`, `StackAccept`). `presence` and `seed` serve COVER_LAYERS. Inlined, so a handler of
+// one policy keeps only that policy's code.
+[ForceInline]
+public bool cover_decision<S : ISurfaces>(SceneRoot* s, ViewConstants* v, uint policy, uint presence, uint seed, HitContext context, float3 dir, uint class_id, uint instance_index, uint cluster, uint primitive, float2 bary)
+{
     // One resolve of the candidate's presence serves every policy.
     bool alpha = true;
     bool layer = false;
-    if (c.policy == COVER_LAYERS)
+    if (policy == COVER_LAYERS)
     {
         layer = class_id == CLASS_PRESENCE;
-        if (layer && c.presence == PRESENCE_NONE)
-            return ANY_HIT_IGNORE;
+        if (layer && presence == PRESENCE_NONE)
+            return false;
         alpha = !layer;
     }
-    else if (c.policy == COVER_STACK)
+    else if (policy == COVER_STACK)
     {
         uint entry;
         if (class_id == CLASS_DIELECTRIC && !hit_producer(s, instance_index, entry))
         {
             ClusterRef* r = s.clusters + cluster;
             if ((cluster_at(r.page, r.local).flags & CLUSTER_SOLID) == 0)
-                return ANY_HIT_IGNORE;
+                return false;
         }
         else if (class_id != CLASS_OPAQUE)
-            return ANY_HIT_IGNORE;
+            return false;
     }
-    else if (c.policy == COVER_CROSSING && class_id != CLASS_DIELECTRIC)
-        return ANY_HIT_IGNORE;
-    float coverage = resolve_presence<S>(s, v, dir, instance_index, cluster, primitive, bary, c.context, alpha);
-    bool accept;
-    if (!layer || c.presence == PRESENCE_ANY)
-        accept = coverage > 0.0;
-    else
-        accept = unit_float(pcg(c.seed ^ pcg(instance_index ^ pcg(cluster ^ pcg(primitive))))) < coverage;
-    return accept ? ANY_HIT_ACCEPT : ANY_HIT_IGNORE;
+    else if (policy == COVER_CROSSING && class_id != CLASS_DIELECTRIC)
+        return false;
+    float coverage = resolve_presence<S>(s, v, dir, instance_index, cluster, primitive, bary, context, alpha);
+    if (!layer || presence == PRESENCE_ANY)
+        return coverage > 0.0;
+    return unit_float(pcg(seed ^ pcg(instance_index ^ pcg(cluster ^ pcg(primitive))))) < coverage;
 }
 
 // `visibility` modes of shadow rays, and the thin tracer's probe for a dielectric in front of a

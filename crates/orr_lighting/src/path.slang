@@ -354,37 +354,44 @@ public bool sides_agree(float3 n, float3 ng, float3 wi)
     return dot(wi, n) * dot(wi, ng) > 0.0;
 }
 
+// The vertex of surface `g` reached along `dir`, its normals as `g` has them: `origin_error` is
+// what its ray origin offset must cover, and its visible triangle's plane lies `depth_offset` m
+// back along `dir`.
+PathVertex vertex_on(ViewConstants* v, GSurface g, float origin_error, float depth_offset, float3 dir)
+{
+    PathVertex x;
+    x.surface = g;
+    x.view = -dir;
+    x.origin_error = origin_error;
+    x.plane_point = g.position - dir * depth_offset;
+    x.camera_distance = length(g.position - v.eye_render.xyz);
+    return x;
+}
+
+// `vertex_on` with the shading normal leaned toward the ray's origin where a normal map tilts it
+// away, and with `hit` the geometric normal facing the ray.
+PathVertex facing_vertex(ViewConstants* v, GSurface g, float origin_error, float depth_offset, float3 dir, bool hit)
+{
+    PathVertex x = vertex_on(v, g, origin_error, depth_offset, dir);
+    x.surface.normal = lean_normal(x.surface.normal, x.view);
+    if (hit && dot(x.surface.geometric_normal, x.view) < 0.0)
+        x.surface.geometric_normal = -x.surface.geometric_normal;
+    return x;
+}
+
 // The vertex of a resolved hit of a ray along `dir`, whose frame the hit turned toward the ray
 // on a back face: the shading normal leaned toward the ray's origin where a normal map tilts it
 // away, and the geometric normal facing it.
 public PathVertex hit_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
 {
-    PathVertex x;
-    x.surface = sh.surface;
-    x.view = -dir;
-    x.surface.normal = lean_normal(x.surface.normal, x.view);
-    if (dot(x.surface.geometric_normal, x.view) < 0.0)
-        x.surface.geometric_normal = -x.surface.geometric_normal;
-    x.origin_error = sh.geometric_error;
-    x.plane_point = sh.surface.position - dir * sh.depth_offset;
-    x.camera_distance = length(sh.surface.position - v.eye_render.xyz);
-    return x;
+    return facing_vertex(v, sh.surface, sh.geometric_error, sh.depth_offset, dir, true);
 }
 
 // The vertex of packed surface `ps`, reached along `dir`: a hit's as `hit_vertex` makes it, and
 // the G-buffer's as `gbuffer_vertex` does, `dir` from the eye.
 public PathVertex surface_vertex(ViewConstants* v, PackedSurface ps, float3 dir)
 {
-    PathVertex x;
-    x.surface = unpack_surface(ps);
-    x.view = -dir;
-    x.surface.normal = lean_normal(x.surface.normal, x.view);
-    if ((ps.flags & SURFACE_HIT) != 0 && dot(x.surface.geometric_normal, x.view) < 0.0)
-        x.surface.geometric_normal = -x.surface.geometric_normal;
-    x.origin_error = ps.origin_error;
-    x.plane_point = ps.position - dir * ps.depth_offset;
-    x.camera_distance = length(ps.position - v.eye_render.xyz);
-    return x;
+    return facing_vertex(v, unpack_surface(ps), ps.origin_error, ps.depth_offset, dir, (ps.flags & SURFACE_HIT) != 0);
 }
 
 // The opaque surface at hit `h` through `S`, packed, with `context` the hit's: the closest-hit
@@ -497,7 +504,7 @@ public struct Alpha<S : ISurfaces> : IAnyHit
 
     public bool accept(Candidate c)
     {
-        return c.cluster_id >= 0 && resolve_alpha<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context);
+        return c.cluster_id >= 0 && cover_decision<S>(scene, view, COVER_ALPHA, PRESENCE_NONE, 0, context, dir, c.class_id, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics);
     }
 }
 
@@ -890,15 +897,11 @@ public void walk_part<T : IWalkTrace>(PathRoot r, inout Walk walk, T tracer, ino
 // face out.
 public PathVertex exit_vertex(ViewConstants* v, PackedSurface ps, float3 dir)
 {
-    PathVertex x;
-    x.surface = unpack_surface(ps);
+    PathVertex x = vertex_on(v, unpack_surface(ps), ps.origin_error, ps.depth_offset, dir);
     float3 ng = dot(x.surface.geometric_normal, dir) < 0.0 ? -x.surface.geometric_normal : x.surface.geometric_normal;
     x.surface.geometric_normal = ng;
     x.surface.normal = dot(x.surface.normal, ng) < 0.0 ? -x.surface.normal : x.surface.normal;
     x.view = x.surface.normal;
-    x.origin_error = ps.origin_error;
-    x.plane_point = ps.position - dir * ps.depth_offset;
-    x.camera_distance = length(ps.position - v.eye_render.xyz);
     return x;
 }
 
@@ -1100,27 +1103,28 @@ public struct LayerVertex
     public bool stack;              // a layer on a plane stack face (`stack_face`)
 }
 
-// The vertex of a layer hit by a ray along `dir`: the shading normal leaned toward the ray's
-// origin on the side the ray arrived from, both normals kept on the material's front side so
-// the BSDF sees which side the path is on.
-public LayerVertex layer_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
+// The layer vertex of surface `g` of section material `section`, as `vertex_on` places it, reached
+// from its front side where `front` holds: the shading normal leaned toward the ray's origin on
+// that side, both normals kept on the material's front side so the BSDF sees which side the path
+// is on.
+LayerVertex layer_on(ViewConstants* v, GSurface g, float origin_error, float depth_offset, float3 dir, uint section, bool front)
 {
     LayerVertex l;
     l.kind = VERTEX_LAYER;
-    l.section = sh.section;
-    l.front = dot(sh.surface.geometric_normal, dir) < 0.0;
+    l.section = section;
+    l.front = front;
     l.anisotropy = 0.0;
     l.stack = false;
-    PathVertex x;
-    x.surface = sh.surface;
-    x.view = -dir;
-    float side = l.front ? 1.0 : -1.0;
-    x.surface.normal = side * lean_normal(side * sh.surface.normal, x.view);
-    x.origin_error = sh.geometric_error;
-    x.plane_point = sh.surface.position - dir * sh.depth_offset;
-    x.camera_distance = length(sh.surface.position - v.eye_render.xyz);
-    l.x = x;
+    l.x = vertex_on(v, g, origin_error, depth_offset, dir);
+    float side = front ? 1.0 : -1.0;
+    l.x.surface.normal = side * lean_normal(side * g.normal, l.x.view);
     return l;
+}
+
+// The vertex of a layer hit by a ray along `dir`, as `layer_on` makes it.
+public LayerVertex layer_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
+{
+    return layer_on(v, sh.surface, sh.geometric_error, sh.depth_offset, dir, sh.section, dot(sh.surface.geometric_normal, dir) < 0.0);
 }
 
 // What a layer's surface keeps beside the G-buffer's words, which hold no transmission and the
@@ -1174,22 +1178,9 @@ public LayerVertex unpack_layer(ViewConstants* v, PackedLayer pl, float3 dir)
     g.bsdf.transmission_color = float3(rg, bw.x);
     g.bsdf.transmission_weight = bw.y;
     g.medium_point = pl.layer.medium_point;
-    LayerVertex l;
-    l.kind = VERTEX_LAYER;
-    l.section = pl.layer.section;
-    l.front = (ps.flags & SURFACE_FRONT) != 0;
-    l.anisotropy = 0.0;
+    LayerVertex l = layer_on(v, g, ps.origin_error, ps.depth_offset, dir, pl.layer.section, (ps.flags & SURFACE_FRONT) != 0);
     l.stack = (ps.flags & SURFACE_STACK) != 0;
     l.chains = (ps.flags & SURFACE_CHAINS) != 0;
-    PathVertex x;
-    x.surface = g;
-    x.view = -dir;
-    float side = l.front ? 1.0 : -1.0;
-    x.surface.normal = side * lean_normal(side * g.normal, x.view);
-    x.origin_error = ps.origin_error;
-    x.plane_point = ps.position - dir * ps.depth_offset;
-    x.camera_distance = length(ps.position - v.eye_render.xyz);
-    l.x = x;
     return l;
 }
 
