@@ -19,6 +19,7 @@ module rays;
 
 import orr_shaders.abi;
 import orr_shaders.math;
+import orr_shaders.packing;
 import orr_shaders.trace;
 import orr_scene.hit;
 import orr_scene.visibility;
@@ -55,7 +56,7 @@ public static const uint RAY_SHADOW = 0;
 public static const uint NO_JOB = 0xffffffff;
 
 // One ray to trace, 48 bytes. The cone is the hit context's at the origin, which every candidate
-// of the ray takes, at half precision; its tap is hardware filtering.
+// of the ray takes, in the top halves of its f32s (`pack_top16`); its tap is hardware filtering.
 public struct RayJob
 {
     public float3 origin;
@@ -129,7 +130,7 @@ public RayJob shadow_job(float3 origin, float3 direction, float t_max, uint ray_
     j.flags = (ray_flags & JOB_RAY_FLAGS) | (RAY_SHADOW << JOB_KIND_SHIFT) | (mode << JOB_MODE_SHIFT)
         | (environment ? JOB_ENVIRONMENT : 0) | (bend ? JOB_BEND : 0)
         | (context.kind == HIT_PRIMARY ? JOB_PRIMARY : 0) | (context.feedback ? JOB_FEEDBACK : 0);
-    j.cone = f32tof16(context.cone_width) | (f32tof16(context.cone_spread) << 16);
+    j.cone = pack_top16(context.cone_width) | (pack_top16(context.cone_spread) << 16);
     j.extra = 0;
     j.depth = context.depth;
     j.user = user;
@@ -159,7 +160,7 @@ public bool job_bends(RayJob j)
 
 public HitContext job_context(RayJob j)
 {
-    RayCone cone = { f16tof32(j.cone & 0xffff), f16tof32(j.cone >> 16) };
+    RayCone cone = { unpack_top16(j.cone & 0xffff), unpack_top16(j.cone >> 16) };
     return hit_context((j.flags & JOB_PRIMARY) != 0 ? HIT_PRIMARY : HIT_SECONDARY, j.depth, cone, 0.0, float2(-1.0), (j.flags & JOB_FEEDBACK) != 0);
 }
 

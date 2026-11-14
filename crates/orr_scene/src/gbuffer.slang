@@ -353,7 +353,7 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
         if ((p.flags & BSDF_COAT_FRAME) != 0)
             w.y.z = oct_code(p.coat_normal) | (angle_code(p.coat_tangent_angle) << 24);
         // The top half of a float, which holds any thickness a film can state.
-        uint thickness = (asuint(p.thin_film_thickness) + 0x8000) >> 16;
+        uint thickness = pack_top16(p.thin_film_thickness);
         w.y.w = pack_unorm8(p.thin_film_weight) | (ior_code(p.thin_film_ior) << 8) | (thickness << 16);
     }
     return w;
@@ -447,7 +447,7 @@ public GSurface decode_gsurface(GBufferWords w)
         }
         p.thin_film_weight = unpack_unorm8(w.y.w);
         p.thin_film_ior = ior_from_code(w.y.w >> 8);
-        p.thin_film_thickness = asfloat((w.y.w >> 16) << 16);
+        p.thin_film_thickness = unpack_top16(w.y.w >> 16);
         if (p.thin_film_weight > 0.0)
             p.flags |= BSDF_THIN_FILM;
     }

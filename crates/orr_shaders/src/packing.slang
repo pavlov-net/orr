@@ -151,6 +151,19 @@ public float4 unpack_snorm4x8(uint p)
     return max(float4(q) / 127.0, -1.0);
 }
 
+// The top half of an f32, rounded to nearest with ties away from 0: the f32's sign and exponent
+// range and 8 significant bits, encoded and decoded by bit operations alone, so no device's
+// denormal mode changes it. A magnitude within half a step of the largest f32 becomes infinity.
+public uint pack_top16(float v)
+{
+    return (asuint(v) + 0x8000) >> 16;
+}
+
+public float unpack_top16(uint p)
+{
+    return asfloat(p << 16);
+}
+
 // IEEE half, rounded to nearest even; values beyond the half range become infinity.
 public uint pack_half2x16(float2 v)
 {
