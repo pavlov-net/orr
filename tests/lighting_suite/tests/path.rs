@@ -7,13 +7,13 @@ use lighting_suite::bed::{
     Accumulated, Analytic, BLACK_SPHERE, BUMPY_FLOOR, Bed, COATED_EMITTER, EMITTER, EMITTER_FIELD,
     EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal, GLASS_SPHERE, GLOSSY_FLOOR, Item, MIRROR, NEAR,
     Particle, ParticleLook, Paths, QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR, SUN, Spec,
-    StrandRow, TILED_FLOOR, TINTED_FLOOR, TROUGH, WHITE_FLOOR, assert_close, image_mean, luminance,
-    mean_where, pixel_of, reference, surface_mean,
+    StrandRow, TILED_FLOOR, TINTED_FLOOR, TROUGH, WHITE_FLOOR, assert_close, assert_within_noise,
+    image_mean, luminance, mean_where, pixel_of, reference, surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
 use lighting_suite::{
-    assert_clean, device, pipeline, read, readback, render, run, texture, upload,
+    assert_clean, device, pipeline, read, readback, render, require, run, texture, upload,
 };
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::types::LocalLights;
@@ -78,6 +78,46 @@ fn an_albedo_one_sphere_in_a_uniform_environment_returns_the_environment() {
         expected,
         1e-3,
     );
+    assert_clean();
+}
+
+/// The pipeline path tracer renders opaque scenes as the staged loop does: a sphere on the ground
+/// under a sun and a sky, the Cornell box lit by its emissive quad, and an alpha-tested quad.
+/// Real-time frames redraw the light tiles, so runs differ by their noise: the pipeline's frames
+/// at the staged loop's seed sit as close to the staged loop's as its frames at another seed do,
+/// and the two means agree over frames that alternate, which see the world cache alike. The
+/// world cache settles over the staged loop's frames first.
+#[test]
+fn the_pipeline_renders_opaque_scenes_as_the_staged_loop_does() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    let settings = ViewLighting::default();
+    let staged = Paths::new(&KernelSet::default(), PathEntry::Compute, settings);
+    let launched = Paths::new(&KernelSet::default(), PathEntry::Pipeline, settings);
+    // At a pre-exposure of 1 the sunlit ground passes the HDR ceiling, which would clip the
+    // samples that draw the sun.
+    for (scene, pre_exposure) in [
+        (Analytic::SunAndGround, 1.0 / 64.0),
+        (Analytic::CornellBox, 1.0),
+        (Analytic::AlphaQuad, 1.0 / 64.0),
+    ] {
+        let what = format!("{scene:?}");
+        let mut bed = Bed::new(scene);
+        bed.set_hit_pipeline(launched.hit_pipeline());
+        bed.set_pre_exposure(pre_exposure);
+        render_paths(&mut bed, &staged, 32, 3);
+        let piped = render_paths(&mut bed, &launched, 32, 1);
+        let same_seed = render_paths(&mut bed, &staged, 32, 1);
+        let noise = render_paths(&mut bed, &staged, 32, 2);
+        assert_within_noise(&what, &piped, &same_seed, &noise, 1.25);
+        let (mut of_staged, mut of_launched) = (Vec::new(), Vec::new());
+        for k in 0..24 {
+            of_staged.push(image_mean(&render_paths(&mut bed, &staged, 1, 4 + k))[1]);
+            of_launched.push(image_mean(&render_paths(&mut bed, &launched, 1, 4 + k))[1]);
+        }
+        assert_same_mean(&what, &of_launched, &of_staged);
+    }
     assert_clean();
 }
 

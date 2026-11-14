@@ -1680,6 +1680,7 @@ impl BedFrame<'_> {
             overlay_front: false,
             scene_features: self.view.features,
             particle_lighting: self.particles,
+            hits: self.hits,
         }
     }
 
@@ -1908,6 +1909,8 @@ pub struct Bed {
     light_writes: Vec<(LightId, Option<Light>)>,
     proxy_writes: Vec<(MediumProxyId, Option<MediumProxy>)>,
     scene_compute: Option<SceneComputeHook>,
+    /// The pipeline whose hit table every frame's kernel takes in [`BedFrame::hits`].
+    hit_pipeline: Option<(&'static RayPipeline, &'static HitGroups)>,
     /// Frames add the background layer instead of the radiance.
     background_layer: bool,
     kernels: &'static KernelSet,
@@ -2157,6 +2160,7 @@ impl Bed {
             light_writes: Vec::new(),
             proxy_writes: Vec::new(),
             scene_compute: None,
+            hit_pipeline: None,
             background_layer: false,
             kernels,
             particle_group,
@@ -2600,6 +2604,16 @@ impl Bed {
             .unwrap_or_else(|e| panic!("volume {name}: {e}"))
     }
 
+    /// Gives every frame from the next on the scene's hit table for `pipeline`'s groups in
+    /// [`BedFrame::hits`], as the paths of [`Paths::hit_pipeline`] trace through; `None` gives
+    /// none.
+    pub fn set_hit_pipeline(
+        &mut self,
+        pipeline: Option<(&'static RayPipeline, &'static HitGroups)>,
+    ) {
+        self.hit_pipeline = pipeline;
+    }
+
     /// Runs `hook` at the scene compute point of every frame from the next on.
     pub fn set_scene_compute(&mut self, hook: SceneComputeHook) {
         self.scene_compute = Some(hook);
@@ -2717,7 +2731,9 @@ impl Bed {
             .unwrap();
         }
         let view = f.raster_view(&desc).unwrap();
-        let hits = hits.map(|(p, g)| f.hit_table(self.scene, p, g).unwrap());
+        let hits = hits
+            .or(self.hit_pipeline)
+            .map(|(p, g)| f.hit_table(self.scene, p, g).unwrap());
         let id = f.id();
         self.last_id = id;
         self.last_root = view.scene;
@@ -3029,6 +3045,13 @@ impl Paths {
             overlay_front: false,
             every_tile: false,
         }
+    }
+
+    /// The ray tracing pipeline the paths trace through and the groups its hit table names, with
+    /// [`PathEntry::Pipeline`]: a bed whose frames run them gives each its hit table
+    /// ([`Bed::set_hit_pipeline`]).
+    pub fn hit_pipeline(&self) -> Option<(&'static RayPipeline, &'static HitGroups)> {
+        self.kernels.hit_pipeline()
     }
 
     /// Starts the view's frame, then records the froxel passes, the view's paths, media apply,

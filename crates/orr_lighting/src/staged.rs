@@ -35,8 +35,8 @@ const INTERIOR_PARTS: u64 = 8;
 const STACK_PART: u64 = 5;
 const SPECTRAL_PART: u64 = 5;
 const SHADOW_INTERIOR_WORDS: u64 = 2;
-const RECORD_WORDS: u64 = 2;
-const UPDATE_RECORD_WORDS: u64 = 9;
+pub(crate) const RECORD_WORDS: u64 = 2;
+pub(crate) const UPDATE_RECORD_WORDS: u64 = 9;
 /// Lanes per workgroup of its stages.
 const STAGE_GROUP: u32 = 32;
 /// Path slots of a source's own at most: one with more paths runs them in slices, which bounds

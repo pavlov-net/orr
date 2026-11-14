@@ -6,9 +6,6 @@ import orr_shaders.trace;
 import orr_scene.hit;
 import orr_scene.candidates;
 
-// RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, which both `trace` and `pipeline` name.
-public static const uint MICROMAP_2_STATE = 0x400;
-
 // One ray: a path ray under `policy` or a shadow ray in `mode`.
 public struct RayIn
 {
@@ -88,7 +85,7 @@ public uint path_mask(RayIn r)
 
 public uint path_flags(RayIn r)
 {
-    return r.flags & MICROMAP_2_STATE;
+    return r.flags & RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE;
 }
 
 public uint shadow_mask(RayIn r)

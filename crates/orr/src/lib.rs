@@ -1473,6 +1473,10 @@ impl<'a> Frame<'a> {
         let raster = self
             .scenes
             .raster_view_with(&desc, &requests, hooks.opaque.as_deref_mut())?;
+        let hits = match kernels.hit_pipeline() {
+            Some((pipeline, groups)) => Some(self.scenes.hit_table(view.scene, pipeline, groups)?),
+            None => None,
+        };
         let gpu = self.output.device.clone();
         if let Some(at) = take_probe(&mut self.probes, view.history) {
             let probe = ProbeAt {
@@ -1535,6 +1539,7 @@ impl<'a> Frame<'a> {
             overlay_front: blurs && view.lens.shutter > 0.0,
             scene_features: raster.features,
             particle_lighting: hooks.transparency.is_some(),
+            hits,
         };
         paths.begin(scene, &desc, lighting);
         state.scene_resets = Some(scene_resets);

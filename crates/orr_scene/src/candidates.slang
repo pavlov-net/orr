@@ -127,11 +127,20 @@ public static const uint SHADOW_VOLUME = 1 << 19;    // it passed a medium proxy
 
 // What a shadow ray's any-hit shaders read and write, 16 bytes of payload: the product of what
 // its candidates let through, and a word of its mode (bits 0-1), its instance mask (bits 2-9),
-// the candidates it counted (bits 10-14) and SHADOW_* flags.
+// the candidates it counted (bits 10-14), SHADOW_* flags (bits 15-19) and the hit context its
+// candidates take (`context`): whether they report texture feedback (bit 20) and the path depth
+// (from bit 21).
 public struct ShadowCover
 {
     public float3 product;
     public uint word;
+
+    // A shadow ray's: secondary, of no cone.
+    public HitContext context()
+    {
+        RayCone cone = { 0.0, 0.0 };
+        return hit_context(HIT_SECONDARY, word >> 21, cone, 0.0, float2(-1.0), ((word >> 20) & 1) != 0);
+    }
 
     public uint mode()
     {
@@ -183,6 +192,15 @@ public struct ShadowCover
 public ShadowCover shadow_cover(uint mode, uint mask)
 {
     ShadowCover c = { float3(1.0), (mode & 3) | ((mask & 0xff) << 2) };
+    return c;
+}
+
+// As above, its candidates taking the context of a ray at path depth `depth` that reports
+// texture feedback where `feedback` holds.
+public ShadowCover shadow_cover(uint mode, uint mask, uint depth, bool feedback)
+{
+    ShadowCover c = shadow_cover(mode, mask);
+    c.word |= (feedback ? 1u << 20 : 0u) | (min(depth, 0x7ffu) << 21);
     return c;
 }
 

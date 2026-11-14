@@ -18,6 +18,7 @@
 module pipeline;
 
 import orr_shaders.abi;
+import orr_shaders.trace;
 __exported import orr_shaders.hits;
 
 // What crosses a trace, invoke or call in registers. A launch pays registers in every thread
@@ -29,10 +30,6 @@ public struct Payload
 
 // The attributes of a triangle hit; an intersection shader reports its own type.
 public typealias TriangleAttributes = BuiltInTriangleIntersectionAttributes;
-
-// Ray flags beside Slang's `RAY_FLAG_*`: opacity micromaps forced to two states. Pipelines
-// see micromaps only when created for them; builds without micromaps drop the flag.
-public static const uint RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE = 0x400;
 
 // Loads `*p` as another shader of the path stored it, made visible at device scope.
 [ForceInline]
@@ -54,6 +51,8 @@ public void store_coherent<T>(T* p, T v)
     };
 }
 
+// `flags` with `orr_shaders.trace`'s RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, which pipelines see
+// only when created for micromaps, and builds without micromaps drop.
 [ForceInline]
 uint ray_flags(uint flags)
 {

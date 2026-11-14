@@ -56,6 +56,7 @@
 mod bsdf;
 mod caustics;
 mod environment;
+mod launch;
 mod media;
 pub mod openpbr;
 mod particles;
