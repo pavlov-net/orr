@@ -13,8 +13,8 @@ use lighting_suite::bed::{
     MILKY_SLAB, MIXED_SLAB, NEAR, OverlayFrontLayer, PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, PRISM,
     PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Particle, ParticleLook, Paths, ROUGH_SLAB,
     SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB, TWO_SIDED_SLAB, WATER_BOX,
-    WHITE_SPHERE, assert_close, fresnel, image_mean, pixel_of, prism_corners, reference,
-    surface_mean, water_transmission,
+    WHITE_SPHERE, assert_close, fresnel, image_mean, moved_entry, pixel_of, prism_corners,
+    reference, surface_mean, water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
@@ -1086,6 +1086,8 @@ fn layer_tiles_trace_what_every_tile_traces() {
     ) {
         entries.push(PathEntry::RayDispatch);
     }
+    // Under `ORR_TEST_PIPELINE_PATHS` both run the pipeline.
+    entries.dedup_by_key(|e| moved_entry(*e));
     for entry in entries {
         let paths = |every_tile| {
             let lighting = ViewLighting {
@@ -1191,8 +1193,8 @@ fn raygen_and_compute_entries_trace_the_same_light() {
     let mut bed = Bed::new(Analytic::SunAndGround);
     bed.set_pre_exposure(1.0 / 64.0);
     let settings = ViewLighting::default();
-    let compute = Paths::new(&KernelSet::default(), PathEntry::Compute, settings);
-    let rays = Paths::new(&KernelSet::default(), PathEntry::RayDispatch, settings);
+    let compute = Paths::exactly(&KernelSet::default(), PathEntry::Compute, settings);
+    let rays = Paths::exactly(&KernelSet::default(), PathEntry::RayDispatch, settings);
     // Every frame redraws the light tiles, so runs differ by their noise; the raygen run must
     // sit as close to a compute run as another compute run does.
     let a = render_paths(&mut bed, &compute, 32);

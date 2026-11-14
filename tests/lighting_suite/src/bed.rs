@@ -2964,8 +2964,8 @@ pub fn render_paths(bed: &mut Bed, paths: &Paths, frames: u32, seed: u32) -> Acc
 /// The staged loop and the pipeline path tracer of `kernels`, both with `settings`.
 pub fn both(kernels: &KernelSet, settings: ViewLighting) -> (Paths, Paths) {
     (
-        Paths::new(kernels, PathEntry::Compute, settings),
-        Paths::new(kernels, PathEntry::Pipeline, settings),
+        Paths::exactly(kernels, PathEntry::Compute, settings),
+        Paths::exactly(kernels, PathEntry::Pipeline, settings),
     )
 }
 
@@ -3020,10 +3020,17 @@ pub struct Paths {
     pub every_tile: bool,
 }
 
-/// Whether paths that ask for the compute or fastest entry run through the ray tracing pipeline
-/// instead: set from `ORR_TEST_PIPELINE_PATHS`, to run every bed's paths on it.
-fn pipeline_paths() -> bool {
-    std::env::var_os("ORR_TEST_PIPELINE_PATHS").is_some()
+/// The entry [`Paths::new`] runs for `entry`: with `ORR_TEST_PIPELINE_PATHS` set, the staged loop's
+/// entries move to the ray tracing pipeline, so every bed's paths run on it.
+pub fn moved_entry(entry: PathEntry) -> PathEntry {
+    match entry {
+        PathEntry::Fastest | PathEntry::Compute | PathEntry::RayDispatch
+            if std::env::var_os("ORR_TEST_PIPELINE_PATHS").is_some() =>
+        {
+            PathEntry::Pipeline
+        }
+        e => e,
+    }
 }
 
 /// The hit pipelines of the paths `ORR_TEST_PIPELINE_PATHS` moved onto the pipeline: every bed
@@ -3036,14 +3043,24 @@ fn compile_threads() -> usize {
 }
 
 impl Paths {
-    /// The kernels of a set and entry compile once per process, on threads of their own, and
-    /// stay: under the validation layer each compile takes minutes.
+    /// The paths of [`moved_entry`]`(entry)`. Every bed frame takes a hit table for paths that
+    /// moved to the pipeline.
     pub fn new(kernels: &KernelSet, entry: PathEntry, settings: ViewLighting) -> Self {
-        let moved = pipeline_paths();
-        let entry = match entry {
-            PathEntry::Compute | PathEntry::Fastest if moved => PathEntry::Pipeline,
-            e => e,
-        };
+        let moved = moved_entry(entry);
+        let paths = Self::exactly(kernels, moved, settings);
+        if let Some(h) = paths.hit_pipeline().filter(|_| moved != entry) {
+            let mut all = MOVED.lock().unwrap_or_else(PoisonError::into_inner);
+            if !all.iter().any(|(p, _)| ptr::eq(*p, h.0)) {
+                all.push(h);
+            }
+        }
+        paths
+    }
+
+    /// The paths of `entry` whatever `ORR_TEST_PIPELINE_PATHS` says, for tests that compare
+    /// entries. The kernels of a set and entry compile once per process, on threads of their
+    /// own, and stay: under the validation layer each compile takes minutes.
+    pub fn exactly(kernels: &KernelSet, entry: PathEntry, settings: ViewLighting) -> Self {
         type Key = (Vec<usize>, PathEntry);
         type Compiled = (LightingKernels, Arc<orr_scene::Loading>);
         static COMPILED: Mutex<Vec<(Key, &'static OnceLock<Compiled>)>> = Mutex::new(Vec::new());
@@ -3087,12 +3104,6 @@ impl Paths {
             });
             (kernels, loading)
         });
-        if let Some(h) = kernels.hit_pipeline().filter(|_| moved) {
-            let mut all = MOVED.lock().unwrap_or_else(PoisonError::into_inner);
-            if !all.iter().any(|(p, _)| ptr::eq(*p, h.0)) {
-                all.push(h);
-            }
-        }
         Self {
             kernels,
             loading,
