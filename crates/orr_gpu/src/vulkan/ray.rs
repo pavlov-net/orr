@@ -94,41 +94,87 @@ pub struct RayDispatchPipeline(pub(super) Box<RayPipeline>);
 struct Joined {
     shared: Arc<Shared>,
     op: vk::DeferredOperationKHR,
-    done: Mutex<bool>,
-    completed: Condvar,
+    state: Mutex<JoinState>,
+    /// Signaled when the operation completes or a thread leaves it.
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct JoinState {
+    /// A join returned success: the operation is complete.
+    done: bool,
+    /// Threads inside a join, which may yet complete it.
+    joined: u32,
+    /// The first error a join returned.
+    error: Option<vk::Result>,
+}
+
+/// How a thread's join of a deferred operation ended.
+enum Join {
+    /// The operation completed in it.
+    Complete,
+    /// The driver had no more work for the thread.
+    NoWork,
+    Failed(vk::Result),
 }
 
 impl Joined {
-    /// Joins the operation until it has no more work for this thread. Returns whether it
-    /// completed here.
-    fn join(&self) -> bool {
+    /// Joins the operation until it has no more work for this thread. While the driver has no
+    /// work for the thread yet, it waits for the operation to complete elsewhere and joins again.
+    fn join(&self) -> Join {
         let f = &self.shared.deferred_fn;
-        loop {
+        self.state.lock().unwrap().joined += 1;
+        let out = loop {
             // SAFETY: the operation is live while `self` is.
             match unsafe { f.deferred_operation_join(self.op) } {
-                Ok(()) => {
-                    *self.done.lock().unwrap() = true;
-                    self.completed.notify_all();
-                    return true;
+                Ok(()) => break Join::Complete,
+                Err(vk::Result::THREAD_IDLE_KHR) => {
+                    let state = self.state.lock().unwrap();
+                    let (state, _) = self
+                        .changed
+                        .wait_timeout_while(state, Duration::from_millis(1), |s| !s.done)
+                        .unwrap();
+                    if state.done {
+                        break Join::NoWork;
+                    }
                 }
-                Err(vk::Result::THREAD_IDLE_KHR) => std::thread::yield_now(),
-                Err(_) => return false,
+                Err(vk::Result::THREAD_DONE_KHR) => break Join::NoWork,
+                Err(e) => break Join::Failed(e),
             }
+        };
+        let mut state = self.state.lock().unwrap();
+        state.joined -= 1;
+        match out {
+            Join::Complete => state.done = true,
+            Join::Failed(e) => {
+                state.error.get_or_insert(e);
+            }
+            Join::NoWork => {}
         }
+        drop(state);
+        self.changed.notify_all();
+        out
     }
 
     /// The operation's result once it is complete. Joins until then: a thread that runs out of
-    /// work waits for the others, and joins again in case none is left.
+    /// work waits while others are joined, and joins again once none is, unless a join failed,
+    /// whose error it returns.
     fn finish(&self) -> vk::Result {
         let f = &self.shared.deferred_fn;
-        while !self.join() {
-            let done = self.done.lock().unwrap();
-            let (done, _) = self
-                .completed
-                .wait_timeout_while(done, Duration::from_millis(1), |d| !*d)
-                .unwrap();
-            if *done {
+        loop {
+            if matches!(self.join(), Join::Complete) {
                 break;
+            }
+            let state = self.state.lock().unwrap();
+            let state = self
+                .changed
+                .wait_while(state, |s| !s.done && s.joined > 0)
+                .unwrap();
+            if state.done {
+                break;
+            }
+            if let Some(e) = state.error {
+                return e;
             }
         }
         // SAFETY: the operation is live and complete.
@@ -173,8 +219,8 @@ fn create_deferred(
     let joined = Arc::new(Joined {
         shared: Arc::clone(shared),
         op,
-        done: Mutex::new(false),
-        completed: Condvar::new(),
+        state: Mutex::new(JoinState::default()),
+        changed: Condvar::new(),
     });
     match create(op) {
         vk::Result::OPERATION_DEFERRED_KHR => {}
