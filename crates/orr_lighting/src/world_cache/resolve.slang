@@ -122,7 +122,7 @@ void resolve(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
                     resolved = float3(0.0);
                     history = 0.0;
                 }
-                uint state = life | (uint(history) << 8) | (f32tof16(delta) << 16);
+                uint state = life | (uint(history) << 8) | (pack_half(delta) << 16);
                 c.resolved[i] = uint2(pack_rgb9e5(resolved * CACHE_STORE_SCALE), state);
                 occupied = true;
             }

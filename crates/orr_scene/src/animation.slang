@@ -134,7 +134,7 @@ void animate(uint3 id: SV_DispatchThreadID)
 
     if (placed && inst.pose_group != 0 && mesh.animated_parts > 0 && chain_near(*st) == 0)
     {
-        float range = float(inst.animation_range) * (was ? ANIMATION_HYSTERESIS : 1.0);
+        float range = instance_animation_range(inst) * (was ? ANIMATION_HYSTERESIS : 1.0);
         now = !focus || distance <= range;
     }
     st.rt_flags = (flags & ~(RT_ANIMATED | RT_WAS_ANIMATED)) | (now ? RT_ANIMATED : 0) | (was ? RT_WAS_ANIMATED : 0);

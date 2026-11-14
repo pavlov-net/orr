@@ -68,7 +68,7 @@ float volume_texel(VolumeGridGpu g, uint8_t* brick, int3 t)
     uint i = uint(t.x + int(VOLUME_BRICK_TEXELS) * (t.y + int(VOLUME_BRICK_TEXELS) * t.z));
     float texel = g.vk_format == VOLUME_R8_UNORM
         ? unpack_unorm8(uint(brick[i]))
-        : f16tof32(uint(((uint16_t*)brick)[i]));
+        : unpack_half(uint(((uint16_t*)brick)[i]));
     return texel * g.scale + g.offset;
 }
 

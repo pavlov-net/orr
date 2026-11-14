@@ -232,7 +232,7 @@ public struct PathRoot
 public uint64_t overlay_front_word(float depth, float2 motion, float weight)
 {
     uint high = (asuint(depth) & 0xffffff00u) | pack_unorm8(weight);
-    return (uint64_t(high) << 32) | uint64_t(f32tof16(motion.x) | (f32tof16(motion.y) << 16));
+    return (uint64_t(high) << 32) | uint64_t(pack_half2x16(motion));
 }
 
 public float overlay_front_depth(uint64_t word)
@@ -247,8 +247,7 @@ public float overlay_front_weight(uint64_t word)
 
 public float2 overlay_front_motion(uint64_t word)
 {
-    uint low = uint(word);
-    return float2(f16tof32(low & 0xffff), f16tof32(low >> 16));
+    return unpack_half2x16(uint(word));
 }
 
 // What the layer guide dispatch leaves the guide resolve of a pixel's first dielectric or

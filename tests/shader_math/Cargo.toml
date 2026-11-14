@@ -1,6 +1,6 @@
 [package]
 name = "shader_math"
-description = "orr's Slang math libraries compiled for the CPU and checked against references."
+description = "orr's Slang math libraries compiled for the CPU, and its half helpers on the GPU, checked against references."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,10 @@ orr_math.workspace = true
 
 [dev-dependencies]
 bytemuck.workspace = true
+env_logger.workspace = true
+half.workspace = true
 orr_color.workspace = true
+orr_gpu.workspace = true
 orr_pack.workspace = true
 
 [build-dependencies]

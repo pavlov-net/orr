@@ -298,7 +298,7 @@ public FroxelMaterial froxel_material(MediumPoint m)
 {
     FroxelMaterial f;
     f.sigma = float4(m.sigma_s, luminance_rec2020(m.sigma_t)) * FROXEL_SIGMA_SCALE;
-    f.words = uint4(pack_rgb9e5(m.emission), f32tof16(m.phase_parameter),
+    f.words = uint4(pack_rgb9e5(m.emission), pack_half(m.phase_parameter),
                     pack_shares(m.phase_share), pack_shares(m.phase_share_second));
     return f;
 }
@@ -313,7 +313,7 @@ public MediumPoint froxel_point(FroxelMaterial f, bool chromatic)
     float sigma_t = f.sigma.a / FROXEL_SIGMA_SCALE;
     m.sigma_t = chromatic ? m.sigma_s + max(0.0, sigma_t - luminance_rec2020(m.sigma_s)) : float3(sigma_t);
     m.emission = unpack_rgb9e5(f.words.x);
-    m.phase_parameter = f16tof32(f.words.y);
+    m.phase_parameter = unpack_half(f.words.y);
     m.phase_share = unpack_shares(f.words.z);
     m.phase_share_second = unpack_shares(f.words.w);
     return m;

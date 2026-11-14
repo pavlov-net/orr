@@ -860,8 +860,9 @@ impl PixelProbe {
                 }
             );
         }
+        let rt_range = half::f16::from_bits(inst.rt_range).to_f32();
         let in_range = c.rt_distance
-            <= f32::from(inst.rt_range)
+            <= rt_range
                 * if st.rt_flags & RT_IN_RANGE != 0 {
                     1.15
                 } else {
@@ -872,8 +873,7 @@ impl PixelProbe {
         } else if !in_range {
             format!(
                 "out of its rt range ({:.1} m from the focus, range {:.1} m)",
-                c.rt_distance,
-                f32::from(inst.rt_range)
+                c.rt_distance, rt_range
             )
         } else if c.rt_cut == RT_CUT_BUILT {
             let parts = if c.flags & CUT_PARTS != 0 {

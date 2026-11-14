@@ -4,7 +4,8 @@
 
 pub mod stats;
 
-/// `gpu/math.slang` compiled to SPIR-V; building it checks its generated layouts.
+/// `gpu/` compiled to SPIR-V: building `math` checks its generated layouts, and the GPU test
+/// runs `halves`.
 pub mod gpu {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
 }

@@ -164,15 +164,63 @@ public float unpack_top16(uint p)
     return asfloat(p << 16);
 }
 
-// IEEE half, rounded to nearest even; values beyond the half range become infinity.
+// IEEE half bits, rounded to nearest even with subnormal halves exact, as the host's
+// `half::f16::from_f32` writes them: magnitudes from 65520 up become infinity, and NaN a quiet
+// NaN with the f32's top payload bits. Integer operations alone, so no device's denormal mode
+// changes it.
+public uint pack_half(float v)
+{
+    uint x = asuint(v);
+    uint sign = (x >> 16) & 0x8000;
+    uint a = x & 0x7FFFFFFF;
+    // 2^16 and up: infinity, or NaN.
+    if (a >= 0x47800000)
+        return sign | 0x7C00 | (a > 0x7F800000 ? 0x200 | ((a >> 13) & 0x3FF) : 0);
+    // 2^-14 and up: rebiased by 112, which a carry out of the significand takes to the next
+    // exponent and from 65520 to infinity.
+    if (a >= 0x38800000)
+    {
+        uint b = a - 0x38000000;
+        return sign | ((b + 0xFFF + ((b >> 13) & 1)) >> 13);
+    }
+    // Under 2^-25, and 2^-25 itself, rounds to 0.
+    uint e = a >> 23;
+    if (e < 102)
+        return sign;
+    // In steps of 2^-24, the smallest subnormal half; a carry makes the smallest normal one.
+    uint shift = 126 - e;
+    uint m = (a & 0x7FFFFF) | 0x800000;
+    return sign | ((m + (1u << (shift - 1)) - 1 + ((m >> shift) & 1)) >> shift);
+}
+
+// The f32 of the half bits in the low 16 bits of `p`, exact: every half is a normal f32, 0 or
+// infinity, and NaN a quiet NaN with the half's payload, as the host's `half::f16::to_f32` reads
+// it. Integer operations alone, so no device's denormal mode changes it.
+public float unpack_half(uint p)
+{
+    uint sign = (p & 0x8000) << 16;
+    uint e = (p >> 10) & 0x1F;
+    uint m = p & 0x3FF;
+    if (e == 0x1F)
+        return asfloat(sign | 0x7F800000 | (m != 0 ? 0x400000 | (m << 13) : 0));
+    if (e != 0)
+        return asfloat(sign | ((e + 112) << 23) | (m << 13));
+    if (m == 0)
+        return asfloat(sign);
+    // A subnormal half, m x 2^-24: its top set bit becomes the f32's implicit one.
+    uint top = firstbithigh(m);
+    return asfloat(sign | ((top + 103) << 23) | ((m << (23 - top)) & 0x7FFFFF));
+}
+
+// Two halves (`pack_half`), x in the low 16 bits.
 public uint pack_half2x16(float2 v)
 {
-    return f32tof16(v.x) | (f32tof16(v.y) << 16);
+    return pack_half(v.x) | (pack_half(v.y) << 16);
 }
 
 public float2 unpack_half2x16(uint p)
 {
-    return float2(f16tof32(p & 0xFFFF), f16tof32(p >> 16));
+    return float2(unpack_half(p), unpack_half(p >> 16));
 }
 
 // Shared exponent packed float color (VK_FORMAT_E5B9G9R9_UFLOAT_PACK32). Unsigned: negative

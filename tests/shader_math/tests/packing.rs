@@ -279,13 +279,6 @@ fn scalar_words_decode_and_round_trip_within_their_step() {
         let canonical = if c == 0x80 { 0x81 } else { c };
         assert_eq!(pack_snorm8(unpack_snorm8(c)), canonical);
     }
-    for c in 0..=0xFFFFu32 {
-        let exp = c >> 10 & 0x1F;
-        if exp != 0x1F {
-            let p = c | c << 16;
-            assert_eq!(pack_half2x16(unpack_half2x16(p)), p, "half {c:#06x}");
-        }
-    }
     let mut rng = Rng::new(4);
     for _ in 0..100_000 {
         let s = [rng.range(-1.0, 1.0), rng.range(-1.0, 1.0)];
@@ -298,22 +291,7 @@ fn scalar_words_decode_and_round_trip_within_their_step() {
         for i in 0..4 {
             assert!((du4[i] - u4[i]).abs() <= 0.5 / 255.0 + 1e-7);
         }
-        // Normal halves: relative error at most half an ulp, 2^-11.
-        let h = [rng.range(6.2e-5, 65000.0), -rng.range(6.2e-5, 1.0)];
-        let dh = unpack_half2x16(pack_half2x16(h));
-        for i in 0..2 {
-            assert!(
-                (dh[i] - h[i]).abs() <= h[i].abs() * 2f32.powi(-11),
-                "{} -> {}",
-                h[i],
-                dh[i]
-            );
-        }
     }
-    assert_eq!(
-        unpack_half2x16(pack_half2x16([70000.0, -1e6])),
-        [f32::INFINITY, f32::NEG_INFINITY]
-    );
 }
 
 #[test]

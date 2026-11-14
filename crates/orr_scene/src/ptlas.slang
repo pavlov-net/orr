@@ -444,7 +444,7 @@ void want(uint3 id: SV_DispatchThreadID)
         float3 center = place(pl, 0.5 * (model.bounds_min + model.bounds_max));
         float radius = 0.5 * length(model.bounds_max - model.bounds_min) * pl.scale;
         float distance = has_focus ? max(length(center) - radius, 0.0) : 0.0;
-        float range = float(inst.rt_range) * ((st.rt_flags & RT_IN_RANGE) != 0 ? RT_HYSTERESIS : 1.0);
+        float range = instance_rt_range(inst) * ((st.rt_flags & RT_IN_RANGE) != 0 ? RT_HYSTERESIS : 1.0);
         in_range = !has_focus || distance <= range;
         op.cut = s.cut.slots[slot].rt_cut;
         cut_blas(s, slot, mesh, model, inst, op.cut, op.rest, body);

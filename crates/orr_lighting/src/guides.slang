@@ -11,6 +11,7 @@ module guides;
 
 import orr_shaders.abi;
 import orr_shaders.math;
+import orr_shaders.packing;
 import orr_color.luminance;
 import orr_shaders.trace;
 import orr_lighting.media;
@@ -99,8 +100,8 @@ static const uint FROST_TAPS = 24;
 public void frost_body(FrostRoot r, uint2 pixel)
 {
     LayerGuide own = layer_guide(r.layers, uint2(r.width, r.height), pixel);
-    float radius = f16tof32(own.frost & 0xffff);
-    float weight = f16tof32(own.frost >> 16);
+    float radius = unpack_half(own.frost);
+    float weight = unpack_half(own.frost >> 16);
     if (radius < 0.5 || weight <= 0.0)
         return;
     // A Vogel disc, the same on every pixel and frame, so the term holds still.

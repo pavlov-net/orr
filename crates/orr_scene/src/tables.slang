@@ -3,6 +3,7 @@ module tables;
 
 import orr_shaders.abi;
 import orr_shaders.math;
+import orr_shaders.packing;
 import orr_shaders.trace;
 import orr_pack.instance;
 __exported import orr_scene.cut;
@@ -71,8 +72,8 @@ public struct InstanceGpu
     public uint pose_group;    // 0: no animated parts
     public uint pose_index;
     public uint first_part;    // the copy's part run, or NO_PART_RUN
-    public half rt_range;      // m from the scene focus
-    public half animation_range;
+    public uint16_t rt_range;  // f16 bits, m from the scene focus (`instance_rt_range`)
+    public uint16_t animation_range; // f16 bits, m (`instance_animation_range`)
     public uint8_t flags;      // INSTANCE_*
     public uint8_t _pad;
     public uint16_t pose_variants;
@@ -83,6 +84,16 @@ public struct InstanceGpu
     public uint first_emissive; // in SceneRoot.emissive, or NO_EMISSIVE
     // Entries from it: one per emissive section rank of its model, then one per caster rank.
     public uint emissive_count;
+}
+
+public float instance_rt_range(InstanceGpu inst)
+{
+    return unpack_half(inst.rt_range);
+}
+
+public float instance_animation_range(InstanceGpu inst)
+{
+    return unpack_half(inst.animation_range);
 }
 
 // `InstanceGpu.debug_lod` holding the copy at one DAG level, in its low byte.

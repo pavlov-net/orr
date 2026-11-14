@@ -165,7 +165,7 @@ void select(uint3 id: SV_DispatchThreadID)
     st.clusters = n;
     st.first = at;
 
-    float range = float(inst.rt_range) * ((s.slot_state[k.slot].rt_flags & RT_IN_RANGE) != 0 ? SKIN_HYSTERESIS : 1.0);
+    float range = instance_rt_range(inst) * ((s.slot_state[k.slot].rt_flags & RT_IN_RANGE) != 0 ? SKIN_HYSTERESIS : 1.0);
     bool traced = f.traced != 0 && (inst.flags & INSTANCE_RAY) != 0 && (!focus || distance <= range);
     if (!traced)
     {

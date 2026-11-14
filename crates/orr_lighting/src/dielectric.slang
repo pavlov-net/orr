@@ -7,6 +7,7 @@ module dielectric;
 
 import orr_shaders.abi;
 import orr_shaders.math;
+import orr_shaders.packing;
 import orr_color.luminance;
 import orr_shaders.trace;
 import orr_scene.hit;
@@ -151,7 +152,7 @@ public LayerGuide layer_guides<S : ISurfaces>(PathRoot r, LayerVertex l, Bsdf b,
         float radius = isfinite(traveled)
             ? sqrt(max(traveled * traveled * blur.x - 2.0 * traveled * blur.y + blur.z, 0.0)) / (cone.spread * (length(camera) + traveled))
             : sqrt(blur.x) / cone.spread;
-        g.frost = f32tof16(min(radius, FROST_MAX_RADIUS)) | (f32tof16(guide_luminance(c.through)) << 16);
+        g.frost = pack_half(min(radius, FROST_MAX_RADIUS)) | (pack_half(guide_luminance(c.through)) << 16);
     }
     return g;
 }

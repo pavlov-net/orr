@@ -5,6 +5,7 @@
 // thresholds the frame's traversal ran with.
 #include "orr_root.h"
 import orr_shaders.abi;
+import orr_shaders.packing;
 import orr_pack.mesh;
 import orr_scene.producer;
 import orr_scene.gbuffer;
@@ -261,7 +262,7 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
     // The thresholds as the traversal's `slot_lod` takes them.
     uint d = mesh.edit != nullptr ? 0 : inst.debug_lod;
     o.debug_level = (d & DEBUG_LOD_LEVEL) != 0 ? int(d & 0xff) : -1;
-    o.debug_scale = (d & DEBUG_LOD_LEVEL) == 0 && d != 0 ? 1.0 / f16tof32(d) : 1.0;
+    o.debug_scale = (d & DEBUG_LOD_LEVEL) == 0 && d != 0 ? 1.0 / unpack_half(d) : 1.0;
     SlotStateGpu st = o.state;
     o.seen = st.last_visible_frame + 1 >= s.frame_index && st.last_visible_frame != 0 ? 1 : 0;
     o.raster_threshold = root.raster_pixels;

@@ -128,7 +128,7 @@ void resolve(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
         }
         else
         {
-            uint state = life | (uint(history) << 8) | (f32tof16(delta) << 16);
+            uint state = life | (uint(history) << 8) | (pack_half(delta) << 16);
             g.resolved[i] = uint2(pack_rgb9e5(irradiance * CAUSTIC_STORE_SCALE), state);
             g.photons[i] = photons;
             occupied = true;

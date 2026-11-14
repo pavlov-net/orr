@@ -249,7 +249,7 @@ public uint cache_history(uint2 r)
 
 public float cache_delta(uint2 r)
 {
-    return f16tof32(r.y >> 16);
+    return unpack_half(r.y >> 16);
 }
 
 public float3 cache_radiance(uint2 r)

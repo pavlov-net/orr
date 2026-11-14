@@ -4,6 +4,7 @@
 // `AtmosphereMedium` as lighting's segments and froxels read it.
 #include "orr_root.h"
 import orr_shaders.math;
+import orr_shaders.packing;
 import orr_color.luminance;
 import orr_scene.lights;
 import orr_lighting.media;
@@ -279,7 +280,7 @@ void froxel_packing(uint3 id: SV_DispatchThreadID)
     float3 up = a.up.xyz;
     float3 top = atmosphere_top_render(a);
     FroxelMaterial f = froxel_material(AtmosphereMedium.sample(data, top + up * h));
-    f.sigma = f16tof32(f32tof16(f.sigma));
+    f.sigma = float4(unpack_half2x16(pack_half2x16(f.sigma.xy)), unpack_half2x16(pack_half2x16(f.sigma.zw)));
     MediumPoint p = froxel_point(f, false);
     root.output[2 * id.x] = float4(exact, 0.0);
     root.output[2 * id.x + 1] = float4(p.sigma_s * AtmosphereMedium.phase(data, p, c), 0.0);

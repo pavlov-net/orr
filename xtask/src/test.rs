@@ -83,6 +83,7 @@ const GPU_TARGETS: &[&str] = &[
     "shader_abi.crash",
     "shader_abi.kernels",
     "shader_link.gpu",
+    "shader_math.gpu",
 ];
 
 fn needs_gpu(name: &str) -> bool {

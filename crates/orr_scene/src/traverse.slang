@@ -38,6 +38,7 @@
 import orr_shaders.abi;
 import orr_shaders.atomic;
 import orr_shaders.math;
+import orr_shaders.packing;
 import orr_shaders.trace;
 import orr_pack.mesh;
 import orr_gpu.rtas;
@@ -216,7 +217,7 @@ Lod slot_lod(SceneRoot* s, InstanceGpu inst, uint slot)
     if ((d & DEBUG_LOD_LEVEL) != 0)
         l.level = int(d & 0xff);
     else if (d != 0)
-        debug = 1.0 / f16tof32(d);
+        debug = 1.0 / unpack_half(d);
     // A copy no view drew traces at the hidden threshold throughout; the raster takes no such
     // term, as what it draws would decide what it draws.
     bool seen = s.slot_state[slot].last_visible_frame + 1 >= s.frame_index && s.slot_state[slot].last_visible_frame != 0;
@@ -537,7 +538,7 @@ void init(uint3 id: SV_DispatchThreadID)
     float3 center = place(p, sphere.xyz);
     float radius = sphere.w * p.scale;
     float distance = has_focus() ? max(length(center) - radius, 0.0) : 0.0;
-    float range = float(inst.rt_range) * ((st.rt_flags & RT_IN_RANGE) != 0 ? RT_HYSTERESIS : 1.0);
+    float range = instance_rt_range(inst) * ((st.rt_flags & RT_IN_RANGE) != 0 ? RT_HYSTERESIS : 1.0);
     bool ray = (inst.flags & INSTANCE_RAY) != 0 && mesh.rt_cut_count > 0 && (!has_focus() || distance <= range);
     c.rt_distance = distance;
     c.rt_scale = p.scale * l.scale;
