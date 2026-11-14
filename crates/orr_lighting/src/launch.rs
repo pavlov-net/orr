@@ -235,28 +235,32 @@ impl PathPipeline {
                 ShaderStage::new(m, entry, data)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let caps = device.caps();
-        let mut flags = RayPipelineFlags::CLUSTERS;
-        if caps.omm {
-            flags |= RayPipelineFlags::OPACITY_MICROMAPS;
-        }
-        if caps.lss {
-            flags |= RayPipelineFlags::SWEPT_SPHERES;
-        }
+        let flags = RayPipelineFlags::scene(device.caps());
         let callables: Vec<ShaderRecord<'_>> = (first_callable..stages.len() as u32)
             .map(ShaderRecord::new)
             .collect();
         // Each pinned kind's groups one after another by pin, then the medium proxies'.
         let pinned = |pin: u32, k: usize| FIXED.len() as u32 + pin * PINNED.len() as u32 + k as u32;
+        // Each group's index is its place in the list, which `groups` names.
+        let mut groups = groups;
         let mut hit_groups = Vec::new();
-        for (resolve, any_hit) in [
-            (Some(RESOLVE_COPIES), Some(COVER_PATH)),
-            (Some(RESOLVE_PRODUCERS), Some(COVER_PATH)),
-            (Some(RESOLVE_STRANDS), None),
-            (None, Some(COVER_SHADOW)),
-            (Some(LAYER_COPIES), Some(COVER_PATH)),
-            (Some(LAYER_PRODUCERS), Some(COVER_PATH)),
+        for (first, resolve, any_hit) in [
+            (&mut groups.path, Some(RESOLVE_COPIES), Some(COVER_PATH)),
+            (
+                &mut groups.producer_path,
+                Some(RESOLVE_PRODUCERS),
+                Some(COVER_PATH),
+            ),
+            (&mut groups.strand_path, Some(RESOLVE_STRANDS), None),
+            (&mut groups.shadow, None, Some(COVER_SHADOW)),
+            (&mut groups.layer_path, Some(LAYER_COPIES), Some(COVER_PATH)),
+            (
+                &mut groups.producer_layer_path,
+                Some(LAYER_PRODUCERS),
+                Some(COVER_PATH),
+            ),
         ] {
+            *first = Some(hit_groups.len() as u32);
             for pin in 0..pins {
                 hit_groups.push(HitGroup {
                     closest_hit: resolve.map(|k| pinned(pin, k)),
@@ -265,30 +269,36 @@ impl PathPipeline {
                 });
             }
         }
-        hit_groups.push(HitGroup {
-            closest_hit: None,
-            any_hit: Some(MEDIUM_ANY_HIT),
-            intersection: Some(MEDIUM_INTERSECTION),
-        });
-        hit_groups.push(HitGroup {
-            closest_hit: Some(WALK_MEET),
-            ..HitGroup::default()
-        });
-        for (any_hit, intersection) in [
-            (LAYERS_ANY_HIT, None),
-            (MEDIUM_LAYERS_ANY_HIT, Some(MEDIUM_INTERSECTION)),
-            (LIGHT_LAYERS_ANY_HIT, Some(LIGHT_INTERSECTION)),
+        for (group, closest_hit, any_hit, intersection) in [
+            (
+                &mut groups.medium_shadow,
+                None,
+                Some(MEDIUM_ANY_HIT),
+                Some(MEDIUM_INTERSECTION),
+            ),
+            (&mut groups.walk_meet, Some(WALK_MEET), None, None),
+            (&mut groups.layers, None, Some(LAYERS_ANY_HIT), None),
+            (
+                &mut groups.medium_layers,
+                None,
+                Some(MEDIUM_LAYERS_ANY_HIT),
+                Some(MEDIUM_INTERSECTION),
+            ),
+            (
+                &mut groups.light_layers,
+                None,
+                Some(LIGHT_LAYERS_ANY_HIT),
+                Some(LIGHT_INTERSECTION),
+            ),
+            (&mut groups.stack_meet, Some(STACK_MEET), None, None),
         ] {
+            *group = Some(hit_groups.len() as u32);
             hit_groups.push(HitGroup {
-                closest_hit: None,
-                any_hit: Some(any_hit),
+                closest_hit,
+                any_hit,
                 intersection,
             });
         }
-        hit_groups.push(HitGroup {
-            closest_hit: Some(STACK_MEET),
-            ..HitGroup::default()
-        });
         let raygens: Vec<ShaderRecord<'_>> = (0..RAYGENS).map(ShaderRecord::new).collect();
         let desc = RayPipelineDesc {
             stages: &stages,
@@ -306,24 +316,7 @@ impl PathPipeline {
             "path pipeline made in {:.1} s",
             started.elapsed().as_secs_f64()
         );
-        Ok(Self {
-            pipeline,
-            groups: HitGroups {
-                path: Some(0),
-                producer_path: Some(pins),
-                strand_path: Some(2 * pins),
-                shadow: Some(3 * pins),
-                layer_path: Some(4 * pins),
-                producer_layer_path: Some(5 * pins),
-                medium_shadow: Some(6 * pins),
-                walk_meet: Some(6 * pins + 1),
-                layers: Some(6 * pins + 2),
-                medium_layers: Some(6 * pins + 3),
-                light_layers: Some(6 * pins + 4),
-                stack_meet: Some(6 * pins + 5),
-                ..groups
-            },
-        })
+        Ok(Self { pipeline, groups })
     }
 
     pub(crate) fn hit_pipeline(&self) -> (&RayPipeline, &HitGroups) {

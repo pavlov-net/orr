@@ -1121,12 +1121,36 @@ fn runs_rays(entry: PathEntry) -> bool {
 /// or through the pipeline path tracer over the scene's hit records.
 enum PhotonPaths<'a> {
     Staged {
+        paths: &'a StagedPaths,
         may: u64,
     },
     Launched {
         launch: &'a PathPipeline,
         hits: &'a HitTable,
     },
+}
+
+/// What runs a view's paths.
+enum PathBackend {
+    /// The staged loop, whose pipelines compile when paths first ask for them.
+    Staged(Arc<StagedPaths>),
+    /// The pipeline path tracer, with [`PathEntry::Pipeline`].
+    Pipeline(Box<PathPipeline>),
+}
+
+/// [`PathBackend`] while the kernels compile.
+enum CompilingPaths {
+    Staged(Arc<StagedPaths>),
+    Pipeline(JobResult<Result<PathPipeline, Error>>),
+}
+
+impl CompilingPaths {
+    fn staged(&self) -> Option<&StagedPaths> {
+        match self {
+            Self::Staged(paths) => Some(paths),
+            Self::Pipeline(_) => None,
+        }
+    }
 }
 
 const SUPPORT: &str = "lighting compute kernels";
@@ -1152,12 +1176,10 @@ pub struct CompilingKernels {
     kernels: &'static KernelSet,
     loading: Arc<Loading>,
     /// The staged loop's pipelines compile when paths first ask for them, which a view may
-    /// while the other kernels compile.
-    paths: Arc<StagedPaths>,
+    /// while the other kernels compile; the pipeline path tracer's is a job.
+    paths: CompilingPaths,
     /// One job per support pipeline, in [`SupportKernels::pipelines`]' order.
     support: Vec<JobResult<Result<ComputePipeline, Error>>>,
-    /// The pipeline path tracer's, with [`PathEntry::Pipeline`].
-    launch: Option<JobResult<Result<PathPipeline, Error>>>,
     /// The support kernels made per mask, which a view asks for as it does its path pipelines.
     masked: Arc<MaskedSupport>,
     tables: BsdfTables,
@@ -1168,7 +1190,10 @@ impl CompilingKernels {
         self.support
             .iter()
             .map(|j| j as &dyn JobState)
-            .chain(self.launch.iter().map(|j| j as &dyn JobState))
+            .chain(match &self.paths {
+                CompilingPaths::Pipeline(job) => Some(job as &dyn JobState),
+                CompilingPaths::Staged(_) => None,
+            })
             .collect()
     }
 
@@ -1187,9 +1212,9 @@ impl CompilingKernels {
         needs: PathNeeds,
         lighting: &ViewLighting,
     ) -> Result<(), Error> {
-        if self.launch.is_none() {
-            let (wanted, stages) = self.paths.wanted(scene, needs, lighting);
-            self.paths.ask(wanted, &stages, lighting)?;
+        if let Some(paths) = self.paths.staged() {
+            let (wanted, stages) = paths.wanted(scene, needs, lighting);
+            paths.ask(wanted, &stages, lighting)?;
         }
         ask_support(&self.masked, needs, lighting)?;
         Ok(())
@@ -1198,7 +1223,10 @@ impl CompilingKernels {
     /// How many pipelines asked for through [`Self::prepare_paths`] that a frame or a caller
     /// waits for are still compiling ([`LightingKernels::outstanding`]).
     pub fn paths_outstanding(&self, exact: bool) -> u32 {
-        self.paths.stages.outstanding(exact) + self.masked.outstanding(exact)
+        self.paths
+            .staged()
+            .map_or(0, |paths| paths.stages.outstanding(exact))
+            + self.masked.outstanding(exact)
     }
 
     /// Whether a thread has started any job.
@@ -1221,13 +1249,14 @@ impl CompilingKernels {
         for job in &self.support {
             support.push(compiled(job, SUPPORT)?);
         }
-        let launch = match &self.launch {
-            Some(job) => Some(compiled(job, LAUNCH)?),
-            None => None,
+        let paths = match &self.paths {
+            CompilingPaths::Staged(paths) => PathBackend::Staged(Arc::clone(paths)),
+            CompilingPaths::Pipeline(job) => {
+                PathBackend::Pipeline(Box::new(compiled(job, LAUNCH)?))
+            }
         };
         let out = LightingKernels {
-            paths: Arc::clone(&self.paths),
-            launch,
+            paths,
             support: SupportKernels::assemble(
                 &self.device,
                 self.kernels,
@@ -1665,10 +1694,7 @@ impl StagedPaths {
 
 /// The per-view lighting kernels of one device.
 pub struct LightingKernels {
-    paths: Arc<StagedPaths>,
-    /// The pipeline path tracer, which runs every view's paths in place of the staged loop with
-    /// [`PathEntry::Pipeline`].
-    launch: Option<PathPipeline>,
+    paths: PathBackend,
     support: SupportKernels,
     _tables: BsdfTables,
 }
@@ -1685,17 +1711,20 @@ impl LightingKernels {
         tables: &BsdfTables,
         entry: PathEntry,
     ) -> Result<Self, Error> {
-        let rays = runs_rays(entry);
-        let paths = Arc::new(StagedPaths::new(
-            StagedKernels::new(device, kernels, rays),
-            links_medium(kernels),
-        ));
-        let launch = (entry == PathEntry::Pipeline)
-            .then(|| PathPipeline::new(device, kernels, CompileThreads::default()))
-            .transpose()?;
+        let paths = if entry == PathEntry::Pipeline {
+            PathBackend::Pipeline(Box::new(PathPipeline::new(
+                device,
+                kernels,
+                CompileThreads::default(),
+            )?))
+        } else {
+            PathBackend::Staged(Arc::new(StagedPaths::new(
+                StagedKernels::new(device, kernels, runs_rays(entry)),
+                links_medium(kernels),
+            )))
+        };
         Ok(Self {
             paths,
-            launch,
             support: SupportKernels::new(device, kernels)?,
             _tables: tables.clone(),
         })
@@ -1712,32 +1741,32 @@ impl LightingKernels {
         entry: PathEntry,
         loading: &Arc<Loading>,
     ) -> CompilingKernels {
-        let rays = runs_rays(entry);
-        let paths = Arc::new(StagedPaths::new(
-            StagedKernels::new(device, kernels, rays),
-            links_medium(kernels),
-        ));
-        paths.stages.attach(device, loading);
         let masked = Arc::new(MaskedSupport::new(device, kernels));
         masked.attach(device, loading);
-        let launch = (entry == PathEntry::Pipeline).then(|| {
+        let paths = if entry == PathEntry::Pipeline {
             // The driver compiles the pipeline's shaders on the loading workers that join it.
             let pool = Arc::clone(loading);
-            loading.compile_job(device, Urgency::Needed, move |d| {
+            CompilingPaths::Pipeline(loading.compile_job(device, Urgency::Needed, move |d| {
                 let spawn = |task: Box<dyn FnOnce() + Send>| pool.spawn(task);
                 let threads = CompileThreads::Pool {
                     spawn: &spawn,
                     max: std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
                 };
                 PathPipeline::new(d, kernels, threads)
-            })
-        });
+            }))
+        } else {
+            let paths = Arc::new(StagedPaths::new(
+                StagedKernels::new(device, kernels, runs_rays(entry)),
+                links_medium(kernels),
+            ));
+            paths.stages.attach(device, loading);
+            CompilingPaths::Staged(paths)
+        };
         CompilingKernels {
             device: device.clone(),
             kernels,
             loading: Arc::clone(loading),
             paths,
-            launch,
             masked,
             support: SupportKernels::pipelines()
                 .map(|compile| {
@@ -1753,7 +1782,9 @@ impl LightingKernels {
     /// [`CompilingKernels::finish`] calls it; kernels from [`Self::new`] compile their later
     /// pipelines on the calling thread until this call.
     pub fn attach(&self, device: &Device, loading: &Arc<Loading>) {
-        self.paths.stages.attach(device, loading);
+        if let PathBackend::Staged(paths) = &self.paths {
+            paths.stages.attach(device, loading);
+        }
         self.support.masked.attach(device, loading);
     }
 
@@ -1761,8 +1792,8 @@ impl LightingKernels {
     /// behind a view's own. A caller that compiles ahead of its first frame calls this
     /// and runs the loading side's jobs.
     pub fn compile_rest(&self) {
-        if self.launch.is_none() {
-            self.paths.start_general();
+        if let PathBackend::Staged(paths) = &self.paths {
+            paths.start_general();
         }
         self.support.masked.start_general();
     }
@@ -1771,7 +1802,10 @@ impl LightingKernels {
     /// and the groups the table names, where the kernels run the pipeline path tracer
     /// ([`PathEntry::Pipeline`]).
     pub fn hit_pipeline(&self) -> Option<(&RayPipeline, &HitGroups)> {
-        self.launch.as_ref().map(PathPipeline::hit_pipeline)
+        match &self.paths {
+            PathBackend::Pipeline(launch) => Some(launch.hit_pipeline()),
+            PathBackend::Staged(_) => None,
+        }
     }
 
     /// The masked support kernels with the mask of `pass`'s frame under `lighting`, and
@@ -1806,10 +1840,9 @@ impl LightingKernels {
         lighting: &ViewLighting,
     ) -> Result<bool, Error> {
         let support = ask_support(&self.support.masked, needs, lighting)?;
-        if self.launch.is_some() {
+        let PathBackend::Staged(k) = &self.paths else {
             return Ok(support);
-        }
-        let k = &self.paths;
+        };
         let (wanted, stages) = k.wanted(scene, needs, lighting);
         Ok(k.ask(wanted, &stages, lighting)? && support)
     }
@@ -1828,11 +1861,12 @@ impl LightingKernels {
         let _zone = orr_scene::orr_gpu::zone!("wait for path pipelines");
         // The masked support kernels compile beside the path pipelines waited for first.
         ask_support(&self.support.masked, needs, lighting)?;
-        let waited = if self.launch.is_none() {
-            let (wanted, stages) = self.paths.wanted(scene, needs, lighting);
-            Some(self.paths.stages.wait_exact(wanted, &stages)?)
-        } else {
-            None
+        let waited = match &self.paths {
+            PathBackend::Staged(k) => {
+                let (wanted, stages) = k.wanted(scene, needs, lighting);
+                Some(k.stages.wait_exact(wanted, &stages)?)
+            }
+            PathBackend::Pipeline(_) => None,
         };
         let masked = &self.support.masked;
         let may = support_may(
@@ -1852,7 +1886,11 @@ impl LightingKernels {
     /// later, but where `exact`, which says the caller takes those made for exactly its view
     /// ([`Self::wait_paths`]).
     pub fn outstanding(&self, exact: bool) -> u32 {
-        self.paths.stages.outstanding(exact) + self.support.masked.outstanding(exact)
+        let paths = match &self.paths {
+            PathBackend::Staged(k) => k.stages.outstanding(exact),
+            PathBackend::Pipeline(_) => 0,
+        };
+        paths + self.support.masked.outstanding(exact)
     }
 
     /// Records the froxel passes of `pass` after the scene's [`SceneLighting::record`], the
@@ -2126,9 +2164,12 @@ impl LightingKernels {
             _pad0: 0,
             _pad1: 0,
         };
-        if let Some(launch) = &self.launch {
-            return self.record_launched(list, scene, view, pass, lighting, launch, &path_root);
-        }
+        let k = match &self.paths {
+            PathBackend::Pipeline(launch) => {
+                return self.record_launched(list, scene, view, pass, lighting, launch, &path_root);
+            }
+            PathBackend::Staged(k) => k,
+        };
         // Asked for together, the sources that run in the stages share their pipelines.
         let needs = PathNeeds {
             features: pass.scene_features,
@@ -2136,7 +2177,6 @@ impl LightingKernels {
             dof_background: pass.dof_background.is_some(),
             particle_lighting: pass.particle_lighting,
         };
-        let k = &self.paths;
         let predicted = k.predict(scene, needs, lighting);
         let pixels = view.extent[0] * view.extent[1];
         let parts = StateParts::of(features);
@@ -2199,7 +2239,10 @@ impl LightingKernels {
                 pass,
                 lighting,
                 &path_root,
-                PhotonPaths::Staged { may: photons },
+                PhotonPaths::Staged {
+                    paths: k,
+                    may: photons,
+                },
             )?,
             ..path_root
         };
@@ -2495,9 +2538,18 @@ impl LightingKernels {
         // than that run in slices that each hold as many.
         let slots = photons.min(PHOTON_SLOTS);
         match paths {
-            PhotonPaths::Staged { may } => {
+            PhotonPaths::Staged { paths: k, may } => {
                 let photons = (photons, slots);
-                self.record_staged_photons(list, view, pass, lighting, &photon_root, may, photons)?;
+                Self::record_staged_photons(
+                    list,
+                    k,
+                    view,
+                    pass,
+                    lighting,
+                    &photon_root,
+                    may,
+                    photons,
+                )?;
             }
             PhotonPaths::Launched { launch, hits } => {
                 // Photons that may meet a layer or lie in an interior take the dielectric depth's
@@ -2547,8 +2599,8 @@ impl LightingKernels {
     /// loop's stages for what they may meet, `may`.
     #[allow(clippy::too_many_arguments)]
     fn record_staged_photons(
-        &self,
         list: &mut CommandList<'_>,
+        k: &StagedPaths,
         view: &mut LightingView,
         pass: &ViewPass,
         lighting: &ViewLighting,
@@ -2576,7 +2628,6 @@ impl LightingKernels {
         if let Some(memory) = &view.staged_photons {
             memory.begin_frame(own.ran().0);
         }
-        let k = &self.paths;
         let asks = scene_may(pass.scene_features) | root_may(photon_root);
         assert!(
             asks & !may == 0,
