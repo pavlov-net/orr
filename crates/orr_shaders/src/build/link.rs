@@ -337,7 +337,7 @@ pub(super) fn single_type(links: &[Link], point: LinkPoint) -> Option<&str> {
         .map(|l| l.ty.as_str())
 }
 
-/// The width of the coherence key (contracts.md 3): 3 plus the bit length of the highest
+/// The width of the coherence key: 3 plus the bit length of the highest
 /// linked surface id.
 fn key_bits(links: &[Link]) -> u32 {
     let surfaces = links

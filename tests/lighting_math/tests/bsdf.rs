@@ -1,4 +1,4 @@
-//! orr_lighting's real-time BSDF against adobe/openpbr-bsdf (lighting.md L1): the harness
+//! orr_lighting's real-time BSDF against adobe/openpbr-bsdf: the harness
 //! gates, directional albedo by kind within 2% over a parameter grid, sampling consistent
 //! with eval, the white furnace, collapse, the mirror threshold, the subsurface entry, and
 //! finite results everywhere.

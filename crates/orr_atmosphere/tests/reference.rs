@@ -267,7 +267,7 @@ fn zenith_blue_red_ratio() {
 
 /// The three Rec.2020 bands of the medium's `sample` and finite `t` against spectral on
 /// horizontal segments: prints the worst in-scatter and transmitted-sunlight color error
-/// per light elevation and length over the aerosol presets (atmosphere.md 6).
+/// per light elevation and length over the aerosol presets.
 #[test]
 #[ignore = "measurement: run with --ignored --nocapture"]
 fn rgb_bands_on_segments() {

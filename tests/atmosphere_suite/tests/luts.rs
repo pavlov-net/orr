@@ -155,7 +155,7 @@ fn sky_view_single_scattering_matches_reference() {
 }
 
 /// The full sky against the reference's multiple scattering: measures the error of the
-/// multiple-scattering LUT model (atmosphere.md 6).
+/// multiple-scattering LUT model.
 #[test]
 #[ignore = "measurement, about 7 minutes: run with --ignored --nocapture"]
 fn sky_view_multiple_scattering_error() {

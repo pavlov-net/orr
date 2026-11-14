@@ -1,5 +1,5 @@
-//! The required device features and extensions (contracts.md 7) and the optional ones that
-//! become `Caps` flags.
+//! The required device features and extensions and the optional ones that become `Caps`
+//! flags.
 
 use std::any::Any;
 use std::ffi::{CStr, c_void};

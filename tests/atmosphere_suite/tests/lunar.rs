@@ -134,7 +134,7 @@ fn high_moon_at_the_ground() {
 
 /// The sky lit by the moon alone has the color of the spectral reference lit by the lunar
 /// spectrum: the solar-weighted groups hold for moonlight. Single scattering on both sides
-/// (the multiple-scattering model's error is atmosphere.md 6's), no night background.
+/// (leaving out the multiple-scattering model's error), no night background.
 #[test]
 fn moonlit_sky_color() {
     let atmosphere = Atmosphere {

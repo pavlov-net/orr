@@ -1,4 +1,4 @@
-//! The resource heap (image descriptors only) and the sampler heap (contracts.md 9).
+//! The resource heap (image descriptors only) and the sampler heap.
 
 use std::mem::DropGuard;
 use std::ptr::NonNull;

@@ -1183,8 +1183,7 @@ mod tests {
         }
     }
 
-    /// The surface formats of a full-screen window on an RTX 5090 with 621.01 (measured.md
-    /// DSP-4).
+    /// The surface formats of a full-screen window on an RTX 5090 with driver 621.01.
     fn recorded() -> Vec<vk::SurfaceFormatKHR> {
         use vk::{ColorSpaceKHR as C, Format as F};
         vec![

@@ -299,7 +299,7 @@ fn c_string(chars: &[c_char]) -> String {
 
 impl Device {
     /// Creates the device: the first Vulkan 1.4 GPU (discrete first) with every required
-    /// feature of contracts.md 7. Fails naming the first missing item. The validation layer
+    /// feature and extension. Fails naming the first missing item. The validation layer
     /// loads only when the environment enables it (`VK_INSTANCE_LAYERS`, vkconfig); its
     /// synchronization checks are then on, and its messages are logged and counted
     /// ([`Device::validation_messages`]).

@@ -5,7 +5,7 @@ use orr_pack::texture::{
     tile_shape, untile, vk,
 };
 
-/// Standard 2D sparse block shapes reported by the device (measured.md SP-8).
+/// Standard 2D sparse block shapes reported by the device.
 #[test]
 fn tile_shapes_and_tails_match_the_device() {
     let shapes = [

@@ -274,8 +274,7 @@ fn near_range_composition() {
     assert_clean();
 }
 
-/// The same with multiple scattering: carries the multiple-scattering LUT's model error
-/// (atmosphere.md 6).
+/// The same with multiple scattering: carries the multiple-scattering LUT's model error.
 #[test]
 #[ignore = "measurement, about 20 s: run with --ignored --nocapture"]
 fn near_range_composition_full_sky() {

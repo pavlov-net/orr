@@ -58,4 +58,4 @@ setup. It has no users yet.
   the cause; never skip it. `README.md` covers installing it.
 - Don't commit plans, notes or reports. Working documents stay out of the repo.
 - Comments are rare: only a reason, constraint or surprise the code can't show, in plain words and
-  the present tense, with no history.
+  the present tense, with no history and no references that can go stale.
