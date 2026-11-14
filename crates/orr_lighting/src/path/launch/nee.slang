@@ -274,22 +274,35 @@ public uint draw_lights<S : ISurfaces>(PathRoot r, uint slot, float3 position, f
     return drawn;
 }
 
-// The draw of next-event estimation at `x` weighed by `f` among the `drawn` candidates its arrival
-// left in `slot`'s scratch (`nee_draw` past its candidates): resampled by unshadowed luminance,
-// with `no_environment` the environment's counting for nothing; at a `chain` vertex what a light
-// other than the environment gives keeps `keep` of the share outside the vertex's diffuse lobes.
-public NeeDraw weigh_lights<F : IScatter>(PathRoot r, uint slot, PathVertex x, F f, uint drawn, float3 keep, bool chain, bool no_environment)
+// The winner among a vertex's light candidates as its scatter weighs them: its place in the
+// scratch, its resampling target, what the scatter gives toward it with its diffuse lobes' share
+// and its own density of the way, and the sum of the candidates' weights. `any` is false where
+// none has a value.
+public struct Weighed
 {
-    LightSetGpu* set = r.set;
-    NeeDraw d = NeeDraw();
+    public bool any;
+    public uint index;
+    public float target;
+    public float3 f;
+    public float3 diffuse;
+    public float scatter_pdf;
+    public float sum;
+}
+
+public Weighed no_weighed()
+{
+    Weighed w = { false, 0, 0.0, float3(0.0), float3(0.0), 0.0, 0.0 };
+    return w;
+}
+
+// Weighs by `f` the `drawn` candidates a vertex's arrival left in `slot`'s scratch, resampled by
+// unshadowed luminance (`nee_draw`'s loop), with `no_environment` the environment's counting for
+// nothing. It reads nothing of the path, so a shader holds only `f` across it.
+public Weighed weigh_candidates<F : IScatter>(PathRoot r, uint slot, F f, uint drawn, bool no_environment)
+{
+    Weighed w = no_weighed();
     if (f.specular_only())
-        return d;
-    ResolvedLightSample chosen = no_candidate();
-    float chosen_target = 0.0;
-    float3 chosen_f = float3(0.0);
-    float3 chosen_diffuse = float3(0.0);
-    float chosen_scatter_pdf = 0.0;
-    float sum = 0.0;
+        return w;
     for (uint i = 0; i < drawn; i++)
     {
         LightCandidate k = load_part<LightCandidate, CANDIDATE_WORDS>(candidate_words(r, slot, i));
@@ -299,26 +312,37 @@ public NeeDraw weigh_lights<F : IScatter>(PathRoot r, uint slot, PathVertex x, F
         float3 dc;
         float3 fc = f.eval_and_pdf(k.dir, scatter_pdf, dc);
         float target = luminance_rec2020(fc * k.radiance);
-        float w = target / k.pdf;
-        if (!(w > 0.0) || !isfinite(w))
+        float weight = target / k.pdf;
+        if (!(weight > 0.0) || !isfinite(weight))
             continue;
-        sum += w;
-        if (k.u * sum < w)
+        w.sum += weight;
+        if (k.u * w.sum < weight)
         {
-            chosen = light_sample_of(k);
-            chosen_target = target;
-            chosen_f = fc;
-            chosen_diffuse = dc;
-            chosen_scatter_pdf = scatter_pdf;
+            w.index = i;
+            w.target = target;
+            w.f = fc;
+            w.diffuse = dc;
+            w.scatter_pdf = scatter_pdf;
         }
     }
-    if (!(sum > 0.0))
+    w.any = w.sum > 0.0;
+    return w;
+}
+
+// The draw of next-event estimation at `x` from the winner `w` of the `drawn` candidates in
+// `slot`'s scratch (`nee_draw` past its resampling): at a `chain` vertex what a light other than
+// the environment gives keeps `keep` of the share outside the vertex's diffuse lobes.
+public NeeDraw winner_draw(PathRoot r, uint slot, PathVertex x, Weighed w, uint drawn, float3 keep, bool chain)
+{
+    NeeDraw d = NeeDraw();
+    if (!w.any)
         return d;
+    ResolvedLightSample chosen = light_sample_of(load_part<LightCandidate, CANDIDATE_WORDS>(candidate_words(r, slot, w.index)));
     float3 dir = chosen.dir;
-    float3 l = chosen.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, chosen.light, dir) : chosen.radiance;
-    float3 fe = chosen_f;
+    float3 l = chosen.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(r.set, chosen.light, dir) : chosen.radiance;
+    float3 fe = w.f;
     if (chain && chosen.kind != LIGHT_SAMPLE_ENVIRONMENT)
-        fe = chosen_diffuse + max(chosen_f - chosen_diffuse, 0.0) * keep;
+        fe = w.diffuse + max(w.f - w.diffuse, 0.0) * keep;
     float3 e = fe * l;
     if (all(e == 0.0))
         return d;
@@ -339,8 +363,8 @@ public NeeDraw weigh_lights<F : IScatter>(PathRoot r, uint slot, PathVertex x, F
     d.chosen = chosen;
     d.e = e;
     d.l = l;
-    d.W = sum / (float(drawn) * chosen_target);
-    d.scatter_pdf = chosen_scatter_pdf;
+    d.W = w.sum / (float(drawn) * w.target);
+    d.scatter_pdf = w.scatter_pdf;
     d.origin = origin;
     d.toward = toward;
     d.t_max = t_max;
@@ -374,10 +398,17 @@ public float3 nee_normal(ShadeVertex sv, uint kind)
     return kind == VERTEX_LAYER || kind == VERTEX_SCATTER ? float3(0.0) : sv.l.x.surface.normal;
 }
 
+// Whether next-event estimation at a vertex of kind `kind` of a path with context `x` counts the
+// environment's candidates for nothing: the rays of a walk's way out carry its light.
+public bool nee_without_environment(PathContext x, uint kind)
+{
+    return kind == VERTEX_LEAVE && x.count_bsdf;
+}
+
 // Next-event estimation at vertex `sv` of kind `kind`, with `X` a walk's exit, which `nee_runs`
-// let run with probability `run` and whose `drawn` candidates its arrival left in `slot`'s
-// scratch: its shadow ray in `nee`.
-public ShadeNee vertex_nee<S : ISurfaces, M : IMedium, let X : uint>(PathRoot r, uint slot, inout PathLoop p, ShadeState c, PathContext x, uint kind, ShadeVertex sv, float run, uint drawn)
+// let run with probability `run`, from the winner `w` of the `drawn` candidates its arrival left
+// in `slot`'s scratch: its shadow ray in `nee`.
+public ShadeNee vertex_nee<S : ISurfaces, M : IMedium, let X : uint>(PathRoot r, uint slot, inout PathLoop p, ShadeState c, PathContext x, uint kind, ShadeVertex sv, float run, uint drawn, Weighed w)
 {
     ShadeNee nee = no_nee(c.spectral);
     nee.run = run;
@@ -391,8 +422,7 @@ public ShadeNee vertex_nee<S : ISurfaces, M : IMedium, let X : uint>(PathRoot r,
     bool weight_one = x.one_technique || leaving;
     float3 keep = x.one_technique ? float3(1.0) : p.keep;
     bool chain = l.chains && !x.one_technique;
-    bool no_environment = leaving && x.count_bsdf;
-    NeeDraw d = weigh_lights(r, slot, at, vertex_weighs<X>(sv, kind), drawn, keep, chain, no_environment);
+    NeeDraw d = winner_draw(r, slot, at, w, drawn, keep, chain);
     if (!d.traced)
         return nee;
     count_ray(p);

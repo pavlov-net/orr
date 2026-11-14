@@ -685,19 +685,32 @@ uint4 arrive_at<V : IAt, let X : uint, S : ISurfaces, M : IMedium>(PathRoot r, u
     V at = V.load(r, v);
     uint out = 0;
     float run = 0.0;
-    uint drawn = 0;
+    bool draws = false;
+    float3 position = float3(0.0);
+    float3 normal = float3(0.0);
     if (at.arrive<M>(r, v, out))
     {
         ShadeVertex sv = at.vertex(r, v.c.ray.dir, step, at.prep(r, v));
-        if (nee_runs<X>(r, v.p, v.c, v.x, kind, sv, v.p.rng, run))
-            drawn = draw_lights<S>(r, slot, sv.l.x.surface.position, nee_normal(sv, kind), v.p.depth, v.f.pixel, v.p.rng);
+        draws = nee_runs<X>(r, v.p, v.c, v.x, kind, sv, v.p.rng, run);
+        position = sv.l.x.surface.position;
+        normal = nee_normal(sv, kind);
     }
     else
         out |= STEP_ENDED;
+    // The path's state is stored before its candidates are drawn, which holds none of it: they
+    // take the sampler dimensions from here on that the loop then lies past.
+    Sampler rng = v.p.rng;
+    uint depth = v.p.depth;
+    uint2 pixel = v.f.pixel;
+    if (draws)
+        v.p.rng.dimension += candidate_dimensions(vertex_candidates(r, depth));
     at.stored(r, v);
     store_loop_state(v.at, v.p);
     store_ray_cone(v.at, v.p.cone);
     flush_loop_radiance(v.at, v.p);
+    uint drawn = 0;
+    if (draws)
+        drawn = draw_lights<S>(r, slot, position, normal, depth, pixel, rng);
     return uint4(out, asuint(run), drawn, 0);
 }
 
@@ -710,23 +723,36 @@ uint shade_at<V : IAt, let X : uint, S : ISurfaces, M : IMedium>(PathRoot r, uin
 {
     VertexState v = load_vertex_state(r, slot, step, 0.0, V.ray_part(r));
     V at = V.load(r, v);
-    bool stack_ray = has(v.p.flags, LOOP_STACK_RAY);
     bool opaque = kind == VERTEX_OPAQUE && X == SHADE_VERTEX;
-    // A pixel that runs stands for the view's share of them.
-    if (opaque && has(step, STEP_FIRST) && v.c.interior.count == 0)
-        v.p.throughput /= r.pixel_fraction;
     Prep q = at.prep(r, v);
     ShadeVertex sv = at.vertex(r, v.c.ray.dir, step, q);
     PrepIors iors = prep_iors(r.scene, sv.l, v.c.interior, q);
     if (at.prepares())
         sv.b = prepare_iors(sv.l, q, iors);
+    Weighed w = no_weighed();
+    bool weighs = v.x.count_nee && drawn > 0;
+    if (weighs)
+    {
+        w = weigh_candidates(r, slot, vertex_weighs<X>(sv, kind), drawn, nee_without_environment(v.x, kind));
+        // The weighing holds the vertex's scatter alone: the path's state and the vertex are
+        // loaded again past it, so nothing of them is live across its evaluations.
+        v = load_vertex_state(r, slot, step, 0.0, V.ray_part(r));
+        at = V.load(r, v);
+        ShadeVertex again = at.vertex(r, v.c.ray.dir, step, q);
+        again.b = sv.b;
+        sv = again;
+    }
+    bool stack_ray = has(v.p.flags, LOOP_STACK_RAY);
+    // A pixel that runs stands for the view's share of them.
+    if (opaque && has(step, STEP_FIRST) && v.c.interior.count == 0)
+        v.p.throughput /= r.pixel_fraction;
     GSurface g = sv.l.x.surface;
     Sampler rng = v.p.rng;
     uint out = 0;
     ShadeNee nee = no_nee(v.c.spectral);
-    if (v.x.count_nee && drawn > 0)
+    if (weighs)
     {
-        nee = vertex_nee<S, M, X>(r, slot, v.p, v.c, v.x, kind, sv, run, drawn);
+        nee = vertex_nee<S, M, X>(r, slot, v.p, v.c, v.x, kind, sv, run, drawn, w);
         at.estimated(sv, nee);
         if (nee.traced)
         {
