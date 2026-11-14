@@ -81,10 +81,11 @@ void clas(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     bool layer = class_id != 0 && (c.flags & CLUSTER_SOLID) == 0;
     bool non_opaque = layer || (job.flags & CLAS_NON_OPAQUE) != 0;
     bool micromap = (job.flags & CLAS_MICROMAP) != 0;
+    // Opaque triangles take no duplicates either: forced non-opaque, they reach candidate loops.
     for (uint i = t; i < c.tri_count; i += 64)
     {
         bool opaque = !non_opaque && i < c.alpha_first;
-        root.triangle_flags[job.triangle_first + i] = geometry_index_and_flags(class_id, opaque ? GEOMETRY_OPAQUE : 0);
+        root.triangle_flags[job.triangle_first + i] = geometry_index_and_flags(class_id, GEOMETRY_NO_DUPLICATE_ANY_HIT | (opaque ? GEOMETRY_OPAQUE : 0));
         if (micromap)
             root.omm_indices[job.triangle_first + i] = opaque ? OMM_INDEX_OPAQUE : load_omm_index(job.page, h, c, i);
     }

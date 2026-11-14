@@ -30,7 +30,7 @@ void templates(uint3 id: SV_DispatchThreadID)
     r.cluster.tri_count = p.tri_count;
     r.cluster.vertex_count = p.vertex_count;
     r.cluster.index_format = 1;
-    r.cluster.base_geometry_and_flags = geometry_index_and_flags(0, opaque ? GEOMETRY_OPAQUE : 0);
+    r.cluster.base_geometry_and_flags = geometry_index_and_flags(0, GEOMETRY_NO_DUPLICATE_ANY_HIT | (opaque ? GEOMETRY_OPAQUE : 0));
     r.cluster.omm_index_format = 4;
     r.cluster.vertices = (uint64_t)root.curve;
     r.cluster.indices = (uint64_t)(table.triangles + 3 * p.tri_first);

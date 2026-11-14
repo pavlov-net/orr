@@ -61,7 +61,7 @@ public struct ProducerBuildGpu
     public uint64_t swept_blas;     // a swept-sphere entry's BLAS
     public uint topology_count;
     public uint direct_capacity;    // the direct records' room: clusters past it are refused
-    public uint geometry_flags;     // rtas GEOMETRY_* of every triangle, 0 for PRODUCER_SECTIONS
+    public uint geometry_flags;     // rtas GEOMETRY_* of every triangle; PRODUCER_SECTIONS: of its non-opaque clusters
     public uint strands;            // STRANDS_*
 }
 
@@ -349,7 +349,7 @@ void records(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
         MaterialGpu* m = s.materials + producer_material(p, k);
         class_id = material_class(m);
         if (class_id == CLASS_OPAQUE && (m.flags & MATERIAL_ALPHA_TESTED) == 0)
-            geometry_flags = GEOMETRY_OPAQUE;
+            geometry_flags = GEOMETRY_OPAQUE | GEOMETRY_NO_DUPLICATE_ANY_HIT;
         else
             topology += PATTERNS;
     }

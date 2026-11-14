@@ -14,7 +14,7 @@
 
 use std::assert_matches;
 
-use orr_gpu::rtas::consts::GEOMETRY_OPAQUE;
+use orr_gpu::rtas::consts::{GEOMETRY_NO_DUPLICATE_ANY_HIT, GEOMETRY_OPAQUE};
 use orr_gpu::{
     Allocation, BlasLimits, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicKind,
     ClusterLimits, ClusterVertexFormat, CommandList, Device, DispatchArgs, GpuAddress, GpuPtr,
@@ -752,7 +752,7 @@ pub(crate) fn build(
         swept_blas: swept.as_ref().map_or_default(|s| s.blas.address().0),
         topology_count: built_topologies as u32,
         direct_capacity: direct_clusters,
-        geometry_flags: if opaque { GEOMETRY_OPAQUE } else { 0 },
+        geometry_flags: GEOMETRY_NO_DUPLICATE_ANY_HIT | if opaque { GEOMETRY_OPAQUE } else { 0 },
         strands: if swept.is_some() {
             STRANDS_SWEPT
         } else if tubes {

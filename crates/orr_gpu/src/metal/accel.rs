@@ -469,6 +469,7 @@ fn descriptor(
             g.setVertexFormat(MTLAttributeFormat::Float3);
             g.setIndexType(MTLIndexType::UInt32);
             g.setOpaque(opaque);
+            g.setAllowDuplicateIntersectionFunctionInvocation(opaque);
             primitive(Retained::into_super(g))
         }
         ClassicGeometry::Aabbs {
@@ -484,6 +485,7 @@ fn descriptor(
                 g.setBoundingBoxCount(count as usize);
             }
             g.setOpaque(opaque);
+            g.setAllowDuplicateIntersectionFunctionInvocation(opaque);
             primitive(Retained::into_super(g))
         }
         ClassicGeometry::Lss { .. } => not_implemented("linear swept spheres"),
