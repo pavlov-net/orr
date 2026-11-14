@@ -26,6 +26,11 @@ pub(super) const SLANGC_OPTIONS: &[&str] = &[
     "-fvk-use-entrypoint-name",
     "-warnings-as-errors",
     "all",
+    // Keeps subnormal halves through conversions and arithmetic, which a device may otherwise
+    // flush to 0. No f32 or f64 mode: Slang emits one for every width named, and not every
+    // device that preserves half denormals can set the f32 or f64 behavior.
+    "-denorm-mode-fp16",
+    "preserve",
     // Renumbers ids densely: large kernels otherwise leave too few spare ids for the
     // optimizer the validation layer runs when it applies specialization constants.
     "-Xspirv-opt",

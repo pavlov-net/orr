@@ -5,6 +5,7 @@ use std::any::Any;
 use std::ffi::{CStr, c_void};
 
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 
 use super::diagnostics::Diagnostics;
 use super::interop::{DeviceHooks, Features};
@@ -676,6 +677,21 @@ pub(super) fn select(
         {
             return Err(format!("linear filtering of {format:?} images"));
         }
+    }
+    // The shaders declare DenormPreserve for halves alone, which leaves the f32 and f64
+    // behavior to the device: that needs full independence.
+    let mut v12_props = vk::PhysicalDeviceVulkan12Properties::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::default().push(&mut v12_props);
+    // SAFETY: `physical` came from this instance; the struct is core 1.2.
+    unsafe { instance.get_physical_device_properties2(physical, &mut props2) };
+    if v12_props.shader_denorm_preserve_float16 == vk::FALSE {
+        return Err("shaderDenormPreserveFloat16".to_owned());
+    }
+    if v12_props.denorm_behavior_independence != vk::ShaderFloatControlsIndependence::ALL {
+        return Err(format!(
+            "denormBehaviorIndependence ALL (has {:?})",
+            v12_props.denorm_behavior_independence
+        ));
     }
 
     opt.ray_dispatch &= q.ray_pipeline.ray_tracing_pipeline != 0
