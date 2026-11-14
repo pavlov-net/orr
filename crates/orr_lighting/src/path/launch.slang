@@ -145,14 +145,13 @@ public static const uint SLOT_SPECTRAL_PART = 5;
 // at a subsurface walk's exit, which is the vertex the walk entered where it stopped at its cap,
 // and which takes the parameters of the vertex it entered (in ENTRY_AT) with VERTEX_ENTRY_PARAMS;
 // a segment drew the sampler dimensions of the ray that reached it, which its resolve or miss then
-// draws none of; it is a scatter in a medium.
+// draws none of.
 static const uint VERTEX_FIRST = 1 << 0;
 static const uint VERTEX_GBUFFER = 1 << 1;
 static const uint VERTEX_EXIT = 1 << 2;
 static const uint VERTEX_EXIT_CAP = 1 << 3;
 static const uint VERTEX_ENTRY_PARAMS = 1 << 4;
 static const uint VERTEX_SEGMENTED = 1 << 5;
-static const uint VERTEX_MEDIUM = 1 << 6;
 
 // What a path ray asks of the raygen beside its trace (`launch_path_ray`): the instance mask of a
 // LAYERS trace in front of its hit in the low bits, 0 for none, and a segment.
@@ -499,18 +498,12 @@ uint4* crossed_words(PathRoot r, uint slot)
 // The pixel of the path of the slice's `slot`th item.
 uint2 launch_pixel(PathRoot r, uint slot)
 {
-    uint index = r.slice_base + slot;
-    if (from_update(r))
-        return update_pixel(r, index);
-    if (from_photon(r))
-        return uint2(index % PHOTON_ROW, index / PHOTON_ROW);
-    uint2 extent = r.gbuffer.extent;
-    return uint2(index % extent.x, index / extent.x);
+    return item_pixel(r, r.slice_base + slot);
 }
 
 PathLoop launch_loop_of(PathRoot r, LaunchLoop l, uint2 pixel)
 {
-    Sampler rng = Sampler(pixel, r.frame, path_stream(r));
+    Sampler rng = path_sampler(r, pixel);
     rng.dimension = l.dimension;
     return unpack_loop(l.v, rng, l.rays);
 }
@@ -930,25 +923,15 @@ uint begin_interior_walk(PathRoot r, LaunchVertex v, uint medium, InteriorMedium
 uint reach_gbuffer(PathRoot r, uint4* at, inout PathLoop p, LayerRay ray, inout LaunchRecord record, uint2 pixel, bool start)
 {
     set_flag(p.flags, LOOP_GBUFFER_START, false);
-    set_flag(p.flags, LOOP_CAMERA, false);
-    set_flag(p.flags, LOOP_GBUFFER_HIT, false);
     if (!start)
         p.iteration++;
+    PathFixed f = { pixel };
     PackedSurface ps;
-    if (!gbuffer_surface(r, pixel, ps))
+    if (!arrive_gbuffer(r, f, p, record, start, ps, ray.dir))
     {
-        p.sky = p.throughput;
         store_part<LaunchLoop, 5>(at + LOOP_AT, launch_loop_from(p, 0.0, 0));
         return STEP_ENDED;
     }
-    ViewConstants* v = r.view;
-    float3 to_eye = v.eye_render.xyz - ps.position;
-    float3 dir = -to_eye / max(length(to_eye), 1e-30);
-    p.opaque++;
-    p.cone.width = cone_width(p.cone, length(ps.position - v.eye_render.xyz));
-    set_flag(p.flags, LOOP_DISPERSIVE, false);
-    record.arrive(r, surface_vertex(v, ps, dir), bsdf_unprepared(), start ? 0.0 : length(to_eye), false);
-    ray.dir = dir;
     store_part<PackedSurface, 7>(at + SURFACE_AT, ps);
     store_part<LaunchRay, 4>(at + RAY_AT, launch_ray(ray, 0.0, 0));
     store_part<LaunchLoop, 5>(at + LOOP_AT, launch_loop_from(p, 0.0, VERTEX_FIRST | VERTEX_GBUFFER));
@@ -962,7 +945,7 @@ uint begin_launch(PathRoot r, uint slot, uint2 pixel, PathStart start, Sampler r
     PathFixed f;
     PathLoop p;
     ShadeState c;
-    start_state(r, pixel, start, rng, false, f, p, c);
+    start_state(r, pixel, start, rng, record.photon(), f, p, c);
     p.rays = rays;
     uint4* at = slot_words(r, slot);
     store_tracked_parts(r, at, p, c);
@@ -976,70 +959,44 @@ uint begin_launch(PathRoot r, uint slot, uint2 pixel, PathStart start, Sampler r
     return reach_gbuffer(r, at, p, c.ray, record, pixel, true);
 }
 
-// The start of a view's path of the slice's `slot`th pixel: through the thin lens, inside the
-// interiors at its point of the lens; on a tile the layer guides traced, a camera ray that looks
-// for layers before the G-buffer's surface, inside the interiors at its near-plane point; else
-// from the G-buffer's surface. Debug views of the first vertex alone write the pixel here.
+// The start of a view's path of the slice's `slot`th pixel (`view_start`). Debug views of the
+// first vertex alone write the pixel here.
 public uint launch_start_view<S : ISurfaces>(PathRoot r, uint slot)
 {
     uint2 pixel = launch_pixel(r, slot);
-    Sampler rng = Sampler(pixel, r.frame, r.seed);
-    uint mode = path_mode(r);
-    if (mode == PATH_CACHE || mode == PATH_CACHE_LOD || mode == PATH_ORIGIN_BIAS || mode == PATH_CAUSTICS)
+    Sampler rng = path_sampler(r, pixel);
+    if (first_vertex_mode(r))
     {
         first_vertex_view<S>(r, pixel, rng);
         return STEP_DONE;
     }
-    PathStart start;
-    if (thin_lens(r))
-    {
-        start = lens_start(r, pixel, r.aperture_radius, r.focus_distance, 0.0, MASK_OPAQUE | MASK_DIELECTRIC, rng);
-        start.interior = lens_interior<S>(r, start.origin);
-    }
-    else
-    {
-        bool traced = pixel_traced(r, pixel);
-        start = pinhole_start(r.view, r.gbuffer, pixel, traced);
-        if (traced)
-            start.interior = Interior(r.layers[pixel.y * r.gbuffer.extent.x + pixel.x].near_interior);
-    }
+    PathStart start = view_start<S>(r, pixel, rng);
     LaunchRecord record = launch_record(r, slot);
-    store_part<StoredView, RECORD_WORDS>(record.words, new_view_record(pcg3d(uint3(pixel, r.frame ^ r.seed)).x));
+    store_part<StoredView, RECORD_WORDS>(record.words, view_record_start(r, pixel));
     return begin_launch(r, slot, pixel, start, rng, 0, record);
 }
 
-// The update path of the slice's `slot`th block: from its pixel's G-buffer surface, inside the
-// interiors around it.
+// The update path of the slice's `slot`th block (`update_path_start`).
 public uint launch_start_update<S : ISurfaces>(PathRoot r, uint slot)
 {
     uint2 pixel = launch_pixel(r, slot);
-    uint2 extent = r.gbuffer.extent;
-    if (any(pixel >= extent))
+    if (any(pixel >= r.gbuffer.extent))
         return STEP_DONE;
-    Sampler rng = Sampler(pixel, r.frame, r.seed ^ UPDATE_STREAM);
-    PathStart start = pinhole_start(r.view, r.gbuffer, pixel, false);
-    start.interior = gbuffer_interior<S>(r.scene, r.view, r.layers, extent, pixel, start);
     LaunchRecord record = launch_record(r, slot);
     store_part<CacheUpdate, UPDATE_RECORD_WORDS>(record.words, CacheUpdate());
-    return begin_launch(r, slot, pixel, start, rng, 0, record);
+    return begin_launch(r, slot, pixel, update_path_start<S>(r, pixel), path_sampler(r, pixel), 0, record);
 }
 
-// The background layer's path of the slice's `slot`th pixel: on a marked pixel its lens ray past
-// the mask's depth, the full path at the view path's settings; else its texel, (0, 0, 0, -1).
+// The background layer's path of the slice's `slot`th pixel (`background_path_start`).
 public uint launch_start_background(PathRoot r, uint slot)
 {
     uint2 pixel = launch_pixel(r, slot);
-    float mask = r.dof_mask.get<Texture2D<float>>().Load(int3(pixel, 0));
-    if (!(mask > 0.0))
-    {
-        r.dof_background.get<RWTexture2D<float4>>()[pixel] = float4(0.0, 0.0, 0.0, -1.0);
+    Sampler rng = path_sampler(r, pixel);
+    PathStart start;
+    if (!background_path_start(r, pixel, rng, start))
         return STEP_DONE;
-    }
-    float near = r.view.clip_from_view[2][3];
-    Sampler rng = Sampler(pixel, r.frame, r.seed ^ DOF_STREAM);
-    PathStart start = lens_start(r, pixel, r.dof_aperture, *r.dof_focus, near / mask, MASK_OPAQUE | MASK_DIELECTRIC, rng);
     LaunchRecord record = launch_record(r, slot);
-    store_part<StoredView, RECORD_WORDS>(record.words, new_view_record(pcg3d(uint3(pixel, r.frame ^ r.seed ^ DOF_STREAM)).x));
+    store_part<StoredView, RECORD_WORDS>(record.words, view_record_start(r, pixel));
     return begin_launch(r, slot, pixel, start, rng, 0, record);
 }
 
@@ -1052,31 +1009,15 @@ public uint launch_start_photon<S : ISurfaces>(PathRoot r, uint slot)
     if (index >= r.caustics.photon_count || !(r.caustics.source.total > 0.0))
         return STEP_DONE;
     uint2 pixel = launch_pixel(r, slot);
-    Sampler rng = Sampler(pixel, r.frame, r.seed ^ PHOTON_STREAM);
+    Sampler rng = path_sampler(r, pixel);
     PhotonStart p;
     PhotonRay light;
     if (!photon_emit<S>(r, index, rng, p, light))
         return STEP_DONE;
-    PathStart start = PathStart();
-    start.origin = p.point;
-    start.dir = p.dir;
-    start.mask = MASK_OPAQUE | MASK_DIELECTRIC;
-    start.interior = p.interior;
-    start.throughput = p.flux;
-    start.given = true;
-    start.directional = p.directional;
-    PathFixed f;
-    PathLoop l;
-    ShadeState c;
-    start_state(r, pixel, start, rng, true, f, l, c);
+    LaunchRecord record = launch_record(r, slot);
+    store_part<CausticPhoton, RECORD_WORDS>(record.words, CausticPhoton(p.entry));
+    begin_launch(r, slot, pixel, photon_path_start(p), rng, 0, record);
     uint4* at = slot_words(r, slot);
-    store_tracked_parts(r, at, l, c);
-    store_spectral_part(r, at, c.spectral);
-    store_part<CausticPhoton, RECORD_WORDS>(launch_record(r, slot).words, CausticPhoton(p.entry));
-    // The given hit lies at the ray's origin, from which no light density is taken.
-    c.ray.from = float3(0.0);
-    store_part<LaunchRay, 4>(at + RAY_AT, launch_ray(c.ray, 0.0, start.mask));
-    store_part<LaunchLoop, 5>(at + LOOP_AT, launch_loop_from(l, 0.0, 0));
     GivenHit given = { p.hit.instance_index, p.hit.custom_index, p.hit.cluster_id, p.hit.primitive_index, p.hit.barycentrics, p.hit.front_face ? 1u : 0u, p.dir, p.positions };
     store_part<GivenHit, 5>(at + SURFACE_AT, given);
     // What the interiors around the start take of the flux on the way to the light, as its
@@ -1101,24 +1042,18 @@ public uint launch_gbuffer(PathRoot r, uint slot)
 // The ray of `slot`'s path and its instance mask, with the payload its any-hit shaders read,
 // counted on the path; `last` where the opaque vertex it may reach is the last bounce's hit, and
 // in `front` what the raygen does between its trace and its hit's shader (FRONT_*), and `gbuffer`
-// for a camera ray that only looks for layers. Rays leaving a layer or a scatter, and the first
-// vertex's, see particles, and every path ray that adds emission sees the proxies of sphere and
-// rect lights, which cover nothing: a LAYERS trace finds them in front of the hit. The camera ray
-// sees neither, and crosses a segment only inside an interior that the froxels do not hold.
+// for a camera ray that only looks for layers. A LAYERS trace finds what `front_mask` names in
+// front of the hit. The camera ray crosses a segment only inside an interior that the froxels do
+// not hold.
 public RayDesc launch_path_ray(PathRoot r, uint slot, out uint mask, out uint4 payload, out bool last, out uint front, out bool gbuffer)
 {
     LaunchVertex v = load_vertex(r, slot);
     LaunchRay ray = v.ray;
     bool camera = has(v.p.flags, LOOP_CAMERA);
-    front = 0;
-    if (!camera)
-    {
-        bool adds = v.x.count_bsdf && has(v.p.flags, LOOP_COUNTED);
-        bool particles = v.record.particles() && (v.c.ray.chain || v.p.depth == 0) && r.set.particle_entries > 0;
-        bool lights = adds && r.set.local_lights > 0;
-        front = (particles ? MASK_PARTICLE : 0) | (lights ? MASK_LIGHT : 0) | ((r.features & FEATURE_SEGMENTS) != 0 ? FRONT_SEGMENT : 0);
-    }
-    if (interiors_tracked(r) && (!camera || has(v.p.flags, LOOP_CARRIED)) && v.c.interior.innermost() != MATERIAL_NONE)
+    front = front_mask(r, v.p, v.c.ray, v.record, v.x);
+    if (!camera && (r.features & FEATURE_SEGMENTS) != 0)
+        front |= FRONT_SEGMENT;
+    if (in_interior(r, v.p, v.c.interior))
         front |= FRONT_SEGMENT;
     uint depth = camera ? 0 : v.p.depth + 1;
     mask = camera ? ray.flags >> LAUNCH_MASK_SHIFT : MASK_OPAQUE | MASK_DIELECTRIC;
@@ -1147,33 +1082,16 @@ public RayDesc launch_path_ray(PathRoot r, uint slot, out uint mask, out uint4 p
 public uint launch_resolve<S : ISurfaces, H : IHit>(PathRoot r, uint slot, H h)
 {
     LaunchVertex v = load_vertex(r, slot);
-    ViewConstants* view = r.view;
     if ((v.vertex & VERTEX_EXIT) != 0)
         return resolve_exit<S, H>(r, v, h);
     bool first = has(v.p.flags, LOOP_CAMERA);
-    // The march's jitter of a segment past the first, drawn where no segment ran.
-    if (!first && (v.vertex & VERTEX_SEGMENTED) == 0)
-        v.p.rng.next();
-    v.p.iteration++;
-    set_flag(v.p.flags, LOOP_CAMERA, false);
-    set_flag(v.p.flags, LOOP_GBUFFER_HIT, false);
-    // The camera ray's vertex lies its origin's distance further from the eye.
-    float t = first ? camera_start(r, v.f.pixel).offset + h.t() : h.t();
-    HitContext context = hit_context(first ? HIT_PRIMARY : HIT_SECONDARY, v.p.depth, v.p.cone, t, texture_tap(view, v.f.pixel, r.frame, r.seed, v.p.depth), v.x.feedback);
+    float t = end_ray(r, v, h.t());
     PackedSurface ps;
-    if (!resolve_opaque<FeedbackSurface<S>, H>(r, h, context, ps))
+    if (!arrive_hit<S, H>(r, v.f, v.p, v.record, v.x, h, t, ps))
     {
         store_loop_part(v);
         return STEP_ENDED;
     }
-    if (!first)
-        v.p.cone = cone_after_hit(v.p.cone, t, 0.0);
-    v.p.opaque++;
-    if (first)
-        v.p.cone.width = cone_width(v.p.cone, length(ps.position - view.eye_render.xyz));
-    set_flag(v.p.flags, LOOP_DISPERSIVE, false);
-    if (first)
-        v.record.arrive(r, surface_vertex(view, ps, h.world_direction()), bsdf_unprepared(), t, false);
     v.t = t;
     v.vertex = first ? VERTEX_FIRST : 0;
     store_part<PackedSurface, 7>(v.at + SURFACE_AT, ps);
@@ -1181,14 +1099,24 @@ public uint launch_resolve<S : ISurfaces, H : IHit>(PathRoot r, uint slot, H h)
     return vertex_step(ps);
 }
 
+// The end of the iteration that traced `v`'s ray to its hit `t` m along it: the march's jitter of
+// a segment past the first, drawn where no segment ran, and the iteration counted. The hit's
+// distance, from the eye for the camera ray's vertex, which lies its origin's distance further.
+float end_ray(PathRoot r, inout LaunchVertex v, float t)
+{
+    bool first = has(v.p.flags, LOOP_CAMERA);
+    if (!first && (v.vertex & VERTEX_SEGMENTED) == 0)
+        v.p.rng.next();
+    v.p.iteration++;
+    return first ? camera_start(r, v.f.pixel).offset + t : t;
+}
+
 // The surface hit `h` where `v`'s subsurface walk leaves, into its surface words: the entry's,
 // which an exit without a subsurface weight scatters with, go to the walk part first.
 uint resolve_exit<S : ISurfaces, H : IHit>(PathRoot r, LaunchVertex v, H h)
 {
-    uint depth = v.p.depth + 1;
-    HitContext context = hit_context(HIT_SECONDARY, depth, v.p.cone, h.t(), texture_tap(r.view, v.f.pixel, r.frame, r.seed, depth), v.x.feedback);
     PackedSurface exit;
-    if (!resolve_opaque<FeedbackSurface<S>, H>(r, h, context, exit))
+    if (!resolve_walk_exit<S, H>(r, v.f, v.p, v.x, h, exit))
         return STEP_ENDED;
     if (!(unpack_surface(exit).bsdf.subsurface_weight > 0.0))
     {
@@ -1222,56 +1150,17 @@ public uint launch_resolve_layer<S : ISurfaces, H : IHit>(PathRoot r, uint slot,
     // too, whose record resolves a layer.
     if ((v.vertex & VERTEX_EXIT) != 0)
         return resolve_exit<S, H>(r, v, h);
-    ViewConstants* view = r.view;
     bool first = has(v.p.flags, LOOP_CAMERA);
-    bool counted = has(v.p.flags, LOOP_COUNTED);
-    if (!first && (v.vertex & VERTEX_SEGMENTED) == 0)
-        v.p.rng.next();
-    v.p.iteration++;
-    set_flag(v.p.flags, LOOP_CAMERA, false);
-    set_flag(v.p.flags, LOOP_GBUFFER_HIT, false);
-    float t = first ? camera_start(r, v.f.pixel).offset + h.t() : h.t();
-    float3 dir = h.world_direction();
-    HitContext context = hit_context(first ? HIT_PRIMARY : HIT_SECONDARY, v.p.depth, v.p.cone, t, texture_tap(view, v.f.pixel, r.frame, r.seed, v.p.depth), v.x.feedback);
-    float3 positions[3] = { h.corner(0), h.corner(1), h.corner(2) };
-    uint instance = h.instance_index();
-    uint cluster = uint(h.cluster_id());
-    SurfaceHit sh = resolve_hit<FeedbackSurface<S>>(r.scene, view, dir, instance, cluster, h.primitive_index(), h.barycentrics(), positions, false, context);
-    if (!sh.valid)
+    float t = end_ray(r, v, h.t());
+    Sampler rng = v.p.rng;
+    PackedLayer pl;
+    bool alive = resolve_layer_hit<S, H>(r, v.f, v.p, v.c, v.x, h, t, rng, pl);
+    v.p.rng = rng;
+    if (!alive)
     {
         store_loop_part(v);
         return STEP_ENDED;
     }
-    if (!first)
-        v.p.cone = cone_after_hit(v.p.cone, t, 0.0);
-    v.p.layers++;
-    if (v.p.layers > r.dielectric_depth && !first)
-    {
-        if (v.x.cache && counted)
-        {
-            Sampler rng = v.p.rng;
-            v.p.radiance += v.c.spectral.color(v.p.throughput * interior_ambient(r, sh.surface.position, dir, rng));
-            v.p.rng = rng;
-        }
-        store_loop_part(v);
-        return STEP_ENDED;
-    }
-    // A plane stack the path tracks takes a layer on one of its faces.
-    bool stack = false;
-    if (stack_kept(r) && v.c.stack.valid)
-    {
-        Hit face_hit = Hit();
-        face_hit.hit = true;
-        face_hit.triangle = true;
-        face_hit.instance_index = instance;
-        face_hit.cluster_id = h.cluster_id();
-        face_hit.primitive_index = h.primitive_index();
-        face_hit.barycentrics = h.barycentrics();
-        face_hit.class_id = class_of(scene_traced(r.scene), h.custom_index(), instance, h.cluster_id());
-        StackFace face;
-        stack = stack_face(r.scene, face_hit, v.x.disperse, face);
-    }
-    PackedLayer pl = pack_layer(r, sh, instance, cluster, h.primitive_index(), h.barycentrics(), dir, stack);
     store_part<PackedSurface, 7>(v.at + SURFACE_AT, pl.surface);
     store_part<LayerWords, LAYER_WORDS>(v.at + layer_at(r), pl.layer);
     v.t = t;
@@ -2086,86 +1975,33 @@ public uint launch_scatter_layer<S : ISurfaces>(PathRoot r, uint slot)
 // ---------------------------------------------------------------------------------------------
 // Media
 
-// The segment of `v`'s ray to `t` inside the innermost interior the path lies in: its
-// transmittance, or a scatter in it that takes the hit's place. 0 where the path goes on to
-// what the ray met, else the step of the scatter or STEP_ENDED.
-uint interior_segment_of(PathRoot r, inout LaunchVertex v, float t)
-{
-    SceneRoot* s = r.scene;
-    bool camera = has(v.p.flags, LOOP_CAMERA);
-    LayerRay ray = v.c.ray;
-    uint medium = v.c.interior.innermost();
-    InteriorMedium im = interior_medium(s, medium, v.c.interior.point(medium));
-    // The segment runs from the surface point its offset origin left.
-    float span = segment_length(ray.start, ray.origin, ray.dir, t);
-    // A walk takes a bounce; a ray leaving an opaque vertex takes transmittance only.
-    bool walks = v.record.walks() && ray.chain && (v.x.reference || !has(v.p.flags, LOOP_WALKED)) && v.p.opaque < r.max_bounces
-        && max_component(im.sigma_s) * span >= 1.0;
-    Sampler rng = v.p.rng;
-    float scattered;
-    bool scatters = interior_segment(im, span, ray.scatter || walks || camera, rng, v.p.throughput, scattered);
-    v.p.rng = rng;
-    v.vertex |= VERTEX_SEGMENTED;
-    if (scatters)
-    {
-        float3 at = ray.origin + ray.dir * max(scattered - (span - t), 0.0);
-        v.p.cone = cone_after_hit(v.p.cone, scattered, 0.0);
-        v.p.opaque++;
-        if (walks)
-        {
-            set_flag(v.p.flags, LOOP_WALKED, true);
-            float ior = interior_ior(s, medium) / interior_ior(s, v.c.interior.outside(medium, medium));
-            Sampler walk_rng = v.p.rng;
-            uint step = begin_interior_walk(r, v, medium, im, ior, at, ray.dir, walk_rng);
-            v.p.rng = walk_rng;
-            return step;
-        }
-        return reach_medium_vertex(r, v, at, medium, im.anisotropy, camera ? camera_start(r, v.f.pixel).offset : 0.0);
-    }
-    if (!any(v.p.throughput > 0.0) || !all(isfinite(v.p.throughput)))
-        return STEP_ENDED;
-    return 0;
-}
-
-// What the segment of `v`'s ray outside every interior does, `t` m to its hit (`hit`) or to
-// infinity: past the camera ray, the linked medium's in-scatter and transmittance, through the
-// froxels for rays leaving a layer or a scatter, marched where the ray is one of those or long;
-// elsewhere transmittance alone. The march's jitter dimension is drawn either way, so later
-// dimensions stay put. STEP_ENDED where nothing goes on.
-uint media_segment<M : IMedium>(PathRoot r, inout LaunchVertex v, bool hit, float t)
-{
-    LayerRay ray = v.c.ray;
-    if (hit && (ray.chain || t >= INSCATTER_SEGMENT))
-    {
-        float3 through_medium;
-        float3 e;
-        if (ray.chain)
-            e = froxel_segment_inscatter<M>(r.froxels, r.view, r.set, ray.origin, ray.dir, t, r.segment_steps, v.p.rng.next(), through_medium);
-        else
-            e = segment_inscatter<M>(r.set, ray.origin, ray.dir, t, r.segment_steps, v.p.rng.next(), through_medium);
-        if (has(v.p.flags, LOOP_COUNTED) && !v.x.photon)
-            v.p.radiance += v.c.spectral.color(v.p.throughput * e);
-        v.p.throughput *= through_medium;
-    }
-    else
-    {
-        v.p.rng.next();
-        if (hit)
-            v.p.throughput *= medium_transmittance<M>(r.scene.medium, ray.origin, ray.dir, t);
-    }
-    return any(v.p.throughput > 0.0) && all(isfinite(v.p.throughput)) ? 0 : STEP_ENDED;
-}
-
 // The segment callable's body: what lies along `slot`'s path ray between its origin and its
 // hit (`hit`, `t` m on) or infinity, before the hit's shader: inside the innermost interior the
-// path lies in, else outside every one. 0 where the path goes on to what the ray met, else a step
-// that takes its place.
+// path lies in, its transmittance, or a scatter in it that takes the hit's place, past which the
+// path may walk the interior; else outside every one (`media_segment`). 0 where the path goes on
+// to what the ray met, else a step that takes its place.
 public uint launch_segment<M : IMedium>(PathRoot r, uint slot, bool hit, float t)
 {
     LaunchVertex v = load_vertex(r, slot);
-    bool camera = has(v.p.flags, LOOP_CAMERA);
-    bool inside = interiors_tracked(r) && (!camera || has(v.p.flags, LOOP_CARRIED)) && v.c.interior.innermost() != MATERIAL_NONE;
-    uint step = inside ? interior_segment_of(r, v, t) : media_segment<M>(r, v, hit, t);
+    Sampler rng = v.p.rng;
+    uint step = 0;
+    if (in_interior(r, v.p, v.c.interior))
+    {
+        bool camera = has(v.p.flags, LOOP_CAMERA);
+        uint medium = v.c.interior.innermost();
+        InteriorMedium im = interior_medium(r.scene, medium, v.c.interior.point(medium));
+        float3 at;
+        uint segment = interior_segment_of(r, v.p, rng, v.c.ray, v.record, v.x, im, t, camera, at);
+        if (segment == SEGMENT_WALK)
+            step = begin_interior_walk(r, v, medium, im, interior_walk_ior(r.scene, v.c.interior, medium), at, v.c.ray.dir, rng);
+        else if (segment == SEGMENT_SCATTER)
+            step = reach_medium_vertex(r, v, at, medium, im.anisotropy, camera ? camera_start(r, v.f.pixel).offset : 0.0, rng);
+    }
+    else
+        media_segment<M>(r, v.p, rng, v.c.ray, v.c.spectral, v.x, hit, t);
+    v.p.rng = rng;
+    if (step == 0 && !carries(v.p.throughput))
+        step = STEP_ENDED;
     v.vertex |= VERTEX_SEGMENTED;
     store_loop_part(v);
     return step;
@@ -2175,14 +2011,13 @@ public uint launch_segment<M : IMedium>(PathRoot r, uint slot, bool hit, float t
 // `anisotropy`, `offset` m further from the eye than the ray's origin for the camera ray: the
 // scatter's surface words and the end of the iteration that reached it. Its caller stores the
 // loop. STEP_VERTEX of CLASS_SCATTER, or STEP_ENDED.
-uint reach_medium_vertex(PathRoot r, inout LaunchVertex v, float3 point, uint medium, float anisotropy, float offset)
+uint reach_medium_vertex(PathRoot r, inout LaunchVertex v, float3 point, uint medium, float anisotropy, float offset, inout Sampler rng)
 {
     float t = offset + distance(v.c.ray.origin, point);
-    if (!reach_scatter<LaunchRecord>(r, v.p, v.c, v.record, v.x, point, medium, anisotropy, t, v.p.rng))
+    if (!reach_scatter<LaunchRecord>(r, v.p, v.c, v.record, v.x, point, medium, anisotropy, t, rng))
         return STEP_ENDED;
     MediumVertex m = { point, medium, anisotropy };
     store_part<MediumVertex, 2>(v.at + SURFACE_AT, m);
-    v.vertex = VERTEX_MEDIUM;
     return STEP_VERTEX | (CLASS_SCATTER << STEP_CLASS_SHIFT);
 }
 
@@ -2379,7 +2214,7 @@ public uint launch_layers(PathRoot r, uint slot, uint kept, float t_max, out flo
     store_coherent(at + FRONT_BOUND, key);
     bound = asfloat(key.x);
     store_loop_part(v);
-    return any(v.p.throughput > 0.0) && all(isfinite(v.p.throughput)) ? 0 : STEP_ENDED;
+    return carries(v.p.throughput) ? 0 : STEP_ENDED;
 }
 
 // The proxy march callable's body: what the `kept` medium proxies with a volume a LAYERS trace of
@@ -2408,64 +2243,27 @@ public uint launch_proxy_march(PathRoot r, uint slot, uint kept, out float bound
 // ---------------------------------------------------------------------------------------------
 // Finishes, each STEP_DONE but where a path runs again
 
-// What a view does with `slot`'s finished path in pass `pass`: the pixel's radiance, the sky
-// where its camera ray met nothing, its layer memory and light feedback, and with frost the
-// background's luminance. A frosted pixel's first pass starts the second from the G-buffer's
-// surface, with the sampler, rays and record the first left: the step it starts with.
+// What a view does with `slot`'s finished path in pass `pass` (`view_pass_end`). A frosted
+// pixel's first pass starts the second from the G-buffer's surface, with the sampler, rays and
+// record the first left: the step it starts with.
 public uint launch_finish_view<S : ISurfaces, E : IEnvironment, M : IMedium>(PathRoot r, uint slot, uint pass)
 {
     LaunchVertex v = load_vertex(r, slot);
-    ViewConstants* view = r.view;
     uint2 pixel = v.f.pixel;
-    StoredView record = load_part<StoredView, RECORD_WORDS>(v.record.words);
-    float pre_exposure = view.exposure[view.exposure_slot].pre_exposure;
-    float3 pixel_radiance = view_exposed(record) + pre_exposure * v.p.radiance;
-    bool sky = any(v.p.sky > 0.0) && path_mode(r) != PATH_INDIRECT && path_mode(r) != PATH_SUBSURFACE;
-    bool two = two_passes(r, pixel);
     bool second = pass != 0;
-    PathStart camera_ray = PathStart();
-    if (sky || (two && !second))
-        camera_ray = camera_start(r, pixel);
-    if (sky)
-        pixel_radiance += pre_exposure * v.p.sky * sky_radiance<E, M>(r.set, view.eye_render.xyz, camera_ray.dir);
     // The pixel's rays count both passes: the second reads the texel the first pass's shader
     // wrote.
     RWTexture2D<float4> radiance = r.radiance.get<RWTexture2D<float4>>();
     bool rays = path_mode(r) == PATH_RAYS;
-    if (!second)
-    {
-        float4 texel = view_outputs(r, v.f, v.p, record, pixel_radiance);
-        if (rays && two)
-            store_texel_coherent(radiance, pixel, texel);
-    }
-    else
-    {
-        if (rays)
-            radiance[pixel] = float4(float(v.p.rays), load_texel_coherent(radiance, pixel).yzw);
-        r.layers[pixel.y * r.gbuffer.extent.x + pixel.x].background = guide_luminance(pixel_radiance);
-    }
-    if (!two || second)
-        return STEP_DONE;
-    // The second pass's path starts inside what holds the G-buffer's surface.
+    if (second && rays)
+        radiance[pixel] = float4(float(v.p.rays), load_texel_coherent(radiance, pixel).yzw);
+    StoredView record = load_part<StoredView, RECORD_WORDS>(v.record.words);
+    float4 texel;
     PathStart start;
-    if (thin_lens(r))
-    {
-        start = PathStart();
-        start.interior = lens_interior<S>(r, camera_ray.origin);
-    }
-    else
-    {
-        start = pinhole_start(view, r.gbuffer, pixel, true);
-        start.interior = Interior(r.layers[pixel.y * r.gbuffer.extent.x + pixel.x].near_interior);
-        if (isfinite(start.t_max))
-            surface_crossings<S>(r.scene, view, start.origin, start.dir, start.t_max, start.interior);
-    }
-    start.dir = camera_ray.dir;
-    start.throughput = float3(1.0);
-    start.mask = 0;
-    start.gbuffer = true;
-    // The second pass's path takes the G-buffer's emission anew.
-    record.own = float3(0.0);
+    if (!view_pass_end<S, E, M>(r, v.f, v.p, record, second, texel, start))
+        return STEP_DONE;
+    if (rays)
+        store_texel_coherent(radiance, pixel, texel);
     store_part<StoredView, RECORD_WORDS>(v.record.words, record);
     return begin_launch(r, slot, pixel, start, v.p.rng, v.p.rays, v.record);
 }
@@ -2484,17 +2282,7 @@ public uint launch_finish_record(PathRoot r, uint slot)
 public uint launch_finish_background<E : IEnvironment, M : IMedium>(PathRoot r, uint slot)
 {
     LaunchVertex v = load_vertex(r, slot);
-    ViewConstants* view = r.view;
-    float pre_exposure = view.exposure[view.exposure_slot].pre_exposure;
-    float near = view.clip_from_view[2][3];
-    StoredView record = load_part<StoredView, RECORD_WORDS>(v.record.words);
-    PathStart camera_ray = camera_start(r, v.f.pixel);
-    float4 texel;
-    if (!(record.first_distance > 0.0))
-        texel = float4(apply_hdr_ceiling(pre_exposure * sky_radiance<E, M>(r.set, view.eye_render.xyz, camera_ray.dir)), 0.0);
-    else
-        texel = float4(apply_hdr_ceiling(pre_exposure * v.p.radiance), near / (camera_ray.axis * view_first_t(record)));
-    r.dof_background.get<RWTexture2D<float4>>()[v.f.pixel] = texel;
+    background_texel<E, M>(r, v.f.pixel, load_part<StoredView, RECORD_WORDS>(v.record.words), v.p.radiance);
     return STEP_DONE;
 }
 
