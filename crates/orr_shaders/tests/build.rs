@@ -207,7 +207,7 @@ fn editing_one_input_recompiles_only_its_modules() {
         &[
             ("src/a.slang", &a),
             ("src/b.slang", &b),
-            ("src/common.slang", "float scale() { return 1; }\n"),
+            ("src/common.slang", "public float scale() { return 1; }\n"),
         ],
     );
     let compiled = |dir: &Path| {
@@ -222,7 +222,7 @@ fn editing_one_input_recompiles_only_its_modules() {
     assert_eq!(compiled(&dir), ["b"]);
     fs::write(
         dir.join("src/common.slang"),
-        "float scale() { return 4; }\n",
+        "public float scale() { return 4; }\n",
     )
     .unwrap();
     assert_eq!(compiled(&dir), ["a"]);
@@ -490,7 +490,7 @@ const SURFACE: &str = "module surface;\n\
     public struct SurfaceInput { public uint surface; public float x; }\n\
     public struct GSurface { public float4 albedo; }\n\
     public interface ISurface {\n\
-        static bool surface(SurfaceInput i, out GSurface g, out float d) { g = (GSurface)0; d = 0; return false; }\n\
+        static bool surface(SurfaceInput i, out GSurface g, out float d) { g = GSurface(); d = 0; return false; }\n\
         static void adjust(SurfaceInput i, inout GSurface g, inout float d) {}\n\
         static bool coverage(SurfaceInput i, out float c) { c = 0; return false; }\n\
         static void feedback(SurfaceInput i) {}\n\
@@ -518,7 +518,7 @@ const SURFACE: &str = "module surface;\n\
 /// A consumer surface returning `value`.
 fn consumer_surface(ty: &str, value: &str) -> String {
     format!(
-        "import orr_scene.surface;\nstruct {ty} : ISurface {{ override static bool surface(SurfaceInput i, out GSurface g, out float d) {{ d = 0; g = {{ float4({value}) }}; return true; }} }}\n"
+        "import orr_scene.surface;\npublic struct {ty} : ISurface {{ override static bool surface(SurfaceInput i, out GSurface g, out float d) {{ d = 0; g = {{ float4({value}) }}; return true; }} }}\n"
     )
 }
 
@@ -554,7 +554,7 @@ fn link_fixture(name: &str) -> (PathBuf, Output) {
             ("consumer/grass.slang", &consumer_surface("Grass", "3")),
             (
                 "consumer/air.slang",
-                "import orr_lighting.media;\nstruct Air : IMedium { static float density(uint64_t data) { return 0.5; } }\n",
+                "import orr_lighting.media;\npublic struct Air : IMedium { static float density(uint64_t data) { return 0.5; } }\n",
             ),
         ],
     );
@@ -628,7 +628,7 @@ fn link_calls_are_checked() {
     let stale = dir.join("consumer/stale.slang");
     fs::write(
         &stale,
-        "import orr_scene.surface;\nstruct Stale : ISurface { static GSurface surface(SurfaceInput i, out float d) { d = 0; return { float4(1) }; } }\n",
+        "import orr_scene.surface;\npublic struct Stale : ISurface { static GSurface surface(SurfaceInput i, out float d) { d = 0; return { float4(1) }; } }\n",
     )
     .unwrap();
     let stale = consumer(&dir, &renderer).link(LinkPoint::Surface, "stale", &stale, "Stale");

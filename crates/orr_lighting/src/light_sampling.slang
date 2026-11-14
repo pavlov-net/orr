@@ -936,7 +936,7 @@ public struct EmitterHit
 public EmitterHit emitter_hit(LightSetGpu* set, uint instance_index, uint cluster_id, uint primitive, float2 bary, bool back)
 {
     SceneRoot* s = set.scene;
-    EmitterHit h = (EmitterHit)0;
+    EmitterHit h = EmitterHit();
     h.light = NO_LIGHT;
     uint entry;
     uint p = 0;

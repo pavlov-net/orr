@@ -257,7 +257,7 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     GroupMemoryBarrierWithGroupSync();
     uint index = grid_index(group);
     uint n = second ? min(r.counts[COUNT_WORK], r.work_capacity) : min(cut.counters[CUT_CANDIDATES], cut.candidate_capacity);
-    ClusterWork w = (ClusterWork)0;
+    ClusterWork w = ClusterWork();
     if (index < n)
         w = second ? r.work[index] : cut.candidates[index];
     uint copy = w.instance;
@@ -275,9 +275,9 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         ModelGpu* model = s.models + inst.model;
         MeshGpu* mesh = s.meshes + model.mesh;
         uint8_t* page = (uint8_t*)mesh_page(s, mesh, w.page);
-        Placement placed = (Placement)0;
-        Placement p = (Placement)0;
-        Cluster c = (Cluster)0;
+        Placement placed = Placement();
+        Placement p = Placement();
+        Cluster c = Cluster();
         uint material = MATERIAL_NONE;
         SkinnedGpu k;
         bool skinned = copy_skin(s, inst, k);

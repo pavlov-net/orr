@@ -2,7 +2,7 @@
 // kernels, `ripple` in the tessellation tests.
 import orr_scene.displacement;
 
-struct Ripple : IDisplacement
+public struct Ripple : IDisplacement
 {
     static float3 displace(DisplacementInput i)
     {

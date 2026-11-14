@@ -1,7 +1,7 @@
 // A surface that replaces the standard one, has its own coverage and echoes its hit context.
 import orr_scene.surface;
 
-struct GroundBlend : ISurface
+public struct GroundBlend : ISurface
 {
     override static bool surface(SurfaceInput i, out GSurface g, out float depth_offset)
     {

@@ -200,7 +200,7 @@ uint emit(ProducerBatch b, ProducerClusterGpu c)
 public uint emit_template_cluster(ProducerBatch b, uint topology, uint first_vertex,
                                  uint material, uint user)
 {
-    TopologyGpu t = (TopologyGpu)0;
+    TopologyGpu t = TopologyGpu();
     if (topology < b.topology_count)
         t = b.topologies[topology];
     ProducerClusterGpu c;
@@ -356,7 +356,7 @@ public struct Segment
 // batch, a position or radius that is not finite, or a negative radius.
 public bool load_segment(ProducerBatch b, uint s, bool previous, out Segment g)
 {
-    g = (Segment)0;
+    g = Segment();
     if (s >= emitted_segments(b))
         return false;
     uint v = b.segments[s];

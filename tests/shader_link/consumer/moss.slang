@@ -2,7 +2,7 @@
 // coverage to it.
 import orr_scene.surface;
 
-struct Moss : ISurface
+public struct Moss : ISurface
 {
     override static void adjust(SurfaceInput i, inout GSurface g, inout float depth_offset)
     {

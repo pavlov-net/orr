@@ -101,7 +101,7 @@ void clas(uint group: SV_GroupID, uint t: SV_GroupThreadID)
             box[i] = lo[i];
             box[3 + i] = hi[i];
         }
-        TemplateBuild tb = (TemplateBuild)0;
+        TemplateBuild tb = TemplateBuild();
         tb.cluster.cluster_id = 0;
         tb.cluster.tri_count = c.tri_count;
         tb.cluster.vertex_count = c.vertex_count;

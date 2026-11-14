@@ -26,7 +26,7 @@ public struct Placement
 // `offset`. False when the group hides it.
 public bool placement(GroupGpu* g, bool previous, uint index, int3 cell, float3 offset, uint cell_log2, out Placement p)
 {
-    p = (Placement)0;
+    p = Placement();
     if ((previous ? g.previous : g.current) == nullptr || index >= g.count)
         return false;
     float3x4 m = group_entry(g, previous, index);
@@ -225,7 +225,7 @@ public ProducerTriangle producer_triangle(ProducerBatch b, ProducerClusterGpu k,
     {
         uint v = c[j];
         t.corners.position[j] = positions[v];
-        VertexAttributes a = (VertexAttributes)0;
+        VertexAttributes a = VertexAttributes();
         a.normal = producer_normal(b.attrs[v]);
         a.uv[0] = producer_uv(b.attrs[v]);
         a.uv[1] = producer_uv1(b, v, a.uv[0]);
@@ -431,7 +431,7 @@ public bool crosses_interior(SceneRoot* s, uint material)
 // The skinned copy `inst` names; false for copies not from `add_skinned`.
 public bool copy_skin(SceneRoot* s, InstanceGpu inst, out SkinnedGpu k)
 {
-    k = (SkinnedGpu)0;
+    k = SkinnedGpu();
     if (!may2(MAY2_SKINNING) || (inst.flags & INSTANCE_SKINNED) == 0 || inst.pose_index >= s.skinned_capacity)
         return false;
     k = s.skinned[inst.pose_index];
@@ -685,7 +685,7 @@ public struct TracedTriangle
 // the entry's.
 public bool traced_triangle(SceneRoot* s, uint instance_index, uint cluster_id, uint primitive, bool previous, out TracedTriangle t)
 {
-    t = (TracedTriangle)0;
+    t = TracedTriangle();
     uint cell_log2 = uint(s.origin_cell.w);
     uint entry;
     if (hit_producer(s, instance_index, entry))
@@ -797,9 +797,9 @@ void finish_input(SceneRoot* s, ViewConstants* v, float3 d, uint material, Place
 // section's material.
 void triangle_input(SceneRoot* s, ViewConstants* v, float3 d, TracedTriangle tri, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, out HitInput h)
 {
-    h = (HitInput)0;
+    h = HitInput();
     float bias = footprint_bias(context.kind, v);
-    SurfaceInput i = (SurfaceInput)0;
+    SurfaceInput i = SurfaceInput();
     i.instance = tri.instance;
     i.cluster = tri.cluster;
     i.part = tri.part;
@@ -820,21 +820,21 @@ public SurfaceInput emitter_input(SceneRoot* s, TracedTriangle t, uint primitive
     HitInput h;
     RayCone none = { 0.0, 0.0 };
     HitContext context = hit_context(HIT_SECONDARY, 0, none, 0.0);
-    triangle_input(s, nullptr, d, t, primitive, bary, (Corners)0, false, false, true, context, h);
+    triangle_input(s, nullptr, d, t, primitive, bary, Corners(), false, false, true, context, h);
     return h.input;
 }
 
 // With `sided` the input is that of the side `d` meets, else of the section's material.
 bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, out HitInput h)
 {
-    h = (HitInput)0;
+    h = HitInput();
     uint entry;
     if (may2(MAY2_STRANDS) && hit_producer(s, instance_index, entry) && s.producers[entry].strands != 0)
     {
         // Strands are opaque, so only closest hits with their hit point reach here.
         uint cell_log2 = uint(s.origin_cell.w);
         float bias = footprint_bias(context.kind, v);
-        SurfaceInput i = (SurfaceInput)0;
+        SurfaceInput i = SurfaceInput();
         Placement pl;
         ProducerGpu p = s.producers[entry];
         ProducerBatch b = s.batches[entry];
@@ -907,7 +907,7 @@ void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bo
 // On a strand entry the surface's `cluster` is the segment and its `primitive` 0.
 public SurfaceHit resolve_hit<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], bool previous, HitContext context)
 {
-    SurfaceHit hit = (SurfaceHit)0;
+    SurfaceHit hit = SurfaceHit();
     Corners t;
     t.position = object_positions;
     HitInput h;
@@ -967,7 +967,7 @@ public float resolve_presence_section<S : ISurfaces>(SceneRoot* s, ViewConstants
     section = MATERIAL_NONE;
     if (!fade_present(s, d, instance_index))
         return 0.0;
-    Corners t = (Corners)0;
+    Corners t = Corners();
     HitInput h;
     if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, false, false, false, context, h))
         return 0.0;
@@ -1031,7 +1031,7 @@ bool particle_candidate(SceneRoot* s, uint entry, uint cluster_id, uint primitiv
 {
     material = MATERIAL_NONE;
     normal = float3(0.0);
-    i = (SurfaceInput)0;
+    i = SurfaceInput();
     ProducerGpu p = s.producers[entry];
     ProducerBatch b = s.batches[entry];
     if ((p.opacity != PRODUCER_PARTICLE && p.opacity != PRODUCER_SMOKE) || cluster_id >= emitted_clusters(b))
@@ -1059,7 +1059,7 @@ bool particle_candidate(SceneRoot* s, uint entry, uint cluster_id, uint primitiv
 // What a particle material's textures read at `uv`, with no filter footprint.
 public SurfaceInput particle_input(SceneRoot* s, uint material, float2 uv)
 {
-    SurfaceInput i = (SurfaceInput)0;
+    SurfaceInput i = SurfaceInput();
     i.scene = s;
     i.material = material;
     i.vertex_color = float4(1.0);
@@ -1102,9 +1102,9 @@ public bool resolve_smoke(SceneRoot* s, uint instance_index, uint cluster_id, ui
 public bool hit_previous_position(SceneRoot* s, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, out float3 position)
 {
     position = float3(0.0);
-    Corners t = (Corners)0;
+    Corners t = Corners();
     HitInput h;
-    HitContext context = (HitContext)0;
+    HitContext context = HitContext();
     if (!hit_input(s, nullptr, d, instance_index, cluster_id, primitive, bary, t, false, true, false, context, h))
         return false;
     position = h.input.position;
@@ -1117,10 +1117,10 @@ public bool hit_geometry(SceneRoot* s, float3 d, uint instance_index, uint clust
 {
     normal = float3(0.0);
     material = MATERIAL_NONE;
-    Corners t = (Corners)0;
+    Corners t = Corners();
     t.position = object_positions;
     HitInput h;
-    HitContext context = (HitContext)0;
+    HitContext context = HitContext();
     if (!hit_input(s, nullptr, d, instance_index, cluster_id, primitive, bary, t, true, false, true, context, h))
         return false;
     normal = h.input.geometric_normal;

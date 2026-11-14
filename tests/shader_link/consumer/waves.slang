@@ -1,6 +1,6 @@
 import orr_scene.displacement;
 
-struct Waves : IDisplacement
+public struct Waves : IDisplacement
 {
     static float3 displace(DisplacementInput i)
     {

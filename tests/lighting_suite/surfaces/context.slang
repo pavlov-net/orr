@@ -11,7 +11,7 @@ public struct Context : ISurface
     public override static bool surface(SurfaceInput i, out GSurface g, out float depth_offset)
     {
         depth_offset = 0.0;
-        g = (GSurface)0;
+        g = GSurface();
         g.normal = i.normal;
         g.geometric_normal = i.geometric_normal;
         g.bsdf.specular_ior = 1.5;

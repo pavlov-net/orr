@@ -54,7 +54,7 @@ void main(uint3 id: SV_DispatchThreadID)
     if (id.x >= extent.x * extent.y)
         return;
     uint2 pixel = uint2(id.x % extent.x, id.x / extent.x);
-    Seen o = (Seen)0;
+    Seen o = Seen();
     RayCone cone = camera_cone(v);
     float3 origin;
     float3 d;

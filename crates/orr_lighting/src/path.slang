@@ -325,7 +325,7 @@ public bool layer_group_pixel(PathRoot r, uint3 group, uint2 lane, out uint2 pix
 public LayerGuide layer_guide(LayerGuide* layers, uint2 extent, uint2 pixel)
 {
     if (traced_tiles(layers, extent)[layer_tile(extent, pixel)] == 0)
-        return (LayerGuide)0;
+        return LayerGuide();
     return layers[pixel.y * extent.x + pixel.x];
 }
 
@@ -604,7 +604,7 @@ public struct NeeDraw
 public NeeDraw nee_draw<S : ISurfaces, F : IScatter>(PathRoot r, PathVertex x, F f, uint2 pixel, LocalLights* local, uint candidates, float3 keep, bool chain, inout Sampler rng, bool no_environment)
 {
     LightSetGpu* set = r.set;
-    NeeDraw d = (NeeDraw)0;
+    NeeDraw d = NeeDraw();
     uint end = rng.dimension + 1 + 6 * candidates;
     if (f.specular_only())
     {
@@ -839,7 +839,7 @@ public BsdfSample walk_exit_sample(WalkExitScatter f, inout Sampler rng)
     float3 t, b;
     orthonormal_basis(f.n, t, b);
     float3 l = sample_cosine_hemisphere(rng.next2());
-    BsdfSample bs = (BsdfSample)0;
+    BsdfSample bs = BsdfSample();
     bs.wi = normalize(from_local(l, t, b, f.n));
     bs.pdf = cosine_hemisphere_pdf(l.z);
     bs.weight = bs.pdf > 0.0 ? bsdf_walk_exit(f.p, f.n, bs.wi, rng.next4().xyz) : float3(0.0);
@@ -1075,7 +1075,7 @@ public LayerVertex scatter_vertex(ViewConstants* v, float3 p, float3 dir, uint m
     l.anisotropy = anisotropy;
     l.stack = false;
     l.chains = false;
-    PathVertex x = (PathVertex)0;
+    PathVertex x = PathVertex();
     x.surface.position = p;
     x.surface.material = medium;
     x.view = -dir;
@@ -1095,7 +1095,7 @@ public LayerVertex leave_vertex(ViewConstants* v, float3 p, float3 n)
     l.anisotropy = 0.0;
     l.stack = false;
     l.chains = false;
-    PathVertex x = (PathVertex)0;
+    PathVertex x = PathVertex();
     x.surface.position = p;
     x.surface.normal = n;
     x.surface.geometric_normal = n;
@@ -1722,7 +1722,7 @@ public uint path_iterations(PathRoot r)
 // The first vertex of `pixel` from the G-buffer; false for sky pixels.
 public bool gbuffer_vertex(SceneRoot* s, ViewConstants* v, GBufferGpu* gbuffer, uint2 pixel, out PathVertex x)
 {
-    x = (PathVertex)0;
+    x = PathVertex();
     GSurface g = load_gsurface(v, gbuffer, pixel);
     if (g.material == MATERIAL_NONE)
         return false;
@@ -1746,7 +1746,7 @@ public PathStart lens_start(PathRoot r, uint2 pixel, float aperture, float focus
     float3 at_focus = through * (focus / max(-through.z, 1e-6));
     float3 lens = float3(sample_disk_concentric(rng.next2()) * aperture, 0.0);
     float3 view_dir = normalize(at_focus - lens);
-    PathStart start = (PathStart)0;
+    PathStart start = PathStart();
     start.offset = from / max(-view_dir.z, 1e-6);
     start.origin = render_from_view(v, lens + view_dir * start.offset);
     start.dir = render_direction(v, view_dir);
@@ -1777,7 +1777,7 @@ public Interior lens_interior<S : ISurfaces>(PathRoot r, float3 origin)
 public PathStart pinhole_start(ViewConstants* v, GBufferGpu* gb, uint2 pixel, bool traced)
 {
     float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
-    PathStart start = (PathStart)0;
+    PathStart start = PathStart();
     start.dir = render_direction(v, view_direction(v, uv));
     start.origin = render_from_view(v, view_position(v, uv, 1.0));
     start.offset = length(start.origin - v.eye_render.xyz);
@@ -1827,7 +1827,7 @@ public void first_vertex_view<S : ISurfaces>(PathRoot r, uint2 pixel, inout Samp
         RayCone cone = camera_cone(v);
         float width = cone_width(cone, x1.camera_distance);
         if (r.caustics != nullptr)
-            radiance = pre_exposure * caustic_gather<S>(r, l, b, false, (WalkExitScatter)0, width, rng);
+            radiance = pre_exposure * caustic_gather<S>(r, l, b, false, WalkExitScatter(), width, rng);
     }
     else if (surface && r.mode != PATH_ORIGIN_BIAS)
     {
@@ -1958,7 +1958,7 @@ public struct PhotonStart
 // both densities and the frame's photon count. False for a photon that starts with no flux.
 public bool photon_start<S : ISurfaces, M : IMedium>(PathRoot r, uint index, inout Sampler rng, out PhotonStart p)
 {
-    p = (PhotonStart)0;
+    p = PhotonStart();
     SceneRoot* s = r.scene;
     CausticsGpu* g = r.caustics;
     PhotonSourceGpu* source = g.source;
@@ -2005,7 +2005,7 @@ public bool photon_start<S : ISurfaces, M : IMedium>(PathRoot r, uint index, ino
     // The first vertex as a ray from the light resolves it.
     p.dir = -c.dir;
     p.point = y;
-    Hit h = (Hit)0;
+    Hit h = Hit();
     h.hit = true;
     h.triangle = true;
     h.instance_index = instance_index;

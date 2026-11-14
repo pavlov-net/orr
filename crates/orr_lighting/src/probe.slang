@@ -65,7 +65,7 @@ void probe(uint3 id: SV_DispatchThreadID)
     SceneRoot* s = root.scene;
     ViewConstants* v = root.view;
     uint2 pixel = uint2(root.pixel_x, root.pixel_y);
-    OriginProbeGpu o = (OriginProbeGpu)0;
+    OriginProbeGpu o = OriginProbeGpu();
     PathStart start = pinhole_start(v, root.gbuffer, pixel, true);
     o.camera_origin = float4(start.origin, 0.0);
     o.camera_direction = float4(start.dir, 0.0);

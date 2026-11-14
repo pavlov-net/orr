@@ -58,7 +58,7 @@ void main(uint3 id: SV_DispatchThreadID)
 {
     if (id.x >= root.count)
         return;
-    SurfaceInput i = (SurfaceInput)0;
+    SurfaceInput i = SurfaceInput();
     UvFootprint f = { float2(0.25), float2(0.0), float2(0.0), float2(-1.0), float2(0.0) };
     i.uv[0] = f;
     i.uv[1] = f;
@@ -77,7 +77,7 @@ void main(uint3 id: SV_DispatchThreadID)
     float offset;
     GSurface s = StandardSurface.surface(i, offset, false);
     BsdfParams p = s.bsdf;
-    Params o = (Params)0;
+    Params o = Params();
     o.base_color = p.base_color;
     o.metalness = p.metalness;
     o.specular_color = p.specular_color;

@@ -486,7 +486,7 @@ public GSurface load_gsurface(ViewConstants* view, GBufferGpu* g, uint2 pixel)
     uint64_t vis = g.visibility[pixel.y * g.extent.x + pixel.x];
     if (vis == 0)
     {
-        GSurface none = (GSurface)0;
+        GSurface none = GSurface();
         none.material = MATERIAL_NONE;
         return none;
     }

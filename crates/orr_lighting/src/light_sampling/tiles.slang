@@ -301,7 +301,7 @@ void select(uint lane: SV_GroupIndex)
             root.cdf[i] = w;
             if (i >= lights)
             {
-                EmissiveSelection sel = (EmissiveSelection)0;
+                EmissiveSelection sel = EmissiveSelection();
                 sel.count = w > 0.0 ? c : 0;
                 if (w > 0.0 && pooled > 0)
                     sel.cdf = root.cluster_cdf + first;

@@ -61,8 +61,8 @@ ORR_ROOT(Root);
 
 GSurface surface(Case c)
 {
-    GSurface s = (GSurface)0;
-    BsdfParams p = (BsdfParams)0;
+    GSurface s = GSurface();
+    BsdfParams p = BsdfParams();
     p.base_color = c.base_color;
     p.specular_roughness = c.roughness;
     p.metalness = c.metalness;
@@ -103,7 +103,7 @@ GSurface surface(Case c)
 Case flatten(GSurface s)
 {
     BsdfParams p = s.bsdf;
-    Case c = (Case)0;
+    Case c = Case();
     c.base_color = p.base_color;
     c.roughness = p.specular_roughness;
     c.metalness = p.metalness;

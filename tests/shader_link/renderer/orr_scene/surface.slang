@@ -29,7 +29,7 @@ public interface ISurface
 {
     static bool surface(SurfaceInput i, out GSurface g, out float depth_offset)
     {
-        g = (GSurface)0;
+        g = GSurface();
         depth_offset = 0.0;
         return false;
     }

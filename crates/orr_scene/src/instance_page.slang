@@ -74,7 +74,7 @@ void expand(uint3 id: SV_DispatchThreadID)
     }
     for (uint k = 0; k < entries.count; k++)
     {
-        EmissiveGpu e = (EmissiveGpu)0;
+        EmissiveGpu e = EmissiveGpu();
         e.kind = EMISSIVE_INSTANCE;
         e.source = slot;
         e.rank = k;

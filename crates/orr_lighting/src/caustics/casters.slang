@@ -149,7 +149,7 @@ void pool(uint lane: SV_GroupIndex)
             set_first_block(root.block_layout, i, first_block);
         if (set)
         {
-            EmissiveSelection e = (EmissiveSelection)0;
+            EmissiveSelection e = EmissiveSelection();
             if (n > 0)
             {
                 e.count = n;
@@ -241,7 +241,7 @@ void lists_finish(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
 EmissiveSelection instance_casters(SceneRoot* s, uint e, MeshGpu* mesh)
 {
     EmissiveGpu g = s.emissive[e];
-    EmissiveSelection sel = (EmissiveSelection)0;
+    EmissiveSelection sel = EmissiveSelection();
     sel.count = g.cluster_count;
     if (g.set == GATHERED_SET)
     {
@@ -276,7 +276,7 @@ float entry_weight(SceneRoot* s, uint i)
     }
     else
     {
-        EmissiveSelection sel = (EmissiveSelection)0;
+        EmissiveSelection sel = EmissiveSelection();
         if (g.kind == EMISSIVE_INSTANCE && g.set != NO_SET && g.cluster_count > 0)
         {
             InstanceGpu inst = copy_record(s, g.source);

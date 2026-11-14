@@ -354,7 +354,7 @@ public void froxel_order(FroxelRoot r)
     out.proxies = proxies;
     out.far_smoke = 0;
     out.eye = 0;
-    FroxelQueue q = (FroxelQueue)0;
+    FroxelQueue q = FroxelQueue();
     q.froxels.groups_z = 1;
     q.jobs.groups_z = 1;
     q.flagged.groups_z = 1;
@@ -378,7 +378,7 @@ bool eye_may_be_inside(FroxelRoot r)
 // of another material inside that interior does not end it.
 public void froxel_eye_column<S : ISurfaces>(FroxelRoot r, uint2 column)
 {
-    EyeColumn out = (EyeColumn)0;
+    EyeColumn out = EyeColumn();
     out.interior = EyeInterior();
     out.end = positive_infinity();
     if (eye_may_be_inside(r))
@@ -477,7 +477,7 @@ public void froxel_inject<M : IMedium>(FroxelRoot r, uint3 f)
 {
     Sampler rng = froxel_sampler(r, f);
     float3 x = froxel_sample(r, f, rng);
-    FroxelMaterial m = (FroxelMaterial)0;
+    FroxelMaterial m = FroxelMaterial();
     if (!eye_holds(r.eye[f.y * r.columns + f.x], f.z, r.slices, r.scene.near_range))
         m = froxel_material(M.sample(r.scene.medium, x));
     r.sigma.get<RWTexture3D<float4>>()[f] = m.sigma;
@@ -815,10 +815,10 @@ public void froxel_sample_rays<S : ISurfaces>(FroxelRoot r, uint k, bool valid)
 {
     uint count = r.lights.count;
     uint active = r.queue.froxels.count;
-    FroxelRays out = (FroxelRays)0;
+    FroxelRays out = FroxelRays();
     out.winner = NO_JOB;
     out.view_layer = float3(1.0);
-    RayJob winner = (RayJob)0;
+    RayJob winner = RayJob();
     bool traced = false;
     if (valid)
     {
@@ -982,7 +982,7 @@ public void froxel_accumulate<M : IMedium>(FroxelRoot r, uint k)
 // of a dielectric's interior `im` takes `im`'s phase function, its shadowed lights through their
 // distance in it (`depth` over their visibility) along the direction a plane stack of `stacks`
 // bends them to in its IOR `ior`, and no multiple scattering of the linked medium.
-float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumPoint m, float3 smoke_scatter, float anisotropy, float4 incident, float4 more, float3 x, float3 dir, bool in_interior = false, InteriorMedium im = (InteriorMedium)0, float4 depth = float4(0.0), float4 stacks[MAX_FROXEL_SHADOWED_LIGHTS] = {}, float ior = AMBIENT_IOR)
+float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumPoint m, float3 smoke_scatter, float anisotropy, float4 incident, float4 more, float3 x, float3 dir, bool in_interior = false, InteriorMedium im = InteriorMedium(), float4 depth = float4(0.0), float4 stacks[MAX_FROXEL_SHADOWED_LIGHTS] = {}, float ior = AMBIENT_IOR)
 {
     uint64_t data = set.scene.medium;
     float3 medium_light = float3(0.0);
@@ -1074,7 +1074,7 @@ public float3 froxel_segment_inscatter<M : IMedium>(FroxelVolume* volume, ViewCo
     float3 inscatter = float3(0.0);
     transmittance = float3(1.0);
     uint3 grid = uint3(0);
-    FroxelLights lights = (FroxelLights)0;
+    FroxelLights lights = FroxelLights();
     if (volume != nullptr)
     {
         grid = uint3(volume.columns, volume.rows, volume.slices);

@@ -38,7 +38,7 @@ void main(uint3 group: SV_GroupID, uint lane: SV_GroupThreadID)
         alive[lane] = 0;
     GroupMemoryBarrierWithGroupSync();
 
-    Blade b = (Blade)0;
+    Blade b = Blade();
     float cast = 0.0;
     if (lane < size && blade < f.ranks * CELL_COUNT)
     {

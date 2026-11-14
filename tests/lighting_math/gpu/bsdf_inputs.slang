@@ -2,7 +2,7 @@
 import orr_lighting.bsdf;
 import openpbr_ref.openpbr_inputs;
 
-BsdfParams bsdf_params(Inputs m)
+public BsdfParams bsdf_params(Inputs m)
 {
     BsdfParams p;
     p.base_color = m.base_weight * m.base_color;
@@ -42,7 +42,7 @@ BsdfParams bsdf_params(Inputs m)
     return p;
 }
 
-Bsdf prepare(Inputs m, float3 view, bool collapse)
+public Bsdf prepare(Inputs m, float3 view, bool collapse)
 {
     BsdfParams p = bsdf_params(m);
     if (collapse)

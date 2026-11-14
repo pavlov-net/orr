@@ -35,7 +35,7 @@ void main(uint3 id: SV_DispatchThreadID)
     uint2 extent = v.extent;
     if (id.x >= extent.x * extent.y)
         return;
-    Seen o = (Seen)0;
+    Seen o = Seen();
     uint64_t w = root.gbuffer.visibility[id.x];
     uint entry;
     if (w != 0)

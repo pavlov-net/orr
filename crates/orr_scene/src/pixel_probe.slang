@@ -274,7 +274,7 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
     GroupGpu* g = s.groups + inst.group;
     if (has_focus())
         o.flags |= PROBE_FOCUS;
-    Placement p = (Placement)0;
+    Placement p = Placement();
     // Every chain step of a copy takes its transform.
     bool at_focus = placement(g, false, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), placed);
     if (at_focus && cluster_placement(s, vc.instance, inst, cl, placed, false, p))
@@ -380,7 +380,7 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
 // A streamed texture's tap also gives `probe` the frame's feedback figures.
 ProbeTexture probe_texture(MaterialGpu* m, uint slot, UvFootprint uv[2], inout ProbeGpu probe)
 {
-    ProbeTexture o = (ProbeTexture)0;
+    ProbeTexture o = ProbeTexture();
     o.slot = slot;
     TextureIndex t = m.textures[slot];
     UvFootprint f = material_footprint(m, slot, material_uv_set(m, slot) == 1 ? uv[1] : uv[0]);
@@ -434,7 +434,7 @@ void probe(uint3 id: SV_DispatchThreadID)
     SceneRoot* s = root.scene;
     ViewConstants* v = root.view;
     RasterGpu* r = root.raster;
-    ProbeGpu o = (ProbeGpu)0;
+    ProbeGpu o = ProbeGpu();
     uint2 pixel = uint2(root.pixel_x, root.pixel_y);
     o.frame = s.frame_index;
     uint index = pixel.y * r.gbuffer.extent.x + pixel.x;

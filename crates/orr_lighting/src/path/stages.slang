@@ -521,7 +521,7 @@ PathStart camera_start(PathRoot r, uint2 pixel)
 {
     if (from_photon(r))
     {
-        PathStart given = (PathStart)0;
+        PathStart given = PathStart();
         given.mask = MASK_OPAQUE | MASK_DIELECTRIC;
         given.given = true;
         return given;
@@ -613,7 +613,7 @@ PathPending load_pending(PathRoot r, uint slot, bool medium)
     PathStages* st = r.stages;
     uint4 ids = st.words[word_index(st, SPAN_FIRST, slot)];
     uint4 at = st.words[word_index(st, SPAN_FIRST + 1, slot)];
-    PathPending q = (PathPending)0;
+    PathPending q = PathPending();
     q.hit.hit = (at.w & HIT_HIT) != 0;
     q.hit.triangle = (at.w & HIT_TRIANGLE) != 0;
     q.hit.front_face = (at.w & HIT_FRONT) != 0;
@@ -807,7 +807,7 @@ void store_walk(PathRoot r, uint slot, WalkEntry v)
 PathStack load_stack(PathRoot r, uint slot)
 {
     if (!stack_tracked(r))
-        return (PathStack)0;
+        return PathStack();
     return load_words<PathStack, STACK_WORDS>(r.stages.words, r.stages.capacity, stack_first(r), slot);
 }
 
@@ -922,7 +922,7 @@ void store_record<T>(PathStages* st, uint slot, T value)
 
 // A view's or the background layer's record (`ViewPath`) as its words hold it. A first vertex
 // that is a layer leaves no G-buffer emission, so the two share words.
-struct StoredView
+public struct StoredView
 {
     uint feedback;
     float total;
@@ -933,7 +933,7 @@ struct StoredView
 }
 
 // The first word of `StoredView`.
-struct StoredViewLights
+public struct StoredViewLights
 {
     uint feedback;
     float total;
@@ -1234,12 +1234,12 @@ void start_state(PathRoot r, uint2 pixel, PathStart start, Sampler rng, bool pho
     set_flag(p.flags, LOOP_GBUFFER_HIT, !camera);
     set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
 
-    c.ray = (LayerRay)0;
+    c.ray = LayerRay();
     c.ray.origin = start.origin;
     c.ray.start = start.origin;
     c.ray.dir = start.dir;
     c.interior = start.interior;
-    c.stack = (PathStack)0;
+    c.stack = PathStack();
     c.stack.valid = photon && start.directional && r.set.stack_entries != 0;
     // A photon's stack keeps no vertex's ray: its direction is the one the photon started
     // along, which `shade_vertex` probes back along.
@@ -1270,14 +1270,14 @@ void begin_path(PathRoot r, uint slot, uint2 pixel, PathStart start, Sampler rng
     store_spectral(r, slot, c.spectral);
     if (given)
     {
-        PathPending pending = (PathPending)0;
+        PathPending pending = PathPending();
         pending.hit = start.hit;
         pending.positions = start.positions;
         pending.t = start.hit.t;
         store_pending(r, slot, pending, false);
     }
     store_loop(r, slot, p);
-    append(r, camera ? QUEUE_TRACE : opaque_queue(r.scene, (Hit)0, true), round, slot);
+    append(r, camera ? QUEUE_TRACE : opaque_queue(r.scene, Hit(), true), round, slot);
 }
 
 // The view's primary stage: the path of the slice's `lane`th pixel, one from the first layer of
@@ -1326,7 +1326,7 @@ public void primary_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
     start_state(r, pixel, start, rng, false, f, p, c);
     // The round's trace stage, which runs next, traces these paths' rays beside the camera
     // rays: a queue's list holds one round at a time.
-    shade_slot<S, M, SHADE_START>(r, lane, f, p, (PathPending)0, c, round_now(r));
+    shade_slot<S, M, SHADE_START>(r, lane, f, p, PathPending(), c, round_now(r));
 }
 
 // The background layer's path of the slice's `lane`th pixel: on a marked pixel its lens ray past
@@ -1394,7 +1394,7 @@ public void photon_start_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint l
     PhotonStart p;
     if (!photon_start<S, M>(r, index, rng, p))
         return;
-    PathStart start = (PathStart)0;
+    PathStart start = PathStart();
     start.origin = p.point;
     start.dir = p.dir;
     start.mask = MASK_OPAQUE | MASK_DIELECTRIC;
@@ -1425,7 +1425,7 @@ float3 emitter_view<S : ISurfaces>(PathRoot r, ResolvedLightSample chosen, float
 // weighed along the straight way by `scale`. An emitter's coat and fuzz are not in it.
 PathShadowRay shadow_ray<S : ISurfaces, M : IMedium>(NeeDraw d, float scale, PathShadow<S, M> shadow, float3 start, float3 throughput, uint depth, bool feedback, bool counted)
 {
-    PathShadowRay q = (PathShadowRay)0;
+    PathShadowRay q = PathShadowRay();
     q.contribution = throughput * (d.e * scale);
     q.light = d.chosen.kind != LIGHT_SAMPLE_DIRECTIONAL ? d.chosen.light : NO_LIGHT;
     q.start = start;
@@ -1617,11 +1617,11 @@ public void trace_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
     bool reference = x.reference;
     bool alive = true;
     // The camera ray's reach, mask and distance from the eye, which only its trace reads.
-    PathStart camera_ray = (PathStart)0;
+    PathStart camera_ray = PathStart();
     if (camera)
         camera_ray = camera_start(r, pixel);
 
-    Hit h = (Hit)0;
+    Hit h = Hit();
     float3 positions[3] = { float3(0.0), float3(0.0), float3(0.0) };
     float t = 0.0;
     uint medium = MATERIAL_NONE;
@@ -1731,7 +1731,7 @@ public void trace_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
     p.flags = (p.flags & ((1u << LOOP_KEY_SHIFT) - 1)) | (key << LOOP_KEY_SHIFT);
     // The shade stages see the camera ray's vertex as the first.
     bool first = camera;
-    PathPending pending = (PathPending)0;
+    PathPending pending = PathPending();
     pending.hit = h;
     pending.positions = positions;
 
@@ -1860,10 +1860,10 @@ struct ShadeVertex
 ShadeVertex no_vertex()
 {
     ShadeVertex sv;
-    sv.l = (LayerVertex)0;
+    sv.l = LayerVertex();
     sv.b = bsdf_unprepared();
-    sv.exit_scatter = (WalkExitScatter)0;
-    sv.leave_scatter = (InteriorExitScatter)0;
+    sv.exit_scatter = WalkExitScatter();
+    sv.leave_scatter = InteriorExitScatter();
     sv.leave_dir = float3(0.0);
     return sv;
 }
@@ -1909,8 +1909,8 @@ ShadeNee no_nee(VertexScatter scatter, Spectral spectral)
     ShadeNee nee;
     nee.traced = false;
     nee.here = false;
-    nee.q = (PathShadowRay)0;
-    nee.d = (NeeDraw)0;
+    nee.q = PathShadowRay();
+    nee.d = NeeDraw();
     nee.run = 0.0;
     nee.weight_one = false;
     nee.throughput = float3(0.0);
@@ -1950,7 +1950,7 @@ bool resolve_vertex<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, in
     LocalLights* ray_local = nullptr;
     if (ray.local)
         ray_local = pixel_local_lights(r, pixel);
-    EmitterHit emitter = (EmitterHit)0;
+    EmitterHit emitter = EmitterHit();
     bool swapped = false;
     if (gbuffer)
     {
@@ -2396,7 +2396,7 @@ void shade_slot<S : ISurfaces, M : IMedium, let K : uint>(PathRoot r, uint slot,
     PathContext x = path_context(r, record, f.pixel);
     Sampler rng = p.rng;
     ShadeVertex sv = no_vertex();
-    WalkEntry reached = (WalkEntry)0;
+    WalkEntry reached = WalkEntry();
     uint kind = VERTEX_OPAQUE;
     if (K == QUEUE_OTHER)
         kind = !has(p.flags, LOOP_MEDIUM) ? VERTEX_LAYER : has(p.flags, LOOP_LEAVING) ? VERTEX_LEAVE : VERTEX_SCATTER;
@@ -2509,7 +2509,7 @@ public void walk_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
     PathContext x = path_context(r, record, f.pixel);
     ShadeState c;
     // The exit's shade leaves the next ray: nothing reads the one that reached the vertex.
-    c.ray = (LayerRay)0;
+    c.ray = LayerRay();
     c.interior = load_interior(r, slot);
     c.stack = load_stack(r, slot);
     c.spectral = load_spectral(r, slot);
@@ -2630,7 +2630,7 @@ void view_finish<S : ISurfaces, E : IEnvironment, M : IMedium>(PathRoot r, uint 
     bool two = two_passes(r, pixel);
     bool second = second_pass(r);
     // The camera ray the pixel started with, where what is left to do reads it.
-    PathStart camera_ray = (PathStart)0;
+    PathStart camera_ray = PathStart();
     if (sky || (two && !second))
         camera_ray = camera_start(r, pixel);
     if (sky)
@@ -2655,7 +2655,7 @@ void view_finish<S : ISurfaces, E : IEnvironment, M : IMedium>(PathRoot r, uint 
     PathStart start;
     if (thin_lens(r))
     {
-        start = (PathStart)0;
+        start = PathStart();
         start.interior = lens_interior<S>(r, camera_ray.origin);
     }
     else

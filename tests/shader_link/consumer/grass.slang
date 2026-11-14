@@ -1,7 +1,7 @@
 // A surface that replaces the standard one and leaves coverage to it.
 import orr_scene.surface;
 
-struct Grass : ISurface
+public struct Grass : ISurface
 {
     override static bool surface(SurfaceInput i, out GSurface g, out float depth_offset)
     {

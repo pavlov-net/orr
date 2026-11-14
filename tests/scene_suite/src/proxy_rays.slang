@@ -58,7 +58,7 @@ void main(uint3 id: SV_DispatchThreadID)
     ray.TMin = 0.0;
     ray.TMax = 1e30;
     Count h;
-    h.seen = (Seen)0;
+    h.seen = Seen();
     bool overflow;
     trace_transmittance(root.scene.tlas, ray, root.mask, RAY_FLAG_NONE, h, 16, overflow);
     root.seen[id.x] = h.seen;

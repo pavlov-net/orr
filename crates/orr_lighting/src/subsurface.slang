@@ -97,10 +97,10 @@ public struct Walk
         dir = float3(0.0);
         origin = float3(0.0);
         normal = float3(0.0);
-        hit = (Hit)0;
+        hit = Hit();
         positions = { float3(0.0), float3(0.0), float3(0.0) };
         ior = 1.0;
-        volume = (SubsurfaceVolume)0;
+        volume = SubsurfaceVolume();
         rng = Sampler(uint2(0u), 0u);
         step = 0;
     }

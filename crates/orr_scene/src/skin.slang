@@ -102,7 +102,7 @@ void select(uint3 id: SV_DispatchThreadID)
     SkinMeshGpu* sm = mesh.skin;
     GroupGpu* palette = s.groups + k.palette_group;
     GroupGpu* g = s.groups + inst.group;
-    Placement p = (Placement)0;
+    Placement p = Placement();
     bool shown = (inst.flags & (INSTANCE_RASTER | INSTANCE_RAY)) != 0 && sm != nullptr && sm.cut_count > 0
         && palette.current != nullptr && k.palette_first + k.joint_count <= palette.count
         && placement(g, false, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), p);

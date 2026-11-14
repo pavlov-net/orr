@@ -3,7 +3,7 @@
 #include "orr_root.h"
 import orr_lighting.environment;
 
-struct HotSpot : IEnvironment
+public struct HotSpot : IEnvironment
 {
     static float3 radiance(uint64_t data, float3 dir, float3 eye_render)
     {

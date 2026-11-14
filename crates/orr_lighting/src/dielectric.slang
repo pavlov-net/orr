@@ -84,7 +84,7 @@ public LayerGuide layer_guides<S : ISurfaces>(PathRoot r, LayerVertex l, Bsdf b,
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
     float exposure = v.exposure[v.exposure_slot].pre_exposure;
-    LayerGuide g = (LayerGuide)0;
+    LayerGuide g = LayerGuide();
     float3 lean = l.front ? l.x.surface.normal : -l.x.surface.normal;
     float3 previous;
     if (!hit_previous_position(s, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, previous))
@@ -181,7 +181,7 @@ public void layer_guide_body<S : ISurfaces>(PathRoot r, uint2 pixel)
     // Micromaps forced to two states, as the path's camera ray reads them, so alpha-tested
     // geometry hides a layer from both or neither.
     Hit h = trace_closest(s.tlas, path_ray(start.origin, dir, start.t_max), start.mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
-    LayerGuide guide = (LayerGuide)0;
+    LayerGuide guide = LayerGuide();
     if (is_layer(h) && h.cluster_id >= 0)
     {
         SurfaceHit first = resolve_hit<S>(s, v, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, hit_context(HIT_PRIMARY, 0, cone, h.t));

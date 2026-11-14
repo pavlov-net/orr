@@ -16,7 +16,7 @@ struct SlabTrace : IWalkTrace
         positions[0] = float3(0.0);
         positions[1] = float3(0.0);
         positions[2] = float3(0.0);
-        Hit h = (Hit)0;
+        Hit h = Hit();
         float t = dir.z > 0.0 ? -origin.z / dir.z : dir.z < 0.0 ? (-thickness - origin.z) / dir.z : t_max + 1.0;
         h.hit = t <= t_max;
         h.t = max(t, 0.0);
@@ -60,7 +60,7 @@ void main(uint3 id: SV_DispatchThreadID)
     uint lane = id.x;
     uint index = id.y;
     WalkCase c = root.cases[index];
-    BsdfParams p = (BsdfParams)0;
+    BsdfParams p = BsdfParams();
     p.subsurface_weight = 1.0;
     p.subsurface_color = c.color;
     p.subsurface_anisotropy = c.anisotropy;

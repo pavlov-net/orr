@@ -184,7 +184,7 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint lane: SV
     GroupMemoryBarrierWithGroupSync();
     if (lane == 0)
     {
-        LocalLights out = (LocalLights)0;
+        LocalLights out = LocalLights();
         float p[LOCAL_LIGHTS];
         for (uint k = 0; k < LOCAL_LIGHTS; k++)
             p[k] = 0.0;

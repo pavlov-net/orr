@@ -25,7 +25,7 @@ void templates(uint3 id: SV_DispatchThreadID)
     PatternTable* table = root.patterns;
     PatternGpu p = table.patterns[id.x % PATTERNS];
     bool opaque = id.x < PATTERNS;
-    TemplateBuild r = (TemplateBuild)0;
+    TemplateBuild r = TemplateBuild();
     r.cluster.cluster_id = 0;
     r.cluster.tri_count = p.tri_count;
     r.cluster.vertex_count = p.vertex_count;

@@ -1,3 +1,5 @@
+#language slang 2018
+
 // adobe/openpbr-bsdf compiled as one module; kernels import `orr_lighting.openpbr`, which re-exports
 // it. The module imports nothing: in a module with an import, Slang 2026.22 ignores
 // `#pragma warning(disable)` for flow-analysis diagnostics.

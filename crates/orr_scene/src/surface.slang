@@ -87,7 +87,7 @@ public interface ISurface
     // weights turn on (`surface_lobes`).
     static bool surface(SurfaceInput i, out GSurface g, out float depth_offset)
     {
-        g = (GSurface)0;
+        g = GSurface();
         depth_offset = 0.0;
         return false;
     }
@@ -364,7 +364,7 @@ void decal_over(inout float sum, inout float cover, float value, float share)
 bool decal_place(SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3 py, out float share, out UvFootprint f)
 {
     share = 0.0;
-    f = (UvFootprint)0;
+    f = UvFootprint();
     float3 axis_x = d.axis_x;
     float3 axis_y = d.axis_y;
     float3 local = float3(dot(relative, axis_x) * d.inv_half_x, dot(relative, axis_y) * d.inv_half_y, dot(relative, d.axis_z) * d.inv_half_z);
@@ -599,7 +599,7 @@ void surface_decals_each<V : IDecalVisit>(SurfaceInput i, inout V v)
 // The decals over hit `i` (`surface_decals_each`) blended in id order.
 public DecalLayer surface_decals(SurfaceInput i)
 {
-    DecalBlend b = { (DecalLayer)0 };
+    DecalBlend b = { DecalLayer() };
     surface_decals_each(i, b);
     return b.layer;
 }
@@ -906,7 +906,7 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset)
     p.thin_film_ior = m.thin_film_ior * (thin_film_ior * surface_vertex(i, m, TEXTURE_THIN_FILM_IOR).x);
     p.emission = (emission_luminance * surface_vertex(i, m, TEXTURE_EMISSION_LUMINANCE).x) * emission;
 
-    GSurface s = (GSurface)0;
+    GSurface s = GSurface();
     s.normal = material_bound(m, TEXTURE_NORMAL) ? material_texel_normal(i, m, TEXTURE_NORMAL, normal) : i.normal;
     apply_decals(surface_decals(i), p, s.normal);
     if ((m.flags & MATERIAL_BASE_TINT) != 0)

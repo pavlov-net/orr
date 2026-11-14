@@ -119,7 +119,7 @@ public void weigh_blocks<L : IClusterLists>(L lists, uint* layout, ListBlock* bl
     GroupMemoryBarrierWithGroupSync();
     if (lane == 0)
     {
-        ListBlock k = (ListBlock)0;
+        ListBlock k = ListBlock();
         k.sum = sum;
         k.top = group_top;
         k.end = group_end;
@@ -140,7 +140,7 @@ public float place_blocks(uint* layout, ListBlock* blocks, uint p, uint lane)
     for (uint base = first; base < end; base += BLOCK_CLUSTERS)
     {
         uint b = base + lane;
-        ListBlock k = (ListBlock)0;
+        ListBlock k = ListBlock();
         if (b < end)
             k = blocks[b];
         float before, chunk;

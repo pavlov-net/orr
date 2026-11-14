@@ -96,7 +96,7 @@ void templates(uint t: SV_GroupThreadID)
     for (uint i = t; i < b.topology_count; i += GROUP)
     {
         TopologyGpu topo = batch.topologies[i];
-        TemplateBuild r = (TemplateBuild)0;
+        TemplateBuild r = TemplateBuild();
         r.cluster.cluster_id = 0;
         r.cluster.tri_count = topo.tri_count;
         r.cluster.vertex_count = topo.vertex_count;
@@ -223,7 +223,7 @@ void strands(uint t: SV_GroupThreadID)
         float3* ring = tubes.positions + k * TUBE_SEGMENT_VERTICES;
         if (k % TUBE_SEGMENTS == 0)
         {
-            ProducerClusterGpu c = (ProducerClusterGpu)0;
+            ProducerClusterGpu c = ProducerClusterGpu();
             c.triangles = tubes.topologies[0].triangles;
             c.first_vertex = k * TUBE_SEGMENT_VERTICES;
             c.vertex_count = uint16_t(TUBE_VERTICES);
@@ -276,7 +276,7 @@ void records(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
         group_refused = 0;
     }
     GroupMemoryBarrierWithGroupSync();
-    ProducerClusterGpu k = (ProducerClusterGpu)0;
+    ProducerClusterGpu k = ProducerClusterGpu();
     bool valid = false;
     if (c < emitted_clusters(batch))
     {
@@ -361,7 +361,7 @@ void records(uint3 group: SV_GroupID, uint t: SV_GroupThreadID)
             b.refs[c] = REF_NONE;
             return;
         }
-        ClasBuild r = (ClasBuild)0;
+        ClasBuild r = ClasBuild();
         r.cluster_id = c;
         r.tri_count = k.tri_count;
         r.vertex_count = k.vertex_count;

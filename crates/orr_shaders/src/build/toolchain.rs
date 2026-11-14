@@ -10,6 +10,8 @@ use super::slang::Library;
 /// build hands them to the Slang library unchanged; per-module options (include roots,
 /// debug info, floating-point mode) follow them.
 pub(super) const SLANGC_OPTIONS: &[&str] = &[
+    "-std",
+    "2026",
     "-target",
     "spirv",
     "-profile",

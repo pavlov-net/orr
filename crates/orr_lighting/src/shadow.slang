@@ -116,7 +116,7 @@ public struct InteriorMedium
 
 public InteriorMedium interior_medium(SceneRoot* s, uint m, float4 point = NO_MEDIUM_POINT)
 {
-    InteriorMedium r = (InteriorMedium)0;
+    InteriorMedium r = InteriorMedium();
     if (m == MATERIAL_NONE)
         return r;
     MaterialGpu* g = s.materials + m;
@@ -131,7 +131,7 @@ public InteriorMedium interior_medium(SceneRoot* s, uint m, float4 point = NO_ME
 }
 
 // An unbent shadow ray's crossing of a dielectric: material `material` at `t` m.
-struct ShadowCrossing
+public struct ShadowCrossing
 {
     float t;
     uint material;
@@ -321,7 +321,7 @@ public struct ShadowCandidates<S : ISurfaces, M : IMedium, let MODE : uint> : IC
 public bool proxy_unmarched(SceneRoot* s, Candidate c, float t_max, out float3 t, out MediumProxyGpu p, out float t0, out float t1)
 {
     t = float3(1.0);
-    p = (MediumProxyGpu)0;
+    p = MediumProxyGpu();
     if (!proxy_span(c.object_origin, c.object_direction, t_max, t0, t1))
         return true;
     p = scene_proxy(s, c.instance_index);
@@ -359,7 +359,7 @@ public float3 straight_depth(SceneRoot* s, Interior start, float t_max, bool unb
 }
 
 // Sums a proxy's optical depth over the steps of its march.
-struct ProxyDepth : IProxyStep
+public struct ProxyDepth : IProxyStep
 {
     MediumProxyGpu proxy;
     float3 origin;
@@ -523,7 +523,7 @@ public struct StackLight
 // The light of a directional light along `dir` that meets no stack.
 public StackLight straight_light(float3 dir)
 {
-    StackLight l = (StackLight)0;
+    StackLight l = StackLight();
     l.transmittance = float3(1.0);
     l.bent = dir;
     l.jacobian = 1.0;
@@ -536,7 +536,7 @@ public StackLight straight_light(float3 dir)
 // no decal listed to vary it; with `dispersion`, not dispersive. False for any other material.
 public bool stack_material(SceneRoot* s, uint m, bool dispersion, out BsdfParams p)
 {
-    p = (BsdfParams)0;
+    p = BsdfParams();
     if (m == MATERIAL_NONE || s.decal_globals != 0 || s.decal_bin_slots != 0)
         return false;
     MaterialGpu* g = s.materials + m;
@@ -577,7 +577,7 @@ public struct StackFace
 // normal, at rest), and the face.
 public bool stack_face(SceneRoot* s, Hit h, bool dispersion, out StackFace f)
 {
-    f = (StackFace)0;
+    f = StackFace();
     if (!h.hit || !h.triangle || h.class_id != CLASS_DIELECTRIC || h.cluster_id < 0)
         return false;
     TracedTriangle t;
@@ -686,8 +686,8 @@ public uint path_light<S : ISurfaces, M : IMedium>(SceneRoot* s, ViewConstants* 
     float3 normal = float3(0.0);
     float3 t = float3(1.0);
     float3 tau = float3(0.0);
-    Hit h = (Hit)0;
-    StackFace face = (StackFace)0;
+    Hit h = Hit();
+    StackFace face = StackFace();
     bool on_face = false;
     // 0: the straight ray, 1: the probe, 2: the legs.
     uint phase = 0;

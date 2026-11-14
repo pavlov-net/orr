@@ -43,7 +43,7 @@ public TracedHit traced_hit<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float
     Alpha<S> a = { s, v, dir, context };
     float3 positions[3];
     Hit h = trace_closest(s.tlas, path_ray(origin, dir, t_max), mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
-    TracedHit o = (TracedHit)0;
+    TracedHit o = TracedHit();
     o.copy = TRACED_NONE;
     o.mesh_cluster = TRACED_NONE;
     o.model = TRACED_NONE;

@@ -37,7 +37,7 @@ void main(uint3 id: SV_DispatchThreadID)
     if (id.x >= extent.x * extent.y)
         return;
     uint2 pixel = uint2(id.x % extent.x, id.x / extent.x);
-    Depths o = (Depths)0;
+    Depths o = Depths();
     float3 d = render_direction(v, view_direction(v, (float2(pixel) + 0.5) / float2(extent)));
     uint64_t w = root.gbuffer.visibility[id.x];
     uint entry;

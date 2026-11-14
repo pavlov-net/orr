@@ -2,7 +2,7 @@
 // linked kernels, `cliffs` in the tessellation tests.
 import orr_scene.displacement;
 
-struct Cliffs : IDisplacement
+public struct Cliffs : IDisplacement
 {
     static float3 displace(DisplacementInput i)
     {

@@ -1,6 +1,6 @@
 import orr_lighting.environment;
 
-struct Dome : IEnvironment
+public struct Dome : IEnvironment
 {
     static float3 radiance(uint64_t data, float3 dir, float3 eye_render)
     {

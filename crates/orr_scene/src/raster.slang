@@ -46,7 +46,7 @@ bool draw_placement(SceneRoot* s, ViewConstants* v, VisibleCluster vc, out Place
     if (visible_producer(s, vc, entry))
         return producer_placement(s, s.producers[entry], false, v.eye_cell.xyz, v.eye_offset.xyz, uint(v.eye_cell.w), p);
     InstanceGpu inst = copy_record(s, vc.instance);
-    p = (Placement)0;
+    p = Placement();
     Placement copy;
     if (!placement(s.groups + inst.group, false, inst.group_index, v, copy))
         return false;
@@ -90,7 +90,7 @@ struct ClusterDraw
 ClusterDraw cluster_draw(uint visible, bool alpha)
 {
     SceneRoot* s = root.scene;
-    ClusterDraw d = (ClusterDraw)0;
+    ClusterDraw d = ClusterDraw();
     d.vc = root.raster.gbuffer.clusters[visible];
     MaterialGpu* m = s.materials + d.vc.material;
     uint entry;
@@ -447,7 +447,7 @@ bool micropoly(SoftTriangle t)
 // its back.
 bool soft_setup(ClusterDraw d, uint triangle, uint2 extent, out SoftTriangle t)
 {
-    t = (SoftTriangle)0;
+    t = SoftTriangle();
     uint3 k = draw_triangle(d, triangle);
     if (back_facing(d, k))
         return false;
@@ -562,7 +562,7 @@ void software(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     }
     GroupMemoryBarrierWithGroupSync();
 
-    SoftTriangle t = (SoftTriangle)0;
+    SoftTriangle t = SoftTriangle();
     uint units = 0;
     if (thread < d.tri_count && soft_setup(d, thread, v.extent, t))
         units = micropoly(t) ? 1 : uint(t.rect.w - t.rect.y + 1);

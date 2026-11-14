@@ -344,7 +344,7 @@ public bool sphere_unseen(ViewConstants* v, RasterGpu* r, bool layer, float3 cen
         return true;
     if (r == nullptr)
         return false;
-    Placement here = (Placement)0;
+    Placement here = Placement();
     here.linear = float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
     here.scale = 1.0;
     precise float3 lo = center - radius;
@@ -562,7 +562,7 @@ public bool visible_placement(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     InstanceGpu inst = copy_record(s, vc.instance);
     GroupGpu* g = s.groups + inst.group;
     Placement copy;
-    p = (Placement)0;
+    p = Placement();
     if (!placement(g, previous, inst.group_index, v, copy))
         return false;
     return cluster_placement(s, vc.instance, inst, load_cluster(vc.page, vc.local), copy, previous, p);
@@ -593,7 +593,7 @@ Corners drawn_corners(DrawnTriangle t)
     for (uint j = 0; j < 3; j++)
     {
         c.position[j] = t.position[j];
-        VertexAttributes a = (VertexAttributes)0;
+        VertexAttributes a = VertexAttributes();
         a.normal = t.normal[j];
         a.uv[0] = t.uv[j];
         a.uv[1] = t.uv[j];
@@ -649,8 +649,8 @@ float strand_ray(ProducerBatch b, Placement pl, float3 d, inout uint segment)
 // the one `D` derives, and the hit's error and previous corners that triangle's.
 public PrimaryHit primary_hit<D : IDrawn>(SceneRoot* s, ViewConstants* v, VisibleCluster vc, uint triangle, float2 pixel_center)
 {
-    PrimaryHit hit = (PrimaryHit)0;
-    SurfaceInput i = (SurfaceInput)0;
+    PrimaryHit hit = PrimaryHit();
+    SurfaceInput i = SurfaceInput();
     visible_placement(s, v, vc, false, hit.placement);
     Placement pl = hit.placement;
     float2 extent = float2(v.extent);
@@ -774,7 +774,7 @@ public float2 visible_motion(SceneRoot* s, ViewConstants* v, VisibleCluster vc, 
         prev = p;
     uint entry;
     bool deformed = false;
-    Corners c = (Corners)0;
+    Corners c = Corners();
     SkinnedGpu k;
     bool producer = visible_producer(s, vc, entry);
     if (producer && s.producers[entry].strands != 0)

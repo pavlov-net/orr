@@ -14,6 +14,8 @@ use super::sys;
 /// what a target's Slang backend gets wrong where `__target_switch` cannot reach, as in entry
 /// signatures.
 pub(super) const OPTIONS: &[&str] = &[
+    "-std",
+    "2026",
     "-target",
     "metal",
     "-matrix-layout-row-major",

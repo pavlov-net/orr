@@ -200,7 +200,8 @@ impl Build {
     }
 
     /// Links Slang type `ty` from `module` (relative to `CARGO_MANIFEST_DIR`) into every
-    /// kernel of the [`link_points`](Self::link_points) files that declares `point`.
+    /// kernel of the [`link_points`](Self::link_points) files that declares `point`. `module`
+    /// declares `ty` `public`: a generated module imports it by name.
     ///
     /// Each such kernel is compiled once more with a generated module that exports the
     /// kernel's `extern struct`, and goes into `KERNELS` in `orr_kernels.rs`. Surfaces,

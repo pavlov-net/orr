@@ -22,7 +22,7 @@ public struct ParticleDraw
 // false past the list.
 public bool particle_draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint3 group, out ParticleDraw d)
 {
-    d = (ParticleDraw)0;
+    d = ParticleDraw();
     uint index = grid_index(group) + r.draw_first;
     return index < r.counts[COUNT_PARTICLES] && listed_draw(s, v, r, r.particles[index], d);
 }
@@ -30,7 +30,7 @@ public bool particle_draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint3 gr
 // The draw of workgroup `group` of the smoke clusters; false past the list.
 public bool smoke_draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint3 group, out ParticleDraw d)
 {
-    d = (ParticleDraw)0;
+    d = ParticleDraw();
     uint index = grid_index(group);
     return index < r.counts[COUNT_SMOKE] && listed_draw(s, v, r, r.smoke[index], d);
 }

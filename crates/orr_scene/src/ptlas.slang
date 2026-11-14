@@ -403,14 +403,14 @@ void want(uint3 id: SV_DispatchThreadID)
     bool has_focus = root.focus_cell.w != 0;
     uint cell_log2 = uint(s.origin_cell.w);
 
-    PendingGpu op = (PendingGpu)0;
+    PendingGpu op = PendingGpu();
     op.partition = st.rt_partition;
     op.cut = st.rt_lod;
     bool active = (inst.flags & INSTANCE_RAY) != 0;
     GroupGpu* g = s.groups + inst.group;
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
-    Placement pl = (Placement)0;
+    Placement pl = Placement();
     // A skinned copy traces the BLAS its skinning built this frame, in the global partition;
     // its skinning decided the range.
     bool skinned = (inst.flags & INSTANCE_SKINNED) != 0;
@@ -653,7 +653,7 @@ bool reserve(uint counter, uint capacity, uint count, out uint index)
 // The write of an instance over `blas` placed by `pl` with mesh-space bounds `lo`..`hi`.
 PtlasWrite instance_write(uint index, uint partition, Placement pl, float3 lo, float3 hi, uint64_t blas, uint custom_index, uint mask)
 {
-    PtlasWrite w = (PtlasWrite)0;
+    PtlasWrite w = PtlasWrite();
     w.instance_index = index;
     w.partition = ptlas_partition(partition);
     w.transform = float3x4(
@@ -687,7 +687,7 @@ void release_part_run(SceneRoot* s, PtlasGpu* t, uint start, uint n, uint partit
     {
         for (uint j = 0; j < n; j++)
         {
-            PtlasWrite w = (PtlasWrite)0;
+            PtlasWrite w = PtlasWrite();
             w.instance_index = s.part_base + start + j;
             w.partition = ptlas_partition(partition);
             store((uint64_t)t.writes, index + j, w);
@@ -808,7 +808,7 @@ void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot, Instanc
         else
             blas = mesh.rt_cuts[cut].parts[j];
         float3x4 pose;
-        PtlasWrite w = (PtlasWrite)0;
+        PtlasWrite w = PtlasWrite();
         w.instance_index = s.part_base + st.part_run + j;
         w.partition = ptlas_partition(partition);
         if (shown && blas != 0 && (part.sections & ~hidden) != 0 && part_pose(s, inst, mesh, mesh.first_animated + j, false, pose))
@@ -895,7 +895,7 @@ void emit(uint3 id: SV_DispatchThreadID)
         bool was_global = written && (st.rt_flags & RT_GLOBAL) != 0;
         bool disable = (op.op & OP_NULL) != 0;
         bool global = !disable && op.partition == global_partition();
-        PtlasWrite w = (PtlasWrite)0;
+        PtlasWrite w = PtlasWrite();
         w.instance_index = slot;
         w.partition = ptlas_partition(op.partition);
         if (!disable)
@@ -1025,7 +1025,7 @@ void producer_emit(uint3 id: SV_DispatchThreadID)
     if (!reserve(COUNTER_WRITES, t.write_capacity, 1, index))
         return;
     ProducerGpu p = s.producers[e];
-    PtlasWrite w = (PtlasWrite)0;
+    PtlasWrite w = PtlasWrite();
     w.instance_index = s.producer_base + e;
     w.partition = PTLAS_GLOBAL_PARTITION;
     bool write = (flags & PRODUCER_RT_WRITE) != 0;
@@ -1055,7 +1055,7 @@ public static const uint LIGHT_JOB = 0x80000000;
 // light sampling and hits test.
 bool light_placement(LightGpu l, out Placement pl)
 {
-    pl = (Placement)0;
+    pl = Placement();
     pl.translation = l.position;
     if (l.kind == LIGHT_SPHERE && l.radius > 0.0)
     {
@@ -1095,7 +1095,7 @@ void proxy_write(uint3 id: SV_DispatchThreadID)
     uint index;
     if (!reserve(COUNTER_WRITES, t.write_capacity, 1, index))
         return;
-    PtlasWrite w = (PtlasWrite)0;
+    PtlasWrite w = PtlasWrite();
     w.partition = PTLAS_GLOBAL_PARTITION;
     if ((e & LIGHT_JOB) != 0)
     {

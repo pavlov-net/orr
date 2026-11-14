@@ -104,7 +104,7 @@ Patch load_patch(uint code)
     p.current = producer_triangle(b, p.cluster, code & 127, false);
     p.has_previous = b.previous != nullptr;
     p.previous = producer_triangle(b, p.cluster, code & 127, p.has_previous);
-    p.base = (SubdTriangleGpu)0;
+    p.base = SubdTriangleGpu();
     SubdCopyGpu* c = root.tess.subd;
     if (c != nullptr)
         p.base = c.cage.triangles[c.cage.clusters[code >> 7].z + (code & 127)];
@@ -130,7 +130,7 @@ Rates rates()
     ProducerGpu p = entry();
     SceneRoot* s = root.scene;
     if (!producer_placement(s, p, false, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), r.focus))
-        r.focus = (Placement)0;
+        r.focus = Placement();
     r.seen_test = false;
     if (root.view != nullptr)
     {
@@ -398,7 +398,7 @@ float3 displaced(Patch pt, PatchItem item, uint material, float3 w, bool previou
     ProducerTriangle tri = previous ? pt.previous : pt.current;
     MaterialGpu* m = root.scene.materials + material;
     base = undisplaced(pt, w, previous);
-    DisplacementInput i = (DisplacementInput)0;
+    DisplacementInput i = DisplacementInput();
     i.position = base.position;
     i.displacement = entry().displacement;
     i.normal = base.normal;

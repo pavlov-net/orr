@@ -78,7 +78,7 @@ ProducerFigures entry_figures(SceneRoot* s, uint i)
     uint vertices = b.vertex_count[0];
     // Only a strand entry counts segments.
     uint segments = b.segment_count != nullptr ? b.segment_count[0] : 0;
-    ProducerFigures f = (ProducerFigures)0;
+    ProducerFigures f = ProducerFigures();
     f.entries = 1;
     f.clusters = min(clusters, b.max_clusters);
     f.cluster_capacity = b.max_clusters;
@@ -116,7 +116,7 @@ ProducerFigures entry_figures(SceneRoot* s, uint i)
 void sum(uint t: SV_GroupThreadID)
 {
     SceneRoot* s = root.scene;
-    ProducerFigures f = (ProducerFigures)0;
+    ProducerFigures f = ProducerFigures();
     for (uint i = t; i < s.producer_capacity; i += GROUP)
     {
         // An unset entry is all zero.

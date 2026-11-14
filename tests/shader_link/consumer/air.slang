@@ -1,7 +1,7 @@
 // A medium whose parameters live at the address the scene was given.
 import orr_lighting.media;
 
-struct AirData
+public struct AirData
 {
     float3 scattering;
     float absorption;
@@ -11,7 +11,7 @@ struct AirData
     float pad2;
 }
 
-struct Air : IMedium
+public struct Air : IMedium
 {
     static MediumPoint sample(uint64_t data, float3 p_render)
     {

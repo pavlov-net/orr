@@ -441,7 +441,7 @@ bool skinned_candidates(SceneRoot* s, CutGpu* cut, MeshGpu* mesh, uint slot, Ins
     SkinStateGpu st = s.skin_state[inst.pose_index];
     if (st.clusters == 0)
         return false;
-    ClusterWork w = (ClusterWork)0;
+    ClusterWork w = ClusterWork();
     w.instance = slot;
     uint start = 0;
     for (uint i = 0; i < st.clusters; i++)
@@ -501,7 +501,7 @@ void init(uint3 id: SV_DispatchThreadID)
         return;
     SceneRoot* s = root.scene;
     CutGpu* cut = root.cut;
-    SlotCutGpu c = (SlotCutGpu)0;
+    SlotCutGpu c = SlotCutGpu();
     c.owner = slot;
     c.rt_key = NO_KEY;
     SlotStateGpu st = s.slot_state[slot];
@@ -892,7 +892,7 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
 
     bool internal = node.group < 0;
     Node* children = nullptr;
-    Group g = (Group)0;
+    Group g = Group();
     uint8_t* data = nullptr;
     uint count = node.child_count;
     uint mesh_first = 0;
@@ -960,8 +960,8 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     uint raster_mask = 0;
     for (uint i = 0; i < count; i++)
     {
-        Node child = (Node)0;
-        Cluster cl = (Cluster)0;
+        Node child = Node();
+        Cluster cl = Cluster();
         float4 sphere;
         float error;
         uint cuts = mask;
@@ -1508,7 +1508,7 @@ void admit(uint3 id: SV_DispatchThreadID)
         uint lists;
         InterlockedAdd(cut.counters[CUT_PART_LISTS], n, lists);
         for (uint i = 0; i < n; i++)
-            cut.part_lists[lists + i] = (PartListGpu)0;
+            cut.part_lists[lists + i] = PartListGpu();
         c.rt_parts = lists;
         cut.slots[slot] = c;
         return;

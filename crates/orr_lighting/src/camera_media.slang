@@ -201,7 +201,7 @@ void trace_camera<H : ICandidate>(FroxelRoot f, float3 dir, uint mask, float t_m
 // Spans of the ray from the eye along `dir` to `t_max` through the proxies on screen.
 ProxySpans camera_spans(FroxelRoot f, float3 dir, float t_max)
 {
-    ProxySpans s = (ProxySpans)0;
+    ProxySpans s = ProxySpans();
     s.t_max = t_max;
     if (!may(MAY_PROXIES) || f.lights.proxies == 0 || !(t_max > 0.0))
         return s;
@@ -407,7 +407,7 @@ struct SmokeSheet
 // `c` as a smoke triangle; false for any other candidate.
 bool smoke_sheet(SceneRoot* scene, Candidate c, out SmokeSheet s)
 {
-    s = (SmokeSheet)0;
+    s = SmokeSheet();
     s.t = c.t;
     return c.triangle && c.class_id == CLASS_PARTICLE && c.cluster_id >= 0
         && resolve_smoke(scene, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, s.albedo, s.emission, s.opacity);
@@ -417,7 +417,7 @@ bool smoke_sheet(SceneRoot* scene, Candidate c, out SmokeSheet s)
 struct NearestSheet : ICandidate
 {
     SceneRoot* scene;
-    SmokeSheet sheet = (SmokeSheet)0;
+    SmokeSheet sheet = SmokeSheet();
 
     bool positions(Candidate c)
     {
@@ -440,7 +440,7 @@ struct NearestSheet : ICandidate
 // loses the device: the driver then page-faults on stack writes of other compute kernels.
 SmokeSheet next_sheet(FroxelRoot f, float3 dir, float after, float t_max)
 {
-    NearestSheet nearest = { f.scene, (SmokeSheet)0 };
+    NearestSheet nearest = { f.scene, SmokeSheet() };
     nearest.sheet.t = positive_infinity();
     if (f.smoke != nullptr && after < t_max)
         trace_camera(f, dir, MASK_PARTICLE, after, t_max, nearest);
@@ -463,7 +463,7 @@ Fog reference_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, ui
     float linked_end = isinf(t) ? s.near_range : t;
     // On a sky pixel smoke reaches as far as the aerial-perspective LUT.
     float end = isinf(t) ? max(max(linked_end, spans.end()), f.smoke != nullptr ? f.ap_range : 0.0) : t;
-    SmokeSheet sheet = (SmokeSheet)0;
+    SmokeSheet sheet = SmokeSheet();
     float sheet_after = 0.0;
     uint sheets = 0;
     float3 inscatter = float3(0.0);
@@ -494,7 +494,7 @@ Fog reference_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, ui
             bool at_sheet = sheet.t < step_at;
             float d = at_sheet ? sheet.t : step_at;
             float3 p = eye + dir * d;
-            MediumPoint m = (MediumPoint)0;
+            MediumPoint m = MediumPoint();
             if (!at_sheet && d < linked_end)
                 m = M.sample(data, p);
             NeeVertex nv = nee_vertex(set, p, float3(0.0), pixel, nullptr);
@@ -618,8 +618,8 @@ Fog smoky_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 
         trace_camera(f, dir, MASK_PARTICLE, near_range, t, smoke);
     bool layer = may(MAY_SMOKE) && smoke.weight > 0.0;
     float smoke_t = layer ? smoke.distance / smoke.weight : t;
-    Fog front = (Fog)0;
-    Fog fog = (Fog)0;
+    Fog front = Fog();
+    Fog fog = Fog();
     // One call site: a linked surface and shadow ray compile once per call.
     for (uint k = layer ? 0 : 1; k < 2; k++)
     {

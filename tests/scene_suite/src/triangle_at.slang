@@ -19,7 +19,7 @@ ORR_ROOT(Root);
 [numthreads(1, 1, 1)]
 void main()
 {
-    Corners t = (Corners)0;
+    Corners t = Corners();
     t.position[1] = float3(root.point.w, 0.0, 0.0);
     t.position[2] = float3(0.0, root.point.w, 0.0);
     t.attributes[0].color = root.color0;
@@ -32,10 +32,10 @@ void main()
     t.attributes[2].uv[0] = float2(0.0, 1.0);
     t.attributes[1].uv[1] = float2(0.0, 1.0);
     t.attributes[2].uv[1] = float2(1.0, 0.0);
-    Placement pl = (Placement)0;
+    Placement pl = Placement();
     float size = root.point.z;
     pl.linear = float3x3(-size, 0.0, 0.0, 0.0, size, 0.0, 0.0, 0.0, size);
-    SurfaceInput i = (SurfaceInput)0;
+    SurfaceInput i = SurfaceInput();
     uint material = uint(root.view.w);
     triangle_geometry(i, t, 0, root.scene, material, pl, root.point.xy, float2(0.0), float2(0.0), root.view.xyz, 1.0);
     root.out[0] = i.vertex_color;

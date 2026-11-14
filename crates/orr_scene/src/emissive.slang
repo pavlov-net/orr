@@ -54,7 +54,7 @@ void entries(uint3 id: SV_DispatchThreadID)
     s.instances[j.x].emissive_count = j.z;
     for (uint k = 0; k < j.z; k++)
     {
-        EmissiveGpu e = (EmissiveGpu)0;
+        EmissiveGpu e = EmissiveGpu();
         e.kind = EMISSIVE_INSTANCE;
         e.source = j.x;
         e.rank = k;
@@ -261,7 +261,7 @@ void sum_blocks(uint3 group: SV_GroupID, uint t: SV_GroupIndex)
     reduce(t);
     if (t == 0)
     {
-        EmissiveBlock e = (EmissiveBlock)0;
+        EmissiveBlock e = EmissiveBlock();
         e.sum = sums[0];
         e.count = counts[0];
         root.blocks[b] = e;

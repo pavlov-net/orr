@@ -101,7 +101,7 @@ void task(uint3 group: SV_GroupID, uint lane: SV_GroupThreadID)
     {
         recorded = 0;
         bool go = listed && (!second || f.item_state[index] != 0);
-        Placement now = (Placement)0;
+        Placement now = Placement();
         if (go)
             go = drawn_placement(s, v, f.producer, false, now);
         if (go)
@@ -129,7 +129,7 @@ void task(uint3 group: SV_GroupID, uint lane: SV_GroupThreadID)
 
     bool far = (item & ITEM_FAR) != 0;
     uint size = far ? WINDOW_FAR : WINDOW_FULL;
-    Kept k = (Kept)0;
+    Kept k = Kept();
     bool keep = false;
     uint blade = item_slice(item) * SLICE + lane;
     if (shown != 0 && blade < f.ranks * CELL_COUNT && window_in_view(f, item, lane / size, size))

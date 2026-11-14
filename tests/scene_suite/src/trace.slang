@@ -141,7 +141,7 @@ void pixels(uint3 id: SV_DispatchThreadID)
     RayCone cone = camera_cone(v);
     HitContext near = hit_context(HIT_PRIMARY, 0, cone, 0.0);
     Found f = trace<Surface>(s, v, v.eye_render.xyz, d, 1e30, near);
-    Traced o = (Traced)0;
+    Traced o = Traced();
     if (f.hit.hit && f.hit.cluster_id >= 0)
     {
         float4 clip = mul(v.clip_from_view_jittered, float4(view_from_relative(v, d * f.hit.t), 1.0));
@@ -182,7 +182,7 @@ void same_point(uint3 id: SV_DispatchThreadID)
     if (id.x >= extent.x * extent.y)
         return;
     uint2 pixel = uint2(id.x % extent.x, id.x / extent.x);
-    Seen o = (Seen)0;
+    Seen o = Seen();
     uint64_t w = g.visibility[id.x];
     if (w != 0)
     {
@@ -256,7 +256,7 @@ void cones(uint3 id: SV_DispatchThreadID)
     if (id.x >= extent.x * extent.y)
         return;
     uint2 pixel = uint2(id.x % extent.x, id.x / extent.x);
-    Cone o = (Cone)0;
+    Cone o = Cone();
     float3 d = pixel_direction(v, pixel);
     o.direction = d;
     RayCone cone = camera_cone(v);

@@ -50,6 +50,6 @@ public struct NoDrawn : IDrawn
 {
     public static DrawnTriangle triangle(DrawnInput i)
     {
-        return (DrawnTriangle)0;
+        return DrawnTriangle();
     }
 }

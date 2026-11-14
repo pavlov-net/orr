@@ -3,7 +3,7 @@
 // mirrors the struct.
 import orr_lighting.openpbr;
 
-struct Inputs
+public struct Inputs
 {
     float base_weight;
     float3 base_color;
@@ -49,7 +49,7 @@ struct Inputs
     uint bsdf_flags;    // BSDF_* past what OpenPBR states; the reference reads none
 }
 
-OpenPBR_ResolvedInputs resolve(Inputs m)
+public OpenPBR_ResolvedInputs resolve(Inputs m)
 {
     OpenPBR_ResolvedInputs r = openpbr_make_default_resolved_inputs();
     r.base_weight = m.base_weight;

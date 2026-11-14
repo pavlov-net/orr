@@ -57,7 +57,7 @@ void main(uint3 id: SV_DispatchThreadID)
     ORR_OMM(main);
     SceneRoot* s = root.scene;
     ViewConstants* v = root.view;
-    Seen o = (Seen)0;
+    Seen o = Seen();
     AcceptAll all;
     if (root.mode == 1)
     {

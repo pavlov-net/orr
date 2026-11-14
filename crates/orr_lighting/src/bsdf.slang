@@ -575,7 +575,7 @@ public struct Bsdf : IDifferentiable
             specular = mirror;
         }
         // The mirror's refraction and the walk lobe take their coefficients from one call.
-        Facet m = (Facet)0;
+        Facet m = Facet();
         if (!mirror)
             m = facet(l);
         if (specular || m.valid)
@@ -644,7 +644,7 @@ public struct Bsdf : IDifferentiable
         // The specular and walk lobes share the microfacet toward `l` and its coefficients.
         bool specular = probability[SPECULAR] > 0.0 && !mirror;
         bool walks = !(l.z > 0.0) && probability[WALK] > 0.0 && !mirror;
-        Facet micro = (Facet)0;
+        Facet micro = Facet();
         if ((specular && (l.z > 0.0 || any(transmit != 0.0))) || walks)
             micro = facet_coefficients(l);
         if (may(MAY_COAT) && probability[COAT] > 0.0 && !coat_mirror)
@@ -731,7 +731,7 @@ public struct Bsdf : IDifferentiable
     [TreatAsDifferentiable]
     Facet facet(float3 l)
     {
-        Facet f = (Facet)0;
+        Facet f = Facet();
         if (l.z > 0.0)
         {
             float3 h = normalize(v + l);
@@ -960,7 +960,7 @@ float3 coat_transmittance(float3 color, float eta, float c)
 // A specular microfacet toward a direction: GGX's density `d` there, its cosine `c` to the view,
 // the refraction Jacobian below the surface, and the coefficients at `c`, which callers fill.
 // Not `valid` where no microfacet refracts the view into the direction.
-struct Facet
+public struct Facet
 {
     float d;
     float c;

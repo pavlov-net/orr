@@ -10,6 +10,8 @@ use super::slang::{GlobalSession, Library};
 
 /// Options of the C++ session; include roots follow.
 const OPTIONS: &[&str] = &[
+    "-std",
+    "2026",
     "-target",
     "cpp",
     "-matrix-layout-row-major",
