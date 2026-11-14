@@ -18,22 +18,22 @@ import orr_scene.runs;
 import orr_scene.tables;
 
 // The groups the handle table holds one of, in its order (orr_scene::HitGroups).
-public static const uint KIND_LAYERS = 0;
-public static const uint KIND_MEDIUM_SHADOW = 1;
-public static const uint KIND_MEDIUM_LAYERS = 2;
-public static const uint KIND_LIGHT_LAYERS = 3;
-public static const uint KIND_WALK_MEET = 4;
-public static const uint KIND_STACK_MEET = 5;
-public static const uint FIXED_KINDS = 6;
+[Host] public static const uint KIND_LAYERS = 0;
+[Host] public static const uint KIND_MEDIUM_SHADOW = 1;
+[Host] public static const uint KIND_MEDIUM_LAYERS = 2;
+[Host] public static const uint KIND_LIGHT_LAYERS = 3;
+[Host] public static const uint KIND_WALK_MEET = 4;
+[Host] public static const uint KIND_STACK_MEET = 5;
+[Host] public static const uint FIXED_KINDS = 6;
 // The groups it holds `pins` of after those: one for any surface id, then, where surfaces link,
 // one per pin from id 0 on.
-public static const uint KIND_PATH = 0;          // a copy's clusters
-public static const uint KIND_PRODUCER_PATH = 1; // a producer entry's clusters
-public static const uint KIND_STRAND_PATH = 2;   // a strand entry's
-public static const uint KIND_SHADOW = 3;
-public static const uint KIND_LAYER_PATH = 4;          // a copy's dielectric and presence layer clusters
-public static const uint KIND_PRODUCER_LAYER_PATH = 5; // a producer entry's
-public static const uint PINNED_KINDS = 6;
+[Host] public static const uint KIND_PATH = 0;          // a copy's clusters
+[Host] public static const uint KIND_PRODUCER_PATH = 1; // a producer entry's clusters
+[Host] public static const uint KIND_STRAND_PATH = 2;   // a strand entry's
+[Host] public static const uint KIND_SHADOW = 3;
+[Host] public static const uint KIND_LAYER_PATH = 4;          // a copy's dielectric and presence layer clusters
+[Host] public static const uint KIND_PRODUCER_LAYER_PATH = 5; // a producer entry's
+[Host] public static const uint PINNED_KINDS = 6;
 // No group: a record of zeros.
 static const uint SLOT_NONE = 0xffffffff;
 

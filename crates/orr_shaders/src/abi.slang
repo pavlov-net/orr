@@ -10,6 +10,14 @@ module abi;
 
 import orr_shaders.debug;
 
+// Marks a module-scope integer `static const` whose value the build hands the crate's Rust as a
+// `const` of its name (`shaders::consts`): a table or layout that host code shares with shaders
+// takes its numbers from the shader alone.
+[__AttributeUsage(_AttributeTargets.Var)]
+public struct HostAttribute
+{
+};
+
 // The slot index of no image in `TextureIndex` and `StorageImageIndex`. The heap never hands
 // out slot 0, so a zeroed record names no image.
 public static const uint IMAGE_NONE = 0;

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use super::compile::{MetalLibs, entry_symbol};
 use super::layout::{Plan, Slot};
 use super::link::{self, Link, LinkPoint};
-use super::model::{Model, Scalar, SpecConstant, StructDef, Ty};
+use super::model::{HostConst, Model, Scalar, SpecConstant, StructDef, Ty};
 
 /// Where a struct's Rust type lives.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,10 +36,12 @@ pub(super) struct Kernel<'a> {
     pub(super) plans: &'a HashMap<String, Plan>,
 }
 
-/// The crate's `types` module contents and its extern checks.
+/// The crate's `types` module contents and its extern checks, and the `[Host]` constants of its
+/// shader root, its `consts` module.
 pub(super) struct Shared<'a> {
     pub(super) types: BTreeMap<String, (&'a StructDef, &'a Plan)>,
     pub(super) externs: BTreeMap<String, (&'a StructDef, &'a Plan, String)>,
+    pub(super) consts: BTreeMap<String, &'a HostConst>,
 }
 
 const ALLOW: &str = "#[allow(dead_code, non_camel_case_types, non_snake_case, unreachable_pub, unused_qualifications, clippy::all, clippy::pedantic)]";
@@ -54,6 +56,20 @@ pub(crate) fn generate(kernels: &[Kernel<'_>], shared: &Shared<'_>, manifest: &P
     let _ = writeln!(out, "{ALLOW}\npub mod types {{");
     for (def, plan) in shared.types.values() {
         emit_struct(&mut out, def, plan, &|ty| rust_type(ty, 1, None, &externs));
+    }
+    out.push_str("}\n\n");
+    let _ = writeln!(
+        out,
+        "/// The `[Host]` constants of this crate's shaders.\n{ALLOW}\npub mod consts {{"
+    );
+    for c in shared.consts.values() {
+        let _ = writeln!(
+            out,
+            "    pub const {}: {} = {};",
+            c.name,
+            c.scalar.rust(),
+            const_value(c)
+        );
     }
     out.push_str("}\n\n");
     if !shared.externs.is_empty() {
@@ -273,6 +289,24 @@ fn emit_spec(out: &mut String, spec: &[SpecConstant]) {
         );
     }
     out.push_str("        b\n    }\n}\n");
+}
+
+/// `c`'s value as a literal of its Rust type: the bits of its width.
+fn const_value(c: &HostConst) -> String {
+    let v = c.value;
+    match c.scalar {
+        Scalar::I8 => (v as i8).to_string(),
+        Scalar::U8 => (v as u8).to_string(),
+        Scalar::I16 => (v as i16).to_string(),
+        Scalar::U16 => (v as u16).to_string(),
+        Scalar::I32 => (v as i32).to_string(),
+        Scalar::U32 => (v as u32).to_string(),
+        Scalar::I64 => v.to_string(),
+        Scalar::U64 => (v as u64).to_string(),
+        Scalar::Bool | Scalar::F16 | Scalar::F32 | Scalar::F64 => {
+            unreachable!("a [Host] constant is an integer")
+        }
+    }
 }
 
 fn spec_type(s: Scalar) -> &'static str {

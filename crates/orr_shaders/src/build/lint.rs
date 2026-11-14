@@ -47,6 +47,8 @@ pub enum Lint {
     /// A struct is generated only by the crate whose shader root declares it; others map
     /// it with [`Build::extern_type`](super::Build::extern_type).
     Ownership,
+    /// The `[Host]` constants a crate's shader root declares have one value per name.
+    HostConst,
     /// A kernel with a ray tracing entry declares its root, if any, with `ORR_ROOT_INLINE`, whose
     /// kernels have only compute and ray tracing entries and a root of at most
     /// [`MAX_INLINE_ROOT_BYTES`](crate::abi::MAX_INLINE_ROOT_BYTES).

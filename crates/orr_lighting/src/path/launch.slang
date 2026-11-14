@@ -39,27 +39,28 @@ import orr_lighting.path.stages;
 // estimation and the scatter of a vertex run by its class: an opaque vertex's as a plain
 // surface's, which the pipeline makes without the lobes and walks a plain one lacks, or a rich
 // one's.
-public static const uint CALL_START_VIEW = 0;
-public static const uint CALL_START_UPDATE = 1;
-public static const uint CALL_START_PHOTON = 2;
-public static const uint CALL_START_BACKGROUND = 3;
-public static const uint CALL_RESOLVE_GIVEN = 4;
-public static const uint CALL_EMISSION = 5;
-public static const uint CALL_DIRECT = 6;        // AT_CLASSES of them, by class
-public static const uint CALL_SCATTER = 12;      // AT_CLASSES of them, by class
-public static const uint CALL_DEPOSIT = 18;
-public static const uint CALL_CACHE_VERTEX = 19;
-public static const uint CALL_FINISH_VIEW = 20;
-public static const uint CALL_FINISH_RECORD = 21;
-public static const uint CALL_FINISH_BACKGROUND = 22;
-public static const uint CALL_WALK_END = 23;
-public static const uint CALL_SEGMENT = 24;
-public static const uint CALL_LAYERS = 25;
-public static const uint CALL_PROXY_MARCH = 26;
-public static const uint CALL_GBUFFER = 27;
-public static const uint CALL_WINDOW = 28;
-public static const uint CALL_STACK_STEP = 29;
-public static const uint CALL_EMITTER_VIEW = 30;
+[Host] public static const uint CALL_START_VIEW = 0;
+[Host] public static const uint CALL_START_UPDATE = 1;
+[Host] public static const uint CALL_START_PHOTON = 2;
+[Host] public static const uint CALL_START_BACKGROUND = 3;
+[Host] public static const uint CALL_RESOLVE_GIVEN = 4;
+[Host] public static const uint CALL_EMISSION = 5;
+[Host] public static const uint CALL_DIRECT = 6;        // AT_CLASSES of them, by class
+[Host] public static const uint CALL_SCATTER = 12;      // AT_CLASSES of them, by class
+[Host] public static const uint CALL_DEPOSIT = 18;
+[Host] public static const uint CALL_CACHE_VERTEX = 19;
+[Host] public static const uint CALL_FINISH_VIEW = 20;
+[Host] public static const uint CALL_FINISH_RECORD = 21;
+[Host] public static const uint CALL_FINISH_BACKGROUND = 22;
+[Host] public static const uint CALL_WALK_END = 23;
+[Host] public static const uint CALL_SEGMENT = 24;
+[Host] public static const uint CALL_LAYERS = 25;
+[Host] public static const uint CALL_PROXY_MARCH = 26;
+[Host] public static const uint CALL_GBUFFER = 27;
+[Host] public static const uint CALL_WINDOW = 28;
+[Host] public static const uint CALL_STACK_STEP = 29;
+[Host] public static const uint CALL_EMITTER_VIEW = 30;
+[Host] public static const uint CALLABLES = 31;
 
 // What the raygen hands a vertex's direct or deposit callable in its data's second word: its
 // first call; its call again once the raygen has traced the probe it asked for (STEP_PROBE); and
@@ -85,13 +86,13 @@ public static const uint STEP_PROBE = 1 << 11;
 // From STEP_AT_SHIFT, with STEP_VERTEX, the class of the vertex (AT_*), which selects its direct
 // callable, CALL_DIRECT + class, and its scatter, CALL_SCATTER + class.
 static const uint STEP_AT_SHIFT = 12;
-public static const uint AT_PLAIN = 0;           // an opaque vertex whose surface has no lobe a plain one lacks
-public static const uint AT_RICH = 1;            // an opaque vertex whose surface may have one (`surface_lobed`)
-public static const uint AT_EXIT = 2;            // a subsurface walk's exit
-public static const uint AT_LEAVE = 3;           // an interior's walk leaving it
-public static const uint AT_SCATTER = 4;         // a scatter in an interior's medium, its surface words a `MediumVertex`
-public static const uint AT_LAYER = 5;           // a dielectric or presence layer, its words a `PackedLayer`
-public static const uint AT_CLASSES = 6;
+[Host] public static const uint AT_PLAIN = 0;           // an opaque vertex whose surface has no lobe a plain one lacks
+[Host] public static const uint AT_RICH = 1;            // an opaque vertex whose surface may have one (`surface_lobed`)
+[Host] public static const uint AT_EXIT = 2;            // a subsurface walk's exit
+[Host] public static const uint AT_LEAVE = 3;           // an interior's walk leaving it
+[Host] public static const uint AT_SCATTER = 4;         // a scatter in an interior's medium, its surface words a `MediumVertex`
+[Host] public static const uint AT_LAYER = 5;           // a dielectric or presence layer, its words a `PackedLayer`
+[Host] public static const uint AT_CLASSES = 6;
 
 // The words of a path's slot, in this order: its loop (`LaunchLoop`), the ray its last vertex left
 // (`LaunchRay`), the vertex's packed surface or `MediumVertex` (before a photon's first vertex
@@ -114,29 +115,29 @@ static const uint RAY_AT = LOOP_AT + LOOP_WORDS;
 static const uint SURFACE_AT = RAY_AT + RAY_WORDS;
 static const uint SHADOW_AT = SURFACE_AT + SURFACE_WORDS;
 static const uint FRONT_AT = SHADOW_AT + SHADOW_WORDS;
-public static const uint SLOT_WORDS = FRONT_AT + FRONT_WORDS;
+[Host] public static const uint SLOT_WORDS = FRONT_AT + FRONT_WORDS;
 // The walk part: the walk in flight (`LaunchWalk`), and the surface it entered where the exit
 // scatters with that surface's parameters.
 static const uint WALK_STATE_WORDS = 8;
 static const uint ENTRY_AT = WALK_STATE_WORDS;
-public static const uint WALK_WORDS = WALK_STATE_WORDS + SURFACE_WORDS;
+[Host] public static const uint WALK_WORDS = WALK_STATE_WORDS + SURFACE_WORDS;
 static const uint LAYER_WORDS = 2;
 static const uint CROSSING_WORDS = 4;
 static const uint CROSSED_WORDS = 1;
-public static const uint SLOT_LAYER_PART = LAYER_WORDS + CROSSING_WORDS + CROSSED_WORDS;
+[Host] public static const uint SLOT_LAYER_PART = LAYER_WORDS + CROSSING_WORDS + CROSSED_WORDS;
 static const uint SLOT_INTERIOR_WORDS = 8;
 static const uint SLOT_SHADOW_INTERIOR_WORDS = 2;
-public static const uint SLOT_INTERIOR_PART = SLOT_INTERIOR_WORDS + SLOT_SHADOW_INTERIOR_WORDS;
+[Host] public static const uint SLOT_INTERIOR_PART = SLOT_INTERIOR_WORDS + SLOT_SHADOW_INTERIOR_WORDS;
 // The stack part: `PathStack`, then `StackHit` and `StackWalk`.
 static const uint PATH_STACK_WORDS = 5;
 static const uint STACK_HIT_AT = PATH_STACK_WORDS;
 static const uint STACK_HIT_WORDS = 2;
 static const uint STACK_WALK_AT = STACK_HIT_AT + STACK_HIT_WORDS;
 static const uint STACK_WALK_WORDS = 10;
-public static const uint SLOT_STACK_PART = STACK_WALK_AT + STACK_WALK_WORDS;
+[Host] public static const uint SLOT_STACK_PART = STACK_WALK_AT + STACK_WALK_WORDS;
 // The light part: `BentDraw` or `LightView`.
-public static const uint SLOT_LIGHT_PART = 3;
-public static const uint SLOT_SPECTRAL_PART = 5;
+[Host] public static const uint SLOT_LIGHT_PART = 3;
+[Host] public static const uint SLOT_SPECTRAL_PART = 5;
 
 // `LaunchLoop.reach`, how the path reached its vertex: the vertex is the path's first, and is the
 // G-buffer's surface; the path is at a subsurface walk's exit, which is the vertex the walk entered
@@ -2635,6 +2636,7 @@ uint walk_path(PathRoot r, uint slot)
 // light, or where `deposits` its photon's deposit.
 public void launch_paths<M : IMedium>(PathRoot r, uint start, uint finish, bool deposits)
 {
+    static_assert(CALL_SCATTER == CALL_DIRECT + AT_CLASSES && CALL_DEPOSIT == CALL_SCATTER + AT_CLASSES, "a vertex class's callables overlap another's");
     uint slot = launch_slot();
     if (slot >= r.slice_count)
         return;

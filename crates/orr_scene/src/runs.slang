@@ -8,6 +8,7 @@
 // `page_material_sets`.
 module runs;
 
+import orr_shaders.abi;
 import orr_shaders.trace;
 import orr_scene.material;
 import orr_scene.producer;
@@ -18,7 +19,7 @@ import orr_scene.hit;
 public static const uint RAY_TYPE_PATH = 0;
 public static const uint RAY_TYPE_SHADOW = 1;
 public static const uint RAY_TYPE_LAYERS = 2;
-public static const uint RAY_TYPES = 3;
+[Host] public static const uint RAY_TYPES = 3;
 
 // The contribution of an instance whose row starts at run `run`. Runs past what 24 bits of
 // contribution reach hold no records, since `Frame::hit_table` refuses such a layout; their
@@ -34,7 +35,7 @@ public uint contribution(uint run)
 public static const uint RUN_MEDIUM = 0;
 public static const uint RUN_LIGHT = 1;
 public static const uint RUN_WALK = 2;
-public static const uint FIXED_RUNS = 3;
+[Host] public static const uint FIXED_RUNS = 3;
 
 // `HitData.flags`: the CLASS_* of the run's material in the low bits, then HIT_*.
 public static const uint HIT_CLASS_MASK = 7;
@@ -46,7 +47,8 @@ public static const uint HIT_EMITS = 1 << 6;
 // has one of their weights above 0, or a linked surface, which may set any.
 public static const uint HIT_LOBED = 1 << 7;
 
-// A hit record's data, after its group's handle: what its shaders start from.
+// A hit record's data, after its group's handle: what its shaders start from, HIT_DATA_BYTES of it.
+[Host] public static const uint HIT_DATA_BYTES = 16;
 public struct HitData
 {
     public uint material;          // the section's MaterialId, MATERIAL_NONE for none
@@ -58,6 +60,7 @@ public struct HitData
 // The data of a run of material `material` and class `class_id`.
 public HitData hit_data(SceneRoot* s, uint material, uint class_id)
 {
+    static_assert(sizeof(HitData) == HIT_DATA_BYTES, "a run's data is not HIT_DATA_BYTES");
     HitData d = { material, class_id, MATERIAL_NONE, 0 };
     if (material == MATERIAL_NONE)
         return d;

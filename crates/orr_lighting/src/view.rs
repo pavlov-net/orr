@@ -17,7 +17,7 @@ use orr_scene::{
 };
 
 use crate::caustics::PhotonMap;
-use crate::launch::{FEATURE_COATED_EMITTERS, FEATURE_LAYERS, LaunchMemory, PathPipeline, Raygen};
+use crate::launch::{LaunchMemory, PathPipeline, Raygen};
 use crate::media::{
     MediaKernels, MediaSettings, MediaStats, MediaView, fogged, links_medium, readers, shows_media,
 };
@@ -30,13 +30,14 @@ use crate::shaders::types::{
     ParticleLighting, PathRoot,
 };
 use crate::staged::{
-    FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_SEGMENTS, FEATURE_STACK, FEATURE_WALK,
-    MAX_ROUNDS, MAY_ALL, MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG,
-    MAY_DIRECTIONAL, MAY_DISPERSION, MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ,
-    MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES,
-    MAY_REFERENCE, MAY_SMOKE, MAY_STACK, MAY_SUBSURFACE, MAY_WALK, PATH_SOURCE_BACKGROUND,
-    PATH_SOURCE_PHOTON, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, Source, SourcePaths, Stage, StageSet,
-    StagedKernels, StagedMemory, StateParts,
+    FEATURE_COATED_EMITTERS, FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_LAYERS,
+    FEATURE_SEGMENTS, FEATURE_STACK, FEATURE_WALK, MAX_ROUNDS, MAY_ALL, MAY_CACHE, MAY_CAUSTICS,
+    MAY_COAT, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION, MAY_EMISSIVE, MAY_FILM,
+    MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOCAL,
+    MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES, MAY_REFERENCE, MAY_SMOKE, MAY_STACK,
+    MAY_SUBSURFACE, MAY_WALK, PATH_SOURCE_BACKGROUND, PATH_SOURCE_PHOTON, PATH_SOURCE_UPDATE,
+    PATH_SOURCE_VIEW, Source, SourcePaths, Stage, StageSet, StagedKernels, StagedMemory,
+    StateParts, UPDATE_FEATURES,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::support::{Masked, MaskedFrame, MaskedSupport, Runs};
@@ -1347,9 +1348,6 @@ fn path_features(features: SceneFeatures, lighting: &ViewLighting) -> u32 {
         | part(interiors, FEATURE_INTERIORS)
         | part(stack, FEATURE_STACK)
 }
-
-/// The features an update path keeps of its view's: it does not walk, nor split by wavelength.
-const UPDATE_FEATURES: u32 = FEATURE_INTERIORS | FEATURE_STACK | FEATURE_SEGMENTS;
 
 /// The root the update paths of the view of `root` run under, as `path/stages.slang`'s
 /// `update_root` makes it, but for its source, which the caller sets.

@@ -12,59 +12,46 @@ use orr_scene::orr_gpu::{
 use orr_scene::{JobResult, Loading, SceneFeatures, Urgency};
 use orr_shaders::abi::SpecEntry;
 
+use crate::shaders::consts::{self, SHADOW_DEPTH_SHIFT};
+pub(crate) use crate::shaders::consts::{
+    FEATURE_COATED_EMITTERS, FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_LAYERS,
+    FEATURE_RAY_SHADES, FEATURE_SEGMENTS, FEATURE_STACK, FEATURE_WALK, PATH_SOURCE_BACKGROUND,
+    PATH_SOURCE_PHOTON, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, STAGE_GROUP, UPDATE_FEATURES,
+};
 use crate::shaders::path::staged::{
     primary, reset, shade_opaque, shade_other, sources, trace, walk,
 };
 use crate::shaders::types::{PathRoot, PathStages, StageQueue};
 use crate::{Error, KernelSet, module};
 
-/// `path/stages.slang`'s queues, in its order.
-const QUEUE_OPAQUE: u64 = 0;
-const QUEUE_OTHER: u64 = 1;
-const QUEUE_WALK: u64 = 2;
-const QUEUE_TRACE: u64 = 3;
-const QUEUE_FINISH: u64 = 4;
-const QUEUE_RICH: u64 = 5;
-const STAGE_QUEUES: u64 = 6;
-/// Its words of 16 bytes per path slot: the state every path keeps and the parts of paths that
-/// may lie in an interior, track plane stacks and may split by wavelength; what a deferred
-/// shadow ray keeps of its vertex where paths track interiors; and the record, and an
-/// update path's.
-const BASE_WORDS: u64 = 12;
-const INTERIOR_PARTS: u64 = 8;
-const STACK_PART: u64 = 5;
-const SPECTRAL_PART: u64 = 5;
-const SHADOW_INTERIOR_WORDS: u64 = 2;
-pub(crate) const RECORD_WORDS: u64 = 2;
-pub(crate) const UPDATE_RECORD_WORDS: u64 = 9;
-/// Lanes per workgroup of its stages.
-const STAGE_GROUP: u32 = 32;
+/// `path/stages.slang`'s queues and the words of 16 bytes per path slot it lays out: the state
+/// every path keeps and the parts of paths that may lie in an interior, track plane stacks and may
+/// split by wavelength; what a deferred shadow ray keeps of its vertex where paths track
+/// interiors; and the record, and an update path's.
+const QUEUE_OPAQUE: u64 = consts::QUEUE_OPAQUE as u64;
+const QUEUE_OTHER: u64 = consts::QUEUE_OTHER as u64;
+const QUEUE_WALK: u64 = consts::QUEUE_WALK as u64;
+const QUEUE_TRACE: u64 = consts::QUEUE_TRACE as u64;
+const QUEUE_FINISH: u64 = consts::QUEUE_FINISH as u64;
+const QUEUE_RICH: u64 = consts::QUEUE_RICH as u64;
+const STAGE_QUEUES: u64 = consts::STAGE_QUEUES as u64;
+const BASE_WORDS: u64 = consts::BASE_WORDS as u64;
+const INTERIOR_PARTS: u64 = consts::INTERIOR_PARTS as u64;
+const STACK_PART: u64 = consts::STACK_PART as u64;
+const SPECTRAL_PART: u64 = consts::SPECTRAL_PART as u64;
+const SHADOW_INTERIOR_WORDS: u64 = consts::SHADOW_INTERIOR_WORDS as u64;
+pub(crate) const RECORD_WORDS: u64 = consts::RECORD_WORDS as u64;
+pub(crate) const UPDATE_RECORD_WORDS: u64 = consts::UPDATE_RECORD_WORDS as u64;
 /// Path slots of a source's own at most: one with more paths runs them in slices, which bounds
 /// the state its view keeps.
 const MAX_SLOTS: u32 = 65535 * STAGE_GROUP;
 /// Rounds a source's paths may ask for at most: a deferred shadow ray keeps its vertex's depth
-/// in the 23 bits beside its flags (`SHADOW_DEPTH_SHIFT`). The queues of that many rounds take
-/// more memory than a device has, so no root gets there.
-pub(crate) const MAX_ROUNDS: u32 = 1 << 23;
+/// in the bits above its flags (`SHADOW_DEPTH_SHIFT`). The queues of that many rounds take more
+/// memory than a device has, so no root gets there.
+pub(crate) const MAX_ROUNDS: u32 = 1 << (32 - SHADOW_DEPTH_SHIFT);
 
-/// `PathRoot.source`.
-pub(crate) const PATH_SOURCE_VIEW: u32 = 0;
-pub(crate) const PATH_SOURCE_BACKGROUND: u32 = 1;
-pub(crate) const PATH_SOURCE_UPDATE: u32 = 2;
-pub(crate) const PATH_SOURCE_PHOTON: u32 = 3;
-/// `PathRoot.features`.
-pub(crate) const FEATURE_WALK: u32 = 1 << 0;
-pub(crate) const FEATURE_DISPERSION: u32 = 1 << 2;
-/// Paths may lie in an interior, and may track a plane stack: their state holds those parts.
-pub(crate) const FEATURE_INTERIORS: u32 = 1 << 4;
-pub(crate) const FEATURE_STACK: u32 = 1 << 5;
-/// The pipeline path tracer's segments outside interiors march a medium.
-pub(crate) const FEATURE_SEGMENTS: u32 = 1 << 6;
-/// The shade stages run as ray dispatches.
-const FEATURE_RAY_SHADES: u32 = 1 << 3;
-
-/// The id of `specialize.slang`'s `path_may`, and its bits: what the paths of a pipeline may
-/// meet.
+/// The id of `specialize.slang`'s `path_may`, and its bits (its MAY_*): what the paths of a
+/// pipeline may meet.
 pub(crate) const PATH_MAY_ID: u32 = 110;
 /// The specialization entries of a mask: its low word is `path_may` and its high word
 /// `scene_may.slang`'s `path_may2`, what a scene's surface evaluations and hits may meet.
@@ -80,38 +67,38 @@ pub(crate) const SPEC_ENTRIES: [SpecEntry; 2] = [
         size: 4,
     },
 ];
-pub(crate) const MAY_STACK: u64 = 1 << 0;
-pub(crate) const MAY_DISPERSION: u64 = 1 << 1;
-pub(crate) const MAY_CAUSTICS: u64 = 1 << 2;
-pub(crate) const MAY_VIEW: u64 = 1 << 3;
-pub(crate) const MAY_BACKGROUND: u64 = 1 << 4;
-pub(crate) const MAY_UPDATE: u64 = 1 << 5;
-pub(crate) const MAY_PHOTON: u64 = 1 << 6;
-pub(crate) const MAY_DEBUG: u64 = 1 << 7;
-pub(crate) const MAY_REFERENCE: u64 = 1 << 8;
-pub(crate) const MAY_FROST: u64 = 1 << 9;
-pub(crate) const MAY_LENS: u64 = 1 << 10;
-pub(crate) const MAY_WALK: u64 = 1 << 11;
-pub(crate) const MAY_LOCAL: u64 = 1 << 12;
-pub(crate) const MAY_FROXELS: u64 = 1 << 13;
-pub(crate) const MAY_CACHE: u64 = 1 << 14;
-pub(crate) const MAY_COAT: u64 = 1 << 15;
-pub(crate) const MAY_FUZZ: u64 = 1 << 16;
-pub(crate) const MAY_FILM: u64 = 1 << 17;
-pub(crate) const MAY_SUBSURFACE: u64 = 1 << 18;
+pub(crate) const MAY_STACK: u64 = consts::MAY_STACK as u64;
+pub(crate) const MAY_DISPERSION: u64 = consts::MAY_DISPERSION as u64;
+pub(crate) const MAY_CAUSTICS: u64 = consts::MAY_CAUSTICS as u64;
+pub(crate) const MAY_VIEW: u64 = consts::MAY_VIEW as u64;
+pub(crate) const MAY_BACKGROUND: u64 = consts::MAY_BACKGROUND as u64;
+pub(crate) const MAY_UPDATE: u64 = consts::MAY_UPDATE as u64;
+pub(crate) const MAY_PHOTON: u64 = consts::MAY_PHOTON as u64;
+pub(crate) const MAY_DEBUG: u64 = consts::MAY_DEBUG as u64;
+pub(crate) const MAY_REFERENCE: u64 = consts::MAY_REFERENCE as u64;
+pub(crate) const MAY_FROST: u64 = consts::MAY_FROST as u64;
+pub(crate) const MAY_LENS: u64 = consts::MAY_LENS as u64;
+pub(crate) const MAY_WALK: u64 = consts::MAY_WALK as u64;
+pub(crate) const MAY_LOCAL: u64 = consts::MAY_LOCAL as u64;
+pub(crate) const MAY_FROXELS: u64 = consts::MAY_FROXELS as u64;
+pub(crate) const MAY_CACHE: u64 = consts::MAY_CACHE as u64;
+pub(crate) const MAY_COAT: u64 = consts::MAY_COAT as u64;
+pub(crate) const MAY_FUZZ: u64 = consts::MAY_FUZZ as u64;
+pub(crate) const MAY_FILM: u64 = consts::MAY_FILM as u64;
+pub(crate) const MAY_SUBSURFACE: u64 = consts::MAY_SUBSURFACE as u64;
 /// The lobes a plain surface lacks, which the opaque shade stage is compiled without; and what
 /// goes with them: only a subsurface vertex starts a walk.
 const MAY_LOBES: u64 = MAY_COAT | MAY_FUZZ | MAY_FILM | MAY_SUBSURFACE;
 pub(crate) const MAY_RICH: u64 = MAY_LOBES | MAY_WALK;
-pub(crate) const MAY_INTERIORS: u64 = 1 << 19;
-pub(crate) const MAY_LAYERS: u64 = 1 << 20;
-pub(crate) const MAY_COVERAGE: u64 = 1 << 21;
-pub(crate) const MAY_PARTICLES: u64 = 1 << 22;
-pub(crate) const MAY_LOCAL_LIGHTS: u64 = 1 << 23;
-pub(crate) const MAY_DIRECTIONAL: u64 = 1 << 24;
-pub(crate) const MAY_EMISSIVE: u64 = 1 << 25;
-pub(crate) const MAY_PROXIES: u64 = 1 << 30;
-pub(crate) const MAY_SMOKE: u64 = 1 << 31;
+pub(crate) const MAY_INTERIORS: u64 = consts::MAY_INTERIORS as u64;
+pub(crate) const MAY_LAYERS: u64 = consts::MAY_LAYERS as u64;
+pub(crate) const MAY_COVERAGE: u64 = consts::MAY_COVERAGE as u64;
+pub(crate) const MAY_PARTICLES: u64 = consts::MAY_PARTICLES as u64;
+pub(crate) const MAY_LOCAL_LIGHTS: u64 = consts::MAY_LOCAL_LIGHTS as u64;
+pub(crate) const MAY_DIRECTIONAL: u64 = consts::MAY_DIRECTIONAL as u64;
+pub(crate) const MAY_EMISSIVE: u64 = consts::MAY_EMISSIVE as u64;
+pub(crate) const MAY_PROXIES: u64 = consts::MAY_PROXIES as u64;
+pub(crate) const MAY_SMOKE: u64 = consts::MAY_SMOKE as u64;
 /// What gives the other shade stage a vertex: a layer, or a scatter in or a way out of an
 /// interior.
 const MAY_OTHER: u64 = MAY_LAYERS | MAY_INTERIORS;

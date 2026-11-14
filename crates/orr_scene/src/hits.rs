@@ -6,16 +6,14 @@ use orr_gpu::{
     RayPipeline, Stages,
 };
 
+use crate::shaders::consts::{
+    FIXED_KINDS, FIXED_RUNS, HIT_DATA_BYTES, KIND_LAYER_PATH, KIND_LAYERS, KIND_LIGHT_LAYERS,
+    KIND_MEDIUM_LAYERS, KIND_MEDIUM_SHADOW, KIND_PATH, KIND_PRODUCER_LAYER_PATH,
+    KIND_PRODUCER_PATH, KIND_SHADOW, KIND_STACK_MEET, KIND_STRAND_PATH, KIND_WALK_MEET,
+    PINNED_KINDS, RAY_TYPES,
+};
 use crate::shaders::sbt::HitTableRoot;
 use crate::{Error, Result, SceneRoot};
-
-/// `runs.slang`'s RAY_TYPES, FIXED_RUNS and the size of `HitData`, and `sbt.slang`'s
-/// FIXED_KINDS and PINNED_KINDS.
-const RAY_TYPES: u32 = 3;
-const HIT_DATA_BYTES: u64 = 16;
-const FIXED_RUNS: u32 = 3;
-const FIXED_KINDS: usize = 6;
-const PINNED_KINDS: usize = 6;
 
 /// The hit groups of a ray tracing pipeline that a scene's hit records name, by what each
 /// record serves: a group index of the pipeline, or `None` for records of zeros. A record of
@@ -74,22 +72,28 @@ impl HitGroups {
     /// In `sbt.slang`'s handle table order: the KIND_* groups held once, then each pinned
     /// kind's pins.
     fn slots(&self) -> Vec<Option<u32>> {
-        let fixed: [Option<u32>; FIXED_KINDS] = [
-            self.layers,
-            self.medium_shadow,
-            self.medium_layers,
-            self.light_layers,
-            self.walk_meet,
-            self.stack_meet,
-        ];
-        let pinned: [Option<u32>; PINNED_KINDS] = [
-            self.path,
-            self.producer_path,
-            self.strand_path,
-            self.shadow,
-            self.layer_path,
-            self.producer_layer_path,
-        ];
+        let mut fixed = [None; FIXED_KINDS as usize];
+        for (kind, group) in [
+            (KIND_LAYERS, self.layers),
+            (KIND_MEDIUM_SHADOW, self.medium_shadow),
+            (KIND_MEDIUM_LAYERS, self.medium_layers),
+            (KIND_LIGHT_LAYERS, self.light_layers),
+            (KIND_WALK_MEET, self.walk_meet),
+            (KIND_STACK_MEET, self.stack_meet),
+        ] {
+            fixed[kind as usize] = group;
+        }
+        let mut pinned = [None; PINNED_KINDS as usize];
+        for (kind, group) in [
+            (KIND_PATH, self.path),
+            (KIND_PRODUCER_PATH, self.producer_path),
+            (KIND_STRAND_PATH, self.strand_path),
+            (KIND_SHADOW, self.shadow),
+            (KIND_LAYER_PATH, self.layer_path),
+            (KIND_PRODUCER_LAYER_PATH, self.producer_layer_path),
+        ] {
+            pinned[kind as usize] = group;
+        }
         let pins = self.pins();
         fixed
             .into_iter()
@@ -179,7 +183,7 @@ impl HitTables {
         }
         let limits = &device.caps().limits;
         let handle = u64::from(limits.ray_handle_bytes);
-        let data = HIT_DATA_BYTES;
+        let data = u64::from(HIT_DATA_BYTES);
         let stride = pipeline
             .hit_stride()
             .max(handle + data)

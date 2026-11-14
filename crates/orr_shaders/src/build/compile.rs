@@ -13,7 +13,7 @@ use super::codegen::{self, Kernel, Owner, Shared};
 use super::layout::{Plan, Planner};
 use super::link::{self, KernelPoints, Link, LinkModule, LinkPoint, LinkPoints};
 use super::lint::{self, Lint, LintError};
-use super::model::{self, Model, StructDef, Ty};
+use super::model::{self, HostConst, Model, StructDef, Ty};
 use super::roots::{self, Root};
 use super::slang::{GlobalSession, Library, Session};
 use super::{Error, SLANG_VERSION, SLANGC_OPTIONS, metal, spirv};
@@ -496,6 +496,40 @@ impl Build {
             owners.insert(name.clone(), module_owners);
         }
 
+        // The `[Host]` constants the crate's own shader root declares, which every module that
+        // loads them reports alike.
+        let mut consts: BTreeMap<String, &HostConst> = BTreeMap::new();
+        for (name, record) in &modules {
+            for c in &record.model.consts {
+                if !own_root
+                    .as_ref()
+                    .is_some_and(|r| canonical_lossy(&c.file).starts_with(r))
+                {
+                    continue;
+                }
+                match consts.get(&c.name) {
+                    Some(seen) if seen.value != c.value || seen.scalar != c.scalar => {
+                        lints.push(LintError {
+                            lint: Lint::HostConst,
+                            module: name.clone(),
+                            message: format!(
+                                "[Host] constant {} is {} in {} and {} in {}",
+                                c.name,
+                                seen.value,
+                                seen.file.display(),
+                                c.value,
+                                c.file.display()
+                            ),
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        consts.insert(c.name.clone(), c);
+                    }
+                }
+            }
+        }
+
         let mut plans: HashMap<String, HashMap<String, Plan>> = HashMap::new();
         let mut models: HashMap<String, Model> = HashMap::new();
         for (name, record) in &modules {
@@ -540,6 +574,7 @@ impl Build {
         let mut shared = Shared {
             types: BTreeMap::new(),
             externs: BTreeMap::new(),
+            consts,
         };
         for (s, (def, _)) in &shared_defs {
             let plan = &shared_plans[s];

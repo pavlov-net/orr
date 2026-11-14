@@ -57,51 +57,54 @@ import orr_lighting.path;
 import orr_lighting.specialize;
 
 // `PathRoot.source`: which paths a root's stages run.
-public static const uint PATH_SOURCE_VIEW = 0;
-public static const uint PATH_SOURCE_BACKGROUND = 1;
-public static const uint PATH_SOURCE_UPDATE = 2;
-public static const uint PATH_SOURCE_PHOTON = 3;
+[Host] public static const uint PATH_SOURCE_VIEW = 0;
+[Host] public static const uint PATH_SOURCE_BACKGROUND = 1;
+[Host] public static const uint PATH_SOURCE_UPDATE = 2;
+[Host] public static const uint PATH_SOURCE_PHOTON = 3;
 
 // The queues. The shade stages are named by theirs: opaque vertices, apart those whose material
 // may have a lobe a plain surface lacks (QUEUE_RICH, below), and the others (layers, scatters in
 // interiors and walks' ways out of them).
-public static const uint QUEUE_OPAQUE = 0;
-public static const uint QUEUE_OTHER = 1;
-public static const uint QUEUE_WALK = 2;
-public static const uint QUEUE_TRACE = 3;
-public static const uint QUEUE_FINISH = 4;
+[Host] public static const uint QUEUE_OPAQUE = 0;
+[Host] public static const uint QUEUE_OTHER = 1;
+[Host] public static const uint QUEUE_WALK = 2;
+[Host] public static const uint QUEUE_TRACE = 3;
+[Host] public static const uint QUEUE_FINISH = 4;
 // Opaque vertices whose surface may have a coat, fuzz, a thin film or a subsurface weight, or
 // that the trace stage reads no material for. QUEUE_OPAQUE's pipeline is compiled without
 // those lobes; with none in the scene every opaque vertex goes there.
-public static const uint QUEUE_RICH = 5;
-public static const uint STAGE_QUEUES = 6;
+[Host] public static const uint QUEUE_RICH = 5;
+[Host] public static const uint STAGE_QUEUES = 6;
 // Not a queue: the shade stage `K` of the primary stage, which shades only the vertex a path
 // starts on the G-buffer's surface.
 static const uint SHADE_START = STAGE_QUEUES;
 
 // Lanes per workgroup of the stages over a queue.
-public static const uint STAGE_GROUP = 32;
+[Host] public static const uint STAGE_GROUP = 32;
 
 // `PathRoot.features`: a material of the scene may walk, so the walk stage runs; paths may
 // split by wavelength; and the shade stages run as ray dispatches, which reorder their lanes by
 // coherence key: a workgroup of a shade queue is then a row of STAGE_GROUP rays, and the queue
 // counts rows.
-public static const uint FEATURE_WALK = 1 << 0;
-public static const uint FEATURE_DISPERSION = 1 << 2;
-public static const uint FEATURE_RAY_SHADES = 1 << 3;
+[Host] public static const uint FEATURE_WALK = 1 << 0;
+[Host] public static const uint FEATURE_DISPERSION = 1 << 2;
+[Host] public static const uint FEATURE_RAY_SHADES = 1 << 3;
 // And what a path's state holds beside FEATURE_DISPERSION's wavelengths: paths may lie in an
 // interior, and may track a plane stack.
-public static const uint FEATURE_INTERIORS = 1 << 4;
-public static const uint FEATURE_STACK = 1 << 5;
+[Host] public static const uint FEATURE_INTERIORS = 1 << 4;
+[Host] public static const uint FEATURE_STACK = 1 << 5;
 // The pipeline path tracer's segments outside interiors march a medium: the build links one, or
 // the view has froxels. Without either a segment changes nothing but its sampler dimension.
-public static const uint FEATURE_SEGMENTS = 1 << 6;
+[Host] public static const uint FEATURE_SEGMENTS = 1 << 6;
 // And, read by the pipeline path tracer alone, that its paths may meet dielectric or presence
 // layers: their slots hold a layer vertex's words and a shadow ray's crossings; and that their
 // next-event estimation may draw an emitter with a coat or fuzz, whose sample their slots keep
 // for the shadow ray's end.
-public static const uint FEATURE_LAYERS = 1 << 7;
-public static const uint FEATURE_COATED_EMITTERS = 1 << 8;
+[Host] public static const uint FEATURE_LAYERS = 1 << 7;
+[Host] public static const uint FEATURE_COATED_EMITTERS = 1 << 8;
+// The features an update path keeps of its view's (`update_root`): it does not walk, nor split by
+// wavelength, and rides in the view's shade stages.
+[Host] public static const uint UPDATE_FEATURES = FEATURE_INTERIORS | FEATURE_STACK | FEATURE_RAY_SHADES | FEATURE_SEGMENTS;
 
 uint round_now(PathRoot r) { return r.round; }
 uint round_pass(PathRoot r) { return r.round_first; }
@@ -148,7 +151,7 @@ PathRoot update_root(PathRoot r)
     r.light_flags = 0;
     r.dof_background.index = IMAGE_NONE;
     r.dielectric_flags &= DIELECTRIC_DISPERSION;
-    r.features &= FEATURE_INTERIORS | FEATURE_STACK | FEATURE_RAY_SHADES | FEATURE_SEGMENTS;
+    r.features &= UPDATE_FEATURES;
     r.pixel_fraction = 1.0;
     return r;
 }
@@ -321,7 +324,7 @@ public static const uint SHADOW_VIEW = 1 << 7;     // the light is an emitter wh
 // Read by the pipeline path tracer alone: the ray is a leg of a plane stack's walk, inside the
 // interiors the walk holds.
 public static const uint SHADOW_LEG = 1 << 8;
-public static const uint SHADOW_DEPTH_SHIFT = 9;
+[Host] public static const uint SHADOW_DEPTH_SHIFT = 9;
 
 // The direction a walk enters its vertex along, for the walk stage, and what it resolves the
 // vertex again with: the hit the span still holds, with the cone that reached it, or the
@@ -359,19 +362,19 @@ static const uint SPECTRAL_WORDS = 5;
 static const uint LOOP_FIRST = 0;
 static const uint RAY_FIRST = LOOP_FIRST + LOOP_WORDS;
 static const uint SPAN_FIRST = RAY_FIRST + RAY_WORDS;
-public static const uint BASE_WORDS = SPAN_FIRST + SPAN_WORDS;
+[Host] public static const uint BASE_WORDS = SPAN_FIRST + SPAN_WORDS;
 static const uint INTERIOR_FIRST = BASE_WORDS;
 static const uint ENTERED_FIRST = INTERIOR_FIRST + INTERIOR_WORDS;
-public static const uint INTERIOR_PARTS = INTERIOR_WORDS + ENTERED_WORDS;
-public static const uint STACK_PART = STACK_WORDS;
-public static const uint SPECTRAL_PART = SPECTRAL_WORDS;
+[Host] public static const uint INTERIOR_PARTS = INTERIOR_WORDS + ENTERED_WORDS;
+[Host] public static const uint STACK_PART = STACK_WORDS;
+[Host] public static const uint SPECTRAL_PART = SPECTRAL_WORDS;
 // The words of `PathStages.shadows`, which only paths that track interiors keep: a deferred
 // shadow ray's vertex and the surface it lies on.
-public static const uint SHADOW_INTERIOR_WORDS = 2;
+[Host] public static const uint SHADOW_INTERIOR_WORDS = 2;
 // A record's words: a view's and a photon's, and an update path's, whose slices hold as many
 // fewer paths.
-public static const uint RECORD_WORDS = 2;
-public static const uint UPDATE_RECORD_WORDS = 9;
+[Host] public static const uint RECORD_WORDS = 2;
+[Host] public static const uint UPDATE_RECORD_WORDS = 9;
 
 public bool interiors_tracked(PathRoot r)
 {

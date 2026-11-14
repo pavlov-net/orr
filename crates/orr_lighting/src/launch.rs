@@ -11,48 +11,37 @@ use orr_scene::orr_gpu::{
 };
 use orr_scene::{HitGroups, SceneFeatures};
 
+use crate::shaders::consts::{
+    AT_EXIT, AT_LAYER, AT_LEAVE, AT_PLAIN, AT_RICH, AT_SCATTER, CALL_CACHE_VERTEX, CALL_DEPOSIT,
+    CALL_DIRECT, CALL_EMISSION, CALL_EMITTER_VIEW, CALL_FINISH_BACKGROUND, CALL_FINISH_RECORD,
+    CALL_FINISH_VIEW, CALL_GBUFFER, CALL_LAYERS, CALL_PROXY_MARCH, CALL_RESOLVE_GIVEN,
+    CALL_SCATTER, CALL_SEGMENT, CALL_STACK_STEP, CALL_START_BACKGROUND, CALL_START_PHOTON,
+    CALL_START_UPDATE, CALL_START_VIEW, CALL_WALK_END, CALL_WINDOW, CALLABLES, SLOT_INTERIOR_PART,
+    SLOT_LAYER_PART, SLOT_LIGHT_PART, SLOT_SPECTRAL_PART, SLOT_STACK_PART, SLOT_WORDS, WALK_WORDS,
+};
 use crate::shaders::path::pipeline::{self, Spec};
 use crate::shaders::types::{PathRoot, PathStages};
 use crate::staged::{
-    FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_STACK, FEATURE_WALK, MAY_ALL, MAY_RICH,
-    RECORD_WORDS, UPDATE_RECORD_WORDS,
+    FEATURE_COATED_EMITTERS, FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_LAYERS, FEATURE_STACK,
+    FEATURE_WALK, MAY_ALL, MAY_RICH, RECORD_WORDS, UPDATE_RECORD_WORDS,
 };
 use crate::{Error, KernelSet, module};
-
-/// `path/launch.slang`'s SLOT_WORDS, WALK_WORDS, SLOT_LAYER_PART, SLOT_INTERIOR_PART,
-/// SLOT_STACK_PART, SLOT_LIGHT_PART and SLOT_SPECTRAL_PART: the words of a path's slot, and those
-/// of the parts the paths that walk, may meet layers, track interiors, may cross plane stacks,
-/// whose shadow rays' lights take their draws at the rays' ends, and that split by wavelength add
-/// to it.
-const SLOT_WORDS: u64 = 28;
-const WALK_WORDS: u64 = 15;
-const LAYER_PART: u64 = 7;
-const INTERIOR_PART: u64 = 10;
-const STACK_PART: u64 = 17;
-const LIGHT_PART: u64 = 3;
-const SPECTRAL_PART: u64 = 5;
-
-/// `path/stages.slang`'s FEATURE_LAYERS and FEATURE_COATED_EMITTERS, which only the pipeline's
-/// slots keep parts for: paths may meet dielectric or presence layers, and next-event estimation
-/// may draw an emitter with a coat or fuzz.
-pub(crate) const FEATURE_LAYERS: u32 = 1 << 7;
-pub(crate) const FEATURE_COATED_EMITTERS: u32 = 1 << 8;
 
 /// The words of a slot of paths whose root has `features`, of a view's or its background layer's
 /// (`view`) or not, as `path/launch.slang`'s `slot_stride` lays it out.
 fn slot_words(features: u32, view: bool) -> u64 {
     let walk = view && features & (FEATURE_WALK | FEATURE_INTERIORS) != 0;
-    let part = |on: bool, words: u64| if on { words } else { 0 };
-    SLOT_WORDS
+    let part = |on: bool, words: u32| if on { u64::from(words) } else { 0 };
+    u64::from(SLOT_WORDS)
         + part(walk, WALK_WORDS)
-        + part(features & FEATURE_LAYERS != 0, LAYER_PART)
-        + part(features & FEATURE_INTERIORS != 0, INTERIOR_PART)
-        + part(features & FEATURE_STACK != 0, STACK_PART)
+        + part(features & FEATURE_LAYERS != 0, SLOT_LAYER_PART)
+        + part(features & FEATURE_INTERIORS != 0, SLOT_INTERIOR_PART)
+        + part(features & FEATURE_STACK != 0, SLOT_STACK_PART)
         + part(
             features & (FEATURE_STACK | FEATURE_COATED_EMITTERS) != 0,
-            LIGHT_PART,
+            SLOT_LIGHT_PART,
         )
-        + part(features & FEATURE_DISPERSION != 0, SPECTRAL_PART)
+        + part(features & FEATURE_DISPERSION != 0, SLOT_SPECTRAL_PART)
 }
 
 /// Paths of a source one launch runs at most, which bounds the memory a view's paths keep: a
@@ -109,45 +98,56 @@ const COVER_SHADOW: usize = 4;
 const LAYER_COPIES: usize = 5;
 const LAYER_PRODUCERS: usize = 6;
 
-/// Then the callables, in `path/launch.slang`'s CALL_* order, each with the lobes of the BSDF its
-/// vertices may have. Next-event estimation and the scatter are made per vertex class (`AT_*`), an
+/// Then the callables, each at its `path/launch.slang` CALL_* index with the lobes of the BSDF its
+/// vertices may have. Next-event estimation and the scatter are made per vertex class (AT_*), an
 /// opaque vertex's for a plain surface's and a rich one's. A walk's ends are made rich, as a walk
 /// starts only from a vertex with a subsurface weight, and so are the layer's, the window's and an
 /// emitter's view, whose surfaces may have every lobe. What lies along a ray, a scatter in a
 /// medium and a plane stack's step shade no surface.
-const CALLABLES: [(&str, bool); 31] = [
-    ("start_view", true),
-    ("start_update", true),
-    ("start_photon", true),
-    ("start_background", true),
-    ("resolve_given", true),
-    ("emission", true),
-    ("direct", false),
-    ("direct", true),
-    ("direct_exit", true),
-    ("direct_leave", true),
-    ("direct_medium", false),
-    ("direct_layer", true),
-    ("scatter", false),
-    ("scatter", true),
-    ("scatter_exit", true),
-    ("scatter_leave", true),
-    ("scatter_medium", false),
-    ("scatter_layer", true),
-    ("deposit", true),
-    ("cache_vertex", true),
-    ("finish_view", true),
-    ("finish_record", true),
-    ("finish_background", true),
-    ("walk_end", true),
-    ("segment", false),
-    ("layers", false),
-    ("march_proxy", false),
-    ("gbuffer_start", true),
-    ("window", true),
-    ("stack_step", false),
-    ("emitter_view", true),
+const CALLED: [(u32, &str, bool); CALLABLES as usize] = [
+    (CALL_START_VIEW, "start_view", true),
+    (CALL_START_UPDATE, "start_update", true),
+    (CALL_START_PHOTON, "start_photon", true),
+    (CALL_START_BACKGROUND, "start_background", true),
+    (CALL_RESOLVE_GIVEN, "resolve_given", true),
+    (CALL_EMISSION, "emission", true),
+    (CALL_DIRECT + AT_PLAIN, "direct", false),
+    (CALL_DIRECT + AT_RICH, "direct", true),
+    (CALL_DIRECT + AT_EXIT, "direct_exit", true),
+    (CALL_DIRECT + AT_LEAVE, "direct_leave", true),
+    (CALL_DIRECT + AT_SCATTER, "direct_medium", false),
+    (CALL_DIRECT + AT_LAYER, "direct_layer", true),
+    (CALL_SCATTER + AT_PLAIN, "scatter", false),
+    (CALL_SCATTER + AT_RICH, "scatter", true),
+    (CALL_SCATTER + AT_EXIT, "scatter_exit", true),
+    (CALL_SCATTER + AT_LEAVE, "scatter_leave", true),
+    (CALL_SCATTER + AT_SCATTER, "scatter_medium", false),
+    (CALL_SCATTER + AT_LAYER, "scatter_layer", true),
+    (CALL_DEPOSIT, "deposit", true),
+    (CALL_CACHE_VERTEX, "cache_vertex", true),
+    (CALL_FINISH_VIEW, "finish_view", true),
+    (CALL_FINISH_RECORD, "finish_record", true),
+    (CALL_FINISH_BACKGROUND, "finish_background", true),
+    (CALL_WALK_END, "walk_end", true),
+    (CALL_SEGMENT, "segment", false),
+    (CALL_LAYERS, "layers", false),
+    (CALL_PROXY_MARCH, "march_proxy", false),
+    (CALL_GBUFFER, "gbuffer_start", true),
+    (CALL_WINDOW, "window", true),
+    (CALL_STACK_STEP, "stack_step", false),
+    (CALL_EMITTER_VIEW, "emitter_view", true),
 ];
+
+/// [`CALLED`] in the order of the table: each callable's entry and whether it is made rich.
+fn callables() -> [(&'static str, bool); CALLABLES as usize] {
+    let mut table = [("", false); CALLABLES as usize];
+    for (index, entry, rich) in CALLED {
+        let at = &mut table[index as usize];
+        assert!(at.0.is_empty(), "two callables at index {index}");
+        *at = (entry, rich);
+    }
+    table
+}
 
 /// The geometry a hit shader runs on, which its stage is made for.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -213,7 +213,7 @@ impl PathPipeline {
             }
         }
         let first_callable = specs.len() as u32;
-        for &(entry, rich) in &CALLABLES {
+        for (entry, rich) in callables() {
             let may = if rich { MAY_ALL } else { MAY_ALL & !MAY_RICH };
             let spec = Spec {
                 path_may: may as u32,
