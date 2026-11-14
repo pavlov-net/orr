@@ -194,7 +194,8 @@ public void walk_steps<T : IWalkTrace>(inout Walk e, T tracer, uint steps, Subsu
     for (uint end = min(e.step + steps, max_steps); e.step < end; e.step++)
     {
         float total = e.throughput.x + e.throughput.y + e.throughput.z;
-        if (!(total > 0.0) || !isfinite(total))
+        // Division by a denormal has no precision bound, and a device may keep denormals.
+        if (!(total >= F32_MIN_NORMAL) || !isfinite(total))
         {
             e.kind = WALK_NONE;
             e.throughput = float3(0.0);
