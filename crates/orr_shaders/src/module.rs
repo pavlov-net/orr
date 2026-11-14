@@ -106,8 +106,7 @@ pub enum PathEntry {
     /// without ray-dispatch pipelines.
     RayDispatch,
     /// The ray tracing pipeline path tracer: a raygen per source runs each path to its end
-    /// through hit, miss and callable shaders. It renders opaque scenes so far; fails on devices
-    /// without ray tracing pipelines.
+    /// through hit, miss and callable shaders. Fails on devices without ray tracing pipelines.
     Pipeline,
 }
 

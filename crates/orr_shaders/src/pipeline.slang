@@ -51,6 +51,26 @@ public void store_coherent<T>(T* p, T v)
     };
 }
 
+// `load_coherent` of texel `at` of `image`.
+[ForceInline]
+public float4 load_texel_coherent(RWTexture2D<float4> image, uint2 at)
+{
+    return spirv_asm {
+        OpCapability VulkanMemoryModelDeviceScope;
+        result : $$float4 = OpImageRead $image $at MakeTexelVisible|NonPrivateTexel $(1u);
+    };
+}
+
+// `store_coherent` of texel `at` of `image`.
+[ForceInline]
+public void store_texel_coherent(RWTexture2D<float4> image, uint2 at, float4 v)
+{
+    spirv_asm {
+        OpCapability VulkanMemoryModelDeviceScope;
+        OpImageWrite $image $at $v MakeTexelAvailable|NonPrivateTexel $(1u);
+    };
+}
+
 // `flags` with `orr_shaders.trace`'s RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, which pipelines see
 // only when created for micromaps, and builds without micromaps drop.
 [ForceInline]

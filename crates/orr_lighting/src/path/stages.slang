@@ -1263,8 +1263,9 @@ void finish_path(PathRoot r, uint slot, PathFixed f, PathLoop p)
 }
 
 // What a view writes of a pixel's own path once it ended with `pixel_radiance`: its
-// radiance, layer memory and light feedback, and with frost its background's luminance.
-public void view_outputs(PathRoot r, PathFixed f, PathLoop p, StoredView pixel_path, float3 pixel_radiance)
+// radiance, layer memory and light feedback, and with frost its background's luminance. The
+// radiance texel it wrote.
+public float4 view_outputs(PathRoot r, PathFixed f, PathLoop p, StoredView pixel_path, float3 pixel_radiance)
 {
     uint2 pixel = f.pixel;
     uint index = pixel.y * r.gbuffer.extent.x + pixel.x;
@@ -1287,6 +1288,7 @@ public void view_outputs(PathRoot r, PathFixed f, PathLoop p, StoredView pixel_p
         count_feedback(r.set, feedback);
     if (frost_pass(r))
         r.layers[index].background = guide_luminance(pixel_radiance);
+    return out;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2171,8 +2173,12 @@ public bool shade_direct<S : ISurfaces, M : IMedium, R : IVertexRecord>(PathRoot
 public bool shade_deposit<S : ISurfaces, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, PackedSurface ps, float3 dir, float t, bool first, inout Sampler rng)
 {
     ShadeVertex sv = packed_vertex(r, p, c, record, x, ps, dir);
-    return arrive_opaque(r, f, p, c, record, x, sv, t, first, rng)
-        && photon_deposit<S, R>(r, p, c, record, x, VERTEX_OPAQUE, rng, sv);
+    if (!arrive_opaque(r, f, p, c, record, x, sv, t, first, rng) || !photon_deposit<S, R>(r, p, c, record, x, VERTEX_OPAQUE, rng, sv))
+        return false;
+    // The draw `vertex_nee` takes of whether to run, which a photon's vertex takes too: its
+    // scatter draws the dimensions it draws past `vertex_nee`.
+    rng.next();
+    return true;
 }
 
 // Opaque vertex `ps`, reached along `dir`, prepared as the shade bodies prepare it.

@@ -403,12 +403,16 @@ public uint launch_slot()
     return DispatchRaysIndex().x;
 }
 
+// A slot's layout is its root's source and features alone, never what a stage may meet
+// (`may`): every stage of the pipeline, however it is specialized, and the host
+// (`orr_lighting::launch::slot_words`) lay out a slot alike.
+
 // Whether the slots of `r`'s paths hold the walk part: a view's paths and its background
 // layer's walk where a material may walk or where they may lie in an interior, whose scatters
 // walk.
 bool walk_kept(PathRoot r)
 {
-    return (from_view(r) || from_background(r)) && (r.features & (FEATURE_WALK | FEATURE_INTERIORS)) != 0;
+    return (r.source == PATH_SOURCE_VIEW || r.source == PATH_SOURCE_BACKGROUND) && (r.features & (FEATURE_WALK | FEATURE_INTERIORS)) != 0;
 }
 
 static const uint WALK_AT = SLOT_WORDS;
@@ -416,6 +420,20 @@ static const uint WALK_AT = SLOT_WORDS;
 bool layers_kept(PathRoot r)
 {
     return (r.features & FEATURE_LAYERS) != 0;
+}
+
+// Whether they hold the interiors part, which a stage reads only where its paths may lie in an
+// interior (`interiors_tracked`).
+bool interiors_kept(PathRoot r)
+{
+    return (r.features & FEATURE_INTERIORS) != 0;
+}
+
+// Whether they hold the wavelengths, which a stage reads only where its paths may split by
+// wavelength (`spectral_tracked`).
+bool spectral_kept(PathRoot r)
+{
+    return (r.features & FEATURE_DISPERSION) != 0;
 }
 
 uint layer_at(PathRoot r)
@@ -443,7 +461,7 @@ bool light_kept(PathRoot r)
 
 uint stack_at(PathRoot r)
 {
-    return interior_at(r) + (interiors_tracked(r) ? SLOT_INTERIOR_PART : 0);
+    return interior_at(r) + (interiors_kept(r) ? SLOT_INTERIOR_PART : 0);
 }
 
 uint light_at(PathRoot r)
@@ -459,7 +477,7 @@ uint spectral_at(PathRoot r)
 // The words of a slot of `r`'s paths (`orr_lighting::launch::slot_words`).
 uint slot_stride(PathRoot r)
 {
-    return spectral_at(r) + (spectral_tracked(r) ? SLOT_SPECTRAL_PART : 0);
+    return spectral_at(r) + (spectral_kept(r) ? SLOT_SPECTRAL_PART : 0);
 }
 
 uint4* slot_words(PathRoot r, uint slot)
@@ -552,8 +570,10 @@ public struct LaunchRecord : IVertexRecord
     public bool update;
     public bool caustic;
     public uint4* words;
-    // `vertex` handed the record the vertex.
+    // `vertex` handed the record the vertex, and the sampler dimension it took for it, which the
+    // callable draws.
     public bool recorded;
+    public uint dimension;
     // The slot's stack hit, where the root keeps the stack part: what the raygen's probe met,
     // which `stack_owned` reads.
     public uint4* probe;
@@ -632,6 +652,10 @@ public struct LaunchRecord : IVertexRecord
     public void vertex(PathRoot r, PathVertex x, Bsdf b, float3 throughput, float3 radiance, inout Sampler rng)
     {
         recorded = update;
+        // `CacheUpdate.vertex` draws one dimension.
+        dimension = rng.dimension;
+        if (update)
+            rng.next();
     }
 
     [mutating]
@@ -677,8 +701,10 @@ LaunchRecord launch_record(PathRoot r, uint slot)
     record.background = from_background(r);
     record.update = from_update(r);
     record.caustic = from_photon(r);
-    record.words = r.stages.records + slot * (record.update ? UPDATE_RECORD_WORDS : RECORD_WORDS);
+    // The records' stride is layout, which the source gives alone.
+    record.words = r.stages.records + slot * (r.source == PATH_SOURCE_UPDATE ? UPDATE_RECORD_WORDS : RECORD_WORDS);
     record.recorded = false;
+    record.dimension = 0;
     record.probe = slot_words(r, slot) + stack_at(r) + STACK_HIT_AT;
     return record;
 }
@@ -1192,6 +1218,10 @@ public uint launch_resolve_given<S : ISurfaces>(PathRoot r, uint slot)
 public uint launch_resolve_layer<S : ISurfaces, H : IHit>(PathRoot r, uint slot, H h)
 {
     LaunchVertex v = load_vertex(r, slot);
+    // A subsurface walk leaves through any surface of its instance as an opaque one, solid glass
+    // too, whose record resolves a layer.
+    if ((v.vertex & VERTEX_EXIT) != 0)
+        return resolve_exit<S, H>(r, v, h);
     ViewConstants* view = r.view;
     bool first = has(v.p.flags, LOOP_CAMERA);
     bool counted = has(v.p.flags, LOOP_COUNTED);
@@ -1318,17 +1348,20 @@ public void launch_emission(PathRoot r, uint slot)
 
 // Next-event estimation at `slot`'s vertex, and before it where the path ends there: its shadow
 // ray in the slot, and the vertex's probability of running it in the ray's for the scatter. In
-// `phase` DIRECT_BENT, the light its shadow ray let through bent by a plane stack.
-public uint launch_direct<S : ISurfaces, M : IMedium>(PathRoot r, uint slot, uint phase)
+// `phase` DIRECT_BENT, the light its shadow ray let through bent by a plane stack. With
+// STEP_RECORD, the sampler dimension the record's callable draws in `dimension`.
+public uint launch_direct<S : ISurfaces, M : IMedium>(PathRoot r, uint slot, uint phase, out uint dimension)
 {
     LaunchVertex v = load_vertex(r, slot);
     PackedSurface ps = load_surface_part(v);
+    dimension = 0;
     if (phase == DIRECT_BENT)
         return direct_bent(r, v, opaque_weighs(r, v.p, v.c, v.record, v.x, ps, v.c.ray.dir));
     Sampler rng = v.p.rng;
     ShadeNee nee;
     bool alive = shade_direct<S, M, LaunchRecord>(r, v.f, v.p, v.c, v.record, v.x, ps, v.c.ray.dir, v.t, (v.vertex & VERTEX_FIRST) != 0, rng, nee);
     v.p.rng = rng;
+    dimension = v.record.dimension;
     return direct_left(r, v, alive, nee);
 }
 
@@ -1584,9 +1617,10 @@ public uint launch_deposit<S : ISurfaces>(PathRoot r, uint slot, bool probed)
     return alive ? 0 : STEP_ENDED;
 }
 
-// What an update path's record takes of `slot`'s vertex, which `launch_direct` handed it: the
-// cell the vertex lies in and the light it scatters from here on, over its albedo.
-public void launch_cache_vertex(PathRoot r, uint slot)
+// What an update path's record takes of `slot`'s vertex, which `launch_direct` handed it with the
+// sampler dimension it took for it: the cell the vertex lies in and the light it scatters from
+// here on, over its albedo.
+public void launch_cache_vertex(PathRoot r, uint slot, uint dimension)
 {
     LaunchVertex v = load_vertex(r, slot);
     PackedSurface ps = load_surface_part(v);
@@ -1594,9 +1628,10 @@ public void launch_cache_vertex(PathRoot r, uint slot)
     Bsdf b;
     prepared_vertex(r, v.p, v.c, v.record, v.x, ps, v.c.ray.dir, x, b);
     CacheUpdate u = load_part<CacheUpdate, UPDATE_RECORD_WORDS>(v.record.words);
-    u.vertex(r, x, b, v.p.throughput, v.p.radiance, v.p.rng);
+    Sampler rng = v.p.rng;
+    rng.dimension = dimension;
+    u.vertex(r, x, b, v.p.throughput, v.p.radiance, rng);
     store_part<CacheUpdate, UPDATE_RECORD_WORDS>(v.record.words, u);
-    store_loop_part(v);
 }
 
 // The shadow ray in `slot`'s words as a ray, with the payload its any-hit shaders read: in mode
@@ -1671,13 +1706,13 @@ public uint launch_shadow_take(PathRoot r, uint slot, uint4 payload, bool hit)
     ShadowCover c = { asfloat(payload.xyz), payload.w };
     uint4* at = slot_words(r, slot);
     ShadowJob q = load_part<ShadowJob, 3>(at + SHADOW_AT);
+    bool overflow = c.has(SHADOW_OVERFLOW);
+    if (overflow)
+        InterlockedAdd(*r.set.shadow_overflows, 1u);
     // The AS committed what it met, or an any-hit ended the search at solid glass, which stands
     // for it.
     if (hit && (!c.has(SHADOW_ENDED) || c.has(SHADOW_SOLID)) && shadow_bends(r, q.flags))
         return TAKE_BENDS;
-    bool overflow = c.has(SHADOW_OVERFLOW);
-    if (overflow)
-        InterlockedAdd(*r.set.shadow_overflows, 1u);
     q.contribution *= hit && !overflow ? float3(0.0) : c.product;
     store_part<ShadowJob, 3>(at + SHADOW_AT, q);
     bool walks = layers_kept(r) && c.has(SHADOW_CROSSES) && any(q.contribution > 0.0);
@@ -1997,8 +2032,10 @@ public uint launch_scatter<S : ISurfaces>(PathRoot r, uint slot)
     bool walking;
     float3 wi;
     bool alive = shade_scatter<S, LaunchRecord>(r, v.f, v.p, v.c, v.record, v.x, ps, v.c.ray.dir, nee, rng, walking, wi);
-    // The vertex's subsurface walk takes the place of its ray.
-    if (alive && walking)
+    // The vertex's subsurface walk takes the place of its ray. Only a vertex with a subsurface
+    // lobe, on a path that may walk, starts one: a callable made for neither holds none of it.
+    walking = may(MAY_WALK) && may(MAY_SUBSURFACE) && alive && walking;
+    if (walking)
     {
         uint owner;
         Walk e = subsurface_walk_from(r, v.p, v.x, ps, v.c.ray.dir, wi, rng, owner);
@@ -2205,6 +2242,14 @@ public uint4 layers_payload(float t_max, uint mask, bool bounded, uint4 bound)
     return uint4(asuint(t_max), asuint(positive_infinity()), bounded ? bound.x : 0u, (mask << 8) | (bounded ? LAYERS_BOUNDED : 0u));
 }
 
+// Where a LAYERS trace past a bound `bound` m along its ray starts: the float below it, since
+// traversal takes a triangle only past TMin, and `keep_layer` decides the candidates at the bound
+// by their keys.
+float layers_t_min(float bound)
+{
+    return asfloat(max(asuint(bound), 1u) - 1u);
+}
+
 // The candidates past the bound a LAYERS trace's `payload` counted.
 public uint layers_met(uint4 payload)
 {
@@ -2339,8 +2384,8 @@ public uint launch_layers(PathRoot r, uint slot, uint kept, float t_max, out flo
 
 // The proxy march callable's body: what the `kept` medium proxies with a volume a LAYERS trace of
 // `slot`'s shadow ray kept let through, into its contribution, and the bound moved to the last,
-// whose span's start is in `bound`.
-public void launch_proxy_march(PathRoot r, uint slot, uint kept, out float bound)
+// whose span's start is in `bound`. STEP_ENDED where nothing is left of it, else 0.
+public uint launch_proxy_march(PathRoot r, uint slot, uint kept, out float bound)
 {
     uint4* words = slot_words(r, slot);
     uint4* at = words + FRONT_AT;
@@ -2357,6 +2402,7 @@ public void launch_proxy_march(PathRoot r, uint slot, uint kept, out float bound
     bound = asfloat(key.x);
     q.contribution *= through;
     store_part<ShadowJob, 3>(words + SHADOW_AT, q);
+    return any(q.contribution > 0.0) ? 0 : STEP_ENDED;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2382,16 +2428,20 @@ public uint launch_finish_view<S : ISurfaces, E : IEnvironment, M : IMedium>(Pat
         camera_ray = camera_start(r, pixel);
     if (sky)
         pixel_radiance += pre_exposure * v.p.sky * sky_radiance<E, M>(r.set, view.eye_render.xyz, camera_ray.dir);
+    // The pixel's rays count both passes: the second reads the texel the first pass's shader
+    // wrote.
+    RWTexture2D<float4> radiance = r.radiance.get<RWTexture2D<float4>>();
+    bool rays = path_mode(r) == PATH_RAYS;
     if (!second)
-        view_outputs(r, v.f, v.p, record, pixel_radiance);
+    {
+        float4 texel = view_outputs(r, v.f, v.p, record, pixel_radiance);
+        if (rays && two)
+            store_texel_coherent(radiance, pixel, texel);
+    }
     else
     {
-        // The pixel's rays count both passes.
-        if (path_mode(r) == PATH_RAYS)
-        {
-            float4 out = r.radiance.get<RWTexture2D<float4>>()[pixel];
-            r.radiance.get<RWTexture2D<float4>>()[pixel] = float4(float(v.p.rays), out.yzw);
-        }
+        if (rays)
+            radiance[pixel] = float4(float(v.p.rays), load_texel_coherent(radiance, pixel).yzw);
         r.layers[pixel.y * r.gbuffer.extent.x + pixel.x].background = guide_luminance(pixel_radiance);
     }
     if (!two || second)
@@ -2469,7 +2519,7 @@ uint trace_layers(PathRoot r, RayDesc ray, uint mask)
         call(CALL_LAYERS, c);
         if ((c.words.x & STEP_ENDED) != 0 || met <= LAYERS_KEPT)
             return c.words.x;
-        ray.TMin = asfloat(c.words.y);
+        ray.TMin = layers_t_min(asfloat(c.words.y));
         p.words = layers_payload(ray.TMax, mask, true, c.words.yyyy);
     }
     return 0;
@@ -2556,8 +2606,9 @@ void trace_probe(PathRoot r, uint slot)
 
 // Multiplies what the medium proxies with a volume along `ray`, the shadow ray of `slot`'s vertex,
 // let through into its contribution, by LAYERS traces over MASK_MEDIUM of LAYERS_KEPT proxies
-// each, at most SHADOW_CANDIDATES of them, as many as its shadow trace counts.
-void march_proxies(PathRoot r, RayDesc ray)
+// each, at most SHADOW_CANDIDATES of them, as many as its shadow trace counts: false where
+// nothing is left of it.
+bool march_proxies(PathRoot r, RayDesc ray)
 {
     Payload p;
     p.words = layers_payload(ray.TMax, MASK_MEDIUM, false, uint4(0));
@@ -2566,15 +2617,18 @@ void march_proxies(PathRoot r, RayDesc ray)
         trace_hit(r.scene.tlas, RAY_FLAG_NONE, MASK_MEDIUM, RAY_TYPE_LAYERS, RAY_TYPES, 0, ray, p);
         uint met = layers_met(p.words);
         if (met == 0)
-            return;
+            return true;
         Payload c;
         c.words = uint4(min(met, LAYERS_KEPT), 0, 0, 0);
         call(CALL_PROXY_MARCH, c);
+        if ((c.words.x & STEP_ENDED) != 0)
+            return false;
         if (met <= LAYERS_KEPT)
-            return;
-        ray.TMin = asfloat(c.words.y);
+            return true;
+        ray.TMin = layers_t_min(asfloat(c.words.y));
         p.words = layers_payload(ray.TMax, MASK_MEDIUM, true, c.words.yyyy);
     }
+    return true;
 }
 
 // Traces the shadow ray in `slot`'s shadow job and takes what it lets through into the job's
@@ -2592,8 +2646,9 @@ uint trace_segment(PathRoot r, uint slot, out float committed)
     uint took = launch_shadow_take(r, slot, p.words, h.hit());
     if ((took & TAKE_BENDS) != 0)
         return took;
-    if (c.has(SHADOW_VOLUME) && any(c.product > 0.0) && (!h.hit() || c.has(SHADOW_OVERFLOW)))
-        march_proxies(r, ray);
+    // The walk crosses no wall that a march left nothing to pass through.
+    if (c.has(SHADOW_VOLUME) && any(c.product > 0.0) && (!h.hit() || c.has(SHADOW_OVERFLOW)) && !march_proxies(r, ray))
+        took &= ~TAKE_WALKS;
     if ((took & TAKE_WALKS) != 0)
     {
         for (uint k = 0; k < SHADOW_CANDIDATES; k++)
@@ -2797,14 +2852,19 @@ public void launch_paths<M : IMedium>(PathRoot r, uint start, uint finish, bool 
             if (deposits && kind != CLASS_SURFACE && kind != CLASS_LAYER)
                 break;
             uint vertex_call = deposits && kind == CLASS_SURFACE ? CALL_DEPOSIT : direct_call(reached);
-            step = step_call(vertex_call, DIRECT_FIRST);
-            if ((step & STEP_PROBE) != 0)
+            Payload direct;
+            direct.words = uint4(0, DIRECT_FIRST, 0, 0);
+            call(vertex_call, direct);
+            if ((direct.words.x & STEP_PROBE) != 0)
             {
                 trace_probe(r, slot);
-                step = step_call(vertex_call, DIRECT_PROBED);
+                direct.words = uint4(0, DIRECT_PROBED, 0, 0);
+                call(vertex_call, direct);
             }
+            step = direct.words.x;
+            // The record's callable draws the dimension next-event estimation drew past.
             if ((step & STEP_RECORD) != 0)
-                step_call(CALL_CACHE_VERTEX);
+                step_call(CALL_CACHE_VERTEX, direct.words.y);
             if ((step & STEP_SHADOW) != 0 && trace_shadow<M>(r, slot))
                 step_call(vertex_call, DIRECT_BENT);
             if ((step & STEP_ENDED) != 0)

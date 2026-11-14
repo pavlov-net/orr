@@ -257,12 +257,15 @@ void emission(inout Payload p)
     launch_emission(root, launch_slot());
 }
 
-// Each direct and the deposit take DIRECT_* in their data's second word.
+// Each direct and the deposit take DIRECT_* in their data's second word. An opaque vertex's hands
+// back there the sampler dimension of its record's vertex, which `cache_vertex` takes.
 [shader("callable")]
 void direct(inout Payload p)
 {
     ORR_OMM(direct);
-    p.words.x = launch_direct<Surface, Medium>(root, launch_slot(), p.words.y);
+    uint dimension;
+    p.words.x = launch_direct<Surface, Medium>(root, launch_slot(), p.words.y, dimension);
+    p.words.y = dimension;
 }
 
 [shader("callable")]
@@ -276,7 +279,7 @@ void deposit(inout Payload p)
 void cache_vertex(inout Payload p)
 {
     ORR_OMM(cache_vertex);
-    launch_cache_vertex(root, launch_slot());
+    launch_cache_vertex(root, launch_slot(), p.words.y);
 }
 
 [shader("callable")]
@@ -379,7 +382,7 @@ void march_proxy(inout Payload p)
 {
     ORR_OMM(march_proxy);
     float bound;
-    launch_proxy_march(root, launch_slot(), p.words.x, bound);
+    p.words.x = launch_proxy_march(root, launch_slot(), p.words.x, bound);
     p.words.y = asuint(bound);
 }
 
