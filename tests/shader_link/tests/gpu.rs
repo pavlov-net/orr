@@ -259,7 +259,8 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
             "path/staged/shade_other",
             "path/staged/sources",
             "path/staged/trace",
-            "path/staged/walk"
+            "path/staged/walk",
+            "path/standins"
         ]
     );
     if let Some(e) = renderer_error(&orr_linked::KERNELS) {

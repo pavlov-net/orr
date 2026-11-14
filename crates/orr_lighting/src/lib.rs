@@ -62,6 +62,7 @@ mod particles;
 mod probe;
 mod scene;
 mod staged;
+pub mod standins;
 mod subsurface;
 mod subsurface_table;
 mod support;

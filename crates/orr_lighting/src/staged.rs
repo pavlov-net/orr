@@ -81,10 +81,10 @@ pub(crate) const SPEC_ENTRIES: [SpecEntry; 2] = [
 pub(crate) const MAY_STACK: u64 = 1 << 0;
 pub(crate) const MAY_DISPERSION: u64 = 1 << 1;
 pub(crate) const MAY_CAUSTICS: u64 = 1 << 2;
-const MAY_VIEW: u64 = 1 << 3;
-const MAY_BACKGROUND: u64 = 1 << 4;
-const MAY_UPDATE: u64 = 1 << 5;
-const MAY_PHOTON: u64 = 1 << 6;
+pub(crate) const MAY_VIEW: u64 = 1 << 3;
+pub(crate) const MAY_BACKGROUND: u64 = 1 << 4;
+pub(crate) const MAY_UPDATE: u64 = 1 << 5;
+pub(crate) const MAY_PHOTON: u64 = 1 << 6;
 pub(crate) const MAY_DEBUG: u64 = 1 << 7;
 pub(crate) const MAY_REFERENCE: u64 = 1 << 8;
 pub(crate) const MAY_FROST: u64 = 1 << 9;
@@ -100,7 +100,7 @@ pub(crate) const MAY_SUBSURFACE: u64 = 1 << 18;
 /// The lobes a plain surface lacks, which the opaque shade stage is compiled without; and what
 /// goes with them: only a subsurface vertex starts a walk.
 const MAY_LOBES: u64 = MAY_COAT | MAY_FUZZ | MAY_FILM | MAY_SUBSURFACE;
-const MAY_RICH: u64 = MAY_LOBES | MAY_WALK;
+pub(crate) const MAY_RICH: u64 = MAY_LOBES | MAY_WALK;
 pub(crate) const MAY_INTERIORS: u64 = 1 << 19;
 pub(crate) const MAY_LAYERS: u64 = 1 << 20;
 pub(crate) const MAY_COVERAGE: u64 = 1 << 21;
