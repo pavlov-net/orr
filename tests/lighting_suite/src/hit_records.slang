@@ -51,8 +51,7 @@ void pipeline_shadows()
     Payload p;
     p.words = c.words();
     Traced h = trace_hit(root.scene.tlas, r.flags | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, shadow_mask(r), RAY_TYPE_SHADOW, RAY_TYPES, 0, ray_of(r), p);
-    c.product = asfloat(p.words.xyz);
-    c.word = p.words.w;
+    c = ShadowCover.of_words(p.words);
     ShadowOut o = ShadowOut();
     o.counted = c.counted();
     o.flags = c.word & (SHADOW_OVERFLOW | SHADOW_ENDED | SHADOW_SOLID | SHADOW_CROSSES | SHADOW_VOLUME);

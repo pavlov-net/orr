@@ -483,9 +483,7 @@ uint word_index(PathStages* st, uint word, uint slot)
 // The pixel of `slot`'s path, as its source's start stage took it from the slot's item.
 uint2 slot_pixel(PathRoot r, uint slot)
 {
-    if (from_update(r))
-        return item_pixel(r, update_base(r) + slot - r.stages.update_first);
-    return item_pixel(r, r.slice_base + slot);
+    return item_pixel(r, from_update(r) ? update_base(r) + slot - r.stages.update_first : r.slice_base + slot);
 }
 
 // The pixel of the path of item `index` of the root's source: a photon's place in its rows, an
@@ -1314,6 +1312,13 @@ public bool has(uint flags, uint bit)
     return (flags & bit) != 0;
 }
 
+// What owned light path `p`'s ray `ray` meets keeps: none on a ray a walk's way out lights, the
+// chain's share past a chain vertex, else all of it.
+public float3 owned_light(PathLoop p, LayerRay ray)
+{
+    return ray.lit ? float3(0.0) : has(p.flags, LOOP_THROUGH) ? p.keep : float3(1.0);
+}
+
 // Whether a path with `throughput` goes on: it carries light, and finite light.
 public bool carries(float3 throughput)
 {
@@ -1654,8 +1659,7 @@ void shadow_add(PathShadowRay q, float3 added, inout PathLoop p, inout StagedRec
 public void miss_light<S : ISurfaces, M : IMedium, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, LayerRay ray, Spectral spectral, PathContext x, inout R record, PathStack stack)
 {
     LightSetGpu* set = r.set;
-    bool through = has(p.flags, LOOP_THROUGH);
-    float3 own = ray.lit ? float3(0.0) : through ? p.keep : float3(1.0);
+    float3 own = owned_light(p, ray);
     bool weigh = !x.one_technique && ray.pdf > 0.0;
     LocalLights* ray_local = nullptr;
     if (ray.local)
@@ -1838,8 +1842,6 @@ public void trace_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
     Sampler rng = p.rng;
     bool camera = has(p.flags, LOOP_CAMERA);
     bool counted = has(p.flags, LOOP_COUNTED);
-    bool through = has(p.flags, LOOP_THROUGH);
-    bool reference = x.reference;
     bool alive = true;
     // The camera ray's reach, mask and distance from the eye, which only its trace reads.
     PathStart camera_ray = PathStart();
@@ -1849,8 +1851,7 @@ public void trace_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
     Hit h = Hit();
     float3 positions[3] = { float3(0.0), float3(0.0), float3(0.0) };
     float t = 0.0;
-    // What owned light the ray finds keeps.
-    float3 own = ray.lit ? float3(0.0) : through ? p.keep : float3(1.0);
+    float3 own = owned_light(p, ray);
     if (camera && camera_ray.given)
     {
         PathPending given = load_pending(r, slot, false);
@@ -2212,7 +2213,7 @@ void add_emission(PathRoot r, PathFixed f, inout PathLoop p, ShadeState c, PathC
         return;
     LightSetGpu* set = r.set;
     LayerRay ray = c.ray;
-    float3 own = ray.lit ? float3(0.0) : has(p.flags, LOOP_THROUGH) ? p.keep : float3(1.0);
+    float3 own = owned_light(p, ray);
     bool weigh = !x.one_technique && ray.pdf > 0.0;
     EmitterHit emitter = EmitterHit();
     if (!first && (weigh || any(own != 1.0)))
@@ -2364,9 +2365,16 @@ ShadeVertex walk_exit_vertex(PathRoot r, PathLoop p, PathContext x, PackedSurfac
 // it starts: its exit scatter's `seed`, and its shadow ray in `nee`. False where the path ends.
 public bool shade_exit_direct<S : ISurfaces, M : IMedium, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, PackedSurface at, float3 dir, bool capped, PackedSurface entry, bool own, inout Sampler rng, out uint seed, out ShadeNee nee)
 {
+    ShadeVertex sv;
+    return exit_direct<S, M, R>(r, f, p, c, record, x, at, dir, capped, entry, own, rng, seed, nee, sv);
+}
+
+// `shade_exit_direct`, with the exit's vertex in `sv`.
+bool exit_direct<S : ISurfaces, M : IMedium, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, PackedSurface at, float3 dir, bool capped, PackedSurface entry, bool own, inout Sampler rng, out uint seed, out ShadeNee nee, out ShadeVertex sv)
+{
     nee = no_nee(c.spectral);
     seed = asuint(rng.next());
-    ShadeVertex sv = walk_exit_vertex(r, p, x, at, dir, capped, entry, own, seed);
+    sv = walk_exit_vertex(r, p, x, at, dir, capped, entry, own, seed);
     p.iteration++;
     if (!iteration_runs(r, p, VERTEX_OPAQUE, true))
         return false;
@@ -2508,10 +2516,10 @@ Bsdf layer_bsdf<R : IPathRecord>(PathRoot r, PathLoop p, ShadeState c, R record,
 }
 
 // Resolves the layer at hit `h` of path `p`'s ray, `t` m along it (the camera ray's vertex's
-// distance from the eye), into `pl`, with the loop's account of reaching it up to the root's
-// dielectric depth: past it the path ends, with the cache's light for the interior. False where
-// the path ends.
-public bool resolve_layer_hit<S : ISurfaces, H : IHit>(PathRoot r, PathFixed f, inout PathLoop p, ShadeState c, PathContext x, H h, float t, inout Sampler rng, out PackedLayer pl)
+// distance from the eye), into `pl`, a face of the plane stack the path tracks where `stack`,
+// with the loop's account of reaching it up to the root's dielectric depth: past it the path
+// ends, with the cache's light for the interior. False where the path ends.
+public bool resolve_layer_hit<S : ISurfaces, H : IHit>(PathRoot r, PathFixed f, inout PathLoop p, ShadeState c, PathContext x, H h, float t, bool stack, inout Sampler rng, out PackedLayer pl)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
@@ -2535,21 +2543,6 @@ public bool resolve_layer_hit<S : ISurfaces, H : IHit>(PathRoot r, PathFixed f, 
         if (x.cache && has(p.flags, LOOP_COUNTED))
             p.radiance += c.spectral.color(p.throughput * interior_ambient(r, sh.surface.position, dir, rng));
         return false;
-    }
-    // A plane stack the path tracks takes a layer on one of its faces.
-    bool stack = false;
-    if (may(MAY_STACK) && c.stack.valid)
-    {
-        Hit face_hit = Hit();
-        face_hit.hit = true;
-        face_hit.triangle = true;
-        face_hit.instance_index = instance;
-        face_hit.cluster_id = h.cluster_id();
-        face_hit.primitive_index = h.primitive_index();
-        face_hit.barycentrics = h.barycentrics();
-        face_hit.class_id = class_of(scene_traced(s), h.custom_index(), instance, h.cluster_id());
-        StackFace face;
-        stack = stack_face(s, face_hit, x.disperse, face);
     }
     pl = pack_layer(r, sh, instance, cluster, h.primitive_index(), h.barycentrics(), dir, stack);
     return true;
@@ -2704,7 +2697,10 @@ bool resolve_layer<S : ISurfaces>(PathRoot r, PathFixed f, inout PathLoop p, ino
 {
     bool first = has(p.flags, LOOP_CAMERA);
     PackedLayer pl;
-    return resolve_layer_hit<S>(r, f, p, c, x, pending_hit(pending, c.ray.dir), pending.t, rng, pl)
+    // A plane stack the path tracks takes a layer on one of its faces.
+    StackFace face;
+    bool stack = may(MAY_STACK) && c.stack.valid && stack_face(r.scene, pending.hit, x.disperse, face);
+    return resolve_layer_hit<S>(r, f, p, c, x, pending_hit(pending, c.ray.dir), pending.t, stack, rng, pl)
         && arrive_layer(r, f, p, c, record, x, pl, c.ray.dir, pending.t, first, sv);
 }
 
@@ -3184,9 +3180,7 @@ public void walk_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
     if (!queued_slot(r, QUEUE_WALK, round_now(r), lane, slot))
         return;
     r = slot_root(r, slot);
-    SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
-    LightSetGpu* set = r.set;
     PathFixed f = load_fixed(r, slot);
     PathLoop p = load_loop(r, slot);
     WalkEntry entry = load_walk(r, slot);
@@ -3233,11 +3227,13 @@ public void walk_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
         own = unpack_surface(exit).bsdf.subsurface_weight > 0.0;
     }
     uint seed = 0;
-    alive = alive && shade_exit_direct<S, M, StagedRecord>(r, f, p, c, record, x, exit, exit_dir, capped, ps, own, rng, seed, nee)
-        && shade_exit_scatter<S, StagedRecord>(r, f, p, c, record, x, exit, exit_dir, capped, ps, own, seed, nee, rng);
+    ShadeVertex sv = no_vertex();
+    bool walking;
+    float3 wi;
+    alive = alive && exit_direct<S, M, StagedRecord>(r, f, p, c, record, x, exit, exit_dir, capped, ps, own, rng, seed, nee, sv)
+        && vertex_scatter<S, SHADE_EXIT, StagedRecord>(r, f, p, c, record, x, VERTEX_OPAQUE, rng, sv, nee, walking, wi);
     if (nee.traced)
     {
-        ShadeVertex sv = walk_exit_vertex(r, p, x, exit, exit_dir, capped, ps, own, seed);
         StackLight stack;
         float3 vis = shadow_trace<S, M>(r, nee.q, stack);
         // Through a plane stack the exit's scatter weighs the light again.

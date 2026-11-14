@@ -103,13 +103,7 @@ public uint shadow_mask(RayIn r)
 
 public PathCover path_cover_of(HitRaysRoot root, RayIn r)
 {
-    PathCover c;
-    c.mask = path_mask(r);
-    c.policy = r.policy;
-    c.presence = r.presence;
-    c.seed = r.seed;
-    c.context = context(root);
-    return c;
+    return new_path_cover(path_mask(r), r.policy, r.presence, r.seed, context(root));
 }
 
 public PathOut path_out(Hit h)

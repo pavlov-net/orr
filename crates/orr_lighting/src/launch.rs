@@ -194,7 +194,7 @@ impl PathPipeline {
         threads: CompileThreads<'_>,
     ) -> Result<Self, Error> {
         let m = module(kernels, &pipeline::MODULE)?;
-        let groups = HitGroups {
+        let mut groups = HitGroups {
             surfaces: kernels.surfaces,
             ..HitGroups::default()
         };
@@ -242,7 +242,6 @@ impl PathPipeline {
         // Each pinned kind's groups one after another by pin, then the medium proxies'.
         let pinned = |pin: u32, k: usize| FIXED.len() as u32 + pin * PINNED.len() as u32 + k as u32;
         // Each group's index is its place in the list, which `groups` names.
-        let mut groups = groups;
         let mut hit_groups = Vec::new();
         for (first, resolve, any_hit) in [
             (&mut groups.path, Some(RESOLVE_COPIES), Some(COVER_PATH)),

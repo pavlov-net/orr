@@ -43,6 +43,14 @@ public struct PathCover
     public HitContext context;      // with no tap and the cone's width at the ray's origin
 }
 
+// The cover of a path ray's trace under `policy` (COVER_*) of instance mask `mask`, presence
+// policy `presence` and seed `seed`, with context `context`.
+public PathCover new_path_cover(uint mask, uint policy, uint presence, uint seed, HitContext context)
+{
+    PathCover c = { mask, policy, presence, seed, context };
+    return c;
+}
+
 public uint4 path_payload(PathCover c)
 {
     uint word = (c.mask & 0xff) | (c.policy << 8) | (c.presence << 10) | (c.context.kind << 12)

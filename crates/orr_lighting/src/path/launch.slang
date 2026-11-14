@@ -46,8 +46,8 @@ import orr_lighting.path.stages;
 [Host] public static const uint CALL_RESOLVE_GIVEN = 4;
 [Host] public static const uint CALL_EMISSION = 5;
 [Host] public static const uint CALL_DIRECT = 6;        // AT_CLASSES of them, by class
-[Host] public static const uint CALL_SCATTER = 12;      // AT_CLASSES of them, by class
-[Host] public static const uint CALL_DEPOSIT = 18;
+[Host] public static const uint CALL_SCATTER = CALL_DIRECT + AT_CLASSES;  // AT_CLASSES of them, by class
+[Host] public static const uint CALL_DEPOSIT = CALL_SCATTER + AT_CLASSES;
 [Host] public static const uint CALL_CACHE_VERTEX = 19;
 [Host] public static const uint CALL_FINISH_VIEW = 20;
 [Host] public static const uint CALL_FINISH_RECORD = 21;
@@ -92,7 +92,7 @@ static const uint STEP_AT_SHIFT = 12;
 [Host] public static const uint AT_LEAVE = 3;           // an interior's walk leaving it
 [Host] public static const uint AT_SCATTER = 4;         // a scatter in an interior's medium, its surface words a `MediumVertex`
 [Host] public static const uint AT_LAYER = 5;           // a dielectric or presence layer, its words a `PackedLayer`
-[Host] public static const uint AT_CLASSES = 6;
+public static const uint AT_CLASSES = 6;
 
 // The words of a path's slot, in this order: its loop (`LaunchLoop`), the ray its last vertex left
 // (`LaunchRay`), the vertex's packed surface or `MediumVertex` (before a photon's first vertex
@@ -848,19 +848,6 @@ LaunchWalk walk_into(LaunchWalk w, Walk e)
     return w;
 }
 
-// The cover of a path ray's trace under `policy` (COVER_*) of instance mask `mask`, presence
-// policy `presence` and seed `seed`, before its context.
-PathCover new_path_cover(uint mask, uint policy, uint presence, uint seed)
-{
-    PathCover cover;
-    cover.mask = mask;
-    cover.policy = policy;
-    cover.presence = presence;
-    cover.seed = seed;
-    cover.context = HitContext();
-    return cover;
-}
-
 // The walk part of a walk `e` that starts on `owner` from a path at depth `depth`, whose steps'
 // traces take `cover` with the path's texture feedback `feedback`.
 LaunchWalk new_walk(Walk e, uint flags, uint owner, PathCover cover, uint depth, bool feedback)
@@ -883,7 +870,7 @@ uint begin_interior_walk(PathRoot r, LaunchVertex v, uint medium, InteriorMedium
 {
     uint seed;
     Walk e = interior_walk_from(v.p, v.x, im, ior, at, dir, rng, seed);
-    PathCover cover = new_path_cover(MASK_OPAQUE | MASK_DIELECTRIC, COVER_LAYERS, PRESENCE_DRAWN, seed);
+    PathCover cover = new_path_cover(MASK_OPAQUE | MASK_DIELECTRIC, COVER_LAYERS, PRESENCE_DRAWN, seed, HitContext());
     store_part<LaunchWalk, WALK_STATE_WORDS>(v.at + WALK_AT, new_walk(e, LAUNCH_WALK_INTERIOR, medium, cover, v.p.depth, v.x.feedback));
     return STEP_WALK;
 }
@@ -1025,15 +1012,12 @@ public RayDesc launch_path_ray(PathRoot r, uint slot, out uint mask, out uint4 p
     LaunchRay ray = v.ray;
     bool camera = has(v.p.flags, LOOP_CAMERA);
     front = front_mask(r, v.p, v.c.ray, v.record, v.x);
-    if (!camera && (r.features & FEATURE_SEGMENTS) != 0)
-        front |= FRONT_SEGMENT;
-    if (in_interior(r, v.p, v.c.interior))
+    if ((!camera && (r.features & FEATURE_SEGMENTS) != 0) || in_interior(r, v.p, v.c.interior))
         front |= FRONT_SEGMENT;
     uint depth = camera ? 0 : v.p.depth + 1;
     mask = camera ? ray.flags >> LAUNCH_MASK_SHIFT : MASK_OPAQUE | MASK_DIELECTRIC;
     gbuffer = camera && (ray.flags & LAUNCH_GBUFFER) != 0;
-    PathCover cover = new_path_cover(mask, COVER_LAYERS, PRESENCE_DRAWN, camera ? v.x.seed : pcg(v.x.seed ^ depth));
-    cover.context = hit_context(camera ? HIT_PRIMARY : HIT_SECONDARY, depth, v.p.cone, 0.0, float2(-1.0), v.x.feedback);
+    PathCover cover = new_path_cover(mask, COVER_LAYERS, PRESENCE_DRAWN, camera ? v.x.seed : pcg(v.x.seed ^ depth), hit_context(camera ? HIT_PRIMARY : HIT_SECONDARY, depth, v.p.cone, 0.0, float2(-1.0), v.x.feedback));
     payload = path_payload(cover);
     if (!camera)
     {
@@ -1067,6 +1051,23 @@ public uint launch_resolve<S : ISurfaces, H : IHit>(PathRoot r, uint slot, H h)
     store_part<PackedSurface, SURFACE_WORDS>(v.at + SURFACE_AT, ps);
     store_loop_part(v);
     return vertex_step(ps);
+}
+
+// Whether layer hit `h` of `v`'s ray is a face of the plane stack its path tracks.
+bool stack_face_at<H : IHit>(PathRoot r, LaunchVertex v, H h)
+{
+    if (!(may(MAY_STACK) && v.c.stack.valid))
+        return false;
+    Hit face_hit = Hit();
+    face_hit.hit = true;
+    face_hit.triangle = true;
+    face_hit.instance_index = h.instance_index();
+    face_hit.cluster_id = h.cluster_id();
+    face_hit.primitive_index = h.primitive_index();
+    face_hit.barycentrics = h.barycentrics();
+    face_hit.class_id = class_of(scene_traced(r.scene), h.custom_index(), h.instance_index(), h.cluster_id());
+    StackFace face;
+    return stack_face(r.scene, face_hit, v.x.disperse, face);
 }
 
 // The end of the iteration that traced `v`'s ray to its hit `t` m along it: the march's jitter of
@@ -1124,7 +1125,7 @@ public uint launch_resolve_layer<S : ISurfaces, H : IHit>(PathRoot r, uint slot,
     float t = end_ray(r, v, h.t());
     Sampler rng = v.p.rng;
     PackedLayer pl;
-    bool alive = resolve_layer_hit<S, H>(r, v.f, v.p, v.c, v.x, h, t, rng, pl);
+    bool alive = resolve_layer_hit<S, H>(r, v.f, v.p, v.c, v.x, h, t, stack_face_at(r, v, h), rng, pl);
     v.p.rng = rng;
     if (!alive)
     {
@@ -1270,7 +1271,7 @@ struct AtSurface : IAt
         {
             uint owner;
             Walk e = subsurface_walk_from(r, v.p, v.x, ps, v.c.ray.dir, wi, rng, owner);
-            PathCover cover = new_path_cover(MASK_OPAQUE, COVER_ALPHA, PRESENCE_NONE, 0);
+            PathCover cover = new_path_cover(MASK_OPAQUE, COVER_ALPHA, PRESENCE_NONE, 0, HitContext());
             store_part<LaunchWalk, WALK_STATE_WORDS>(v.at + WALK_AT, new_walk(e, 0, owner, cover, v.p.depth, v.x.feedback));
         }
         return alive;
@@ -1459,8 +1460,11 @@ struct AtLayer : IAt
 
     bool probes(PathRoot r, LaunchVertex v, out PathVertex x)
     {
+        x = PathVertex();
+        if (!deposit_probes(r, v))
+            return false;
         x = unpack_layer(r.view, pl, v.c.ray.dir).x;
-        return deposit_probes(r, v);
+        return true;
     }
 
     [mutating]
@@ -1819,16 +1823,14 @@ public RayDesc launch_crossing_ray(PathRoot r, uint slot, out uint4 payload)
     Crossing none = Crossing();
     none.key.t = positive_infinity();
     store_part<Crossing, CROSSING_WORDS>(crossing_words(r, slot), none);
-    PathCover cover = new_path_cover(MASK_DIELECTRIC, COVER_CROSSING, PRESENCE_NONE, 0);
-    cover.context = shadow_context(q.flags);
+    PathCover cover = new_path_cover(MASK_DIELECTRIC, COVER_CROSSING, PRESENCE_NONE, 0, shadow_context(q.flags));
     payload = path_payload(cover);
     return path_ray(q.origin, q.dir, q.t_max);
 }
 
-// A present dielectric candidate of a step of `slot`'s shadow ray's walk, `t` m along it on
-// triangle `primitive` of cluster `cluster` of instance `instance` at `bary`, with corners
-// `corners`: kept where it is the nearest so far past the walk's last crossing.
-public void launch_crossing_candidate(PathRoot r, uint slot, float t, uint instance, uint cluster, uint primitive, float2 bary, float3 corners[3])
+// Keeps a present dielectric candidate of a step of `slot`'s shadow ray's walk where it is the
+// nearest so far past the walk's last crossing.
+void keep_crossing(PathRoot r, uint slot, float t, uint instance, uint cluster, uint primitive, float2 bary, float3 corners[3])
 {
     CrossingKey key = { t, instance, cluster, primitive };
     if (!crossing_before(load_part<CrossingKey, CROSSED_WORDS>(crossed_words(r, slot)), key))
@@ -1841,8 +1843,7 @@ public void launch_crossing_candidate(PathRoot r, uint slot, float t, uint insta
     store_part<Crossing, CROSSING_WORDS>(at, c);
 }
 
-// Where a step of `slot`'s shadow ray's walk keeps the crossings it meets
-// (`launch_crossing_candidate`).
+// Where a step of `slot`'s shadow ray's walk keeps the crossings it meets (`keep_crossing`).
 public struct SlotCrossings : ICrossings
 {
     public PathRoot r;
@@ -1850,7 +1851,7 @@ public struct SlotCrossings : ICrossings
 
     public void met(float t, uint instance, uint cluster, uint primitive, float2 bary, float3 corners[3])
     {
-        launch_crossing_candidate(r, slot, t, instance, cluster, primitive, bary, corners);
+        keep_crossing(r, slot, t, instance, cluster, primitive, bary, corners);
     }
 }
 
@@ -1958,8 +1959,7 @@ public void launch_emitter_view<S : ISurfaces>(PathRoot r, uint slot)
 public RayDesc launch_stack_ray(PathRoot r, uint slot, float t_max, out uint4 payload)
 {
     ShadowJob q = load_part<ShadowJob, SHADOW_WORDS>(slot_words(r, slot) + SHADOW_AT);
-    PathCover cover = new_path_cover(MASK_OPAQUE | MASK_DIELECTRIC, COVER_STACK, PRESENCE_NONE, 0);
-    cover.context = shadow_context(q.flags);
+    PathCover cover = new_path_cover(MASK_OPAQUE | MASK_DIELECTRIC, COVER_STACK, PRESENCE_NONE, 0, shadow_context(q.flags));
     payload = path_payload(cover);
     return path_ray(q.origin, q.dir, t_max);
 }
@@ -2273,7 +2273,7 @@ public uint launch_layers(PathRoot r, uint slot, uint kept, float t_max, out flo
     LaunchVertex v = load_vertex(r, slot);
     LayerRay ray = v.c.ray;
     bool adds = v.x.count_bsdf && has(v.p.flags, LOOP_COUNTED);
-    float3 own = ray.lit ? float3(0.0) : has(v.p.flags, LOOP_THROUGH) ? v.p.keep : float3(1.0);
+    float3 own = owned_light(v.p, ray);
     LocalLights* ray_local = nullptr;
     if (ray.local)
         ray_local = pixel_local_lights(r, v.f.pixel);
@@ -2572,14 +2572,20 @@ uint trace_light<M : IMedium>(PathRoot r, uint slot)
     return launch_light_add<M>(r, slot, p.words, h.hit());
 }
 
-// Runs callable `index` with `word` in its data's second word, and returns the step it hands
-// back.
-uint step_call(uint index, uint word = 0)
+// Runs callable `index` with `word` in its data's second word, and returns its data: the step it
+// hands back first.
+uint4 data_call(uint index, uint word = 0)
 {
     Payload c;
     c.words = uint4(0, word, 0, 0);
     call(index, c);
-    return c.words.x;
+    return c.words;
+}
+
+// `data_call`'s step.
+uint step_call(uint index, uint word = 0)
+{
+    return data_call(index, word).x;
 }
 
 // The hit record whose closest-hit shader is the walk meet's (`orr_scene.runs`' RUN_WALK).
@@ -2655,7 +2661,6 @@ uint walk_path(PathRoot r, uint slot)
 // light, or where `deposits` its photon's deposit.
 public void launch_paths<M : IMedium>(PathRoot r, uint start, uint finish, bool deposits)
 {
-    static_assert(CALL_SCATTER == CALL_DIRECT + AT_CLASSES && CALL_DEPOSIT == CALL_SCATTER + AT_CLASSES, "a vertex class's callables overlap another's");
     uint slot = launch_slot();
     if (slot >= r.slice_count)
         return;
@@ -2685,19 +2690,16 @@ public void launch_paths<M : IMedium>(PathRoot r, uint start, uint finish, bool 
             if (deposits && !opaque && at != AT_LAYER)
                 break;
             uint vertex_call = deposits && opaque ? CALL_DEPOSIT : CALL_DIRECT + at;
-            Payload direct;
-            direct.words = uint4(0, DIRECT_FIRST, 0, 0);
-            call(vertex_call, direct);
-            if ((direct.words.x & STEP_PROBE) != 0)
+            uint4 direct = data_call(vertex_call, DIRECT_FIRST);
+            if ((direct.x & STEP_PROBE) != 0)
             {
                 trace_probe(r, slot);
-                direct.words = uint4(0, DIRECT_PROBED, 0, 0);
-                call(vertex_call, direct);
+                direct = data_call(vertex_call, DIRECT_PROBED);
             }
-            step = direct.words.x;
+            step = direct.x;
             // The record's callable draws the dimension next-event estimation drew past.
             if ((step & STEP_RECORD) != 0)
-                step_call(CALL_CACHE_VERTEX, direct.words.y);
+                step_call(CALL_CACHE_VERTEX, direct.y);
             if ((step & STEP_SHADOW) != 0 && trace_shadow<M>(r, slot))
                 step_call(vertex_call, DIRECT_BENT);
             if ((step & STEP_ENDED) != 0)

@@ -9,17 +9,17 @@ module trace;
 import orr_shaders.abi;
 
 // TLAS instance mask bits.
-// What an any-hit shader does with its candidate: ignore it, accept it, or accept it and end the
-// search.
-public static const uint ANY_HIT_IGNORE = 0;
-public static const uint ANY_HIT_ACCEPT = 1;
-public static const uint ANY_HIT_END = 2;
-
 [Host] public static const uint MASK_OPAQUE = 0x01;     // opaque and alpha-tested geometry
 [Host] public static const uint MASK_PARTICLE = 0x02;   // particle batches
 [Host] public static const uint MASK_MEDIUM = 0x04;     // medium proxies (AABBs)
 public static const uint MASK_LIGHT = 0x08;      // sphere and rect light proxies (AABBs)
 [Host] public static const uint MASK_DIELECTRIC = 0x80; // dielectric and presence surfaces
+
+// What an any-hit shader does with its candidate: ignore it, accept it, or accept it and end the
+// search.
+public static const uint ANY_HIT_IGNORE = 0;
+public static const uint ANY_HIT_ACCEPT = 1;
+public static const uint ANY_HIT_END = 2;
 
 // Candidate classes. An instance with a custom index holds its class there; under one with custom
 // index 0, whose mask covers every class it shows, each cluster has its own (`ITraced`) and other
