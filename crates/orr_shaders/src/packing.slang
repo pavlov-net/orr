@@ -256,6 +256,30 @@ public float3 unpack_rgb9e5(uint p)
     return float3(uint3(p, p >> 9, p >> 18) & 0x1FF) * scale;
 }
 
+// R, G and B in bytes 0 to 2 under the shared exponent in byte 3, bias 128 (Ward's RGBE): a
+// color of any magnitude a float holds, each channel to half its largest channel's 8-bit step.
+// Colors below 2^-118 are 0; negative and NaN channels are 0.
+public uint pack_rgbe(float3 c)
+{
+    float3 rc = float3(c.r > 0.0 ? c.r : 0.0, c.g > 0.0 ? c.g : 0.0, c.b > 0.0 ? c.b : 0.0);
+    float m = max(rc.r, max(rc.g, rc.b));
+    if (!(m >= exp2i(-118)))
+        return 0;
+    // m lies in [2^(e - 1), 2^e).
+    int e = min(int(asuint(m) >> 23) - 126, 127);
+    if (floor(m * exp2i(8 - e) + 0.5) >= 256.0 && e < 127)
+        e += 1;
+    uint3 q = uint3(min(floor(rc * exp2i(8 - e) + 0.5), 255.0));
+    return q.r | (q.g << 8) | (q.b << 16) | (uint(e + 128) << 24);
+}
+
+public float3 unpack_rgbe(uint p)
+{
+    if ((p >> 24) == 0)
+        return float3(0.0);
+    return float3(uint3(p, p >> 8, p >> 16) & 0xFF) * exp2i(int(p >> 24) - 136);
+}
+
 // Cluster grid positions (orr_pack's resident mesh pages): a vertex is (anchor + local) x
 // 2^k in mesh space, with anchor + local within 24 bits signed, so every value is exact.
 

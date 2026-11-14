@@ -321,6 +321,29 @@ fn packed_float_color_round_trips() {
 }
 
 #[test]
+fn rgbe_colors_round_trip_over_every_float_magnitude() {
+    let mut rng = Rng::new(6);
+    for _ in 0..200_000 {
+        let c = [rng.f32(), rng.f32(), rng.f32()].map(|v| v * 2f32.powf(rng.range(-110.0, 120.0)));
+        let d = unpack_rgbe(pack_rgbe(c));
+        let max = c.iter().copied().fold(0.0f32, f32::max);
+        // The shared step is 2^(floor(log2 max) - 7), doubled when max rounds up to 256 steps.
+        let mut step = 2f64.powf(f64::from(max).log2().floor() - 7.0);
+        if (f64::from(max) / step + 0.5).floor() >= 256.0 {
+            step *= 2.0;
+        }
+        for i in 0..3 {
+            assert!(
+                (f64::from(d[i]) - f64::from(c[i])).abs() <= step / 2.0 * (1.0 + 1e-6),
+                "{c:?} -> {d:?}"
+            );
+        }
+    }
+    assert_eq!(unpack_rgbe(pack_rgbe([0.0, -1.0, f32::NAN])), [0.0; 3]);
+    assert_eq!(unpack_rgbe(pack_rgbe([1e-37, 0.0, 0.0])), [0.0; 3]);
+}
+
+#[test]
 fn rotations_decode_like_orr_pack() {
     let mut rng = Rng::new(6);
     for _ in 0..200_000 {
