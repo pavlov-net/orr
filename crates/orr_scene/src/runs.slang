@@ -3,8 +3,9 @@
 // a hit record per ray type; a trace's record is its instance's contribution, RAY_TYPES times
 // the first run of the row it shows, plus RAY_TYPES times the hit's geometry index (its cluster's
 // section, or its producer cluster's material) plus the ray type. Runs are laid out as
-// `SceneRoot.run_*` give: the medium proxies' and the light proxies' runs, then a run per entry
-// of `model_materials`, of `material_sets`, of the producer rows and of `page_material_sets`.
+// `SceneRoot.run_*` give: the medium proxies' and the light proxies' runs and the walk meet's,
+// then a run per entry of `model_materials`, of `material_sets`, of the producer rows and of
+// `page_material_sets`.
 module runs;
 
 import orr_shaders.trace;
@@ -27,10 +28,12 @@ public uint contribution(uint run)
     return (RAY_TYPES * run) & 0xffffff;
 }
 
-// The runs every medium proxy and every light proxy shows.
+// The runs every medium proxy and every light proxy shows, and the run no instance shows, whose
+// path record a raygen sets on a traced hit to run the walk meet's closest-hit on it.
 public static const uint RUN_MEDIUM = 0;
 public static const uint RUN_LIGHT = 1;
-public static const uint FIXED_RUNS = 2;
+public static const uint RUN_WALK = 2;
+public static const uint FIXED_RUNS = 3;
 
 // `HitData.flags`: the CLASS_* of the run's material in the low bits, then HIT_*.
 public static const uint HIT_CLASS_MASK = 7;

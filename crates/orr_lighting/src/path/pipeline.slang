@@ -1,9 +1,10 @@
 // The pipeline path tracer's shaders (`path.launch`): a raygen per source, the closest-hit shaders
-// that resolve a path ray's hit on triangles and on strands and the miss shader, the coverage's
-// any-hit shaders and the medium proxies' under shadow rays, and the callables that start, shade
-// and finish a path. `orr_lighting::launch` makes several stages of one entry by its
-// specialization constants (`path_may`, `path_may2`, `hit_surface`): a hit shader per kind of
-// geometry and per linked surface id, and next-event estimation and the scatter per BSDF class.
+// that resolve a path ray's hit on triangles and on strands, the walk meet's closest-hit and the
+// miss shader, the coverage's any-hit shaders and the medium proxies' under shadow rays, and the
+// callables that start, shade and finish a path and end its walks. `orr_lighting::launch` makes
+// several stages of one entry by its specialization constants (`path_may`, `path_may2`,
+// `hit_surface`): a hit shader per kind of geometry and per linked surface id, and next-event
+// estimation and the scatter per BSDF class.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_lighting.environment;
@@ -56,6 +57,16 @@ void resolve_strand(inout Payload p, TriangleAttributes a)
     ORR_OMM(resolve_strand);
     BuiltInHit h = { a };
     p.words.x = launch_resolve<Surface, BuiltInHit>(root, launch_slot(), h);
+}
+
+// The closest-hit of the walk meet's record, which an interior walk's step invokes on the face it
+// met in place of the face's own.
+[shader("closesthit")]
+void walk_meet(inout Payload p, TriangleAttributes a)
+{
+    ORR_OMM(walk_meet);
+    TriangleHit h = { a };
+    p.words = launch_walk_meet(root, h);
 }
 
 [shader("anyhit")]
@@ -157,4 +168,39 @@ void finish_update(inout Payload p)
 {
     ORR_OMM(finish_update);
     launch_finish_update(root, launch_slot());
+}
+
+[shader("callable")]
+void walk_end(inout Payload p)
+{
+    ORR_OMM(walk_end);
+    p.words.x = launch_walk_end(root, launch_slot());
+}
+
+[shader("callable")]
+void direct_exit(inout Payload p)
+{
+    ORR_OMM(direct_exit);
+    p.words.x = launch_direct_exit<Surface, Medium>(root, launch_slot());
+}
+
+[shader("callable")]
+void scatter_exit(inout Payload p)
+{
+    ORR_OMM(scatter_exit);
+    p.words.x = launch_scatter_exit<Surface>(root, launch_slot());
+}
+
+[shader("callable")]
+void direct_leave(inout Payload p)
+{
+    ORR_OMM(direct_leave);
+    p.words.x = launch_direct_leave<Surface, Medium>(root, launch_slot());
+}
+
+[shader("callable")]
+void scatter_leave(inout Payload p)
+{
+    ORR_OMM(scatter_leave);
+    p.words.x = launch_scatter_leave<Surface>(root, launch_slot());
 }

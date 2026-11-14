@@ -13,8 +13,8 @@ use crate::{Error, Result, SceneRoot};
 /// FIXED_KINDS and PINNED_KINDS.
 const RAY_TYPES: u32 = 3;
 const HIT_DATA_BYTES: u64 = 16;
-const FIXED_RUNS: u32 = 2;
-const FIXED_KINDS: usize = 4;
+const FIXED_RUNS: u32 = 3;
+const FIXED_KINDS: usize = 5;
 const PINNED_KINDS: usize = 4;
 
 /// The hit groups of a ray tracing pipeline that a scene's hit records name, by what each
@@ -46,6 +46,9 @@ pub struct HitGroups {
     pub medium_layers: Option<u32>,
     /// Sphere and rect light proxies under layer rays.
     pub light_layers: Option<u32>,
+    /// The closest-hit a walk's step runs on a triangle it met, in place of the triangle's own,
+    /// to read its geometry.
+    pub walk_meet: Option<u32>,
 }
 
 impl HitGroups {
@@ -67,6 +70,7 @@ impl HitGroups {
             self.medium_shadow,
             self.medium_layers,
             self.light_layers,
+            self.walk_meet,
         ];
         let pinned: [Option<u32>; PINNED_KINDS] =
             [self.path, self.producer_path, self.strand_path, self.shadow];

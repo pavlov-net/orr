@@ -360,7 +360,7 @@ public static const uint SHADOW_INTERIOR_WORDS = 2;
 public static const uint RECORD_WORDS = 2;
 public static const uint UPDATE_RECORD_WORDS = 9;
 
-bool interiors_tracked(PathRoot r)
+public bool interiors_tracked(PathRoot r)
 {
     return may(MAY_INTERIORS) && (r.features & FEATURE_INTERIORS) != 0;
 }
@@ -2177,6 +2177,167 @@ public bool shade_scatter<S : ISurfaces, R : IVertexRecord>(PathRoot r, PathFixe
 {
     ShadeVertex sv = packed_vertex(r, p, c, record, x, ps, dir);
     return vertex_scatter<S, SHADE_VERTEX, R>(r, f, p, c, record, x, VERTEX_OPAQUE, rng, sv, nee, walking, wi);
+}
+
+// The subsurface walk opaque vertex `ps`, reached along `dir`, starts along `wi` (`shade_scatter`'s
+// `walking`), and what traces its steps: the instance it stays on and the path's depth there.
+// Draws one sampler dimension, which keys the walk's own sampler.
+public Walk subsurface_walk_from(PathRoot r, PathLoop p, PathContext x, PackedSurface ps, float3 dir, float3 wi, inout Sampler rng, out uint owner)
+{
+    owner = surface_owner(r.scene, ps);
+    LayerVertex l = opaque_vertex(surface_vertex(r.view, ps, dir));
+    return walk_from(l.x, vertex_params(l, p.opaque > 1 && !x.reference), wi, rng);
+}
+
+// The path's end of its subsurface walk `walk`: false where the path ends with it.
+public bool subsurface_walk_ended(PathRoot r, inout PathLoop p, PathContext x, Walk walk)
+{
+    p.throughput *= walk.throughput;
+    // The reference ends a path whose walk reached its cap, and counts it.
+    bool capped = walk.kind == WALK_CAP;
+    if (capped && x.reference)
+        InterlockedAdd(r.set.reference_counts[0], 1u);
+    bool alive = walk.kind != WALK_NONE && (!capped || !x.reference);
+    if (alive)
+        set_flag(p.flags, LOOP_WALKED, true);
+    return alive;
+}
+
+// The vertex where a subsurface walk leaves, as its exit scatters, estimated with numbers hashed
+// from `seed`: with `capped` the vertex `at` the walk entered along `dir`, seen from its normal;
+// else opaque surface `at`, reached along the walk's last step `dir`. It scatters with the entry's
+// parameters `entry`, or `at`'s own where `own` (an exit with a subsurface weight).
+ShadeVertex walk_exit_vertex(PathRoot r, PathLoop p, PathContext x, PackedSurface at, float3 dir, bool capped, PackedSurface entry, bool own, uint seed)
+{
+    ShadeVertex sv = no_vertex();
+    bool collapse = p.opaque > 1 && !x.reference;
+    BsdfParams wp;
+    if (capped)
+    {
+        sv.l = opaque_vertex(surface_vertex(r.view, at, dir));
+        wp = vertex_params(sv.l, collapse);
+        sv.l.x.view = sv.l.x.surface.normal;
+    }
+    else
+    {
+        sv.l = opaque_vertex(exit_vertex(r.view, at, dir));
+        wp = own ? sv.l.x.surface.bsdf : vertex_params(opaque_vertex(surface_vertex(r.view, entry, dir)), collapse);
+    }
+    // A walk's exit scatters by its own diffuse lobe, never as a chain.
+    sv.l.chains = false;
+    WalkExitScatter f = { wp, sv.l.x.surface.normal, seed };
+    sv.exit_scatter = f;
+    return sv;
+}
+
+// Next-event estimation at a subsurface walk's exit (`walk_exit_vertex`), the top of the iteration
+// it starts: its exit scatter's `seed`, and its shadow ray in `nee`. False where the path ends.
+public bool shade_exit_direct<S : ISurfaces, M : IMedium, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, PackedSurface at, float3 dir, bool capped, PackedSurface entry, bool own, inout Sampler rng, out uint seed, out ShadeNee nee)
+{
+    nee = no_nee(c.spectral);
+    seed = asuint(rng.next());
+    ShadeVertex sv = walk_exit_vertex(r, p, x, at, dir, capped, entry, own, seed);
+    p.iteration++;
+    if (!iteration_runs(r, p, VERTEX_OPAQUE, true))
+        return false;
+    set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
+    return vertex_nee<S, M, SHADE_EXIT, R>(r, f, p, c, record, x, VERTEX_OPAQUE, rng, sv, nee);
+}
+
+// The rest of the iteration from a subsurface walk's exit, past next-event estimation `nee`
+// (`shade_exit_direct`, which drew `seed`).
+public bool shade_exit_scatter<S : ISurfaces, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, PackedSurface at, float3 dir, bool capped, PackedSurface entry, bool own, uint seed, ShadeNee nee, inout Sampler rng)
+{
+    ShadeVertex sv = walk_exit_vertex(r, p, x, at, dir, capped, entry, own, seed);
+    bool walking;
+    float3 wi;
+    return vertex_scatter<S, SHADE_EXIT, R>(r, f, p, c, record, x, VERTEX_OPAQUE, rng, sv, nee, walking, wi);
+}
+
+// The walk in interior `medium` that a scatter at `at` along `dir` starts, its surface `ior` times
+// the outside's (`InteriorMedium` `im`), and the seed of its steps' presence draws, from a path at
+// depth `p.depth` past its ray.
+public Walk interior_walk_from(PathLoop p, PathContext x, InteriorMedium im, float ior, float3 at, float3 dir, inout Sampler rng, out uint seed)
+{
+    seed = pcg(x.seed ^ (p.depth + 1));
+    return walk_interior(at, dir, im, ior, rng);
+}
+
+// The path's end of its walk `walk` in interior `medium`, the path lying in `interior`: false
+// where the path ends. Where the walk met another surface inside, the path goes on to that hit
+// along `ray`, as its ray's. Else it `leaves` the interior at `at` with outward normal `n` along
+// `dir`, which starts the next iteration from a vertex of kind VERTEX_LEAVE.
+public bool interior_walk_ended(PathRoot r, inout PathLoop p, inout Interior interior, inout LayerRay ray, PathContext x, bool adjoint, Walk walk, uint medium, inout Sampler rng, out bool leaves, out float3 at, out float3 n, out float3 dir)
+{
+    leaves = false;
+    at = float3(0.0);
+    n = float3(0.0);
+    dir = float3(0.0);
+    p.throughput *= walk.throughput;
+    // The reference ends a path whose walk reached its cap, and counts it.
+    bool capped = walk.kind == WALK_CAP;
+    if (capped && x.reference)
+        InterlockedAdd(r.set.reference_counts[0], 1u);
+    if (!(walk.kind != WALK_NONE && (!capped || (!x.reference && p.entered == medium))))
+        return false;
+    if (walk.kind == WALK_BOUNDARY)
+    {
+        ray.dir = walk.dir;
+        ray.pdf = 0.0;
+        ray.diffuse = true;
+        ray.local = false;
+        return any(p.throughput > 0.0) && all(isfinite(p.throughput));
+    }
+    at = walk.origin;
+    n = walk.normal;
+    dir = walk.dir;
+    if (capped)
+    {
+        at = p.entered_at;
+        n = p.entered_normal;
+        float3 tangent, bitangent;
+        orthonormal_basis(n, tangent, bitangent);
+        dir = normalize(from_local(sample_cosine_hemisphere(rng.next2()), tangent, bitangent, n));
+    }
+    interior.cross(medium, false);
+    // The way out is a refraction: the walk's Fresnel draw chose it, and it scales radiance as a
+    // BSDF's does.
+    if (!adjoint)
+        p.throughput *= walk.ior * walk.ior;
+    set_flag(p.flags, LOOP_DISPERSIVE, false);
+    leaves = true;
+    set_flag(p.flags, LOOP_CAMERA, false);
+    p.iteration++;
+    if (!iteration_runs(r, p, VERTEX_LEAVE, true))
+        return false;
+    set_flag(p.flags, LOOP_COUNTED, iteration_counted(r, p));
+    return true;
+}
+
+// The vertex where an interior's walk leaves at `at` with outward normal `n` along `dir`, through a
+// surface of `ior` times the outside's.
+ShadeVertex leave_shade_vertex(ViewConstants* v, float3 at, float3 n, float3 dir, float ior)
+{
+    ShadeVertex sv = no_vertex();
+    sv.l = leave_vertex(v, at, n);
+    sv.leave_scatter = interior_exit(n, ior);
+    sv.leave_dir = dir;
+    return sv;
+}
+
+// Next-event estimation where an interior's walk leaves (`interior_walk_ended`): its shadow ray in
+// `nee`. False where the path ends.
+public bool shade_leave_direct<S : ISurfaces, M : IMedium, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, float3 at, float3 n, float3 dir, float ior, inout Sampler rng, out ShadeNee nee)
+{
+    return vertex_nee<S, M, SHADE_VERTEX, R>(r, f, p, c, record, x, VERTEX_LEAVE, rng, leave_shade_vertex(r.view, at, n, dir, ior), nee);
+}
+
+// The rest of the iteration where an interior's walk leaves, past next-event estimation `nee`.
+public bool shade_leave_scatter<S : ISurfaces, R : IVertexRecord>(PathRoot r, PathFixed f, inout PathLoop p, inout ShadeState c, inout R record, PathContext x, float3 at, float3 n, float3 dir, float ior, ShadeNee nee, inout Sampler rng)
+{
+    bool walking;
+    float3 wi;
+    return vertex_scatter<S, SHADE_VERTEX, R>(r, f, p, c, record, x, VERTEX_LEAVE, rng, leave_shade_vertex(r.view, at, n, dir, ior), nee, walking, wi);
 }
 
 // What shadow ray `nee`, which found `vis` through plane stack `stack`, adds to the path from

@@ -159,9 +159,15 @@ public float3 capped_walk_share(SubsurfaceTableGpu* t, float3 albedo, float g, u
 // name their copy's), the PTLAS index for producer entries.
 public bool on_instance(SceneRoot* s, Hit h, uint instance)
 {
+    return on_instance(s, h.instance_index, instance);
+}
+
+// Whether a hit on PTLAS instance `instance_index` lies on instance `instance`.
+public bool on_instance(SceneRoot* s, uint instance_index, uint instance)
+{
     uint copy;
-    if (!hit_copy(s, h.instance_index, copy))
-        copy = h.instance_index;
+    if (!hit_copy(s, instance_index, copy))
+        copy = instance_index;
     return copy == instance;
 }
 
@@ -187,6 +193,123 @@ void walk_end(inout Walk e)
     e.throughput = float3(0.0);
 }
 
+// One step of a walk as `walk_draw` drew it: the share of each channel in the distance's
+// draw, the distance and the numbers the scatter's direction takes.
+public struct WalkDraw
+{
+    public float3 choose;
+    public float t;
+    public float2 u;
+}
+
+// The walk's densities, kept above 0.
+float3 walk_sigma(Walk e)
+{
+    return max(e.volume.extinction, float3(1e-30));
+}
+
+// The densities against the least attenuated channel, so the hero channel's term stays above
+// exp(-17).
+float3 walk_excess(Walk e)
+{
+    float3 sigma = walk_sigma(e);
+    return sigma - min(sigma.x, min(sigma.y, sigma.z));
+}
+
+// Draws the next step of running walk `e`; false where its throughput is gone, which ends it
+// with nothing.
+public bool walk_draw(inout Walk e, out WalkDraw d)
+{
+    d = { float3(0.0), 0.0, float2(0.0) };
+    float total = e.throughput.x + e.throughput.y + e.throughput.z;
+    // Division by a denormal has no precision bound, and a device may keep denormals.
+    if (!(total >= F32_MIN_NORMAL) || !isfinite(total))
+    {
+        walk_end(e);
+        return false;
+    }
+    d.choose = e.throughput / total;
+    float4 u = e.rng.next4();
+    uint hero = u.x < d.choose.x ? 0 : u.x < d.choose.x + d.choose.y ? 1 : 2;
+    d.t = -log(1.0 - min(u.y, 0.99999994)) / walk_sigma(e)[hero];
+    d.u = u.zw;
+    return true;
+}
+
+// Step `d` of walk `e` reached a surface `t` along and did `met` there: true where the walk goes
+// on, else it ended with `met.kind`.
+public bool walk_met(inout Walk e, WalkDraw d, float t, WalkMeet met)
+{
+    if (met.kind == WALK_NONE)
+    {
+        walk_end(e);
+        return false;
+    }
+    float3 a = exp(-walk_excess(e) * t);
+    // The mix holds the hero's share times at least exp(-17), so it falls below the smallest
+    // normal float only for a hero a sample of 0 drew at a share near none.
+    float mix = dot(d.choose, a);
+    if (!(mix >= F32_MIN_NORMAL))
+    {
+        walk_end(e);
+        return false;
+    }
+    e.throughput = e.throughput * a / mix;
+    if (met.kind == WALK_REFLECT)
+    {
+        e.origin = met.origin;
+        e.dir = met.dir;
+        return true;
+    }
+    e.kind = met.kind;
+    if (met.kind == WALK_LEAVE)
+        e.dir = met.dir;
+    e.origin = met.origin;
+    e.normal = met.normal;
+    return false;
+}
+
+// Step `d` of walk `e` reached no surface and scatters at its end. Without `share` it goes on
+// with the probability of its throughput's largest channel, divided by it: false where it ends
+// with nothing.
+public bool walk_scattered(inout Walk e, WalkDraw d, bool share)
+{
+    float3 sigma = walk_sigma(e);
+    float3 a = exp(-walk_excess(e) * d.t);
+    // The hero's share times its density times at least exp(-17).
+    float mix = dot(d.choose, sigma * a);
+    if (!(mix >= F32_MIN_NORMAL))
+    {
+        walk_end(e);
+        return false;
+    }
+    e.throughput *= e.volume.albedo * sigma * a / mix;
+    e.origin += e.dir * d.t;
+    e.dir = sample_hg(e.volume.anisotropy, e.dir, d.u);
+    if (share)
+        return true;
+    float q = min(1.0, max_component(e.throughput));
+    // A sample of 0 passes a denormal `q` too, which nothing may divide by.
+    if (!(e.rng.next() < q) || q < F32_MIN_NORMAL)
+    {
+        walk_end(e);
+        return false;
+    }
+    e.throughput /= q;
+    return true;
+}
+
+// Stops running walk `e` if it has taken `max_steps` steps, keeping `table`'s share of its
+// throughput if `share`.
+public void walk_capped(inout Walk e, SubsurfaceTableGpu* table, uint max_steps, bool share)
+{
+    if (e.step != max_steps)
+        return;
+    if (share)
+        e.throughput *= capped_walk_share(table, e.volume.albedo, e.volume.anisotropy, max_steps, e.ior);
+    e.kind = all(e.throughput == 0.0) ? WALK_NONE : WALK_CAP;
+}
+
 // Runs up to `steps` more steps of running walk `e`, at most `max_steps` in all, each traced
 // through `tracer`, and counts its queries in `rays`. A walk stopped at `max_steps` keeps
 // `table`'s share of its throughput if `share`, else its throughput as it is. Without `share`, a
@@ -194,86 +317,28 @@ void walk_end(inout Walk e)
 // divided by it, so its steps end by absorption unbiased rather than at the cap.
 public void walk_steps<T : IWalkTrace>(inout Walk e, T tracer, uint steps, SubsurfaceTableGpu* table, uint max_steps, bool share, inout uint rays)
 {
-    float3 sigma = max(e.volume.extinction, float3(1e-30));
-    // The densities against the least attenuated channel, so the hero channel's term stays
-    // above exp(-17).
-    float3 excess = sigma - min(sigma.x, min(sigma.y, sigma.z));
     for (uint end = min(e.step + steps, max_steps); e.step < end; e.step++)
     {
-        float total = e.throughput.x + e.throughput.y + e.throughput.z;
-        // Division by a denormal has no precision bound, and a device may keep denormals.
-        if (!(total >= F32_MIN_NORMAL) || !isfinite(total))
-        {
-            walk_end(e);
+        WalkDraw d;
+        if (!walk_draw(e, d))
             return;
-        }
-        float3 choose = e.throughput / total;
-        float4 u = e.rng.next4();
-        uint hero = u.x < choose.x ? 0 : u.x < choose.x + choose.y ? 1 : 2;
-        float t = -log(1.0 - min(u.y, 0.99999994)) / sigma[hero];
         rays++;
         float3 positions[3];
-        Hit h = tracer.trace(e.origin, e.dir, t, positions);
+        Hit h = tracer.trace(e.origin, e.dir, d.t, positions);
         if (h.hit)
         {
             WalkMeet met = tracer.meet(h, e.origin, e.dir, positions, e.rng);
-            if (met.kind == WALK_NONE)
-            {
-                walk_end(e);
-                return;
-            }
-            float3 a = exp(-excess * h.t);
-            // The mix holds the hero's share times at least exp(-17), so it falls below the
-            // smallest normal float only for a hero a sample of 0 drew at a share near none.
-            float mix = dot(choose, a);
-            if (!(mix >= F32_MIN_NORMAL))
-            {
-                walk_end(e);
-                return;
-            }
-            e.throughput = e.throughput * a / mix;
-            if (met.kind == WALK_REFLECT)
-            {
-                e.origin = met.origin;
-                e.dir = met.dir;
+            if (walk_met(e, d, h.t, met))
                 continue;
-            }
-            e.kind = met.kind;
-            if (met.kind == WALK_LEAVE)
-                e.dir = met.dir;
-            e.origin = met.origin;
-            e.normal = met.normal;
-            e.hit = h;
-            e.positions = positions;
-            return;
-        }
-        float3 a = exp(-excess * t);
-        // The hero's share times its density times at least exp(-17).
-        float mix = dot(choose, sigma * a);
-        if (!(mix >= F32_MIN_NORMAL))
-        {
-            walk_end(e);
-            return;
-        }
-        e.throughput *= e.volume.albedo * sigma * a / mix;
-        e.origin += e.dir * t;
-        e.dir = sample_hg(e.volume.anisotropy, e.dir, u.zw);
-        if (!share)
-        {
-            float q = min(1.0, max_component(e.throughput));
-            // A sample of 0 passes a denormal `q` too, which nothing may divide by.
-            if (!(e.rng.next() < q) || q < F32_MIN_NORMAL)
+            if (e.kind != WALK_NONE)
             {
-                walk_end(e);
-                return;
+                e.hit = h;
+                e.positions = positions;
             }
-            e.throughput /= q;
+            return;
         }
+        if (!walk_scattered(e, d, share))
+            return;
     }
-    if (e.step == max_steps)
-    {
-        if (share)
-            e.throughput *= capped_walk_share(table, e.volume.albedo, e.volume.anisotropy, max_steps, e.ior);
-        e.kind = all(e.throughput == 0.0) ? WALK_NONE : WALK_CAP;
-    }
+    walk_capped(e, table, max_steps, share);
 }

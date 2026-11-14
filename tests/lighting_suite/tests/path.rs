@@ -121,6 +121,49 @@ fn the_pipeline_renders_opaque_scenes_as_the_staged_loop_does() {
     assert_clean();
 }
 
+/// The pipeline path tracer walks subsurface materials as the staged loop does: the light that
+/// leaves a skin slab on the ground through its walks, under a sun and a sky, in real time, whose
+/// walks stop at their cap and keep the subsurface table's share, and in the reference, whose walks
+/// run until they leave. Compared as the opaque scenes are, above.
+#[test]
+fn the_pipeline_walks_subsurface_materials_as_the_staged_loop_does() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    let mut staged = paths(ViewLighting::default());
+    let mut launched = Paths::new(
+        &KernelSet::default(),
+        PathEntry::Pipeline,
+        ViewLighting::default(),
+    );
+    let real_time = ViewLighting {
+        debug_view: LightingDebugView::Subsurface,
+        ..ViewLighting::default()
+    };
+    for (what, settings) in [
+        ("real time", real_time),
+        ("reference", debug(LightingDebugView::Subsurface, 4)),
+    ] {
+        staged.settings = settings;
+        launched.settings = settings;
+        let mut bed = Bed::new(Analytic::SubsurfaceSlab);
+        bed.set_hit_pipeline(launched.hit_pipeline());
+        bed.set_pre_exposure(1.0 / 64.0);
+        render_paths(&mut bed, &staged, 32, 3);
+        let piped = render_paths(&mut bed, &launched, 32, 1);
+        let same_seed = render_paths(&mut bed, &staged, 32, 1);
+        let noise = render_paths(&mut bed, &staged, 32, 2);
+        assert_within_noise(what, &piped, &same_seed, &noise, 1.25);
+        let (mut of_staged, mut of_launched) = (Vec::new(), Vec::new());
+        for k in 0..24 {
+            of_staged.push(image_mean(&render_paths(&mut bed, &staged, 1, 4 + k))[1]);
+            of_launched.push(image_mean(&render_paths(&mut bed, &launched, 1, 4 + k))[1]);
+        }
+        assert_same_mean(what, &of_launched, &of_staged);
+    }
+    assert_clean();
+}
+
 #[test]
 fn reference_error_halves_with_four_times_the_frames() {
     let mut bed = Bed::new(Analytic::CornellBox);

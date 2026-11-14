@@ -1131,7 +1131,6 @@ fn unlaunched(
             "dielectric and presence layers",
         ),
         (path_features & FEATURE_INTERIORS != 0, "interiors"),
-        (path_features & FEATURE_WALK != 0, "subsurface walks"),
         (
             features.contains(SceneFeatures::PARTICLES),
             "particles along path rays",
@@ -2308,8 +2307,9 @@ impl LightingKernels {
     /// [`Self::record_paths`] through the pipeline path tracer `launch`, from the view paths' root
     /// `path`: the layer guides, then the view's paths and its update paths, each source in one
     /// launch per slice of the paths the view's memory holds. The paths hold no interior, plane
-    /// stack or wavelengths, walk nowhere, gather no photons and take one pass; what else of the
-    /// frame they do not render yet ([`unlaunched`]) the caller logs once for each mix.
+    /// stack or wavelengths, walk only through subsurface materials, gather no photons and take
+    /// one pass; what else of the frame they do not render yet ([`unlaunched`]) the caller logs
+    /// once for each mix.
     fn record_launched(
         &self,
         list: &mut CommandList<'_>,
@@ -2326,11 +2326,16 @@ impl LightingKernels {
         self.record_layers(list, view, pass, lighting, path)?;
         let reference = lighting.reference.is_some();
         let root = PathRoot {
-            features: 0,
+            features: path.features & FEATURE_WALK,
             dielectric_flags: path.dielectric_flags & !(DIELECTRIC_FROST | DIELECTRIC_DISPERSION),
             caustics: GpuPtr::NULL,
             source: PATH_SOURCE_VIEW,
-            round_next: rounds(lighting.max_bounces, 0, reference, false)?,
+            round_next: rounds(
+                lighting.max_bounces,
+                0,
+                reference,
+                path.features & FEATURE_WALK != 0,
+            )?,
             ..*path
         };
         let pixels = view.extent[0] * view.extent[1];
@@ -2340,13 +2345,24 @@ impl LightingKernels {
             let blocks = view.extent.map(|e| e.div_ceil(path.update_block));
             blocks[0] * blocks[1]
         };
+        let update_root = PathRoot {
+            source: PATH_SOURCE_UPDATE,
+            ..update_root(&root)
+        };
+        let features = (root.features, update_root.features);
         if !view
             .launched
             .as_ref()
-            .is_some_and(|m| m.fits(pixels, update))
+            .is_some_and(|m| m.fits(pixels, features.0, update, features.1))
         {
             view.launched = None;
-            view.launched = Some(LaunchMemory::new(&view.device, pixels, update)?);
+            view.launched = Some(LaunchMemory::new(
+                &view.device,
+                pixels,
+                features.0,
+                update,
+                features.1,
+            )?);
         }
         let memory = view.launched.as_ref().expect("made above");
         list.begin_pass(
@@ -2359,10 +2375,6 @@ impl LightingKernels {
         );
         launch.record(list, &hits, Raygen::View, &root, &memory.view, pixels);
         if update > 0 {
-            let update_root = PathRoot {
-                source: PATH_SOURCE_UPDATE,
-                ..update_root(&root)
-            };
             launch.record(
                 list,
                 &hits,

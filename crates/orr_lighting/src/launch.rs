@@ -15,28 +15,43 @@ use orr_scene::{HitGroups, SceneFeatures};
 
 use crate::shaders::path::pipeline::{self, Spec};
 use crate::shaders::types::{PathRoot, PathStages};
-use crate::staged::{MAY_ALL, MAY_RICH, RECORD_WORDS, UPDATE_RECORD_WORDS};
+use crate::staged::{
+    FEATURE_INTERIORS, FEATURE_WALK, MAY_ALL, MAY_RICH, RECORD_WORDS, UPDATE_RECORD_WORDS,
+};
 use crate::{Error, KernelSet, module};
 
-/// `path/launch.slang`'s SLOT_WORDS: the words of a path's slot.
+/// `path/launch.slang`'s SLOT_WORDS, WALK_WORDS and INTERIORS_WORDS: the words of a path's slot,
+/// and those of the parts the paths that walk and that track interiors add to it.
 const SLOT_WORDS: u64 = 19;
+const WALK_WORDS: u64 = 15;
+const INTERIORS_WORDS: u64 = 7;
+
+/// The words of a slot of paths whose root has `features`, of a view's (`view`) or not, as
+/// `path/launch.slang`'s `slot_stride` lays it out.
+fn slot_words(features: u32, view: bool) -> u64 {
+    let walk = view && features & (FEATURE_WALK | FEATURE_INTERIORS) != 0;
+    let interiors = features & FEATURE_INTERIORS != 0;
+    SLOT_WORDS + if walk { WALK_WORDS } else { 0 } + if interiors { INTERIORS_WORDS } else { 0 }
+}
 
 /// Paths of a source one launch runs at most, which bounds the memory a view's paths keep: a
 /// source with more runs them in slices.
 const MAX_SLOTS: u32 = 1 << 20;
 
-/// The stages the pipeline holds one of, first, by index: the raygens, the miss shader and the
-/// medium proxies' intersection and any-hit shaders.
-const FIXED: [&str; 5] = [
+/// The stages the pipeline holds one of, first, by index: the raygens, the miss shader, the
+/// medium proxies' intersection and any-hit shaders and the walk meet's closest-hit.
+const FIXED: [&str; 6] = [
     "path_view",
     "path_update",
     "miss_path",
     "box_medium_hit",
     "proxy_shadow_hit",
+    "walk_meet",
 ];
 const MISS: u32 = 2;
 const MEDIUM_INTERSECTION: u32 = 3;
 const MEDIUM_ANY_HIT: u32 = 4;
+const WALK_MEET: u32 = 5;
 
 /// What the pipeline holds per pin after those (`HitGroups`): the closest-hit shaders of a copy's
 /// clusters, of a producer entry's clusters and of strands, and the any-hit shaders under path and
@@ -56,8 +71,9 @@ const COVER_SHADOW: usize = 4;
 
 /// Then the callables, in `path/launch.slang`'s CALL_* order, each with the lobes of the BSDF its
 /// vertices may have: next-event estimation and the scatter are made for a plain surface's and a
-/// rich one's.
-const CALLABLES: [(&str, bool); 9] = [
+/// rich one's. A walk's ends are made rich, as a walk starts only from a vertex with a subsurface
+/// weight.
+const CALLABLES: [(&str, bool); 14] = [
     ("start_view", true),
     ("start_update", true),
     ("emission", true),
@@ -67,6 +83,11 @@ const CALLABLES: [(&str, bool); 9] = [
     ("scatter", true),
     ("finish_view", true),
     ("finish_update", true),
+    ("walk_end", true),
+    ("direct_exit", true),
+    ("scatter_exit", true),
+    ("direct_leave", true),
+    ("scatter_leave", true),
 ];
 
 /// The geometry a hit shader runs on, which its stage is made for.
@@ -191,6 +212,10 @@ impl PathPipeline {
             any_hit: Some(MEDIUM_ANY_HIT),
             intersection: Some(MEDIUM_INTERSECTION),
         });
+        hit_groups.push(HitGroup {
+            closest_hit: Some(WALK_MEET),
+            ..HitGroup::default()
+        });
         let desc = RayPipelineDesc {
             stages: &stages,
             raygens: &[ShaderRecord::new(0), ShaderRecord::new(1)],
@@ -215,6 +240,7 @@ impl PathPipeline {
                 strand_path: Some(2 * pins),
                 shadow: Some(3 * pins),
                 medium_shadow: Some(4 * pins),
+                walk_meet: Some(4 * pins + 1),
                 ..groups
             },
             unlaunched: Mutex::new(HashSet::new()),
@@ -277,20 +303,28 @@ impl PathPipeline {
 /// The slots of a slice of one source's paths in the pipeline and their records.
 pub(crate) struct SourceMemory {
     slots: u32,
+    slot_words: u64,
     header: Allocation<PathStages>,
     _words: Allocation<[u32; 4]>,
     _records: Allocation<[u32; 4]>,
 }
 
 impl SourceMemory {
-    /// The slots of `items` paths, at most [`MAX_SLOTS`], with records of `record_words` words.
-    fn new(device: &Device, items: u32, record_words: u64, name: &str) -> Result<Self, Error> {
+    /// The slots of `items` paths, at most [`MAX_SLOTS`], of `slot_words` words, with records of
+    /// `record_words` words.
+    fn new(
+        device: &Device,
+        items: u32,
+        slot_words: u64,
+        record_words: u64,
+        name: &str,
+    ) -> Result<Self, Error> {
         let slots = slots(items);
         let n = u64::from(slots);
         let words = |count: u64, what: &str| {
             device.gpu_malloc::<[u32; 4]>(MemoryKind::DeviceLocal, count, &format!("{name} {what}"))
         };
-        let state = words(SLOT_WORDS * n, "paths")?;
+        let state = words(slot_words * n, "paths")?;
         let records = words(record_words * n, "path records")?;
         let mut header = device.gpu_malloc::<PathStages>(MemoryKind::Upload, 1, name)?;
         header.as_mut_slice().expect("mapped")[0] = PathStages {
@@ -307,6 +341,7 @@ impl SourceMemory {
         };
         Ok(Self {
             slots,
+            slot_words,
             header,
             _words: state,
             _records: records,
@@ -325,23 +360,52 @@ pub(crate) struct LaunchMemory {
 }
 
 impl LaunchMemory {
-    /// Slots for a slice of a view of `pixels` pixels and one of its `update` update paths.
-    pub(crate) fn new(device: &Device, pixels: u32, update: u32) -> Result<Self, Error> {
+    /// Slots for a slice of a view of `pixels` pixels whose paths' root has `features`, and one
+    /// of its `update` update paths, whose root has `update_features`.
+    pub(crate) fn new(
+        device: &Device,
+        pixels: u32,
+        features: u32,
+        update: u32,
+        update_features: u32,
+    ) -> Result<Self, Error> {
         let memory = Self {
-            view: SourceMemory::new(device, pixels, RECORD_WORDS, "launched view")?,
-            update: SourceMemory::new(device, update, UPDATE_RECORD_WORDS, "launched update")?,
+            view: SourceMemory::new(
+                device,
+                pixels,
+                slot_words(features, true),
+                RECORD_WORDS,
+                "launched view",
+            )?,
+            update: SourceMemory::new(
+                device,
+                update,
+                slot_words(update_features, false),
+                UPDATE_RECORD_WORDS,
+                "launched update",
+            )?,
         };
         log::debug!(
-            "launched paths: {} view and {} update slots of {} bytes",
+            "launched paths: {} view slots of {} bytes and {} update slots of {} bytes",
             memory.view.slots,
+            16 * memory.view.slot_words,
             memory.update.slots,
-            16 * SLOT_WORDS
+            16 * memory.update.slot_words
         );
         Ok(memory)
     }
 
-    /// Whether it holds the slots [`Self::new`] makes for `pixels` and `update`.
-    pub(crate) fn fits(&self, pixels: u32, update: u32) -> bool {
-        self.view.slots == slots(pixels) && self.update.slots == slots(update)
+    /// Whether it holds the slots [`Self::new`] makes for its arguments.
+    pub(crate) fn fits(
+        &self,
+        pixels: u32,
+        features: u32,
+        update: u32,
+        update_features: u32,
+    ) -> bool {
+        self.view.slots == slots(pixels)
+            && self.view.slot_words == slot_words(features, true)
+            && self.update.slots == slots(update)
+            && self.update.slot_words == slot_words(update_features, false)
     }
 }

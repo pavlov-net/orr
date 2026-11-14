@@ -1364,24 +1364,31 @@ public struct InteriorWalk<S : ISurfaces> : IWalkTrace
         uint m;
         if (h.cluster_id < 0 || !hit_geometry(scene, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, normal, m))
             return WalkMeet(WALK_BOUNDARY);
-        float c = dot(normal, dir);
-        if (m != material || !(c > 0.0))
-            return WalkMeet(WALK_BOUNDARY);
-        float3 p = origin + dir * h.t;
-        float3 way_out = refract(dir, -normal, ior);
-        if (rng.next() < openpbr_fresnel(1.0 / ior, c) || all(way_out == 0.0))
-        {
-            WalkMeet back = WalkMeet(WALK_REFLECT);
-            back.dir = reflect(dir, normal);
-            back.origin = ray_origin(p, p, normal, back.dir, ORIGIN_DEFAULT, 0.0, length(p - view.eye_render.xyz));
-            return back;
-        }
-        WalkMeet leave = WalkMeet(WALK_LEAVE);
-        leave.dir = normalize(way_out);
-        leave.origin = p;
-        leave.normal = normal;
-        return leave;
+        return interior_meet(view, material, ior, m, normal, origin, dir, h.t, rng);
     }
+}
+
+// What a step of the walk in interior `material`, its surface `ior` times the outside's, from
+// `origin` along `dir` does at a face of material `m` with geometric normal `normal` `t` along.
+public WalkMeet interior_meet(ViewConstants* view, uint material, float ior, uint m, float3 normal, float3 origin, float3 dir, float t, inout Sampler rng)
+{
+    float c = dot(normal, dir);
+    if (m != material || !(c > 0.0))
+        return WalkMeet(WALK_BOUNDARY);
+    float3 p = origin + dir * t;
+    float3 way_out = refract(dir, -normal, ior);
+    if (rng.next() < openpbr_fresnel(1.0 / ior, c) || all(way_out == 0.0))
+    {
+        WalkMeet back = WalkMeet(WALK_REFLECT);
+        back.dir = reflect(dir, normal);
+        back.origin = ray_origin(p, p, normal, back.dir, ORIGIN_DEFAULT, 0.0, length(p - view.eye_render.xyz));
+        return back;
+    }
+    WalkMeet leave = WalkMeet(WALK_LEAVE);
+    leave.dir = normalize(way_out);
+    leave.origin = p;
+    leave.normal = normal;
+    return leave;
 }
 
 // The walk of interior medium `im` from a scatter at `from` reached along `dir`, its surface
