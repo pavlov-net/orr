@@ -2175,8 +2175,8 @@ bool vertex_scatter<S : ISurfaces, let X : uint, R : IPathRecord>(PathRoot r, Pa
         spread = delta ? 0.0 : diffuse ? 1.0 : 2.0 * roughness * roughness;
         // The walk takes the place of an opaque vertex's ray.
         walking = record.walks() && alive && (bs.lobe & LOBE_VOLUME) != 0;
-        crossed = on_layer && (bs.lobe & MATERIAL_LOBE_TRANSMISSION) != 0 && crosses_interior(s, l.section);
-        null_crossing = on_layer && delta && (bs.lobe & MATERIAL_LOBE_TRANSMISSION) != 0 && thin_walled(l.x.surface);
+        crossed = on_layer && (bs.lobe & LOBE_TRANSMISSION) != 0 && crosses_interior(s, l.section);
+        null_crossing = on_layer && delta && (bs.lobe & LOBE_TRANSMISSION) != 0 && thin_walled(l.x.surface);
         stack_crossing = may(MAY_STACK) && crossed && delta && c.stack.valid && c.stack.crossed < STACK_CROSSINGS && l.stack
             && (c.stack.crossed == 0 || abs(dot(l.x.surface.normal, c.stack.normal)) >= STACK_PARALLEL);
         float3 chained = max(bs.weight - bs.diffuse, 0.0);
