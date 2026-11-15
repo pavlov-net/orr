@@ -296,12 +296,12 @@ public PathStart camera_start(PathRoot r, uint2 pixel)
         float mask = r.dof_mask.get<Texture2D<float>>().Load(int3(pixel, 0));
         float near = r.view.clip_from_view[2][3];
         Sampler rng = Sampler(pixel, r.frame, r.seed ^ DOF_STREAM);
-        return lens_start(r, pixel, r.dof_aperture, *r.dof_focus, near / mask, MASK_OPAQUE | MASK_DIELECTRIC, rng);
+        return lens_start(r, pixel, r.dof_aperture, *r.dof_focus, near / mask, MASK_CAMERA | MASK_DIELECTRIC, rng);
     }
     if (thin_lens(r))
     {
         Sampler rng = Sampler(pixel, r.frame, r.seed);
-        return lens_start(r, pixel, r.aperture_radius, r.focus_distance, 0.0, MASK_OPAQUE | MASK_DIELECTRIC, rng);
+        return lens_start(r, pixel, r.aperture_radius, r.focus_distance, 0.0, MASK_CAMERA | MASK_DIELECTRIC, rng);
     }
     return pinhole_start(r.view, r.gbuffer, pixel, true);
 }
@@ -321,7 +321,7 @@ public PathStart view_start<S : ISurfaces>(PathRoot r, uint2 pixel, inout Sample
 {
     if (thin_lens(r))
     {
-        PathStart start = lens_start(r, pixel, r.aperture_radius, r.focus_distance, 0.0, MASK_OPAQUE | MASK_DIELECTRIC, rng);
+        PathStart start = lens_start(r, pixel, r.aperture_radius, r.focus_distance, 0.0, MASK_CAMERA | MASK_DIELECTRIC, rng);
         start.interior = lens_interior<S>(r, start.origin);
         return start;
     }
@@ -345,7 +345,7 @@ public bool background_path_start(PathRoot r, uint2 pixel, inout Sampler rng, ou
         return false;
     }
     float near = r.view.clip_from_view[2][3];
-    start = lens_start(r, pixel, r.dof_aperture, *r.dof_focus, near / mask, MASK_OPAQUE | MASK_DIELECTRIC, rng);
+    start = lens_start(r, pixel, r.dof_aperture, *r.dof_focus, near / mask, MASK_CAMERA | MASK_DIELECTRIC, rng);
     return true;
 }
 

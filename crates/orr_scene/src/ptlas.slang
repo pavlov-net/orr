@@ -191,12 +191,13 @@ uint partition_bucket(uint p)
     return min(uint(max_component(d)), DISTANCE_BUCKETS - 1);
 }
 
-// The rays a copy of `mesh` meets, from the sections it shows, as `PartGpu.sections`.
-uint section_ray_mask(MeshGpu* mesh, uint shown)
+// The rays a copy of `mesh` with instance flags `flags` meets, from the sections it shows, as
+// `PartGpu.sections`.
+uint section_ray_mask(MeshGpu* mesh, uint shown, uint flags)
 {
     uint mask = 0;
     if ((mesh.opaque_sections & shown) != 0)
-        mask |= MASK_OPAQUE;
+        mask |= opaque_ray_mask(flags);
     if ((mesh.layer_sections & shown) != 0)
         mask |= MASK_DIELECTRIC;
     return mask;
@@ -231,7 +232,8 @@ uint2 instance_key(GroupGpu* g, InstanceGpu inst)
         }
     }
     uint shown = shown_sections(inst);
-    a = mix(mix(a, inst.model), shown);
+    // The kinds of ray it meets are in its mask.
+    a = mix(mix(a, inst.model), shown ^ ((inst.flags & INSTANCE_RAY_KINDS) << 24));
     b = mix(mix(b, inst.group), inst.model ^ (shown << 16));
     return uint2(a, b);
 }
@@ -773,7 +775,7 @@ PtlasWrite copy_write(SceneRoot* s, PtlasGpu* t, uint index, uint partition, Ins
     float3 lo, hi;
     if ((inst.flags & INSTANCE_SKINNED) == 0 || !skinned_reach(s, inst, lo, hi))
         copy_bounds(s, inst, lo, hi);
-    return instance_write(index, partition, pl, lo, hi, blas, 0, section_ray_mask(s.meshes + s.models[inst.model].mesh, shown_sections(inst)), copy_run(s, inst));
+    return instance_write(index, partition, pl, lo, hi, blas, 0, section_ray_mask(s.meshes + s.models[inst.model].mesh, shown_sections(inst), inst.flags), copy_run(s, inst));
 }
 
 // Writes the slot's far instance: its copy's far chain step at `cut`, non-opaque.
@@ -821,7 +823,7 @@ void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot, Instanc
         w.instance_index = s.part_base + st.part_run + j;
         w.partition = ptlas_partition(partition);
         if (shown && blas != 0 && (part.sections & ~hidden) != 0 && part_pose(s, inst, mesh, mesh.first_animated + j, false, pose))
-            w = instance_write(w.instance_index, partition, placed_after(copy, pose), part.bounds_min, part.bounds_max, blas, 0, section_ray_mask(mesh, part.sections & ~hidden), copy_run(s, inst));
+            w = instance_write(w.instance_index, partition, placed_after(copy, pose), part.bounds_min, part.bounds_max, blas, 0, section_ray_mask(mesh, part.sections & ~hidden, inst.flags), copy_run(s, inst));
         if (fading && w.blas != 0)
             w.flags |= INSTANCE_FORCE_NO_OPAQUE;
         store((uint64_t)t.writes, index + j, w);
@@ -967,11 +969,17 @@ uint2 producer_key(GroupGpu* g, ProducerGpu p, uint run)
 // The rays producer entry `p` meets: its class's, or the classes of its materials.
 uint producer_ray_mask(SceneRoot* s, ProducerGpu p)
 {
-    if (p.opacity != PRODUCER_SECTIONS)
-        return class_mask(p.class_id);
     uint mask = 0;
-    for (uint i = 0; i < p.material_count; i++)
-        mask |= class_mask(material_class(s.materials + p.materials[i]));
+    if (p.opacity != PRODUCER_SECTIONS)
+        mask = class_mask(p.class_id);
+    else
+    {
+        for (uint i = 0; i < p.material_count; i++)
+            mask |= class_mask(material_class(s.materials + p.materials[i]));
+    }
+    // Its opaque clusters meet the kinds of ray its flags leave them.
+    if ((mask & MASK_OPAQUE_KINDS) != 0)
+        mask = (mask & ~MASK_OPAQUE_KINDS) | opaque_ray_mask(p.flags);
     return mask;
 }
 

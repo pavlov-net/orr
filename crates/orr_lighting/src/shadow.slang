@@ -31,7 +31,7 @@ import orr_lighting.specialize;
 __exported import orr_lighting.interiors;
 
 // The mask shadow rays trace.
-public static const uint SHADOW_MASK = MASK_OPAQUE | MASK_PARTICLE | MASK_MEDIUM | MASK_DIELECTRIC;
+public static const uint SHADOW_MASK = MASK_SHADOW | MASK_PARTICLE | MASK_MEDIUM | MASK_DIELECTRIC;
 
 // Steps a medium proxy's march takes at most over the ray's span inside it; spans longer than
 // this many voxels step farther than a voxel.
@@ -641,7 +641,7 @@ public Hit stack_trace<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 ori
     ray.Direction = dir;
     ray.TMin = 0.0;
     ray.TMax = t_max;
-    return trace_closest(scene_traced(s), ray, MASK_OPAQUE | MASK_DIELECTRIC, flags, a);
+    return trace_closest(scene_traced(s), ray, MASK_SHADOW | MASK_DIELECTRIC, flags, a);
 }
 
 // Whether a plane stack's probe from `origin` along unit `dir` toward a directional light meets a

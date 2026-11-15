@@ -1988,7 +1988,7 @@ public PathStart pinhole_start(ViewConstants* v, GBufferGpu* gb, uint2 pixel, bo
     float depth = gb.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
     start.t_max = depth > 0.0 ? max((length(view_position(v, uv, depth)) - start.offset) * (1.0 - 1e-5), 0.0) : positive_infinity();
     start.axis = 1.0;
-    start.mask = traced ? MASK_OPAQUE | MASK_DIELECTRIC : 0;
+    start.mask = traced ? MASK_CAMERA | MASK_DIELECTRIC : 0;
     start.gbuffer = true;
     start.interior = Interior();
     start.throughput = float3(1.0);

@@ -22,6 +22,20 @@ public static const uint INSTANCE_CAST_ONLY = 4;
 // Set by orr on copies from `add_skinned`: `pose_group` is the palette group and
 // `pose_index` the copy's entry in `SceneRoot.skinned`.
 public static const uint INSTANCE_SKINNED = 8;
+// Its opaque clusters are hidden from the rays a path scatters, from shadow rays, from camera
+// rays: a copy or producer entry traced by some kinds of ray and not by others.
+public static const uint INSTANCE_NO_SCATTER = 16;
+public static const uint INSTANCE_NO_SHADOW = 32;
+public static const uint INSTANCE_NO_CAMERA = 64;
+public static const uint INSTANCE_RAY_KINDS = INSTANCE_NO_SCATTER | INSTANCE_NO_SHADOW | INSTANCE_NO_CAMERA;
+
+// The kinds of ray the opaque clusters of a copy or producer entry with instance flags `flags`
+// meet, as their instance mask's bits (MASK_OPAQUE_KINDS).
+public uint opaque_ray_mask(uint flags)
+{
+    return ((flags & INSTANCE_NO_SCATTER) != 0 ? 0u : MASK_OPAQUE) | ((flags & INSTANCE_NO_SHADOW) != 0 ? 0u : MASK_SHADOW)
+        | ((flags & INSTANCE_NO_CAMERA) != 0 ? 0u : MASK_CAMERA);
+}
 
 // Whether candidate class `c` is a dielectric or presence layer's: its clusters raster into
 // the layer tiles instead of the visibility buffer.

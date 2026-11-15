@@ -140,7 +140,9 @@ void pixels(uint3 id: SV_DispatchThreadID)
     float3 d = pixel_direction(v, pixel);
     RayCone cone = camera_cone(v);
     HitContext near = hit_context(HIT_PRIMARY, 0, cone, 0.0);
-    Found f = trace<Surface>(s, v, v.eye_render.xyz, d, 1e30, near);
+    // Modes 3 and 4 trace as shadow rays and as camera rays; the others as a path's scatter rays.
+    uint mask = root.mode == 3 ? MASK_SHADOW : root.mode == 4 ? MASK_CAMERA : MASK_OPAQUE;
+    Found f = trace<Surface>(s, v, v.eye_render.xyz, d, 1e30, near, mask);
     Traced o = Traced();
     if (f.hit.hit && f.hit.cluster_id >= 0)
     {

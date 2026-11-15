@@ -208,8 +208,14 @@ impl InstanceFlags {
     pub const RAY: Self = Self(2);
     /// Its opaque clusters are traced and not rastered.
     pub const CAST_ONLY: Self = Self(4);
+    /// Its opaque clusters are hidden from the rays a path scatters, from shadow rays, from
+    /// camera rays: with [`Self::RAY`], a copy or a producer entry that some kinds of ray trace
+    /// and others do not, so another can stand in for it there.
+    pub const NO_SCATTER: Self = Self(16);
+    pub const NO_SHADOW: Self = Self(32);
+    pub const NO_CAMERA: Self = Self(64);
     /// The bits consumers set; orr keeps the others.
-    const CONSUMER: u8 = 7;
+    const CONSUMER: u8 = 7 | 16 | 32 | 64;
     /// `tables.slang` `INSTANCE_SKINNED`.
     const SKINNED: u8 = 8;
 }
