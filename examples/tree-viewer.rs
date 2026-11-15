@@ -425,7 +425,7 @@ fn run(options: &Options) -> Option<Capture> {
     let mut window = (!options.headless).then(|| Window::new(&title(&switches), 1920, 1080));
     let desc = RendererDesc {
         kernels: &KERNELS,
-        ..RendererDesc::default()
+        ..options.renderer_desc()
     };
     let mut display = window.as_ref().map(|w| {
         Display::new(

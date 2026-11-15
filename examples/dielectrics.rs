@@ -24,9 +24,9 @@ use orr::orr_pack::{AssetId, Target};
 use orr::{
     BoundTexture, ClusterTopology, DirectionalLight, DiscProfile, Display, DisplayRequest,
     FrameDesc, FrameTime, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light,
-    LightId, LitView, MaterialGpu, PackSource, ProducerId, Projection, Renderer, RendererDesc,
-    SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc,
-    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    LightId, LitView, MaterialGpu, PackSource, ProducerId, Projection, Renderer, SceneDesc,
+    SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, ViewHooks,
+    ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source, TextureSettings, Usage,
@@ -98,7 +98,7 @@ fn camera(t: f64, still: bool, dive: bool) -> (Vec3, Vec3) {
 pub(crate) fn run(options: &Options) -> Option<Capture> {
     let gpu = device();
     let mut window = (!options.headless).then(|| Window::new("orr dielectrics", 1920, 1080));
-    let desc = RendererDesc::default();
+    let desc = options.renderer_desc();
     let mut display = window.as_ref().map(|w| {
         Display::new(
             gpu,
