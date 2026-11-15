@@ -1045,40 +1045,66 @@ fn quarter_means(a: &Accumulated) -> Vec<[f64; 3]> {
     out
 }
 
+/// The view's local samplers draw a first vertex's lights by what its tile fed back, and the
+/// direct light they give is the light the scene's selection gives without them, through the
+/// staged loop and through the pipeline, whose first vertices pick among the points each sampler
+/// drew for the frame.
 #[test]
 fn light_feedback_and_local_samplers_keep_direct_light_unbiased() {
-    let mut bed = Bed::with(many_lights());
-    let direct = ViewLighting {
-        debug_view: LightingDebugView::DirectOnly,
-        ..ViewLighting::default()
-    };
-    let by_power = SceneLightingSettings {
-        feedback_share: 0.0,
-        ..*bed.lighting.settings()
-    };
-    bed.lighting.set_settings(&by_power).unwrap();
-    let plain = render_paths(
-        &mut bed,
-        &paths(ViewLighting {
-            local_light_share: 0.0,
-            ..direct
-        }),
-        96,
-        1,
-    );
-    bed.lighting
-        .set_settings(&SceneLightingSettings::default())
-        .unwrap();
-    let guided = render_paths(&mut bed, &paths(direct), 96, 2);
-    let stats = bed.lighting.stats(bed.last_frame()).unwrap();
-    assert!(stats.feedback_pixels > 0, "no pixel fed back a light");
-    assert_close("image", image_mean(&guided), image_mean(&plain), 0.015);
-    for (q, (g, p)) in quarter_means(&guided)
-        .into_iter()
-        .zip(quarter_means(&plain))
-        .enumerate()
-    {
-        assert_close(&format!("quarter {q}"), g, p, 0.04);
+    let rays = device().caps().ray_dispatch;
+    for entry in [PathEntry::Compute, PathEntry::Pipeline] {
+        if entry == PathEntry::Pipeline && !rays {
+            continue;
+        }
+        let paths = |settings| Paths::new(&KernelSet::default(), entry, settings);
+        let mut bed = Bed::with(many_lights());
+        // The pipeline's scatter rays find no light proxy, so the share of direct light they
+        // weigh against next-event estimation is missing from its image: its estimate is
+        // whole with next-event estimation alone.
+        let direct = ViewLighting {
+            debug_view: if entry == PathEntry::Pipeline {
+                LightingDebugView::NeeOnly
+            } else {
+                LightingDebugView::DirectOnly
+            },
+            ..ViewLighting::default()
+        };
+        let by_power = SceneLightingSettings {
+            feedback_share: 0.0,
+            ..*bed.lighting.settings()
+        };
+        bed.lighting.set_settings(&by_power).unwrap();
+        let plain = render_paths(
+            &mut bed,
+            &paths(ViewLighting {
+                local_light_share: 0.0,
+                ..direct
+            }),
+            96,
+            1,
+        );
+        bed.lighting
+            .set_settings(&SceneLightingSettings::default())
+            .unwrap();
+        let guided = render_paths(&mut bed, &paths(direct), 96, 2);
+        let stats = bed.lighting.stats(bed.last_frame()).unwrap();
+        assert!(
+            stats.feedback_pixels > 0,
+            "{entry:?}: no pixel fed back a light"
+        );
+        assert_close(
+            &format!("{entry:?} image"),
+            image_mean(&guided),
+            image_mean(&plain),
+            0.015,
+        );
+        for (q, (g, p)) in quarter_means(&guided)
+            .into_iter()
+            .zip(quarter_means(&plain))
+            .enumerate()
+        {
+            assert_close(&format!("{entry:?} quarter {q}"), g, p, 0.04);
+        }
     }
     assert_clean();
 }
