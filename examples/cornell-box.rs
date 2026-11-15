@@ -514,6 +514,15 @@ fn run(options: &Options) -> Option<Capture> {
         }
         let camera = &cameras[current];
         let final_frame = frames.is_some_and(|n| i + 1 == n);
+        // A headless run's clock steps by a fixed amount, so its readout's GPU pass times alone
+        // measure anything.
+        if final_frame && options.headless {
+            log::info!(
+                "last readout of GPU pass times:
+{}",
+                perf.figures
+            );
+        }
         // Headless runs step a fixed clock, so they repeat exactly.
         let t = if options.headless {
             fixed_time(i).absolute
