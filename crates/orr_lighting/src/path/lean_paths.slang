@@ -79,5 +79,6 @@ void miss_scatter(inout Payload p)
 void miss_shadow(inout Payload p)
 {
     ORR_OMM(miss_shadow);
-    lean_shadow_miss(root, DispatchRaysIndex().x, asfloat(p.words.xyz));
+    // Whatever traced the ray reads what reached its end from the payload.
+    p.words.w |= SHADOW_MISSED;
 }

@@ -195,6 +195,8 @@ public static const uint SHADOW_PROBE = 3;
 public static const uint SHADOW_CANDIDATES = 16;
 
 // `ShadowCover` flags.
+// A shadow ray's miss shader ran: nothing ended the ray, and `product` is what reached its end.
+public static const uint SHADOW_MISSED = 1 << 15;
 public static const uint SHADOW_ENDED = 1 << 16;     // an any-hit ended the search: the hit is no opaque one the AS committed
 [Host] public static const uint SHADOW_SOLID = 1 << 17;     // a path's ray met cooked solid glass, which ends it as an opaque hit would
 [Host] public static const uint SHADOW_CROSSES = 1 << 18;   // it passed a dielectric whose crossing the raygen walks

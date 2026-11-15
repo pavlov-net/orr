@@ -1,5 +1,5 @@
 // The lean tracer's raygen: a path from its start to its end. Per vertex it traces the pending
-// shadow job, whose miss shader adds its light, then the path's ray into a hit object, and runs
+// shadow job, whose light it adds where the ray met nothing, then the path's ray into a hit object, and runs
 // the shader the hit's record names after a reorder by it. It holds the slot's address and the
 // path's flags across those, and nothing else of the path.
 module raygen;
@@ -55,9 +55,10 @@ void start_path(PathRoot r, uint2 pixel, uint4* at, float throughput)
     store_hot(at, p);
 }
 
-// Traces the pending shadow job in hot words `at`: any hit ends it, and its miss shader adds the
-// job's light times what its ray's candidates let through.
-void trace_shadow(PathRoot r, uint4* at, uint flags)
+// Traces the pending shadow job of `slot`'s path in hot words `at`: any hit ends it, and where
+// its miss shader ran the job's light, times what the ray's candidates let through, is the
+// path's. The ray's shaders know nothing of the path: they read and write the payload alone.
+void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags)
 {
     uint4 w4 = load_coherent(at + 4);
     uint4 w5 = load_coherent(at + 5);
@@ -79,6 +80,8 @@ void trace_shadow(PathRoot r, uint4* at, uint flags)
     Payload p;
     p.words = cover.words();
     trace(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, path_ray(origin, dir, t_max), p);
+    if ((p.words.w & SHADOW_MISSED) != 0)
+        lean_shadow_add(r, slot, asfloat(p.words.xyz));
 }
 
 // Traces the ray in hot words `at`, whose first word is `w0`, and runs the shader of what it met.
@@ -126,7 +129,7 @@ void run_path(PathRoot r, uint slot, uint4* at, bool surface)
     {
         uint4 w0 = load_coherent(at);
         if ((w0.w & HOT_SHADOW) != 0)
-            trace_shadow(r, at, w0.w);
+            trace_shadow(r, slot, at, w0.w);
         if ((w0.w & HOT_RAY) == 0)
             break;
         trace_ray(r, slot, at, w0);
@@ -196,7 +199,7 @@ public void lean_updates(PathRoot r)
             store_coherent(at, uint4(w0.xyz, w0.w & ~HOT_ARRIVED));
         }
         if ((w0.w & HOT_SHADOW) != 0)
-            trace_shadow(r, at, w0.w);
+            trace_shadow(r, slot, at, w0.w);
         if ((w0.w & HOT_RAY) == 0)
             break;
         trace_ray(r, slot, at, w0);
