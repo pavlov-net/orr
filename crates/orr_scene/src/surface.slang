@@ -177,9 +177,7 @@ public struct Surfaces<L : ISurface> : ISurfaces
             L.feedback(i);
         if (!own)
         {
-            if (report)
-                surface_feedback(i);
-            g = standard_surface(i, depth_offset);
+            g = standard_surface(i, depth_offset, report);
             L.adjust(i, g, depth_offset);
         }
         surface_lobes(g);
@@ -572,13 +570,17 @@ interface IDecalVisit
     void decal(SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3 py);
 }
 
+// Blends each decal, and with `report` reports its texture feedback in the same visit.
 struct DecalBlend : IDecalVisit
 {
     DecalLayer layer;
+    bool report;
 
     [mutating]
     void decal(SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3 py)
     {
+        if (report)
+            decal_feedback(i, d, relative, px, py);
         blend_decal(layer, i, d, relative, px, py);
     }
 }
@@ -638,7 +640,13 @@ void surface_decals_each<V : IDecalVisit>(SurfaceInput i, inout V v)
 // The decals over hit `i` (`surface_decals_each`) blended in id order.
 public DecalLayer surface_decals(SurfaceInput i)
 {
-    DecalBlend b = { DecalLayer() };
+    return surface_decals(i, false);
+}
+
+// As above, reporting each decal's texture feedback with `report`.
+DecalLayer surface_decals(SurfaceInput i, bool report)
+{
+    DecalBlend b = { DecalLayer(), report };
     surface_decals_each(i, b);
     return b.layer;
 }
@@ -819,7 +827,9 @@ float3 slot_color(MaterialGpu* m, uint slot, bool read, float3 texel, bool strea
 // The standard surface: OpenPBR from the hit's `MaterialGpu` and its textures, with the decals
 // over the hit written over the material's parameters, but the flags of the lobes its weights
 // turn on (`surface_lobes`).
-GSurface standard_surface(SurfaceInput i, out float depth_offset)
+// With `report` it reports the texture feedback `surface_feedback` does, from the same visits of
+// its slots and of the decals over the hit.
+GSurface standard_surface(SurfaceInput i, out float depth_offset, bool report)
 {
     depth_offset = 0.0;
     MaterialGpu* m = i.scene.materials + i.material;
@@ -849,7 +859,8 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset)
     float2 coat_tangent = float2(0.0);
     // Past a primary hit the emission slots read with no footprint, as `surface_emission` does.
     UvFootprint finest[2] = { finest_footprint(i.uv[0]), finest_footprint(i.uv[1]) };
-    bool emission_finest = i.context.kind != HIT_PRIMARY;
+    bool primary = i.context.kind == HIT_PRIMARY;
+    bool emission_finest = !primary;
 
     // Every bound slot the surface reads goes through one texture read, and every slot of a
     // material with a vertex color stream through one read of the stream, so a kernel holds one
@@ -874,6 +885,15 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset)
         bool bound = k < bindable && material_bound(m, slot);
         if (!bound && !vertex)
             continue;
+        if (report && bound)
+        {
+            bool point = surface_reads_point(m, slot, primary);
+            if (point || surface_reads(m, slot, primary))
+            {
+                UvFootprint wanted[2] = { point ? finest[0] : i.uv[0], point ? finest[1] : i.uv[1] };
+                material_feedback(m, slot, wanted);
+            }
+        }
         bool read;
         switch (slot)
         {
@@ -984,7 +1004,7 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset)
 
     GSurface s = GSurface();
     s.normal = material_bound(m, TEXTURE_NORMAL) ? material_texel_normal(i, m, TEXTURE_NORMAL, normal) : i.normal;
-    apply_decals(surface_decals(i), p, s.normal);
+    apply_decals(surface_decals(i, report), p, s.normal);
     if ((m.flags & MATERIAL_BASE_TINT) != 0)
         p.transmission_color *= p.base_color;
     s.geometric_normal = i.geometric_normal;
