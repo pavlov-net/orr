@@ -241,6 +241,8 @@ fn gates() -> Vec<Row> {
             &[u64::from(MAY_BACKGROUND)],
             || Bed::new(Analytic::SunAndGround),
             |bed, paths| {
+                // The layer is read from frames whose paths record it, past the exposure's own.
+                dim(bed, paths);
                 bed.accumulate_background_layer(true);
                 // The left half's background rays start past the near plane.
                 let mask: Vec<[f32; 4]> = (0..EXTENT[0] * EXTENT[1])
@@ -260,7 +262,6 @@ fn gates() -> Vec<Row> {
                     aperture_radius: 0.05,
                     focus_distance: focus.gpu(),
                 });
-                dim(bed, paths);
                 Box::new((mask, focus))
             },
             reference(2),
