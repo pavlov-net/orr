@@ -34,9 +34,10 @@ use crate::staged::{
     FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_STACK, FEATURE_WALK, MAX_ROUNDS, MAY_ALL,
     MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION,
     MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS,
-    MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES, MAY_REFERENCE, MAY_SMOKE, MAY_STACK,
-    MAY_SUBSURFACE, MAY_TRACED, MAY_WALK, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, Source,
-    SourcePaths, Stage, StageSet, StagedKernels, StagedMemory, StateParts, UPDATE_FEATURES,
+    MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING,
+    MAY_SMOKE, MAY_STACK, MAY_SUBSURFACE, MAY_TRACED, MAY_WALK, PATH_SOURCE_UPDATE,
+    PATH_SOURCE_VIEW, Source, SourcePaths, Stage, StageSet, StagedKernels, StagedMemory,
+    StateParts, UPDATE_FEATURES,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::support::{Masked, MaskedFrame, MaskedSupport, Runs};
@@ -1492,6 +1493,10 @@ fn scene_may(features: SceneFeatures) -> u64 {
             MAY_PROXIES,
         )
         | bit(features.contains(SceneFeatures::SMOKE), MAY_SMOKE)
+        | bit(
+            features.contains(SceneFeatures::SCATTERING_INTERIORS),
+            MAY_SCATTERING,
+        )
 }
 
 /// What `root` says its paths may meet: the bits of `specialize.slang` a root decides.
@@ -2519,8 +2524,9 @@ impl LightingKernels {
             let blocks = view.extent.map(|e| e.div_ceil(path.update_block));
             blocks[0] * blocks[1]
         };
-        // Paths that may meet a layer keep the interiors they lie in.
-        let cold = may & (MAY_LAYERS | MAY_INTERIORS) != 0;
+        // Paths that may meet a layer keep the interiors they lie in, and paths that may walk the
+        // walk a vertex starts.
+        let cold = may & (MAY_LAYERS | MAY_INTERIORS | MAY_WALK) != 0;
         if !view
             .launched
             .as_ref()

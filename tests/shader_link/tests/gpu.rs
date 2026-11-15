@@ -258,6 +258,7 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
             "path/lean_layer",
             "path/lean_paths",
             "path/lean_rich",
+            "path/lean_walk",
             "path/pipeline/hits",
             "path/pipeline/raygen",
             "path/pipeline/sources",

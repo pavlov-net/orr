@@ -109,6 +109,7 @@ pub(crate) const MAY_DIRECTIONAL: u64 = consts::MAY_DIRECTIONAL as u64;
 pub(crate) const MAY_EMISSIVE: u64 = consts::MAY_EMISSIVE as u64;
 pub(crate) const MAY_PROXIES: u64 = consts::MAY_PROXIES as u64;
 pub(crate) const MAY_SMOKE: u64 = consts::MAY_SMOKE as u64;
+pub(crate) const MAY_SCATTERING: u64 = consts::MAY_SCATTERING as u64;
 /// What gives the other shade stage a vertex: a layer, or a scatter in or a way out of an
 /// interior.
 const MAY_OTHER: u64 = MAY_LAYERS | MAY_INTERIORS;

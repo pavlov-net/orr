@@ -1,5 +1,7 @@
 // The lean path tracer's stages (`path.lean`): the raygens of a view's paths and of its update
-// paths, the callable of a path's first vertex and the one of a debug view of it alone, the hit shader of a plain opaque surface, the
+// paths, the callable of a path's first vertex and the one of a debug view of it alone, the ones
+// that start a path in the interiors around the eye and run its vertex in an interior's medium,
+// the hit shader of a plain opaque surface, the
 // any-hit shaders of a path's ray and of its shadow ray at a candidate that is not opaque, and
 // the miss shaders of the two.
 #include "orr_root.h"
@@ -51,7 +53,7 @@ void updates()
 void first_vertex(inout Payload p)
 {
     ORR_OMM(first_vertex);
-    lean_first<Medium>(root, DispatchRaysIndex().x);
+    lean_first<Medium>(root, DispatchRaysIndex().x, p.words);
 }
 
 [shader("callable")]
@@ -59,6 +61,13 @@ void eye_interior(inout Payload p)
 {
     ORR_OMM(eye_interior);
     lean_eye_interior<Surface>(root, DispatchRaysIndex().x, p.words.x != 0);
+}
+
+[shader("callable")]
+void medium_vertex(inout Payload p)
+{
+    ORR_OMM(medium_vertex);
+    lean_medium_vertex(root, DispatchRaysIndex().x, asfloat(p.words.x), p.words.y, p.words.w != 0);
 }
 
 [shader("callable")]

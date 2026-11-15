@@ -16,10 +16,17 @@ import orr_shaders.pipeline;
 // The budget of the common path: what a plain ray pays whatever else its pipeline links.
 // A path's hot state.
 [Host] public static const uint LEAN_HOT_WORDS = 6;
-// The words a path keeps beside its hot ones where the scene may hold a layer or an interior: the
-// interior list (`Interior`: its entries, then where each was entered), and the layers it met
-// beside the extinction of the innermost interior's medium.
-[Host] public static const uint LEAN_COLD_WORDS = 6;
+// The words a path keeps beside its hot ones where the scene may hold a layer, an interior or a
+// walk: the interior list (`Interior`: its entries, then where each was entered), the layers it
+// met beside the extinction of the innermost interior's medium, that medium's scattering
+// coefficient and anisotropy, the point and outward normal of the surface the path last entered
+// an interior through (`LEAN_ENTERED_WORD`), the start of a walk (`LEAN_WALK_WORD`), and the
+// surface where a subsurface walk leaves, as its hit resolved it (`LEAN_EXIT_WORD`).
+[Host] public static const uint LEAN_COLD_WORDS = 18;
+public static const uint LEAN_SCATTER_WORD = 6;
+public static const uint LEAN_ENTERED_WORD = 7;
+public static const uint LEAN_WALK_WORD = 8;
+public static const uint LEAN_EXIT_WORD = 12;
 [Host] public static const uint LEAN_HOT_BYTES = 16 * LEAN_HOT_WORDS;
 // What a raygen keeps across a trace or an invoke, bytes: the driver's stack size of the raygen
 // beyond its hit object.
@@ -39,6 +46,16 @@ import orr_shaders.pipeline;
 // What a raygen holds more where the scene may hold a layer: the camera ray's search for layers,
 // the walk of a shadow ray through thin walls and a frosted pixel's second path.
 [Host] public static const uint RAYGEN_LAYER_INSTRUCTIONS = 1200;
+// What a raygen holds more where an interior's medium may scatter or a surface may walk: the draw
+// of where a ray inside an interior scatters, and the steps of a walk.
+[Host] public static const uint RAYGEN_WALK_INSTRUCTIONS = 6400;
+// The callable of a path's vertex at a scatter in an interior's medium, or where a walk leaves it.
+[Host] public static const uint MEDIUM_VERTEX_INSTRUCTIONS = 12500;
+// The callable of the vertex where a subsurface walk leaves.
+[Host] public static const uint WALK_EXIT_INSTRUCTIONS = 17000;
+// What a hit made for surfaces that may walk holds more than one with the rich lobes alone: the
+// subsurface lobe, the start of its walk and what it leaves of the surface where a walk leaves.
+[Host] public static const uint WALK_HIT_INSTRUCTIONS = 5400;
 // A hit's cap is the standard surface's hit on a copy's clusters, with every scene flag set; the
 // standard alpha test's any-hit likewise. They stand for the cold compile of the pipeline and the
 // weight of the shaders at run time, and what is left in either is not code held twice. A stage
@@ -76,6 +93,28 @@ public static const uint HOT_COUNTED = 1 << 5;      // light its ray meets count
 public static const uint HOT_MEDIUM = 1 << 6;       // the ray left a point in a medium, which has no normal
 public static const uint HOT_ARRIVED = 1 << 7;      // an update path's hit left its vertex for the raygen to record
 public static const uint HOT_INTERIOR = 1 << 16;    // the path lies in an interior, which its cold words list
+// Bits of a path ray's first payload word that its cover (`path_payload`) leaves free: traversal's
+// any-hits ignore them, and the shader of the hit reads them.
+public static const uint PAYLOAD_WEIGHED = 1 << 14; // a walk weighed the ray's stretch in its interior: the hit takes no Beer for it
+public static const uint PAYLOAD_EXIT = 1 << 15;    // the hit is where a subsurface walk leaves
+public static const uint PAYLOAD_WALKED = 1 << 16;  // the path walked
+// What a hit's shader hands back in its payload's second word: the vertex drew a subsurface walk,
+// which the path's cold words hold (`LEAN_WALK_WORD`), or it resolved the surface where one leaves
+// into them (`LEAN_EXIT_WORD`) for the callable of that vertex.
+public static const uint PAYLOAD_WALKS = 1;
+public static const uint PAYLOAD_EXITS = 2;
+// What the callable of a vertex in an interior's medium runs, by its payload's second word: a
+// scatter's vertex, the walk a scatter starts, or the vertex where a walk leaves the interior or
+// stops at its cap.
+public static const uint MEDIUM_SCATTERS = 0;
+public static const uint MEDIUM_LEAVES = 1;
+public static const uint MEDIUM_WALKS = 2;
+public static const uint MEDIUM_CAPPED = 3;
+// The density word of a ray whose vertex's next-event estimation took the lights it meets, which
+// it meets for nothing: a walk's way out in real time.
+public static const float PDF_LIT = -1.0;
+// The entered word of a path that entered no interior it lies in: not a point.
+public static const uint NO_ENTRY = 0xffffffffu;
 // From HOT_DEPTH_SHIFT, the vertices the path has scattered at, HOT_DEPTH_MASK at most.
 public static const uint HOT_DEPTH_SHIFT = 8;
 public static const uint HOT_DEPTH_MASK = 0xff;

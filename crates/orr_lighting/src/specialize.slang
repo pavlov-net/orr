@@ -81,6 +81,8 @@ static const uint path_may = 0xffffffffu;
 // The surface a stage of a ray tracing pipeline shades may emit: a hit shader made for materials
 // that can, and the first vertex's wherever a surface of the scene can.
 [Host] public static const uint MAY_EMITTER = 1 << 27;
+// The medium of an interior may scatter (`SceneFeatures::SCATTERING_INTERIORS`).
+[Host] public static const uint MAY_SCATTERING = 1 << 28;
 // The scene may hold a medium proxy; a smoke entry.
 [Host] public static const uint MAY_PROXIES = 1u << 30;
 [Host] public static const uint MAY_SMOKE = 1u << 31;
