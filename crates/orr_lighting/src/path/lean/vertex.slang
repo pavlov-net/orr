@@ -133,8 +133,9 @@ void write_primary_sky(PathRoot r, uint2 pixel, float3 dir)
     raster.hzb[0].get<RWTexture2D<float>>()[pixel] = 0.0;
 }
 
-// The winner of a vertex's light candidates, resampled by unshadowed luminance as they are drawn:
-// one stays live.
+// The winner of a vertex's light candidates, resampled as they are drawn by the luminance of their
+// light times the density the vertex's BSDF draws their direction with: one stays live, and the
+// BSDF is evaluated for it alone.
 struct LightPick
 {
     // What the vertex's shadow job takes of the winner: where it lies, its radiance, its density
@@ -147,7 +148,7 @@ struct LightPick
     uint light;
     float3 f;                   // the vertex's BSDF x cos toward it
     float scatter_pdf;          // the vertex's own density of its direction
-    float target;
+    float target;               // what it was resampled by
     float sum;
     uint drawn;
 }
@@ -157,8 +158,8 @@ struct LightPick
 // else `candidates` from its pixel's tile, and at a path's `first` vertex on the G-buffer's
 // surface (`FIRST` 1) the points this frame drew of its screen tile's local sampler for that
 // sampler's share of them; a hit's stage holds none of that. One sampler dimension and six per
-// candidate, as `nee_draw`. The same loop evaluates the direction `d` the vertex's scatter drew,
-// into `f`, `pdf` and `diffuse`, so the vertex holds the BSDF's evaluation once.
+// candidate, as `nee_draw`. The direction `d` the vertex's scatter drew is evaluated beside the
+// winner's, into `f`, `pdf` and `diffuse`, so the vertex holds the BSDF's evaluation once.
 LightPick pick_light<let FIRST : uint>(PathRoot r, Bsdf b, float3 position, float3 normal, uint2 pixel, uint candidates, bool estimates, bool first, BsdfDraw d, out float3 f, out float pdf, out float3 diffuse, inout Sampler rng)
 {
     LightSetGpu* set = r.set;
@@ -188,37 +189,19 @@ LightPick pick_light<let FIRST : uint>(PathRoot r, Bsdf b, float3 position, floa
         directional = rng.next() < v.share;
         k.drawn = directional ? 1 : candidates;
     }
-    uint own = d.drawn && !d.delta ? k.drawn : 0xffffffffu;
-    uint count = k.drawn + (own == k.drawn ? 1 : 0);
-    for (uint i = 0; i < count; i++)
+    for (uint i = 0; i < k.drawn; i++)
     {
-        ResolvedLightSample c = no_candidate();
-        float u = 0.0;
-        float3 dir = d.wi;
-        if (i != own)
-        {
-            if (directional)
-                c = nee_directional_candidate(set, v, rng);
-            else if (local && v.local != nullptr)
-                c = nee_local_tile_candidate(set, v, rng);
-            else
-                c = nee_tile_candidate(set, v, rng);
-            u = rng.next();
-            if (!(c.pdf > 0.0))
-                continue;
-            dir = c.dir;
-        }
-        float scatter_pdf;
-        float3 share;
-        float3 fc = b.eval_and_pdf(dir, scatter_pdf, share);
-        if (i == own)
-        {
-            f = fc;
-            pdf = scatter_pdf;
-            diffuse = share;
+        ResolvedLightSample c;
+        if (directional)
+            c = nee_directional_candidate(set, v, rng);
+        else if (local && v.local != nullptr)
+            c = nee_local_tile_candidate(set, v, rng);
+        else
+            c = nee_tile_candidate(set, v, rng);
+        float u = rng.next();
+        if (!(c.pdf > 0.0))
             continue;
-        }
-        float target = luminance_rec2020(fc * c.radiance);
+        float target = luminance_rec2020(c.radiance) * b.density(c.dir);
         float w = target / c.pdf;
         if (!(w > 0.0) || !isfinite(w))
             continue;
@@ -231,9 +214,29 @@ LightPick pick_light<let FIRST : uint>(PathRoot r, Bsdf b, float3 position, floa
             k.pdf = c.pdf;
             k.kind = c.kind;
             k.light = c.light;
-            k.f = fc;
-            k.scatter_pdf = scatter_pdf;
             k.target = target;
+        }
+    }
+    // The winner's value and the scatter's, through one evaluation of the BSDF in the stage.
+    bool scatters = d.drawn && !d.delta;
+    for (uint i = 0; i < 2; i++)
+    {
+        bool winner = i == 0;
+        if (winner ? !(k.sum > 0.0) : !scatters)
+            continue;
+        float density;
+        float3 share;
+        float3 value = b.eval_and_pdf(winner ? k.dir : d.wi, density, share);
+        if (winner)
+        {
+            k.f = value;
+            k.scatter_pdf = density;
+        }
+        else
+        {
+            f = value;
+            pdf = density;
+            diffuse = share;
         }
     }
     rng.dimension = end;

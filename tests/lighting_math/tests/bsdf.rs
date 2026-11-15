@@ -695,6 +695,27 @@ fn finite_for_any_parameters_and_directions() {
     }
 }
 
+/// The density a light pick weighs a direction by is the one `pdf` reports, whatever lobes the
+/// material has: a lobe the evaluation gained alone would leave directions no pick keeps.
+#[test]
+fn the_density_alone_is_the_pdf() {
+    let mut rng = Rng::new(29);
+    for mut bsdf in [RealTime::new(), RealTime::collapsed()] {
+        for case in 0..20_000 {
+            let (inputs, view_dir) = edge_case(&mut rng, case);
+            bsdf.prepare(&inputs, view_dir);
+            for _ in 0..8 {
+                let wi = edge_direction(&mut rng);
+                let (pdf, density) = (bsdf.pdf(wi), bsdf.density(wi));
+                assert!(
+                    (pdf - density).abs() <= 1e-4 * pdf.max(density),
+                    "case {case}: pdf {pdf}, density {density} toward {wi:?} for {inputs:?} from {view_dir:?}"
+                );
+            }
+        }
+    }
+}
+
 /// Refraction scales a camera path's radiance by the squared IOR ratio, against a light path's
 /// flux, on rough and ideal glass from either side; reflection does not. A path that enters and
 /// leaves multiplies to 1.
