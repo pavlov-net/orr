@@ -62,7 +62,7 @@ public TracedHit traced_hit<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float
     if (h.cluster_id >= 0 && hit_copy(s, h.instance_index, copy))
     {
         o.copy = copy;
-        InstanceGpu inst = copy_record(s, copy);
+        InstanceGpu inst = traced_record(s, copy);
         o.model = inst.model;
         o.mesh = s.models[inst.model].mesh;
         o.mesh_cluster = s.clusters[h.cluster_id].mesh_cluster;

@@ -165,7 +165,7 @@ bool stack_entry(SceneRoot* s, uint e)
     }
     if (g.kind != EMISSIVE_INSTANCE)
         return false;
-    InstanceGpu inst = copy_record(s, g.source);
+    InstanceGpu inst = traced_record(s, g.source);
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
     // A copy's entries hold its chain's largest rank count, which the step it shows can lack.
@@ -201,7 +201,7 @@ void instance_list(SceneRoot* s, uint e, inout EmissiveSelection sel)
         sel.cdf = list + GATHERED_CLUSTERS;
         return;
     }
-    InstanceGpu inst = copy_record(s, g.source);
+    InstanceGpu inst = traced_record(s, g.source);
     SetTablesGpu t = s.meshes[s.models[inst.model].mesh].emissive;
     ClusterSet k = ((ClusterSet*)t.sets)[g.set];
     sel.cdf = t.cdf + k.first;

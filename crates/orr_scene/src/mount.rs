@@ -3235,6 +3235,7 @@ impl Mounts {
             bounds_min: bounds.min,
             bounds_max: bounds.max,
             chain_count: 0,
+            chain_traced: 0,
             ..src_model
         };
         w.put(self.models.entry(model), &[record])?;

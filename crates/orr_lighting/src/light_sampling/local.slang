@@ -301,7 +301,7 @@ float cos_less(float cos_a, float cos_b, float cos_c)
 float importance(SceneRoot* s, uint entry, EmissiveSelection e, SetNode n, float4 receiver, float4 normal)
 {
     float power = float(range_mass(e, n.first, n.count)) / 4294967295.0;
-    InstanceGpu inst = copy_record(s, s.emissive[entry].source);
+    InstanceGpu inst = traced_record(s, s.emissive[entry].source);
     Placement pl;
     if (!placement(s.groups + inst.group, false, inst.group_index, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), pl))
         return power;

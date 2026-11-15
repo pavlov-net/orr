@@ -316,7 +316,7 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
     // instance holds, and while it fades its farther step's.
     InstanceGpu base = o.instance;
     uint near = chain_near(st);
-    InstanceGpu rt = step_record(s, base, near);
+    InstanceGpu rt = traced_step_record(s, base, near);
     ModelGpu* rt_model = s.models + rt.model;
     MeshGpu* rt_mesh = s.meshes + rt_model.mesh;
     o.rt_step = near;
@@ -353,7 +353,7 @@ void probe_cluster(SceneRoot* s, inout ProbeGpu o, VisibleCluster vc)
     if (st.fade != 0)
     {
         o.far_step = chain_far(st);
-        InstanceGpu far = step_record(s, base, o.far_step);
+        InstanceGpu far = traced_step_record(s, base, o.far_step);
         ModelGpu* far_model = s.models + far.model;
         MeshGpu* far_mesh = s.meshes + far_model.mesh;
         o.far_model = far.model;

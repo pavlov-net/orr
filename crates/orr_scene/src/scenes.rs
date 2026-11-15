@@ -967,6 +967,46 @@ impl Scenes {
         Ok(())
     }
 
+    /// Gives rays another step of `model`'s chain than its copies draw: `traced[k]` is the step
+    /// rays trace of a copy that draws step `k`, 0 the model itself, and a step past `traced`'s
+    /// end traces as drawn, as every step does once [`Self::set_chain`] has set a chain. A
+    /// step traced where another is drawn traces rigid, from a cut the scene keeps of its
+    /// model, with that step's materials: far copies can show the camera a cheap form and rays
+    /// one that needs no coverage, or the camera a detailed form and rays a coarse one. A
+    /// skinned model's copies and an edit's trace as drawn.
+    pub fn set_chain_traced(&mut self, model: ModelId, traced: &[u8]) -> Result<()> {
+        let invalid = |reason| Err(Error::InvalidChain { model, reason });
+        if !self.core.mounts.is_live(model) {
+            return invalid("the model is not resident");
+        }
+        let steps = 1 + self.core.chains.get(&model).map_or(0, Vec::len);
+        if traced.len() > steps || traced.iter().any(|&t| usize::from(t) >= steps) {
+            return invalid("a traced step is past the chain's end");
+        }
+        let word = traced.iter().enumerate().fold(0u32, |w, (k, &t)| {
+            w | ((u32::from(t) ^ k as u32) << (2 * k))
+        });
+        let cpu = self.core.model_cpu.get(model.0 as usize);
+        if word != 0 && cpu.is_some_and(|m| m.skin.is_some() || m.edit) {
+            return invalid("a skinned or edited model traces as drawn");
+        }
+        let core = &mut self.core;
+        let at = core
+            .mounts
+            .models
+            .gpu()
+            .offset(u64::from(model.0))
+            .address()
+            .0
+            + std::mem::offset_of!(crate::ModelGpu, chain_traced) as u64;
+        let seq = core.next_seq();
+        core.global
+            .get_mut()
+            .unwrap()
+            .push(Record::fill(seq, at, 1, word));
+        Ok(())
+    }
+
     /// The model `id` of mount `m`.
     pub fn model(&self, m: MountId, id: AssetId) -> Result<ModelId> {
         self.core.mounts.lookup(m, id, |r| &r.models)
@@ -1666,7 +1706,8 @@ impl Core {
 
     /// Writes `model`'s chain into its `ModelGpu` with the next frame's records.
     fn write_chain(&mut self, model: ModelId, chain: &[(ModelId, f32)]) {
-        let mut words = [0u32; 1 + 2 * MAX_CHAIN];
+        // The word past the distances is the steps rays trace: a new chain traces as drawn.
+        let mut words = [0u32; 2 + 2 * MAX_CHAIN];
         words[0] = chain.len() as u32;
         for (i, &(m, distance)) in chain.iter().enumerate() {
             words[1 + i] = m.0;

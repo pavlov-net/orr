@@ -424,7 +424,9 @@ public struct ModelGpu
     public uint chain_count;     // farther models, below CHAIN_STEPS
     public uint chain[3];        // ModelId of steps 1 to chain_count
     public float chain_distance[3]; // m from the focus where each of those steps starts, ascending
-    public uint _pad;
+    // The step rays trace of a copy that draws each step: 2 bits per drawn step, the traced step
+    // exclusive-or the drawn one, so 0 traces every step as drawn (`traced_step`).
+    public uint chain_traced;
 }
 
 // One run of `SceneRoot.runs` (`orr_scene.runs`' ROW_*).
@@ -625,6 +627,35 @@ public InstanceGpu step_record(SceneRoot* s, InstanceGpu inst, uint step)
     InstanceGpu r = inst;
     to_step(s, r, step);
     return r;
+}
+
+// The chain step rays trace of a copy of `model` that draws step `step`: the same, or the one
+// the model's chain gives rays there.
+public uint traced_step(SceneRoot* s, uint model, uint step)
+{
+    return step ^ ((s.models[model].chain_traced >> (2 * step)) & CHAIN_STEP_MASK);
+}
+
+// The record rays trace of a copy with record `inst` that draws chain step `step`. A step
+// traced where another is drawn traces rigid, as the steps past the model itself do.
+public InstanceGpu traced_step_record(SceneRoot* s, InstanceGpu inst, uint step)
+{
+    uint traced = traced_step(s, inst.model, step);
+    InstanceGpu r = inst;
+    to_step(s, r, traced);
+    if (traced != step)
+    {
+        r.pose_group = 0;
+        r.first_part = NO_PART_RUN;
+    }
+    return r;
+}
+
+// The record rays trace of slot copy `copy`: what its PTLAS instance holds, and so what a hit on
+// it, its hit records and its emissive entries name.
+public InstanceGpu traced_record(SceneRoot* s, uint copy)
+{
+    return traced_step_record(s, s.instances[copy_slot(copy)], copy_step(s, copy));
 }
 
 // The record slot copy `copy` draws and traces.

@@ -787,7 +787,7 @@ public bool list_cluster(SceneRoot* s, EmissiveSelection e, uint entry, uint p, 
         return true;
     }
     uint slot = g.source;
-    InstanceGpu inst = copy_record(s, slot);
+    InstanceGpu inst = traced_record(s, slot);
     MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
     cluster_id = e.index != nullptr ? mesh_cluster_id(s, mesh, e.clusters[p]) : e.clusters[p];
     ClusterRef r = s.clusters[cluster_id];
@@ -957,7 +957,7 @@ public EmitterHit emitter_hit(LightSetGpu* set, uint instance_index, uint cluste
         uint copy;
         if (!hit_copy(s, instance_index, copy) || (copy & COPY_FAR) != 0)
             return h;
-        InstanceGpu inst = copy_record(s, copy);
+        InstanceGpu inst = traced_record(s, copy);
         MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
         ClusterRef r = s.clusters[cluster_id];
         Cluster c = load_cluster(r.page, r.local);
