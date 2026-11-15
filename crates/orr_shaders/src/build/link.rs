@@ -162,8 +162,16 @@ const SURFACE: Switch = Switch {
             declares: surface_declares::OTHER_SIDE,
             forward: false,
         },
+        Method {
+            decl: "void always_shades()",
+            name: "always_shades",
+            args: "",
+            optional: true,
+            declares: surface_declares::ALWAYS_SHADES,
+            forward: false,
+        },
     ],
-    with: &[("coverage", "coverage_reads")],
+    with: &[("coverage", "coverage_reads"), ("always_shades", "surface")],
     wrap: Some("Surfaces"),
 };
 
@@ -670,7 +678,7 @@ pub(super) fn check_overrides(session: &Session, m: &LinkModule) -> Result<(), S
                     let named = |n: &str| declared.iter().any(|(x, _)| x.name == n);
                     if named(has) && !named(needs) {
                         wrong.push(format!(
-                            "{ty} declares `{has}` without `{needs}`, which says what it reads"
+                            "{ty} declares `{has}` without `{needs}`, which it stands on"
                         ));
                     }
                 }

@@ -291,7 +291,8 @@ impl Table {
         // one made for materials that may (`emissive`). A linked type that declares its emission
         // has it in its one stage, which every material of its id takes. The standard surface's
         // materials that emit by their own factor take a stage of their own, so the others' holds
-        // none of it; a linked type's that do share their type's.
+        // none of it; a linked type's that do share their type's, unless the type shades every
+        // hit itself, where no factor of its records shows.
         let factors = may & may2(SceneFeatures::EMISSION_FACTORS) != 0;
         let linked_factors = may & may2(SceneFeatures::LINKED_EMISSION_FACTORS) != 0;
         let emitter = |pin: u32, emissive: bool| {
@@ -303,7 +304,8 @@ impl Table {
                 true
             } else {
                 let declared = kernels.surface_declares[pin as usize - 2];
-                declared & surface_declares::EMISSION != 0 || linked_factors
+                let falls_back = declared & surface_declares::ALWAYS_SHADES == 0;
+                declared & surface_declares::EMISSION != 0 || falls_back && linked_factors
             }
         };
         // Whether the closest-hit of pin `pin` comes from the kernel with the rich lobes, where
@@ -325,7 +327,8 @@ impl Table {
                 true
             } else {
                 let declared = kernels.surface_declares[pin as usize - 2];
-                declared & rich_lobes != 0 || linked_factors
+                let falls_back = declared & surface_declares::ALWAYS_SHADES == 0;
+                declared & rich_lobes != 0 || falls_back && linked_factors
             }
         };
         let producers = may & may2(SceneFeatures::PRODUCERS) != 0;
@@ -466,6 +469,8 @@ pub struct StageSize {
     pub geometry: &'static str,
     /// The linked surface id the stage is made for; `u32::MAX` for any.
     pub hit_surface: u32,
+    /// Whether it comes from the lean kernel with the coat, fuzz, thin film and thin wall lobes.
+    pub rich: bool,
     pub instructions: u32,
     /// The most of orr's own code it may hand the driver; none for a stage made for a linked
     /// surface.
@@ -528,6 +533,7 @@ pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>,
                 role: spec.role,
                 geometry: spec.geometry.map_or("", Geometry::label),
                 hit_surface: spec.hit_surface,
+                rich: spec.kernel == Kernel::Rich,
                 instructions,
                 cap: spec.cap(kernels.surfaces),
                 linked,
