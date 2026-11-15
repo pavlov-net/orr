@@ -137,7 +137,14 @@ void write_primary_sky(PathRoot r, uint2 pixel, float3 dir)
 // one stays live.
 struct LightPick
 {
-    ResolvedLightSample chosen;
+    // What the vertex's shadow job takes of the winner: where it lies, its radiance, its density
+    // in the vertex's mixture, its kind and its light.
+    float3 dir;
+    float distance;
+    float3 radiance;
+    float pdf;
+    uint kind;
+    uint light;
     float3 f;                   // the vertex's BSDF x cos toward it
     float scatter_pdf;          // the vertex's own density of its direction
     float target;
@@ -156,7 +163,12 @@ LightPick pick_light<let FIRST : uint>(PathRoot r, Bsdf b, float3 position, floa
 {
     LightSetGpu* set = r.set;
     LightPick k;
-    k.chosen = no_candidate();
+    k.dir = float3(0.0, 0.0, 1.0);
+    k.distance = 0.0;
+    k.radiance = float3(0.0);
+    k.pdf = 0.0;
+    k.kind = LIGHT_SAMPLE_ENVIRONMENT;
+    k.light = NO_LIGHT;
     k.f = float3(0.0);
     k.scatter_pdf = 0.0;
     k.target = 0.0;
@@ -213,7 +225,12 @@ LightPick pick_light<let FIRST : uint>(PathRoot r, Bsdf b, float3 position, floa
         k.sum += w;
         if (u * k.sum < w)
         {
-            k.chosen = c;
+            k.dir = c.dir;
+            k.distance = c.distance;
+            k.radiance = c.radiance;
+            k.pdf = c.pdf;
+            k.kind = c.kind;
+            k.light = c.light;
             k.f = fc;
             k.scatter_pdf = scatter_pdf;
             k.target = target;
@@ -232,49 +249,56 @@ LightPick pick_light<let FIRST : uint>(PathRoot r, Bsdf b, float3 position, floa
 // of its own.
 void lean_vertex<M : IMedium, let FIRST : uint>(PathRoot r, uint slot, uint4* at, PathVertex x, float3 dir, float t, float2 cone)
 {
-    PathHot p = load_hot(at);
-    bool first = FIRST == 1 || (FIRST == 2 && may(MAY_TRACED) && (p.flags & HOT_CAMERA) != 0);
+    // Of the path's words the vertex holds its flags and its throughput. The radiance it adds
+    // goes into the path's word at once, and the ray and the shadow job it leaves are written
+    // whole, so nothing else of the path is live across the surface's light.
+    uint4 w0 = load_coherent(at);
+    uint flags = w0.w;
+    bool first = FIRST == 1 || (FIRST == 2 && may(MAY_TRACED) && (flags & HOT_CAMERA) != 0);
     // Whether light along the ray counts, as the vertex it left had it.
-    bool along = (p.flags & HOT_COUNTED) != 0;
-    p.flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA);
+    bool along = (flags & HOT_COUNTED) != 0;
+    bool was_diffuse = (flags & HOT_DIFFUSE) != 0;
+    flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
+    float3 throughput = hot_throughput(load_coherent(at + 1));
     // A traced camera ray's path runs on the view's share of pixels, as one that starts on the
     // G-buffer's surface does.
     if (FIRST == 2 && first)
     {
         if (!runs_path(r, pixel))
         {
-            store_hot(at, p);
+            store_coherent(at, uint4(w0.xyz, flags));
             return;
         }
-        p.throughput /= r.pixel_fraction;
+        throughput /= r.pixel_fraction;
     }
     GSurface g = x.surface;
     Sampler rng = path_sampler(r, pixel);
-    rng.dimension = p.dimension();
+    rng.dimension = flags >> HOT_DIMENSION_SHIFT;
     LeanMode mode = lean_mode(r);
     bool update = from_update(r);
+    float3 added = float3(0.0);
 
     // The linked medium along the ray. The view composes its camera segment from the froxels.
     float u_segment = rng.next();
     if (!first)
     {
+        float3 origin = asfloat(w0.xyz);
         if (t >= INSCATTER_SEGMENT)
         {
             float3 through;
-            float3 e = segment_inscatter<M>(r.set, p.origin, dir, t, r.segment_steps, u_segment, through);
+            float3 e = segment_inscatter<M>(r.set, origin, dir, t, r.segment_steps, u_segment, through);
             if (along)
-                p.radiance += p.throughput * e;
-            p.throughput *= through;
+                added += throughput * e;
+            throughput *= through;
         }
         else
-            p.throughput *= medium_transmittance<M>(r.scene.medium, p.origin, dir, t);
+            throughput *= medium_transmittance<M>(r.scene.medium, origin, dir, t);
     }
-    uint opaque = p.depth() + 1;
+    uint opaque = ((flags >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK) + 1;
     uint scattered = opaque - 1;
-    p.set_depth(opaque);
-    p.cone = cone;
-    bool alive = (g.flags & GBUFFER_UNLIT) == 0 && (first || path_mode(r) != PATH_DIRECT) && carries(p.throughput);
+    flags = (flags & ~(HOT_DEPTH_MASK << HOT_DEPTH_SHIFT)) | (min(opaque, HOT_DEPTH_MASK) << HOT_DEPTH_SHIFT);
+    bool alive = (g.flags & GBUFFER_UNLIT) == 0 && (first || path_mode(r) != PATH_DIRECT) && carries(throughput);
     Bsdf b = bsdf_prepare(g.bsdf, g.normal, x.view);
 
     // The cache holds the light a vertex scatters by its albedo: a path ends in it past its first
@@ -283,34 +307,38 @@ void lean_vertex<M : IMedium, let FIRST : uint>(PathRoot r, uint slot, uint4* at
     if (alive && mode.cache && !first)
     {
         CacheCell cell = cache_cell(r.cache, r.scene, g.position, g.geometric_normal, u_cell, true);
-        bool wide = p.cone.x > cell.size;
-        bool ends = update ? scattered >= 2 : (p.flags & HOT_DIFFUSE) != 0 || wide || opaque == r.max_bounces + 2;
+        bool wide = cone.x > cell.size;
+        bool ends = update ? scattered >= 2 : was_diffuse || wide || opaque == r.max_bounces + 2;
         float3 cached;
         if (ends && t > CACHE_MIN_RAY_CELLS * cell.size && cache_lookup(r.cache, cell.key, cached))
         {
             if (along)
-                p.radiance += p.throughput * cache_albedo(b.albedo(), g.bsdf) * cached;
+                added += throughput * cache_albedo(b.albedo(), g.bsdf) * cached;
             alive = false;
         }
+    }
+    if (any(added != 0.0))
+    {
+        float4 gathered = asfloat(load_coherent(at + 3));
+        store_coherent(at + 3, asuint(float4(gathered.xyz + added, gathered.w)));
     }
     // The last bounce's hit scatters nothing the path estimates.
     alive = alive && opaque <= r.max_bounces + 1;
     if (!alive)
     {
-        p.set_dimension(rng.dimension);
-        store_hot(at, p);
+        store_coherent(at, uint4(0, 0, 0, hot_flags(flags, rng.dimension)));
         return;
     }
     if (update)
     {
-        UpdateVertex v = { g.position, oct_encode_snorm16(g.geometric_normal), cache_albedo(b.albedo(), g.bsdf) * p.throughput, 0 };
+        UpdateVertex v = { g.position, oct_encode_snorm16(g.geometric_normal), cache_albedo(b.albedo(), g.bsdf) * throughput, 0 };
         uint4* record = lean_record(r, slot) + UPDATE_VERTEX_AT;
         store_coherent(record, uint4(asuint(v.position), v.normal));
         store_coherent(record + 1, uint4(asuint(v.albedo), 0));
-        p.flags |= HOT_ARRIVED;
+        flags |= HOT_ARRIVED;
     }
     bool counted = lean_counted(r, scattered);
-    p.flags = counted ? p.flags | HOT_COUNTED : p.flags & ~HOT_COUNTED;
+    flags = counted ? flags | HOT_COUNTED : flags & ~HOT_COUNTED;
 
     // One light, resampled from the vertex's candidates, as a pending shadow job.
     float run = nee_probability(r.set, g);
@@ -325,28 +353,29 @@ void lean_vertex<M : IMedium, let FIRST : uint>(PathRoot r, uint slot, uint4* at
     float3 scatter_diffuse;
     bool estimates = mode.count_nee && counted && candidates > 0 && u_run < run;
     LightPick k = pick_light<FIRST>(r, b, g.position, g.normal, pixel, candidates, estimates, first, drawn, scatter_f, scatter_pdf, scatter_diffuse, rng);
+    // The blue of the job's light and its light id share a word with the ray's cone.
+    float job_blue = 0.0;
+    uint job_light = NO_LIGHT;
+    if (k.sum > 0.0)
     {
-        if (k.sum > 0.0)
+        float3 radiance = k.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(r.set, k.light, k.dir) : k.radiance;
+        float W = k.sum / (float(k.drawn) * k.target);
+        float mis = mode.one_technique ? 1.0 : mis_balance(run * k.pdf, k.scatter_pdf);
+        float3 origin = vertex_origin(x, k.dir);
+        bool far = !isfinite(k.distance);
+        float3 e = throughput * k.f * radiance * (W * mis / run);
+        // The linked medium's transmittance toward the light; the environment's map holds its own.
+        if (k.kind != LIGHT_SAMPLE_ENVIRONMENT)
+            e *= medium_transmittance<M>(r.scene.medium, origin, k.dir, k.distance);
+        if (any(e > 0.0))
         {
-            ResolvedLightSample l = k.chosen;
-            float3 radiance = l.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(r.set, l.light, l.dir) : l.radiance;
-            float W = k.sum / (float(k.drawn) * k.target);
-            float mis = mode.one_technique ? 1.0 : mis_balance(run * l.pdf, k.scatter_pdf);
-            float3 origin = vertex_origin(x, l.dir);
-            bool far = !isfinite(l.distance);
-            float3 e = p.throughput * k.f * radiance * (W * mis / run);
-            // The linked medium's transmittance toward the light; the environment's map holds its own.
-            if (l.kind != LIGHT_SAMPLE_ENVIRONMENT)
-                e *= medium_transmittance<M>(r.scene.medium, origin, l.dir, l.distance);
-            if (any(e > 0.0))
-            {
-                p.shadow_origin = origin;
-                p.shadow_target = far ? l.dir : l.point;
-                p.shadow_light = e;
-                p.light = l.kind != LIGHT_SAMPLE_DIRECTIONAL ? l.light : NO_LIGHT;
-                p.flags |= HOT_SHADOW | (far ? HOT_SHADOW_FAR : 0);
-                store_shadow(at, p);
-            }
+            // The point drawn on the light is the candidate's distance along its direction
+            // from the vertex.
+            store_coherent(at + 4, uint4(asuint(origin), asuint(e.x)));
+            store_coherent(at + 5, uint4(asuint(far ? k.dir : g.position + k.dir * k.distance), asuint(e.y)));
+            job_blue = e.z;
+            job_light = k.kind != LIGHT_SAMPLE_DIRECTIONAL ? k.light : NO_LIGHT;
+            flags |= HOT_SHADOW | (far ? HOT_SHADOW_FAR : 0);
         }
     }
 
@@ -355,31 +384,31 @@ void lean_vertex<M : IMedium, let FIRST : uint>(PathRoot r, uint slot, uint4* at
     bool goes = s.pdf > 0.0 && sides_agree(g.normal, g.geometric_normal, s.wi);
     if (goes)
     {
-        p.throughput *= s.weight;
+        throughput *= s.weight;
         if (opaque > r.roulette_depth)
         {
-            float survive = saturate(max_component(p.throughput));
+            float survive = saturate(max_component(throughput));
             goes = u_roulette < survive;
-            p.throughput /= max(survive, 1e-6);
+            throughput /= max(survive, 1e-6);
         }
-        goes = goes && carries(p.throughput);
+        goes = goes && carries(throughput);
     }
     if (goes)
     {
         bool delta = (s.lobe & LOBE_SPECULAR) != 0;
         bool diffuse = (s.lobe & LOBE_DIFFUSE) != 0;
         float roughness = g.bsdf.specular_roughness;
-        p.origin = vertex_origin(x, s.wi);
-        p.dir = s.wi;
-        p.pdf = delta ? 0.0 : s.pdf;
-        p.run = mode.count_nee ? run : 0.0;
-        p.normal = g.normal;
-        p.cone.y += delta ? 0.0 : diffuse ? 1.0 : 2.0 * roughness * roughness;
-        p.flags |= HOT_RAY;
-        p.flags = diffuse ? p.flags | HOT_DIFFUSE : p.flags & ~HOT_DIFFUSE;
+        cone.y += delta ? 0.0 : diffuse ? 1.0 : 2.0 * roughness * roughness;
+        flags |= HOT_RAY;
+        flags = diffuse ? flags | HOT_DIFFUSE : flags & ~HOT_DIFFUSE;
+        store_coherent(at, uint4(asuint(vertex_origin(x, s.wi)), hot_flags(flags, rng.dimension)));
+        store_coherent(at + 1, uint4(oct_encode_snorm16(s.wi), oct_encode_snorm16(g.normal), as_halves(throughput.xy), as_halves(float2(throughput.z, mode.count_nee ? run : 0.0))));
+        float4 gathered = asfloat(load_coherent(at + 3));
+        store_coherent(at + 3, asuint(float4(gathered.xyz, delta ? 0.0 : s.pdf)));
     }
-    p.set_dimension(rng.dimension);
-    store_hot(at, p);
+    else
+        store_coherent(at, uint4(0, 0, 0, hot_flags(flags, rng.dimension)));
+    store_coherent(at + 2, uint4(as_halves(cone), asuint(job_blue), 0, job_light));
 }
 
 // The whole vertex of a plain opaque hit `h` of `slot`'s ray, invoked with the ray's cover

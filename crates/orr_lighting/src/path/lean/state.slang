@@ -150,6 +150,18 @@ public PathHot load_hot(uint4* at)
     return p;
 }
 
+// The throughput in a path's hot word 1.
+public float3 hot_throughput(uint4 w1)
+{
+    return float3(halves(w1.z), halves(w1.w).x);
+}
+
+// `flags` with the sampler dimension `dimension`.
+public uint hot_flags(uint flags, uint dimension)
+{
+    return (flags & 0xffff) | (dimension << HOT_DIMENSION_SHIFT);
+}
+
 // Stores `p` but its shadow job's ray and the rest of its light, which `store_shadow` stores where
 // one is pending.
 public void store_hot(uint4* at, PathHot p)
