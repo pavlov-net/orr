@@ -17,10 +17,10 @@ use crate::mask_sets::Members;
 use crate::shaders::consts::{
     ANY_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE,
     PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
-    PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
+    PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS, SAMPLER_INSTRUCTIONS,
 };
 use crate::shaders::path::lean_paths;
-use crate::staged::{MAY_UPDATE, MAY_VIEW};
+use crate::staged::{MAY_LOCAL, MAY_UPDATE, MAY_VIEW};
 use crate::{Error, KernelSet, module};
 
 /// The bit of `path_may2`, in the high word, that `feature` decides.
@@ -37,6 +37,8 @@ pub enum Role {
     Hit,
     /// An any-hit shader of a candidate that is not opaque.
     AnyHit,
+    /// The callable that draws a first vertex's candidate from its local light sampler.
+    Sampler,
 }
 
 /// The most instructions the stages of a pipeline may hand the driver together.
@@ -115,6 +117,7 @@ impl Spec {
         let (base, producer) = match self.role {
             Role::Raygen => return Some(RAYGEN_INSTRUCTIONS),
             Role::Miss => return Some(MISS_INSTRUCTIONS),
+            Role::Sampler => return Some(SAMPLER_INSTRUCTIONS),
             Role::Hit => (HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS),
             Role::AnyHit => (ANY_HIT_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS),
         };
@@ -141,6 +144,8 @@ struct Table {
     misses: [u32; 2],
     /// The callable of a path's first vertex.
     first: u32,
+    /// The callable of that vertex's local light sampler, where paths may read one.
+    local: Option<u32>,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
 }
@@ -192,6 +197,8 @@ impl Table {
             Self::stage(&mut specs, folded("miss_shadow", Role::Miss)),
         ];
         let first = Self::stage(&mut specs, folded("first_vertex", Role::Hit));
+        let local = (may & MAY_LOCAL != 0)
+            .then(|| Self::stage(&mut specs, folded("local_light", Role::Sampler)));
         // `hit_surface` of the hit shaders of each pin: any id, then each id from 0 on. Where
         // no surface links every material shows id 0.
         let pinned = |entry, role, pin: u32, geometry: Geometry| Spec {
@@ -264,6 +271,7 @@ impl Table {
             raygens,
             misses,
             first,
+            local,
             hit_groups,
             groups,
         }
@@ -281,38 +289,69 @@ pub struct StageSize {
     /// The linked surface id the stage is made for; `u32::MAX` for any.
     pub hit_surface: u32,
     pub instructions: u32,
-    /// The most it may hand the driver; none for a stage made for a linked surface.
+    /// The most of orr's own code it may hand the driver; none for a stage made for a linked
+    /// surface.
     pub cap: Option<u32>,
+    /// What the kernels' linked types add to it: its size beyond the same stage of orr's
+    /// kernels with nothing linked, where a stage made for a linked surface is the standard
+    /// surface's. None for those kernels themselves.
+    pub linked: Option<i64>,
     /// Of a stage made for a linked surface, what it holds beyond the stage of its entry and
     /// geometry made for the standard surface: the surface's own code, less the standard code
     /// it replaces.
     pub own: Option<i64>,
 }
 
+/// What `spec`'s stage of `module` hands the driver: its entry folded with its constants.
+fn handed(module: &'static orr_shaders::ShaderModule, spec: &Spec) -> Result<u32, Error> {
+    let (bytes, entries) = spec.constants();
+    let stage = ShaderStage::new(
+        module,
+        spec.entry,
+        SpecData {
+            entries,
+            bytes: &bytes,
+        },
+    )?;
+    Ok(handed_instructions(
+        stage.spirv,
+        stage.entry.spirv_name,
+        stage.spec,
+    ))
+}
+
 /// What each stage of the pipeline of paths that may meet `may` hands the driver, from
-/// `kernels`: the stages' entries folded with their constants.
+/// `kernels`, and what of it is orr's own.
 pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>, Error> {
     let lean = module(kernels, &lean_paths::MODULE)?;
+    // Kernels that link a type compile the lean stages anew, with the types' code in them.
+    let own: &'static orr_shaders::ShaderModule = &lean_paths::MODULE;
+    let plain = (!std::ptr::eq(lean, own)).then_some(own);
     let mut sizes = Table::new(may, kernels)
         .specs
         .iter()
         .map(|spec| {
-            let (bytes, entries) = spec.constants();
-            let stage = ShaderStage::new(
-                lean,
-                spec.entry,
-                SpecData {
-                    entries,
-                    bytes: &bytes,
-                },
-            )?;
+            let instructions = handed(lean, spec)?;
+            let linked = plain
+                .map(|plain| {
+                    let standard = Spec {
+                        hit_surface: match spec.geometry {
+                            Some(_) => 0,
+                            None => spec.hit_surface,
+                        },
+                        ..*spec
+                    };
+                    handed(plain, &standard).map(|own| i64::from(instructions) - i64::from(own))
+                })
+                .transpose()?;
             Ok(StageSize {
                 entry: spec.entry,
                 role: spec.role,
                 geometry: spec.geometry.map_or("", Geometry::label),
                 hit_surface: spec.hit_surface,
-                instructions: handed_instructions(stage.spirv, stage.entry.spirv_name, stage.spec),
+                instructions,
                 cap: spec.cap(kernels.surfaces),
+                linked,
                 own: None,
             })
         })
@@ -331,14 +370,17 @@ pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>,
     Ok(sizes)
 }
 
-/// The first of `sizes` over its cap, or the pipeline's total, the stages made for linked
-/// surfaces among it, where that is over [`PIPELINE_CAP`].
+/// The first of `sizes` whose own code, without what linked types add to it, is over its cap,
+/// or the pipeline's total, the linked types' code among it, where that is over
+/// [`PIPELINE_CAP`].
 pub fn over_cap(sizes: &[StageSize]) -> Option<String> {
     for s in sizes {
-        if let Some(cap) = s.cap.filter(|&cap| s.instructions > cap) {
+        let own = i64::from(s.instructions) - s.linked.unwrap_or(0);
+        if let Some(cap) = s.cap.filter(|&cap| own > i64::from(cap)) {
             return Some(format!(
-                "stage {}{} hands the driver {} instructions, over its {cap} as a {:?}",
-                s.entry, s.geometry, s.instructions, s.role
+                "stage {}{} hands the driver {own} instructions of orr's own, over its {cap} as \
+                 a {:?}",
+                s.entry, s.geometry, s.role
             ));
         }
     }
@@ -374,20 +416,18 @@ impl PathPipeline {
         let name = format!("path pipeline {may:#x}");
         let sizes = path_stage_sizes(kernels, may)?;
         for s in &sizes {
-            match s.own {
-                Some(own) => log::info!(
-                    "{name}: {}{} for surface {:#x}: {} instructions, {own:+} its surface's own",
-                    s.entry,
-                    s.geometry,
+            let stage = format!("{name}: {}{}", s.entry, s.geometry);
+            match (s.own, s.linked) {
+                (Some(own), _) => log::info!(
+                    "{stage} for surface {:#x}: {} instructions, {own:+} its surface's own",
                     s.hit_surface,
                     s.instructions
                 ),
-                None => log::debug!(
-                    "{name}: {}{}: {} instructions",
-                    s.entry,
-                    s.geometry,
+                (None, Some(linked)) => log::info!(
+                    "{stage}: {} instructions, {linked:+} of the linked types",
                     s.instructions
                 ),
+                (None, None) => log::debug!("{stage}: {} instructions", s.instructions),
             }
         }
         if let Some(message) = over_cap(&sizes) {
@@ -420,7 +460,11 @@ impl PathPipeline {
             raygens: &records,
             misses: &table.misses.map(ShaderRecord::new),
             hit_groups: &table.hit_groups,
-            callables: &[Some(ShaderRecord::new(table.first))],
+            // In `raygen.slang`'s CALL_* order.
+            callables: &[
+                Some(ShaderRecord::new(table.first)),
+                table.local.map(ShaderRecord::new),
+            ],
             max_recursion: 1,
             flags: RayPipelineFlags::scene(device.caps()),
             threads,

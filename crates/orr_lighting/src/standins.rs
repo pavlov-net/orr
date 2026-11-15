@@ -45,6 +45,8 @@ pub enum Body {
     Vertex,
     /// A path's first vertex, on the G-buffer's surface: its callable.
     First,
+    /// A first vertex's draw of a candidate from its local light sampler: its callable.
+    Local,
     /// A path ray's any-hit at a non-opaque triangle.
     CoverPath,
     /// A shadow ray's any-hit at a non-opaque triangle.
@@ -56,9 +58,10 @@ pub enum Body {
 }
 
 impl Body {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Vertex,
         Self::First,
+        Self::Local,
         Self::CoverPath,
         Self::CoverShadow,
         Self::BoxMedium,
@@ -69,6 +72,7 @@ impl Body {
         match self {
             Self::Vertex => "vertex",
             Self::First => "first vertex",
+            Self::Local => "local light",
             Self::CoverPath => "cover path",
             Self::CoverShadow => "cover shadow",
             Self::BoxMedium => "box medium",
@@ -81,7 +85,7 @@ impl Body {
             Self::Vertex => ShaderKind::ClosestHit,
             Self::CoverPath | Self::CoverShadow | Self::ProxyShadow => ShaderKind::AnyHit,
             Self::BoxMedium => ShaderKind::Intersection,
-            Self::First => ShaderKind::Callable,
+            Self::First | Self::Local => ShaderKind::Callable,
         }
     }
 
@@ -89,6 +93,7 @@ impl Body {
         match self {
             Self::Vertex => "vertex_hit",
             Self::First => "first_vertex",
+            Self::Local => "local_light",
             Self::CoverPath => "cover_path_hit",
             Self::CoverShadow => "cover_shadow_hit",
             Self::BoxMedium => "box_medium_hit",

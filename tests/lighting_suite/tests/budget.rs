@@ -25,6 +25,10 @@ const OVER: &[(Body, &str)] = &[
         "the prepared BSDF and the path's state across its light candidates",
     ),
     (
+        Body::Local,
+        "the walk to a point of an emissive entry and that point's triangle",
+    ),
+    (
         Body::CoverShadow,
         "the candidate's attributes and the texture read at the mask that may meet everything",
     ),

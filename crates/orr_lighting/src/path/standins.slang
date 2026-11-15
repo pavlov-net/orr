@@ -60,7 +60,22 @@ void vertex_hit(uint3 id: SV_DispatchThreadID)
 void first_vertex(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(first_vertex);
-    lean_first<Medium>(root, id.x);
+    lean_first<Medium, NoLocalDraw>(root, id.x);
+}
+
+[shader("compute")]
+[numthreads(STAGE_GROUP, 1, 1)]
+void local_light(uint3 id: SV_DispatchThreadID)
+{
+    ORR_OMM(local_light);
+    uint4* w = lane_words(id.x);
+    LocalDraw d;
+    d.words[0] = w[0];
+    d.words[1] = w[1];
+    d.words[2] = uint4(0);
+    lean_local<Surface>(root, id.x, d);
+    w[0] = d.words[0] ^ d.words[2];
+    w[1] = d.words[1];
 }
 
 [shader("compute")]
