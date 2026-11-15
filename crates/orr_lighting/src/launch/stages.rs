@@ -12,12 +12,12 @@ use orr_scene::{HitGroups, Loading, SceneFeatures};
 
 use crate::mask_sets::Members;
 use crate::shaders::consts::{
-    AT_EXIT, AT_LAYER, AT_LEAVE, AT_SCATTER, AT_SURFACE, CALL_ARRIVE, CALL_BENT, CALL_CACHE_VERTEX,
-    CALL_DEPOSIT, CALL_EMISSION, CALL_EMITTER_VIEW, CALL_FINISH_BACKGROUND, CALL_FINISH_RECORD,
-    CALL_FINISH_VIEW, CALL_GATHER, CALL_GBUFFER, CALL_LAYERS, CALL_PROXY_MARCH, CALL_RESOLVE_GIVEN,
-    CALL_SEGMENT, CALL_SHADE, CALL_STACK_MISS, CALL_STACK_STEP, CALL_START_BACKGROUND,
-    CALL_START_FIRST_VERTEX, CALL_START_PHOTON, CALL_START_UPDATE, CALL_START_VIEW, CALL_WALK_END,
-    CALLABLES,
+    AT_EXIT, AT_LAYER, AT_LEAVE, AT_SCATTER, AT_SURFACE, CALL_BENT, CALL_CACHE_VERTEX,
+    CALL_CROSS_FOLD, CALL_DEPOSIT, CALL_EMISSION, CALL_EMITTER_VIEW, CALL_FINISH_BACKGROUND,
+    CALL_FINISH_RECORD, CALL_FINISH_VIEW, CALL_GATHER, CALL_GBUFFER, CALL_LAYERS, CALL_PROXY_MARCH,
+    CALL_RESOLVE_GIVEN, CALL_SEGMENT, CALL_STACK_MISS, CALL_STACK_STEP, CALL_START_BACKGROUND,
+    CALL_START_FIRST_VERTEX, CALL_START_PHOTON, CALL_START_UPDATE, CALL_START_VIEW, CALL_VERTEX,
+    CALL_WALK_END, CALLABLES,
 };
 use crate::shaders::path::pipeline;
 use crate::staged::{
@@ -157,16 +157,11 @@ const CALLED: [Callable; CALLABLES as usize] = [
     row(CALL_START_BACKGROUND, S, "start_background", 0, |m| m.any(MAY_BACKGROUND)),
     row(CALL_RESOLVE_GIVEN, S, "resolve_given", 0, |m| m.any(MAY_PHOTON)),
     row(CALL_EMISSION, V, "emission", 0, |m| m.any(MAY_EMISSIVE)),
-    row(CALL_ARRIVE + AT_SURFACE, V, "arrive", 0, |_| true),
-    row(CALL_ARRIVE + AT_EXIT, V, "arrive_exit", 0, |m| m.any(MAY_WALK)),
-    row(CALL_ARRIVE + AT_LEAVE, V, "arrive_leave", 0, |m| m.any(MAY_INTERIORS)),
-    row(CALL_ARRIVE + AT_SCATTER, V, "arrive_medium", MAY_RICH, |m| m.any(MAY_INTERIORS)),
-    row(CALL_ARRIVE + AT_LAYER, V, "arrive_layer", 0, |m| m.any(MAY_LAYERS)),
-    row(CALL_SHADE + AT_SURFACE, V, "shade", 0, |_| true),
-    row(CALL_SHADE + AT_EXIT, V, "shade_exit", 0, |m| m.any(MAY_WALK)),
-    row(CALL_SHADE + AT_LEAVE, V, "shade_leave", 0, |m| m.any(MAY_INTERIORS)),
-    row(CALL_SHADE + AT_SCATTER, V, "shade_medium", MAY_RICH, |m| m.any(MAY_INTERIORS)),
-    row(CALL_SHADE + AT_LAYER, V, "shade_layer", 0, |m| m.any(MAY_LAYERS)),
+    row(CALL_VERTEX + AT_SURFACE, V, "vertex", 0, |_| true),
+    row(CALL_VERTEX + AT_EXIT, V, "vertex_exit", 0, |m| m.any(MAY_WALK)),
+    row(CALL_VERTEX + AT_LEAVE, V, "vertex_leave", 0, |m| m.any(MAY_INTERIORS)),
+    row(CALL_VERTEX + AT_SCATTER, V, "vertex_medium", MAY_RICH, |m| m.any(MAY_INTERIORS)),
+    row(CALL_VERTEX + AT_LAYER, V, "vertex_layer", 0, |m| m.any(MAY_LAYERS)),
     row(CALL_GATHER, V, "gather", MAY_RICH, |m| m.any(MAY_CAUSTICS)),
     row(CALL_DEPOSIT, V, "deposit", SOURCES & !MAY_PHOTON, |m| m.any(MAY_PHOTON)),
     row(CALL_CACHE_VERTEX, V, "cache_vertex", SOURCES & !MAY_UPDATE, |m| m.any(MAY_UPDATE)),
@@ -174,7 +169,7 @@ const CALLED: [Callable; CALLABLES as usize] = [
     row(CALL_FINISH_VIEW, S, "finish_view", 0, |m| m.any(MAY_VIEW)),
     row(CALL_FINISH_RECORD, S, "finish_record", 0, |m| m.any(MAY_UPDATE | MAY_PHOTON)),
     row(CALL_FINISH_BACKGROUND, S, "finish_background", 0, |m| m.any(MAY_BACKGROUND)),
-    row(CALL_WALK_END, V, "walk_end", 0, |m| m.any(MAY_WALK | MAY_INTERIORS)),
+    row(CALL_WALK_END, V, "walk_end", 0, |m| m.any(MAY_INTERIORS)),
     row(CALL_SEGMENT, S, "segment", MAY_RICH, |m| m.any(MAY_INTERIORS)),
     row(CALL_LAYERS, S, "layers", MAY_RICH, |m| m.any(MAY_PARTICLES | MAY_LOCAL_LIGHTS)),
     row(CALL_PROXY_MARCH, S, "march_proxy", MAY_RICH, |m| m.any(MAY_PROXIES)),
@@ -183,6 +178,7 @@ const CALLED: [Callable; CALLABLES as usize] = [
     row(CALL_STACK_MISS, V, "stack_miss", MAY_RICH, |m| m.any(MAY_STACK)),
     row(CALL_EMITTER_VIEW, V, "emitter_view", 0, |m| m.any(MAY_EMISSIVE) && m.may2(SceneFeatures::COATED_EMITTERS)),
     row(CALL_START_FIRST_VERTEX, S, "start_first_vertex", 0, |m| m.all(MAY_VIEW | MAY_DEBUG)),
+    row(CALL_CROSS_FOLD, S, "cross_fold", MAY_RICH, |m| m.any(MAY_INTERIORS) && m.any(MAY_VIEW | MAY_UPDATE)),
 ];
 
 /// [`CALLED`] in the order of the table, checked to name each index once.
@@ -273,32 +269,73 @@ impl PathPipeline {
         let raygen = listed.stage(Kernel::Raygen, "paths", folded);
         let miss = listed.stage(Kernel::Raygen, "miss_path", folded);
         // `hit_surface` of the hit shaders of each pin: any id, then each id from 0 on.
-        let pinned = |pin: u32, geometry: Geometry| Constants {
-            may: may & !geometry.without(),
+        let pinned = |pin: u32, geometry: Geometry, without: u64| Constants {
+            may: may & !geometry.without() & !without,
             hit_surface: Some(if pin == 0 { u32::MAX } else { pin - 1 }),
         };
+        let producers = mask.any(may2(SceneFeatures::PRODUCERS));
+        let rich = mask.any(MAY_RICH);
+        let layers = mask.any(MAY_LAYERS);
+        let cover = Some("cover_path_hit");
         let mut hit_groups = Vec::new();
-        // Each pinned kind's groups one after another by pin, the first named in `groups`.
-        for (first, resolve, any_hit, geometry, linked) in [
+        // Each pinned kind's groups one after another by pin, the first named in `groups`: a
+        // path ray's hit shaders by what its record's material and geometry need, the opaque
+        // ones without the rich lobes where the record's material has none.
+        for (first, hit, any_hit, geometry, without, linked) in [
             (
                 &mut groups.path,
-                Some("resolve"),
-                Some("cover_path_hit"),
+                Some("vertex_hit"),
+                cover,
                 Geometry::Copies,
+                MAY_RICH,
                 true,
             ),
             (
+                &mut groups.rich_path,
+                Some("vertex_hit"),
+                cover,
+                Geometry::Copies,
+                0,
+                rich,
+            ),
+            (
+                &mut groups.layer_path,
+                Some("layer_hit"),
+                cover,
+                Geometry::Copies,
+                0,
+                layers,
+            ),
+            (
                 &mut groups.producer_path,
-                Some("resolve"),
-                Some("cover_path_hit"),
+                Some("vertex_hit"),
+                cover,
                 Geometry::Producers,
-                mask.any(may2(SceneFeatures::PRODUCERS)),
+                MAY_RICH,
+                producers,
+            ),
+            (
+                &mut groups.producer_rich_path,
+                Some("vertex_hit"),
+                cover,
+                Geometry::Producers,
+                0,
+                producers && rich,
+            ),
+            (
+                &mut groups.producer_layer_path,
+                Some("layer_hit"),
+                cover,
+                Geometry::Producers,
+                0,
+                producers && layers,
             ),
             (
                 &mut groups.strand_path,
-                Some("resolve_strand"),
+                Some("strand_hit"),
                 None,
                 Geometry::Any,
+                0,
                 mask.any(may2(SceneFeatures::STRANDS)),
             ),
             (
@@ -306,6 +343,7 @@ impl PathPipeline {
                 None,
                 Some("cover_shadow_hit"),
                 Geometry::Any,
+                0,
                 true,
             ),
         ] {
@@ -315,16 +353,19 @@ impl PathPipeline {
             *first = Some(hit_groups.len() as u32);
             for pin in 0..pins {
                 // The coverage's any-hit shaders are made for any geometry, once per pin.
-                let (c, any) = (pinned(pin, geometry), pinned(pin, Geometry::Any));
+                let (c, any) = (
+                    pinned(pin, geometry, without),
+                    pinned(pin, Geometry::Any, 0),
+                );
                 hit_groups.push(HitGroup {
-                    closest_hit: resolve.map(|e| listed.stage(Kernel::Hits, e, c)),
+                    closest_hit: hit.map(|e| listed.stage(Kernel::Hits, e, c)),
                     any_hit: any_hit.map(|e| listed.stage(Kernel::Hits, e, any)),
                     intersection: None,
                 });
             }
         }
-        // The groups held once: the medium proxies' under shadow and layer rays, what layer rays
-        // keep of particles and of light proxies, and the stack meet's closest-hit.
+        // The groups held once: the medium proxies' under shadow and layer rays, what path and
+        // layer rays keep of particles and of light proxies, and the stack meet's closest-hit.
         let medium = mask.any(MAY_PROXIES);
         for (group, closest_hit, any_hit, intersection, linked) in [
             (
@@ -333,6 +374,20 @@ impl PathPipeline {
                 Some("proxy_shadow_hit"),
                 Some("box_medium_hit"),
                 medium,
+            ),
+            (
+                &mut groups.front,
+                None,
+                Some("front_path_hit"),
+                None,
+                mask.any(MAY_PARTICLES),
+            ),
+            (
+                &mut groups.light_front,
+                None,
+                Some("front_path_light_hit"),
+                Some("box_light_hit"),
+                mask.any(MAY_LOCAL_LIGHTS),
             ),
             (
                 &mut groups.layers,

@@ -16,13 +16,20 @@ export static const bool PATH_SPECIALIZES = true;
 
 ORR_ROOT_INLINE(PathRoot);
 
-// The starts of a view's and an update's paths, and the view's finish, take the crossings the
-// raygen traced for them in their data's third word (`crossed_call`).
 [shader("callable")]
 void start_view(inout Payload p)
 {
     ORR_OMM(start_view);
-    p.words.x = launch_start_view(root, launch_slot(), p.words.z);
+    p.words.x = launch_start_view(root, launch_slot());
+}
+
+// Takes the step of the start whose crossings the raygen traced and their count, and hands the
+// step back.
+[shader("callable")]
+void cross_fold(inout Payload p)
+{
+    ORR_OMM(cross_fold);
+    p.words.x = launch_cross_fold(root, launch_slot(), p.words.x, p.words.y);
 }
 
 [shader("callable")]
@@ -36,7 +43,7 @@ void start_first_vertex(inout Payload p)
 void start_update(inout Payload p)
 {
     ORR_OMM(start_update);
-    p.words.x = launch_start_update(root, launch_slot(), p.words.z);
+    p.words.x = launch_start_update(root, launch_slot());
 }
 
 [shader("callable")]
@@ -72,7 +79,7 @@ void resolve_given(inout Payload p)
 void finish_view(inout Payload p)
 {
     ORR_OMM(finish_view);
-    p.words.x = launch_finish_view(root, launch_slot(), p.words.y, p.words.z);
+    p.words.x = launch_finish_view(root, launch_slot(), p.words.y);
 }
 
 [shader("callable")]

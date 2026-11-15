@@ -87,34 +87,55 @@ public float3 boundary_normal(SceneRoot* s, Traced h, Boundary b, float3 dir)
 // The crossings before a path's start, which its start callable asks for with STEP_CROSS
 // ---------------------------------------------------------------------------------------------
 
-// A start's or a finish's data word 2 (z): 0 on its first call; on its call once the raygen has
-// traced the crossings it asked for, CROSSINGS_TRACED and their count.
-public static const uint CROSSINGS_TRACED = 1 << 8;
-
-// Leaves in `slot`'s ray words the ray from `origin` along unit `dir` to `t_max` whose crossings a
-// start asks for.
+// Leaves in `slot`'s shadow ray words, which no shadow ray holds before the path's first vertex,
+// the ray from `origin` along unit `dir` to `t_max` whose crossings a start asks for.
 public void store_crossing_ray(PathRoot r, uint slot, float3 origin, float3 dir, float t_max)
 {
     uint4* at = hot_words(r, slot);
-    RayOrigin o = { origin, t_max };
-    RayDir d = { dir, 0 };
-    store_word(at + RAY_ORIGIN_AT, o);
-    store_word(at + RAY_DIR_AT, d);
+    ShadowOrigin o = { origin, t_max };
+    ShadowDir d = { dir, 0 };
+    store_word(at + SHADOW_ORIGIN_AT, o);
+    store_word(at + SHADOW_DIR_AT, d);
 }
 
-// Flips `interior` at each crossing the raygen traced for `slot` (`crossings`, a start's data word
-// 2), in their order.
-public void fold_crossings(PathRoot r, uint slot, uint crossings, inout Interior interior)
+// The cross fold callable's body: flips the interiors `slot`'s path started in at each of the
+// `crossings` crossings the raygen traced for its start, in their order, and stores them with
+// what the start made of them: whether the path lies in one, whether its camera ray takes an
+// interior's segment, and whether the pixel of a first vertex inside one runs. `step` is the
+// start's, which it hands back as the path goes on with it.
+public uint launch_cross_fold(PathRoot r, uint slot, uint step, uint crossings)
 {
-    uint2* at = (uint2*)scratch_words(r, slot);
-    for (uint k = 0; k < (crossings & ~CROSSINGS_TRACED); k++)
+    uint4* at = hot_words(r, slot);
+    uint2 pixel = launch_pixel(r, slot);
+    LoopThroughput t = load_word<LoopThroughput>(at + LOOP_THROUGHPUT_AT);
+    PathLoop p = empty_loop(r, pixel);
+    p.flags = t.flags;
+    ShadeState c = launch_state(LayerRay());
+    // A path that started in no interior stored none: its ray starts at its origin.
+    c.ray.start = load_word<RayOrigin>(at + RAY_ORIGIN_AT).origin;
+    load_interiors(r, slot, p, c);
+    uint2* crossed = (uint2*)scratch_words(r, slot);
+    for (uint k = 0; k < crossings; k++)
     {
-        uint2 c = load_coherent(at + k);
-        interior.cross(c.x, c.y != 0);
+        uint2 x = load_coherent(crossed + k);
+        c.interior.cross(x.x, x.y != 0);
     }
+    store_interiors(r, slot, p, c);
+    set_flag(p.flags, LOOP_CARRIED, c.interior.count > 0 && !has_froxels(r));
+    t.flags = p.flags;
+    store_word(at + LOOP_THROUGHPUT_AT, t);
+    if ((step & STEP_RAY) != 0)
+    {
+        RayDir d = load_word<RayDir>(at + RAY_DIR_AT);
+        d.word = (d.word & ~(LAUNCH_INSIDE | LAUNCH_SEGMENTED)) | (in_interior(r, p, c.interior) ? LAUNCH_INSIDE | LAUNCH_SEGMENTED : 0);
+        store_word(at + RAY_DIR_AT, d);
+    }
+    if ((step & STEP_VERTEX) != 0)
+        step = (step & ~STEP_UNSHADED) | (c.interior.count == 0 && !runs_path(r, pixel) ? STEP_UNSHADED : 0);
+    return step & ~STEP_CROSS;
 }
 
-// The surfaces of an interior that the crossing ray in `slot`'s ray words crosses, as
+// The surfaces of an interior that the crossing ray in `slot`'s shadow ray words crosses, as
 // `surface_crossings` takes them: each step meets the nearest surface past the last but presence
 // layers, up to SURFACE_CROSSINGS steps, and the walk stops at the ray's reach or a hit with no
 // geometry or material. Each crossing's material and whether the ray meets its front go to the
@@ -122,18 +143,18 @@ public void fold_crossings(PathRoot r, uint slot, uint crossings, inout Interior
 uint trace_crossings(PathRoot r, uint slot)
 {
     uint4* at = hot_words(r, slot);
-    RayOrigin o = load_word<RayOrigin>(at + RAY_ORIGIN_AT);
-    float3 dir = load_word<RayDir>(at + RAY_DIR_AT).dir;
+    ShadowOrigin o = load_word<ShadowOrigin>(at + SHADOW_ORIGIN_AT);
+    float3 dir = load_word<ShadowDir>(at + SHADOW_DIR_AT).dir;
     uint2* out = (uint2*)scratch_words(r, slot);
     uint mask = MASK_OPAQUE | MASK_DIELECTRIC;
     PathCover cover = new_path_cover(mask, COVER_LAYERS, PRESENCE_NONE, 0, hit_context(HIT_PRIMARY, 0, camera_cone(r.view), 0.0));
     uint crossed = 0;
     float along = 0.0;
-    for (uint k = 0; k < SURFACE_CROSSINGS && along < o.reach; k++)
+    for (uint k = 0; k < SURFACE_CROSSINGS && along < o.t_max; k++)
     {
         Payload p;
         p.words = path_payload(cover);
-        Traced h = boundary_trace(r.scene, path_ray(o.origin + dir * along, dir, o.reach - along), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, mask, p);
+        Traced h = boundary_trace(r.scene, path_ray(o.origin + dir * along, dir, o.t_max - along), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, mask, p);
         Boundary b = boundary_of(h);
         if (!b.triangle || b.material == MATERIAL_NONE)
             break;
@@ -148,19 +169,17 @@ uint trace_crossings(PathRoot r, uint slot)
     return crossed;
 }
 
-// Runs callable `index`, a start or a finish, with `word` in its data's second word, and again
-// with the crossings it asks for (STEP_CROSS) once they are traced: the step it hands back.
+// Runs callable `index`, a start or a finish, with `word` in its data's second word, then traces
+// the crossings it asks for (STEP_CROSS), which the cross fold takes: the step the path goes on
+// with.
 uint crossed_call(PathRoot r, uint slot, uint index, uint word)
 {
-    Payload c;
-    c.words = uint4(0, word, 0, 0);
-    call(index, c);
-    if (!may(MAY_INTERIORS) || (c.words.x & STEP_CROSS) == 0)
-        return c.words.x;
-    uint crossings = CROSSINGS_TRACED | trace_crossings(r, slot);
-    c.words = uint4(0, word, crossings, 0);
-    call(index, c);
-    return c.words.x;
+    uint step = step_call(index, word);
+    // A path that ends where it starts crosses nothing.
+    if (!may(MAY_INTERIORS) || (step & STEP_CROSS) == 0 || (step & (STEP_RAY | STEP_VERTEX)) == 0)
+        return step & ~STEP_CROSS;
+    uint crossings = trace_crossings(r, slot);
+    return data_call(CALL_CROSS_FOLD, uint4(step, crossings, 0, 0)).x;
 }
 
 // The start of `slot`'s path by its source's callable: a view's debug view of its first vertex

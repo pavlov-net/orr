@@ -55,46 +55,38 @@ bool view_pass_done(PathRoot r, uint2 pixel, PathLoop p, inout StoredView record
     return true;
 }
 
-// The second pass of a view's `pixel` from the G-buffer's surface, inside what holds it: on its
-// first call (`crossings` 0) false where the interiors around it wait on crossings `slot`'s finish
-// asks for, which its next call folds in.
-bool second_pass_start(PathRoot r, uint slot, uint crossings, uint2 pixel, out PathStart start)
+// The second pass of a view's `pixel` from the G-buffer's surface, inside what holds it, to flip
+// at the crossings `slot`'s finish asks for with the STEP_CROSS this returns.
+uint second_pass_start(PathRoot r, uint slot, uint2 pixel, out PathStart start)
 {
     PathStart camera_ray = camera_start(r, pixel);
     start = PathStart();
-    bool crossed;
+    uint cross = 0;
     if (thin_lens(r))
-        crossed = lens_crossed(r, slot, crossings, camera_ray.origin, start.interior);
+        cross = lens_crossed(r, slot, camera_ray.origin, start.interior);
     else
     {
         start = pinhole_start(r.view, r.gbuffer, pixel, true);
         start.interior = Interior(r.layers[pixel.y * r.gbuffer.extent.x + pixel.x].near_interior);
-        crossed = !isfinite(start.t_max) || start_crossed(r, slot, crossings, start.origin, start.dir, start.t_max, start.interior);
+        if (isfinite(start.t_max))
+            cross = ask_crossings(r, slot, start.origin, start.dir, start.t_max);
     }
     start.dir = camera_ray.dir;
     start.throughput = float3(1.0);
     start.mask = 0;
     start.gbuffer = true;
-    return crossed;
+    return cross;
 }
 
 // What a view does with `slot`'s finished path in pass `pass` (`view_pass_end`). A frosted
 // pixel's first pass starts the second from the G-buffer's surface, with the sampler, rays and
-// record the first left: the step it starts with, once the crossings it may ask for are traced
-// (`crossings`, data word 2), on which it runs only that start.
-public uint launch_finish_view(PathRoot r, uint slot, uint pass, uint crossings)
+// record the first left: the step it starts with.
+public uint launch_finish_view(PathRoot r, uint slot, uint pass)
 {
     uint4* at = hot_words(r, slot);
     uint2 pixel = launch_pixel(r, slot);
     LaunchRecord record = launch_record(r, slot);
     PathStart start;
-    if (may(MAY_FROST) && crossings != 0)
-    {
-        second_pass_start(r, slot, crossings, pixel, start);
-        Sampler rng = path_sampler(r, pixel);
-        rng.dimension = load_word<LoopKeep>(at + LOOP_KEEP_AT).dimension;
-        return begin_launch(r, slot, pixel, start, rng, load_word<LoopRadiance>(at + LOOP_RADIANCE_AT).rays, record);
-    }
     PathLoop p = load_path_loop(r, at, pixel);
     bool second = pass != 0;
     // The pixel's rays count both passes: the second reads the texel the first pass's shader
@@ -110,9 +102,8 @@ public uint launch_finish_view(PathRoot r, uint slot, uint pass, uint crossings)
     if (rays)
         store_texel_coherent(radiance, pixel, texel);
     store_part<StoredView, RECORD_WORDS>(record.words, view);
-    if (!second_pass_start(r, slot, 0, pixel, start))
-        return STEP_CROSS;
-    return begin_launch(r, slot, pixel, start, p.rng, p.rays, record);
+    uint cross = second_pass_start(r, slot, pixel, start);
+    return begin_launch(r, slot, pixel, start, p.rng, p.rays, record) | cross;
 }
 
 // The end of an update path, whose record adds to the cache, or of a photon, which its entry's

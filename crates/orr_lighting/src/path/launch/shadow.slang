@@ -80,17 +80,6 @@ public RayDesc launch_shadow(PathRoot r, uint slot, uint mode, out uint flags, o
     return path_ray(o.origin, d.dir, o.t_max);
 }
 
-// What a shadow ray whose any-hit shaders left `c` let through of its candidates: their product,
-// 0 where it met an opaque surface (`hit`) but past SHADOW_CANDIDATES counted ones, which the light
-// set's overflow counter counts.
-public float3 shadow_passed(PathRoot r, ShadowCover c, bool hit)
-{
-    bool overflow = c.has(SHADOW_OVERFLOW);
-    if (overflow)
-        InterlockedAdd(*r.set.shadow_overflows, 1u);
-    return hit && !overflow ? float3(0.0) : c.product;
-}
-
 // Multiplies `slot`'s shadow job's contribution by `by`.
 public void scale_shadow(PathRoot r, uint slot, float3 by)
 {

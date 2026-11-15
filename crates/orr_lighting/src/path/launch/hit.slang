@@ -54,8 +54,14 @@ public void store_path_ray<R : IPathRecord>(PathRoot r, uint4* at, inout PathLoo
         p.depth = depth;
     }
     bool stacked = stack_kept(r) && !x.photon && c.stack.valid && c.stack.crossed > 0;
+    bool segmented = false;
+    if (may(MAY_INTERIORS) && inside)
+    {
+        uint medium = c.interior.innermost();
+        segmented = any(interior_medium(r.scene, medium, c.interior.point(medium)).sigma_s > 0.0);
+    }
     flags |= ray_flags(c.ray) | (mask << LAUNCH_MASK_SHIFT) | (front << LAUNCH_FRONT_SHIFT) | (inside ? LAUNCH_INSIDE : 0)
-        | (p.opaque > r.max_bounces ? LAUNCH_LAST : 0) | (stacked ? LAUNCH_STACKED : 0);
+        | (segmented ? LAUNCH_SEGMENTED : 0) | (p.opaque > r.max_bounces ? LAUNCH_LAST : 0) | (stacked ? LAUNCH_STACKED : 0);
     RayOrigin o = { c.ray.origin, camera ? t_max : positive_infinity() };
     RayDir d = { c.ray.dir, flags };
     RayNormal n = { c.ray.normal, c.ray.pdf };
@@ -75,6 +81,9 @@ public void store_path_ray<R : IPathRecord>(PathRoot r, uint4* at, inout PathLoo
 public static const uint INVOKE_EXIT = 1 << 1;
 public static const uint INVOKE_WINDOW = 1 << 3;
 public static const uint INVOKE_ENVIRONMENT = 1 << 4;
+// The hit's shader runs the whole vertex where nothing lay in front of the hit: the ray needs no
+// segment taken before its vertex.
+public static const uint INVOKE_VERTEX = 1 << 5;
 
 // The payload a crossing of the walk of a shadow ray of flags `flags` (SHADOW_*), whose crossing
 // steps take cover word `cover`, is invoked with, inside a medium of IOR `exterior`.
@@ -83,9 +92,10 @@ public uint4 window_payload(uint cover, uint flags, float exterior)
     return uint4(cover, INVOKE_WINDOW | (has(flags, SHADOW_ENVIRONMENT) ? INVOKE_ENVIRONMENT : 0), asuint(exterior), 0);
 }
 
-// Stores in hot words `at` the cover the hit a walk of path `p` ended at is invoked with: of the
-// surface a subsurface walk leaves through where `exit`, at the depth past the vertex it started
-// from, else of the path ray's hit an interior's walk met inside.
+// Stores in hot words `at` the cover the hit a walk of path `p` may end at is invoked with, which
+// the walk's maker leaves there: of the surface a subsurface walk leaves through where `exit`, at
+// the depth past the vertex it started from, else of the path ray's hit an interior's walk met
+// inside. A walk changes neither the path's depth nor its cone.
 public void store_invoke_cover(uint4* at, PathLoop p, PathContext x, bool exit)
 {
     PathCover cover = new_path_cover(0, COVER_ALPHA, PRESENCE_NONE, 0, hit_context(HIT_SECONDARY, exit ? p.depth + 1 : p.depth, p.cone, 0.0, float2(-1.0), x.feedback));
@@ -108,22 +118,40 @@ PackedSurface pack_opaque<H : IHit>(PathRoot r, SurfaceHit sh, H h)
     return pack_hit_surface(sh.surface, h.instance_index(), uint(h.cluster_id()), h.primitive_index(), h.barycentrics(), sh.geometric_error, sh.depth_offset, flags);
 }
 
-// The closest-hit shader's body: resolves the hit `h` of `slot`'s ray, invoked with `payload`,
-// through `S` with its section material from `material`, as a layer where `class_id` is a
-// layer's, and stores it in the slot's surface words: the step of the vertex, with its class,
-// whether it is the camera ray's and whether an opaque surface emits, and in the second word the
-// ray's length to the vertex; STEP_ENDED where the hit names nothing to resolve. It reads nothing
-// of the path. A subsurface walk's exit (INVOKE_EXIT) goes to the walk part as an opaque surface,
-// solid glass too. In window mode, the thin wall's straight transmission in the first three words,
-// where it is an ideal window and else nothing, 1 where the hit names nothing.
-public uint4 launch_resolve<S : ISurfaces, H : IHit, M : ISectionMaterial>(PathRoot r, uint slot, uint4 payload, uint class_id, M material, H h)
+// What a hit's resolve makes of it before anything of the vertex is stored: where `ended`, `out`
+// is what its shader hands back, a window's transmission, STEP_ENDED for a hit that names nothing,
+// or the step of a walk's exit, whose surface went to the walk part; else the vertex's step, the
+// ray's length to it, and its surface, with a layer's words.
+public struct Resolved
 {
+    public bool ended;
+    public uint4 out;
+    public uint step;
+    public float t;
+    public PackedSurface ps;
+    public LayerWords layer;
+}
+
+// Resolves the hit `h` of `slot`'s ray, invoked with `payload`, through `S` with its section
+// material from `material`, as a vertex of class `K` (AT_LAYER for a dielectric or a presence
+// layer, else an opaque one): its step, with its class, whether it is the camera ray's and whether
+// an opaque surface emits. It reads nothing of the path. A subsurface walk's exit (INVOKE_EXIT)
+// goes to the walk part as an opaque surface, solid glass too. In window mode, the thin wall's
+// straight transmission in the first three words, where it is an ideal window and else nothing, 1
+// where the hit names nothing.
+public Resolved resolve_vertex<let K : uint, S : ISurfaces, H : IHit, M : ISectionMaterial>(PathRoot r, uint slot, uint4 payload, M material, H h)
+{
+    Resolved x;
+    x.ended = true;
+    x.out = uint4(STEP_ENDED, 0, 0, 0);
+    x.step = 0;
     PathCover c = path_cover(payload);
     uint mode = payload.y;
-    bool window = may2(MAY2_THIN_DIELECTRICS) && has(mode, INVOKE_WINDOW);
+    bool window = K == AT_LAYER && may2(MAY2_THIN_DIELECTRICS) && has(mode, INVOKE_WINDOW);
     bool first = c.context.kind == HIT_PRIMARY;
     uint2 pixel = launch_pixel(r, slot);
     float t = h.t();
+    x.t = t;
     HitContext context = c.context;
     // A crossing's surface takes a shadow ray's context, of no cone, and reports no texture
     // feedback, as its candidates' coverage did.
@@ -148,31 +176,56 @@ public uint4 launch_resolve<S : ISurfaces, H : IHit, M : ISectionMaterial>(PathR
             BsdfParams p = sh.surface.bsdf;
             through = bsdf_thin_mirror(p, exterior) ? bsdf_straight_transmission(p, sh.surface.geometric_normal, dir, exterior, has(mode, INVOKE_ENVIRONMENT)) : float3(0.0);
         }
-        return uint4(asuint(through), 0);
+        x.out = uint4(asuint(through), 0);
+        return x;
     }
     if (!sh.valid)
-        return uint4(STEP_ENDED, 0, 0, 0);
+        return x;
     if (may(MAY_WALK) && has(mode, INVOKE_EXIT))
     {
         store_part<PackedSurface, SURFACE_WORDS>(walk_words(r, slot) + EXIT_AT, pack_opaque(r, sh, h));
-        return uint4(STEP_VERTEX | (AT_EXIT << STEP_AT_SHIFT), 0, 0, 0);
+        x.out = uint4(STEP_VERTEX | (AT_EXIT << STEP_AT_SHIFT), 0, 0, 0);
+        return x;
     }
-    uint4* at = hot_words(r, slot);
-    uint step;
-    if (may(MAY_LAYERS) && (class_id == CLASS_DIELECTRIC || class_id == CLASS_PRESENCE))
+    x.ended = false;
+    if (K == AT_LAYER)
     {
         PackedLayer pl = pack_layer(r, sh, instance, cluster, h.primitive_index(), h.barycentrics(), dir, false);
-        store_part<PackedSurface, SURFACE_WORDS>(at + SURFACE_AT, pl.surface);
-        store_part<LayerWords, LAYER_WORDS>(layer_words(r, slot), pl.layer);
-        step = STEP_VERTEX | (AT_LAYER << STEP_AT_SHIFT);
+        x.ps = pl.surface;
+        x.layer = pl.layer;
+        x.step = STEP_VERTEX | (AT_LAYER << STEP_AT_SHIFT);
     }
     else
     {
-        PackedSurface ps = pack_opaque(r, sh, h);
-        store_part<PackedSurface, SURFACE_WORDS>(at + SURFACE_AT, ps);
-        step = vertex_step() | (may(MAY_EMISSIVE) && surface_emits(ps) ? STEP_EMITS : 0);
+        x.ps = pack_opaque(r, sh, h);
+        x.step = vertex_step() | (may(MAY_EMISSIVE) && surface_emits(x.ps) ? STEP_EMITS : 0);
     }
-    return uint4(step | (first ? STEP_FIRST : 0), asuint(t), 0, 0);
+    x.step |= first ? STEP_FIRST : 0;
+    return x;
+}
+
+// Stores the vertex `x` of `slot`'s ray in the slot's surface words, and a layer's in its layer
+// part, for the callables of a vertex the hit's shader does not run itself.
+public void store_resolved(PathRoot r, uint slot, Resolved x)
+{
+    store_part<PackedSurface, SURFACE_WORDS>(hot_words(r, slot) + SURFACE_AT, x.ps);
+    if (step_at(x.step) == AT_LAYER)
+        store_part<LayerWords, LAYER_WORDS>(layer_words(r, slot), x.layer);
+}
+
+// `resolve_vertex` of a hit of class `class_id`, stored: what a shader that only resolves hands
+// back, the vertex's step and in the second word the ray's length to it.
+public uint4 launch_resolve<S : ISurfaces, H : IHit, M : ISectionMaterial>(PathRoot r, uint slot, uint4 payload, uint class_id, M material, H h)
+{
+    Resolved x;
+    if (may(MAY_LAYERS) && (class_id == CLASS_DIELECTRIC || class_id == CLASS_PRESENCE))
+        x = resolve_vertex<AT_LAYER, S, H, M>(r, slot, payload, material, h);
+    else
+        x = resolve_vertex<AT_SURFACE, S, H, M>(r, slot, payload, material, h);
+    if (x.ended)
+        return x.out;
+    store_resolved(r, slot, x);
+    return uint4(x.step, asuint(x.t), 0, 0);
 }
 
 // `launch_resolve` of the hit a photon's start gave `slot`'s path, which no ray found, by the

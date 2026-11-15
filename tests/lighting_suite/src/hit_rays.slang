@@ -41,16 +41,20 @@ public struct PathOut
     public uint _pad1;
 }
 
-// What a shadow ray lets through: the product, the candidates counted, SHADOW_* flags as the
-// pipeline sets them, and the hit the AS committed.
+// With the inline handler's SHADOW_* flags: the ray counts more candidates than an inline shadow
+// trace takes (SHADOW_CANDIDATES).
+[Host] public static const uint SHADOW_DEEP = 1 << 15;
+
+// What a shadow ray lets through: the product, SHADOW_* flags as the pipeline sets them, and the
+// hit the AS committed.
 public struct ShadowOut
 {
     public float3 product;
-    public uint counted;
     public uint flags;
     public uint committed_class;       // ~0 for none
     public float committed_t;
     public uint crossed;               // the inline handler's dielectric crossings
+    public uint _pad0;
 }
 
 public struct HitRaysRoot

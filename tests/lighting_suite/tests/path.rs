@@ -4,14 +4,13 @@
 //! as lights.
 
 use lighting_suite::bed::{
-    Accumulated, Analytic, BLACK_SPHERE, BUMPY_FLOOR, Bed, CLOUD_SPHERE, COATED_EMITTER,
-    DISPERSIVE_SPHERE, EMITTER, EMITTER_FIELD, EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal,
-    FrostGuide, GLASS_SLAB, GLASS_SPHERE, GLOSSY_FLOOR, Item, MASKED_PANE, MILKY_SLAB, MIRROR,
-    NEAR, PLUME, Particle, ParticleLook, Paths, QUADRANT_EMITTER, ROUGH_SLAB, SKINNED_EMITTER, SKY,
-    SMOOTH_FLOOR, SUN, Spec, StrandRow, TILED_FLOOR, TINTED_FLOOR, TINTED_SLAB, TROUGH, WATER_BOX,
-    WHITE_FLOOR, assert_close, assert_pipeline_renders_as_staged, assert_pipeline_within_noise,
-    assert_within_noise, both, image_mean, luminance, mean_where, pixel_of, reference,
-    render_paths, surface_mean,
+    Accumulated, Analytic, BLACK_SPHERE, BUMPY_FLOOR, Bed, COATED_EMITTER, EMITTER, EMITTER_FIELD,
+    EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal, FrostGuide, GLASS_SPHERE, GLOSSY_FLOOR, Item,
+    MIRROR, NEAR, Particle, ParticleLook, Paths, QUADRANT_EMITTER, SKINNED_EMITTER, SKY,
+    SMOOTH_FLOOR, SUN, Spec, StrandRow, TILED_FLOOR, TINTED_FLOOR, TROUGH, WATER_BOX, WHITE_FLOOR,
+    assert_close, assert_pipeline_renders_as_staged, assert_pipeline_within_noise,
+    assert_within_noise, both, glass_scene, image_mean, light_bed, luminance, mean_where,
+    particle_bed, pixel_of, plane_stack_spec, plume_bed, reference, render_paths, surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
@@ -19,10 +18,6 @@ use lighting_suite::{
     assert_clean, device, pipeline, read, readback, render, require, run, texture, upload,
 };
 use orr_gpu::{Hazards, KernelSet, Stages};
-use orr_lighting::path_may::{
-    MAY_COVERAGE, MAY_DIRECTIONAL, MAY_EMISSIVE, MAY_LAYERS, MAY_STACK, MAY_SUBSURFACE, MAY_VIEW,
-    MAY_WALK,
-};
 use orr_lighting::types::LocalLights;
 use orr_lighting::{
     CausticSettings, DirectionalLight, DiscProfile, DofBackgroundPass, Light, LightId, LightSetGpu,
@@ -30,9 +25,7 @@ use orr_lighting::{
     ViewLighting,
 };
 use orr_math::{Affine3, DVec3, Mat3, Quat, Vec2, Vec3};
-use orr_scene::{
-    MediumProxy, MediumProxyId, Opacity, Projection, ProxyDensity, RendererDesc, SceneFeatures,
-};
+use orr_scene::{MediumProxy, MediumProxyId, Opacity, Projection, ProxyDensity, RendererDesc};
 
 fn paths(settings: ViewLighting) -> Paths {
     Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
@@ -143,79 +136,8 @@ fn glass_cases(run: std::ops::Range<usize>) {
     if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
         return;
     }
-    let lit = |copies: Vec<Item>, lights: Vec<Light>, eye: Vec3, target: Vec3| Spec {
-        copies: [vec![at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)], copies].concat(),
-        lights,
-        environment: Some(SKY),
-        eye,
-        target,
-        fov_y: 0.8,
-        focus: None,
-    };
-    let slabs = lit(
-        vec![
-            at(GLASS_SLAB, Mat3::IDENTITY, Vec3::new(-0.5, 0.5, 0.0)),
-            at(TINTED_SLAB, Mat3::IDENTITY, Vec3::new(0.9, 0.4, -0.6)),
-        ],
-        Vec::new(),
-        Vec3::new(0.0, 2.0, 3.5),
-        Vec3::new(0.0, 0.4, 0.0),
-    );
-    let frosted = lit(
-        vec![at(ROUGH_SLAB, Mat3::IDENTITY, Vec3::new(0.0, 0.5, 0.0))],
-        Vec::new(),
-        Vec3::new(0.0, 2.0, 3.5),
-        Vec3::new(0.0, 0.4, 0.0),
-    );
-    let lens = lit(
-        vec![at(GLASS_SPHERE, Mat3::IDENTITY, Vec3::new(0.0, 1.5, 0.0))],
-        vec![Light::Directional(SUN)],
-        Vec3::new(0.0, 3.0, 4.5),
-        Vec3::new(0.0, 0.5, 0.0),
-    );
-    let pane = lit(
-        vec![
-            at(MASKED_PANE, Mat3::IDENTITY, Vec3::new(0.0, 1.1, 0.0)),
-            at(MASKED_PANE, Mat3::IDENTITY, Vec3::new(0.0, 1.1, 0.3)),
-        ],
-        vec![Light::Directional(SUN)],
-        Vec3::new(0.5, 1.5, 3.5),
-        Vec3::new(0.0, 0.9, 0.0),
-    );
-    let prism = lit(
-        vec![at(
-            DISPERSIVE_SPHERE,
-            Mat3::IDENTITY,
-            Vec3::new(0.0, 1.0, 0.0),
-        )],
-        Vec::new(),
-        Vec3::new(0.0, 2.0, 4.0),
-        Vec3::new(0.0, 0.8, 0.0),
-    );
-    // The water box widened to 24 m, its top 4 m up.
-    let water = lit(
-        vec![
-            at(
-                WATER_BOX,
-                Mat3::from_diagonal(Vec3::new(4.0, 1.0, 4.0)),
-                Vec3::new(0.0, 1.99, 0.0),
-            ),
-            at(TINTED_SLAB, Mat3::IDENTITY, Vec3::new(0.0, 0.6, 0.0)),
-        ],
-        Vec::new(),
-        Vec3::new(0.0, 1.5, 2.0),
-        Vec3::ZERO,
-    );
-    // Scattering interiors: scatters in them, and walks where they scatter densely.
-    let milk = lit(
-        vec![
-            at(MILKY_SLAB, Mat3::IDENTITY, Vec3::new(0.0, 0.5, 0.0)),
-            at(CLOUD_SPHERE, Mat3::IDENTITY, Vec3::new(0.5, 2.3, -0.5)),
-        ],
-        Vec::new(),
-        Vec3::new(0.0, 3.0, 6.0),
-        Vec3::new(0.0, 1.0, 0.0),
-    );
+    let [slabs, frosted, lens, pane, prism, water, milk] =
+        ["slabs", "frosted", "lens", "pane", "prism", "water", "milk"].map(glass_scene);
     let realtime = ViewLighting::default();
     let thin_lens = ViewLighting {
         reference: Some(ReferenceSettings {
@@ -342,76 +264,10 @@ fn the_pipeline_renders_layers_and_media_as_the_staged_loop_does() {
         return;
     }
     let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
-    let particles = || {
-        let mut bed = Bed::with(Spec {
-            copies: vec![at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
-            lights: Vec::new(),
-            environment: Some(SKY.map(|c| c / 2000.0)),
-            eye: Vec3::new(0.0, 2.0, 4.0),
-            target: Vec3::ZERO,
-            fov_y: 0.8,
-            focus: None,
-        });
-        let stack: Vec<Particle> = (0..6)
-            .map(|k| Particle {
-                center: Vec3::new(0.1 * k as f32, 0.5 + 0.12 * k as f32, -1.0),
-                size: 0.6,
-            })
-            .collect();
-        let look = ParticleLook {
-            albedo: [0.0; 3],
-            emission: [40.0, 30.0, 20.0],
-            opacity: 0.4,
-            anisotropy: 0.0,
-        };
-        bed.set_particles(&stack, look, Opacity::Particle);
-        bed
-    };
-    let lights = || {
-        Bed::with(Spec {
-            copies: vec![at(GLOSSY_FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
-            lights: vec![
-                Light::Sphere {
-                    position: DVec3::new(-0.6, 1.2, -0.5),
-                    radius: 0.15,
-                    intensity: Vec3::splat(40.0),
-                    cone: None,
-                },
-                Light::Rect {
-                    center: DVec3::new(0.6, 1.2, -0.5),
-                    edge_x: Vec3::new(0.4, 0.0, 0.0),
-                    edge_y: Vec3::new(0.0, 0.0, 0.3),
-                    luminance: Vec3::splat(200.0),
-                },
-            ],
-            environment: None,
-            eye: Vec3::new(0.0, 1.0, 3.0),
-            target: Vec3::ZERO,
-            fov_y: 0.8,
-            focus: None,
-        })
-    };
-    let plume = || {
-        let mut bed = Bed::new(Analytic::SunAndGround);
-        let v = bed.volume(PLUME);
-        bed.set_medium_proxy(
-            MediumProxyId(0),
-            Some(MediumProxy {
-                position: DVec3::new(1.2, 0.0, -0.5),
-                rotation: Quat::from_rotation_y(0.4),
-                scale: 1.25,
-                density: v.density(v.grid("density").unwrap()),
-                extinction: Vec3::new(1.6, 1.2, 0.9),
-                albedo: Vec3::splat(0.9),
-                anisotropy: 0.5,
-            }),
-        );
-        bed
-    };
     let scenes: [(&str, &dyn Fn() -> Bed, f32); 3] = [
-        ("particles", &particles, 1.0),
-        ("sphere and rect lights", &lights, 1.0),
-        ("smoke plume", &plume, 1.0 / 64.0),
+        ("particles", &particle_bed, 1.0),
+        ("sphere and rect lights", &light_bed, 1.0),
+        ("smoke plume", &plume_bed, 1.0 / 64.0),
     ];
     for (what, make, pre_exposure) in scenes {
         let mut bed = make();
@@ -524,187 +380,6 @@ fn the_pipeline_renders_photons_and_the_background_layer_as_the_staged_loop_does
     let same_seed = render_paths(&mut bed, &staged, 32, 1);
     let noise = render_paths(&mut bed, &staged, 32, 2);
     assert_within_noise("the background layer", &piped, &same_seed, &noise, 1.25);
-    assert_clean();
-}
-
-/// Code of the pipeline path tracer that not every scene runs, behind `path_may` and `path_may2`
-/// bits (`bits`, the second word in the high one), and a scene whose paths run it, rendered with
-/// `settings`. Its images through two pipelines agree pixel for pixel where `pixels` holds: its
-/// lights are drawn without the light tiles, which follow the scene's frame id and so the wait
-/// for a pipeline. Else their means agree.
-struct Gate {
-    what: &'static str,
-    bits: u64,
-    bed: fn() -> Bed,
-    settings: ViewLighting,
-    pixels: bool,
-}
-
-/// The bit of `path_may2`, in the high word, that `feature` decides.
-fn may2(feature: SceneFeatures) -> u64 {
-    u64::from(!SceneFeatures(!feature.0).surface_may()) << 32
-}
-
-/// The gates [`specialized_pipelines_launch_the_paths_the_general_one_does`] covers. BSDF rays
-/// alone, and next-event estimation of a directional light alone, read no light tile.
-fn gates() -> Vec<Gate> {
-    let real_time = ViewLighting::default();
-    let bsdf_rays = ViewLighting {
-        debug_view: LightingDebugView::BsdfOnly,
-        ..real_time
-    };
-    let sun_alone = ViewLighting {
-        debug_view: LightingDebugView::NeeOnly,
-        max_bounces: 0,
-        ..real_time
-    };
-    vec![
-        Gate {
-            what: "sun and ground",
-            bits: u64::from(MAY_DIRECTIONAL),
-            bed: || {
-                dim(Bed::with(sphere_on_ground(
-                    vec![Light::Directional(SUN)],
-                    None,
-                )))
-            },
-            settings: sun_alone,
-            pixels: true,
-        },
-        Gate {
-            what: "emissive quad",
-            bits: u64::from(MAY_EMISSIVE),
-            bed: || Bed::new(Analytic::CornellBox),
-            settings: bsdf_rays,
-            pixels: true,
-        },
-        Gate {
-            what: "alpha-tested quad",
-            bits: u64::from(MAY_COVERAGE),
-            bed: || dim(Bed::new(Analytic::AlphaQuad)),
-            settings: bsdf_rays,
-            pixels: true,
-        },
-        Gate {
-            what: "subsurface walks",
-            bits: u64::from(MAY_WALK | MAY_SUBSURFACE),
-            bed: || dim(Bed::new(Analytic::SubsurfaceSlab)),
-            settings: ViewLighting {
-                max_bounces: 2,
-                ..bsdf_rays
-            },
-            pixels: true,
-        },
-        Gate {
-            what: "plane stack",
-            bits: u64::from(MAY_STACK | MAY_LAYERS),
-            bed: || dim(Bed::with(plane_stack_spec(false))),
-            settings: sun_alone,
-            pixels: true,
-        },
-        Gate {
-            what: "coated emitter",
-            bits: may2(SceneFeatures::COATED_EMITTERS),
-            bed: || dim(Bed::with(plane_stack_spec(true))),
-            settings: real_time,
-            pixels: false,
-        },
-    ]
-}
-
-/// `bed` at a pre-exposure that keeps the sunlit ground under the HDR ceiling.
-fn dim(mut bed: Bed) -> Bed {
-    bed.set_pre_exposure(1.0 / 64.0);
-    bed
-}
-
-/// A tinted slab over the floor under the sun, whose shadow the sun's light through both faces
-/// fills; with `emitter`, under a sky too, beside an emitter with a coat and fuzz.
-fn plane_stack_spec(emitter: bool) -> Spec {
-    let mut copies = vec![
-        at(FLOOR, Mat3::IDENTITY, Vec3::ZERO),
-        at(TINTED_SLAB, Mat3::IDENTITY, Vec3::new(0.0, 0.8, 0.0)),
-    ];
-    if emitter {
-        copies.push(at(
-            COATED_EMITTER,
-            Mat3::from_rotation_x(-0.6),
-            Vec3::new(-1.4, 0.9, -0.4),
-        ));
-    }
-    Spec {
-        copies,
-        lights: vec![Light::Directional(SUN)],
-        environment: emitter.then_some(SKY),
-        eye: Vec3::new(0.0, 2.0, 3.5),
-        target: Vec3::new(0.0, 0.4, 0.0),
-        fov_y: 0.8,
-        focus: None,
-    }
-}
-
-/// The largest relative difference between two images' channels. Each shader that shades a vertex
-/// prepares its BSDF, and the driver may round those copies apart in two specializations: a path
-/// can drift by its last bits, where a feature a mask left out would change its light.
-fn drift(a: &Accumulated, b: &Accumulated) -> f32 {
-    a.mean
-        .iter()
-        .zip(&b.mean)
-        .flat_map(|(a, b)| a.iter().zip(b))
-        .map(|(a, b)| {
-            if a.to_bits() == b.to_bits() {
-                return 0.0;
-            }
-            let d = (a - b).abs() / a.abs().max(b.abs()).max(f32::MIN_POSITIVE);
-            if d.is_nan() { f32::INFINITY } else { d }
-        })
-        .fold(0.0, f32::max)
-}
-
-/// The pipelines made for exactly what a scene and its settings may meet hold the code its
-/// paths run behind each gate of [`gates`]: its scene renders through them as through the
-/// pipeline that may meet everything, which with one of the gate's bits forced clear it does
-/// not, and the pipeline its view's paths ran holds the gate's bits.
-#[test]
-fn specialized_pipelines_launch_the_paths_the_general_one_does() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
-    for gate in gates() {
-        let mut paths = Paths::exactly(&KernelSet::default(), PathEntry::Pipeline, gate.settings);
-        paths.specialize = false;
-        let general = render_paths(&mut (gate.bed)(), &paths, 4, 1);
-        paths.specialize = true;
-        let mut bed = (gate.bed)();
-        let specialized = render_paths(&mut bed, &paths, 4, 1);
-        let ran = bed.view().paths_ran().expect("the paths ran");
-        let view = ran
-            .ran
-            .iter()
-            .find(|&&may| may & u64::from(MAY_VIEW) != 0)
-            .expect("a pipeline ran the view's paths");
-        assert!(
-            view & gate.bits == gate.bits,
-            "{}: the view's pipeline {view:#x} lacks {:#x}",
-            gate.what,
-            gate.bits & !view
-        );
-        if gate.pixels {
-            let drift = drift(&general, &specialized);
-            assert!(
-                drift <= 1e-3,
-                "{}: the specialized pipelines changed the image by {drift} of a channel",
-                gate.what
-            );
-        } else {
-            assert_close(
-                gate.what,
-                image_mean(&specialized),
-                image_mean(&general),
-                5e-3,
-            );
-        }
-    }
     assert_clean();
 }
 

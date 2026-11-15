@@ -46,8 +46,7 @@ void inline_paths(uint3 id: SV_DispatchThreadID)
     root.paths[id.x] = o;
 }
 
-// Shadow rays through `ShadowCandidates` in mode MODE.
-ShadowOut inline_shadow<let MODE : uint>(RayIn r)
+ShadowCandidates<Surface, NoMedium, MODE> shadow_candidates<let MODE : uint>(RayIn r)
 {
     ShadowCandidates<Surface, NoMedium, MODE> c;
     c.scene = root.scene;
@@ -60,10 +59,22 @@ ShadowOut inline_shadow<let MODE : uint>(RayIn r)
     c.exterior_ior = 1.0;
     c.crossed = 0;
     c.solid_t = positive_infinity();
+    return c;
+}
+
+// Shadow rays through `ShadowCandidates` in mode MODE, taking every candidate as a shadow ray's
+// any-hit shaders do, and whether a trace of SHADOW_CANDIDATES would have stopped short.
+ShadowOut inline_shadow<let MODE : uint>(RayIn r)
+{
+    uint flags = r.flags | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+    ShadowCandidates<Surface, NoMedium, MODE> capped = shadow_candidates<MODE>(r);
+    bool deep;
+    trace_transmittance(scene_traced(root.scene), ray_of(r), shadow_mask(r), flags, capped, SHADOW_CANDIDATES, deep);
+    ShadowCandidates<Surface, NoMedium, MODE> c = shadow_candidates<MODE>(r);
     bool overflow;
     ShadowOut o = ShadowOut();
-    o.product = trace_transmittance(scene_traced(root.scene), ray_of(r), shadow_mask(r), r.flags | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, c, SHADOW_CANDIDATES, overflow, o.committed_class, o.committed_t);
-    o.flags = (overflow ? SHADOW_OVERFLOW : 0) | (c.solid_t < positive_infinity() ? SHADOW_SOLID : 0);
+    o.product = trace_transmittance(scene_traced(root.scene), ray_of(r), shadow_mask(r), flags, c, ~0u, overflow, o.committed_class, o.committed_t);
+    o.flags = (deep ? SHADOW_DEEP : 0) | (c.solid_t < positive_infinity() ? SHADOW_SOLID : 0);
     if (c.solid_t < positive_infinity())
         o.committed_t = c.solid_t;
     o.crossed = c.crossed;

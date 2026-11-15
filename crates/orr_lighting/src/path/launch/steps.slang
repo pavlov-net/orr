@@ -25,10 +25,10 @@ import orr_lighting.specialize;
 import orr_lighting.path;
 import orr_lighting.path.common;
 
-// The pipeline's callables, in the order of its table (`orr_lighting::launch`). A vertex runs by
-// its class (AT_*): its arrival, CALL_ARRIVE + class, which ends the path there or draws its light
-// candidates, and its shade, CALL_SHADE + class, which leaves its shadow job and its next ray. The
-// raygen runs what a shade leaves an entry for in the scratch: the caustic photons' gather, a
+// The pipeline's callables, in the order of its table (`orr_lighting::launch`). A path ray's hit
+// shader runs its whole vertex; a vertex no hit shader ran, one with something in front of it or
+// along its ray, a walk's or the G-buffer's, runs by its class (AT_*) in CALL_VERTEX + class. The
+// raygen runs what a vertex leaves an entry for in the scratch: the caustic photons' gather, a
 // photon's deposit and an update path's cache vertex.
 [Host] public static const uint CALL_START_VIEW = 0;
 [Host] public static const uint CALL_START_UPDATE = 1;
@@ -36,9 +36,8 @@ import orr_lighting.path.common;
 [Host] public static const uint CALL_START_BACKGROUND = 3;
 [Host] public static const uint CALL_RESOLVE_GIVEN = 4;
 [Host] public static const uint CALL_EMISSION = 5;
-[Host] public static const uint CALL_ARRIVE = 6;        // AT_CLASSES of them, by class
-[Host] public static const uint CALL_SHADE = CALL_ARRIVE + AT_CLASSES;  // AT_CLASSES of them, by class
-[Host] public static const uint CALL_GATHER = CALL_SHADE + AT_CLASSES;
+[Host] public static const uint CALL_VERTEX = 6;        // AT_CLASSES of them, by class
+[Host] public static const uint CALL_GATHER = CALL_VERTEX + AT_CLASSES;
 [Host] public static const uint CALL_DEPOSIT = CALL_GATHER + 1;
 [Host] public static const uint CALL_CACHE_VERTEX = CALL_DEPOSIT + 1;
 [Host] public static const uint CALL_BENT = CALL_CACHE_VERTEX + 1;
@@ -54,7 +53,8 @@ import orr_lighting.path.common;
 [Host] public static const uint CALL_STACK_MISS = CALL_STACK_STEP + 1;
 [Host] public static const uint CALL_EMITTER_VIEW = CALL_STACK_MISS + 1;
 [Host] public static const uint CALL_START_FIRST_VERTEX = CALL_EMITTER_VIEW + 1;  // a view's debug view of its first vertex alone
-[Host] public static const uint CALLABLES = CALL_START_FIRST_VERTEX + 1;
+[Host] public static const uint CALL_CROSS_FOLD = CALL_START_FIRST_VERTEX + 1;
+[Host] public static const uint CALLABLES = CALL_CROSS_FOLD + 1;
 
 // What a shader hands the raygen in its payload's first word.
 public static const uint STEP_RAY = 1 << 0;      // the path has a ray to trace
@@ -63,11 +63,11 @@ public static const uint STEP_EMITS = 1 << 2;    // whose emission toward the pa
 public static const uint STEP_SHADOW = 1 << 3;   // the vertex's shade left a shadow job
 public static const uint STEP_ENDED = 1 << 4;    // the path ended: its finish runs
 public static const uint STEP_DONE = 1 << 5;     // nothing of the path is left to run: no finish follows
-// A start or a finish asks for the surfaces of an interior that the ray it left in the slot's ray
-// words crosses (`launch/boundary.slang`), before it runs again.
+// A start, or a finish that starts a pass, left in the slot's shadow ray words a ray whose
+// crossings of interiors' surfaces the path's interiors take before it goes on
+// (`launch/boundary.slang`).
 public static const uint STEP_CROSS = 1 << 6;
 public static const uint STEP_WALK = 1 << 7;     // the path walks from its walk part
-public static const uint STEP_INVOKE = 1 << 8;   // the walk's last step met a surface whose hit shader goes on
 public static const uint STEP_GIVEN = 1 << 9;    // the path starts on the hit its surface words give, once its shadow ray has passed
 // The path starts on a sky pixel: the miss shader runs on the camera ray its ray words hold.
 public static const uint STEP_SKY = 1 << 10;
@@ -75,7 +75,7 @@ public static const uint STEP_SKY = 1 << 10;
 // the slot's shadow ray.
 public static const uint STEP_PROBE = 1 << 11;
 // From STEP_AT_SHIFT, with STEP_VERTEX, the class of the vertex (AT_*), which selects its
-// callables, CALL_ARRIVE + class and CALL_SHADE + class.
+// callable, CALL_VERTEX + class.
 public static const uint STEP_AT_SHIFT = 12;
 [Host] public static const uint AT_SURFACE = 0;         // an opaque vertex, its surface words a `PackedSurface`
 [Host] public static const uint AT_EXIT = 1;            // a subsurface walk's exit
@@ -83,7 +83,7 @@ public static const uint STEP_AT_SHIFT = 12;
 [Host] public static const uint AT_SCATTER = 3;         // a scatter in an interior's medium, its surface words a `MediumVertex`
 [Host] public static const uint AT_LAYER = 4;           // a dielectric or presence layer, its words a `PackedLayer`
 [Host] public static const uint AT_CLASSES = 5;
-static const uint STEP_AT_MASK = 7;
+public static const uint STEP_AT_MASK = 7;
 
 // How the path reached the vertex a step names, which the raygen hands its shaders: the vertex
 // is the path's first; it is the G-buffer's surface, which its start reached and counted; a
@@ -93,6 +93,9 @@ public static const uint STEP_FIRST = 1 << 16;
 public static const uint STEP_GBUFFER = 1 << 17;
 public static const uint STEP_CAPPED = 1 << 18;
 public static const uint STEP_UNSHADED = 1 << 19;
+// A hit's shader ran its whole vertex: the step is its shade's, with the vertex's class and
+// STEP_FIRST.
+public static const uint STEP_SHADED = 1 << 23;
 // What a vertex's shade leaves in the scratch for the raygen to run after it: the entry of the
 // caustic photons' gather, of a photon's deposit, of an update path's cache vertex.
 public static const uint STEP_GATHER = 1 << 20;

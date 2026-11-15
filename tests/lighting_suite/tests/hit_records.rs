@@ -13,7 +13,7 @@ use lighting_suite::bed::{
 use lighting_suite::shaders::consts::{
     CLASS_DIELECTRIC, COVER_ALPHA, COVER_LAYERS, COVER_STACK, MASK_DIELECTRIC, MASK_MEDIUM,
     MASK_OPAQUE, MASK_PARTICLE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, SHADOW_CROSSES,
-    SHADOW_OVERFLOW, SHADOW_PATH, SHADOW_PHOTON, SHADOW_SOLID, SHADOW_UNBENT,
+    SHADOW_DEEP, SHADOW_PATH, SHADOW_PHOTON, SHADOW_SOLID, SHADOW_UNBENT,
 };
 use lighting_suite::shaders::types::{HitRaysRoot, PathOut, RayIn, ShadowOut};
 use lighting_suite::shaders::{hit_inline, hit_records};
@@ -251,7 +251,8 @@ struct Seen {
     hits: usize,
     normals: usize,
     hit_classes: [usize; 6],
-    overflows: usize,
+    /// Shadow rays past the candidates an inline shadow trace takes.
+    deep: usize,
     solid: usize,
     crossed: usize,
     products: usize,
@@ -303,11 +304,6 @@ fn compare(rays: &[RayIn], [inline, piped]: &[Traced; 2]) -> Seen {
         }
         let (a, b) = (&inline.shadows[i], &piped.shadows[i]);
         let what = format!("shadow ray {i} {r:?}: inline {a:?}, pipeline {b:?}");
-        assert_eq!(
-            a.flags & SHADOW_OVERFLOW,
-            b.flags & SHADOW_OVERFLOW,
-            "{what}"
-        );
         assert_eq!(a.flags & SHADOW_SOLID, b.flags & SHADOW_SOLID, "{what}");
         assert_eq!(a.committed_class, b.committed_class, "{what}");
         if a.committed_class != u32::MAX || a.flags & SHADOW_SOLID != 0 {
@@ -321,7 +317,7 @@ fn compare(rays: &[RayIn], [inline, piped]: &[Traced; 2]) -> Seen {
         if r.mode == SHADOW_PHOTON {
             assert!(!crosses, "{what}");
         }
-        seen.overflows += usize::from(a.flags & SHADOW_OVERFLOW != 0);
+        seen.deep += usize::from(a.flags & SHADOW_DEEP != 0);
         seen.solid += usize::from(a.flags & SHADOW_SOLID != 0);
         seen.crossed += usize::from(crosses);
         if crosses && r.mode == SHADOW_PATH {
@@ -347,8 +343,9 @@ fn item(model: &'static str, at: Vec3, linear: Mat3) -> Item {
 /// Path and shadow rays through the scene's hit records find what the inline handlers find:
 /// the same closest hit of every policy and mask, with the record's class the trace's and, on
 /// copies placed turned, the boundary step's material and geometric normal `hit_geometry`'s; and the
-/// same shadow product, overflow past `SHADOW_CANDIDATES`, solid glass and committed hit, with
-/// what the inline handling bends left to the raygen's walk. On opaque, alpha-tested (with and
+/// same shadow product of every candidate, past the `SHADOW_CANDIDATES` an inline shadow trace
+/// stops at too, solid glass and committed hit, with what the inline handling bends left to the
+/// raygen's walk. On opaque, alpha-tested (with and
 /// without micromaps), presence, solid and thin dielectric and mixed-class copies, a stack of
 /// presence layers deeper than the candidate cap, particles and a medium proxy.
 #[test]
@@ -449,7 +446,7 @@ fn rays_through_the_hit_records_meet_what_inline_traces_meet() {
         "{seen:?}"
     );
     assert!(
-        seen.overflows > 100 && seen.solid > 100 && seen.crossed > 100 && seen.products > 1000,
+        seen.deep > 100 && seen.solid > 100 && seen.crossed > 100 && seen.products > 1000,
         "{seen:?}"
     );
     assert_clean();

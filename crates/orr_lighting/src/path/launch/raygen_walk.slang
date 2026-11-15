@@ -29,19 +29,36 @@ import orr_lighting.path.launch.walk;
 import orr_lighting.path.launch.boundary;
 import orr_lighting.path.launch.hit;
 
+// The step `slot`'s path goes on with past its walk, which ended as `kind` (WALK_*) after `rays`
+// rays, an interior's where `interior`; `resolved` is the step of the shader of the surface it
+// ended on (WALK_BOUNDARY), which ran. A subsurface walk goes on at its exit, the surface it met
+// or, at its cap, the one it entered, whose arrival takes the walk's end. An interior's walk end
+// takes the path to the hit its last step met or to its way out.
+uint walk_ended(PathRoot r, uint slot, uint kind, uint rays, bool interior, uint resolved)
+{
+    if (may(MAY_DEBUG))
+        count_rays(hot_words(r, slot), rays);
+    if (kind == WALK_NONE || (kind == WALK_BOUNDARY && (resolved & STEP_ENDED) != 0))
+        return STEP_ENDED;
+    if (may(MAY_INTERIORS) && interior)
+        return (step_call(CALL_WALK_END) & STEP_ENDED) != 0 ? STEP_ENDED : kind == WALK_BOUNDARY ? resolved : STEP_VERTEX | (AT_LEAVE << STEP_AT_SHIFT);
+    return kind == WALK_BOUNDARY ? resolved : STEP_VERTEX | (AT_EXIT << STEP_AT_SHIFT) | STEP_CAPPED;
+}
+
 // Runs the walk of `slot`'s path from its walk part to its end, and returns the step the path
 // goes on with there. Its steps are boundary steps traced here, a ray each. What a step changes
 // stays in registers across its trace, and what it only reads is loaded again past it; after every
 // WALK_POINT_STEPS steps the changing words are stored, and the thread reorders by whether it
-// still walks. Where its last step met a surface the hit's shader resolved, the length it gave the
-// step in `t`.
+// still walks. Where its last step met a surface, the surface's shader runs at once, as the
+// walk's exit or as the hit of an interior's walk, with the cover the walk's maker left in the ray
+// words (`store_invoke_cover`): the length it gave the step in `t`.
 public uint walk_path(PathRoot r, uint slot, out float t)
 {
     t = 0.0;
     uint4* at = walk_words(r, slot);
     bool share = (r.dielectric_flags & DIELECTRIC_REFERENCE) == 0;
     WalkMoving m = load_walk_moving(at);
-    bool interior = (m.kind & LAUNCH_WALK_INTERIOR) != 0;
+    bool interior = may(MAY_INTERIORS) && (m.kind & LAUNCH_WALK_INTERIOR) != 0;
     uint mask = interior ? MASK_OPAQUE | MASK_DIELECTRIC : MASK_OPAQUE;
     for (;;)
     {
@@ -73,16 +90,17 @@ public uint walk_path(PathRoot r, uint slot, out float t)
             if (walk_met(e, d, b.t, met))
                 continue;
             store_walk_moving(at, e, m.kind, m.rays);
-            uint step = step_call(CALL_WALK_END);
-            if ((step & STEP_INVOKE) != 0)
+            uint ended = e.kind;
+            uint rays = m.rays;
+            uint resolved = 0;
+            if (ended == WALK_BOUNDARY)
             {
-                h.reorder();
-                p.words = walk_invoke_payload(r, slot, !interior || !interiors_tracked(r));
-                h.invoke(p);
-                step = p.words.x;
+                p.words = walk_invoke_payload(r, slot, !interior);
+                reorder_invoke(h, p);
+                resolved = p.words.x;
                 t = asfloat(p.words.y);
             }
-            return step;
+            return walk_ended(r, slot, ended, rays, interior, resolved);
         }
         if (e.kind == WALK_RUNNING)
             walk_capped(e, r.subsurface_table, r.sss_max_steps, share);
@@ -91,7 +109,7 @@ public uint walk_path(PathRoot r, uint slot, out float t)
         bool running = e.kind == WALK_RUNNING;
         reorder(running ? 1u : 0u, 1);
         if (!running)
-            return step_call(CALL_WALK_END);
+            return walk_ended(r, slot, e.kind, m.rays, interior, 0);
     }
     return STEP_ENDED;
 }

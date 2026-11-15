@@ -197,42 +197,45 @@ public float3 bent_added<F : IScatter>(BentDraw b, F f, StackLight stack, float3
 }
 
 // A light candidate a vertex's arrival leaves in the scratch, CANDIDATE_WORDS words: `ResolvedLightSample`
-// with the number its resampling draws.
+// with the number its resampling draws, but its point, which lies its distance along its
+// direction from the vertex.
 public struct LightCandidate
 {
     public float3 dir;
     public float pdf;
     public float3 radiance;
     public float distance;
-    public float3 point;
     public uint light;
-    public uint kind;                       // LIGHT_SAMPLE_*, and CANDIDATE_VIEW
     public uint position;
-    public uint triangle;
+    public uint word;                       // LIGHT_SAMPLE_*, CANDIDATE_VIEW, and the triangle from CANDIDATE_TRIANGLE_SHIFT
     public float u;
 }
 
-static const uint CANDIDATE_VIEW = 1 << 8;
+static const uint CANDIDATE_KIND_MASK = 0xf;
+static const uint CANDIDATE_VIEW = 1 << 4;
+static const uint CANDIDATE_TRIANGLE_SHIFT = 8;
 
 LightCandidate light_candidate_of(ResolvedLightSample c, float u)
 {
-    LightCandidate k = { c.dir, c.pdf, c.radiance, c.distance, c.point, c.light, c.kind | (c.view ? CANDIDATE_VIEW : 0), c.position, c.triangle, u };
+    LightCandidate k = { c.dir, c.pdf, c.radiance, c.distance, c.light, c.position, c.kind | (c.view ? CANDIDATE_VIEW : 0) | (c.triangle << CANDIDATE_TRIANGLE_SHIFT), u };
     return k;
 }
 
-ResolvedLightSample light_sample_of(LightCandidate k)
+// Candidate `k` as the vertex at `x`, which drew it, sees it.
+ResolvedLightSample light_sample_of(LightCandidate k, float3 x)
 {
     ResolvedLightSample c = no_candidate();
     c.dir = k.dir;
     c.distance = k.distance;
     c.radiance = k.radiance;
     c.pdf = k.pdf;
-    c.kind = k.kind & ~CANDIDATE_VIEW;
+    c.kind = k.word & CANDIDATE_KIND_MASK;
     c.light = k.light;
     c.position = k.position;
-    c.triangle = k.triangle;
-    c.view = (k.kind & CANDIDATE_VIEW) != 0;
-    c.point = k.point;
+    c.triangle = k.word >> CANDIDATE_TRIANGLE_SHIFT;
+    c.view = (k.word & CANDIDATE_VIEW) != 0;
+    if (isfinite(k.distance))
+        c.point = x + k.dir * k.distance;
     return c;
 }
 
@@ -306,7 +309,7 @@ public Weighed weigh_candidates<F : IScatter>(PathRoot r, uint slot, F f, uint d
     for (uint i = 0; i < drawn; i++)
     {
         LightCandidate k = load_part<LightCandidate, CANDIDATE_WORDS>(candidate_words(r, slot, i));
-        if (!(k.pdf > 0.0) || (no_environment && (k.kind & ~CANDIDATE_VIEW) == LIGHT_SAMPLE_ENVIRONMENT))
+        if (!(k.pdf > 0.0) || (no_environment && (k.word & CANDIDATE_KIND_MASK) == LIGHT_SAMPLE_ENVIRONMENT))
             continue;
         float scatter_pdf;
         float3 dc;
@@ -337,7 +340,7 @@ public NeeDraw winner_draw(PathRoot r, uint slot, PathVertex x, Weighed w, uint 
     NeeDraw d = NeeDraw();
     if (!w.any)
         return d;
-    ResolvedLightSample chosen = light_sample_of(load_part<LightCandidate, CANDIDATE_WORDS>(candidate_words(r, slot, w.index)));
+    ResolvedLightSample chosen = light_sample_of(load_part<LightCandidate, CANDIDATE_WORDS>(candidate_words(r, slot, w.index)), x.surface.position);
     float3 dir = chosen.dir;
     float3 l = chosen.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(r.set, chosen.light, dir) : chosen.radiance;
     float3 fe = w.f;

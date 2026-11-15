@@ -62,12 +62,11 @@ void pipeline_shadows()
     Traced h = trace_hit(root.scene.tlas, r.flags | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, shadow_mask(r), RAY_TYPE_SHADOW, RAY_TYPES, 0, ray_of(r), p);
     c = ShadowCover.of_words(p.words);
     ShadowOut o = ShadowOut();
-    o.counted = c.counted();
-    o.flags = c.word & (SHADOW_OVERFLOW | SHADOW_ENDED | SHADOW_SOLID | SHADOW_CROSSES | SHADOW_VOLUME);
+    o.flags = c.word & (SHADOW_ENDED | SHADOW_SOLID | SHADOW_CROSSES | SHADOW_VOLUME);
     o.product = c.product;
     o.committed_class = ~0u;
     o.committed_t = positive_infinity();
-    if (h.hit() && !c.has(SHADOW_OVERFLOW))
+    if (h.hit())
         o.product = float3(0.0);
     if (h.hit() && !c.has(SHADOW_ENDED))
     {

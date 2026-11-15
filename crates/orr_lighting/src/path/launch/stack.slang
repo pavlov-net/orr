@@ -55,10 +55,11 @@ public RayDesc launch_probe_ray(PathRoot r, uint slot, float committed, out uint
     return launch_stack_ray(r, slot, committed * (1.0 + 1e-4) + T_MIN_BASE, payload);
 }
 
-// Keeps what stack ray `ray` of `slot`'s path met, `t` m along it: the instance, cluster,
-// triangle and barycentrics of a hit of class `class_id` where `hit`, a triangle where `triangle`.
-// The leg along it, the slot's shadow ray, ends there, short of it by its rounding.
-public void keep_stack_hit(PathRoot r, uint slot, bool hit, bool triangle, uint class_id, float t, uint instance, int cluster, uint primitive, float2 bary, RayDesc ray)
+// Keeps what the stack ray of `slot`'s path from `origin` along `dir` met, `t` m along it: the
+// instance, cluster, triangle and barycentrics of a hit of class `class_id` where `hit`, a
+// triangle where `triangle`. The leg along it, the slot's shadow ray, ends there, short of it by
+// its rounding.
+public void keep_stack_hit(PathRoot r, uint slot, bool hit, bool triangle, uint class_id, float t, uint instance, int cluster, uint primitive, float2 bary, float3 origin, float3 dir)
 {
     uint4* at = hot_words(r, slot);
     StackHit h = { t, instance, cluster, primitive, bary, class_id, (hit ? STACK_HIT_MET : 0) | (triangle ? STACK_HIT_TRIANGLE : 0) };
@@ -66,7 +67,7 @@ public void keep_stack_hit(PathRoot r, uint slot, bool hit, bool triangle, uint 
     float leg = positive_infinity();
     if (hit)
     {
-        float3 p = ray.Origin + ray.Direction * t;
+        float3 p = origin + dir * t;
         float magnitude = max(abs(p.x), max(abs(p.y), abs(p.z)));
         leg = max(0.0, t - max(1e-4 * t, magnitude * F32_PRECISION));
     }

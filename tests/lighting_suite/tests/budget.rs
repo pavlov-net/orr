@@ -21,20 +21,16 @@ const OVER: &[(Body, &str)] = &[
         "the standard surface's evaluation, and its decals with every path_may2 bit",
     ),
     (
+        Body::Vertex,
+        "the surface's evaluation, then the path with the BSDF across its light candidates",
+    ),
+    (
+        Body::VertexLayer,
+        "the surface's evaluation, then the path with the BSDF across its light candidates",
+    ),
+    (
         Body::Emission,
         "the emitter's triangle, rebuilt for the light set's density at the hit",
-    ),
-    (
-        Body::Arrive,
-        "an emissive candidate's surface emission and coverage",
-    ),
-    (
-        Body::Shade,
-        "the BSDF's preparation, its evaluation toward each light candidate and its sampling",
-    ),
-    (
-        Body::ShadeLayer,
-        "the BSDF's preparation, its evaluation toward each light candidate and its sampling",
     ),
     (
         Body::CoverPath,

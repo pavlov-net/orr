@@ -96,65 +96,60 @@ public uint begin_launch(PathRoot r, uint slot, uint2 pixel, PathStart start, Sa
     return reach_gbuffer(r, at, p, record, pixel, true);
 }
 
-// Folds into `interior` the crossings of the ray from `origin` along unit `dir` to `t_max` that the
-// raygen traced for `slot`'s start (`crossings`, its data word 2). False on the start's first call,
-// which leaves the ray for them. A root that tracks no interiors has no surface to cross.
-public bool start_crossed(PathRoot r, uint slot, uint crossings, float3 origin, float3 dir, float t_max, inout Interior interior)
+// Asks for the crossings of the ray from `origin` along unit `dir` to `t_max`, which the interiors
+// `slot`'s path starts in take once the raygen has traced them: STEP_CROSS for its start's step. A
+// root that tracks no interiors has no surface to cross.
+public uint ask_crossings(PathRoot r, uint slot, float3 origin, float3 dir, float t_max)
 {
     if (!interiors_tracked(r))
-        return true;
-    if (crossings == 0)
-    {
-        store_crossing_ray(r, slot, origin, dir, t_max);
-        return false;
-    }
-    fold_crossings(r, slot, crossings, interior);
-    return true;
+        return 0;
+    store_crossing_ray(r, slot, origin, dir, t_max);
+    return STEP_CROSS;
 }
 
 // The interiors at `origin`, a point of the lens, in `interior` (`lens_interior`): `camera_medium`,
-// flipped at each surface between the eye and it. False where `slot`'s start asks for them.
-public bool lens_crossed(PathRoot r, uint slot, uint crossings, float3 origin, out Interior interior)
+// to flip at each surface between the eye and it, which `slot`'s start asks for (STEP_CROSS).
+public uint lens_crossed(PathRoot r, uint slot, float3 origin, out Interior interior)
 {
     interior = Interior();
     if (r.camera_medium != MATERIAL_NONE)
         interior.cross(r.camera_medium, true);
     float3 eye = r.view.eye_render.xyz;
     float t = length(origin - eye);
-    return start_crossed(r, slot, crossings, eye, (origin - eye) / t, t, interior);
+    return ask_crossings(r, slot, eye, (origin - eye) / t, t);
 }
 
 // The interiors around `pixel`'s G-buffer surface, which its `pinhole_start` ray `start` reaches, in
 // `start.interior` (`gbuffer_interior`): on a tile the layer guides traced, those at its near-plane
-// point flipped at each surface the ray crosses before it; elsewhere none. False where `slot`'s
-// start asks for the crossings.
-bool gbuffer_crossed(PathRoot r, uint slot, uint crossings, uint2 pixel, inout PathStart start)
+// point, to flip at each surface the ray crosses before it, which `slot`'s start asks for
+// (STEP_CROSS); elsewhere none.
+uint gbuffer_crossed(PathRoot r, uint slot, uint2 pixel, inout PathStart start)
 {
     start.interior = Interior();
     LayerGuide* layers = r.layers;
     uint2 extent = r.gbuffer.extent;
     if (layers == nullptr || traced_tiles(layers, extent)[layer_tile(extent, pixel)] == 0)
-        return true;
+        return 0;
     start.interior = Interior(layers[pixel.y * extent.x + pixel.x].near_interior);
     if (!isfinite(start.t_max))
-        return true;
-    return start_crossed(r, slot, crossings, start.origin, start.dir, start.t_max, start.interior);
+        return 0;
+    return ask_crossings(r, slot, start.origin, start.dir, start.t_max);
 }
 
-// The start of a view's path of the slice's `slot`th pixel (`view_start`), its crossings
-// `crossings` (data word 2): through the thin lens, inside the interiors at its point of the lens;
-// on a tile the layer guides traced, a camera ray that looks for layers before the G-buffer's
-// surface, inside the interiors at its near-plane point; else from the G-buffer's surface.
-public uint launch_start_view(PathRoot r, uint slot, uint crossings)
+// The start of a view's path of the slice's `slot`th pixel (`view_start`): through the thin lens,
+// inside the interiors at its point of the lens; on a tile the layer guides traced, a camera ray
+// that looks for layers before the G-buffer's surface, inside the interiors at its near-plane
+// point; else from the G-buffer's surface.
+public uint launch_start_view(PathRoot r, uint slot)
 {
     uint2 pixel = launch_pixel(r, slot);
     Sampler rng = path_sampler(r, pixel);
     PathStart start;
+    uint cross = 0;
     if (thin_lens(r))
     {
         start = lens_start(r, pixel, r.aperture_radius, r.focus_distance, 0.0, MASK_OPAQUE | MASK_DIELECTRIC, rng);
-        if (!lens_crossed(r, slot, crossings, start.origin, start.interior))
-            return STEP_CROSS;
+        cross = lens_crossed(r, slot, start.origin, start.interior);
     }
     else
     {
@@ -165,7 +160,7 @@ public uint launch_start_view(PathRoot r, uint slot, uint crossings)
     }
     LaunchRecord record = launch_record(r, slot);
     store_part<StoredView, RECORD_WORDS>(record.words, view_record_start(r, pixel));
-    return begin_launch(r, slot, pixel, start, rng, 0, record);
+    return begin_launch(r, slot, pixel, start, rng, 0, record) | cross;
 }
 
 // A view's debug view of the first vertex alone of the slice's `slot`th pixel, which it writes.
@@ -177,19 +172,18 @@ public uint launch_start_first_vertex<S : ISurfaces>(PathRoot r, uint slot)
     return STEP_DONE;
 }
 
-// The update path of the slice's `slot`th block (`update_path_start`), its crossings `crossings`:
-// from its G-buffer surface, inside the interiors around it.
-public uint launch_start_update(PathRoot r, uint slot, uint crossings)
+// The update path of the slice's `slot`th block (`update_path_start`): from its G-buffer surface,
+// inside the interiors around it.
+public uint launch_start_update(PathRoot r, uint slot)
 {
     uint2 pixel = launch_pixel(r, slot);
     if (any(pixel >= r.gbuffer.extent))
         return STEP_DONE;
     PathStart start = pinhole_start(r.view, r.gbuffer, pixel, false);
-    if (!gbuffer_crossed(r, slot, crossings, pixel, start))
-        return STEP_CROSS;
+    uint cross = gbuffer_crossed(r, slot, pixel, start);
     LaunchRecord record = launch_record(r, slot);
     store_part<CacheUpdate, UPDATE_RECORD_WORDS>(record.words, CacheUpdate());
-    return begin_launch(r, slot, pixel, start, path_sampler(r, pixel), 0, record);
+    return begin_launch(r, slot, pixel, start, path_sampler(r, pixel), 0, record) | cross;
 }
 // The background layer's path of the slice's `slot`th pixel (`background_path_start`).
 public uint launch_start_background(PathRoot r, uint slot)

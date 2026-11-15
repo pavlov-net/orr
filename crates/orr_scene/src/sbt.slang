@@ -23,14 +23,23 @@ import orr_scene.tables;
 [Host] public static const uint KIND_LIGHT_LAYERS = 3;
 [Host] public static const uint KIND_WALK_MEET = 4;
 [Host] public static const uint KIND_STACK_MEET = 5;
-[Host] public static const uint FIXED_KINDS = 6;
+[Host] public static const uint KIND_FRONT = 6;         // particles under path rays
+[Host] public static const uint KIND_LIGHT_FRONT = 7;   // light proxies under path rays
+[Host] public static const uint FIXED_KINDS = 8;
 // The groups it holds `pins` of after those: one for any surface id, then, where surfaces link,
 // one per pin from id 0 on.
 [Host] public static const uint KIND_PATH = 0;          // a copy's clusters
 [Host] public static const uint KIND_PRODUCER_PATH = 1; // a producer entry's clusters
 [Host] public static const uint KIND_STRAND_PATH = 2;   // a strand entry's
 [Host] public static const uint KIND_SHADOW = 3;
-[Host] public static const uint PINNED_KINDS = 4;
+// Under path rays, by what the record's shader holds: a copy's or a producer entry's clusters whose
+// material may have a coat, fuzz, thin film or subsurface (HIT_LOBED), and those that trace as a
+// dielectric or a presence layer.
+[Host] public static const uint KIND_RICH_PATH = 4;
+[Host] public static const uint KIND_LAYER_PATH = 5;
+[Host] public static const uint KIND_PRODUCER_RICH_PATH = 6;
+[Host] public static const uint KIND_PRODUCER_LAYER_PATH = 7;
+[Host] public static const uint PINNED_KINDS = 8;
 // No group: a record of zeros.
 static const uint SLOT_NONE = 0xffffffff;
 
@@ -106,7 +115,7 @@ void write_records(SceneRoot* s, uint run)
         if (run == RUN_MEDIUM)
             write_run(run, uint3(SLOT_NONE, KIND_MEDIUM_SHADOW, KIND_MEDIUM_LAYERS), proxy_data(CLASS_MEDIUM));
         else if (run == RUN_LIGHT)
-            write_run(run, uint3(SLOT_NONE, SLOT_NONE, KIND_LIGHT_LAYERS), proxy_data(CLASS_LIGHT));
+            write_run(run, uint3(KIND_LIGHT_FRONT, SLOT_NONE, KIND_LIGHT_LAYERS), proxy_data(CLASS_LIGHT));
         else
             write_run(run, uint3(KIND_WALK_MEET, KIND_STACK_MEET, SLOT_NONE), proxy_data(CLASS_OPAQUE));
         return;
@@ -131,7 +140,16 @@ void write_records(SceneRoot* s, uint run)
     }
     uint pin = material_pin(s, material);
     HitData data = hit_data(s, material, class_id, (g.word & ROW_SOLID) != 0, attributes);
-    write_run(run, uint3(pinned(path, pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), data);
+    if (path != KIND_STRAND_PATH)
+    {
+        bool producer = path == KIND_PRODUCER_PATH;
+        if (class_id == CLASS_DIELECTRIC || class_id == CLASS_PRESENCE)
+            path = producer ? KIND_PRODUCER_LAYER_PATH : KIND_LAYER_PATH;
+        else if (data.has(HIT_LOBED))
+            path = producer ? KIND_PRODUCER_RICH_PATH : KIND_RICH_PATH;
+    }
+    // A particle is no path ray's hit: its record keeps it as what lies in front of one.
+    write_run(run, uint3(class_id == CLASS_PARTICLE ? KIND_FRONT : pinned(path, pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), data);
 }
 
 // One workgroup per range of runs.

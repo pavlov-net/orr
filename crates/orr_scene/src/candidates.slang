@@ -33,6 +33,11 @@ public static const uint PRESENCE_DRAWN = 2;     // where a hashed draw from `se
 [Host] public static const uint COVER_LAYERS = 1;       // presence layers by `presence`, the rest by the alpha test: `LayerAccept`
 [Host] public static const uint COVER_STACK = 2;        // present opaque triangles and cooked solid glass: `StackAccept`
 
+// A path ray's cover word counts in bits 14-16 the candidates in front of its hit that its any-hit
+// shaders met, up to COVER_FRONT_MASK: its trace starts at 0.
+public static const uint COVER_FRONT_SHIFT = 14;
+public static const uint COVER_FRONT_MASK = 7;
+
 // What a path ray's any-hit reads of its trace, 16 bytes of payload (`path_payload`).
 public struct PathCover
 {
@@ -54,7 +59,7 @@ public PathCover new_path_cover(uint mask, uint policy, uint presence, uint seed
 public uint4 path_payload(PathCover c)
 {
     uint word = (c.mask & 0xff) | (c.policy << 8) | (c.presence << 10) | (c.context.kind << 12)
-        | (c.context.feedback ? 1u << 13 : 0u) | (min(c.context.depth, 0xffffu) << 16);
+        | (c.context.feedback ? 1u << 13 : 0u) | (min(c.context.depth, 0x7fffu) << 17);
     return uint4(word, c.seed, asuint(c.context.cone_width), asuint(c.context.cone_spread));
 }
 
@@ -67,7 +72,7 @@ public PathCover path_cover(uint4 payload)
     c.presence = (word >> 10) & 3;
     c.seed = payload.y;
     RayCone cone = { asfloat(payload.z), asfloat(payload.w) };
-    c.context = hit_context((word >> 12) & 1, word >> 16, cone, 0.0, float2(-1.0), ((word >> 13) & 1) != 0);
+    c.context = hit_context((word >> 12) & 1, word >> 17, cone, 0.0, float2(-1.0), ((word >> 13) & 1) != 0);
     return c;
 }
 
@@ -183,12 +188,11 @@ public uint proxy_any_hit(SceneRoot* s, inout uint4 payload, uint instance, floa
 [Host] public static const uint SHADOW_UNBENT = 2;
 public static const uint SHADOW_PROBE = 3;
 
-// Non-opaque candidates a shadow ray multiplies before it ends with the product so far.
-// Alpha-tested candidates do not count.
+// Non-opaque candidates an inline shadow trace multiplies before it ends with the product so far.
+// Alpha-tested candidates do not count. A shadow ray's any-hit shaders take every candidate.
 public static const uint SHADOW_CANDIDATES = 16;
 
 // `ShadowCover` flags.
-[Host] public static const uint SHADOW_OVERFLOW = 1 << 15;  // a counted candidate came past SHADOW_CANDIDATES; the product is the one before it
 public static const uint SHADOW_ENDED = 1 << 16;     // an any-hit ended the search: the hit is no opaque one the AS committed
 [Host] public static const uint SHADOW_SOLID = 1 << 17;     // a path's ray met cooked solid glass, which ends it as an opaque hit would
 [Host] public static const uint SHADOW_CROSSES = 1 << 18;   // it passed a dielectric whose crossing the raygen walks
@@ -196,7 +200,7 @@ public static const uint SHADOW_VOLUME = 1 << 19;    // it passed a medium proxy
 
 // What a shadow ray's any-hit shaders read and write, 16 bytes of payload: the product of what
 // its candidates let through, and a word of its mode (bits 0-1), its instance mask (bits 2-9),
-// the candidates it counted (bits 10-14), SHADOW_* flags (bits 15-19) and the hit context its
+// SHADOW_* flags (bits 16-19) and the hit context its
 // candidates take (`context`): whether they report texture feedback (bit 20) and the path depth
 // (from bit 21).
 public struct ShadowCover
@@ -232,38 +236,23 @@ public struct ShadowCover
         return (word >> 2) & 0xff;
     }
 
-    public uint counted()
-    {
-        return (word >> 10) & 0x1f;
-    }
-
     public bool has(uint flag)
     {
         return (word & flag) != 0;
     }
 
     // Whether the ray passed a medium proxy with a volume that a march takes, where it committed
-    // a hit where `hit`: light is left, and no opaque hit ended it before every candidate counted.
+    // a hit where `hit`: light is left, and nothing ended it.
     public bool marches(bool hit)
     {
-        return has(SHADOW_VOLUME) && any(product > 0.0) && (!hit || has(SHADOW_OVERFLOW));
+        return has(SHADOW_VOLUME) && any(product > 0.0) && !hit;
     }
 
-    // Multiplies a candidate's `transmittance` in, counted or not, ending the search past
-    // SHADOW_CANDIDATES counted candidates and where the product is 0: ANY_HIT_END or
-    // ANY_HIT_IGNORE.
+    // Multiplies a candidate's `transmittance` in, ending the search where the product is 0:
+    // ANY_HIT_END or ANY_HIT_IGNORE.
     [mutating]
-    public uint take(float3 transmittance, bool counted)
+    public uint take(float3 transmittance)
     {
-        if (counted)
-        {
-            if (this.counted() == SHADOW_CANDIDATES)
-            {
-                word |= SHADOW_OVERFLOW | SHADOW_ENDED;
-                return ANY_HIT_END;
-            }
-            word += 1 << 10;
-        }
         product *= transmittance;
         if (all(product == 0.0))
         {
@@ -397,7 +386,7 @@ public uint cover_shadow<S : ISurfaces>(SceneRoot* s, ViewConstants* v, HitConte
         t = thin_present(mode, class_id, layer, true, present, wall, counted, flags);
     }
     p.word |= flags;
-    return p.take(t, counted);
+    return p.take(t);
 }
 
 // The span of a medium proxy's box, the cube [-1, 1]^3 in its instance's object space, along the
@@ -419,5 +408,5 @@ public uint proxy_shadow(SceneRoot* s, inout ShadowCover p, uint instance_index,
     float3 t = float3(1.0);
     if (span.y > span.x && !proxy_beer(scene_proxy(s, instance_index), span.x, span.y, t))
         p.word |= SHADOW_VOLUME;
-    return p.take(t, true);
+    return p.take(t);
 }

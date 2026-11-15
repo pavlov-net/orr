@@ -125,6 +125,10 @@ public static const uint LAUNCH_FRONT_SHIFT = 16;
 public static const uint LAUNCH_INSIDE = 1 << 24;
 public static const uint LAUNCH_LAST = 1 << 25;
 public static const uint LAUNCH_STACKED = 1 << 26;
+// With LAUNCH_INSIDE: the interior's medium may scatter the ray, or a walk ran its last stretch,
+// so what lies along it is taken before its vertex's arrival, by the segment callable or the
+// walk. Without it the arrival at the surface it meets takes the interior's transmittance.
+public static const uint LAUNCH_SEGMENTED = 1 << 27;
 
 // The ray's MIS half: what weighs the light its hit finds against next-event estimation at the
 // vertex it left. A camera ray weighs nothing, and its `run` is the distance from the eye to its
@@ -217,17 +221,19 @@ public static const uint LAYER_WORDS = 2;
 [Host] public static const uint SLOT_LAYER_PART = LAYER_WORDS;
 // The interiors part (FEATURE_INTERIORS): the path's interiors (`LaunchInterior`).
 [Host] public static const uint SLOT_INTERIOR_PART = 8;
-// The stack part (FEATURE_STACK): `PathStack`, then `StackHit` and `StackWalk`, then the interiors
-// a shadow ray a stack may bend starts in, where it starts in any (BENT_INSIDE). The stack hit is
+// The stack part (FEATURE_STACK): `PathStack`, then `StackHit` and `StackWalk`. The stack hit is
 // live across a leg's segment, whose march and crossings use the scratch and the layer part.
 public static const uint PATH_STACK_WORDS = 5;
 public static const uint STACK_HIT_AT = PATH_STACK_WORDS;
 public static const uint STACK_HIT_WORDS = 2;
 public static const uint STACK_WALK_AT = STACK_HIT_AT + STACK_HIT_WORDS;
 public static const uint STACK_WALK_WORDS = 10;
-public static const uint STACK_INSIDE_AT = STACK_WALK_AT + STACK_WALK_WORDS;
+// The interiors a shadow ray a stack may bend starts in, where it starts in any (BENT_INSIDE):
+// its vertex's shade leaves them where the stack walk's begin, and the walk's first step takes
+// them from there.
+public static const uint STACK_INSIDE_AT = STACK_WALK_AT;
 public static const uint STACK_INSIDE_WORDS = 6;
-[Host] public static const uint SLOT_STACK_PART = STACK_INSIDE_AT + STACK_INSIDE_WORDS;
+[Host] public static const uint SLOT_STACK_PART = STACK_WALK_AT + STACK_WALK_WORDS;
 // The light part (FEATURE_STACK or FEATURE_COATED_EMITTERS): what a shadow ray's light takes at the
 // ray's end, a directional light's draw with the vertex that drew it (`BentDraw`) or a coated
 // emitter's sample (`LightView`).
@@ -245,7 +251,7 @@ public static const uint LAYERS_KEPT = 4;
 public static const uint FRONT_AT = 0;
 public static const uint FRONT_BOUND = FRONT_AT + 2 * LAYERS_KEPT;
 [Host] public static const uint FRONT_WORDS = FRONT_BOUND + 1;
-[Host] public static const uint CANDIDATE_WORDS = 4;
+[Host] public static const uint CANDIDATE_WORDS = 3;
 // A shade's entries: the gather's from the scratch's first word, then its record's, a photon's
 // deposit or an update path's cache vertex.
 public static const uint GATHER_WORDS = 7;
@@ -598,6 +604,14 @@ public void add_radiance(uint4* at, float3 e)
 {
     LoopRadiance l = load_word<LoopRadiance>(at + LOOP_RADIANCE_AT);
     l.radiance += e;
+    store_word(at + LOOP_RADIANCE_AT, l);
+}
+
+// Counts `rays` more rays on the path in hot words `at`.
+public void count_rays(uint4* at, uint rays)
+{
+    LoopRadiance l = load_word<LoopRadiance>(at + LOOP_RADIANCE_AT);
+    l.rays += rays;
     store_word(at + LOOP_RADIANCE_AT, l);
 }
 

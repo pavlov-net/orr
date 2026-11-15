@@ -56,37 +56,30 @@ void resolve(uint3 id: SV_DispatchThreadID)
 
 [shader("compute")]
 [numthreads(STAGE_GROUP, 1, 1)]
+void vertex_hit(uint3 id: SV_DispatchThreadID)
+{
+    ORR_OMM(vertex_hit);
+    uint4* w = lane_words(id.x);
+    HitData data = lane_data(id.x);
+    w[0] = launch_hit<AT_SURFACE, Surface, Medium, StoredHit, SectionGiven>(root, id.x, w[0], section_given(data.material), lane_hit(id.x));
+}
+
+[shader("compute")]
+[numthreads(STAGE_GROUP, 1, 1)]
+void layer_hit(uint3 id: SV_DispatchThreadID)
+{
+    ORR_OMM(layer_hit);
+    uint4* w = lane_words(id.x);
+    HitData data = lane_data(id.x);
+    w[0] = launch_hit<AT_LAYER, Surface, Medium, StoredHit, SectionGiven>(root, id.x, w[0], section_given(data.material), lane_hit(id.x));
+}
+
+[shader("compute")]
+[numthreads(STAGE_GROUP, 1, 1)]
 void emission(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(emission);
     launch_emission(root, id.x, lane_words(id.x)[0].x);
-}
-
-[shader("compute")]
-[numthreads(STAGE_GROUP, 1, 1)]
-void arrive(uint3 id: SV_DispatchThreadID)
-{
-    ORR_OMM(arrive);
-    uint4* w = lane_words(id.x);
-    w[0] = launch_arrive<AT_SURFACE, Surface, Medium>(root, id.x, w[0].x, asfloat(w[0].y));
-}
-
-[shader("compute")]
-[numthreads(STAGE_GROUP, 1, 1)]
-void shade(uint3 id: SV_DispatchThreadID)
-{
-    ORR_OMM(shade);
-    uint4* w = lane_words(id.x);
-    w[0].x = launch_shade<AT_SURFACE, Surface, Medium>(root, id.x, w[0].x, asfloat(w[0].y), w[0].z);
-}
-
-[shader("compute")]
-[numthreads(STAGE_GROUP, 1, 1)]
-void shade_layer(uint3 id: SV_DispatchThreadID)
-{
-    ORR_OMM(shade_layer);
-    uint4* w = lane_words(id.x);
-    w[0].x = launch_shade<AT_LAYER, Surface, Medium>(root, id.x, w[0].x, asfloat(w[0].y), w[0].z);
 }
 
 [shader("compute")]

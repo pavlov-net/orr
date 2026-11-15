@@ -108,12 +108,20 @@ float first_distance(VertexState v)
 }
 
 // The loop's account of the traced ray that reached `v`'s vertex, the path's first where `first`:
-// the cone past the ray, and what lies along a ray outside every interior, the linked medium and
-// the froxels (`media_segment`). A ray inside an interior took its segment before its hit's
-// shader, and the froxels hold the camera ray's.
+// the cone past the ray, and what lies along it. Inside an interior that is the interior's
+// transmittance, unless its segment was taken before the hit's shader (LAUNCH_SEGMENTED); outside
+// every interior, the linked medium and the froxels (`media_segment`), which hold the camera
+// ray's.
 void reach_traced<M : IMedium>(PathRoot r, inout VertexState v, bool first)
 {
     set_flag(v.p.flags, LOOP_CAMERA, false);
+    if (may(MAY_INTERIORS) && (v.word & (LAUNCH_INSIDE | LAUNCH_SEGMENTED)) == LAUNCH_INSIDE)
+    {
+        uint medium = v.c.interior.innermost();
+        float3 origin = load_word<RayOrigin>(v.at + RAY_ORIGIN_AT).origin;
+        float span = segment_length(v.c.ray.start, origin, v.c.ray.dir, v.t);
+        v.p.throughput *= beer(interior_medium(r.scene, medium, v.c.interior.point(medium)).sigma_t, span);
+    }
     if (first)
         return;
     v.p.cone = cone_after_hit(v.p.cone, v.t, 0.0);
@@ -152,6 +160,10 @@ interface IAt
     void scattered(PathRoot r, inout VertexState v, inout Scattered s, inout Sampler rng);
     // Whether the vertex may change the path's wavelengths.
     bool disperses();
+    // Its light toward the path, past its arrival, which found that it counts (STEP_EMITS).
+    void emit(PathRoot r, inout VertexState v, uint step);
+    // Stores its words in the slot, for what runs past a shader that held them in registers.
+    void keep(PathRoot r, VertexState v);
 }
 
 // An opaque vertex, of its packed surface.
@@ -248,11 +260,22 @@ struct AtSurface : IAt
         Walk e = subsurface_walk_from(r, v.p, v.x, ps, v.c.ray.dir, s.wi, rng, owner);
         PathCover cover = new_path_cover(MASK_OPAQUE, COVER_ALPHA, PRESENCE_NONE, 0, HitContext());
         store_part<LaunchWalk, WALK_STATE_WORDS>(walk_words(r, v.slot), new_walk(e, 0, owner, cover, v.p.depth, v.x.feedback));
+        store_invoke_cover(v.at, v.p, v.x, true);
     }
 
     bool disperses()
     {
         return false;
+    }
+
+    void emit(PathRoot r, inout VertexState v, uint step)
+    {
+        emit_surface(r, v, step, ps);
+    }
+
+    void keep(PathRoot r, VertexState v)
+    {
+        store_part<PackedSurface, SURFACE_WORDS>(v.at + SURFACE_AT, ps);
     }
 }
 
@@ -260,7 +283,8 @@ struct AtSurface : IAt
 // entered in the surface words: it scatters with the surface the walk entered unless the exit's
 // has a subsurface weight, from the entered one where the walk stopped at its cap (STEP_CAPPED),
 // along the walk's last direction (`walk_exit_vertex`), estimated with numbers hashed from the
-// seed its arrival draws.
+// seed its arrival draws. Its arrival takes the walk's end: what the walk left of the path's
+// throughput, and whether the path goes on past it.
 struct AtExit : IAt
 {
     LaunchWalk w;
@@ -302,6 +326,11 @@ struct AtExit : IAt
     [mutating]
     bool arrive<M : IMedium>(PathRoot r, inout VertexState v, inout uint out)
     {
+        Walk e = Walk();
+        e.kind = w.kind & 0xff;
+        e.throughput = w.throughput;
+        if (!subsurface_walk_ended(r, v.p, v.x, e))
+            return false;
         w.seed = asuint(v.p.rng.next());
         if (v.p.opaque > r.max_bounces + 1)
             return false;
@@ -333,6 +362,10 @@ struct AtExit : IAt
     {
         return false;
     }
+
+    void emit(PathRoot r, inout VertexState v, uint step) {}
+
+    void keep(PathRoot r, VertexState v) {}
 }
 
 // An interior's walk leaving it, from the way out its walk part holds.
@@ -386,6 +419,10 @@ struct AtLeave : IAt
     {
         return false;
     }
+
+    void emit(PathRoot r, inout VertexState v, uint step) {}
+
+    void keep(PathRoot r, VertexState v) {}
 }
 
 // A scatter in an interior's medium, of the `MediumVertex` its surface words hold.
@@ -439,6 +476,10 @@ struct AtScatter : IAt
     {
         return true;
     }
+
+    void emit(PathRoot r, inout VertexState v, uint step) {}
+
+    void keep(PathRoot r, VertexState v) {}
 }
 
 // A dielectric or presence layer, of its packed layer.
@@ -559,6 +600,14 @@ struct AtLayer : IAt
     {
         return true;
     }
+
+    void emit(PathRoot r, inout VertexState v, uint step) {}
+
+    void keep(PathRoot r, VertexState v)
+    {
+        store_part<PackedSurface, SURFACE_WORDS>(v.at + SURFACE_AT, pl.surface);
+        store_part<LayerWords, LAYER_WORDS>(layer_words(r, v.slot), pl.layer);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -673,56 +722,146 @@ void store_scattered_parts(PathRoot r, inout VertexState v, Scattered s, bool st
         keep_path_stack(r, v.slot, v.p, v.c.stack);
 }
 
-// The arrival of `slot`'s path at its vertex of class `V` (`X` a walk's exit, of vertex kind
-// `kind`), which `step` names, reached by a ray `t` m long: the loop's account of reaching it,
-// and where the path goes on and next-event estimation runs, its light candidates in the scratch.
-// Its data: STEP_ENDED where the path ends, STEP_EMITS where the raygen runs the vertex's
-// emission; the vertex's probability of running next-event estimation; and how many candidates it
-// drew.
-uint4 arrive_at<V : IAt, let X : uint, S : ISurfaces, M : IMedium>(PathRoot r, uint slot, uint step, float t, uint kind)
+// What a vertex's arrival finds: STEP_ENDED and STEP_EMITS for its step, the vertex's probability
+// of running next-event estimation, and whether it draws light candidates, from where.
+struct Arrived
 {
-    VertexState v = load_vertex_state(r, slot, step, t, V.ray_part(r));
-    V at = V.load(r, v);
-    uint out = 0;
-    float run = 0.0;
-    bool draws = false;
-    float3 position = float3(0.0);
-    float3 normal = float3(0.0);
-    if (at.arrive<M>(r, v, out))
-    {
-        ShadeVertex sv = at.vertex(r, v.c.ray.dir, step, at.prep(r, v));
-        draws = nee_runs<X>(r, v.p, v.c, v.x, kind, sv, v.p.rng, run);
-        position = sv.l.x.surface.position;
-        normal = nee_normal(sv, kind);
-    }
-    else
-        out |= STEP_ENDED;
-    // The path's state is stored before its candidates are drawn, which holds none of it: they
-    // take the sampler dimensions from here on that the loop then lies past.
-    Sampler rng = v.p.rng;
-    uint depth = v.p.depth;
-    uint2 pixel = v.f.pixel;
-    if (draws)
-        v.p.rng.dimension += candidate_dimensions(vertex_candidates(r, depth));
-    at.stored(r, v);
-    store_loop_state(v.at, v.p);
-    store_ray_cone(v.at, v.p.cone);
-    flush_loop_radiance(v.at, v.p);
-    uint drawn = 0;
-    if (draws)
-        drawn = draw_lights<S>(r, slot, position, normal, depth, pixel, rng);
-    return uint4(out, asuint(run), drawn, 0);
+    uint out;
+    float run;
+    bool draws;
+    float3 position;
+    float3 normal;
 }
 
-// The shade of `slot`'s vertex of class `V` (`X` a walk's exit, of vertex kind `kind`), which
-// `step` names, past its arrival, which ran next-event estimation with probability `run` and drew
-// `drawn` light candidates: its shadow job (STEP_SHADOW), the entries of what the raygen runs
-// after it (STEP_GATHER, STEP_DEPOSIT with STEP_PROBE, STEP_CACHE_VERTEX), and its next ray,
-// STEP_RAY, the subsurface walk that takes its place, STEP_WALK, or STEP_ENDED.
-uint shade_at<V : IAt, let X : uint, S : ISurfaces, M : IMedium>(PathRoot r, uint slot, uint step, float run, uint drawn, uint kind)
+// The loop's account of `v`'s path reaching its vertex `at` of class `V` (`X` a walk's exit, of
+// vertex kind `kind`), which `step` names.
+Arrived arrive_core<V : IAt, let X : uint, M : IMedium>(PathRoot r, inout VertexState v, inout V at, uint step, uint kind)
 {
-    VertexState v = load_vertex_state(r, slot, step, 0.0, V.ray_part(r));
+    Arrived a = { 0, 0.0, false, float3(0.0), float3(0.0) };
+    if (at.arrive<M>(r, v, a.out))
+    {
+        ShadeVertex sv = at.vertex(r, v.c.ray.dir, step, at.prep(r, v));
+        a.draws = nee_runs<X>(r, v.p, v.c, v.x, kind, sv, v.p.rng, a.run);
+        a.position = sv.l.x.surface.position;
+        a.normal = nee_normal(sv, kind);
+    }
+    else
+        a.out |= STEP_ENDED;
+    return a;
+}
+
+// A vertex of `v`'s path whole: its arrival, its emission, its light candidates, drawn with the
+// path live, and its shade, with one store of the path. A shader that resolved the vertex holds
+// it in registers (`held`): its words go to the slot only where something past the shader reads
+// them, the walk it starts or the weighing of light a plane stack bent.
+uint whole_core<V : IAt, let X : uint, S : ISurfaces, M : IMedium>(PathRoot r, uint slot, inout VertexState v, inout V at, uint step, uint kind, bool held)
+{
+    Arrived a = arrive_core<V, X, M>(r, v, at, step, kind);
+    if (may(MAY_EMISSIVE) && (a.out & STEP_EMITS) != 0)
+        at.emit(r, v, step);
+    if ((a.out & STEP_ENDED) != 0)
+    {
+        at.stored(r, v);
+        store_loop_state(v.at, v.p);
+        flush_loop_radiance(v.at, v.p);
+        return STEP_ENDED;
+    }
+    uint drawn = 0;
+    if (a.draws)
+    {
+        Sampler rng = v.p.rng;
+        v.p.rng.dimension += candidate_dimensions(vertex_candidates(r, v.p.depth));
+        drawn = draw_lights<S>(r, slot, a.position, a.normal, v.p.depth, v.f.pixel, rng);
+        // The interiors, which the arrival left as they were, are not held across the draw.
+        load_interiors(r, slot, v.p, v.c);
+    }
+    at.stored(r, v);
+    uint out = shade_core<V, X, S, M>(r, slot, v, at, step, a.run, drawn, kind);
+    if (held && ((out & STEP_WALK) != 0 || (stack_kept(r) && (out & STEP_SHADOW) != 0)))
+        at.keep(r, v);
+    return out;
+}
+
+// What a vertex's shader loads of the ray that reached the vertex `step` names, of class `V`: the
+// whole ray where the vertex may emit, for the weight of its light.
+uint whole_ray_part<V : IAt>(PathRoot r, uint step)
+{
+    return max(V.ray_part(r), may(MAY_EMISSIVE) && has(step, STEP_EMITS) ? RAY_WHOLE : RAY_DIR);
+}
+
+// The vertex callable's body: the vertex of class `V` (`X` a walk's exit, of vertex kind `kind`)
+// that `step` names, reached by a ray `t` m long, from its words in `slot`: its shadow job
+// (STEP_SHADOW), the entries of what the raygen runs after it (STEP_GATHER, STEP_DEPOSIT with
+// STEP_PROBE, STEP_CACHE_VERTEX), and its next ray, STEP_RAY, the subsurface walk that takes its
+// place, STEP_WALK, or STEP_ENDED.
+uint whole_at<V : IAt, let X : uint, S : ISurfaces, M : IMedium>(PathRoot r, uint slot, uint step, float t, uint kind)
+{
+    VertexState v = load_vertex_state(r, slot, step, t, whole_ray_part<V>(r, step));
     V at = V.load(r, v);
+    return whole_core<V, X, S, M>(r, slot, v, at, step, kind, false);
+}
+
+// `whole_at` of vertex class `K` (AT_*).
+public uint launch_vertex<let K : uint, S : ISurfaces, M : IMedium>(PathRoot r, uint slot, uint step, float t)
+{
+    if (K == AT_EXIT)
+        return whole_at<AtExit, SHADE_EXIT, S, M>(r, slot, step, t, VERTEX_OPAQUE);
+    if (K == AT_LEAVE)
+        return whole_at<AtLeave, SHADE_VERTEX, S, M>(r, slot, step, t, VERTEX_LEAVE);
+    if (K == AT_SCATTER)
+        return whole_at<AtScatter, SHADE_VERTEX, S, M>(r, slot, step, t, VERTEX_SCATTER);
+    if (K == AT_LAYER)
+        return whole_at<AtLayer, SHADE_VERTEX, S, M>(r, slot, step, t, VERTEX_LAYER);
+    return whole_at<AtSurface, SHADE_VERTEX, S, M>(r, slot, step, t, VERTEX_OPAQUE);
+}
+
+// A path ray's hit shader's body, of the class `K` its record's geometry traces as (AT_LAYER for
+// a dielectric or a presence layer, else opaque): resolves hit `h` of `slot`'s ray, invoked with
+// `payload`, through `S` with its section material from `material`, and runs the whole vertex
+// with the surface in registers, where the raygen asked (INVOKE_VERTEX) and the ray met nothing
+// in front of the hit: STEP_SHADED with the vertex's step, its class and whether it is the
+// path's first. Else it stores the vertex for the callable the raygen runs once what lay in
+// front of it is taken, and hands back what `launch_resolve` does.
+public uint4 launch_hit<let K : uint, S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>(PathRoot r, uint slot, uint4 payload, T material, H h)
+{
+    bool whole = has(payload.y, INVOKE_VERTEX) && ((payload.x >> COVER_FRONT_SHIFT) & COVER_FRONT_MASK) == 0;
+    Resolved x = resolve_vertex<K, S, H, T>(r, slot, payload, material, h);
+    if (x.ended)
+        return x.out;
+    if (!whole)
+    {
+        store_resolved(r, slot, x);
+        return uint4(x.step, asuint(x.t), 0, 0);
+    }
+    uint kept = (x.step & ((STEP_AT_MASK << STEP_AT_SHIFT) | STEP_FIRST)) | STEP_SHADED;
+    VertexState v;
+    uint out;
+    if (K == AT_LAYER)
+    {
+        v = load_vertex_state(r, slot, x.step, x.t, whole_ray_part<AtLayer>(r, x.step));
+        AtLayer at;
+        at.pl.surface = x.ps;
+        at.pl.layer = x.layer;
+        at.started = false;
+        out = whole_core<AtLayer, SHADE_VERTEX, S, M>(r, slot, v, at, x.step, VERTEX_LAYER, true);
+    }
+    else
+    {
+        v = load_vertex_state(r, slot, x.step, x.t, whole_ray_part<AtSurface>(r, x.step));
+        AtSurface at = { x.ps };
+        out = whole_core<AtSurface, SHADE_VERTEX, S, M>(r, slot, v, at, x.step, VERTEX_OPAQUE, true);
+    }
+    return uint4(out | kept, 0, 0, 0);
+}
+
+// The shade of `v`'s path at its vertex `at` of class `V` (`X` a walk's exit, of vertex kind
+// `kind`), which `step` names, past its arrival, which ran next-event estimation with probability
+// `run` and drew `drawn` light candidates: its shadow job (STEP_SHADOW), the entries of what the
+// raygen runs after it (STEP_GATHER, STEP_DEPOSIT with STEP_PROBE, STEP_CACHE_VERTEX), and its
+// next ray, STEP_RAY, the subsurface walk that takes its place, STEP_WALK, or STEP_ENDED. It
+// stores the path.
+uint shade_core<V : IAt, let X : uint, S : ISurfaces, M : IMedium>(PathRoot r, uint slot, inout VertexState v, inout V at, uint step, float run, uint drawn, uint kind)
+{
     bool opaque = kind == VERTEX_OPAQUE && X == SHADE_VERTEX;
     Prep q = at.prep(r, v);
     ShadeVertex sv = at.vertex(r, v.c.ray.dir, step, q);
@@ -732,16 +871,7 @@ uint shade_at<V : IAt, let X : uint, S : ISurfaces, M : IMedium>(PathRoot r, uin
     Weighed w = no_weighed();
     bool weighs = v.x.count_nee && drawn > 0;
     if (weighs)
-    {
         w = weigh_candidates(r, slot, vertex_weighs<X>(sv, kind), drawn, nee_without_environment(v.x, kind));
-        // The weighing holds the vertex's scatter alone: the path's state and the vertex are
-        // loaded again past it, so nothing of them is live across its evaluations.
-        v = load_vertex_state(r, slot, step, 0.0, V.ray_part(r));
-        at = V.load(r, v);
-        ShadeVertex again = at.vertex(r, v.c.ray.dir, step, q);
-        again.b = sv.b;
-        sv = again;
-    }
     bool stack_ray = has(v.p.flags, LOOP_STACK_RAY);
     // A pixel that runs stands for the view's share of them.
     if (opaque && has(step, STEP_FIRST) && v.c.interior.count == 0)
@@ -765,7 +895,7 @@ uint shade_at<V : IAt, let X : uint, S : ISurfaces, M : IMedium>(PathRoot r, uin
     if (may(MAY_UPDATE) && v.record.update && opaque)
     {
         CacheEntry e = { cache_albedo(sv.b.albedo(), g.bsdf) * v.p.throughput, rng.dimension, g.position, 0, g.geometric_normal, 0,
-            load_word<LoopRadiance>(v.at + LOOP_RADIANCE_AT).radiance, 0 };
+            load_word<LoopRadiance>(v.at + LOOP_RADIANCE_AT).radiance + v.p.radiance, 0 };
         store_part<CacheEntry, RECORD_ENTRY_WORDS>(scratch + RECORD_ENTRY_AT, e);
         rng.dimension++;
         out |= STEP_CACHE_VERTEX;
@@ -841,36 +971,8 @@ uint shade_at<V : IAt, let X : uint, S : ISurfaces, M : IMedium>(PathRoot r, uin
     return out | (!alive ? STEP_ENDED : s.walking ? STEP_WALK : STEP_RAY);
 }
 
-// `arrive_at` of vertex class `K` (AT_*).
-public uint4 launch_arrive<let K : uint, S : ISurfaces, M : IMedium>(PathRoot r, uint slot, uint step, float t)
-{
-    if (K == AT_EXIT)
-        return arrive_at<AtExit, SHADE_EXIT, S, M>(r, slot, step, t, VERTEX_OPAQUE);
-    if (K == AT_LEAVE)
-        return arrive_at<AtLeave, SHADE_VERTEX, S, M>(r, slot, step, t, VERTEX_LEAVE);
-    if (K == AT_SCATTER)
-        return arrive_at<AtScatter, SHADE_VERTEX, S, M>(r, slot, step, t, VERTEX_SCATTER);
-    if (K == AT_LAYER)
-        return arrive_at<AtLayer, SHADE_VERTEX, S, M>(r, slot, step, t, VERTEX_LAYER);
-    return arrive_at<AtSurface, SHADE_VERTEX, S, M>(r, slot, step, t, VERTEX_OPAQUE);
-}
-
-// `shade_at` of vertex class `K` (AT_*).
-public uint launch_shade<let K : uint, S : ISurfaces, M : IMedium>(PathRoot r, uint slot, uint step, float run, uint drawn)
-{
-    if (K == AT_EXIT)
-        return shade_at<AtExit, SHADE_EXIT, S, M>(r, slot, step, run, drawn, VERTEX_OPAQUE);
-    if (K == AT_LEAVE)
-        return shade_at<AtLeave, SHADE_VERTEX, S, M>(r, slot, step, run, drawn, VERTEX_LEAVE);
-    if (K == AT_SCATTER)
-        return shade_at<AtScatter, SHADE_VERTEX, S, M>(r, slot, step, run, drawn, VERTEX_SCATTER);
-    if (K == AT_LAYER)
-        return shade_at<AtLayer, SHADE_VERTEX, S, M>(r, slot, step, run, drawn, VERTEX_LAYER);
-    return shade_at<AtSurface, SHADE_VERTEX, S, M>(r, slot, step, run, drawn, VERTEX_OPAQUE);
-}
-
 // ---------------------------------------------------------------------------------------------
-// The callables the raygen runs around a vertex's arrival and shade
+// The callables the raygen runs around a vertex
 
 // The emission shader's body: the light of `slot`'s opaque vertex toward the path, which `step`
 // names, past its arrival, which found that it counts. A hit's light is weighed against the light
@@ -881,7 +983,15 @@ public uint launch_shade<let K : uint, S : ISurfaces, M : IMedium>(PathRoot r, u
 public void launch_emission(PathRoot r, uint slot, uint step)
 {
     VertexState v = load_vertex_state(r, slot, step, 0.0, RAY_WHOLE);
-    PackedSurface ps = load_part<PackedSurface, SURFACE_WORDS>(v.at + SURFACE_AT);
+    emit_surface(r, v, step, load_part<PackedSurface, SURFACE_WORDS>(v.at + SURFACE_AT));
+    flush_loop_radiance(v.at, v.p);
+}
+
+// The light of the opaque vertex of `ps` that `step` names toward `v`'s path, which holds the
+// whole ray that reached it, past its arrival: into the path's radiance, or for the G-buffer's
+// surface into its record.
+void emit_surface(PathRoot r, inout VertexState v, uint step, PackedSurface ps)
+{
     LayerVertex l = opaque_shade_vertex(r.view, ps, v.c.ray.dir).l;
     Prep q = opaque_prep(r, v.p, v.c, v.record, v.x, l);
     Bsdf b = opaque_emission_layers(l, interior_ior(r.scene, v.c.interior.innermost()), q.collapse, q.walks, q.adjoint);
@@ -891,7 +1001,6 @@ public void launch_emission(PathRoot r, uint slot, uint step)
         return;
     }
     add_emission(r, v.f, v.p, v.c, v.x, ps, b.emission_layer() * unpack_rgbe(ps.emission), has(step, STEP_FIRST));
-    flush_loop_radiance(v.at, v.p);
 }
 
 // The gather shader's body: what the entry `slot`'s vertex left in the scratch (`GatherEntry`)

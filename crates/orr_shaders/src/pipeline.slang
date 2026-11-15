@@ -246,6 +246,40 @@ public extension HitObject
     {
         HitObject::Invoke(this, payload);
     }
+
+}
+
+// `h.reorder()` then `h.invoke(payload)` as the extension's one instruction, which Slang has no
+// name for: the driver keeps no hit object of the caller's across the regrouping.
+[ForceInline]
+public void reorder_invoke<P>(Traced h, inout P payload)
+{
+    [__vulkanRayPayload]
+    static P p;
+    p = payload;
+    spirv_asm
+    {
+        OpExtension "SPV_EXT_shader_invocation_reorder";
+        OpCapability ShaderInvocationReorderEXT;
+        OpHitObjectReorderExecuteShaderEXT &h &p
+    };
+    payload = p;
+}
+
+// As above, after `h.reorder(hint, bits)`.
+[ForceInline]
+public void reorder_invoke<P>(Traced h, uint hint, uint bits, inout P payload)
+{
+    [__vulkanRayPayload]
+    static P p;
+    p = payload;
+    spirv_asm
+    {
+        OpExtension "SPV_EXT_shader_invocation_reorder";
+        OpCapability ShaderInvocationReorderEXT;
+        OpHitObjectReorderExecuteShaderEXT &h &p $hint $bits
+    };
+    payload = p;
 }
 
 // Traces `ray` running only intersection and any-hit shaders: what it found, to read, reorder

@@ -33,6 +33,9 @@ import orr_lighting.path.launch.slot;
 import orr_lighting.path.launch.record;
 import orr_lighting.path.launch.start;
 
+// What the layers callable hands back beside STEP_ENDED.
+public static const uint FRONT_MORE = 1 << 0;
+
 // A LAYERS trace's payload, 16 bytes: the ray's reach, the distance of the LAYERS_KEPT-th
 // candidate kept (+inf until that many are), the bound's distance, and a word of the candidates
 // past the bound it met (bits 0-7, saturating), its instance mask (bits 8-15) and LAYERS_BOUNDED.
@@ -72,6 +75,58 @@ public uint layers_met(uint4 payload)
     return payload.w & 0xff;
 }
 
+// Puts the candidate of key `key` and `more` among the `kept` nearest that front words `at` hold in
+// order, LAYERS_KEPT at most: false where it lies past LAYERS_KEPT of them.
+bool insert_layer(uint4* at, uint kept, uint4 key, uint4 more)
+{
+    uint i = kept;
+    for (; i > 0; i--)
+    {
+        uint4 k = load_coherent(at + 2 * (i - 1));
+        if (!layer_before(key, k))
+            break;
+        if (i < LAYERS_KEPT)
+        {
+            store_coherent(at + 2 * i, k);
+            store_coherent(at + 2 * i + 1, load_coherent(at + 2 * (i - 1) + 1));
+        }
+    }
+    if (i == LAYERS_KEPT)
+        return false;
+    store_coherent(at + 2 * i, key);
+    store_coherent(at + 2 * i + 1, more);
+    return true;
+}
+
+// Keeps a path ray's candidate in front of its hit, of key `key` and `more`, among the
+// LAYERS_KEPT nearest so far, and counts it in the ray's cover word (COVER_FRONT_SHIFT). The ray's
+// hit is not known yet: its layers callable drops what lies past it.
+void keep_front(PathRoot r, inout uint4 payload, uint4 key, uint4 more)
+{
+    uint met = (payload.x >> COVER_FRONT_SHIFT) & COVER_FRONT_MASK;
+    if (met < COVER_FRONT_MASK)
+        payload.x += 1u << COVER_FRONT_SHIFT;
+    insert_layer(scratch_words(r, launch_slot()) + FRONT_AT, min(met, LAYERS_KEPT), key, more);
+}
+
+// A path ray's triangle candidate with hit record data `d`, from the any-hit shader of a
+// particle's record: kept where the ray's mask takes particles.
+public void front_triangle(PathRoot r, inout uint4 payload, HitData d, uint instance_index, int cluster_id, uint primitive, float t, float2 bary)
+{
+    if (cluster_id < 0)
+        return;
+    uint class_id = d.class_id();
+    if (class_id != CLASS_PARTICLE || !class_taken(class_id, payload.x & 0xff))
+        return;
+    keep_front(r, payload, uint4(asuint(t), instance_index, asuint(cluster_id), primitive), uint4(asuint(bary), LAYER_PARTICLE, 0));
+}
+
+// A path ray's light proxy candidate on instance `instance_index`, at `t`.
+public void front_light(PathRoot r, inout uint4 payload, uint instance_index, float t)
+{
+    keep_front(r, payload, uint4(asuint(t), instance_index, ~0u, 0), uint4(0, 0, LAYER_LIGHT, 0));
+}
+
 // Keeps a LAYERS trace's candidate of key `key` and `more` where it lies before the ray's reach,
 // past the bound, and among the LAYERS_KEPT nearest so far.
 void keep_layer(PathRoot r, inout uint4 payload, uint4 key, uint4 more)
@@ -91,23 +146,7 @@ void keep_layer(PathRoot r, inout uint4 payload, uint4 key, uint4 more)
     if (t > asfloat(payload.y))
         return;
     uint kept = min(met, LAYERS_KEPT);
-    uint i = kept;
-    for (; i > 0; i--)
-    {
-        uint4 k = load_coherent(at + 2 * (i - 1));
-        if (!layer_before(key, k))
-            break;
-        if (i < LAYERS_KEPT)
-        {
-            store_coherent(at + 2 * i, k);
-            store_coherent(at + 2 * i + 1, load_coherent(at + 2 * (i - 1) + 1));
-        }
-    }
-    if (i == LAYERS_KEPT)
-        return;
-    store_coherent(at + 2 * i, key);
-    store_coherent(at + 2 * i + 1, more);
-    if (kept + 1 >= LAYERS_KEPT)
+    if (insert_layer(at, kept, key, more) && kept + 1 >= LAYERS_KEPT)
         payload.y = load_coherent(at + 2 * (LAYERS_KEPT - 1)).x;
 }
 
@@ -154,11 +193,12 @@ LayerEntry front_entry(uint4* at, uint k)
     return e;
 }
 
-// The layers callable's body: composites the `kept` candidates a LAYERS trace of `slot`'s path
-// ray, reaching `t_max`, kept in front of its hit, in depth order, as `trace_resolve_translucent`
-// takes them with `PathEmission`, and moves the bound to the last. STEP_ENDED where nothing goes
-// on through them, else 0; the bound's distance in `bound`. It loads the loop's throughput and
-// keep and the ray, and the wavelengths where the path is split by them.
+// The layers callable's body: composites the `kept` candidates the trace of `slot`'s path ray,
+// reaching `t_max`, or a LAYERS trace past its bound kept, those in front of its hit, in depth
+// order, as `trace_resolve_translucent` takes them with `PathEmission`, and moves the bound to the
+// last. STEP_ENDED where nothing goes on through them; FRONT_MORE where every one lay before the
+// reach, so more may lie past the bound; the bound's distance in `bound`. It loads the loop's
+// throughput and keep and the ray, and the wavelengths where the path is split by them.
 public uint launch_layers(PathRoot r, uint slot, uint kept, float t_max, out float bound)
 {
     uint4* words = hot_words(r, slot);
@@ -179,9 +219,12 @@ public uint launch_layers(PathRoot r, uint slot, uint kept, float t_max, out flo
     PathEmission pe = { r.scene, r.set, ray_local, ray.origin, ray.dir, ray.from, ray.normal, x.one_technique ? 0.0 : ray.pdf, ray.run, t_max, own, adds };
     uint4* at = scratch_words(r, slot) + FRONT_AT;
     uint4 key = uint4(0);
-    for (uint k = 0; k < kept; k++)
+    uint k = 0;
+    for (; k < kept; k++)
     {
         LayerEntry e = front_entry(at, k);
+        if (!(asfloat(e.key.x) < t_max))
+            break;
         key = e.key;
         Candidate c;
         c.instance_index = e.key.y;
@@ -207,7 +250,7 @@ public uint launch_layers(PathRoot r, uint slot, uint kept, float t_max, out flo
     w.throughput = p.throughput;
     store_word(words + LOOP_THROUGHPUT_AT, w);
     flush_loop_radiance(words, p);
-    return carries(p.throughput) ? 0 : STEP_ENDED;
+    return (carries(p.throughput) ? 0 : STEP_ENDED) | (k == kept ? FRONT_MORE : 0);
 }
 
 // The proxy march callable's body: what the `kept` medium proxies with a volume a LAYERS trace of

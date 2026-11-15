@@ -1,5 +1,5 @@
-// The raygen's calls at a path's vertex: its arrival, its emission, its shade, what the shade
-// leaves entries for, and its shadow ray.
+// The raygen's calls at a path's vertex: the vertex's callable where no hit shader ran it, what
+// its shade leaves entries for, and its shadow ray.
 module raygen_vertex;
 
 import orr_shaders.abi;
@@ -22,11 +22,10 @@ void run(uint index)
     call(index, c);
 }
 
-// Runs `slot`'s path from the vertex `step` names (STEP_VERTEX), reached by a ray `t` m long, to
-// the step its shade hands back: its next ray, its walk or its end. Each callable takes the
-// vertex's step in its data's first word; the arrival the ray's length in the second; the shade
-// what the arrival hands it, the vertex's probability of running next-event estimation and the
-// light candidates it drew.
+// Runs `slot`'s path from the vertex `step` names (STEP_VERTEX), which no hit shader ran, reached
+// by a ray `t` m long, to the step its shade hands back: its next ray, its walk or its end. Its
+// callable takes the vertex's step in its data's first word and the ray's length in the second.
+// A first vertex whose pixel runs no path this frame only emits.
 public uint vertex_calls(PathRoot r, uint slot, uint step, float t)
 {
     if ((step & STEP_UNSHADED) != 0)
@@ -35,13 +34,14 @@ public uint vertex_calls(PathRoot r, uint slot, uint step, float t)
             data_call(CALL_EMISSION, uint4(step, 0, 0, 0));
         return STEP_ENDED;
     }
-    uint at = step_at(step);
-    uint4 arrived = data_call(CALL_ARRIVE + at, uint4(step, asuint(t), 0, 0));
-    if (may(MAY_EMISSIVE) && (arrived.x & STEP_EMITS) != 0)
-        data_call(CALL_EMISSION, uint4(step, 0, 0, 0));
-    if ((arrived.x & STEP_ENDED) != 0)
-        return STEP_ENDED;
-    uint shaded = data_call(CALL_SHADE + at, uint4(step, arrived.y, arrived.z, 0)).x;
+    uint shaded = data_call(CALL_VERTEX + step_at(step), uint4(step, asuint(t), 0, 0)).x;
+    return after_shade(r, slot, step, shaded);
+}
+
+// What the raygen runs past the shade of the vertex `step` names, which handed back `shaded`:
+// the entries it left, and its shadow ray. `shaded` again.
+public uint after_shade(PathRoot r, uint slot, uint step, uint shaded)
+{
     if (may(MAY_UPDATE) && (shaded & STEP_CACHE_VERTEX) != 0)
         run(CALL_CACHE_VERTEX);
     if (may(MAY_PHOTON) && (shaded & STEP_DEPOSIT) != 0)

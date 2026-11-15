@@ -161,10 +161,10 @@ public LaunchWalk new_walk(Walk e, uint flags, uint owner, PathCover cover, uint
     return w;
 }
 
-// The end of `slot`'s walk, once its walk part holds it: STEP_ENDED; STEP_VERTEX with the class of
-// a subsurface walk's exit at its cap (STEP_CAPPED) or of an interior's way out; or STEP_INVOKE
-// where its last step met a surface, which the raygen then invokes as the exit or the path ray's
-// hit. It loads the loop and the walk, and for an interior's walk the ray and the interiors.
+// The end of the walk of an interior that `slot`'s path ran, once its walk part holds it:
+// STEP_ENDED where the path ends with it, else 0, the path going on to the hit its last step met,
+// whose shader the raygen ran, or leaving the interior by the way out the walk part holds. It
+// loads the loop, the walk, the ray and the interiors.
 public uint launch_walk_end(PathRoot r, uint slot)
 {
     uint4* at = hot_words(r, slot);
@@ -174,24 +174,8 @@ public uint launch_walk_end(PathRoot r, uint slot)
     LaunchWalk w = load_part<LaunchWalk, WALK_STATE_WORDS>(walk);
     Walk e = walk_of(moving_part(w), fixed_part(w));
     e.normal = w.normal;
-    if (may(MAY_DEBUG))
-        p.rays += w.rays;
     LaunchRecord record = launch_record(r, slot);
     PathContext x = path_context(r, record, pixel);
-    if ((w.kind & LAUNCH_WALK_INTERIOR) == 0 || !interiors_tracked(r))
-    {
-        bool alive = subsurface_walk_ended(r, p, x, e);
-        store_loop_state(at, p);
-        flush_loop_radiance(at, p);
-        if (!alive)
-            return STEP_ENDED;
-        if (e.kind == WALK_BOUNDARY)
-        {
-            store_invoke_cover(at, p, x, true);
-            return STEP_INVOKE;
-        }
-        return STEP_VERTEX | (AT_EXIT << STEP_AT_SHIFT) | STEP_CAPPED;
-    }
     LaunchRay stored = load_launch_ray(at);
     ShadeState c = launch_state(layer_ray(stored));
     load_interiors(r, slot, p, c);
@@ -208,8 +192,7 @@ public uint launch_walk_end(PathRoot r, uint slot)
         if (stack_kept(r) && stack_ray)
             keep_path_stack(r, slot, p, load_path_stack(r, slot, p.flags, stored, arrived, p.depth - 1, !x.photon && !x.one_technique));
         // The hit's arrival takes no segment: the walk's last step ran inside the interior.
-        store_launch_ray(at, launch_ray(c.ray, 0.0, 0, LAUNCH_INSIDE));
-        store_invoke_cover(at, p, x, false);
+        store_launch_ray(at, launch_ray(c.ray, 0.0, 0, LAUNCH_INSIDE | LAUNCH_SEGMENTED));
     }
     else if (alive)
     {
@@ -222,7 +205,5 @@ public uint launch_walk_end(PathRoot r, uint slot)
     }
     store_loop_state(at, p);
     flush_loop_radiance(at, p);
-    if (!alive)
-        return STEP_ENDED;
-    return leaves ? STEP_VERTEX | (AT_LEAVE << STEP_AT_SHIFT) : STEP_INVOKE;
+    return alive ? 0 : STEP_ENDED;
 }

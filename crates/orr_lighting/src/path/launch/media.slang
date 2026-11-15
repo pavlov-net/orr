@@ -28,6 +28,7 @@ import orr_lighting.path.launch.steps;
 import orr_lighting.path.launch.slot;
 import orr_lighting.path.launch.record;
 import orr_lighting.path.launch.walk;
+import orr_lighting.path.launch.hit;
 import orr_lighting.path.launch.start;
 import orr_lighting.path.launch.segment;
 import orr_lighting.path.launch.shade_other;
@@ -41,11 +42,13 @@ uint begin_interior_walk(PathRoot r, uint slot, PathLoop p, PathContext x, uint 
     Walk e = interior_walk_from(p, x, im, ior, at, dir, rng, seed);
     PathCover cover = new_path_cover(MASK_OPAQUE | MASK_DIELECTRIC, COVER_LAYERS, PRESENCE_DRAWN, seed, HitContext());
     store_part<LaunchWalk, WALK_STATE_WORDS>(walk_words(r, slot), new_walk(e, LAUNCH_WALK_INTERIOR, medium, cover, p.depth, x.feedback));
+    store_invoke_cover(hot_words(r, slot), p, x, false);
     return STEP_WALK;
 }
 
 // The segment callable's body: what lies along `slot`'s path ray inside the innermost interior
-// its path lies in (LAUNCH_INSIDE), between its origin and its hit (`hit`, `t` m on) or infinity,
+// its path lies in, where its medium may scatter the ray (LAUNCH_SEGMENTED) or the ray met no
+// surface whose arrival takes it, between its origin and its hit (`hit`, `t` m on) or infinity,
 // before the hit's shader: the interior's transmittance, or a scatter in it that takes the hit's
 // place, past which the path may walk the interior. 0 where the path goes on to what the ray met,
 // else a step that takes its place. It loads the loop, the ray's trace half, and the interiors

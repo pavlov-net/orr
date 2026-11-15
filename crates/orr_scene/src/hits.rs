@@ -10,8 +10,9 @@ use orr_gpu::{
 
 use crate::memory::UploadWindow;
 use crate::shaders::consts::{
-    FIXED_KINDS, HIT_DATA_BYTES, KIND_LAYERS, KIND_LIGHT_LAYERS, KIND_MEDIUM_LAYERS,
-    KIND_MEDIUM_SHADOW, KIND_PATH, KIND_PRODUCER_PATH, KIND_SHADOW, KIND_STACK_MEET,
+    FIXED_KINDS, HIT_DATA_BYTES, KIND_FRONT, KIND_LAYER_PATH, KIND_LAYERS, KIND_LIGHT_FRONT,
+    KIND_LIGHT_LAYERS, KIND_MEDIUM_LAYERS, KIND_MEDIUM_SHADOW, KIND_PATH, KIND_PRODUCER_LAYER_PATH,
+    KIND_PRODUCER_PATH, KIND_PRODUCER_RICH_PATH, KIND_RICH_PATH, KIND_SHADOW, KIND_STACK_MEET,
     KIND_STRAND_PATH, KIND_WALK_MEET, PINNED_KINDS, RAY_TYPES, RUNS_PER_GROUP,
 };
 use crate::shaders::sbt::HitTableRoot;
@@ -29,15 +30,30 @@ use crate::{Result, SceneRoot};
 pub struct HitGroups {
     /// The linked surface types the pinned groups serve, ids 1 to `surfaces`.
     pub surfaces: u32,
-    /// Triangles of copies' clusters under path rays: a closest-hit that resolves the hit and an
+    /// Triangles of copies' clusters under path rays: a closest-hit that shades the hit and an
     /// any-hit that decides by `orr_scene.candidates`'s `cover_path`.
     pub path: Option<u32>,
+    /// As [`Self::path`], for a material that may have a coat, fuzz, thin film or subsurface;
+    /// `None` serves those by [`Self::path`].
+    pub rich_path: Option<u32>,
+    /// As [`Self::path`], for clusters that trace as a dielectric or a presence layer; `None`
+    /// serves those by [`Self::path`].
+    pub layer_path: Option<u32>,
     /// Triangles of producer entries' clusters under path rays.
     pub producer_path: Option<u32>,
+    /// As [`Self::rich_path`] and [`Self::layer_path`], of producer entries' clusters, served
+    /// by [`Self::producer_path`] where `None`.
+    pub producer_rich_path: Option<u32>,
+    pub producer_layer_path: Option<u32>,
     /// Strand entries' segments under path rays.
     pub strand_path: Option<u32>,
     /// Triangles under shadow rays: an any-hit that decides by `cover_shadow`.
     pub shadow: Option<u32>,
+    /// Particles under path rays: an any-hit that keeps them as what lies in front of the ray's
+    /// hit and ignores them, since a record of zeros would commit them.
+    pub front: Option<u32>,
+    /// Sphere and rect light proxies under path rays.
+    pub light_front: Option<u32>,
     /// Triangles under layer rays: an any-hit that keeps particles and ignores the rest, since a
     /// record of zeros would commit them.
     pub layers: Option<u32>,
@@ -77,13 +93,25 @@ impl HitGroups {
             (KIND_LIGHT_LAYERS, self.light_layers),
             (KIND_WALK_MEET, self.walk_meet),
             (KIND_STACK_MEET, self.stack_meet),
+            (KIND_FRONT, self.front),
+            (KIND_LIGHT_FRONT, self.light_front),
         ] {
             fixed[kind as usize] = group;
         }
         let mut pinned = [None; PINNED_KINDS as usize];
         for (kind, group) in [
             (KIND_PATH, self.path),
+            (KIND_RICH_PATH, self.rich_path.or(self.path)),
+            (KIND_LAYER_PATH, self.layer_path.or(self.path)),
             (KIND_PRODUCER_PATH, self.producer_path),
+            (
+                KIND_PRODUCER_RICH_PATH,
+                self.producer_rich_path.or(self.producer_path),
+            ),
+            (
+                KIND_PRODUCER_LAYER_PATH,
+                self.producer_layer_path.or(self.producer_path),
+            ),
             (KIND_STRAND_PATH, self.strand_path),
             (KIND_SHADOW, self.shadow),
         ] {
