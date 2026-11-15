@@ -15,10 +15,10 @@ use orr_shaders::surface_declares;
 
 use crate::mask_sets::Members;
 use crate::shaders::consts::{
-    ANY_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, LAYER_HIT_INSTRUCTIONS,
-    MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS,
-    PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
-    RAYGEN_LAYER_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
+    ANY_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, INTERIOR_HIT_INSTRUCTIONS,
+    LAYER_HIT_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW,
+    PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS,
+    RAYGEN_INSTRUCTIONS, RAYGEN_LAYER_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
 };
 use crate::shaders::path::{lean_layer, lean_paths, lean_rich};
 use crate::staged::{
@@ -166,12 +166,18 @@ impl Spec {
         let traced = if primary { TRACED_HIT_INSTRUCTIONS } else { 0 };
         let emitter = self.role == Role::Hit && self.may & MAY_EMITTER != 0;
         let emitter = if emitter { EMITTER_HIT_INSTRUCTIONS } else { 0 };
+        let interiors = self.role == Role::Hit && self.may & MAY_INTERIORS != 0;
+        let interiors = if interiors {
+            INTERIOR_HIT_INSTRUCTIONS
+        } else {
+            0
+        };
         let rich = match (self.role, self.kernel) {
             (Role::Hit, Kernel::Rich) => RICH_HIT_INSTRUCTIONS,
             (Role::Hit, Kernel::Layer) => LAYER_HIT_INSTRUCTIONS,
             _ => 0,
         };
-        Some(base + if producers { producer } else { 0 } + traced + emitter + rich)
+        Some(base + if producers { producer } else { 0 } + traced + emitter + interiors + rich)
     }
 
     fn constants(&self) -> ([u8; 32], &'static [SpecEntry]) {

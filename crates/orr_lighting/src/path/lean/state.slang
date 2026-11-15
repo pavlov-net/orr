@@ -61,6 +61,9 @@ import orr_shaders.pipeline;
 [Host] public static const uint RICH_HIT_INSTRUCTIONS = 8500;
 // What a hit made for dielectrics holds more: their transmission and the interiors they bound.
 [Host] public static const uint LAYER_HIT_INSTRUCTIONS = 14000;
+// What a hit holds more where the scene's paths may lie in an interior: the medium's
+// transmittance over the whole of a ray inside it, from the surface its origin lies off.
+[Host] public static const uint INTERIOR_HIT_INSTRUCTIONS = 100;
 [Host] public static const uint PIPELINE_INSTRUCTIONS = 1000000;
 
 // `PathHot.flags`.
