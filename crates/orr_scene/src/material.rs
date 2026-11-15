@@ -336,13 +336,16 @@ pub(crate) struct MaterialTable {
 }
 
 /// What `orr_scene.runs`' `hit_data` and `sbt.slang`'s pin read of a record: the flags they test,
-/// its back, its linked surface id and whether it has a lobe that `HIT_LOBED` names.
+/// its back, its linked surface id and the lobes that `HIT_LOBED` and `HIT_EMITS` name.
 fn hit_key(m: &MaterialGpu) -> [u32; 4] {
-    use material_flags as f;
-    let flags =
-        f::ALPHA_TESTED | f::THIN_WALLED | f::DIELECTRIC | f::PRESENCE | f::EMISSIVE | f::HAS_BACK;
-    let lobed = m.lobes & material_lobes::RICH != 0;
-    [m.flags & flags, m.back, m.surface, u32::from(lobed)]
+    use {material_flags as f, material_lobes as l};
+    let flags = f::ALPHA_TESTED | f::THIN_WALLED | f::DIELECTRIC | f::PRESENCE | f::HAS_BACK;
+    [
+        m.flags & flags,
+        m.back,
+        m.surface,
+        m.lobes & (l::RICH | l::EMISSION),
+    ]
 }
 
 /// Whether record `m` takes [`material_flags::STACK_FACE`].

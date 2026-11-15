@@ -103,13 +103,20 @@ public HitData hit_data(SceneRoot* s, uint material, uint class_id, bool solid, 
         d.flags |= HIT_ALPHA_TESTED;
     if (class_id == CLASS_DIELECTRIC)
         d.flags |= crosses_interior(s, material) ? HIT_CROSSES_INTERIOR : HIT_THIN_WALL;
-    if ((flags & MATERIAL_EMISSIVE) != 0)
-        d.flags |= HIT_EMITS;
     if ((flags & MATERIAL_HAS_BACK) != 0)
         d.back = s.materials[material].back;
+    if (material_emits(s.materials + material) || (d.back != MATERIAL_NONE && material_emits(s.materials + d.back)))
+        d.flags |= HIT_EMITS;
     if (material_lobed(s.materials + material) || (d.back != MATERIAL_NONE && material_lobed(s.materials + d.back)))
         d.flags |= HIT_LOBED;
     return d;
+}
+
+// Whether a surface of `m` may emit: its own emission is not zero, or its linked surface type
+// declares one.
+bool material_emits(MaterialGpu* m)
+{
+    return (m.lobes & MATERIAL_LOBE_EMISSION) != 0;
 }
 
 bool material_lobed(MaterialGpu* m)

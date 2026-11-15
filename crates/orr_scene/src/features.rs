@@ -102,6 +102,10 @@ impl SceneFeatures {
     const STACK_FACES: Self = Self(1 << 32);
     /// A material is of a linked surface type, which shades its hits.
     pub const LINKED_SURFACES: Self = Self(1 << 33);
+    /// A material's own emission is not zero, whatever its linked surface type declares.
+    pub const EMISSION_FACTORS: Self = Self(1 << 34);
+    /// As [`Self::EMISSION_FACTORS`], of a material with a linked surface id.
+    pub const LINKED_EMISSION_FACTORS: Self = Self(1 << 35);
     /// What a mesh keeps from the material it was built with, whatever the record holds now:
     /// once a record has shown one of these, the table keeps it.
     const BUILT: Self = Self(Self::LAYERS.0 | Self::COVERAGE.0);
@@ -126,6 +130,8 @@ impl SceneFeatures {
             (Self::THIN_DIELECTRICS, 1 << 9),
             (Self::NEURAL_TEXTURES, 1 << 10),
             (Self::LINKED_SURFACES, 1 << 11),
+            (Self::EMISSION_FACTORS, 1 << 12),
+            (Self::LINKED_EMISSION_FACTORS, 1 << 13),
         ] {
             if !self.contains(feature) {
                 ruled_out |= bit;
@@ -181,6 +187,11 @@ impl SceneFeatures {
             ),
             (m.flags & f::STACK_FACE != 0, Self::STACK_FACES),
             (m.surface != 0, Self::LINKED_SURFACES),
+            (m.emission_luminance != 0.0, Self::EMISSION_FACTORS),
+            (
+                m.emission_luminance != 0.0 && m.surface != 0,
+                Self::LINKED_EMISSION_FACTORS,
+            ),
         ] {
             if on {
                 out |= bit;
@@ -348,20 +359,28 @@ mod tests {
         let solid = record(|m| m.flags = f::DIELECTRIC);
         assert!(!solid.contains(SceneFeatures::THIN_DIELECTRICS));
         // A plain scene rules every surface feature out; each one found sets its bit alone.
-        assert_eq!(plain.surface_may(), !0b1111_1110_1111);
-        assert_eq!(vertex.surface_may(), !0b1111_1110_1110);
-        assert_eq!(tiled.surface_may(), !0b1111_1110_1101);
-        assert_eq!(thin.surface_may() & 0b1111_1110_1111, 1 << 9);
+        const DEFINED: u32 = 0b11_1111_1110_1111;
+        assert_eq!(plain.surface_may(), !DEFINED);
+        assert_eq!(vertex.surface_may(), !DEFINED | 1);
+        assert_eq!(tiled.surface_may(), !DEFINED | 1 << 1);
+        assert_eq!(thin.surface_may() & DEFINED, 1 << 9);
         let scene = SceneFeatures::DECALS | SceneFeatures::PRODUCERS | SceneFeatures::STRANDS;
-        assert_eq!(scene.surface_may() & 0b1111_1110_1111, 0b0110_1000);
+        assert_eq!(scene.surface_may() & DEFINED, 0b0110_1000);
+        assert_eq!(SceneFeatures::SKINNING.surface_may() & DEFINED, 1 << 7);
         assert_eq!(
-            SceneFeatures::SKINNING.surface_may() & 0b1111_1110_1111,
-            1 << 7
-        );
-        assert_eq!(
-            SceneFeatures::COATED_EMITTERS.surface_may() & 0b1111_1110_1111,
+            SceneFeatures::COATED_EMITTERS.surface_may() & DEFINED,
             1 << 8
         );
+        // An emission factor is the standard surface's emitter; on a linked record it is its
+        // type's too, whatever the type declares.
+        let emits = record(|m| m.emission_luminance = 2.0);
+        assert_eq!(emits.surface_may() & DEFINED, 1 << 12);
+        assert!(emits.contains(SceneFeatures::EMISSIVE));
+        let linked = record(|m| {
+            m.emission_luminance = 2.0;
+            m.surface = 1;
+        });
+        assert_eq!(linked.surface_may() & DEFINED, 1 << 11 | 1 << 12 | 1 << 13);
     }
 
     /// An emitter's light passes a coat or fuzz only while a record emits and a record has

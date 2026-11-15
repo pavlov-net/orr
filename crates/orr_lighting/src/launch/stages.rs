@@ -15,12 +15,12 @@ use orr_shaders::surface_declares;
 
 use crate::mask_sets::Members;
 use crate::shaders::consts::{
-    ANY_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE,
-    PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
+    ANY_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, MISS_INSTRUCTIONS,
+    PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
     PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
 };
 use crate::shaders::path::lean_paths;
-use crate::staged::{MAY_TRACED, MAY_UPDATE, MAY_VIEW};
+use crate::staged::{MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_TRACED, MAY_UPDATE, MAY_VIEW};
 use crate::{Error, KernelSet, module};
 
 /// The bit of `path_may2`, in the high word, that `feature` decides.
@@ -87,8 +87,9 @@ struct Spec {
 }
 
 impl Spec {
-    /// The name a driver's tools show the stage by: its entry, the geometry it is made for and
-    /// the linked surface id it is made for, so a trace tells stages of one entry apart.
+    /// The name a driver's tools show the stage by: its entry, the geometry it is made for, the
+    /// linked surface id it is made for and whether it shades emitters, so a trace tells stages
+    /// of one entry apart.
     fn label(&self) -> CString {
         let surface = match (self.geometry, self.hit_surface) {
             (None, _) => String::new(),
@@ -96,7 +97,13 @@ impl Spec {
             (Some(_), id) => format!(".surface{id}"),
         };
         let geometry = self.geometry.map_or("", Geometry::label);
-        CString::new(format!("{}{geometry}{surface}", self.entry)).expect("no nul in a label")
+        let emitter = if self.geometry.is_some() && self.may & MAY_EMITTER != 0 {
+            ".emitter"
+        } else {
+            ""
+        };
+        CString::new(format!("{}{geometry}{surface}{emitter}", self.entry))
+            .expect("no nul in a label")
     }
 
     /// Whether the stage is made for a linked surface type, or for any of them.
@@ -122,7 +129,9 @@ impl Spec {
         let primary =
             self.role == Role::Hit && self.geometry.is_some() && self.may & MAY_TRACED != 0;
         let traced = if primary { TRACED_HIT_INSTRUCTIONS } else { 0 };
-        Some(base + if producers { producer } else { 0 } + traced)
+        let emitter = self.role == Role::Hit && self.may & MAY_EMITTER != 0;
+        let emitter = if emitter { EMITTER_HIT_INSTRUCTIONS } else { 0 };
+        Some(base + if producers { producer } else { 0 } + traced + emitter)
     }
 
     fn constants(&self) -> ([u8; 32], &'static [SpecEntry]) {
@@ -143,8 +152,10 @@ struct Table {
     /// The raygen stage of each source by its id, where the pipeline runs the source.
     raygens: [Option<u32>; 4],
     misses: [u32; 2],
-    /// The callable of a path's first vertex.
+    /// The callable of a path's first vertex, and where the pipeline may show a debug view, the
+    /// one of a debug view of the first vertex alone.
     first: u32,
+    first_view: Option<u32>,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
 }
@@ -174,6 +185,9 @@ impl Table {
             surfaces,
             ..HitGroups::default()
         };
+        let emits = may & MAY_EMISSIVE != 0;
+        // The stage made for a surface that may emit is the only one with `MAY_EMITTER`.
+        let may = may & !MAY_EMITTER;
         let folded = |entry, role| Spec {
             entry,
             role,
@@ -195,7 +209,15 @@ impl Table {
             Self::stage(&mut specs, folded("miss_scatter", Role::Miss)),
             Self::stage(&mut specs, folded("miss_shadow", Role::Miss)),
         ];
-        let first = Self::stage(&mut specs, folded("first_vertex", Role::Hit));
+        let first = Self::stage(
+            &mut specs,
+            Spec {
+                may: may | if emits { MAY_EMITTER } else { 0 },
+                ..folded("first_vertex", Role::Hit)
+            },
+        );
+        let first_view = (may & MAY_DEBUG != 0)
+            .then(|| Self::stage(&mut specs, folded("first_view", Role::Hit)));
         // `hit_surface` of the hit shaders of each pin: any id, then each id from 0 on. Where
         // no surface links every material shows id 0.
         let pinned = |entry, role, pin: u32, geometry: Geometry| Spec {
@@ -211,16 +233,44 @@ impl Table {
                 pin - 1
             },
         };
+        // Whether the closest-hit of pin `pin` shades a surface that may emit, where it is the
+        // one made for materials that may (`emissive`). A linked type that declares its emission
+        // has it in its one stage, which every material of its id takes. The standard surface's
+        // materials that emit by their own factor take a stage of their own, so the others' holds
+        // none of it; a linked type's that do share their type's.
+        let factors = may & may2(SceneFeatures::EMISSION_FACTORS) != 0;
+        let linked_factors = may & may2(SceneFeatures::LINKED_EMISSION_FACTORS) != 0;
+        let emitter = |pin: u32, emissive: bool| {
+            if !emits {
+                false
+            } else if surfaces == 0 || pin == 1 {
+                emissive && factors
+            } else if pin == 0 {
+                true
+            } else {
+                let declared = kernels.surface_declares[pin as usize - 2];
+                declared & surface_declares::EMISSION != 0 || linked_factors
+            }
+        };
         let producers = may & may2(SceneFeatures::PRODUCERS) != 0;
         let mut hit_groups = Vec::new();
         let pins = groups.pins();
         // Each pinned kind's groups one after another by pin, the first named in `groups`.
-        for (first, hit, any_hit, geometry, linked) in [
+        for (first, hit, any_hit, geometry, linked, emissive) in [
             (
                 &mut groups.path,
                 Some("surface_hit"),
                 "cover_hit",
                 Geometry::Copies,
+                true,
+                false,
+            ),
+            (
+                &mut groups.emissive_path,
+                Some("surface_hit"),
+                "cover_hit",
+                Geometry::Copies,
+                emits,
                 true,
             ),
             (
@@ -229,6 +279,15 @@ impl Table {
                 "cover_hit",
                 Geometry::Producers,
                 producers,
+                false,
+            ),
+            (
+                &mut groups.producer_emissive_path,
+                Some("surface_hit"),
+                "cover_hit",
+                Geometry::Producers,
+                producers && emits,
+                true,
             ),
             (
                 &mut groups.shadow,
@@ -236,6 +295,7 @@ impl Table {
                 "shadow_hit",
                 Geometry::Triangles,
                 true,
+                false,
             ),
         ] {
             if !linked {
@@ -253,8 +313,21 @@ impl Table {
                     continue;
                 }
                 hit_groups.push(HitGroup {
-                    closest_hit: hit
-                        .map(|e| Self::stage(&mut specs, pinned(e, Role::Hit, pin, geometry))),
+                    closest_hit: hit.map(|e| {
+                        let spec = pinned(e, Role::Hit, pin, geometry);
+                        let bit = if emitter(pin, emissive) {
+                            MAY_EMITTER
+                        } else {
+                            0
+                        };
+                        Self::stage(
+                            &mut specs,
+                            Spec {
+                                may: spec.may | bit,
+                                ..spec
+                            },
+                        )
+                    }),
                     any_hit: Some(Self::stage(
                         &mut specs,
                         pinned(any_hit, Role::AnyHit, pin, geometry),
@@ -263,11 +336,16 @@ impl Table {
                 });
             }
         }
+        // A material with a coat, fuzz, thin film or subsurface that may emit shows its light
+        // through the stage of those that may.
+        groups.rich_path = groups.emissive_path;
+        groups.producer_rich_path = groups.producer_emissive_path;
         Self {
             specs,
             raygens,
             misses,
             first,
+            first_view,
             hit_groups,
             groups,
         }
@@ -292,9 +370,9 @@ pub struct StageSize {
     /// kernels with nothing linked, where a stage made for a linked surface is the standard
     /// surface's. None for those kernels themselves.
     pub linked: Option<i64>,
-    /// Of a stage made for a linked surface, what it holds beyond the stage of its entry and
-    /// geometry made for the standard surface: the surface's own code, less the standard code
-    /// it replaces.
+    /// Of a stage made for a linked surface, what it holds beyond the stage of its entry,
+    /// geometry and constants made for the standard surface: the surface's own code, less the
+    /// standard code it replaces.
     pub own: Option<i64>,
 }
 
@@ -323,8 +401,8 @@ pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>,
     // Kernels that link a type compile the lean stages anew, with the types' code in them.
     let own: &'static orr_shaders::ShaderModule = &lean_paths::MODULE;
     let plain = (!std::ptr::eq(lean, own)).then_some(own);
-    let mut sizes = Table::new(may, kernels)
-        .specs
+    let specs = Table::new(may, kernels).specs;
+    let mut sizes = specs
         .iter()
         .map(|spec| {
             let instructions = handed(lean, spec)?;
@@ -352,16 +430,21 @@ pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>,
             })
         })
         .collect::<Result<Vec<StageSize>, Error>>()?;
-    let standard: Vec<_> = sizes
-        .iter()
-        .filter(|s| s.hit_surface == 0)
-        .map(|s| (s.entry, s.geometry, s.instructions))
-        .collect();
-    for s in sizes.iter_mut().filter(|s| s.cap.is_none()) {
-        s.own = standard
-            .iter()
-            .find(|&&(entry, geometry, _)| (entry, geometry) == (s.entry, s.geometry))
-            .map(|&(.., instructions)| i64::from(s.instructions) - i64::from(instructions));
+    for at in 0..sizes.len() {
+        if !specs[at].linked(kernels.surfaces) {
+            continue;
+        }
+        // The standard surface's stage of the same constants, which the table need not hold:
+        // the standard surface's materials may emit by no factor where a linked type emits.
+        let standard = Spec {
+            hit_surface: 0,
+            ..specs[at]
+        };
+        let instructions = match specs.iter().position(|s| *s == standard) {
+            Some(i) => sizes[i].instructions,
+            None => handed(lean, &standard)?,
+        };
+        sizes[at].own = Some(i64::from(sizes[at].instructions) - i64::from(instructions));
     }
     Ok(sizes)
 }
@@ -456,7 +539,10 @@ impl PathPipeline {
             raygens: &records,
             misses: &table.misses.map(ShaderRecord::new),
             hit_groups: &table.hit_groups,
-            callables: &[Some(ShaderRecord::new(table.first))],
+            callables: &[
+                Some(ShaderRecord::new(table.first)),
+                table.first_view.map(ShaderRecord::new),
+            ],
             max_recursion: 1,
             flags: RayPipelineFlags::scene(device.caps()),
             threads,

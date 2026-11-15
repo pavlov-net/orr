@@ -28,8 +28,10 @@ import orr_lighting.path.lean.vertex;
 // The miss shaders: of a path's ray and of its shadow ray.
 public static const uint MISS_SCATTER = 0;
 public static const uint MISS_SHADOW = 1;
-// The callable that runs a path's first vertex from the G-buffer.
+// The callable that runs a path's first vertex from the G-buffer, and the one of a debug view of
+// the first vertex alone, which a pipeline that may show a debug view holds.
 public static const uint CALL_FIRST = 0;
+public static const uint CALL_FIRST_VIEW = 1;
 
 // Starts the path of `pixel` in hot words `at` on its camera ray, which its throughput
 // `throughput` rides: its first vertex is the G-buffer's surface, and a pixel whose G-buffer holds
@@ -151,6 +153,14 @@ public void lean_paths(PathRoot r)
     if (slot >= r.slice_count)
         return;
     uint2 pixel = item_pixel(r, r.slice_base + slot);
+    // A debug view of the first vertex alone runs no path; its callable writes the pixel.
+    if (may(MAY_DEBUG) && first_vertex_mode(r) && !traces_primary(r))
+    {
+        Payload p;
+        p.words = uint4(0);
+        call(CALL_FIRST_VIEW, p);
+        return;
+    }
     ViewConstants* v = r.view;
     uint4* at = lean_hot(r, slot);
     uint4* record = lean_record(r, slot);

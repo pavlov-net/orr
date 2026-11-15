@@ -82,6 +82,7 @@ pub(crate) const MAY_LENS: u64 = consts::MAY_LENS as u64;
 pub(crate) const MAY_WALK: u64 = consts::MAY_WALK as u64;
 pub(crate) const MAY_LOCAL: u64 = consts::MAY_LOCAL as u64;
 pub(crate) const MAY_TRACED: u64 = consts::MAY_TRACED as u64;
+pub(crate) const MAY_EMITTER: u64 = consts::MAY_EMITTER as u64;
 pub(crate) const MAY_FROXELS: u64 = consts::MAY_FROXELS as u64;
 pub(crate) const MAY_CACHE: u64 = consts::MAY_CACHE as u64;
 pub(crate) const MAY_COAT: u64 = consts::MAY_COAT as u64;

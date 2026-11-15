@@ -645,6 +645,16 @@ public struct SurfaceHit
     public bool valid;            // false for hits on entries this module does not resolve
 }
 
+// The triangle a hit met as light sampling reads it (`traced_area`, `traced_point`): its
+// render-space area, unit front-face normal and the point hit, without the surface's depth
+// offset. An area of 0 off a triangle.
+public struct HitTriangle
+{
+    public float area;
+    public float3 normal;
+    public float3 position;
+}
+
 // The slot copy of PTLAS instance `index`: slot instances name themselves, part instances
 // their copy's slot, and the instance tracing a fading copy's far step its slot with
 // COPY_FAR. False for producer entries (`hit_producer`).
@@ -915,13 +925,16 @@ public SurfaceInput emitter_input(SceneRoot* s, TracedTriangle t, uint primitive
 bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, out HitInput h)
 {
     SectionLookup lookup;
-    return hit_input_by(s, v, d, instance_index, cluster_id, primitive, bary, t, fetched, previous, sided, context, lookup, h);
+    HitTriangle traced;
+    return hit_input_by<SectionLookup, false>(s, v, d, instance_index, cluster_id, primitive, bary, t, fetched, previous, sided, context, lookup, h, traced);
 }
 
-// `hit_input` with the section material from `m`.
-bool hit_input_by<M : ISectionMaterial>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, M m, out HitInput h)
+// `hit_input` with the section material from `m`, and with `TRACED` its triangle as light
+// sampling reads it in `traced`, which is an area of 0 without.
+bool hit_input_by<M : ISectionMaterial, let TRACED : bool>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, M m, out HitInput h, out HitTriangle traced)
 {
     h = HitInput();
+    traced = HitTriangle();
     uint entry;
     if (may2(MAY2_STRANDS) && hit_producer(s, instance_index, entry) && s.producers[entry].strands != 0)
     {
@@ -952,6 +965,11 @@ bool hit_input_by<M : ISectionMaterial>(SceneRoot* s, ViewConstants* v, float3 d
     if (!traced_triangle_by(s, instance_index, cluster_id, primitive, previous, m, tri))
         return false;
     triangle_input(s, v, d, tri, primitive, bary, t, fetched, previous, sided, context, h);
+    if (TRACED)
+    {
+        traced.area = traced_area(tri, traced.normal);
+        traced.position = traced_point(tri, bary);
+    }
     return true;
 }
 
@@ -1026,11 +1044,19 @@ public SurfaceHit resolve_hit<S : ISurfaces>(SceneRoot* s, ViewConstants* v, flo
 // its record names, reads no section table.
 public SurfaceHit resolve_hit_by<S : ISurfaces, M : ISectionMaterial>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], bool previous, HitContext context, M m)
 {
+    HitTriangle traced;
+    return resolve_hit_traced<S, M, false>(s, v, d, instance_index, cluster_id, primitive, bary, object_positions, previous, context, m, traced);
+}
+
+// `resolve_hit_by`, and with `TRACED` the triangle it met in `traced`, which is an area of 0
+// without.
+public SurfaceHit resolve_hit_traced<S : ISurfaces, M : ISectionMaterial, let TRACED : bool>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], bool previous, HitContext context, M m, out HitTriangle traced)
+{
     SurfaceHit hit = SurfaceHit();
     Corners t;
     t.position = object_positions;
     HitInput h;
-    if (!hit_input_by(s, v, d, instance_index, cluster_id, primitive, bary, t, true, previous, true, context, m, h))
+    if (!hit_input_by<M, TRACED>(s, v, d, instance_index, cluster_id, primitive, bary, t, true, previous, true, context, m, h, traced))
         return hit;
     float offset;
     GSurface g = hit_surface<S>(s, h.input, h.origin, false, offset);
@@ -1173,7 +1199,8 @@ bool coverage_input<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uin
         if (reads == COVERAGE_WHOLE)
         {
             HitInput h;
-            bool found = hit_input_by(s, v, d, instance_index, cluster_id, primitive, bary, Corners(), false, false, false, context, section_given(material), h);
+            HitTriangle traced;
+            bool found = hit_input_by<SectionGiven, false>(s, v, d, instance_index, cluster_id, primitive, bary, Corners(), false, false, false, context, section_given(material), h, traced);
             i = h.input;
             i.ray_origin = ray.origin;
             i.ray_distance = ray.t;

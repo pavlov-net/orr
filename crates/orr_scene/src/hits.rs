@@ -10,10 +10,11 @@ use orr_gpu::{
 
 use crate::memory::UploadWindow;
 use crate::shaders::consts::{
-    FIXED_KINDS, HIT_DATA_BYTES, KIND_FRONT, KIND_LAYER_PATH, KIND_LAYERS, KIND_LIGHT_FRONT,
-    KIND_LIGHT_LAYERS, KIND_MEDIUM_LAYERS, KIND_MEDIUM_SHADOW, KIND_PATH, KIND_PRODUCER_LAYER_PATH,
-    KIND_PRODUCER_PATH, KIND_PRODUCER_RICH_PATH, KIND_RICH_PATH, KIND_SHADOW, KIND_STACK_MEET,
-    KIND_STRAND_PATH, KIND_WALK_MEET, PINNED_KINDS, RAY_TYPES, RUNS_PER_GROUP,
+    FIXED_KINDS, HIT_DATA_BYTES, KIND_EMISSIVE_PATH, KIND_FRONT, KIND_LAYER_PATH, KIND_LAYERS,
+    KIND_LIGHT_FRONT, KIND_LIGHT_LAYERS, KIND_MEDIUM_LAYERS, KIND_MEDIUM_SHADOW, KIND_PATH,
+    KIND_PRODUCER_EMISSIVE_PATH, KIND_PRODUCER_LAYER_PATH, KIND_PRODUCER_PATH,
+    KIND_PRODUCER_RICH_PATH, KIND_RICH_PATH, KIND_SHADOW, KIND_STACK_MEET, KIND_STRAND_PATH,
+    KIND_WALK_MEET, PINNED_KINDS, RAY_TYPES, RUNS_PER_GROUP,
 };
 use crate::shaders::sbt::HitTableRoot;
 use crate::{Result, SceneRoot};
@@ -40,12 +41,16 @@ pub struct HitGroups {
     /// As [`Self::path`], for clusters that trace as a dielectric or a presence layer; `None`
     /// serves those by [`Self::path`].
     pub layer_path: Option<u32>,
+    /// As [`Self::path`], for a material that may emit and has none of those; `None` serves
+    /// those by [`Self::path`].
+    pub emissive_path: Option<u32>,
     /// Triangles of producer entries' clusters under path rays.
     pub producer_path: Option<u32>,
     /// As [`Self::rich_path`] and [`Self::layer_path`], of producer entries' clusters, served
     /// by [`Self::producer_path`] where `None`.
     pub producer_rich_path: Option<u32>,
     pub producer_layer_path: Option<u32>,
+    pub producer_emissive_path: Option<u32>,
     /// Strand entries' segments under path rays.
     pub strand_path: Option<u32>,
     /// Triangles under shadow rays: an any-hit that decides by `cover_shadow`.
@@ -104,6 +109,7 @@ impl HitGroups {
             (KIND_PATH, self.path),
             (KIND_RICH_PATH, self.rich_path.or(self.path)),
             (KIND_LAYER_PATH, self.layer_path.or(self.path)),
+            (KIND_EMISSIVE_PATH, self.emissive_path.or(self.path)),
             (KIND_PRODUCER_PATH, self.producer_path),
             (
                 KIND_PRODUCER_RICH_PATH,
@@ -112,6 +118,10 @@ impl HitGroups {
             (
                 KIND_PRODUCER_LAYER_PATH,
                 self.producer_layer_path.or(self.producer_path),
+            ),
+            (
+                KIND_PRODUCER_EMISSIVE_PATH,
+                self.producer_emissive_path.or(self.producer_path),
             ),
             (KIND_STRAND_PATH, self.strand_path),
             (KIND_SHADOW, self.shadow),

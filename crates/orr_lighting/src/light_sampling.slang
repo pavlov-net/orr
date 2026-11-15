@@ -942,18 +942,48 @@ public struct EmitterHit
 // PTLAS instance `instance_index`, its side shown being its back with `back`.
 public EmitterHit emitter_hit(LightSetGpu* set, uint instance_index, uint cluster_id, uint primitive, float2 bary, bool back)
 {
-    SceneRoot* s = set.scene;
+    uint entry, p, triangles;
+    TracedTriangle t;
+    if (!emitter_entry(set, instance_index, cluster_id, entry, p, triangles) || !traced_triangle(set.scene, instance_index, cluster_id, primitive, false, t))
+        return no_emitter();
+    float3 n;
+    float area = traced_area(t, n);
+    return emitter_on(set, entry, p, triangles, t.material, area, n, traced_point(t, bary), back);
+}
+
+// `emitter_hit` of a ray's hit `sh` on PTLAS instance `instance_index`, cluster `cluster_id`,
+// whose triangle as light sampling reads it is `traced`.
+public EmitterHit emitter_hit_of(LightSetGpu* set, SurfaceHit sh, HitTriangle traced, uint instance_index, uint cluster_id)
+{
+    uint entry, p, triangles;
+    if (!emitter_entry(set, instance_index, cluster_id, entry, p, triangles))
+        return no_emitter();
+    return emitter_on(set, entry, p, triangles, sh.section, traced.area, traced.normal, traced.position, sh.swapped);
+}
+
+// A hit on no point light sampling draws.
+public EmitterHit no_emitter()
+{
     EmitterHit h = EmitterHit();
     h.light = NO_LIGHT;
-    uint entry;
-    uint p = 0;
-    uint triangles = 0;
+    return h;
+}
+
+// The emissive entry whose list may hold cluster `cluster_id` on PTLAS instance
+// `instance_index`, the cluster's position `p` in it and the cluster's triangle count. False
+// where light sampling draws no point of the cluster.
+bool emitter_entry(LightSetGpu* set, uint instance_index, uint cluster_id, out uint entry, out uint p, out uint triangles)
+{
+    SceneRoot* s = set.scene;
+    entry = 0;
+    p = 0;
+    triangles = 0;
     uint producer;
     if (hit_producer(s, instance_index, producer))
     {
         ProducerBatch b = s.batches[producer];
         if (cluster_id >= emitted_clusters(b))
-            return h;
+            return false;
         entry = s.producers[producer].emissive;
         p = cluster_id;
         triangles = b.clusters[cluster_id].tri_count;
@@ -962,32 +992,36 @@ public EmitterHit emitter_hit(LightSetGpu* set, uint instance_index, uint cluste
     {
         uint copy;
         if (!hit_copy(s, instance_index, copy) || (copy & COPY_FAR) != 0)
-            return h;
+            return false;
         InstanceGpu inst = traced_record(s, copy);
         MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
         ClusterRef r = s.clusters[cluster_id];
         Cluster c = load_cluster(r.page, r.local);
         if (mesh.emissive.count == 0 || inst.first_emissive == NO_EMISSIVE)
-            return h;
+            return false;
         uint rank = mesh.emissive.ranks[c.section];
         if (rank >= inst.emissive_count)
-            return h;
+            return false;
         entry = inst.first_emissive + rank;
         p = list_position(set.emissive[entry], cluster_id, r.mesh_cluster);
         triangles = c.tri_count;
     }
-    EmissiveSelection e = set.emissive[entry];
-    TracedTriangle t;
-    if (p >= e.count || triangles == 0 || !traced_triangle(s, instance_index, cluster_id, primitive, false, t))
-        return h;
-    float3 n;
-    float area = traced_area(t, n);
-    float side = side_probability(s, t.material, back);
+    return p < set.emissive[entry].count && triangles > 0;
+}
+
+// The emitter hit at position `p` of emissive entry `entry`'s list, on one of its cluster's
+// `triangles` triangles, of section material `material`, render-space `area` and unit front-face
+// normal `n`, at render-space `point`, its back shown with `back`.
+EmitterHit emitter_on(LightSetGpu* set, uint entry, uint p, uint triangles, uint material, float area, float3 n, float3 point, bool back)
+{
+    SceneRoot* s = set.scene;
+    float side = side_probability(s, material, back);
+    EmitterHit h;
     h.light = s.light_capacity + entry;
     h.position = p;
-    h.point = traced_point(t, bary);
+    h.point = point;
     h.normal = back ? -n : n;
-    h.density = area > 0.0 ? list_step(e, p) / float(triangles) / area * side : 0.0;
+    h.density = area > 0.0 ? list_step(set.emissive[entry], p) / float(triangles) / area * side : 0.0;
     return h;
 }
 
