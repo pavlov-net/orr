@@ -87,6 +87,19 @@ public struct BsdfFit : IDifferentiable
     public float fold_fuzz;
 }
 
+// A direction a BSDF drew, before its value (`Bsdf.draw`).
+public struct BsdfDraw
+{
+    public bool drawn;          // a direction was drawn
+    public bool delta;          // of a delta lobe, which no evaluation gives a value
+    public float3 wi;           // world space, unit
+    float3 l;                   // in the BSDF's frame
+    uint lobe;
+    uint component;
+    float3 weight;              // a delta direction's coefficient
+    float within;               // and its probability within its lobe
+}
+
 public struct BsdfSample
 {
     public float3 wi;
@@ -366,10 +379,13 @@ public struct Bsdf : IDifferentiable
         return density;
     }
 
-    // One direction from three uniform numbers in [0, 1).
-    public BsdfSample sample(float3 u)
+    // The direction `sample` draws from three uniform numbers in [0, 1), before its value: a
+    // caller that evaluates other directions too evaluates it among them (`eval_and_pdf` at
+    // `wi`, unless it is `delta`) and makes the sample of it with `drawn_sample`, so its kernel
+    // holds the evaluation once.
+    public BsdfDraw draw(float3 u)
     {
-        BsdfSample r = no_sample();
+        BsdfDraw r = BsdfDraw();
         float x = u.x;
         uint k = pick(x);
         if (k == LOBES)
@@ -509,28 +525,53 @@ public struct Bsdf : IDifferentiable
         bool layered = k == COAT || k == FUZZ;
         if (!ok || (layered ? facing <= 0.0 : up ? l.z <= 0.0 : l.z >= 0.0))
             return r;
-        if (delta)
+        r.drawn = true;
+        r.delta = delta;
+        r.l = l;
+        r.wi = normalize(from_local(l, t, b, n));
+        r.lobe = delta ? (lobe & ~LOBE_GLOSSY) | LOBE_SPECULAR : lobe;
+        r.component = k;
+        r.weight = w;
+        r.within = within;
+        return r;
+    }
+
+    // The sample of drawn direction `d`: a delta one from its coefficient, another from the
+    // value `f`, density `pdf` and diffuse share `diffuse` the evaluation gave at `d.wi`.
+    public BsdfSample drawn_sample(BsdfDraw d, float3 f, float pdf, float3 diffuse)
+    {
+        BsdfSample r = no_sample();
+        if (!d.drawn)
+            return r;
+        if (d.delta)
         {
-            r.pdf = probability[k] * within;
-            r.weight = w / r.pdf;
-            lobe = (lobe & ~LOBE_GLOSSY) | LOBE_SPECULAR;
+            r.pdf = probability[d.component] * d.within;
+            r.weight = d.weight / r.pdf;
         }
         else
         {
-            float3 diffuse;
-            float3 f = evaluate(l, r.pdf, diffuse);
-            if (!(r.pdf > 0.0))
-            {
-                r.pdf = 0.0;
+            if (!(pdf > 0.0))
                 return r;
-            }
-            r.weight = f / r.pdf;
-            r.diffuse = diffuse / r.pdf;
+            r.pdf = pdf;
+            r.weight = f / pdf;
+            r.diffuse = diffuse / pdf;
         }
-        r.wi = normalize(from_local(l, t, b, n));
-        r.lobe = lobe;
-        r.component = k;
+        r.wi = d.wi;
+        r.lobe = d.lobe;
+        r.component = d.component;
         return r;
+    }
+
+    // One direction from three uniform numbers in [0, 1).
+    public BsdfSample sample(float3 u)
+    {
+        BsdfDraw d = draw(u);
+        float pdf = 0.0;
+        float3 diffuse = float3(0.0);
+        float3 f = float3(0.0);
+        if (d.drawn && !d.delta)
+            f = evaluate(d.l, pdf, diffuse);
+        return drawn_sample(d, f, pdf, diffuse);
     }
 
     // What a delta sample of `component` reaching `wi` has here: BSDF x cos over the

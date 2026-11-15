@@ -84,9 +84,11 @@ struct LightPick
 }
 
 // Draws the light candidates of the vertex at `position` with shading normal `normal`, weighed by
-// `b`: one directional light with the vertex's directional share, else `candidates` from its
-// pixel's tile. One sampler dimension and six per candidate, as `nee_draw`.
-LightPick pick_light(PathRoot r, Bsdf b, float3 position, float3 normal, uint2 pixel, uint candidates, inout Sampler rng)
+// `b`, where the vertex `estimates`: one directional light with the vertex's directional share,
+// else `candidates` from its pixel's tile. One sampler dimension and six per candidate, as
+// `nee_draw`. The same loop evaluates the direction `d` the vertex's scatter drew, into `f`, `pdf`
+// and `diffuse`, so the vertex holds the BSDF's evaluation once.
+LightPick pick_light(PathRoot r, Bsdf b, float3 position, float3 normal, uint2 pixel, uint candidates, bool estimates, BsdfDraw d, out float3 f, out float pdf, out float3 diffuse, inout Sampler rng)
 {
     LightSetGpu* set = r.set;
     LightPick k;
@@ -96,27 +98,45 @@ LightPick pick_light(PathRoot r, Bsdf b, float3 position, float3 normal, uint2 p
     k.target = 0.0;
     k.sum = 0.0;
     k.drawn = 0;
+    f = float3(0.0);
+    pdf = 0.0;
+    diffuse = float3(0.0);
     uint end = rng.dimension + 1 + 6 * candidates;
-    if (b.specular_only())
-    {
-        rng.dimension = end;
-        return k;
-    }
     NeeVertex v = nee_vertex(set, position, normal, pixel, nullptr);
-    bool directional = rng.next() < v.share;
-    k.drawn = directional ? 1 : candidates;
-    for (uint i = 0; i < k.drawn; i++)
+    bool directional = false;
+    if (estimates && !b.specular_only())
     {
-        ResolvedLightSample c;
-        if (directional)
-            c = nee_directional_candidate(set, v, rng);
-        else
-            c = nee_tile_candidate(set, v, rng);
-        float u = rng.next();
-        if (!(c.pdf > 0.0))
-            continue;
+        directional = rng.next() < v.share;
+        k.drawn = directional ? 1 : candidates;
+    }
+    uint own = d.drawn && !d.delta ? k.drawn : 0xffffffffu;
+    uint count = k.drawn + (own == k.drawn ? 1 : 0);
+    for (uint i = 0; i < count; i++)
+    {
+        ResolvedLightSample c = no_candidate();
+        float u = 0.0;
+        float3 dir = d.wi;
+        if (i != own)
+        {
+            if (directional)
+                c = nee_directional_candidate(set, v, rng);
+            else
+                c = nee_tile_candidate(set, v, rng);
+            u = rng.next();
+            if (!(c.pdf > 0.0))
+                continue;
+            dir = c.dir;
+        }
         float scatter_pdf;
-        float3 fc = b.eval_and_pdf(c.dir, scatter_pdf);
+        float3 share;
+        float3 fc = b.eval_and_pdf(dir, scatter_pdf, share);
+        if (i == own)
+        {
+            f = fc;
+            pdf = scatter_pdf;
+            diffuse = share;
+            continue;
+        }
         float target = luminance_rec2020(fc * c.radiance);
         float w = target / c.pdf;
         if (!(w > 0.0) || !isfinite(w))
@@ -209,9 +229,16 @@ void lean_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathHot start, P
     float run = nee_probability(r.set, g);
     float u_run = rng.next();
     uint candidates = first ? r.primary_candidates : r.bounce_candidates;
-    if (mode.count_nee && counted && candidates > 0 && u_run < run)
+    // The scatter's direction is drawn first: the light candidates' loop evaluates it with them.
+    float4 u = rng.next4();
+    float u_roulette = rng.next();
+    BsdfDraw drawn = b.draw(u.xyz);
+    float3 scatter_f;
+    float scatter_pdf;
+    float3 scatter_diffuse;
+    bool estimates = mode.count_nee && counted && candidates > 0 && u_run < run;
+    LightPick k = pick_light(r, b, g.position, g.normal, pixel, candidates, estimates, drawn, scatter_f, scatter_pdf, scatter_diffuse, rng);
     {
-        LightPick k = pick_light(r, b, g.position, g.normal, pixel, candidates, rng);
         if (k.sum > 0.0)
         {
             ResolvedLightSample l = k.chosen;
@@ -235,13 +262,9 @@ void lean_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathHot start, P
             }
         }
     }
-    else
-        rng.dimension += 1 + 6 * candidates;
 
     // The next ray.
-    float4 u = rng.next4();
-    float u_roulette = rng.next();
-    BsdfSample s = b.sample(u.xyz);
+    BsdfSample s = b.drawn_sample(drawn, scatter_f, scatter_pdf, scatter_diffuse);
     bool goes = s.pdf > 0.0 && sides_agree(g.normal, g.geometric_normal, s.wi);
     if (goes)
     {
