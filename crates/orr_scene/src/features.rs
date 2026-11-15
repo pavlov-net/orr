@@ -113,6 +113,9 @@ impl SceneFeatures {
     /// As [`Self::LOBE_FACTORS`], of a material of a linked type that may leave a hit to the
     /// standard surface.
     pub const LINKED_LOBE_FACTORS: Self = Self(1 << 37);
+    /// A material of a linked type that may leave a hit to the standard surface transmits by
+    /// its own weight.
+    pub const LINKED_TRANSMISSION_FACTORS: Self = Self(1 << 38);
     /// What a mesh keeps from the material it was built with, whatever the record holds now:
     /// once a record has shown one of these, the table keeps it.
     const BUILT: Self = Self(Self::LAYERS.0 | Self::COVERAGE.0);
@@ -141,6 +144,7 @@ impl SceneFeatures {
             (Self::LINKED_EMISSION_FACTORS, 1 << 13),
             (Self::LOBE_FACTORS, 1 << 14),
             (Self::LINKED_LOBE_FACTORS, 1 << 15),
+            (Self::LINKED_TRANSMISSION_FACTORS, 1 << 16),
         ] {
             if !self.contains(feature) {
                 ruled_out |= bit;
@@ -205,6 +209,10 @@ impl SceneFeatures {
             (emits && linked, Self::LINKED_EMISSION_FACTORS),
             (factors && !linked, Self::LOBE_FACTORS),
             (factors && linked, Self::LINKED_LOBE_FACTORS),
+            (
+                own & l::TRANSMISSION != 0 && linked,
+                Self::LINKED_TRANSMISSION_FACTORS,
+            ),
         ] {
             if on {
                 out |= bit;
@@ -372,7 +380,7 @@ mod tests {
         let solid = record(|m| m.flags = f::DIELECTRIC);
         assert!(!solid.contains(SceneFeatures::THIN_DIELECTRICS));
         // A plain scene rules every surface feature out; each one found sets its bit alone.
-        const DEFINED: u32 = 0b1111_1111_1110_1111;
+        const DEFINED: u32 = 0b1_1111_1111_1110_1111;
         assert_eq!(plain.surface_may(), !DEFINED);
         assert_eq!(vertex.surface_may(), !DEFINED | 1);
         assert_eq!(tiled.surface_may(), !DEFINED | 1 << 1);
@@ -408,6 +416,13 @@ mod tests {
             m.surface = 2;
         });
         assert_eq!(unlinked.surface_may() & DEFINED, 1 << 11 | 1 << 14);
+        // A linked record's transmission shows where its type leaves hits to the standard
+        // surface, which may be dielectrics.
+        let glass = record(|m| {
+            m.transmission_weight = 1.0;
+            m.surface = 1;
+        });
+        assert_eq!(glass.surface_may() & DEFINED, 1 << 11 | 1 << 16);
     }
 
     /// An emitter's light passes a coat or fuzz only while a record emits and a record has

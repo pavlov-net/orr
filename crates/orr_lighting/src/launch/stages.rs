@@ -354,15 +354,17 @@ impl Table {
             }
         };
         // Whether pin `pin` may shade a dielectric layer: the standard surface, any id, a linked
-        // type that declares its transmission, and one that leaves hits to the standard surface.
+        // type that declares its transmission, and one that leaves hits to the standard surface
+        // where such a type's records transmit by their own weights.
         let layers = may & MAY_LAYERS != 0;
+        let linked_transmits = may & may2(SceneFeatures::LINKED_TRANSMISSION_FACTORS) != 0;
         let transmits = |pin: u32| {
             if surfaces == 0 || pin <= 1 {
                 true
             } else {
                 let declared = kernels.surface_declares[pin as usize - 2];
-                declared & surface_declares::TRANSMISSION != 0
-                    || declared & surface_declares::ALWAYS_SHADES == 0
+                let falls_back = declared & surface_declares::ALWAYS_SHADES == 0;
+                declared & surface_declares::TRANSMISSION != 0 || falls_back && linked_transmits
             }
         };
         let producers = may & may2(SceneFeatures::PRODUCERS) != 0;
