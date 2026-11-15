@@ -79,6 +79,59 @@ fn an_albedo_one_sphere_in_a_uniform_environment_returns_the_environment() {
     assert_clean();
 }
 
+/// A first vertex of the pipeline path tracer draws a share of its candidates from its screen
+/// tile's local light sampler, through a callable of its own, with their densities in the mixture
+/// of the two and its shadow ray to the point the sampler drew: next-event estimation alone
+/// lights a glossy floor under a sphere and a rect light, neither in view, around the shadows a
+/// black sphere casts of them, as the staged loop's does.
+#[test]
+fn the_pipeline_draws_from_local_light_samplers_as_the_staged_loop_does() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    let nee = ViewLighting {
+        debug_view: LightingDebugView::NeeOnly,
+        ..ViewLighting::default()
+    };
+    assert!(nee.local_light_share > 0.0);
+    let (staged, launched) = both(&KernelSet::default(), nee);
+    let mut bed = Bed::with(Spec {
+        copies: vec![
+            Item {
+                model: GLOSSY_FLOOR,
+                linear: Mat3::IDENTITY,
+                at: Vec3::ZERO,
+            },
+            Item {
+                model: BLACK_SPHERE,
+                linear: Mat3::IDENTITY,
+                at: Vec3::new(0.0, 0.8, 0.2),
+            },
+        ],
+        lights: vec![
+            Light::Sphere {
+                position: DVec3::new(-0.6, 3.0, 0.5),
+                radius: 0.15,
+                intensity: Vec3::splat(40.0),
+                cone: None,
+            },
+            Light::Rect {
+                center: DVec3::new(0.6, 3.0, 0.5),
+                edge_x: Vec3::new(0.4, 0.0, 0.0),
+                edge_y: Vec3::new(0.0, 0.0, 0.3),
+                luminance: Vec3::splat(200.0),
+            },
+        ],
+        environment: None,
+        eye: Vec3::new(0.0, 1.0, 3.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        focus: None,
+    });
+    assert_pipeline_renders_as_staged("local lights", &mut bed, &staged, &launched);
+    assert_clean();
+}
+
 /// The pipeline path tracer renders opaque scenes as the staged loop does: a sphere on the ground
 /// under a sun and a sky, the Cornell box lit by its emissive quad, and an alpha-tested quad; and
 /// the box in the debug view of its first vertex's ray origin bias.

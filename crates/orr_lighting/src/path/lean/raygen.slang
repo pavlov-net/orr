@@ -28,8 +28,10 @@ import orr_lighting.path.lean.vertex;
 // The miss shaders: of a path's ray and of its shadow ray.
 public static const uint MISS_SCATTER = 0;
 public static const uint MISS_SHADOW = 1;
-// The callable that runs a path's first vertex from the G-buffer.
+// The callables: a path's first vertex from the G-buffer, and that vertex's draw of a candidate
+// from its local sampler, where paths may read one.
 public static const uint CALL_FIRST = 0;
+public static const uint CALL_LOCAL = 1;
 
 // Starts the path of `pixel` in hot words `at` on its camera ray, which its throughput
 // `throughput` rides: its first vertex is the G-buffer's surface, and a pixel whose G-buffer holds

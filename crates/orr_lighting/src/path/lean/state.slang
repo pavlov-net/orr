@@ -36,13 +36,16 @@ import orr_shaders.pipeline;
 // standard alpha test's any-hit likewise. They stand for the cold compile of the pipeline and the
 // weight of the shaders at run time, and what is left in either is not code held twice. A stage
 // made for producer entries, or for both kinds of geometry, adds what resolves a producer's
-// triangle. A stage made for a linked surface holds that surface's own code beside the standard
-// stage's: its size is the application's, so the host reports its part and holds it to the
-// pipeline's cap alone.
+// triangle. The caps hold orr's own code: what an application's linked types add to a stage (a
+// medium, an environment, a surface's own code in the stage made for it) is the application's,
+// so the host reports each part and holds it to the pipeline's cap alone.
 [Host] public static const uint HIT_INSTRUCTIONS = 46000;
 [Host] public static const uint ANY_HIT_INSTRUCTIONS = 4800;
 [Host] public static const uint PRODUCER_HIT_INSTRUCTIONS = 2000;
 [Host] public static const uint PRODUCER_ANY_HIT_INSTRUCTIONS = 800;
+// The callable that draws a first vertex's candidate from its local light sampler: a slot of
+// the sampler and a point on its light, through the light's own distribution.
+[Host] public static const uint SAMPLER_INSTRUCTIONS = 23000;
 [Host] public static const uint PIPELINE_INSTRUCTIONS = 1000000;
 
 // `PathHot.flags`.
