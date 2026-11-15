@@ -43,9 +43,9 @@ import orr_shaders.pipeline;
 [Host] public static const uint ANY_HIT_INSTRUCTIONS = 4800;
 [Host] public static const uint PRODUCER_HIT_INSTRUCTIONS = 2000;
 [Host] public static const uint PRODUCER_ANY_HIT_INSTRUCTIONS = 800;
-// The callable that draws a first vertex's candidate from its local light sampler: a slot of
-// the sampler and a point on its light, through the light's own distribution.
-[Host] public static const uint SAMPLER_INSTRUCTIONS = 23000;
+// What a hit holds more where the view's paths trace its camera rays, whose hits write the
+// view's G-buffer: the mode's alone, the hit of every other pipeline holds none of it.
+[Host] public static const uint TRACED_HIT_INSTRUCTIONS = 2800;
 [Host] public static const uint PIPELINE_INSTRUCTIONS = 1000000;
 
 // `PathHot.flags`.

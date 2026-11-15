@@ -83,6 +83,10 @@ public static const uint CACHE_TERMINATE = 1 << 0;
 // `PathRoot.light_flags`: the view dispatch counts each pixel's light feedback into the
 // scene's selection.
 public static const uint LIGHT_FEEDBACK_COUNT = 1 << 0;
+// The pipeline's paths trace the view's camera rays and their hits write its G-buffer:
+// `PathRoot.gbuffer` is the one in the view's raster state (`RasterGpu`), through whose targets
+// they write it.
+public static const uint LIGHT_TRACED_PRIMARY = 1 << 1;
 
 // `PathRoot.sss_flags`: only the first vertex walks.
 public static const uint SSS_PRIMARY_ONLY = 1 << 0;

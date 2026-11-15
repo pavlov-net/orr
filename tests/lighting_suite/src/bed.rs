@@ -1907,6 +1907,8 @@ impl Drop for Capture {
 pub struct Bed {
     pub spec: Spec,
     pub lighting: SceneLighting,
+    /// The frames' views are ones no raster draws, for paths that trace the camera rays.
+    traced_primary: bool,
     scenes: Scenes,
     scene: SceneId,
     history: ViewHistoryId,
@@ -2179,6 +2181,7 @@ impl Bed {
             frame,
             last_id: 0,
             last_root: GpuPtr::NULL,
+            traced_primary: false,
             last_overlay: None,
             light_writes: Vec::new(),
             proxy_writes: Vec::new(),
@@ -2773,7 +2776,11 @@ impl Bed {
             })
             .unwrap();
         }
-        let view = f.raster_view(&desc).unwrap();
+        let view = if self.traced_primary {
+            f.traced_view(&desc, &[]).unwrap()
+        } else {
+            f.raster_view(&desc).unwrap()
+        };
         let id = f.id();
         self.last_id = id;
         self.last_root = view.scene;
@@ -3007,6 +3014,8 @@ pub fn assert_within_noise(
 
 /// `frames` frames of `paths` on `bed` from seed `seed`.
 pub fn render_paths(bed: &mut Bed, paths: &Paths, frames: u32, seed: u32) -> Accumulated {
+    // Paths that trace the view's camera rays take a view no raster drew.
+    bed.traced_primary = paths.settings.traced_primary;
     bed.accumulate(frames, seed, &mut |list, f| paths.record(list, f))
 }
 

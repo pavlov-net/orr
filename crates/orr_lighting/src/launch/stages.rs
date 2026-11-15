@@ -17,10 +17,10 @@ use crate::mask_sets::Members;
 use crate::shaders::consts::{
     ANY_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE,
     PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
-    PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS, SAMPLER_INSTRUCTIONS,
+    PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
 };
 use crate::shaders::path::lean_paths;
-use crate::staged::{MAY_LOCAL, MAY_UPDATE, MAY_VIEW};
+use crate::staged::{MAY_TRACED, MAY_UPDATE, MAY_VIEW};
 use crate::{Error, KernelSet, module};
 
 /// The bit of `path_may2`, in the high word, that `feature` decides.
@@ -37,8 +37,6 @@ pub enum Role {
     Hit,
     /// An any-hit shader of a candidate that is not opaque.
     AnyHit,
-    /// The callable that draws a first vertex's candidate from its local light sampler.
-    Sampler,
 }
 
 /// The most instructions the stages of a pipeline may hand the driver together.
@@ -117,11 +115,14 @@ impl Spec {
         let (base, producer) = match self.role {
             Role::Raygen => return Some(RAYGEN_INSTRUCTIONS),
             Role::Miss => return Some(MISS_INSTRUCTIONS),
-            Role::Sampler => return Some(SAMPLER_INSTRUCTIONS),
             Role::Hit => (HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS),
             Role::AnyHit => (ANY_HIT_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS),
         };
-        Some(base + if producers { producer } else { 0 })
+        // A hit of a view's camera ray writes the view's G-buffer too.
+        let primary =
+            self.role == Role::Hit && self.geometry.is_some() && self.may & MAY_TRACED != 0;
+        let traced = if primary { TRACED_HIT_INSTRUCTIONS } else { 0 };
+        Some(base + if producers { producer } else { 0 } + traced)
     }
 
     fn constants(&self) -> ([u8; 32], &'static [SpecEntry]) {
@@ -144,8 +145,6 @@ struct Table {
     misses: [u32; 2],
     /// The callable of a path's first vertex.
     first: u32,
-    /// The callable of that vertex's local light sampler, where paths may read one.
-    local: Option<u32>,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
 }
@@ -197,8 +196,6 @@ impl Table {
             Self::stage(&mut specs, folded("miss_shadow", Role::Miss)),
         ];
         let first = Self::stage(&mut specs, folded("first_vertex", Role::Hit));
-        let local = (may & MAY_LOCAL != 0)
-            .then(|| Self::stage(&mut specs, folded("local_light", Role::Sampler)));
         // `hit_surface` of the hit shaders of each pin: any id, then each id from 0 on. Where
         // no surface links every material shows id 0.
         let pinned = |entry, role, pin: u32, geometry: Geometry| Spec {
@@ -271,7 +268,6 @@ impl Table {
             raygens,
             misses,
             first,
-            local,
             hit_groups,
             groups,
         }
@@ -460,11 +456,7 @@ impl PathPipeline {
             raygens: &records,
             misses: &table.misses.map(ShaderRecord::new),
             hit_groups: &table.hit_groups,
-            // In `raygen.slang`'s CALL_* order.
-            callables: &[
-                Some(ShaderRecord::new(table.first)),
-                table.local.map(ShaderRecord::new),
-            ],
+            callables: &[Some(ShaderRecord::new(table.first))],
             max_recursion: 1,
             flags: RayPipelineFlags::scene(device.caps()),
             threads,
@@ -531,10 +523,14 @@ mod tests {
     use super::*;
 
     /// A stage over its cap compiles for longer than a cold start may wait, whatever the scene
-    /// holds: the pipeline that may meet everything is the one a session runs.
+    /// holds: the pipeline that may meet everything is the one a session runs. It holds the
+    /// camera rays' hits, with their allowance; the same pipeline without them holds the plain
+    /// caps.
     #[test]
     fn the_stages_of_the_pipeline_that_may_meet_everything_hold_their_caps() {
-        let sizes = path_stage_sizes(&KernelSet::default(), u64::MAX).unwrap();
-        assert_eq!(over_cap(&sizes), None);
+        for may in [u64::MAX, !MAY_TRACED] {
+            let sizes = path_stage_sizes(&KernelSet::default(), may).unwrap();
+            assert_eq!(over_cap(&sizes), None, "{may:#x}");
+        }
     }
 }

@@ -28,10 +28,8 @@ import orr_lighting.path.lean.vertex;
 // The miss shaders: of a path's ray and of its shadow ray.
 public static const uint MISS_SCATTER = 0;
 public static const uint MISS_SHADOW = 1;
-// The callables: a path's first vertex from the G-buffer, and that vertex's draw of a candidate
-// from its local sampler, where paths may read one.
+// The callable that runs a path's first vertex from the G-buffer.
 public static const uint CALL_FIRST = 0;
-public static const uint CALL_LOCAL = 1;
 
 // Starts the path of `pixel` in hot words `at` on its camera ray, which its throughput
 // `throughput` rides: its first vertex is the G-buffer's surface, and a pixel whose G-buffer holds
@@ -87,21 +85,28 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags)
 }
 
 // Traces the ray in hot words `at`, whose first word is `w0`, and runs the shader of what it met.
-// A camera ray, which a sky pixel alone traces, has no length.
+// A camera ray has no length where the path starts on the G-buffer's surface, which a sky pixel
+// alone traces it on; where the view's paths trace their camera rays it is the ray the camera
+// sees along, and its hit a primary one.
 void trace_ray(PathRoot r, uint slot, uint4* at, uint4 w0)
 {
     uint4 w1 = load_coherent(at + 1);
     float2 cone = halves(load_coherent(at + 2).x);
     bool camera = (w0.w & HOT_CAMERA) != 0;
+    bool primary = camera && traces_primary(r);
+    uint mask = primary ? MASK_CAMERA : MASK_OPAQUE;
+    // What the camera sees of an alpha-tested triangle is its coverage itself; a scattered
+    // ray takes the micromap's two states for it.
+    uint flags = primary ? RAY_FLAG_NONE : RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE;
     uint depth = (w0.w >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK;
     uint2 pixel = item_pixel(r, r.slice_base + slot);
     RayCone c = { cone.x, cone.y };
     uint seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x;
-    PathCover cover = new_path_cover(MASK_OPAQUE, COVER_ALPHA, PRESENCE_NONE, pcg(seed ^ depth),
-        hit_context(HIT_SECONDARY, depth, c, 0.0, float2(-1.0), texture_feedback_drawn(pixel, r.frame)));
+    PathCover cover = new_path_cover(mask, COVER_ALPHA, PRESENCE_NONE, pcg(seed ^ depth),
+        hit_context(primary ? HIT_PRIMARY : HIT_SECONDARY, depth, c, 0.0, float2(-1.0), texture_feedback_drawn(pixel, r.frame)));
     Payload p;
     p.words = path_payload(cover);
-    Traced h = trace_hit(r.scene.tlas, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, MASK_OPAQUE, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), camera ? 0.0 : positive_infinity()), p);
+    Traced h = trace_hit(r.scene.tlas, flags, mask, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), camera && !primary ? 0.0 : positive_infinity()), p);
     if (h.hit())
     {
         reorder_invoke(h, p);
@@ -151,20 +156,26 @@ public void lean_paths(PathRoot r)
     uint4* record = lean_record(r, slot);
     StoredViewLights lights = { NO_LIGHT, 0.0, pcg3d(uint3(pixel, r.frame ^ path_stream(r))).x, 0.0 };
     store_coherent(record, reinterpret<uint4>(lights));
-    float depth = r.gbuffer.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
     float3 radiance = float3(0.0);
+    // Where the paths trace the view's camera rays every pixel's is traced: its hit writes the
+    // G-buffer and the record's distance, and takes the view's share of pixels on from there.
+    bool traced = traces_primary(r);
+    float depth = 0.0;
+    if (!traced)
+        depth = r.gbuffer.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
+    bool surface = !traced && depth > 0.0;
     // A surface's path runs on the view's share of pixels; the sky shows in all.
-    if (depth == 0.0 || runs_path(r, pixel))
+    if (traced || depth == 0.0 || runs_path(r, pixel))
     {
-        start_path(r, pixel, at, depth > 0.0 ? 1.0 / r.pixel_fraction : 1.0);
-        run_path(r, slot, at, depth > 0.0);
+        start_path(r, pixel, at, surface ? 1.0 / r.pixel_fraction : 1.0);
+        run_path(r, slot, at, surface);
         radiance = asfloat(load_coherent(at + 3).xyz);
         lights = reinterpret<StoredViewLights>(load_coherent(record));
     }
     float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
-    float first_distance = depth > 0.0 ? length(view_position(v, uv, depth)) : 0.0;
+    float first_distance = traced ? lights.first_distance : surface ? length(view_position(v, uv, depth)) : 0.0;
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
-    r.radiance.get<RWTexture2D<float4>>()[pixel] = float4(apply_hdr_ceiling(pre_exposure * radiance), depth > 0.0 ? 1.0 : 0.0);
+    r.radiance.get<RWTexture2D<float4>>()[pixel] = float4(apply_hdr_ceiling(pre_exposure * radiance), first_distance > 0.0 ? 1.0 : 0.0);
     r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(lights.feedback, asuint(first_distance));
     if ((r.light_flags & LIGHT_FEEDBACK_COUNT) != 0 && lights.feedback != NO_LIGHT)
         count_feedback(r.set, lights.feedback);

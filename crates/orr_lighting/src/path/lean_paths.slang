@@ -1,7 +1,7 @@
 // The lean path tracer's stages (`path.lean`): the raygens of a view's paths and of its update
-// paths, the callable of a path's first vertex and the one that draws its local sampler's
-// candidates, the hit shader of a plain opaque surface, the any-hit shaders of a path's ray and
-// of its shadow ray at a candidate that is not opaque, and the miss shaders of the two.
+// paths, the callable of a path's first vertex, the hit shader of a plain opaque surface, the
+// any-hit shaders of a path's ray and of its shadow ray at a candidate that is not opaque, and
+// the miss shaders of the two.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_shaders.trace;
@@ -46,27 +46,11 @@ void updates()
     lean_updates(root);
 }
 
-// The first vertex's local sampler candidates, each a call of `local_light`.
-struct CalledLocal : ILocalDraw
-{
-    static void draw(inout LocalDraw d)
-    {
-        call(CALL_LOCAL, d);
-    }
-}
-
 [shader("callable")]
 void first_vertex(inout Payload p)
 {
     ORR_OMM(first_vertex);
-    lean_first<Medium, CalledLocal>(root, DispatchRaysIndex().x);
-}
-
-[shader("callable")]
-void local_light(inout LocalDraw d)
-{
-    ORR_OMM(local_light);
-    lean_local<Surface>(root, DispatchRaysIndex().x, d);
+    lean_first<Medium>(root, DispatchRaysIndex().x);
 }
 
 [shader("anyhit")]

@@ -171,6 +171,23 @@ public float3 view_from_relative(ViewConstants* v, float3 x)
     return mul(v.view_from_world_rotation, float4(x, 0.0));
 }
 
+// Previous uv minus current uv of a direction `d` at infinity.
+public float2 sky_motion(ViewConstants* v, float3 d)
+{
+    float4 cur = mul(v.clip_from_view, float4(view_from_relative(v, d), 0.0));
+    float4 prev = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(d, 0.0)), 0.0));
+    return motion_between(prev, cur);
+}
+
+// Previous uv minus current uv of a point `relative` to the eye that did not move.
+public float2 still_motion(ViewConstants* v, float3 relative)
+{
+    float4 current = mul(v.clip_from_view, float4(view_from_relative(v, relative), 1.0));
+    float3 prev_relative = relative + v.eye_motion.xyz;
+    float4 previous = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(prev_relative, 0.0)), 1.0));
+    return motion_between(previous, current);
+}
+
 // Reverse-Z device depth of render-space point `p`, as the jittered projection places it.
 public float device_depth(ViewConstants* v, float3 p)
 {

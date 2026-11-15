@@ -20,6 +20,7 @@ import orr_scene.lights;
 import orr_scene.surface;
 import orr_scene.candidates;
 import orr_scene.gbuffer;
+import orr_scene.visibility;
 import orr_lighting.bsdf;
 import orr_lighting.media;
 import orr_lighting.environment;
@@ -71,42 +72,65 @@ public bool lean_counted(PathRoot r, uint scattered)
     return mode == PATH_DIRECT ? scattered == 0 : mode == PATH_INDIRECT ? scattered > 0 : mode != PATH_SUBSURFACE;
 }
 
-// What a first vertex hands the stage that draws its local sampler's candidate, and takes back:
-// the vertex's position, the sampler dimension the draw starts at and the vertex's directional
-// share; then the candidate's point on its light and distance, or its direction where it lies at
-// infinity, its radiance and density, and its kind, light and position in its light's list.
-public struct LocalDraw
+// Whether the view's paths trace their camera rays, whose hits are their first vertices and
+// write the view's G-buffer.
+public bool traces_primary(PathRoot r)
 {
-    public uint4 words[3];
+    return may(MAY_TRACED) && (r.light_flags & LIGHT_TRACED_PRIMARY) != 0;
 }
 
-// How a path's first vertex gets a candidate of its screen tile's local sampler, whose code a
-// vertex's own stage leaves to another.
-public interface ILocalDraw
+// Writes the hit `sh` of `slot`'s camera ray along `dir` as `pixel`'s G-buffer surface, as the
+// material resolve writes a rastered one: the visibility word, naming the pixel's own visible
+// cluster, the surface's words, its motion and its depth, into the HZB's mip 0 too, which is
+// the G-buffer's depth until the depth target is drawn from it; and into the path's record the
+// surface's distance from the eye. The motion is that of a point that stood still: a hit holds
+// no positions of the frame before.
+void write_primary(PathRoot r, uint slot, uint2 pixel, SurfaceHit sh)
 {
-    static void draw(inout LocalDraw d);
-}
-
-// Of a vertex that draws none.
-public struct NoLocalDraw : ILocalDraw
-{
-    public static void draw(inout LocalDraw d)
+    RasterGpu* raster = (RasterGpu*)r.gbuffer;
+    ViewConstants* v = r.view;
+    GSurface g = sh.surface;
+    float3 relative = g.position - v.eye_render.xyz;
+    uint4* record = lean_record(r, slot);
+    StoredViewLights lights = reinterpret<StoredViewLights>(load_coherent(record));
+    lights.first_distance = length(relative);
+    store_coherent(record, reinterpret<uint4>(lights));
+    uint index = pixel.y * raster.gbuffer.extent.x + pixel.x;
+    float depth = device_depth(v, g.position);
+    // The view's list holds an entry per pixel unless memory was short for it, where the pixel
+    // reads as one with no geometry.
+    if (index < raster.visible_capacity)
     {
+        VisibleCluster vc = { nullptr, g.instance, g.cluster, 0, g.material };
+        raster.gbuffer.clusters[index] = vc;
+        raster.gbuffer.visibility[index] = visibility_word(depth, index, g.primitive);
     }
+    g.raster_error = sh.geometric_error;
+    g.bsdf.emission = apply_hdr_ceiling(g.bsdf.emission * v.exposure[v.exposure_slot].pre_exposure);
+    GBufferWords words = encode_gsurface(g, raster.x.index != IMAGE_NONE);
+    uint flags = words.a.w >> 24;
+    raster.a.get<RWTexture2D<uint4>>()[pixel] = words.a;
+    raster.b.get<RWTexture2D<uint2>>()[pixel] = words.b;
+    if ((flags & GBUFFER_EXTENDED) != 0)
+        raster.x.get<RWTexture2D<uint4>>()[pixel] = words.x;
+    if ((flags & GBUFFER_LAYERS) != 0)
+        raster.y.get<RWTexture2D<uint4>>()[pixel] = words.y;
+    raster.motion.get<RWTexture2D<float2>>()[pixel] = still_motion(v, relative);
+    raster.depth[index] = depth;
+    raster.hzb[0].get<RWTexture2D<float>>()[pixel] = depth;
 }
 
-// The candidate that `slot`'s path's first vertex asks of its pixel's local sampler in `d`,
-// through surface `S`, in the vertex's whole mixture of directional share `share`.
-public void lean_local<S : ISurfaces>(PathRoot r, uint slot, inout LocalDraw d)
+// Writes `pixel` as one whose camera ray along `dir` met nothing, as the material resolve writes
+// a pixel nothing was rastered on.
+void write_primary_sky(PathRoot r, uint2 pixel, float3 dir)
 {
-    uint2 pixel = item_pixel(r, r.slice_base + slot);
-    Sampler rng = path_sampler(r, pixel);
-    rng.dimension = d.words[0].w;
-    NeeVertex v = { asfloat(d.words[0].xyz), float3(0.0), pixel, pixel_local_lights(r, pixel), asfloat(d.words[1].x), 0.0 };
-    ResolvedLightSample c = nee_local_candidate<S>(r.set, v, rng);
-    d.words[0] = uint4(asuint(isfinite(c.distance) ? c.point : c.dir), asuint(c.distance));
-    d.words[1] = uint4(asuint(c.radiance), asuint(c.pdf));
-    d.words[2] = uint4(c.kind, c.light, c.position, 0);
+    RasterGpu* raster = (RasterGpu*)r.gbuffer;
+    uint index = pixel.y * raster.gbuffer.extent.x + pixel.x;
+    raster.a.get<RWTexture2D<uint4>>()[pixel] = uint4(0);
+    raster.b.get<RWTexture2D<uint2>>()[pixel] = uint2(0);
+    raster.motion.get<RWTexture2D<float2>>()[pixel] = sky_motion(r.view, dir);
+    raster.depth[index] = 0.0;
+    raster.hzb[0].get<RWTexture2D<float>>()[pixel] = 0.0;
 }
 
 // The winner of a vertex's light candidates, resampled by unshadowed luminance as they are drawn:
@@ -123,11 +147,12 @@ struct LightPick
 
 // Draws the light candidates of the vertex at `position` with shading normal `normal`, weighed by
 // `b`, where the vertex `estimates`: one directional light with the vertex's directional share,
-// else `candidates` from its pixel's tile, and at a path's first vertex (`FIRST`) its screen
-// tile's local sampler for that sampler's share of them, through `L`. One sampler dimension and
-// six per candidate, as `nee_draw`. The same loop evaluates the direction `d` the vertex's
-// scatter drew, into `f`, `pdf` and `diffuse`, so the vertex holds the BSDF's evaluation once.
-LightPick pick_light<L : ILocalDraw, let FIRST : uint>(PathRoot r, Bsdf b, float3 position, float3 normal, uint2 pixel, uint candidates, bool estimates, BsdfDraw d, out float3 f, out float pdf, out float3 diffuse, inout Sampler rng)
+// else `candidates` from its pixel's tile, and at a path's `first` vertex on the G-buffer's
+// surface (`FIRST` 1) the points this frame drew of its screen tile's local sampler for that
+// sampler's share of them; a hit's stage holds none of that. One sampler dimension and six per
+// candidate, as `nee_draw`. The same loop evaluates the direction `d` the vertex's scatter drew,
+// into `f`, `pdf` and `diffuse`, so the vertex holds the BSDF's evaluation once.
+LightPick pick_light<let FIRST : uint>(PathRoot r, Bsdf b, float3 position, float3 normal, uint2 pixel, uint candidates, bool estimates, bool first, BsdfDraw d, out float3 f, out float pdf, out float3 diffuse, inout Sampler rng)
 {
     LightSetGpu* set = r.set;
     LightPick k;
@@ -142,7 +167,8 @@ LightPick pick_light<L : ILocalDraw, let FIRST : uint>(PathRoot r, Bsdf b, float
     diffuse = float3(0.0);
     uint end = rng.dimension + 1 + 6 * candidates;
     NeeVertex v = nee_vertex(set, position, normal, pixel, nullptr);
-    if (FIRST != 0 && may(MAY_LOCAL))
+    bool local = FIRST == 1 && first && may(MAY_LOCAL);
+    if (local)
         v.local = pixel_local_lights(r, pixel);
     bool directional = false;
     if (estimates && !b.specular_only())
@@ -161,36 +187,8 @@ LightPick pick_light<L : ILocalDraw, let FIRST : uint>(PathRoot r, Bsdf b, float
         {
             if (directional)
                 c = nee_directional_candidate(set, v, rng);
-            else if (FIRST != 0 && may(MAY_LOCAL) && v.local != nullptr)
-            {
-                // The tile's draw leaves the dimension of the choice between the two unread.
-                float choice = rng.next();
-                rng.dimension--;
-                if (choice < v.local.share)
-                {
-                    LocalDraw draw;
-                    draw.words[0] = uint4(asuint(position), rng.dimension + 1);
-                    draw.words[1] = uint4(asuint(v.share), 0, 0, 0);
-                    draw.words[2] = uint4(0);
-                    L.draw(draw);
-                    rng.dimension += 5;
-                    c.distance = asfloat(draw.words[0].w);
-                    if (isfinite(c.distance))
-                    {
-                        c.point = asfloat(draw.words[0].xyz);
-                        c.dir = (c.point - position) / c.distance;
-                    }
-                    else
-                        c.dir = asfloat(draw.words[0].xyz);
-                    c.radiance = asfloat(draw.words[1].xyz);
-                    c.pdf = asfloat(draw.words[1].w);
-                    c.kind = draw.words[2].x;
-                    c.light = draw.words[2].y;
-                    c.position = draw.words[2].z;
-                }
-                else
-                    c = nee_shared_tile_candidate(set, v, rng);
-            }
+            else if (local && v.local != nullptr)
+                c = nee_local_tile_candidate(set, v, rng);
             else
                 c = nee_tile_candidate(set, v, rng);
             u = rng.next();
@@ -227,17 +225,30 @@ LightPick pick_light<L : ILocalDraw, let FIRST : uint>(PathRoot r, Bsdf b, float
 
 // The vertex `x` of `slot`'s path, whose hot words are `at`, reached along `dir` by a ray `t` m
 // long whose cone there is `cone`, in a medium `M`: the rest of the vertex past its surface, which
-// the shader of a plain opaque hit runs and, for a path's first vertex (`FIRST`), the callable that
-// takes it from the G-buffer, which draws its local sampler's candidates through `L`. The path's
-// state is loaded here, past the surface's evaluation, which holds enough of its own.
-void lean_vertex<M : IMedium, L : ILocalDraw, let FIRST : uint>(PathRoot r, uint slot, uint4* at, PathVertex x, float3 dir, float t, float2 cone)
+// the shader of a plain opaque hit runs and, for a path's first vertex, the callable that takes it
+// from the G-buffer. `FIRST` says where the vertex is its path's first: 1 always, the
+// callable's, and 2 where its ray is the camera's, a hit's, which a view that traces its camera
+// rays has. The path's state is loaded here, past the surface's evaluation, which holds enough
+// of its own.
+void lean_vertex<M : IMedium, let FIRST : uint>(PathRoot r, uint slot, uint4* at, PathVertex x, float3 dir, float t, float2 cone)
 {
-    bool first = FIRST != 0;
     PathHot p = load_hot(at);
+    bool first = FIRST == 1 || (FIRST == 2 && may(MAY_TRACED) && (p.flags & HOT_CAMERA) != 0);
     // Whether light along the ray counts, as the vertex it left had it.
     bool along = (p.flags & HOT_COUNTED) != 0;
     p.flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
+    // A traced camera ray's path runs on the view's share of pixels, as one that starts on the
+    // G-buffer's surface does.
+    if (FIRST == 2 && first)
+    {
+        if (!runs_path(r, pixel))
+        {
+            store_hot(at, p);
+            return;
+        }
+        p.throughput /= r.pixel_fraction;
+    }
     GSurface g = x.surface;
     Sampler rng = path_sampler(r, pixel);
     rng.dimension = p.dimension();
@@ -313,7 +324,7 @@ void lean_vertex<M : IMedium, L : ILocalDraw, let FIRST : uint>(PathRoot r, uint
     float scatter_pdf;
     float3 scatter_diffuse;
     bool estimates = mode.count_nee && counted && candidates > 0 && u_run < run;
-    LightPick k = pick_light<L, FIRST>(r, b, g.position, g.normal, pixel, candidates, estimates, drawn, scatter_f, scatter_pdf, scatter_diffuse, rng);
+    LightPick k = pick_light<FIRST>(r, b, g.position, g.normal, pixel, candidates, estimates, first, drawn, scatter_f, scatter_pdf, scatter_diffuse, rng);
     {
         if (k.sum > 0.0)
         {
@@ -392,13 +403,16 @@ public void lean_hit<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>
         store_coherent(at, uint4(w0.xyz, w0.w & ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA)));
         return;
     }
-    lean_vertex<M, NoLocalDraw, 0>(r, slot, at, hit_vertex(r.view, sh, dir), dir, t, float2(cone_width(cone, t), cone.spread));
+    // A view that traces its camera rays marks them by their context.
+    if (may(MAY_TRACED) && c.context.kind == HIT_PRIMARY && traces_primary(r))
+        write_primary(r, slot, pixel, sh);
+    lean_vertex<M, 2>(r, slot, at, hit_vertex(r.view, sh, dir), dir, t, float2(cone_width(cone, t), cone.spread));
 }
 
 // The first vertex of `slot`'s path, on the G-buffer's surface of its pixel: the raster's
 // surface, which the scene's ray tracing geometry need not hold, so no ray finds it. The callable
-// a path starts with; `L` draws its local sampler's candidates.
-public void lean_first<M : IMedium, L : ILocalDraw>(PathRoot r, uint slot)
+// a path starts with.
+public void lean_first<M : IMedium>(PathRoot r, uint slot)
 {
     uint4* at = lean_hot(r, slot);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
@@ -410,7 +424,7 @@ public void lean_first<M : IMedium, L : ILocalDraw>(PathRoot r, uint slot)
         return;
     }
     RayCone cone = camera_cone(r.view);
-    lean_vertex<M, L, 1>(r, slot, at, x, -x.view, x.camera_distance, float2(cone_width(cone, x.camera_distance), cone.spread));
+    lean_vertex<M, 1>(r, slot, at, x, -x.view, x.camera_distance, float2(cone_width(cone, x.camera_distance), cone.spread));
 }
 
 // Adds to a view path's record that light `id` gave it `contribution` of luminance.
@@ -434,6 +448,8 @@ public void lean_miss<M : IMedium>(PathRoot r, uint slot)
     LeanMode mode = lean_mode(r);
     bool camera = (p.flags & HOT_CAMERA) != 0;
     p.flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA);
+    if (camera && traces_primary(r))
+        write_primary_sky(r, item_pixel(r, r.slice_base + slot), p.dir);
     if ((p.flags & HOT_COUNTED) != 0 && (mode.count_bsdf || camera))
     {
         bool weigh = !mode.one_technique && p.pdf > 0.0;

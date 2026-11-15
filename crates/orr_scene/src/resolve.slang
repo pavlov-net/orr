@@ -26,14 +26,6 @@ ORR_ROOT(RasterRoot);
 
 groupshared uint bins_used[8];
 
-// Previous uv minus current uv of a direction at infinity.
-float2 sky_motion(ViewConstants* v, float3 d)
-{
-    float4 cur = mul(v.clip_from_view, float4(view_from_relative(v, d), 0.0));
-    float4 prev = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(d, 0.0)), 0.0));
-    return motion_between(prev, cur);
-}
-
 uint surface_bin(RasterGpu* r, uint surface)
 {
     return surface < r.bins ? surface : 0;

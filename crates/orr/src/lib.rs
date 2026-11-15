@@ -1555,9 +1555,20 @@ impl<'a> Frame<'a> {
                 .restart_exposure(view.history, output.exposure.start())?;
             state.output.exposure_restarted(id);
         }
-        let raster = self
-            .scenes
-            .raster_view_with(&desc, &requests, hooks.opaque.as_deref_mut())?;
+        // The pipeline's paths may trace the view's camera rays in place of the raster.
+        let traces_primary = lighting.traced_primary && self.lighting.entry == PathEntry::Pipeline;
+        let raster = if traces_primary {
+            if hooks.opaque.is_some() {
+                return Err(orr_lighting::Error::Settings(
+                    "a view whose paths trace its camera rays draws no opaque hook",
+                )
+                .into());
+            }
+            self.scenes.traced_view(&desc, &requests)?
+        } else {
+            self.scenes
+                .raster_view_with(&desc, &requests, hooks.opaque.as_deref_mut())?
+        };
         let gpu = self.output.device.clone();
         if let Some(at) = take_probe(&mut self.probes, view.history) {
             let probe = ProbeAt {
@@ -1650,6 +1661,11 @@ impl<'a> Frame<'a> {
                 paths.radiance_storage(),
                 paths.extent(),
             )?;
+        }
+        // The passes from here on test against the depth target, which a traced view draws
+        // from what its paths' hits wrote.
+        if traces_primary {
+            self.scenes.finish_traced_view(&raster)?;
         }
         let mut overlay = None;
         if let Some(hook) = hooks.transparency.as_mut() {

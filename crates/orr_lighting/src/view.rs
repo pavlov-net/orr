@@ -35,8 +35,8 @@ use crate::staged::{
     MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION,
     MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS,
     MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES, MAY_REFERENCE, MAY_SMOKE, MAY_STACK,
-    MAY_SUBSURFACE, MAY_WALK, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, Source, SourcePaths, Stage,
-    StageSet, StagedKernels, StagedMemory, StateParts, UPDATE_FEATURES,
+    MAY_SUBSURFACE, MAY_TRACED, MAY_WALK, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, Source,
+    SourcePaths, Stage, StageSet, StagedKernels, StagedMemory, StateParts, UPDATE_FEATURES,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::support::{Masked, MaskedFrame, MaskedSupport, Runs};
@@ -99,6 +99,12 @@ pub struct ViewLighting {
     /// them apart; through the ray tracing pipeline, each source's launches ("view paths",
     /// "update paths", "caustic photons") and the caustic resolve.
     pub stage_passes: bool,
+    /// The pipeline path tracer's paths trace the view's camera rays, and their hits, the paths'
+    /// first vertices, write the view's G-buffer: the pass's raster state is of a view no
+    /// raster drew ([`orr_scene::Frame::traced_view`]). The motion they write is the camera's
+    /// alone, the hits see the scene's ray tracing geometry and not its drawn entries, and the
+    /// local light samplers, which read the G-buffer before the paths, are off.
+    pub traced_primary: bool,
 }
 
 impl Default for ViewLighting {
@@ -120,6 +126,7 @@ impl Default for ViewLighting {
             reference: None,
             specialize: true,
             stage_passes: false,
+            traced_primary: false,
         }
     }
 }
@@ -303,6 +310,8 @@ const LOCAL_TILE: u32 = 16;
 
 /// `path`'s `LIGHT_FEEDBACK_COUNT`.
 const LIGHT_FEEDBACK_COUNT: u32 = 1;
+/// `path`'s `LIGHT_TRACED_PRIMARY`.
+const LIGHT_TRACED_PRIMARY: u32 = 2;
 
 /// Bounces from which Russian roulette may end a path: after the first, or 64 in the
 /// reference.
@@ -1060,6 +1069,7 @@ struct SupportKernels {
     overlay_resolve: ComputePipeline,
     local: ComputePipeline,
     refine: ComputePipeline,
+    presample: ComputePipeline,
     media: MediaKernels,
     /// The guide resolve, the layer guides, the froxels' light pass and media apply, made for
     /// what a scene may hold when a view first runs them.
@@ -1070,7 +1080,7 @@ struct SupportKernels {
 impl SupportKernels {
     /// Its own pipelines that every scene runs alike, in the order [`Self::assemble`] takes
     /// them; [`MediaKernels`]' follow.
-    const PIPELINES: [CompilePipeline; 7] = [
+    const PIPELINES: [CompilePipeline; 8] = [
         |d, k| pipeline(d, k, &tiles::MODULE, "tiles"),
         |d, k| pipeline(d, k, &tiles::MODULE, "args"),
         |d, k| pipeline(d, k, &frost::MODULE, "main"),
@@ -1078,6 +1088,7 @@ impl SupportKernels {
         |d, k| pipeline(d, k, &overlay_front::MODULE, "resolve"),
         |d, k| pipeline(d, k, &local::MODULE, "main"),
         |d, k| pipeline(d, k, &local::MODULE, "refine"),
+        |d, k| pipeline(d, k, &local::MODULE, "presample"),
     ];
 
     /// Every pipeline of the support kernels.
@@ -1106,6 +1117,7 @@ impl SupportKernels {
             overlay_resolve: next(),
             local: next(),
             refine: next(),
+            presample: next(),
             media: MediaKernels::new(device, kernels, &mut pipelines)?,
             masked,
             subsurface_table: SubsurfaceTable::new(device)?,
@@ -1535,6 +1547,7 @@ fn root_may(root: &PathRoot) -> u64 {
         | bit(flag(DIELECTRIC_FROST), MAY_FROST)
         | bit(root.aperture_radius > 0.0, MAY_LENS)
         | bit(root.local != GpuPtr::NULL, MAY_LOCAL)
+        | bit(root.light_flags & LIGHT_TRACED_PRIMARY != 0, MAY_TRACED)
         | bit(root.froxels != GpuPtr::NULL, MAY_FROXELS)
         | bit(root.cache_flags & CACHE_TERMINATE != 0, MAY_CACHE)
 }
@@ -1562,9 +1575,10 @@ fn path_mode(lighting: &ViewLighting) -> u32 {
 }
 
 /// The share of a view's first-vertex candidates its local light samplers draw: 0 under the
-/// reference, which has none.
+/// reference, which has none, and where the paths trace the camera rays, whose samplers would
+/// read a G-buffer the paths have yet to write.
 fn local_share(lighting: &ViewLighting) -> f32 {
-    if lighting.reference.is_some() {
+    if lighting.reference.is_some() || lighting.traced_primary {
         0.0
     } else {
         lighting.local_light_share.clamp(0.0, MAX_LOCAL_LIGHT_SHARE)
@@ -1723,6 +1737,7 @@ fn predict(
         | bit(reference, MAY_REFERENCE)
         | bit(needs.frosted_glass, MAY_FROST)
         | bit(local_share(lighting) > 0.0, MAY_LOCAL)
+        | bit(lighting.traced_primary, MAY_TRACED)
         | bit(!reference, MAY_CACHE);
     PathMay {
         view: background | bit(path_mode(lighting) != 0, MAY_DEBUG),
@@ -2156,6 +2171,7 @@ impl LightingKernels {
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         let local_share = local_share(lighting);
         let local = local_share > 0.0;
+        let presampled = matches!(self.paths, Paths::Pipeline(_));
         let written = view.feedback_index;
         view.feedback_index = 1 - written;
         view.feedback[written].tables = scene.light_tables();
@@ -2182,6 +2198,11 @@ impl LightingKernels {
             list.dispatch(&self.support.local, root, [w, h, 1]);
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
             list.dispatch(&self.support.refine, root, [w, h, 1]);
+            // The pipeline's first vertices read each sampler's points ready drawn.
+            if presampled {
+                list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+                list.dispatch(&self.support.presample, root, [w, h, 1]);
+            }
             list.end_pass();
             list.barrier(
                 Stages::COMPUTE,
@@ -2258,7 +2279,13 @@ impl LightingKernels {
         let path_root = PathRoot {
             scene: pass.scene,
             view: pass.view,
-            gbuffer: pass.gbuffer,
+            // A view whose paths trace its camera rays hands them the G-buffer inside its
+            // raster state, which the state begins with.
+            gbuffer: if lighting.traced_primary {
+                pass.raster.cast()
+            } else {
+                pass.gbuffer
+            },
             set: scene.light_set(),
             cache: scene.world_cache(pass.frame),
             local: if local {
@@ -2281,7 +2308,12 @@ impl LightingKernels {
             update_block: block,
             feedback: view.feedback[written].target.store,
             local_columns: view.local_tiles[0],
-            light_flags: if reference { 0 } else { LIGHT_FEEDBACK_COUNT },
+            light_flags: if reference { 0 } else { LIGHT_FEEDBACK_COUNT }
+                | if lighting.traced_primary {
+                    LIGHT_TRACED_PRIMARY
+                } else {
+                    0
+                },
             layers: view.layers.gpu(),
             froxels,
             dielectric_depth: dielectric_depth(lighting),
@@ -2555,6 +2587,10 @@ impl LightingKernels {
             list.begin_pass("update paths", false);
         }
         if update > 0 {
+            // Update paths start on the G-buffer, which the view paths' camera rays wrote.
+            if lighting.traced_primary {
+                list.barrier(Stages::RAY, Stages::RAY, Hazards::empty());
+            }
             let update_root = PathRoot {
                 source: PATH_SOURCE_UPDATE,
                 features: 0,
