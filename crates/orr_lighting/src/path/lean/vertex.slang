@@ -134,31 +134,14 @@ LightPick pick_light(PathRoot r, Bsdf b, float3 position, float3 normal, uint2 p
     return k;
 }
 
-// The whole vertex of a plain opaque hit `h` of `slot`'s ray, invoked with the ray's cover
-// `payload`, through surface `S` with its section material from `material`, in a medium `M`:
-// what the hit shader of such a surface runs.
-public void lean_hit<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>(PathRoot r, uint slot, uint4 payload, T material, H h)
+// The vertex `x` of `slot`'s path, whose hot words `at` hold `p`, reached along `dir` by a ray `t` m
+// long whose cone there is `cone`, in a medium `M`: the rest of the vertex past its surface, which
+// the shader of a plain opaque hit runs and, for a path's `first` vertex, the callable that takes
+// it from the G-buffer. `along` holds where light along the ray counts.
+void lean_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathHot start, PathVertex x, float3 dir, float t, float2 cone, bool first, bool along)
 {
-    uint4* at = lean_hot(r, slot);
-    PathHot p = load_hot(at);
+    PathHot p = start;
     uint2 pixel = item_pixel(r, r.slice_base + slot);
-    PathCover c = path_cover(payload);
-    float t = h.t();
-    float3 dir = h.world_direction();
-    RayCone cone = { p.cone.x, p.cone.y };
-    bool first = (p.flags & HOT_CAMERA) != 0;
-    // Whether light along the ray counts, as the vertex it left had it.
-    bool along = (p.flags & HOT_COUNTED) != 0;
-    HitContext context = hit_context(c.context.kind, c.context.depth, cone, t, texture_tap(r.view, pixel, r.frame, r.seed, c.context.depth), c.context.feedback);
-    float3 positions[3] = { h.corner(0), h.corner(1), h.corner(2) };
-    SurfaceHit sh = resolve_hit_by<FeedbackSurface<S>>(r.scene, r.view, dir, h.instance_index(), uint(h.cluster_id()), h.primitive_index(), h.barycentrics(), positions, false, context, material);
-    p.flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA);
-    if (!sh.valid)
-    {
-        store_hot(at, p);
-        return;
-    }
-    PathVertex x = hit_vertex(r.view, sh, dir);
     GSurface g = x.surface;
     Sampler rng = path_sampler(r, pixel);
     rng.dimension = p.dimension();
@@ -183,7 +166,7 @@ public void lean_hit<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>
     uint opaque = p.depth() + 1;
     uint scattered = opaque - 1;
     p.set_depth(opaque);
-    p.cone = float2(cone_width(cone, t), cone.spread);
+    p.cone = cone;
     bool alive = (g.flags & GBUFFER_UNLIT) == 0 && (first || path_mode(r) != PATH_DIRECT) && carries(p.throughput);
     Bsdf b = bsdf_prepare(g.bsdf, g.normal, x.view);
 
@@ -287,6 +270,52 @@ public void lean_hit<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>
     }
     p.set_dimension(rng.dimension);
     store_hot(at, p);
+}
+
+// The whole vertex of a plain opaque hit `h` of `slot`'s ray, invoked with the ray's cover
+// `payload`, through surface `S` with its section material from `material`, in a medium `M`:
+// what the hit shader of such a surface runs.
+public void lean_hit<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>(PathRoot r, uint slot, uint4 payload, T material, H h)
+{
+    uint4* at = lean_hot(r, slot);
+    PathHot p = load_hot(at);
+    uint2 pixel = item_pixel(r, r.slice_base + slot);
+    PathCover c = path_cover(payload);
+    float t = h.t();
+    float3 dir = h.world_direction();
+    RayCone cone = { p.cone.x, p.cone.y };
+    // Whether light along the ray counts, as the vertex it left had it.
+    bool along = (p.flags & HOT_COUNTED) != 0;
+    HitContext context = hit_context(c.context.kind, c.context.depth, cone, t, texture_tap(r.view, pixel, r.frame, r.seed, c.context.depth), c.context.feedback);
+    float3 positions[3] = { h.corner(0), h.corner(1), h.corner(2) };
+    SurfaceHit sh = resolve_hit_by<FeedbackSurface<S>>(r.scene, r.view, dir, h.instance_index(), uint(h.cluster_id()), h.primitive_index(), h.barycentrics(), positions, false, context, material);
+    p.flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA);
+    if (!sh.valid)
+    {
+        store_hot(at, p);
+        return;
+    }
+    lean_vertex<M>(r, slot, at, p, hit_vertex(r.view, sh, dir), dir, t, float2(cone_width(cone, t), cone.spread), false, along);
+}
+
+// The first vertex of `slot`'s path, on the G-buffer's surface of its pixel: the raster's
+// surface, which the scene's ray tracing geometry need not hold, so no ray finds it. The callable
+// a path starts with.
+public void lean_first<M : IMedium>(PathRoot r, uint slot)
+{
+    uint4* at = lean_hot(r, slot);
+    PathHot p = load_hot(at);
+    uint2 pixel = item_pixel(r, r.slice_base + slot);
+    bool along = (p.flags & HOT_COUNTED) != 0;
+    p.flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA);
+    PathVertex x;
+    if (!gbuffer_vertex(r.scene, r.view, r.gbuffer, pixel, x))
+    {
+        store_hot(at, p);
+        return;
+    }
+    RayCone cone = { p.cone.x, p.cone.y };
+    lean_vertex<M>(r, slot, at, p, x, -x.view, x.camera_distance, float2(cone_width(cone, x.camera_distance), cone.spread), true, along);
 }
 
 // Adds to a view path's record that light `id` gave it `contribution` of luminance.

@@ -59,7 +59,7 @@ struct Switch {
 /// The surface interface's methods, every one optional: `Surfaces` over the switch calls the
 /// standard surface once at a site for every linked type that leaves a hit to it.
 const SURFACE: Switch = Switch {
-    id: "i.surface",
+    id: "surface_id(i)",
     default: "NoSurface",
     linked: "ISurface",
     methods: &[

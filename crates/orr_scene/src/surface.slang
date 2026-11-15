@@ -220,6 +220,13 @@ public float material_opacity(SurfaceInput i)
     return opacity;
 }
 
+// The linked surface id the hit of `i` shades by, as the linked types' switch reads it: a scalar
+// that a stage made for one id folds, which the input's field is not.
+public uint surface_id(SurfaceInput i)
+{
+    return hit_surface_id(i.surface);
+}
+
 // What the vertex color stream multiplies `slot` by at the hit: from its first channel on in
 // xyz, or the complement of that for a slot that reads one, and 1 for a slot that reads none.
 public float3 surface_vertex(SurfaceInput i, MaterialGpu* m, uint slot)

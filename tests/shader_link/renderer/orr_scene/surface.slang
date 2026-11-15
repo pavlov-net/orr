@@ -20,6 +20,12 @@ public struct SurfaceInput
     public uint64_t data;
 }
 
+// The id the linked types' switch reads.
+public uint surface_id(SurfaceInput i)
+{
+    return i.surface;
+}
+
 public struct GSurface
 {
     public float4 albedo;

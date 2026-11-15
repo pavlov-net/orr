@@ -320,3 +320,11 @@ fn the_pipeline_renders_linked_types_geometry_kinds_and_rich_materials_as_the_st
     }
     assert_clean();
 }
+
+/// The pipeline that may meet everything, from the kernels that link the suite's surface types:
+/// a stage made for one linked surface holds that type's code alone, under its cap.
+#[test]
+fn the_stages_of_a_pipeline_with_linked_surfaces_hold_their_caps() {
+    let sizes = orr_lighting::path_stage_sizes(&linked::KERNELS, u64::MAX).unwrap();
+    assert_eq!(orr_lighting::over_cap(&sizes), None);
+}
