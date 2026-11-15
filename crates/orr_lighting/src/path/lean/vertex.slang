@@ -31,6 +31,7 @@ import orr_lighting.world_cache;
 import orr_lighting.path;
 import orr_lighting.path.common;
 import orr_lighting.path.lean.state;
+import orr_lighting.interiors;
 
 // The hot words of the slice's `slot`th path.
 public uint4* lean_hot(PathRoot r, uint slot)
@@ -42,6 +43,135 @@ public uint4* lean_hot(PathRoot r, uint slot)
 public uint4* lean_record(PathRoot r, uint slot)
 {
     return r.launch.records + slot * (from_update(r) ? LEAN_UPDATE_RECORD_WORDS : LEAN_VIEW_RECORD_WORDS);
+}
+
+// The cold words of the slice's `slot`th path, where the scene may hold a layer or an interior.
+public uint4* lean_cold(PathRoot r, uint slot)
+{
+    return r.launch.cold + slot * LEAN_COLD_WORDS;
+}
+
+// The interior list cold words `at` hold.
+public Interior load_interior(uint4* at)
+{
+    Interior i = Interior();
+    i.entries = load_coherent(at);
+    i.count = 0;
+    for (uint k = 0; k < INTERIOR_ENTRIES; k++)
+    {
+        i.count += i.entries[k] != MATERIAL_NONE ? 1 : 0;
+        i.points[k] = asfloat(load_coherent(at + 1 + k));
+    }
+    return i;
+}
+
+// Stores interior list `i` in cold words `at`, with its innermost medium's extinction, which
+// depends on the material and where the path entered it alone: what the stages that do not change
+// the list read of it.
+public void store_interior(SceneRoot* s, uint4* at, Interior i)
+{
+    store_coherent(at, i.entries);
+    for (uint k = 0; k < INTERIOR_ENTRIES; k++)
+        store_coherent(at + 1 + k, asuint(i.points[k]));
+    float3 sigma = float3(0.0);
+    if (i.count > 0)
+    {
+        uint m = i.innermost();
+        sigma = interior_medium(s, m, i.point(m)).sigma_t;
+    }
+    uint4* last = at + 1 + INTERIOR_ENTRIES;
+    store_coherent(last, uint4(load_coherent(last).x, asuint(sigma)));
+}
+
+// The innermost interior of the list whose entries are `entries`, innermost last.
+uint innermost_of(uint4 entries)
+{
+    uint m = MATERIAL_NONE;
+    for (uint k = 0; k < INTERIOR_ENTRIES; k++)
+    {
+        if (entries[k] != MATERIAL_NONE)
+            m = entries[k];
+    }
+    return m;
+}
+
+// The extinction of the innermost interior's medium, which cold words `at` keep.
+float3 interior_sigma(uint4* at)
+{
+    return asfloat(load_coherent(at + 1 + INTERIOR_ENTRIES).yzw);
+}
+
+// The layers a path met, which its cold words `at` count.
+uint met_layers(uint4* at)
+{
+    return load_coherent(at + 1 + INTERIOR_ENTRIES).x;
+}
+
+public void store_met_layers(uint4* at, uint layers)
+{
+    uint4* last = at + 1 + INTERIOR_ENTRIES;
+    store_coherent(last, uint4(layers, load_coherent(last).yzw));
+}
+
+// Starts `slot`'s path in the interiors around the eye at its pixel's near-plane point, which the
+// layer guides list, its cold words empty but for them: the callable a camera inside an interior
+// starts its path with.
+public void lean_eye_interior(PathRoot r, uint slot)
+{
+    uint2 pixel = item_pixel(r, r.slice_base + slot);
+    uint4* cold = lean_cold(r, slot);
+    store_coherent(cold + 1 + INTERIOR_ENTRIES, uint4(0));
+    store_interior(r.scene, cold, Interior(r.layers[pixel.y * r.gbuffer.extent.x + pixel.x].near_interior));
+}
+
+// What sets a vertex's BSDF apart by what its surface is, as the stage that runs it knows it: an
+// opaque surface, whose path passes no surface past it, or a layer of the dielectric class, whose
+// transmission crosses into or out of the interior its section material bounds.
+interface IVertexKind
+{
+    // The vertex `x`'s BSDF, its path inside the interiors its cold words `cold` list where
+    // `inside`.
+    Bsdf prepare(PathRoot r, PathVertex x, uint4* cold, bool inside);
+    // The interiors past a scatter `s` of the vertex, in `cold`: whether the path lies in one.
+    bool cross(PathRoot r, BsdfSample s, uint4* cold, bool inside);
+}
+
+// An opaque surface: in an interior its BSDF sees the interior's medium outside it.
+struct OnOpaque : IVertexKind
+{
+    Bsdf prepare(PathRoot r, PathVertex x, uint4* cold, bool inside)
+    {
+        float exterior = 1.0;
+        if (inside)
+            exterior = interior_ior(r.scene, innermost_of(load_coherent(cold)));
+        return bsdf_prepare(x.surface.bsdf, x.surface.normal, x.view, exterior);
+    }
+
+    bool cross(PathRoot r, BsdfSample s, uint4* cold, bool inside)
+    {
+        return inside;
+    }
+}
+
+// A layer `l`, prepared with the media on its two sides as the path's interiors give them.
+struct OnLayer : IVertexKind
+{
+    LayerVertex l;
+
+    Bsdf prepare(PathRoot r, PathVertex x, uint4* cold, bool inside)
+    {
+        return prepare_vertex(r.scene, l, inside ? load_interior(cold) : Interior(), false, false, false, 0.0);
+    }
+
+    bool cross(PathRoot r, BsdfSample s, uint4* cold, bool inside)
+    {
+        if ((s.lobe & LOBE_TRANSMISSION) == 0 || !crosses_interior(r.scene, l.section))
+            return inside;
+        Interior interior = inside ? load_interior(cold) : Interior();
+        interior.cross(l.section, l.front, l.x.surface.medium_point);
+        store_interior(r.scene, cold, interior);
+        return interior.count > 0;
+    }
 }
 
 // What the root's mode counts of a path's light.
@@ -316,14 +446,14 @@ struct HitLight : IVertexLight
 // callable's, and 2 where its ray is the camera's, a hit's, which a view that traces its camera
 // rays has. The path's state is loaded here, past the surface's evaluation, which holds enough
 // of its own. The vertex takes its surface's light through `L` where its stage may emit.
-void lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight>(PathRoot r, uint slot, uint4* at, PathVertex x, float3 dir, float t, float2 cone, L emits)
+void lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKind, let LAYER : bool>(PathRoot r, uint slot, uint4* at, PathVertex x, float3 dir, float t, float2 cone, L emits, V on)
 {
     // Of the path's words the vertex holds its flags and its throughput. The radiance it adds
     // goes into the path's word at once, and the ray and the shadow job it leaves are written
     // whole, so nothing else of the path is live across the surface's light.
     uint4 w0 = load_coherent(at);
     uint flags = w0.w;
-    bool first = FIRST == 1 || (FIRST == 2 && may(MAY_TRACED) && (flags & HOT_CAMERA) != 0);
+    bool first = FIRST == 1 || (FIRST == 2 && may_any(MAY_TRACED | MAY_LAYERS) && (flags & HOT_CAMERA) != 0);
     // Whether light along the ray counts, as the vertex it left had it.
     bool along = (flags & HOT_COUNTED) != 0;
     bool was_diffuse = (flags & HOT_DIFFUSE) != 0;
@@ -331,8 +461,9 @@ void lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight>(PathRoot r, ui
     uint2 pixel = item_pixel(r, r.slice_base + slot);
     float3 throughput = hot_throughput(load_coherent(at + 1));
     // A traced camera ray's path runs on the view's share of pixels, as one that starts on the
-    // G-buffer's surface does.
-    if (FIRST == 2 && first)
+    // G-buffer's surface does. One that looks for layers in front of the G-buffer's surface
+    // runs on the share its raygen gave it.
+    if (FIRST == 2 && first && traces_primary(r))
     {
         if (!runs_path(r, pixel))
         {
@@ -347,10 +478,17 @@ void lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight>(PathRoot r, ui
     LeanMode mode = lean_mode(r);
     bool update = from_update(r);
     float3 added = float3(0.0);
+    // The interiors the path lies in, which its cold words list with the innermost's extinction.
+    uint4* cold = lean_cold(r, slot);
+    bool inside = may(MAY_INTERIORS) && (flags & HOT_INTERIOR) != 0;
+    float3 sigma = inside ? interior_sigma(cold) : float3(0.0);
 
-    // The linked medium along the ray. The view composes its camera segment from the froxels.
+    // The medium along the ray: an interior's, or the linked medium's, whose camera segment the
+    // view composes from the froxels.
     float u_segment = rng.next();
-    if (!first)
+    if (inside)
+        throughput *= beer(sigma, t);
+    else if (!first)
     {
         float3 origin = asfloat(w0.xyz);
         if (t >= INSCATTER_SEGMENT)
@@ -364,18 +502,32 @@ void lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight>(PathRoot r, ui
         else
             throughput *= medium_transmittance<M>(r.scene.medium, origin, dir, t);
     }
-    uint opaque = ((flags >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK) + 1;
-    uint scattered = opaque - 1;
+    // A layer is no bounce: its path counts the layers it meets apart.
+    uint scattered = (flags >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK;
+    uint opaque = scattered + (LAYER ? 0 : 1);
     flags = (flags & ~(HOT_DEPTH_MASK << HOT_DEPTH_SHIFT)) | (min(opaque, HOT_DEPTH_MASK) << HOT_DEPTH_SHIFT);
     bool alive = (g.flags & GBUFFER_UNLIT) == 0 && (first || path_mode(r) != PATH_DIRECT) && carries(throughput);
-    Bsdf b = bsdf_prepare(g.bsdf, g.normal, x.view);
+    Bsdf b = on.prepare(r, x, cold, inside);
     if (may(MAY_EMITTER) && along && (first || mode.count_bsdf) && any(g.bsdf.emission > 0.0))
         added += throughput * emits.light(r, at, b, g, pixel, w0, first, scattered, mode.one_technique);
 
     // The cache holds the light a vertex scatters by its albedo: a path ends in it past its first
     // vertex where its ray was diffuse or its footprint has outgrown the cell.
     float3 u_cell = rng.next4().xyz;
-    if (alive && mode.cache && !first)
+    // Past the root's dielectric depth a path ends at its layer, with the cache's light for the
+    // interior there.
+    if (may(MAY_LAYERS) && LAYER && alive)
+    {
+        uint layers = met_layers(cold) + 1;
+        store_met_layers(cold, layers);
+        if (layers > r.dielectric_depth && !first)
+        {
+            if (mode.cache && along)
+                added += throughput * interior_ambient(r, g.position, dir, rng);
+            alive = false;
+        }
+    }
+    if (alive && mode.cache && !first && !LAYER)
     {
         CacheCell cell = cache_cell(r.cache, r.scene, g.position, g.geometric_normal, u_cell, true);
         bool wide = cone.x > cell.size;
@@ -435,8 +587,12 @@ void lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight>(PathRoot r, ui
         float3 origin = vertex_origin(x, k.dir);
         bool far = !isfinite(k.distance);
         float3 e = throughput * k.f * radiance * (W * mis / run);
-        // The linked medium's transmittance toward the light; the environment's map holds its own.
-        if (k.kind != LIGHT_SAMPLE_ENVIRONMENT)
+        // The medium's transmittance toward the light: the interior's, which a shadow ray leaves
+        // through no surface of, or the linked medium's, whose transmittance the environment's
+        // map holds of its own.
+        if (inside)
+            e *= beer(sigma, k.distance);
+        else if (k.kind != LIGHT_SAMPLE_ENVIRONMENT)
             e *= medium_transmittance<M>(r.scene.medium, origin, k.dir, k.distance);
         if (any(e > 0.0))
         {
@@ -456,7 +612,7 @@ void lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight>(PathRoot r, ui
     if (goes)
     {
         throughput *= s.weight;
-        if (opaque > r.roulette_depth)
+        if (opaque > r.roulette_depth && !LAYER)
         {
             float survive = saturate(max_component(throughput));
             goes = u_roulette < survive;
@@ -466,6 +622,9 @@ void lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight>(PathRoot r, ui
     }
     if (goes)
     {
+        // The interiors past the vertex.
+        if (may(MAY_INTERIORS) && LAYER)
+            flags = on.cross(r, s, cold, inside) ? flags | HOT_INTERIOR : flags & ~HOT_INTERIOR;
         bool delta = (s.lobe & LOBE_SPECULAR) != 0;
         bool diffuse = (s.lobe & LOBE_DIFFUSE) != 0;
         float roughness = g.bsdf.specular_roughness;
@@ -489,13 +648,23 @@ void lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight>(PathRoot r, ui
 public void lean_hit<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>(PathRoot r, uint slot, uint4 payload, T material, H h)
 {
     if (may(MAY_EMITTER))
-        lean_hit_as<S, M, H, T, true>(r, slot, payload, material, h);
+        lean_hit_as<S, M, H, T, true, false>(r, slot, payload, material, h);
     else
-        lean_hit_as<S, M, H, T, false>(r, slot, payload, material, h);
+        lean_hit_as<S, M, H, T, false, false>(r, slot, payload, material, h);
 }
 
-// `lean_hit` of a stage made for emitters, or not.
-void lean_hit_as<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial, let EMITTER : bool>(PathRoot r, uint slot, uint4 payload, T material, H h)
+// `lean_hit` of a hit `h` on a layer of the dielectric class: what the hit shader of such a
+// surface runs, its vertex crossing into or out of the interior its material bounds.
+public void lean_layer_hit<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>(PathRoot r, uint slot, uint4 payload, T material, H h)
+{
+    if (may(MAY_EMITTER))
+        lean_hit_as<S, M, H, T, true, true>(r, slot, payload, material, h);
+    else
+        lean_hit_as<S, M, H, T, false, true>(r, slot, payload, material, h);
+}
+
+// `lean_hit` of a stage made for emitters, or not, on a layer or an opaque surface.
+void lean_hit_as<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial, let EMITTER : bool, let LAYER : bool>(PathRoot r, uint slot, uint4 payload, T material, H h)
 {
     uint4* at = lean_hot(r, slot);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
@@ -516,19 +685,47 @@ void lean_hit_as<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial, let
         return;
     }
     // A view that traces its camera rays marks them by their context.
-    if (may(MAY_TRACED) && c.context.kind == HIT_PRIMARY && traces_primary(r))
+    if (may(MAY_TRACED) && !LAYER && c.context.kind == HIT_PRIMARY && traces_primary(r))
         write_primary(r, slot, pixel, sh);
-    PathVertex x = hit_vertex(r.view, sh, dir);
     float2 footprint = float2(cone_width(cone, t), cone.spread);
+    PathVertex x;
+    OnLayer on = { LayerVertex() };
+    if (LAYER)
+    {
+        on.l = layer_vertex(r.view, sh, dir);
+        x = on.l.x;
+        // A camera ray's layer is what its pixel shows first.
+        if (c.context.kind == HIT_PRIMARY)
+            first_layer(r, slot, x.camera_distance);
+    }
+    else
+        x = hit_vertex(r.view, sh, dir);
     if (EMITTER)
     {
         HitLight emits = { no_emitter() };
         if (any(sh.surface.bsdf.emission > 0.0))
             emits.emitter = emitter_hit_of(r.set, sh, traced, h.instance_index(), uint(h.cluster_id()));
-        lean_vertex<M, 2, HitLight>(r, slot, at, x, dir, t, footprint, emits);
+        if (LAYER)
+            lean_vertex<M, 2, HitLight, OnLayer, true>(r, slot, at, x, dir, t, footprint, emits, on);
+        else
+            lean_vertex<M, 2, HitLight, OnOpaque, false>(r, slot, at, x, dir, t, footprint, emits, OnOpaque());
     }
+    else if (LAYER)
+        lean_vertex<M, 2, NoLight, OnLayer, true>(r, slot, at, x, dir, t, footprint, NoLight(), on);
     else
-        lean_vertex<M, 2, NoLight>(r, slot, at, x, dir, t, footprint, NoLight());
+        lean_vertex<M, 2, NoLight, OnOpaque, false>(r, slot, at, x, dir, t, footprint, NoLight(), OnOpaque());
+}
+
+// Writes into the record of `slot`'s view path that its first vertex is a layer `distance` m from
+// the eye.
+void first_layer(PathRoot r, uint slot, float distance)
+{
+    if (!from_view(r))
+        return;
+    uint4* record = lean_record(r, slot);
+    StoredViewLights lights = reinterpret<StoredViewLights>(load_coherent(record));
+    lights.first_distance = distance;
+    store_coherent(record, reinterpret<uint4>(lights));
 }
 
 // The first vertex of `slot`'s path, on the G-buffer's surface of its pixel: the raster's
@@ -546,7 +743,7 @@ public void lean_first<M : IMedium>(PathRoot r, uint slot)
         return;
     }
     RayCone cone = camera_cone(r.view);
-    lean_vertex<M, 1, GBufferLight>(r, slot, at, x, -x.view, x.camera_distance, float2(cone_width(cone, x.camera_distance), cone.spread), GBufferLight());
+    lean_vertex<M, 1, GBufferLight, OnOpaque, false>(r, slot, at, x, -x.view, x.camera_distance, float2(cone_width(cone, x.camera_distance), cone.spread), GBufferLight(), OnOpaque());
 }
 
 // A debug view of the first vertex alone (`first_vertex_mode`) of `slot`'s pixel, through surface
@@ -578,6 +775,9 @@ public void lean_miss<M : IMedium>(PathRoot r, uint slot)
     LightSetGpu* set = r.set;
     LeanMode mode = lean_mode(r);
     bool camera = (p.flags & HOT_CAMERA) != 0;
+    // A ray inside an interior passes its medium to the end.
+    if (may(MAY_INTERIORS) && (p.flags & HOT_INTERIOR) != 0)
+        p.throughput *= beer(interior_sigma(lean_cold(r, slot)), positive_infinity());
     p.flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA);
     if (camera && traces_primary(r))
         write_primary_sky(r, item_pixel(r, r.slice_base + slot), p.dir);

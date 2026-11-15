@@ -2519,13 +2519,15 @@ impl LightingKernels {
             let blocks = view.extent.map(|e| e.div_ceil(path.update_block));
             blocks[0] * blocks[1]
         };
+        // Paths that may meet a layer keep the interiors they lie in.
+        let cold = may & (MAY_LAYERS | MAY_INTERIORS) != 0;
         if !view
             .launched
             .as_ref()
-            .is_some_and(|m| m.fits(pixels, update))
+            .is_some_and(|m| m.fits(pixels, update, cold))
         {
             view.launched = None;
-            view.launched = Some(LaunchMemory::new(&view.device, pixels, update)?);
+            view.launched = Some(LaunchMemory::new(&view.device, pixels, update, cold)?);
         }
         let memory = view.launched.as_ref().expect("made above");
         list.begin_pass(
