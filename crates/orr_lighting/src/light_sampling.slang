@@ -1294,6 +1294,22 @@ public ResolvedLightSample nee_light_candidate<S : ISurfaces>(LightSetGpu* set, 
     return light_candidate<S>(set, v, rng.next(), rng);
 }
 
+// `nee_light_candidate` of a vertex with no local sampler: a sample of its pixel's tile at a
+// random offset, its density the whole mixture's. Draws the same five sampler dimensions.
+public ResolvedLightSample nee_tile_candidate(LightSetGpu* set, NeeVertex v, inout Sampler rng)
+{
+    rng.dimension++;
+    uint pick = rng.next_bits();
+    rng.dimension += 2;
+    float2 u = rng.next4_parts().xy();
+    if (!light_tiles(set))
+        return no_candidate();
+    uint tile = light_tile(v.pixel, set.frame);
+    ResolvedLightSample r = resolve_light_sample(set, set.tiles[tile * TILE_SIZE + mulhi(pick, TILE_SIZE)], v.position, u);
+    r.pdf *= 1.0 - v.share;
+    return r;
+}
+
 // A light candidate from local sampler or tile by `choice` in [0, 1); four sampler dimensions.
 ResolvedLightSample light_candidate<S : ISurfaces>(LightSetGpu* set, NeeVertex v, float choice, inout Sampler rng)
 {

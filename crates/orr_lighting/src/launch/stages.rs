@@ -484,6 +484,104 @@ impl PathPipeline {
     }
 }
 
+/// A stage of [`lean_probe`]: its module, entry and specialization.
+type ProbeStage = (
+    &'static ShaderModule,
+    &'static str,
+    ([u8; 32], &'static [SpecEntry]),
+);
+
+/// TEMP-EXPERIMENT: makes the lean tracer's stage set as one pipeline and logs its stage count,
+/// what it hands the driver and how long the driver took, for the cold-compile check.
+pub(crate) fn lean_probe(
+    device: &Device,
+    kernels: &KernelSet,
+    threads: CompileThreads<'_>,
+) -> Result<(), Error> {
+    use crate::shaders::path::lean_paths;
+    let lean = module(kernels, &lean_paths::MODULE)?;
+    let hits = module(kernels, &pipeline::hits::MODULE)?;
+    let pins = HitGroups {
+        surfaces: kernels.surfaces,
+        ..HitGroups::default()
+    }
+    .pins();
+    let lean_spec = |pin: Option<u32>| {
+        let d = lean_paths::Spec::default();
+        let s = lean_paths::Spec {
+            hit_surface: pin.unwrap_or(d.hit_surface),
+            ..d
+        };
+        (s.bytes(), lean_paths::Spec::ENTRIES)
+    };
+    let pin_of = |pin: u32| Some(if pin == 0 { u32::MAX } else { pin - 1 });
+    let mut specs: Vec<ProbeStage> = vec![
+        (lean, "paths", lean_spec(None)),
+        (lean, "miss_scatter", lean_spec(None)),
+        (lean, "miss_shadow", lean_spec(None)),
+    ];
+    let mut hit_groups = Vec::new();
+    for pin in 0..pins {
+        let c = Constants {
+            may: u64::MAX,
+            hit_surface: pin_of(pin),
+        };
+        let at = specs.len() as u32;
+        specs.push((lean, "surface_hit", lean_spec(pin_of(pin))));
+        specs.push((hits, "cover_path_hit", Kernel::Hits.spec(c)));
+        hit_groups.push(HitGroup {
+            closest_hit: Some(at),
+            any_hit: Some(at + 1),
+            intersection: None,
+        });
+    }
+    for pin in 0..pins {
+        let c = Constants {
+            may: u64::MAX,
+            hit_surface: pin_of(pin),
+        };
+        let at = specs.len() as u32;
+        specs.push((hits, "cover_shadow_hit", Kernel::Hits.spec(c)));
+        hit_groups.push(HitGroup {
+            closest_hit: None,
+            any_hit: Some(at),
+            intersection: None,
+        });
+    }
+    let stages = specs
+        .iter()
+        .map(|(m, entry, (bytes, entries))| ShaderStage::new(m, entry, SpecData { entries, bytes }))
+        .collect::<Result<Vec<_>, _>>()?;
+    let instructions: u32 = stages.iter().map(|s| s.entry.instructions).sum();
+    for s in &stages {
+        log::info!(
+            "lean probe stage {:?}: {} instructions",
+            s.entry.name,
+            s.entry.instructions
+        );
+    }
+    let desc = RayPipelineDesc {
+        stages: &stages,
+        raygens: &[ShaderRecord::new(0)],
+        misses: &[ShaderRecord::new(1), ShaderRecord::new(2)],
+        hit_groups: &hit_groups,
+        callables: &[],
+        max_recursion: 1,
+        flags: RayPipelineFlags::scene(device.caps()),
+        threads,
+    };
+    let started = Instant::now();
+    let _pipeline = device.create_ray_pipeline(&desc, "lean probe")?;
+    log::info!(
+        "lean probe: {} stages, {} instructions handed over, {} linked surfaces, made in {:.2} s",
+        stages.len(),
+        instructions,
+        kernels.surfaces,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 /// The path tracer's pipelines as [`crate::mask_sets::MaskSets`] members: one per mask.
 pub(crate) struct PathPipelines {
     pub(crate) kernels: KernelSet,
@@ -516,6 +614,21 @@ impl Members for PathPipelines {
             spawn: &spawn,
             max: std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
         };
+        // TEMP-EXPERIMENT
+        if std::env::var_os("ORR_LEAN_PROBE").is_some() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            let mut result = Ok(());
+            ONCE.call_once(|| {
+                let again = CompileThreads::Pool {
+                    spawn: &spawn,
+                    max: std::thread::available_parallelism().map_or(1, |n| n.get() as u32),
+                };
+                result = lean_probe(device, &self.kernels, again);
+            });
+            result?;
+            log::info!("lean probe done; exiting");
+            std::process::exit(0);
+        }
         PathPipeline::new(device, &self.kernels, threads, may)
     }
 }

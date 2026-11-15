@@ -1249,6 +1249,12 @@ public float3 bsdf_emission_layer(BsdfParams p, float3 n, float3 wo, float exter
     return prepare_layers(p, n, wo, exterior_ior, false, layers, true, true, true, true).emission_layer();
 }
 
+// TEMP-EXPERIMENT
+public Bsdf bsdf_prepare_some(BsdfParams p, float3 n, float3 wo, float exterior_ior, bool adjoint, out BsdfLayers layers, bool coat, bool fuzz, bool film, bool subsurface)
+{
+    return prepare_layers(p, n, wo, exterior_ior, adjoint, layers, coat, fuzz, film, subsurface);
+}
+
 // `bsdf_prepare_layers` of a surface that has a coat, a fuzz, a thin film and subsurface only
 // where `coat`, `fuzz`, `film` and `subsurface` allow them.
 Bsdf prepare_layers(BsdfParams p, float3 n, float3 wo, float exterior_ior, bool adjoint, out BsdfLayers layers, bool coat, bool fuzz, bool film, bool subsurface)
