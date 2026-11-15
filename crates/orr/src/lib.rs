@@ -358,6 +358,10 @@ struct Lighting {
     /// [`Renderer::wait_paths`] was called: a view waits for the path pipelines its scene asks
     /// for instead of rendering without them.
     waits: bool,
+    /// What the application's content may hold over the session ([`Renderer::set_content`]).
+    content: Option<orr_scene::SceneFeatures>,
+    /// The features a scene held beyond `content` when that was last reported.
+    undeclared: u64,
     /// When the kernels started, until a view first renders lit.
     started: Option<Instant>,
     scenes: HashMap<SceneId, SceneLighting>,
@@ -585,6 +589,36 @@ impl Output {
 /// The arena name of a view's display-linear image.
 const VIEW_LINEAR: &str = "view linear";
 /// The arena name of ray reconstruction's output.
+/// What the paths of a scene that holds `now` are made for: with a declared `content`, that
+/// content, so the pipelines a session asks for do not change as its packs mount; and what the
+/// scene holds beyond it, which is said once (`undeclared` keeps what was last said), since those
+/// paths then take pipelines of their own.
+fn path_features(
+    content: Option<orr_scene::SceneFeatures>,
+    undeclared: &mut u64,
+    now: orr_scene::SceneFeatures,
+) -> orr_scene::SceneFeatures {
+    let Some(content) = content else {
+        return now;
+    };
+    let beyond = now.0 & !content.0;
+    if beyond & !*undeclared != 0 {
+        log::warn!(
+            "the scene holds features {beyond:#x} beyond the declared content {:#x}",
+            content.0
+        );
+    }
+    *undeclared = beyond;
+    orr_scene::SceneFeatures(now.0 | content.0)
+}
+
+/// Whether a view keeps what the frosted-glass term reads: ray reconstruction reads the guide
+/// the term goes into, and the scene may hold a layer, the one thing a pixel's rough transmission
+/// can lie on. Without a layer no pixel has the term, whatever the output asks for.
+fn frosts(reconstructed: bool, features: orr_scene::SceneFeatures) -> bool {
+    reconstructed && features.contains(orr_scene::SceneFeatures::LAYERS)
+}
+
 const RECONSTRUCTED: &str = "reconstructed radiance";
 
 /// A view image at the output `extent`, from step `first` to the end of the frame: ray
@@ -639,6 +673,8 @@ impl Renderer {
                 try_cached_paths: desc.try_cached_paths,
                 paths: Paths::NotStarted,
                 waits: false,
+                content: None,
+                undeclared: 0,
                 started: None,
                 scenes: HashMap::new(),
                 tables,
@@ -959,6 +995,15 @@ impl Renderer {
         Ok(self.scenes.set_chain(model, chain)?)
     }
 
+    /// Says what the application's content may hold over the session, beyond what its scenes
+    /// hold now: the path pipelines are made for it, so one set serves from the first frame and
+    /// none compiles as packs mount. A scene that comes to hold more takes pipelines made for
+    /// that, as every scene does without a declaration. `None` takes it back.
+    pub fn set_content(&mut self, features: Option<orr_scene::SceneFeatures>) {
+        self.lighting.content = features;
+        self.lighting.undeclared = 0;
+    }
+
     /// Gives rays another step of `model`'s chain than its copies draw: `traced[k]` is the step
     /// rays trace of a copy that draws step `k`, 0 the model itself. [`Self::set_chain`] sets
     /// every step back to tracing as drawn.
@@ -1268,13 +1313,19 @@ impl<'a> Frame<'a> {
             .scenes
             .get(&view.scene)
             .ok_or(SceneError::UnknownScene(view.scene))?;
+        let features = path_features(
+            self.lighting.content,
+            &mut self.lighting.undeclared,
+            self.scenes.scene_features(view.scene)?,
+        );
+        let reconstructed = self
+            .output
+            .views
+            .get(&view.history)
+            .is_some_and(|state| state.reconstruction.is_some());
         let needs = PathNeeds {
-            features: self.scenes.scene_features(view.scene)?,
-            frosted_glass: self
-                .output
-                .views
-                .get(&view.history)
-                .is_some_and(|state| state.reconstruction.is_some()),
+            features,
+            frosted_glass: frosts(reconstructed, features),
             dof_background: false,
             particle_lighting,
         };
@@ -1549,6 +1600,11 @@ impl<'a> Frame<'a> {
             l => *l = Some(LightingView::new(&gpu, arena)?),
         }
         let paths = state.lighting.as_mut().expect("lighting view");
+        let features = path_features(
+            self.lighting.content,
+            &mut self.lighting.undeclared,
+            raster.features,
+        );
         // A debug view is not the final image, so it shows no camera effects. A view that stops
         // after exposure holds none of their images. Depth of field takes this rule too once it
         // runs here: the reference traces its own lens.
@@ -1564,9 +1620,9 @@ impl<'a> Frame<'a> {
             sample_index: state.samples,
             seed: 0,
             dof_background: None,
-            frosted_glass: reconstructed,
+            frosted_glass: frosts(reconstructed, features),
             overlay_front: blurs && view.lens.shutter > 0.0,
-            scene_features: raster.features,
+            scene_features: features,
             particle_lighting: hooks.transparency.is_some(),
         };
         paths.begin(scene, &desc, lighting);
