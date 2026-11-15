@@ -69,7 +69,7 @@ void probe(uint3 id: SV_DispatchThreadID)
     PathStart start = pinhole_start(v, root.gbuffer, pixel, true);
     o.camera_origin = float4(start.origin, 0.0);
     o.camera_direction = float4(start.dir, 0.0);
-    o.traced = traced_hit<Surface>(s, v, start.origin, start.dir, positive_infinity(), MASK_OPAQUE | MASK_DIELECTRIC);
+    o.traced = traced_hit<Surface>(s, v, start.origin, start.dir, positive_infinity(), MASK_CAMERA | MASK_DIELECTRIC);
     float3 sun;
     o.sun = sun_direction(s, sun) ? 1 : 0;
     o.sun_direction = float4(sun, 0.0);
@@ -97,7 +97,7 @@ void probe(uint3 id: SV_DispatchThreadID)
         {
             float3 from = vertex_origin(x, sun);
             o.sun_offset = length(from - g.position);
-            o.blocker = traced_hit<Surface>(s, v, from, sun, positive_infinity(), MASK_OPAQUE);
+            o.blocker = traced_hit<Surface>(s, v, from, sun, positive_infinity(), MASK_SHADOW);
         }
     }
     *root.out = o;

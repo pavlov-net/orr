@@ -4081,6 +4081,54 @@ fn chain_steps_and_fades_follow_the_reference_over_a_distance_sweep() {
     assert_clean();
 }
 
+/// A copy's flags hide its opaque clusters from kinds of ray: rays of a hidden kind pass it while
+/// the other kinds still meet it, once a change of flags has reached its instance.
+#[test]
+fn a_copy_hidden_from_a_kind_of_ray_is_traced_by_the_other_kinds() {
+    let _serial = serial();
+    let (mut w, _) = chain_world();
+    let placed = place_at(&mut w, &chain_copies(), DVec3::ZERO, 1e4);
+    let eye = DVec3::new(0.0, 2.0, 6.0);
+    let target = DVec3::new(0.0, 1.0, 0.0);
+    let ranges = placed.ranges.clone();
+    // The modes of the ray kernel's `pixels` that trace as a path's scatter rays, as shadow rays
+    // and as camera rays.
+    let kinds = [
+        (InstanceFlags::NO_SCATTER, 1),
+        (InstanceFlags::NO_SHADOW, 3),
+        (InstanceFlags::NO_CAMERA, 4),
+    ];
+    let mut frame = 0;
+    for (hidden, _) in kinds {
+        let flags = InstanceFlags::RASTER | InstanceFlags::RAY | hidden;
+        let mut last = None;
+        for _ in 0..3 {
+            frame += 1;
+            let mut shot = Shot::at(eye, target, frame);
+            shot.focus = Some(DVec3::new(0.0, 1.0, 3.0));
+            last = Some(shoot_with(&mut w, &placed, &shot, |s| {
+                for &range in &ranges {
+                    s.set_instance_flags(range, flags);
+                }
+            }));
+        }
+        let g = last.expect("three frames");
+        for (kind, mode) in kinds {
+            let r = rays(&g.view, &trace::MODULE, "pixels", mode);
+            let hits = r.traced.iter().filter(|t| t.instance != 0).count();
+            if kind == hidden {
+                assert_eq!(hits, 0, "hidden from mode {mode}, whose rays met it");
+            } else {
+                assert!(
+                    hits > r.traced.len() / 20,
+                    "hidden from another kind: {hits} rays of mode {mode} met it"
+                );
+            }
+        }
+    }
+    assert_clean();
+}
+
 /// A chain gives rays another step than its copies draw: the raster shows each drawn step's model
 /// while a ray through the same pixel meets the model of the step the chain names for rays there.
 #[test]

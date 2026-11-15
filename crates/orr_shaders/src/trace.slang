@@ -9,11 +9,16 @@ module trace;
 import orr_shaders.abi;
 
 // TLAS instance mask bits.
-[Host] public static const uint MASK_OPAQUE = 0x01;     // opaque and alpha-tested geometry
+[Host] public static const uint MASK_OPAQUE = 0x01;     // opaque and alpha-tested geometry, as the rays a path scatters see it
 [Host] public static const uint MASK_PARTICLE = 0x02;   // particle batches
 [Host] public static const uint MASK_MEDIUM = 0x04;     // medium proxies (AABBs)
 public static const uint MASK_LIGHT = 0x08;      // sphere and rect light proxies (AABBs)
 [Host] public static const uint MASK_DIELECTRIC = 0x80; // dielectric and presence surfaces
+// Opaque and alpha-tested geometry as shadow rays and as camera rays see it: an entry can show
+// each kind of ray another form, or none.
+[Host] public static const uint MASK_SHADOW = 0x10;
+[Host] public static const uint MASK_CAMERA = 0x20;
+public static const uint MASK_OPAQUE_KINDS = MASK_OPAQUE | MASK_SHADOW | MASK_CAMERA;
 
 // What an any-hit shader does with its candidate: ignore it, accept it, or accept it and end the
 // search.
@@ -77,7 +82,7 @@ public uint class_mask(uint class_id)
     switch (class_id)
     {
     case CLASS_OPAQUE:
-        return MASK_OPAQUE;
+        return MASK_OPAQUE_KINDS;
     case CLASS_DIELECTRIC:
     case CLASS_PRESENCE:
         return MASK_DIELECTRIC;
@@ -515,7 +520,7 @@ uint64_t metal_committed_data(inout RayQuery<RAY_FLAG_NONE> q)
 [ForceInline]
 public bool class_taken(uint class_id, uint mask)
 {
-    return (mask & (MASK_OPAQUE | MASK_DIELECTRIC)) == (MASK_OPAQUE | MASK_DIELECTRIC) || (class_mask(class_id) & mask) != 0;
+    return ((mask & MASK_OPAQUE_KINDS) != 0 && (mask & MASK_DIELECTRIC) != 0) || (class_mask(class_id) & mask) != 0;
 }
 
 [ForceInline]

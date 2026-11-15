@@ -64,13 +64,13 @@ void traced(uint3 id: SV_DispatchThreadID)
             c = float3(0.0, 0.0, 0.08);
         else
         {
-            TracedHit b = traced_hit<Surface>(s, v, vertex_origin(x, sun), sun, positive_infinity(), MASK_OPAQUE);
+            TracedHit b = traced_hit<Surface>(s, v, vertex_origin(x, sun), sun, positive_infinity(), MASK_SHADOW);
             c = b.hit != 0 ? float3(0.06, 0.0, 0.0) : float3(1.0) * (0.2 + 0.8 * dot(x.surface.geometric_normal, sun));
         }
     }
     else
     {
-        TracedHit h = traced_hit<Surface>(s, v, start.origin, start.dir, positive_infinity(), MASK_OPAQUE | MASK_DIELECTRIC);
+        TracedHit h = traced_hit<Surface>(s, v, start.origin, start.dir, positive_infinity(), MASK_CAMERA | MASK_DIELECTRIC);
         if (root.mode == TRACED_DISTANCE)
             c = h.hit != 0 ? distance_gray(h.t) : SKY;
         else if (root.mode == TRACED_NORMAL)
