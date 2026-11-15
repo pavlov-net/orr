@@ -362,7 +362,7 @@ public void lean_miss<M : IMedium>(PathRoot r, uint slot)
 
 // What `slot`'s shadow ray that met nothing adds: `added`, its job's light times what the
 // candidates along it let through.
-public void lean_shadow_miss(PathRoot r, uint slot, float3 added)
+public void lean_shadow_add(PathRoot r, uint slot, float3 added)
 {
     uint4* at = lean_hot(r, slot);
     float4 radiance = asfloat(load_coherent(at + 3));

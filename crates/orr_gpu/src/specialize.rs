@@ -345,38 +345,50 @@ fn mark_defined(inst: &[u32], defined: &mut [bool]) {
     }
 }
 
-/// `code` with its entry point `entry` named `name` instead: what a driver's tools show for the
-/// stage. `None` where the module has no such entry point.
+/// `code` with its entry point `entry` named `name` instead, and the debug name of the entry's
+/// function with it: what a driver's tools show for the stage. `None` where the module has no
+/// such entry point.
 pub(crate) fn rename_entry(code: &[u32], entry: &[u8], name: &[u8]) -> Option<Vec<u32>> {
+    let mut bytes = name.to_vec();
+    bytes.resize((name.len() / 4 + 1) * 4, 0);
+    let words = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c));
+    // The instruction `inst` with the string from word `at` on replaced by the name.
+    let renamed = |inst: &[u32], at: usize| {
+        let old = string(&inst[at..]).len() / 4 + 1;
+        let count = inst.len() - old + bytes.len() / 4;
+        let mut out = vec![((count as u32) << 16) | op(inst)];
+        out.extend_from_slice(&inst[1..at]);
+        out.extend(words.clone());
+        out.extend_from_slice(&inst[at + old..]);
+        out
+    };
+    let mut function = None;
+    let mut out = Vec::with_capacity(code.len() + bytes.len() / 2);
+    out.extend_from_slice(code.get(..HEADER_WORDS)?);
+    let mut rest = code.len();
     for item in instructions(code, HEADER_WORDS) {
         let (at, inst) = item?;
         match op(inst) {
-            OP_FUNCTION => break,
-            OP_ENTRY_POINT if string(inst.get(3..)?) == entry => {
-                let old_words = entry.len() / 4 + 1;
-                let mut bytes = name.to_vec();
-                bytes.resize((name.len() / 4 + 1) * 4, 0);
-                let new_words = bytes.len() / 4;
-                let count = inst.len() - old_words + new_words;
-                let mut out = Vec::with_capacity(code.len() - old_words + new_words);
-                out.extend_from_slice(&code[..at]);
-                out.push(((count as u32) << 16) | OP_ENTRY_POINT);
-                out.extend_from_slice(&inst[1..3]);
-                out.extend(
-                    bytes
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|c| u32::from_le_bytes(*c)),
-                );
-                out.extend_from_slice(&inst[3 + old_words..]);
-                out.extend_from_slice(&code[at + inst.len()..]);
-                return Some(out);
+            OP_FUNCTION => {
+                rest = at;
+                break;
             }
-            _ => {}
+            OP_ENTRY_POINT if string(inst.get(3..)?) == entry => {
+                function = inst.get(2).copied();
+                out.extend(renamed(inst, 3));
+            }
+            OP_NAME if function.is_some() && inst.get(1).copied() == function => {
+                out.extend(renamed(inst, 2));
+            }
+            _ => out.extend_from_slice(inst),
         }
     }
-    None
+    out.extend_from_slice(&code[rest..]);
+    function.map(|_| out)
 }
 
 /// How many instructions the functions of entry point `entry` of `code` hold once `spec` is
