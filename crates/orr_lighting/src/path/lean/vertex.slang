@@ -820,7 +820,7 @@ void lean_feedback(PathRoot r, uint slot, uint id, float contribution)
 
 // What `slot`'s path ray that met nothing adds: the environment along it and the directional
 // lights' discs, each weighed against next-event estimation at the vertex the ray left.
-public void lean_miss<M : IMedium>(PathRoot r, uint slot)
+public void lean_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot)
 {
     uint4* at = lean_hot(r, slot);
     PathHot p = load_hot(at);
@@ -836,7 +836,8 @@ public void lean_miss<M : IMedium>(PathRoot r, uint slot)
     if ((p.flags & HOT_COUNTED) != 0 && (mode.count_bsdf || camera))
     {
         bool weigh = !mode.one_technique && p.pdf > 0.0;
-        float3 env = environment_map(set.environment, p.dir);
+        // The camera sees the environment itself; every other ray the map its light is drawn from.
+        float3 env = camera ? E.radiance(set.scene.environment, p.dir, r.view.eye_render.xyz) : environment_map(set.environment, p.dir);
         // The vertex the ray left drew its candidates with its local sampler where it was the
         // path's first.
         LocalLights* local = nullptr;

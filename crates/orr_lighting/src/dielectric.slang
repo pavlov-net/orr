@@ -161,7 +161,7 @@ public LayerGuide layer_guides<S : ISurfaces>(PathRoot r, LayerVertex l, Bsdf b,
 // The layer guide dispatch's body for `pixel`, in a traced tile: `camera_medium`, flipped at each
 // surface between the eye and the near-plane point where a layer may lie there, so a near plane
 // straddling a surface works; the camera ray up to the opaque depth; and the guide of its first
-// layer. Opaque hits on the way name no layer.
+// layer, past opaque geometry of models that mix classes.
 public void layer_guide_body<S : ISurfaces>(PathRoot r, uint2 pixel)
 {
     SceneRoot* s = r.scene;
@@ -182,7 +182,15 @@ public void layer_guide_body<S : ISurfaces>(PathRoot r, uint2 pixel)
     float3 positions[3];
     // Micromaps forced to two states, as the path's camera ray reads them, so both find the same
     // layers.
-    Hit h = trace_closest(scene_traced(s), path_ray(start.origin, dir, start.t_max), start.mask, layer_search_flags(true), a, positions);
+    RayDesc ray = path_ray(start.origin, dir, start.t_max);
+    Hit h;
+    for (;;)
+    {
+        h = trace_closest(scene_traced(s), ray, start.mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+        if (!h.hit || is_layer(h))
+            break;
+        ray.TMin = asfloat(asuint(h.t) + 1);
+    }
     LayerGuide guide = LayerGuide();
     if (is_layer(h) && h.cluster_id >= 0)
     {
