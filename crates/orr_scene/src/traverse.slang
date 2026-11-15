@@ -509,6 +509,10 @@ void init(uint3 id: SV_DispatchThreadID)
     // The copy's nearer chain step; a step past the first traces a cached cut of its model.
     uint near = chain_near(st);
     InstanceGpu inst = step_record(s, s.instances[slot], near);
+    // What rays trace of the copy: the step it draws, or the step its chain gives rays there,
+    // which traces a cached cut of that step's model.
+    InstanceGpu traced = traced_step_record(s, s.instances[slot], near);
+    bool other = traced_step(s, s.instances[slot].model, near) != near;
     // The fill passes list the emissive clusters of a cut built this frame anew.
     InstanceGpu base = s.instances[slot];
     for (uint k = 0; base.first_emissive != NO_EMISSIVE && k < base.emissive_count; k++)
@@ -522,6 +526,11 @@ void init(uint3 id: SV_DispatchThreadID)
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
     Lod l = slot_lod(s, inst, slot);
+    ModelGpu* traced_model = s.models + traced.model;
+    MeshGpu* traced_mesh = s.meshes + traced_model.mesh;
+    Lod traced_l = l;
+    if (other)
+        traced_l = slot_lod(s, traced, slot);
     // Dielectric and presence clusters raster into the layer tiles wherever camera rays may
     // meet them; the culling takes each cluster by its class.
     bool raster = (mesh_has_layers(mesh) && layer_traced(inst.flags)) || (mesh_has_opaque(mesh) && opaque_rastered(inst.flags));
@@ -538,19 +547,21 @@ void init(uint3 id: SV_DispatchThreadID)
     float3 center = place(p, sphere.xyz);
     float radius = sphere.w * p.scale;
     float distance = has_focus() ? max(length(center) - radius, 0.0) : 0.0;
-    float range = instance_rt_range(inst) * ((st.rt_flags & RT_IN_RANGE) != 0 ? RT_HYSTERESIS : 1.0);
-    bool ray = (inst.flags & INSTANCE_RAY) != 0 && mesh.rt_cut_count > 0 && (!has_focus() || distance <= range);
-    c.rt_distance = distance;
-    c.rt_scale = p.scale * l.scale;
-    c.rt_limit = l.cached;
-    bool holds = (st.rt_flags & RT_WRITTEN) != 0 && st.rt_model == inst.model;
+    float4 traced_sphere = model_sphere(traced_model);
+    float traced_distance = has_focus() ? max(length(place(p, traced_sphere.xyz)) - traced_sphere.w * p.scale, 0.0) : 0.0;
+    float range = instance_rt_range(traced) * ((st.rt_flags & RT_IN_RANGE) != 0 ? RT_HYSTERESIS : 1.0);
+    bool ray = (traced.flags & INSTANCE_RAY) != 0 && traced_mesh.rt_cut_count > 0 && (!has_focus() || traced_distance <= range);
+    c.rt_distance = traced_distance;
+    c.rt_scale = p.scale * traced_l.scale;
+    c.rt_limit = traced_l.cached;
+    bool holds = (st.rt_flags & RT_WRITTEN) != 0 && st.rt_model == traced.model;
     if (ray)
-        c.rt_cut = cached_cut(mesh, st, holds, c.rt_scale, distance, l.cached, lowest_cut(mesh, inst));
+        c.rt_cut = cached_cut(traced_mesh, st, holds, c.rt_scale, traced_distance, traced_l.cached, lowest_cut(traced_mesh, traced));
     // The BLAS of a finer cut stay while a slot's PTLAS instance or this frame's cut names them.
     if (holds)
-        touch_cut(cut, mesh, st.rt_lod);
+        touch_cut(cut, traced_mesh, st.rt_lod);
     if (ray)
-        touch_cut(cut, mesh, c.rt_cut);
+        touch_cut(cut, traced_mesh, c.rt_cut);
 
     // A fading copy also draws its far step and traces a cached cut of it.
     if (st.fade != 0)
@@ -559,12 +570,16 @@ void init(uint3 id: SV_DispatchThreadID)
         ModelGpu* far_model = s.models + far.model;
         MeshGpu* far_mesh = s.meshes + far_model.mesh;
         float4 far_sphere = model_sphere(far_model);
-        float far_distance = has_focus() ? max(length(place(p, far_sphere.xyz)) - far_sphere.w * p.scale, 0.0) : 0.0;
-        if (ray && far_mesh.rt_cut_count > 0)
+        // Rays trace the step the chain gives them at the far step.
+        InstanceGpu traced_far = traced_step_record(s, s.instances[slot], chain_far(st));
+        MeshGpu* ray_mesh = s.meshes + s.models[traced_far.model].mesh;
+        float4 ray_sphere = model_sphere(s.models + traced_far.model);
+        float far_distance = has_focus() ? max(length(place(p, ray_sphere.xyz)) - ray_sphere.w * p.scale, 0.0) : 0.0;
+        if (ray && ray_mesh.rt_cut_count > 0)
         {
-            c.far_cut = coarsest_cut(far_mesh, p.scale * l.scale, far_distance, l.cached, 0);
-            touch_cut(cut, far_mesh, c.far_cut);
-            want_cut(cut, far_mesh, p.scale * l.scale, far_distance, l.cached, 0);
+            c.far_cut = coarsest_cut(ray_mesh, p.scale * traced_l.scale, far_distance, traced_l.cached, 0);
+            touch_cut(cut, ray_mesh, c.far_cut);
+            want_cut(cut, ray_mesh, p.scale * traced_l.scale, far_distance, traced_l.cached, 0);
         }
         // Its far instance holds a cut of the model it was last written with, which the fade
         // may have turned from or its chain replaced.
@@ -574,6 +589,16 @@ void init(uint3 id: SV_DispatchThreadID)
             raster_roots(s, cut, slot | COPY_FAR, far_mesh, p, far_sphere, l);
     }
 
+    // A step traced where another is drawn asks for its cached cut here; what follows is the
+    // drawn step's, with nothing to trace.
+    if (other)
+    {
+        if (ray && traced_mesh.level_count > 0 && traced_l.level >= 0)
+            c.rt_cut = min(uint(traced_l.level), traced_mesh.rt_cut_count - 1);
+        if (ray && traced_mesh.level_count == 0)
+            want_cut(cut, traced_mesh, c.rt_scale, traced_distance, traced_l.cached, lowest_cut(traced_mesh, traced));
+        ray = false;
+    }
     if (mesh.level_count > 0)
     {
         if (raster)

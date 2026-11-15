@@ -393,7 +393,7 @@ void want(uint3 id: SV_DispatchThreadID)
     }
     uint near = chain_near(*st);
     bool fading = st.fade != 0;
-    InstanceGpu inst = step_record(s, base, near);
+    InstanceGpu inst = traced_step_record(s, base, near);
     bool seen = (st.rt_flags & RT_SEEN) != 0;
     bool written = (st.rt_flags & RT_WRITTEN) != 0;
     // The instance holds another chain step, model or fade state than the copy shows: a
@@ -557,7 +557,7 @@ void want(uint3 id: SV_DispatchThreadID)
     bool far_moved = false;
     if (fading)
     {
-        InstanceGpu far_record = step_record(s, base, chain_far(*st));
+        InstanceGpu far_record = traced_step_record(s, base, chain_far(*st));
         uint far_model = far_record.model;
         MeshGpu* far_mesh = s.meshes + s.models[far_model].mesh;
         far = far_mesh.rt_cut_count > 0;
@@ -782,7 +782,7 @@ void write_far(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, InstanceGpu base, ui
     uint index;
     if (!reserve(COUNTER_WRITES, t.write_capacity, 1, index))
         return;
-    InstanceGpu far = step_record(s, base, chain_far(*st));
+    InstanceGpu far = traced_step_record(s, base, chain_far(*st));
     MeshGpu* mesh = s.meshes + s.models[far.model].mesh;
     PtlasWrite w = copy_write(s, t, s.part_base + st.far_part - 1, partition, far, mesh.rt_cuts[cut].blas);
     w.flags |= INSTANCE_FORCE_NO_OPAQUE;
@@ -864,7 +864,7 @@ void emit(uint3 id: SV_DispatchThreadID)
     InstanceGpu base = s.instances[slot];
     uint near = chain_near(*st);
     bool fading = st.fade != 0;
-    InstanceGpu inst = step_record(s, base, near);
+    InstanceGpu inst = traced_step_record(s, base, near);
 
     if ((op.op & OP_RELEASE) != 0)
         release_run(s, t, st, slot);

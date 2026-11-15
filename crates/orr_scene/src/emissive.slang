@@ -123,7 +123,7 @@ void instances(uint3 id: SV_DispatchThreadID)
     EmissiveGpu* e = s.emissive + id.x;
     if (e.kind != EMISSIVE_INSTANCE)
         return;
-    InstanceGpu inst = copy_record(s, e.source);
+    InstanceGpu inst = traced_record(s, e.source);
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
     uint set = NO_SET;

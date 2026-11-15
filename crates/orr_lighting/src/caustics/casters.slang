@@ -279,7 +279,7 @@ float entry_weight(SceneRoot* s, uint i)
         EmissiveSelection sel = EmissiveSelection();
         if (g.kind == EMISSIVE_INSTANCE && g.set != NO_SET && g.cluster_count > 0)
         {
-            InstanceGpu inst = copy_record(s, g.source);
+            InstanceGpu inst = traced_record(s, g.source);
             ModelGpu* model = s.models + inst.model;
             MeshGpu* mesh = s.meshes + model.mesh;
             if (g.rank >= mesh.emissive.count && g.area > 0.0)

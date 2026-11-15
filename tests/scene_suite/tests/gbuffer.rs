@@ -4081,6 +4081,58 @@ fn chain_steps_and_fades_follow_the_reference_over_a_distance_sweep() {
     assert_clean();
 }
 
+/// A chain gives rays another step than its copies draw: the raster shows each drawn step's model
+/// while a ray through the same pixel meets the model of the step the chain names for rays there.
+#[test]
+fn a_chain_traces_the_step_it_gives_rays_where_the_raster_draws_another() {
+    let _serial = serial();
+    let (mut w, models) = chain_world();
+    set_chain(&mut w, &models);
+    let traced = [0u8, 0, 1, 1];
+    w.scenes.set_chain_traced(models[0], &traced).unwrap();
+    let placed = place_at(&mut w, &chain_copies(), DVec3::ZERO, 1e4);
+    let eye = DVec3::new(0.0, 2.0, 6.0);
+    let target = DVec3::new(0.0, 1.0, 0.0);
+    let mut frame = 0;
+    let mut shoot_at = |w: &mut World, z: f64| {
+        frame += 1;
+        let mut shot = Shot::at(eye, target, frame);
+        shot.focus = Some(DVec3::new(0.0, 1.0, z));
+        shoot(w, &placed, &shot)
+    };
+    // Focus distances inside steps 0 to 3.
+    for (step, z) in [3.0, 30.0, 60.0, 120.0].into_iter().enumerate() {
+        let mut g = shoot_at(&mut w, z);
+        for _ in 0..CHAIN_FADE_FRAMES {
+            g = shoot_at(&mut w, z);
+        }
+        let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
+        let drawn = model_materials(&root, &models[step..=step])[0];
+        let rays_step = usize::from(traced[step]);
+        let seen = model_materials(&root, &models[rays_step..=rays_step])[0];
+        let r = rays(&g.view, &trace::MODULE, "pixels", 1);
+        let materials = pixel_materials(&g.view);
+        let hits = r.traced.iter().filter(|t| t.instance != 0).count();
+        assert!(
+            hits > r.traced.len() / 20,
+            "step {step}: {hits} rays met a copy"
+        );
+        for (i, t) in r.traced.iter().enumerate() {
+            assert!(
+                materials[i] == u32::MAX || drawn.contains(&materials[i]),
+                "step {step}: pixel {i} draws material {}",
+                materials[i]
+            );
+            assert!(
+                t.instance == 0 || seen.contains(&t.material),
+                "step {step}: the ray of pixel {i} met material {}",
+                t.material
+            );
+        }
+    }
+    assert_clean();
+}
+
 #[test]
 fn each_chain_step_traces_what_the_raster_draws_and_a_fade_shows_both() {
     let _serial = serial();

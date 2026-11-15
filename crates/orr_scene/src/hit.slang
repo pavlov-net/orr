@@ -679,7 +679,7 @@ public uint traced_material(SceneRoot* s, uint instance_index, uint cluster_id)
     uint copy;
     if (!hit_copy(s, instance_index, copy))
         return MATERIAL_NONE;
-    InstanceGpu inst = copy_record(s, copy);
+    InstanceGpu inst = traced_record(s, copy);
     ClusterRef r = s.clusters[cluster_id];
     return section_material(s, inst, s.models + inst.model, load_cluster(r.page, r.local).section);
 }
@@ -798,7 +798,7 @@ public bool traced_triangle_by<M : ISectionMaterial>(SceneRoot* s, uint instance
     uint copy;
     if (!hit_copy(s, instance_index, copy))
         return false;
-    InstanceGpu inst = copy_record(s, copy);
+    InstanceGpu inst = traced_record(s, copy);
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
     ClusterRef r = s.clusters[cluster_id];
@@ -1140,7 +1140,7 @@ bool candidate_placement(SceneRoot* s, uint instance_index, uint cluster_id, out
     uint copy;
     if (!hit_copy(s, instance_index, copy))
         return false;
-    InstanceGpu inst = copy_record(s, copy);
+    InstanceGpu inst = traced_record(s, copy);
     if (!placement(s.groups + inst.group, false, inst.group_index, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
         return false;
     if (instance_index >= s.part_base && (copy & COPY_FAR) == 0)
@@ -1215,7 +1215,7 @@ bool coverage_input<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uin
             if (!hit_copy(s, instance_index, copy))
                 return false;
             i.instance = copy;
-            i.user_tag = copy_record(s, copy).user_tag;
+            i.user_tag = traced_record(s, copy).user_tag;
         }
         else
             i.instance = instance_index;
