@@ -6,11 +6,12 @@
 use lighting_suite::bed::{
     Accumulated, Analytic, BLACK_SPHERE, BUMPY_FLOOR, Bed, COATED_EMITTER, EMITTER, EMITTER_FIELD,
     EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal, FrostGuide, GLASS_SPHERE, GLOSSY_FLOOR, Item,
-    MIRROR, NEAR, Particle, ParticleLook, Paths, QUADRANT_EMITTER, SKINNED_EMITTER, SKY,
-    SMOOTH_FLOOR, SUN, Spec, StrandRow, TILED_FLOOR, TINTED_FLOOR, TROUGH, WATER_BOX, WHITE_FLOOR,
-    assert_close, assert_pipeline_renders_as_staged, assert_pipeline_within_noise,
-    assert_within_noise, both, glass_scene, image_mean, light_bed, luminance, mean_where,
-    particle_bed, pixel_of, plane_stack_spec, plume_bed, reference, render_paths, surface_mean,
+    LAYERED_SPHERE, MIRROR, NEAR, Particle, ParticleLook, Paths, QUADRANT_EMITTER, SKINNED_EMITTER,
+    SKY, SMOOTH_FLOOR, SUN, Spec, StrandRow, TILED_FLOOR, TINTED_FLOOR, TRANSLUCENT_SHEET, TROUGH,
+    WATER_BOX, WHITE_FLOOR, assert_close, assert_pipeline_renders_as_staged,
+    assert_pipeline_within_noise, assert_within_noise, both, glass_scene, image_mean, light_bed,
+    luminance, mean_where, particle_bed, pixel_of, plane_stack_spec, plume_bed, reference,
+    render_paths, surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
@@ -206,6 +207,36 @@ fn the_pipeline_renders_opaque_scenes_as_the_staged_loop_does() {
             );
         }
     }
+    assert_clean();
+}
+
+/// The pipeline path tracer renders the lobes a plain surface lacks as the staged loop does,
+/// through the stages its table makes for them and its first vertex: a sphere under a coat, a
+/// fuzz and a thin film, and a thin-walled sheet whose subsurface carries the sun's light through
+/// it, seen from its shaded side. Compared as the opaque scenes are.
+#[test]
+fn the_pipeline_renders_coats_fuzz_films_and_thin_walls_as_the_staged_loop_does() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
+    let mut bed = Bed::with(Spec {
+        copies: vec![
+            at(FLOOR, Mat3::IDENTITY, Vec3::ZERO),
+            at(LAYERED_SPHERE, Mat3::IDENTITY, Vec3::new(-1.2, 1.0, 0.0)),
+            at(TRANSLUCENT_SHEET, Mat3::IDENTITY, Vec3::new(1.0, 1.1, 0.0)),
+        ],
+        eye: Vec3::new(0.0, 1.5, -4.0),
+        target: Vec3::new(0.0, 0.9, 0.0),
+        ..Analytic::SunAndGround.spec()
+    });
+    bed.set_pre_exposure(1.0 / 64.0);
+    assert_pipeline_renders_as_staged(
+        "layered sphere and translucent sheet",
+        &mut bed,
+        &staged,
+        &launched,
+    );
     assert_clean();
 }
 

@@ -91,7 +91,7 @@ pub(crate) const MAY_FILM: u64 = consts::MAY_FILM as u64;
 pub(crate) const MAY_SUBSURFACE: u64 = consts::MAY_SUBSURFACE as u64;
 /// The lobes a plain surface lacks, which the opaque shade stage is compiled without; and what
 /// goes with them: only a subsurface vertex starts a walk.
-const MAY_LOBES: u64 = consts::MAY_LOBES as u64;
+pub(crate) const MAY_LOBES: u64 = consts::MAY_LOBES as u64;
 pub(crate) const MAY_RICH: u64 = MAY_LOBES | MAY_WALK;
 
 /// What gives the rich opaque stage a vertex (`stages.slang`'s `opaque_queue`): a lobe a plain

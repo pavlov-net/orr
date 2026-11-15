@@ -106,6 +106,11 @@ impl SceneFeatures {
     pub const EMISSION_FACTORS: Self = Self(1 << 34);
     /// As [`Self::EMISSION_FACTORS`], of a material with a linked surface id.
     pub const LINKED_EMISSION_FACTORS: Self = Self(1 << 35);
+    /// A material's own weights give it a coat, fuzz, thin film or subsurface, whatever its
+    /// linked surface type declares.
+    pub const LOBE_FACTORS: Self = Self(1 << 36);
+    /// As [`Self::LOBE_FACTORS`], of a material with a linked surface id.
+    pub const LINKED_LOBE_FACTORS: Self = Self(1 << 37);
     /// What a mesh keeps from the material it was built with, whatever the record holds now:
     /// once a record has shown one of these, the table keeps it.
     const BUILT: Self = Self(Self::LAYERS.0 | Self::COVERAGE.0);
@@ -132,6 +137,8 @@ impl SceneFeatures {
             (Self::LINKED_SURFACES, 1 << 11),
             (Self::EMISSION_FACTORS, 1 << 12),
             (Self::LINKED_EMISSION_FACTORS, 1 << 13),
+            (Self::LOBE_FACTORS, 1 << 14),
+            (Self::LINKED_LOBE_FACTORS, 1 << 15),
         ] {
             if !self.contains(feature) {
                 ruled_out |= bit;
@@ -157,6 +164,7 @@ impl SceneFeatures {
         let walks = !thin && (lobe(l::SUBSURFACE) || (lobe(l::TRANSMISSION) && scatters));
         let disperses =
             m.transmission_dispersion_scale > 0.0 && m.transmission_dispersion_abbe_number > 0.0;
+        let factors = crate::material::record_lobes(m, &[]) & l::RICH != 0;
         let mut out = Self::NONE;
         for (on, bit) in [
             (walks, Self::WALKING),
@@ -192,6 +200,8 @@ impl SceneFeatures {
                 m.emission_luminance != 0.0 && m.surface != 0,
                 Self::LINKED_EMISSION_FACTORS,
             ),
+            (factors, Self::LOBE_FACTORS),
+            (factors && m.surface != 0, Self::LINKED_LOBE_FACTORS),
         ] {
             if on {
                 out |= bit;
@@ -359,7 +369,7 @@ mod tests {
         let solid = record(|m| m.flags = f::DIELECTRIC);
         assert!(!solid.contains(SceneFeatures::THIN_DIELECTRICS));
         // A plain scene rules every surface feature out; each one found sets its bit alone.
-        const DEFINED: u32 = 0b11_1111_1110_1111;
+        const DEFINED: u32 = 0b1111_1111_1110_1111;
         assert_eq!(plain.surface_may(), !DEFINED);
         assert_eq!(vertex.surface_may(), !DEFINED | 1);
         assert_eq!(tiled.surface_may(), !DEFINED | 1 << 1);
@@ -381,6 +391,14 @@ mod tests {
             m.surface = 1;
         });
         assert_eq!(linked.surface_may() & DEFINED, 1 << 11 | 1 << 12 | 1 << 13);
+        // So is a coat, fuzz, thin film or subsurface the record's weights give it.
+        let coated = record(|m| m.coat_weight = 1.0);
+        assert_eq!(coated.surface_may() & DEFINED, 1 << 14);
+        let skin = record(|m| {
+            m.subsurface_weight = 1.0;
+            m.surface = 2;
+        });
+        assert_eq!(skin.surface_may() & DEFINED, 1 << 11 | 1 << 14 | 1 << 15);
     }
 
     /// An emitter's light passes a coat or fuzz only while a record emits and a record has
