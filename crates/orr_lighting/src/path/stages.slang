@@ -1124,7 +1124,8 @@ public void media_segment<M : IMedium>(PathRoot r, inout PathLoop p, inout Sampl
 }
 
 // Candidate handler `inner` in a pipeline whose rays may meet triangles that are not opaque in
-// traversal: no candidate reaches any other pipeline's.
+// traversal: no candidate reaches any other pipeline's. A trace that forces its candidates
+// non-opaque makes every triangle one, so it takes `inner` itself.
 struct MayAccept<A : IAnyHit> : IAnyHit
 {
     A inner;
