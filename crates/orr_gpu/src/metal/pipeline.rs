@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::ptr::NonNull;
 
 use objc2::rc::Retained;
@@ -31,6 +32,8 @@ pub struct ShaderStage<'a> {
     pub debug_info: &'a str,
     pub entry: &'a EntryPoint,
     pub spec: SpecData<'a>,
+    /// The name a ray tracing pipeline's tools show the stage by; unused here.
+    pub label: &'a CStr,
     pub(super) module: &'a ShaderModule,
 }
 
@@ -49,8 +52,14 @@ impl<'a> ShaderStage<'a> {
             debug_info: module.debug_info,
             entry,
             spec,
+            label: c"",
             module,
         })
+    }
+
+    /// The stage named `label`, as the Vulkan backend's.
+    pub fn labeled(self, label: &'a CStr) -> Self {
+        Self { label, ..self }
     }
 
     /// The stage's library for pixel entries when `fragment`, else for the others: the

@@ -1101,14 +1101,14 @@ public float resolve_presence_section<S : ISurfaces>(SceneRoot* s, ViewConstants
 // vertex `attributes`: the pipeline's any-hit shaders' decision, which reads no instance, model or
 // section table, and for a material that takes no alpha test nothing of the triangle. The inline
 // handlers keep `resolve_presence`.
-public float record_presence<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, uint material, uint attributes, bool tested, bool alpha)
+public float record_presence<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, uint material, uint attributes, bool tested, bool alpha, CandidateRay ray)
 {
     if (material == MATERIAL_NONE || !fade_present(s, d, instance_index))
         return 0.0;
     if (alpha && !tested)
         return 1.0;
     SurfaceInput i;
-    if (!coverage_input<S>(s, v, d, instance_index, cluster_id, primitive, bary, context, material, attributes, i))
+    if (!coverage_input<S>(s, v, d, instance_index, cluster_id, primitive, bary, context, material, attributes, ray, i))
         return 0.0;
     uint flags = s.materials[material].flags;
     float coverage = S.coverage(i, !alpha && (flags & MATERIAL_PRESENCE) != 0, false);
@@ -1118,13 +1118,49 @@ public float record_presence<S : ISurfaces>(SceneRoot* s, ViewConstants* v, floa
     return coverage > unit_float(pcg3d(key).x) ? 1.0 : 0.0;
 }
 
+// A candidate's ray as its any-hit shader has it: its origin, the distance to the candidate and
+// the candidate triangle's corners in object space.
+public struct CandidateRay
+{
+    public float3 origin;
+    public float t;
+    public float3 corners[3];
+}
+
+// The placement of the copy or producer entry of TLAS instance `instance_index`, with the pose
+// of its part on cluster `cluster_id` where it is a part instance, as `traced_triangle_by` places
+// it; false where it is hidden.
+bool candidate_placement(SceneRoot* s, uint instance_index, uint cluster_id, out Placement pl)
+{
+    pl = Placement();
+    uint cell_log2 = uint(s.origin_cell.w);
+    uint entry;
+    if (hit_producer(s, instance_index, entry))
+        return producer_placement(s, s.producers[entry], false, s.origin_cell.xyz, float3(0.0), cell_log2, pl);
+    uint copy;
+    if (!hit_copy(s, instance_index, copy))
+        return false;
+    InstanceGpu inst = copy_record(s, copy);
+    if (!placement(s.groups + inst.group, false, inst.group_index, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
+        return false;
+    if (instance_index >= s.part_base && (copy & COPY_FAR) == 0)
+    {
+        ClusterRef r = s.clusters[cluster_id];
+        float3x4 pose;
+        if (!part_pose(s, inst, s.meshes + s.models[inst.model].mesh, load_cluster(r.page, r.local).part, false, pose))
+            return false;
+        pl = placed_after(pl, pose);
+    }
+    return true;
+}
+
 // What a coverage reads of a triangle candidate of section material `material`, its copy's mesh's
 // vertex `attributes` on a copy's cluster. The standard surface's, a material's opacity, reads the
 // uvs and with a vertex stream the vertex color, interpolated here from the triangle's corners.
 // A material of a linked surface id takes what its type's coverage says it reads
 // (`ISurface.coverage_reads`): that much of the input, or the whole of it, which is false where
 // that names nothing to resolve, as `hit_input` is.
-bool coverage_input<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, uint material, uint attributes, out SurfaceInput i)
+bool coverage_input<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, uint material, uint attributes, CandidateRay ray, out SurfaceInput i)
 {
     MaterialGpu* m = s.materials + material;
     uint surface = hit_surface_id(m.surface);
@@ -1139,6 +1175,8 @@ bool coverage_input<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uin
             HitInput h;
             bool found = hit_input_by(s, v, d, instance_index, cluster_id, primitive, bary, Corners(), false, false, false, context, section_given(material), h);
             i = h.input;
+            i.ray_origin = ray.origin;
+            i.ray_distance = ray.t;
             return found;
         }
     }
@@ -1201,6 +1239,26 @@ bool coverage_input<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uin
         i.uv[set].tap = context.tap;
     }
     i.vertex_color = w.x * color[0] + w.y * color[1] + w.z * color[2];
+    if ((reads & (COVERAGE_PLACE | COVERAGE_FACE)) != 0)
+    {
+        Placement pl;
+        if (!candidate_placement(s, instance_index, cluster_id, pl))
+            return false;
+        i.object_position = w.x * ray.corners[0] + w.y * ray.corners[1] + w.z * ray.corners[2];
+        i.object_to_render = pl.linear;
+        i.position = place(pl, i.object_position);
+        world_cell(s.origin_cell.xyz, float3(0.0), i.position, uint(s.origin_cell.w), i.cell, i.offset);
+        // The side shown, as `traced_area` and the hit's geometry turn the triangle's normal.
+        float3 e1 = mul(pl.linear, ray.corners[1] - ray.corners[0]);
+        float3 e2 = mul(pl.linear, ray.corners[2] - ray.corners[0]);
+        float size = unit_factor(max(abs(e1), abs(e2)));
+        i.back_face = dot(cross(e1 * size, e2 * size), d) * linear_mirror(pl.linear) > 0.0;
+    }
+    if ((reads & COVERAGE_RAY) != 0)
+    {
+        i.ray_origin = ray.origin;
+        i.ray_distance = ray.t;
+    }
     i.context = context;
     i.primitive = primitive;
     i.barycentrics = bary;

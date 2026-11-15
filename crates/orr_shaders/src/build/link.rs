@@ -54,6 +54,8 @@ struct Switch {
     /// The generic over the switch that the kernels' interface takes, where the kernels use
     /// another interface than the linked types.
     wrap: Option<&'static str>,
+    /// Pairs of optional methods: a type that declares the first declares the second too.
+    with: &'static [(&'static str, &'static str)],
 }
 
 /// The surface interface's methods, every one optional: `Surfaces` over the switch calls the
@@ -100,6 +102,7 @@ const SURFACE: Switch = Switch {
             optional: true,
         },
     ],
+    with: &[("coverage", "coverage_reads")],
     wrap: Some("Surfaces"),
 };
 
@@ -113,6 +116,7 @@ const DISPLACEMENT: Switch = Switch {
         args: "i",
         optional: false,
     }],
+    with: &[],
     wrap: None,
 };
 
@@ -126,6 +130,7 @@ const DRAWN: Switch = Switch {
         args: "i",
         optional: false,
     }],
+    with: &[],
     wrap: None,
 };
 
@@ -525,6 +530,14 @@ pub(super) fn check_overrides(session: &Session, m: &LinkModule) -> Result<(), S
                         declared.push((method, signature(api, f)));
                     }
                 }
+                for (has, needs) in switch.with {
+                    let named = |n: &str| declared.iter().any(|(x, _)| x.name == n);
+                    if named(has) && !named(needs) {
+                        wrong.push(format!(
+                            "{ty} declares `{has}` without `{needs}`, which says what it reads"
+                        ));
+                    }
+                }
                 for method in switch.methods.iter().filter(|x| x.optional) {
                     let wanted = declared_signature(method.decl);
                     let found = declared.iter().filter(|(x, _)| x.name == method.name);
@@ -547,8 +560,9 @@ pub(super) fn check_overrides(session: &Session, m: &LinkModule) -> Result<(), S
     wrong.sort();
     wrong.dedup();
     Err(format!(
-        "linked {} types declare methods named as the interface's of which none overrides it, \
-         so the switch calls the interface's default: {}",
+        "linked {} types declare methods the switch cannot forward as declared: one named as \
+         the interface's that does not override it calls the interface's default, and one of a \
+         pair needs the other: {}",
         m.point.label(),
         wrong.join("; ")
     ))

@@ -66,6 +66,10 @@ public struct SurfaceInput
     public int3 cell;               // world position as cell and offset in the cell
     public float3 offset;
     public float3 view_direction;   // from the eye toward the hit
+    // The origin of the ray and the distance along it, of a ray tracing pipeline's candidate
+    // whose coverage reads them (COVERAGE_RAY); zero elsewhere.
+    public float3 ray_origin;
+    public float ray_distance;
     public SceneRoot* scene;
     public ViewConstants* view;
     public uint64_t data;           // the material's consumer data, else the scene's
@@ -76,6 +80,9 @@ public struct SurfaceInput
 // (`instance`), its `user_tag`, the triangle and the barycentrics, which every candidate has.
 public static const uint COVERAGE_UV = 1 << 0;       // the uv sets, at no footprint
 public static const uint COVERAGE_COLOR = 1 << 1;    // the vertex color
+public static const uint COVERAGE_PLACE = 1 << 2;    // the object and render positions, the world cell and `object_to_render`
+public static const uint COVERAGE_FACE = 1 << 3;     // `back_face`
+public static const uint COVERAGE_RAY = 1 << 4;      // the ray's origin and the distance to the candidate
 public static const uint COVERAGE_WHOLE = 0xffffffffu; // all of the hit's input
 
 // What a linked surface type implements. Every method is optional: what a type leaves out, or
@@ -126,10 +133,12 @@ public interface ISurface
 
     // What `coverage` and `coverage_feedback` read of their input beside what every candidate
     // has (COVERAGE_*): a ray tracing pipeline's any-hit shader resolves that much of a
-    // candidate and leaves the rest as an empty input holds it.
+    // candidate and leaves the rest as an empty input holds it. A type with a `coverage` says
+    // what it reads, which the build checks; one without reads what the material's alpha test
+    // does.
     static uint coverage_reads(SurfaceInput i)
     {
-        return COVERAGE_WHOLE;
+        return COVERAGE_UV | COVERAGE_COLOR;
     }
 }
 

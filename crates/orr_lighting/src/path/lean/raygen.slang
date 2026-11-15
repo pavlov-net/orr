@@ -98,7 +98,16 @@ void trace_ray(PathRoot r, uint slot, uint4* at, uint4 w0)
     p.words = path_payload(cover);
     Traced h = trace_hit(r.scene.tlas, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, MASK_OPAQUE, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), camera ? 0.0 : positive_infinity()), p);
     if (h.hit())
+    {
         reorder_invoke(h, p);
+        // A hit shader zeroes the cover word, which a trace never leaves zero. A hit whose record
+        // names no shader ran none, and its path would trace the same ray again: it ends here.
+        if (p.words.x != 0)
+        {
+            uint4 left = load_coherent(at);
+            store_coherent(at, uint4(left.xyz, left.w & ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA)));
+        }
+    }
     else
         h.invoke(p);
 }

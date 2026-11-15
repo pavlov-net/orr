@@ -345,6 +345,40 @@ fn mark_defined(inst: &[u32], defined: &mut [bool]) {
     }
 }
 
+/// `code` with its entry point `entry` named `name` instead: what a driver's tools show for the
+/// stage. `None` where the module has no such entry point.
+pub(crate) fn rename_entry(code: &[u32], entry: &[u8], name: &[u8]) -> Option<Vec<u32>> {
+    for item in instructions(code, HEADER_WORDS) {
+        let (at, inst) = item?;
+        match op(inst) {
+            OP_FUNCTION => break,
+            OP_ENTRY_POINT if string(inst.get(3..)?) == entry => {
+                let old_words = entry.len() / 4 + 1;
+                let mut bytes = name.to_vec();
+                bytes.resize((name.len() / 4 + 1) * 4, 0);
+                let new_words = bytes.len() / 4;
+                let count = inst.len() - old_words + new_words;
+                let mut out = Vec::with_capacity(code.len() - old_words + new_words);
+                out.extend_from_slice(&code[..at]);
+                out.push(((count as u32) << 16) | OP_ENTRY_POINT);
+                out.extend_from_slice(&inst[1..3]);
+                out.extend(
+                    bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| u32::from_le_bytes(*c)),
+                );
+                out.extend_from_slice(&inst[3 + old_words..]);
+                out.extend_from_slice(&code[at + inst.len()..]);
+                return Some(out);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// How many instructions the functions of entry point `entry` of `code` hold once `spec` is
 /// folded in, without debug lines: the size of the code a driver is handed for the stage.
 pub fn handed_instructions(code: &[u32], entry: &CStr, spec: SpecData<'_>) -> u32 {

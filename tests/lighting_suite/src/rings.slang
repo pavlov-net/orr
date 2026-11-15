@@ -56,6 +56,11 @@ public struct Rings : ISurface
         coverage = rings_coverage(i.uv[0].uv);
         return true;
     }
+
+    public override static uint coverage_reads(SurfaceInput i)
+    {
+        return COVERAGE_UV;
+    }
 }
 
 public struct Veil : ISurface
@@ -64,5 +69,10 @@ public struct Veil : ISurface
     {
         coverage = VEIL_COVERAGE;
         return true;
+    }
+
+    public override static uint coverage_reads(SurfaceInput i)
+    {
+        return 0;
     }
 }

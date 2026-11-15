@@ -34,6 +34,8 @@ void surface_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
     ORR_OMM(surface_hit);
     TriangleHit h = { a };
     lean_hit<Surface, Medium, TriangleHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
+    // Tells the raygen a shader took the hit.
+    p.words.x = 0;
 }
 
 [shader("raygeneration")]
