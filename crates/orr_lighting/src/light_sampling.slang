@@ -1281,6 +1281,14 @@ public NeeVertex nee_vertex(LightSetGpu* set, float3 position, float3 normal, ui
 // direction's.
 ResolvedLightSample directional_candidate(LightSetGpu* set, float3 normal, float total, float probability, uint pick, float2 u)
 {
+    ResolvedLightSample r = directional_draw(set, normal, total, probability, pick, u);
+    r.radiance = disc_radiance(set, r.light, r.dir) * set.directional[r.light].transmittance;
+    return r;
+}
+
+// `directional_candidate` without its radiance.
+ResolvedLightSample directional_draw(LightSetGpu* set, float3 normal, float total, float probability, uint pick, float2 u)
+{
     float target = unit_float(pick) * total;
     uint id = NO_LIGHT;
     float w = 0.0;
@@ -1302,7 +1310,6 @@ ResolvedLightSample directional_candidate(LightSetGpu* set, float3 normal, float
     float cone_pdf;
     r.dir = directional_sample(set.scene.lights[id], u, cone_pdf);
     r.distance = positive_infinity();
-    r.radiance = disc_radiance(set, id, r.dir) * set.directional[id].transmittance;
     r.pdf = probability * w / total * cone_pdf;
     r.kind = LIGHT_SAMPLE_DIRECTIONAL;
     r.light = id;
@@ -1331,6 +1338,16 @@ public ResolvedLightSample nee_directional_candidate(LightSetGpu* set, NeeVertex
     return directional_candidate(set, v.normal, v.total, v.share, pick, u);
 }
 
+// `nee_directional_candidate` without its radiance, for a vertex that draws it alone: as the
+// only candidate it takes no weight.
+public ResolvedLightSample nee_directional_draw(LightSetGpu* set, NeeVertex v, inout Sampler rng)
+{
+    uint pick = rng.next_bits();
+    rng.dimension += 2;
+    float2 u = rng.next4_parts().xy();
+    return directional_draw(set, v.normal, v.total, v.share, pick, u);
+}
+
 // `nee_candidate` given that it draws no directional light, its density still the whole
 // mixture's: with the local sampler's share, a slot it holds and a sample of its range, or
 // else a sample at a random offset in the vertex's tile. Draws five sampler dimensions.
@@ -1339,50 +1356,35 @@ public ResolvedLightSample nee_light_candidate<S : ISurfaces>(LightSetGpu* set, 
     return light_candidate<S>(set, v, rng.next(), rng);
 }
 
-// `nee_light_candidate` of a vertex with no local sampler: a sample of its pixel's tile at a
-// random offset, its density the whole mixture's. Draws the same five sampler dimensions.
-public ResolvedLightSample nee_tile_candidate(LightSetGpu* set, NeeVertex v, inout Sampler rng)
-{
-    rng.dimension++;
-    uint pick = rng.next_bits();
-    rng.dimension += 2;
-    float2 u = rng.next4_parts().xy();
-    if (!light_tiles(set))
-        return no_candidate();
-    uint tile = light_tile(v.pixel, set.frame);
-    ResolvedLightSample r = resolve_light_sample(set, set.tiles[tile * TILE_SIZE + mulhi(pick, TILE_SIZE)], v.position, u);
-    r.pdf *= 1.0 - v.share;
-    return r;
-}
-
-// `nee_tile_candidate` for a vertex whose local sampler `v.local` draws a share of its
-// candidates: the tile's sample, with its density in that mixture.
-public ResolvedLightSample nee_shared_tile_candidate(LightSetGpu* set, NeeVertex v, inout Sampler rng)
-{
-    ResolvedLightSample r = nee_tile_candidate(set, v, rng);
-    if (r.pdf > 0.0)
-        r.pdf *= light_selection(set, v.local, r.light, r.position) / global_selection(set, r.light);
-    return r;
-}
-
-// A candidate of vertex `v`, whose screen tile holds local sampler `v.local` with its points of
-// this frame: one of those points for the sampler's share, else the tile's sample, either with
-// its density in the mixture of the two. Five sampler dimensions, as `nee_tile_candidate`.
-public ResolvedLightSample nee_local_tile_candidate(LightSetGpu* set, NeeVertex v, inout Sampler rng)
+// `nee_light_candidate` given that it draws no directional light, its density still the whole
+// mixture's: a sample of the vertex's tile at a random offset, or with `LOCAL` where `v.local` is
+// set, one of the points its local sampler drew this frame for that sampler's share. The sample is
+// resolved at one site, so a kernel holds one copy of it. Five sampler dimensions.
+public ResolvedLightSample nee_tile_candidate<let LOCAL : bool>(LightSetGpu* set, NeeVertex v, inout Sampler rng)
 {
     float choice = rng.next();
-    if (!(choice < v.local.share))
-    {
-        // The tile's draw leaves the choice's dimension unread.
-        rng.dimension--;
-        return nee_shared_tile_candidate(set, v, rng);
-    }
     uint pick = rng.next_bits();
     rng.dimension += 2;
     float2 u = rng.next4_parts().xy();
-    ResolvedLightSample r = resolve_light_sample(set, v.local.samples[mulhi(pick, LOCAL_SAMPLES)], v.position, u);
-    if (r.pdf > 0.0)
-        r.pdf *= light_selection(set, v.local, r.light, r.position);
+    LocalLights* local = nullptr;
+    if (LOCAL)
+        local = v.local;
+    bool drawn = local != nullptr && choice < local.share;
+    if (!drawn && !light_tiles(set))
+        return no_candidate();
+    LightSample s;
+    if (drawn)
+        s = local.samples[mulhi(pick, LOCAL_SAMPLES)];
+    else
+        s = set.tiles[light_tile(v.pixel, set.frame) * TILE_SIZE + mulhi(pick, TILE_SIZE)];
+    ResolvedLightSample r = resolve_light_sample(set, s, v.position, u);
+    // The local sampler's points are drawn with their slot's gain alone, the tile's samples with
+    // the light set's selection.
+    if (r.pdf > 0.0 && local != nullptr)
+    {
+        float selection = light_selection(set, local, r.light, r.position);
+        r.pdf *= drawn ? selection : selection / global_selection(set, r.light);
+    }
     r.pdf *= 1.0 - v.share;
     return r;
 }

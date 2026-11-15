@@ -189,15 +189,25 @@ LightPick pick_light<let FIRST : uint>(PathRoot r, Bsdf b, float3 position, floa
         directional = rng.next() < v.share;
         k.drawn = directional ? 1 : candidates;
     }
-    for (uint i = 0; i < k.drawn; i++)
+    // A directional light is drawn alone, and a lone candidate takes no weight: its radiance and
+    // the BSDF are evaluated once it is picked.
+    if (directional)
     {
-        ResolvedLightSample c;
-        if (directional)
-            c = nee_directional_candidate(set, v, rng);
-        else if (local && v.local != nullptr)
-            c = nee_local_tile_candidate(set, v, rng);
-        else
-            c = nee_tile_candidate(set, v, rng);
+        ResolvedLightSample c = nee_directional_draw(set, v, rng);
+        if (c.pdf > 0.0)
+        {
+            k.dir = c.dir;
+            k.distance = c.distance;
+            k.pdf = c.pdf;
+            k.kind = c.kind;
+            k.light = c.light;
+            k.target = 1.0;
+            k.sum = 1.0 / c.pdf;
+        }
+    }
+    for (uint i = 0; i < (directional ? 0 : k.drawn); i++)
+    {
+        ResolvedLightSample c = nee_tile_candidate<FIRST == 1>(set, v, rng);
         float u = rng.next();
         if (!(c.pdf > 0.0))
             continue;
