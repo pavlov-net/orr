@@ -28,12 +28,20 @@ and the counters, for the GPU, driver, scene and mask in front of you.
   of it is needed. The driver's compile time grows faster than the code, and a scene's first
   lit frame waits for its slowest pipeline.
 - **Ray tracing pipelines.** A launch has one register count for all its threads, set by the
-  largest shader linked into it whether or not that shader runs, under a ceiling lower than a
-  compute kernel's. Payload bytes cost registers in every thread.
+  largest stage of a kind its raygen can reach, whether or not that stage runs: a hit, miss or
+  any-hit stage of the pipeline counts for a raygen that traces, a callable for one that calls.
+  On NVIDIA the count moves in steps of 8 between a floor of 64 and a ceiling of 128, lower than
+  a compute kernel's. Payload bytes cost registers in every thread.
+- **Instruction fetch.** A ray tracing launch runs many shaders at once and its warps can wait
+  with no instruction to issue: the code in play does not fit the instruction caches. That
+  share of warp time grows with the code a launch's threads run between reorders, not with
+  what a pipeline merely holds, and shrinks when hit objects are reordered by shader before
+  they are invoked.
 
 ## What the work aims for
 
 - **No spill:** each kernel under its launch's register ceiling.
+- **Little code in play:** a ray tracing pass's warps rarely waiting for an instruction.
 - **Driver compile time a person can live with:** about ten to fifteen seconds cold for a
   large kernel on a scene's mask.
 - **Little state that every thread pays for:** per-path state, per-thread arrays, payload.
@@ -46,8 +54,10 @@ possible, a narrower helper where a site needs only part, the mask where a scene
 ## Gating with the mask
 
 `path_may` and `path_may2` say what a scene's paths may meet. The fold
-(`crates/orr_gpu/src/vulkan/specialize.rs`) deletes the blocks a scene's mask rules out before
+(`crates/orr_gpu/src/specialize.rs`) deletes the blocks a scene's mask rules out before
 the driver sees the module; specialization constants alone leave the driver to read all of it.
+`handed_instructions` there counts what a stage hands the driver after the fold, which the path
+pipeline's stage caps hold.
 
 - Gate large code that not every scene uses with a direct test where the feature is used:
   `if (may2(MAY2_DECALS) && has_decal) { ... }`. The fold follows a bit through integer and
@@ -93,11 +103,19 @@ report those with the GPU and driver beside every number.
     idle, where a dispatch sized from the data gives each item a thread;
   - register-limited: a full register file (`registers_allocated`) with few warps resident
     (`warps_active`); the two also give a ray tracing launch's registers per thread where the
-    driver reports no statistics for its pipeline;
+    driver reports no statistics for its pipeline:
+    `tpc__sm_rf_registers_allocated_realtime.sum / tpc__warps_active_realtime.sum / 32`. Warps
+    resident follow that count, but a pass's time follows it only weakly: halving a launch's
+    occupancy costs a trace-bound pass a few percent, so a register count is no target of its
+    own;
   - waiting: warps stall on the long scoreboard (`warp_issue_stalled`), with cache hit rates
     and DRAM throughput pointing at memory, RT core throughput at traversal, `sysmem` and
     `pcie` traffic at a buffer in host memory, and `mem_local` bytes at spill or arrays;
-  - instruction fetch: warps stall with no instruction, which points at code size.
+  - instruction fetch: warps stall with no instruction
+    (`smsp__warp_issue_stalled_no_instruction_per_warp_active.pct`), which points at the code
+    the pass runs. For a ray tracing pass this share and the pass's time are the measures of a
+    code change: compare them before and after on the same scene, and find what holds them by
+    swapping one part of a stage for a stub that keeps the rays the same.
 
 Metal has neither the statistics nor the counters.
 
