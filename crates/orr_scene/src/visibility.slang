@@ -330,12 +330,40 @@ public bool sphere_visible(ViewConstants* v, float3 center, float radius)
 // and the near plane, which the frustum test leaves out.
 public bool near_eye(ViewConstants* v, float3 center, float radius)
 {
+    precise float gap = exact_length(center) - radius;
+    return gap < near_reach(v);
+}
+
+// How far from the eye the space between it and the near plane reaches, with a margin.
+float near_reach(ViewConstants* v)
+{
     float4x4 m = v.clip_from_view;
     float near = m[2][3];
     precise float corner2 = 1.0 + 1.0 / (m[0][0] * m[0][0]) + 1.0 / (m[1][1] * m[1][1]);
     precise float limit = 1.01 * near * sqrt(corner2);
-    precise float gap = exact_length(center) - radius;
-    return gap < limit;
+    return limit;
+}
+
+// Whether the box `lo..hi` placed by `p` may reach the space between the eye and the near plane,
+// tested against the slab between each pair of its faces. A flat or long box's sphere can hold
+// the eye far from the box, which these slabs leave out.
+public bool box_near_eye(ViewConstants* v, Placement p, float3 lo, float3 hi)
+{
+    precise float limit = near_reach(v);
+    float3 center = exact_place(p, 0.5 * (lo + hi));
+    float3 half_size = 0.5 * (hi - lo);
+    float3x3 l = p.linear;
+    float3 axes[3] = { float3(l[0].x, l[1].x, l[2].x), float3(l[0].y, l[1].y, l[2].y), float3(l[0].z, l[1].z, l[2].z) };
+    [unroll]
+    for (uint i = 0; i < 3; i++)
+    {
+        float3 n = cross(axes[(i + 1) % 3], axes[(i + 2) % 3]);
+        precise float gap = abs(n.x * center.x + n.y * center.y + n.z * center.z);
+        precise float reach = abs(dot(n, axes[i])) * half_size[i] + limit * exact_length(n);
+        if (gap > reach)
+            return false;
+    }
+    return true;
 }
 
 // A view's last render of a scene, for kernels outside its raster that test what it saw: its

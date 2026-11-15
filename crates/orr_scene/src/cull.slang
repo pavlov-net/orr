@@ -49,12 +49,13 @@ bool frustum_visible(ViewConstants* v, bool layer, float3 center, float radius)
     return (layer && near_eye(v, center, radius)) || sphere_visible(v, center, radius);
 }
 
-// `frustum_visible` for the sphere of one cluster. A dielectric or presence cluster's surface
-// between the eye and the near plane marks every tile; a copy's sphere can't, since one layer
+// `frustum_visible` for the sphere of one cluster, whose box is `lo..hi` placed by `p`. A
+// dielectric or presence cluster's surface between the eye and the near plane marks every tile,
+// where its sphere and its box both reach that space; a copy's sphere can't, since one layer
 // cluster anywhere in a model would then mark for all of it.
-bool cluster_frustum_visible(ViewConstants* v, RasterGpu* r, bool layer, float3 center, float radius)
+bool cluster_frustum_visible(ViewConstants* v, RasterGpu* r, bool layer, float3 center, float radius, Placement p, float3 lo, float3 hi)
 {
-    if (layer && near_eye(v, center, radius))
+    if (layer && near_eye(v, center, radius) && box_near_eye(v, p, lo, hi))
     {
         r.gbuffer.layer_tiles[layer_tile_count(r.gbuffer.extent)] = 1;
         return true;
@@ -153,7 +154,7 @@ float displacement_reach(Cluster c)
 
 // Whether cluster `c` of `inst` survives frustum, cone and section culling. Rays meet both
 // sides of dielectric and presence surfaces, so their clusters skip the cone.
-bool cluster_visible(ViewConstants* v, RasterGpu* r, InstanceGpu inst, Placement p, Cluster c, MaterialGpu* m)
+bool cluster_visible(ViewConstants* v, RasterGpu* r, InstanceGpu inst, Placement p, Cluster c, float3 lo, float3 hi, MaterialGpu* m)
 {
     if (section_hidden(inst, c.section))
         return false;
@@ -161,7 +162,7 @@ bool cluster_visible(ViewConstants* v, RasterGpu* r, InstanceGpu inst, Placement
     float3 center = place(p, c.cull_sphere.xyz);
     float radius = (c.cull_sphere.w + reach) * p.scale;
     bool layer = layer_class(cluster_class(c));
-    if (!class_rastered(cluster_class(c), inst.flags) || !cluster_frustum_visible(v, r, layer, center, radius))
+    if (!class_rastered(cluster_class(c), inst.flags) || !cluster_frustum_visible(v, r, layer, center, radius, p, lo, hi))
         return false;
     if (layer)
         return true;
@@ -194,7 +195,7 @@ bool skinned_visible(ViewConstants* v, RasterGpu* r, InstanceGpu inst, Placement
     uint class_id = cluster_class(c);
     if (section_hidden(inst, c.section) || !class_rastered(class_id, inst.flags))
         return false;
-    return cluster_frustum_visible(v, r, layer_class(class_id), place(p, 0.5 * (lo + hi)), 0.5 * length(hi - lo) * p.scale);
+    return cluster_frustum_visible(v, r, layer_class(class_id), place(p, 0.5 * (lo + hi)), 0.5 * length(hi - lo) * p.scale, p, lo, hi);
 }
 
 void append(RasterGpu* r, uint count, uint* list, uint visible)
@@ -297,7 +298,7 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
             else
                 cluster_box(mesh, c, lo, hi);
             shown = material != MATERIAL_NONE
-                && (skinned ? skinned_visible(v, r, inst, p, c, lo, hi) : cluster_visible(v, r, inst, p, c, s.materials + material));
+                && (skinned ? skinned_visible(v, r, inst, p, c, lo, hi) : cluster_visible(v, r, inst, p, c, lo, hi, s.materials + material));
         }
         if (shown)
         {
@@ -409,7 +410,7 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     }
     float3 center = place(pl, 0.5 * (lo + hi));
     float radius = 0.5 * length(hi - lo) * pl.scale;
-    if (!cluster_frustum_visible(v, r, layer, center, radius))
+    if (!cluster_frustum_visible(v, r, layer, center, radius, pl, lo, hi))
         return;
     // Diced clusters that displacement stretches past the software raster's limit
     // split their triangles between the two paths by size.

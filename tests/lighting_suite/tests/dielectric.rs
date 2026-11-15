@@ -1013,21 +1013,10 @@ fn a_white_line_seen_through_a_prism_splits_by_the_abbe_number() {
 /// runs.
 const BUILD_STEPS: u16 = 1;
 
-/// An eye inside the bounds of a model, beside its opaque section, turned away from its slab far
-/// from the eye: no layer can lie before the near plane, so no tile is traced.
-#[test]
-fn a_model_reaching_the_eye_marks_no_tile_without_a_layer_cluster_there() {
+/// The layer tile marks one frame of `spec` rasters, the word marking every tile last.
+fn layer_tile_marks(spec: Spec) -> Vec<u32> {
     const TILES: u64 = (EXTENT[0].div_ceil(8) * EXTENT[1].div_ceil(8)) as u64;
-    let eye = Vec3::new(0.95, -0.3, 0.95);
-    let mut bed = Bed::with(Spec {
-        copies: vec![at(MIXED_SLAB, Vec3::ZERO)],
-        lights: Vec::new(),
-        environment: None,
-        eye,
-        target: eye + Vec3::new(1.0, 0.0, 1.0),
-        fov_y: 0.3,
-        focus: None,
-    });
+    let mut bed = Bed::with(spec);
     let marks = readback::<u32>(TILES + 1, "layer tiles");
     bed.accumulate(1, 1, &mut |list, f| {
         list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
@@ -1037,7 +1026,47 @@ fn a_model_reaching_the_eye_marks_no_tile_without_a_layer_cluster_there() {
             4 * (TILES + 1),
         );
     });
-    assert!(marks.as_slice().unwrap().iter().all(|&m| m == 0));
+    marks.as_slice().unwrap().to_vec()
+}
+
+/// An eye inside the bounds of a model, beside its opaque section, turned away from its slab far
+/// from the eye: no layer can lie before the near plane, so no tile is traced.
+#[test]
+fn a_model_reaching_the_eye_marks_no_tile_without_a_layer_cluster_there() {
+    let eye = Vec3::new(0.95, -0.3, 0.95);
+    let marks = layer_tile_marks(Spec {
+        copies: vec![at(MIXED_SLAB, Vec3::ZERO)],
+        lights: Vec::new(),
+        environment: None,
+        eye,
+        target: eye + Vec3::new(1.0, 0.0, 1.0),
+        fov_y: 0.3,
+        focus: None,
+    });
+    assert!(marks.iter().all(|&m| m == 0));
+    assert_clean();
+}
+
+/// An eye 2 m above a glass sheet 1.6 km wide and 3 mm thick, inside its cluster's bounding
+/// sphere, looking up and away from it: the sheet lies nowhere near the near plane, so no tile is
+/// traced.
+#[test]
+fn an_eye_inside_a_wide_layer_clusters_sphere_far_from_its_surface_marks_no_tile() {
+    let eye = Vec3::new(3.0, 2.0, -5.0);
+    let marks = layer_tile_marks(Spec {
+        copies: vec![Item {
+            model: TINTED_SLAB,
+            linear: Mat3::from_diagonal(Vec3::new(1000.0, 0.01, 1000.0)),
+            at: Vec3::ZERO,
+        }],
+        lights: Vec::new(),
+        environment: None,
+        eye,
+        target: eye + Vec3::new(1.0, 1.0, 1.0),
+        fov_y: 0.3,
+        focus: None,
+    });
+    assert!(marks.iter().all(|&m| m == 0));
     assert_clean();
 }
 
