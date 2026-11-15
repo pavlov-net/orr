@@ -756,12 +756,19 @@ impl ViewTargets {
         }
     }
 
-    pub(crate) fn gbuffer(&self, lists: &ViewLists) -> GBufferGpu {
+    /// The G-buffer as kernels read it. Where the view's paths trace its camera rays
+    /// (`traced`), their hits write each pixel's depth into the HZB's mip 0, which kernels then
+    /// read as the depth: the depth target is drawn from it only after them.
+    pub(crate) fn gbuffer(&self, lists: &ViewLists, traced: bool) -> GBufferGpu {
         let t = &self.transient;
         GBufferGpu {
             visibility: t.visibility.gpu(),
             clusters: lists.visible.clusters.gpu(),
-            depth: self.depth.sampled,
+            depth: if traced {
+                self.hzb.sampled
+            } else {
+                self.depth.sampled
+            },
             a: t.a.sampled(),
             b: t.b.sampled(),
             x: t.x
@@ -797,13 +804,14 @@ impl ViewTargets {
         occlusion: bool,
         slots: u32,
         bin_roots: GpuPtr<RasterRoot>,
+        traced: bool,
     ) -> RasterGpu {
         let [tx, ty] = tiles(self.sizes.extent);
         let mut hzb = [StorageImageIndex::NONE; MAX_HZB_MIPS as usize];
         hzb[..self.hzb.storage.len()].copy_from_slice(&self.hzb.storage);
         let t = &self.transient;
         RasterGpu {
-            gbuffer: self.gbuffer(lists),
+            gbuffer: self.gbuffer(lists, traced),
             work: lists.work.gpu(),
             args: self.args.gpu(),
             draw_args: lists.visible.draw_args.gpu().cast(),
@@ -942,6 +950,7 @@ pub(crate) fn record(
     occlusion: bool,
     preprocess: Option<GpuPtr<u8>>,
     mut opaque: Option<&mut OpaqueHook<'_>>,
+    traced: bool,
 ) -> Result<Vec<GpuPtr<RasterGpu>>> {
     let s = targets.sizes;
     let (raster, record) = window.slice::<RasterGpu>(device, 1)?;
@@ -954,7 +963,7 @@ pub(crate) fn record(
     };
     // The bins' roots; bin 0's is also the root of every pass with value 0.
     let roots = window.put_roots(device, s.bins, root_of)?;
-    record[0] = targets.record(lists, software_pixels, occlusion, slots, roots);
+    record[0] = targets.record(lists, software_pixels, occlusion, slots, roots, traced);
     let first = record[0];
     let mut draws = vec![raster];
     for i in 1..lists.visible.draws {
@@ -1041,11 +1050,20 @@ pub(crate) fn record(
     };
     let slot_groups = [slots.div_ceil(64).max(1), 1, 1];
 
-    list.begin_pass("cull", false);
     let cleared = pixels
         .max(3 * s.bins + 1)
         .max(COUNTS as u32)
         .max(tx * ty + 1);
+    // The view's paths trace its camera rays: their hits write the G-buffer, over a
+    // visibility buffer and lists of nothing.
+    if traced {
+        list.begin_pass("clear", false);
+        list.dispatch(pipelines.get(p.clear), r0, [cleared.div_ceil(64), 1, 1]);
+        list.end_pass();
+        list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
+        return Ok(draws);
+    }
+    list.begin_pass("cull", false);
     list.dispatch(pipelines.get(p.clear), r0, [cleared.div_ceil(64), 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
     list.dispatch(pipelines.get(p.instances), r0, slot_groups);
@@ -1143,6 +1161,55 @@ pub(crate) fn record(
     list.end_pass();
     list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
     Ok(draws)
+}
+
+/// What follows the paths of a view that traced its camera rays, whose hits wrote each
+/// pixel's depth into the HZB's mip 0 and the resolved depths: the HZB's other mips, which the
+/// next frame's kernels read, and the depth target, which the passes after the paths test
+/// against.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_traced(
+    device: &Device,
+    p: &RasterPipelines,
+    pipelines: &Pipelines,
+    window: &UploadWindow,
+    list: &mut CommandList<'_>,
+    targets: &ViewTargets,
+    scene: GpuPtr<SceneRoot>,
+    view: GpuPtr<ViewConstants>,
+    raster: GpuPtr<RasterGpu>,
+) -> Result<()> {
+    let root = |value| {
+        window.put_root(
+            device,
+            &RasterRoot {
+                scene,
+                view,
+                raster,
+                value,
+                _pad: 0,
+            },
+        )
+    };
+    list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+    list.begin_pass("hzb", false);
+    reduce_hzb(list, pipelines, p, targets, &root, None)?;
+    list.end_pass();
+    list.begin_pass("depth", false);
+    list.begin_rendering(&Rendering {
+        extent: targets.sizes.extent,
+        colors: &[],
+        depth: Some(DepthAttachment {
+            texture: &targets.depth.texture,
+            load: DepthLoad::Discard,
+            store: true,
+        }),
+    });
+    list.draw_mesh_tasks(&p.depth, root(0)?, [1, 1, 1]);
+    list.end_rendering();
+    list.end_pass();
+    list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
+    Ok(())
 }
 
 /// Builds the HZB's mips from mip 0, after `seed` writes mip 0 from the visibility buffer

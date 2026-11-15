@@ -4,11 +4,13 @@
 // whose reprojected surface lay at another distance from the camera was hidden then, and adds
 // nothing; the sampler's share falls with the tile's surfaces that found no feedback. `main`
 // also bounds the tile's surfaces when a slot's emissive entry has a cooked set holding a tree,
-// and `refine` splits those slots toward them.
+// and `refine` splits those slots toward them. `presample` then draws `LOCAL_SAMPLES` points of
+// each sampler, for the vertices that read a sampler's points ready drawn.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_shaders.packing;
+import orr_shaders.random;
 import orr_shaders.sampling;
 import orr_pack.mesh;
 import orr_scene.hit;
@@ -18,8 +20,11 @@ import orr_scene.producer;
 import orr_scene.tables;
 import orr_scene.view;
 import orr_scene.gbuffer;
+import orr_scene.surface;
 import orr_lighting.environment;
 import orr_lighting.light_sampling;
+
+extern struct Surface : ISurfaces = StandardSurface;
 
 // A reprojected pixel's last camera distance must lie within this share of the distance a
 // static surface would have had.
@@ -462,4 +467,24 @@ void refine(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
     out.count = n;
     finish_slots(out, p, n);
     *at = out;
+}
+
+// One group per tile, a thread per point: a slot of the tile's sampler and a point of its light,
+// through the light's own distribution; no sample where the sampler holds no slot.
+[shader("compute")]
+[numthreads(LOCAL_SAMPLES, 1, 1)]
+void presample(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
+{
+    uint tile = group.y * root.columns + group.x;
+    LocalLights* local = root.local + tile;
+    LightSample s = LightSample();
+    if (local.count > 0)
+    {
+        Sampler rng = Sampler(uint2(tile, lane), root.frame, 0x6c6f6361u);
+        uint pick = rng.next_bits();
+        uint2 bits = uint2(rng.next_bits(), rng.next_bits());
+        OwenSobol4 u = rng.next4_parts();
+        s = local_sample<Surface>(root.set, local, pick, bits, float4(u.xy(), u.zw()));
+    }
+    local.samples[lane] = s;
 }

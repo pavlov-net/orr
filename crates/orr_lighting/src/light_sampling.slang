@@ -45,6 +45,9 @@ public static const float FEEDBACK_HISTORY = 0.5;
 public static const uint LOCAL_TILE = 16;
 // Slots one local sampler holds.
 public static const uint LOCAL_LIGHTS = 32;
+// Points a view draws of each of its local samplers every frame, for the vertices that read
+// them ready drawn.
+public static const uint LOCAL_SAMPLES = 32;
 
 // The offset in pixels of the local samplers' tile grid in path frame `frame`: the grid moves
 // each frame, so the edges between tiles' samplers fall somewhere new.
@@ -236,6 +239,9 @@ public struct LocalLights
     // around their normals (axis, cosine of its half angle in w).
     public float4 receiver;
     public float4 normal;
+    // Points of the sampler drawn this frame (`local_sample`), where the view draws them: what
+    // a vertex that reads the sampler's points ready drawn picks among.
+    public LightSample samples[LOCAL_SAMPLES];
 }
 
 // A receiver of next-event estimation.
@@ -1106,10 +1112,9 @@ public LightSample presample_light<S : ISurfaces>(LightSetGpu* set, uint index, 
     return tile_light_sample<S>(set, id, 0, count, h0.zw, u, global_selection(set, id));
 }
 
-// The local sampler candidate of a vertex at `x`: a slot by its fixed-point step from `pick`,
-// then a sample of its range, with the density of its point alone (the light chosen with
-// probability 1).
-ResolvedLightSample local_candidate<S : ISurfaces>(LightSetGpu* set, LocalLights* local, float3 x, uint pick, uint2 bits, float4 u)
+// A sample of local sampler `local`: a slot by its fixed-point step from `pick`, then a sample
+// of its range, with the density of its point alone (the light chosen with probability 1).
+public LightSample local_sample<S : ISurfaces>(LightSetGpu* set, LocalLights* local, uint pick, uint2 bits, float4 u)
 {
     uint n = min(local.count, LOCAL_LIGHTS);
     uint target = mulhi(pick, 0xffffffffu);
@@ -1124,7 +1129,13 @@ ResolvedLightSample local_candidate<S : ISurfaces>(LightSetGpu* set, LocalLights
             lo = mid + 1;
     }
     LocalLight k = local.lights[lo];
-    return resolve_light_sample(set, tile_light_sample<S>(set, k.id, k.first, k.count, bits, u, 1.0), x, u.xy);
+    return tile_light_sample<S>(set, k.id, k.first, k.count, bits, u, 1.0);
+}
+
+// The local sampler candidate of a vertex at `x`: `local_sample`, seen from the vertex.
+ResolvedLightSample local_candidate<S : ISurfaces>(LightSetGpu* set, LocalLights* local, float3 x, uint pick, uint2 bits, float4 u)
+{
+    return resolve_light_sample(set, local_sample<S>(set, local, pick, bits, u), x, u.xy);
 }
 
 // Adds one pixel whose feedback names `id` to the scene's feedback counts.
@@ -1310,20 +1321,6 @@ public ResolvedLightSample nee_tile_candidate(LightSetGpu* set, NeeVertex v, ino
     return r;
 }
 
-// The candidate of local sampler `v.local` for vertex `v`, with its density in the vertex's
-// whole mixture; four sampler dimensions, as `light_candidate` takes them.
-public ResolvedLightSample nee_local_candidate<S : ISurfaces>(LightSetGpu* set, NeeVertex v, inout Sampler rng)
-{
-    uint pick = rng.next_bits();
-    uint2 bits = uint2(rng.next_bits(), rng.next_bits());
-    OwenSobol4 u4 = rng.next4_parts();
-    ResolvedLightSample r = local_candidate<S>(set, v.local, v.position, pick, bits, float4(u4.xy(), u4.zw()));
-    if (r.pdf > 0.0)
-        r.pdf *= light_selection(set, v.local, r.light, r.position);
-    r.pdf *= 1.0 - v.share;
-    return r;
-}
-
 // `nee_tile_candidate` for a vertex whose local sampler `v.local` draws a share of its
 // candidates: the tile's sample, with its density in that mixture.
 public ResolvedLightSample nee_shared_tile_candidate(LightSetGpu* set, NeeVertex v, inout Sampler rng)
@@ -1331,6 +1328,28 @@ public ResolvedLightSample nee_shared_tile_candidate(LightSetGpu* set, NeeVertex
     ResolvedLightSample r = nee_tile_candidate(set, v, rng);
     if (r.pdf > 0.0)
         r.pdf *= light_selection(set, v.local, r.light, r.position) / global_selection(set, r.light);
+    return r;
+}
+
+// A candidate of vertex `v`, whose screen tile holds local sampler `v.local` with its points of
+// this frame: one of those points for the sampler's share, else the tile's sample, either with
+// its density in the mixture of the two. Five sampler dimensions, as `nee_tile_candidate`.
+public ResolvedLightSample nee_local_tile_candidate(LightSetGpu* set, NeeVertex v, inout Sampler rng)
+{
+    float choice = rng.next();
+    if (!(choice < v.local.share))
+    {
+        // The tile's draw leaves the choice's dimension unread.
+        rng.dimension--;
+        return nee_shared_tile_candidate(set, v, rng);
+    }
+    uint pick = rng.next_bits();
+    rng.dimension += 2;
+    float2 u = rng.next4_parts().xy();
+    ResolvedLightSample r = resolve_light_sample(set, v.local.samples[mulhi(pick, LOCAL_SAMPLES)], v.position, u);
+    if (r.pdf > 0.0)
+        r.pdf *= light_selection(set, v.local, r.light, r.position);
+    r.pdf *= 1.0 - v.share;
     return r;
 }
 

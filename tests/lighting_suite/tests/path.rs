@@ -132,6 +132,33 @@ fn the_pipeline_draws_from_local_light_samplers_as_the_staged_loop_does() {
     assert_clean();
 }
 
+/// The pipeline's paths trace a view's camera rays in place of the raster: their hits, the
+/// paths' first vertices, write the G-buffer the guides and the update paths read, and the view
+/// of a sphere on the ground under a sun and a sky, and of an alpha-tested quad over it, comes
+/// out as the staged loop renders the rastered one.
+#[test]
+fn the_pipeline_traces_a_view_s_camera_rays_as_the_raster_draws_it() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    let traced = ViewLighting {
+        traced_primary: true,
+        ..ViewLighting::default()
+    };
+    let staged = Paths::exactly(
+        &KernelSet::default(),
+        PathEntry::Compute,
+        ViewLighting::default(),
+    );
+    let launched = Paths::exactly(&KernelSet::default(), PathEntry::Pipeline, traced);
+    for scene in [Analytic::SunAndGround, Analytic::AlphaQuad] {
+        let mut bed = Bed::new(scene);
+        bed.set_pre_exposure(1.0 / 64.0);
+        assert_pipeline_renders_as_staged(&format!("{scene:?}"), &mut bed, &staged, &launched);
+    }
+    assert_clean();
+}
+
 /// The pipeline path tracer renders opaque scenes as the staged loop does: a sphere on the ground
 /// under a sun and a sky, the Cornell box lit by its emissive quad, and an alpha-tested quad; and
 /// the box in the debug view of its first vertex's ray origin bias.

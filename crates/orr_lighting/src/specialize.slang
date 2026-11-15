@@ -75,6 +75,9 @@ static const uint path_may = 0xffffffffu;
 [Host] public static const uint MAY_LOCAL_LIGHTS = 1 << 23;
 [Host] public static const uint MAY_DIRECTIONAL = 1 << 24;
 [Host] public static const uint MAY_EMISSIVE = 1 << 25;
+// The view's paths trace their camera rays, whose hits are their first vertices and write the
+// view's G-buffer in place of the raster (`PathRoot.raster`).
+[Host] public static const uint MAY_TRACED = 1 << 26;
 // The scene may hold a medium proxy; a smoke entry.
 [Host] public static const uint MAY_PROXIES = 1u << 30;
 [Host] public static const uint MAY_SMOKE = 1u << 31;

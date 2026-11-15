@@ -2890,6 +2890,53 @@ impl<'a> Frame<'a> {
         requests: &[ArenaRequest],
         opaque: Option<&mut OpaqueHook<'_>>,
     ) -> Result<RasterView> {
+        self.view_with(view, requests, opaque, false)
+    }
+
+    /// A view whose paths trace its camera rays in place of the raster: the view's targets and
+    /// lists as [`Self::raster_view_with`] makes them, cleared, with nothing culled, drawn or
+    /// resolved. The hits of the camera rays write the G-buffer, each pixel's visibility word
+    /// naming an entry of its own in the visible clusters, and [`Self::finish_traced_view`]
+    /// follows the paths. The scene's drawn producer entries are not seen.
+    pub fn traced_view(
+        &mut self,
+        view: &ViewDesc,
+        requests: &[ArenaRequest],
+    ) -> Result<RasterView> {
+        self.view_with(view, requests, None, true)
+    }
+
+    /// After the paths of a view [`Self::traced_view`] made this frame: the HZB from the depths
+    /// their camera rays' hits wrote, and the depth target.
+    pub fn finish_traced_view(&mut self, view: &RasterView) -> Result<()> {
+        let core = &mut *self.core;
+        let history = core
+            .histories
+            .get(view.history.0 as usize)
+            .and_then(Option::as_ref)
+            .ok_or(Error::UnknownViewHistory(view.history))?;
+        let targets = history.targets.as_ref().expect("view targets");
+        let list = self.list.as_mut().expect("frame list");
+        raster::finish_traced(
+            self.device,
+            &core.raster,
+            self.pipelines,
+            &core.windows[self.window],
+            list,
+            targets,
+            view.scene,
+            view.view,
+            view.raster,
+        )
+    }
+
+    fn view_with(
+        &mut self,
+        view: &ViewDesc,
+        requests: &[ArenaRequest],
+        opaque: Option<&mut OpaqueHook<'_>>,
+        traced: bool,
+    ) -> Result<RasterView> {
         self.ensure_updated()?;
         let _zone = orr_gpu::zone!("raster_view");
         if !self.listed.contains(&view.scene) {
@@ -2971,9 +3018,10 @@ impl<'a> Frame<'a> {
         history.arena.layout(&all, list)?;
         let produced = producers.iter().map(|&(_, n)| u64::from(n)).sum();
         let pixels = u64::from(view.render_extent.x) * u64::from(view.render_extent.y);
-        history
-            .visible
-            .floor(sized.1.visible(&sized.0, produced, pixels));
+        let visible = sized.1.visible(&sized.0, produced, pixels);
+        // A traced view's hits name one visible cluster per pixel.
+        let per_pixel = if traced { pixels as u32 } else { 0 };
+        history.visible.floor(visible.max(per_pixel));
         // The second culling pass takes at most one work item per candidate item.
         let want = ListSizes {
             visible_clusters: history.visible.wanted(),
@@ -3042,6 +3090,7 @@ impl<'a> Frame<'a> {
             occlusion,
             preprocess,
             opaque,
+            traced,
         )?;
         drop(record);
         let raster = draws[0];
@@ -3055,7 +3104,7 @@ impl<'a> Frame<'a> {
             view: constants,
             scene: root,
             gbuffer: raster.cast(),
-            targets: targets.gbuffer(lists),
+            targets: targets.gbuffer(lists, traced),
             depth: Arc::clone(&targets.depth.texture),
             motion: Arc::clone(&targets.motion.texture),
             gbuf_a,
