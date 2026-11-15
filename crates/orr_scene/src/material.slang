@@ -29,6 +29,18 @@ public static const uint MATERIAL_ORIGIN_MASK = 3 << 13;
 // displacement, linked surface, coat, fuzz, thin film or anisotropy varies; the host sets it on
 // every record (orr_scene::material_flags::STACK_FACE).
 public static const uint MATERIAL_STACK_FACE = 1 << 15;
+// `MaterialGpu.lobes` (orr_scene::material_lobes): what the material's surface may show beyond
+// the plain part, by its record's weights where the standard surface shades it and by what its
+// linked surface type declares.
+public static const uint MATERIAL_LOBE_TRANSMISSION = 1 << 0;
+public static const uint MATERIAL_LOBE_SUBSURFACE = 1 << 1;
+public static const uint MATERIAL_LOBE_COAT = 1 << 2;
+public static const uint MATERIAL_LOBE_FUZZ = 1 << 3;
+public static const uint MATERIAL_LOBE_THIN_FILM = 1 << 4;
+public static const uint MATERIAL_LOBE_EMISSION = 1 << 5;
+public static const uint MATERIAL_LOBE_ANISOTROPY = 1 << 6;
+// The lobes a path's rich stages hold.
+public static const uint MATERIAL_LOBES_RICH = MATERIAL_LOBE_SUBSURFACE | MATERIAL_LOBE_COAT | MATERIAL_LOBE_FUZZ | MATERIAL_LOBE_THIN_FILM;
 public static const uint MATERIAL_COST_SHIFT = 16;
 public static const uint MATERIAL_COST_MASK = 3 << 16;
 // The coat shades on the base's normal, normal map included, not the mesh's.
@@ -239,6 +251,8 @@ public struct MaterialGpu
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
     public uint coat_tangent_set;           // what the coat's normal map and tangent follow, as `tangent_set`
+    public uint lobes;                      // MATERIAL_LOBE_*: what its surface may show beyond the plain part; orr sets it
+    public uint _pad;
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
     public TextureStreamGpu** texture_streams; // by heap index, null where it neither streams nor has a neural set; orr sets it
     public uint* tiles[TEXTURE_SLOTS];                  // per slot of TEXTURE_TILED, its table: `texture_tile`

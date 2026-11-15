@@ -44,11 +44,15 @@ public struct BladeGeometry : IDrawn
 
 public struct BladeSurface : ISurface
 {
-    public override static void adjust(SurfaceInput i, inout GSurface g, inout float depth_offset)
+    public override static void adjust(SurfaceInput i, inout PlainSurface s, inout float depth_offset)
     {
         // Darker toward the root, where less light reaches.
-        float3 color = blade_color_from(i.vertex_user.x) * lerp(0.35, 1.0, saturate(i.uv[0].uv.y));
-        g.bsdf.base_color = color;
-        g.bsdf.subsurface_color = color;
+        s.base_color = blade_color_from(i.vertex_user.x) * lerp(0.35, 1.0, saturate(i.uv[0].uv.y));
+    }
+
+    // The blade passes light of its own color through.
+    public override static void subsurface(SurfaceInput i, PlainSurface s, inout SubsurfaceLobe lobe)
+    {
+        lobe.color = s.base_color;
     }
 }

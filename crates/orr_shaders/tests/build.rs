@@ -492,13 +492,31 @@ fn omm_builds_declare_the_mode_on_every_ray_query_entry() {
 /// The surface interfaces in the shape the build's switch calls.
 const SURFACE: &str = "module surface;\n\
     public struct SurfaceInput { public uint surface; public float x; }\n\
+    public uint surface_id(SurfaceInput i) { return i.surface; }\n\
     public struct GSurface { public float4 albedo; }\n\
+    public struct PlainSurface { public float4 albedo; }\n\
+    public struct TransmissionLobe { public float weight; }\n\
+    public struct SubsurfaceLobe { public float weight; }\n\
+    public struct CoatLobe { public float weight; }\n\
+    public struct FuzzLobe { public float weight; }\n\
+    public struct ThinFilmLobe { public float weight; }\n\
+    public struct EmissionLobe { public float weight; }\n\
+    public struct AnisotropyLobe { public float weight; }\n\
     public interface ISurface {\n\
-        static bool surface(SurfaceInput i, out GSurface g, out float d) { g = GSurface(); d = 0; return false; }\n\
-        static void adjust(SurfaceInput i, inout GSurface g, inout float d) {}\n\
+        static bool surface(SurfaceInput i, out PlainSurface s, out float d) { s = PlainSurface(); d = 0; return false; }\n\
+        static void adjust(SurfaceInput i, inout PlainSurface s, inout float d) {}\n\
         static bool coverage(SurfaceInput i, out float c) { c = 0; return false; }\n\
         static void feedback(SurfaceInput i) {}\n\
         static void coverage_feedback(SurfaceInput i) {}\n\
+        static uint coverage_reads(SurfaceInput i) { return 0; }\n\
+        static void transmission(SurfaceInput i, PlainSurface s, inout TransmissionLobe lobe) {}\n\
+        static void subsurface(SurfaceInput i, PlainSurface s, inout SubsurfaceLobe lobe) {}\n\
+        static void coat(SurfaceInput i, PlainSurface s, inout CoatLobe lobe) {}\n\
+        static void fuzz(SurfaceInput i, PlainSurface s, inout FuzzLobe lobe) {}\n\
+        static void thin_film(SurfaceInput i, PlainSurface s, inout ThinFilmLobe lobe) {}\n\
+        static void emission(SurfaceInput i, PlainSurface s, inout EmissionLobe lobe) {}\n\
+        static void anisotropy(SurfaceInput i, PlainSurface s, inout AnisotropyLobe lobe) {}\n\
+        static void other_side() {}\n\
     }\n\
     public struct NoSurface : ISurface {}\n\
     public interface ISurfaces {\n\
@@ -507,8 +525,9 @@ const SURFACE: &str = "module surface;\n\
     }\n\
     public struct Surfaces<L : ISurface> : ISurfaces {\n\
         public static GSurface surface(SurfaceInput i, out float d, bool report) {\n\
-            GSurface g;\n\
-            if (!L.surface(i, g, d)) { d = 0; g = { float4(0) }; L.adjust(i, g, d); }\n\
+            PlainSurface s;\n\
+            if (!L.surface(i, s, d)) { d = 0; s = { float4(0) }; L.adjust(i, s, d); }\n\
+            GSurface g = { s.albedo };\n\
             return g;\n\
         }\n\
         public static float coverage(SurfaceInput i, bool presence, bool report) {\n\
@@ -522,7 +541,7 @@ const SURFACE: &str = "module surface;\n\
 /// A consumer surface returning `value`.
 fn consumer_surface(ty: &str, value: &str) -> String {
     format!(
-        "import orr_scene.surface;\npublic struct {ty} : ISurface {{ override static bool surface(SurfaceInput i, out GSurface g, out float d) {{ d = 0; g = {{ float4({value}) }}; return true; }} }}\n"
+        "import orr_scene.surface;\npublic struct {ty} : ISurface {{ override static bool surface(SurfaceInput i, out PlainSurface s, out float d) {{ d = 0; s = {{ float4({value}) }}; return true; }} }}\n"
     )
 }
 

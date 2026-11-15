@@ -7,14 +7,18 @@ import orr_scene.surface;
 
 public struct Words : ISurface
 {
-    public override static bool surface(SurfaceInput i, out GSurface g, out float depth_offset)
+    public override static bool surface(SurfaceInput i, out PlainSurface s, out float depth_offset)
     {
         depth_offset = 0.0;
-        g = GSurface();
-        g.normal = i.normal;
-        g.geometric_normal = i.geometric_normal;
-        g.bsdf.base_color = float3(float(i.cluster_user), float(i.vertex_user.x), float(i.vertex_user.y));
-        g.bsdf.emission = float3(float(i.vertex_user.z), float(i.user_tag), float(i.context.kind));
+        s = PlainSurface();
+        s.normal = i.normal;
+        s.geometric_normal = i.geometric_normal;
+        s.base_color = float3(float(i.cluster_user), float(i.vertex_user.x), float(i.vertex_user.y));
         return true;
+    }
+
+    public override static void emission(SurfaceInput i, PlainSurface s, inout EmissionLobe lobe)
+    {
+        lobe.emission = float3(float(i.vertex_user.z), float(i.user_tag), float(i.context.kind));
     }
 }

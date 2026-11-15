@@ -91,6 +91,13 @@ pub(crate) const MAY_SUBSURFACE: u64 = consts::MAY_SUBSURFACE as u64;
 /// goes with them: only a subsurface vertex starts a walk.
 const MAY_LOBES: u64 = consts::MAY_LOBES as u64;
 pub(crate) const MAY_RICH: u64 = MAY_LOBES | MAY_WALK;
+
+/// What gives the rich opaque stage a vertex (`stages.slang`'s `opaque_queue`): a lobe a plain
+/// surface lacks, or a linked surface type, whose code the plain stage leaves out.
+fn may_queue_rich() -> u64 {
+    let linked = !SceneFeatures(!SceneFeatures::LINKED_SURFACES.0).surface_may();
+    MAY_LOBES | u64::from(linked) << 32
+}
 pub(crate) const MAY_INTERIORS: u64 = consts::MAY_INTERIORS as u64;
 pub(crate) const MAY_LAYERS: u64 = consts::MAY_LAYERS as u64;
 pub(crate) const MAY_COVERAGE: u64 = consts::MAY_COVERAGE as u64;
@@ -310,15 +317,15 @@ impl Members for StagedStages {
         &*STAGE_NAMES
     }
 
-    /// With the rich opaque stage where the set's surfaces may have lobes a plain one lacks,
-    /// and without the other shade stage where nothing gives it a vertex.
+    /// With the rich opaque stage where the set's surfaces may have lobes a plain one lacks or
+    /// be of a linked type, and without the other shade stage where nothing gives it a vertex.
     fn runs(&self, may: u64, members: &[usize]) -> Vec<usize> {
         let mut out: Vec<_> = members
             .iter()
             .copied()
             .filter(|&s| s != Stage::Other as usize || may & MAY_OTHER != 0)
             .collect();
-        if may & MAY_LOBES != 0 {
+        if may & may_queue_rich() != 0 {
             out.push(Stage::Rich as usize);
         }
         out
@@ -533,7 +540,7 @@ impl StagedKernels {
                     if set.may() & MAY_OTHER != 0 {
                         shades.push((Stage::Other, queue(QUEUE_OTHER)));
                     }
-                    if set.may() & MAY_LOBES != 0 {
+                    if set.may() & may_queue_rich() != 0 {
                         shades.push((Stage::Rich, queue(QUEUE_RICH)));
                     }
                     steps.push(Step {

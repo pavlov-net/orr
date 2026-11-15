@@ -63,8 +63,9 @@ public static const uint HIT_ALPHA_TESTED = 1 << 3;
 public static const uint HIT_THIN_WALL = 1 << 4;      // of the dielectric class, its material bounds no interior
 public static const uint HIT_CROSSES_INTERIOR = 1 << 5;
 public static const uint HIT_EMITS = 1 << 6;
-// The material or its back may give its surface a coat, fuzz, thin film or subsurface weight: it
-// has one of their weights above 0, or a linked surface, which may set any.
+// The material or its back may give its surface a coat, fuzz, thin film or subsurface weight
+// (`MaterialGpu.lobes`): it has one of their weights above 0, or its linked surface type
+// declares one.
 public static const uint HIT_LOBED = 1 << 7;
 // Solid glass, a section cooked as a dielectric with an interior: a plane stack's ray stops at it.
 public static const uint HIT_SOLID = 1 << 8;
@@ -113,7 +114,7 @@ public HitData hit_data(SceneRoot* s, uint material, uint class_id, bool solid, 
 
 bool material_lobed(MaterialGpu* m)
 {
-    return m.surface != 0 || m.coat_weight > 0.0 || m.fuzz_weight > 0.0 || m.thin_film_weight > 0.0 || m.subsurface_weight > 0.0;
+    return (m.lobes & MATERIAL_LOBES_RICH) != 0;
 }
 
 // The data of the medium or light proxies' run.

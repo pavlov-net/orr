@@ -66,11 +66,14 @@ uint pinned(uint kind, uint pin)
 }
 
 // The pin of the groups that shade material `material`: its linked surface id's, or with a back
-// of another id the pin of any id.
+// of another id the pin of any id, whose groups hold shaders only where a linked type declares
+// its other side (`ISurface.other_side`). A run of no material shades as the standard surface's.
 uint material_pin(SceneRoot* s, uint material)
 {
-    if (root.surfaces == 0 || material == MATERIAL_NONE)
+    if (root.surfaces == 0)
         return 0;
+    if (material == MATERIAL_NONE)
+        return 1;
     MaterialGpu* m = s.materials + material;
     uint id = m.surface <= root.surfaces ? m.surface : 0;
     if ((m.flags & MATERIAL_HAS_BACK) != 0)

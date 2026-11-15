@@ -571,7 +571,7 @@ impl Scenes {
             },
             clusters: ClusterTable::new(device, pools.mesh, pool_block(device, b, pools))?,
         });
-        let materials = MaterialTable::new(device)?;
+        let materials = MaterialTable::new(device, desc.kernels.surface_declares)?;
         let mounts = Mounts::new(
             device,
             b,

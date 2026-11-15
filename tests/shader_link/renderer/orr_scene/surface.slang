@@ -31,15 +31,52 @@ public struct GSurface
     public float4 albedo;
 }
 
+public struct PlainSurface
+{
+    public float4 albedo;
+}
+
+public struct TransmissionLobe { public float weight; }
+public struct SubsurfaceLobe { public float weight; }
+public struct CoatLobe { public float weight; }
+public struct FuzzLobe { public float weight; }
+public struct ThinFilmLobe { public float weight; }
+public struct EmissionLobe { public float weight; }
+public struct AnisotropyLobe { public float weight; }
+
 public interface ISurface
 {
-    static bool surface(SurfaceInput i, out GSurface g, out float depth_offset)
+    static bool surface(SurfaceInput i, out PlainSurface s, out float depth_offset)
     {
-        g = GSurface();
+        s = PlainSurface();
         depth_offset = 0.0;
         return false;
     }
-    static void adjust(SurfaceInput i, inout GSurface g, inout float depth_offset)
+    static void adjust(SurfaceInput i, inout PlainSurface s, inout float depth_offset)
+    {
+    }
+    static void transmission(SurfaceInput i, PlainSurface s, inout TransmissionLobe lobe)
+    {
+    }
+    static void subsurface(SurfaceInput i, PlainSurface s, inout SubsurfaceLobe lobe)
+    {
+    }
+    static void coat(SurfaceInput i, PlainSurface s, inout CoatLobe lobe)
+    {
+    }
+    static void fuzz(SurfaceInput i, PlainSurface s, inout FuzzLobe lobe)
+    {
+    }
+    static void thin_film(SurfaceInput i, PlainSurface s, inout ThinFilmLobe lobe)
+    {
+    }
+    static void emission(SurfaceInput i, PlainSurface s, inout EmissionLobe lobe)
+    {
+    }
+    static void anisotropy(SurfaceInput i, PlainSurface s, inout AnisotropyLobe lobe)
+    {
+    }
+    static void other_side()
     {
     }
     static bool coverage(SurfaceInput i, out float coverage)
@@ -73,13 +110,16 @@ public struct Surfaces<L : ISurface> : ISurfaces
 {
     public static GSurface surface(SurfaceInput i, out float depth_offset, bool report)
     {
-        GSurface g;
-        if (!L.surface(i, g, depth_offset))
+        PlainSurface s;
+        if (!L.surface(i, s, depth_offset))
         {
             depth_offset = 0.0;
-            g = { float4(0.5, 0.5, 0.5, 1.0) };
-            L.adjust(i, g, depth_offset);
+            s = { float4(0.5, 0.5, 0.5, 1.0) };
+            L.adjust(i, s, depth_offset);
         }
+        FuzzLobe fuzz = { 0.0 };
+        L.fuzz(i, s, fuzz);
+        GSurface g = { s.albedo + float4(fuzz.weight, 0.0, 0.0, 0.0) };
         return g;
     }
 

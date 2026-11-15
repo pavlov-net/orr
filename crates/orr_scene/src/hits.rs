@@ -24,8 +24,9 @@ use crate::{Result, SceneRoot};
 ///
 /// The path and shadow groups are pinned: each is the first of [`Self::pins`] groups, one after
 /// another, for the materials of one linked surface id (`scene_may.slang`'s `hit_surface`). The
-/// first serves any id, and is what a material whose back shows another id takes; where surfaces
-/// link, the pin of id `k` follows at `k + 1`.
+/// first serves any id, and is what a material whose back shows another id takes: a pipeline
+/// gives it shaders where a linked type declares its other side, which alone lets such a
+/// material be. Where surfaces link, the pin of id `k` follows at `k + 1`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct HitGroups {
     /// The linked surface types the pinned groups serve, ids 1 to `surfaces`.

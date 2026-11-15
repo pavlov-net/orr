@@ -115,6 +115,20 @@ pub const DEFAULT_ENVIRONMENT: &str = "EnvironmentMap";
 /// The Slang type of the medium kernels declare, which reads no data.
 pub const DEFAULT_MEDIUM: &str = "NoMedium";
 
+/// What a linked surface type declares by the optional methods of `ISurface` it has: each lobe
+/// its materials may show beyond the plain surface, and that one may share a triangle with a
+/// material of another surface id.
+pub mod surface_declares {
+    pub const TRANSMISSION: u32 = 1 << 0;
+    pub const SUBSURFACE: u32 = 1 << 1;
+    pub const COAT: u32 = 1 << 2;
+    pub const FUZZ: u32 = 1 << 3;
+    pub const THIN_FILM: u32 = 1 << 4;
+    pub const EMISSION: u32 = 1 << 5;
+    pub const ANISOTROPY: u32 = 1 << 6;
+    pub const OTHER_SIDE: u32 = 1 << 7;
+}
+
 /// Kernels compiled by a consumer's build with its own link-time types: `KERNELS` in the
 /// build's `orr_kernels.rs`. Empty when nothing links.
 #[derive(Clone, Copy, Debug)]
@@ -122,6 +136,8 @@ pub struct KernelSet {
     pub modules: &'static [&'static ShaderModule],
     /// Linked surfaces: their ids are `1..=surfaces`.
     pub surfaces: u32,
+    /// What each linked surface type declares ([`surface_declares`]), by id from 1.
+    pub surface_declares: &'static [u32],
     /// The Slang type linked as the environment; [`DEFAULT_ENVIRONMENT`] when none is.
     pub environment: &'static str,
     /// The Slang type linked as the medium; [`DEFAULT_MEDIUM`] when none is.
@@ -139,6 +155,7 @@ impl KernelSet {
     pub const NONE: Self = Self {
         modules: &[],
         surfaces: 0,
+        surface_declares: &[],
         environment: DEFAULT_ENVIRONMENT,
         medium: DEFAULT_MEDIUM,
     };

@@ -8,16 +8,19 @@ public static const float3 FAR = float3(4.0, 40.0, 4.0);
 
 public struct Context : ISurface
 {
-    public override static bool surface(SurfaceInput i, out GSurface g, out float depth_offset)
+    public override static bool surface(SurfaceInput i, out PlainSurface s, out float depth_offset)
     {
         depth_offset = 0.0;
-        g = GSurface();
-        g.normal = i.normal;
-        g.geometric_normal = i.geometric_normal;
-        g.bsdf.specular_ior = 1.5;
-        g.bsdf.coat_normal = i.normal;
-        g.bsdf.emission = i.context.depth < 2 ? NEAR : FAR;
-        g.flags = GBUFFER_UNLIT;
+        s = PlainSurface();
+        s.normal = i.normal;
+        s.geometric_normal = i.geometric_normal;
+        s.specular_ior = 1.5;
         return true;
+    }
+
+    public override static void emission(SurfaceInput i, PlainSurface s, inout EmissionLobe lobe)
+    {
+        lobe.emission = i.context.depth < 2 ? NEAR : FAR;
+        lobe.unlit = true;
     }
 }
