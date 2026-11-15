@@ -805,6 +805,17 @@ public struct CoverageFeedback<S : ISurfaces> : ISurfaces
     }
 }
 
+// Color slot `slot`'s color from its factor `factor`: times the vertex color stream's value
+// `stream` where the slot reads the stream (`streamed`), as `surface_color_factor`, then tinted by
+// its texel `texel` where one was read.
+float3 slot_color(MaterialGpu* m, uint slot, bool read, float3 texel, bool streamed, float3 stream, float3 factor)
+{
+    float3 c = factor;
+    if (streamed)
+        c = mul(REC709_TO_REC2020, mul(REC2020_TO_REC709, factor) * stream);
+    return read ? material_tint(m, slot, texel, c) : c;
+}
+
 // The standard surface: OpenPBR from the hit's `MaterialGpu` and its textures, with the decals
 // over the hit written over the material's parameters, but the flags of the lobes its weights
 // turn on (`surface_lobes`).
@@ -825,13 +836,13 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset)
     float thin_film_ior = 1.0, emission_luminance = 1.0, specular_anisotropy = 1.0;
     float3 subsurface_radius_scale = float3(1.0);
     float subsurface_anisotropy = 1.0;
-    float3 base_color = surface_color_factor(i, m, TEXTURE_BASE_COLOR, m.base_color);
-    float3 specular_color = surface_color_factor(i, m, TEXTURE_SPECULAR_COLOR, m.specular_color);
-    float3 transmission_color = surface_color_factor(i, m, TEXTURE_TRANSMISSION_COLOR, m.transmission_color);
-    float3 subsurface_color = surface_color_factor(i, m, TEXTURE_SUBSURFACE_COLOR, m.subsurface_color);
-    float3 coat_color = surface_color_factor(i, m, TEXTURE_COAT_COLOR, m.coat_color);
-    float3 fuzz_color = surface_color_factor(i, m, TEXTURE_FUZZ_COLOR, m.fuzz_color);
-    float3 emission = surface_color_factor(i, m, TEXTURE_EMISSION, material_emission(m));
+    float3 base_color = m.base_color;
+    float3 specular_color = m.specular_color;
+    float3 transmission_color = m.transmission_color;
+    float3 subsurface_color = m.subsurface_color;
+    float3 coat_color = m.coat_color;
+    float3 fuzz_color = m.fuzz_color;
+    float3 emission = material_emission(m);
     float4 normal = float4(0.0);
     float4 coat_normal = float4(0.0);
     float2 tangent = float2(0.0);
@@ -840,16 +851,28 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset)
     UvFootprint finest[2] = { finest_footprint(i.uv[0]), finest_footprint(i.uv[1]) };
     bool emission_finest = i.context.kind != HIT_PRIMARY;
 
-    // Every bound slot the surface reads goes through one texture read, so a kernel holds one
-    // copy of the texture path per surface it shades. Transmission depth comes first: it says
-    // whether the transmission color is read. Slots past TEXTURE_TRANSMISSION bind only with
+    // Every bound slot the surface reads goes through one texture read, and every slot of a
+    // material with a vertex color stream through one read of the stream, so a kernel holds one
+    // copy of each per surface it shades. Transmission depth comes first: it says whether the
+    // transmission color is read. Slots past TEXTURE_TRANSMISSION bind only with
     // MATERIAL_MORE_TEXTURES, transmission depth aside.
-    uint count = more ? TEXTURE_SLOTS : TEXTURE_TRANSMISSION + 2;
+    bool vertex = may2(MAY2_VERTEX_COLORS) && (m.flags & MATERIAL_VERTEX) != 0;
+    uint bindable = more ? TEXTURE_SLOTS : TEXTURE_TRANSMISSION + 2;
+    uint count = vertex ? TEXTURE_SLOTS : bindable;
     [loop]
     for (uint k = 0; k < count; k++)
     {
         uint slot = k == 0 ? TEXTURE_TRANSMISSION_DEPTH : k - 1 < TEXTURE_TRANSMISSION_DEPTH ? k - 1 : k;
-        if (!material_bound(m, slot))
+        // What the vertex color stream multiplies the slot by, and whether it reads the stream.
+        float3 stream = float3(1.0);
+        bool streamed = false;
+        if (vertex)
+        {
+            stream = surface_vertex(i, m, slot);
+            streamed = ((m.samplers[slot].modes >> TEXTURE_VERTEX_SHIFT) & TEXTURE_VERTEX_MASK) != 0;
+        }
+        bool bound = k < bindable && material_bound(m, slot);
+        if (!bound && !vertex)
             continue;
         bool read;
         switch (slot)
@@ -872,88 +895,92 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset)
             read = anisotropic;
             break;
         case TEXTURE_COAT_TANGENT:
-            read = m.coat_weight * coat * surface_vertex(i, m, TEXTURE_COAT).x > 0.0
-                && m.coat_anisotropy * (coat_anisotropy * surface_vertex(i, m, TEXTURE_COAT_ANISOTROPY).x) > 0.0;
+            read = m.coat_weight * coat > 0.0 && m.coat_anisotropy * coat_anisotropy > 0.0;
             break;
         default:
             read = true;
             break;
         }
-        if (!read)
+        read = read && bound;
+        if (!read && !vertex)
             continue;
         bool lit = slot == TEXTURE_EMISSION || slot == TEXTURE_EMISSION_LUMINANCE;
-        float4 v = material_texture(m, slot, lit && emission_finest ? finest : i.uv, float4(1.0));
+        float4 v = float4(1.0);
+        if (read)
+            v = material_texture(m, slot, lit && emission_finest ? finest : i.uv, float4(1.0));
+        // A scalar the stream multiplies takes its texel, 1 where it reads none, times the stream.
+        float scaled = v.x * stream.x;
         switch (slot)
         {
-        case TEXTURE_BASE_WEIGHT: base_weight = v.x; break;
-        case TEXTURE_BASE_COLOR: base_color = material_tint(m, slot, v.rgb, base_color); break;
-        case TEXTURE_METALNESS: metalness = v.x; break;
-        case TEXTURE_SPECULAR_IOR: specular_ior = v.x; break;
-        case TEXTURE_SPECULAR_COLOR: specular_color = material_tint(m, slot, v.rgb, specular_color); break;
-        case TEXTURE_SPECULAR_WEIGHT: specular_weight = v.x; break;
-        case TEXTURE_ROUGHNESS: roughness = v.x; break;
-        case TEXTURE_DIFFUSE_ROUGHNESS: diffuse_roughness = v.x; break;
-        case TEXTURE_TRANSMISSION: transmission = v.x; break;
-        case TEXTURE_TRANSMISSION_DEPTH: transmission_depth = v.x; break;
-        case TEXTURE_TRANSMISSION_COLOR: transmission_color = material_tint(m, slot, v.rgb, transmission_color); break;
-        case TEXTURE_SUBSURFACE_WEIGHT: subsurface_weight = v.x; break;
-        case TEXTURE_SUBSURFACE_COLOR: subsurface_color = material_tint(m, slot, v.rgb, subsurface_color); break;
-        case TEXTURE_SUBSURFACE_RADIUS: subsurface_radius = v.x; break;
-        case TEXTURE_SUBSURFACE_RADIUS_SCALE: subsurface_radius_scale = v.rgb; break;
-        case TEXTURE_SUBSURFACE_ANISOTROPY: subsurface_anisotropy = v.x; break;
-        case TEXTURE_COAT: coat = v.x; break;
-        case TEXTURE_COAT_COLOR: coat_color = material_tint(m, slot, v.rgb, coat_color); break;
-        case TEXTURE_COAT_ROUGHNESS: coat_roughness = v.x; break;
-        case TEXTURE_COAT_IOR: coat_ior = v.x; break;
-        case TEXTURE_COAT_DARKENING: coat_darkening = v.x; break;
-        case TEXTURE_COAT_ANISOTROPY: coat_anisotropy = v.x; break;
-        case TEXTURE_FUZZ_WEIGHT: fuzz_weight = v.x; break;
-        case TEXTURE_FUZZ_COLOR: fuzz_color = material_tint(m, slot, v.rgb, fuzz_color); break;
-        case TEXTURE_FUZZ_ROUGHNESS: fuzz_roughness = v.x; break;
-        case TEXTURE_THIN_FILM_WEIGHT: thin_film_weight = v.x; break;
-        case TEXTURE_THIN_FILM_THICKNESS: thin_film_thickness = v.x; break;
-        case TEXTURE_THIN_FILM_IOR: thin_film_ior = v.x; break;
-        case TEXTURE_EMISSION_LUMINANCE: emission_luminance = v.x; break;
-        case TEXTURE_EMISSION: emission = material_tint(m, slot, v.rgb, emission); break;
-        case TEXTURE_ANISOTROPY: specular_anisotropy = v.x; break;
-        case TEXTURE_NORMAL: normal = v; break;
-        case TEXTURE_COAT_NORMAL: coat_normal = v; break;
-        case TEXTURE_TANGENT: tangent = v.xy; break;
-        case TEXTURE_COAT_TANGENT: coat_tangent = v.xy; break;
+        case TEXTURE_BASE_WEIGHT: base_weight = scaled; break;
+        case TEXTURE_BASE_COLOR: base_color = slot_color(m, slot, read, v.rgb, streamed, stream, base_color); break;
+        case TEXTURE_METALNESS: metalness = scaled; break;
+        case TEXTURE_SPECULAR_IOR: specular_ior = scaled; break;
+        case TEXTURE_SPECULAR_COLOR: specular_color = slot_color(m, slot, read, v.rgb, streamed, stream, specular_color); break;
+        case TEXTURE_SPECULAR_WEIGHT: specular_weight = scaled; break;
+        case TEXTURE_ROUGHNESS: roughness = scaled; break;
+        case TEXTURE_DIFFUSE_ROUGHNESS: diffuse_roughness = scaled; break;
+        case TEXTURE_TRANSMISSION: transmission = scaled; break;
+        case TEXTURE_TRANSMISSION_DEPTH: if (read) transmission_depth = v.x; break;
+        case TEXTURE_TRANSMISSION_COLOR: transmission_color = slot_color(m, slot, read, v.rgb, streamed, stream, transmission_color); break;
+        case TEXTURE_SUBSURFACE_WEIGHT: subsurface_weight = scaled; break;
+        case TEXTURE_SUBSURFACE_COLOR: subsurface_color = slot_color(m, slot, read, v.rgb, streamed, stream, subsurface_color); break;
+        case TEXTURE_SUBSURFACE_RADIUS: subsurface_radius = scaled; break;
+        case TEXTURE_SUBSURFACE_RADIUS_SCALE: if (read) subsurface_radius_scale = v.rgb; break;
+        case TEXTURE_SUBSURFACE_ANISOTROPY: if (read) subsurface_anisotropy = v.x; break;
+        case TEXTURE_COAT: coat = scaled; break;
+        case TEXTURE_COAT_COLOR: coat_color = slot_color(m, slot, read, v.rgb, streamed, stream, coat_color); break;
+        case TEXTURE_COAT_ROUGHNESS: coat_roughness = scaled; break;
+        case TEXTURE_COAT_IOR: coat_ior = scaled; break;
+        case TEXTURE_COAT_DARKENING: coat_darkening = scaled; break;
+        case TEXTURE_COAT_ANISOTROPY: coat_anisotropy = scaled; break;
+        case TEXTURE_FUZZ_WEIGHT: fuzz_weight = scaled; break;
+        case TEXTURE_FUZZ_COLOR: fuzz_color = slot_color(m, slot, read, v.rgb, streamed, stream, fuzz_color); break;
+        case TEXTURE_FUZZ_ROUGHNESS: fuzz_roughness = scaled; break;
+        case TEXTURE_THIN_FILM_WEIGHT: thin_film_weight = scaled; break;
+        case TEXTURE_THIN_FILM_THICKNESS: thin_film_thickness = scaled; break;
+        case TEXTURE_THIN_FILM_IOR: thin_film_ior = scaled; break;
+        case TEXTURE_EMISSION_LUMINANCE: emission_luminance = scaled; break;
+        case TEXTURE_EMISSION: emission = slot_color(m, slot, read, v.rgb, streamed, stream, emission); break;
+        case TEXTURE_ANISOTROPY: specular_anisotropy = scaled; break;
+        case TEXTURE_NORMAL: if (read) normal = v; break;
+        case TEXTURE_COAT_NORMAL: if (read) coat_normal = v; break;
+        case TEXTURE_TANGENT: if (read) tangent = v.xy; break;
+        case TEXTURE_COAT_TANGENT: if (read) coat_tangent = v.xy; break;
         default: break;
         }
     }
 
     BsdfParams p;
-    p.base_color = m.base_weight * (base_weight * surface_vertex(i, m, TEXTURE_BASE_WEIGHT).x) * base_color;
-    p.metalness = m.metalness * metalness * surface_vertex(i, m, TEXTURE_METALNESS).x;
-    p.specular_ior = m.specular_ior * (specular_ior * surface_vertex(i, m, TEXTURE_SPECULAR_IOR).x);
+    p.base_color = m.base_weight * base_weight * base_color;
+    p.metalness = m.metalness * metalness;
+    p.specular_ior = m.specular_ior * specular_ior;
     p.specular_color = surface_specular_color(m, specular_color, p.specular_ior);
-    p.specular_weight = m.specular_weight * specular_weight * surface_vertex(i, m, TEXTURE_SPECULAR_WEIGHT).x;
-    p.specular_roughness = m.specular_roughness * roughness * surface_vertex(i, m, TEXTURE_ROUGHNESS).x;
-    p.diffuse_roughness = m.diffuse_roughness * (diffuse_roughness * surface_vertex(i, m, TEXTURE_DIFFUSE_ROUGHNESS).x);
-    p.transmission_weight = m.transmission_weight * transmission * surface_vertex(i, m, TEXTURE_TRANSMISSION).x;
+    p.specular_weight = m.specular_weight * specular_weight;
+    p.specular_roughness = m.specular_roughness * roughness;
+    p.diffuse_roughness = m.diffuse_roughness * diffuse_roughness;
+    p.transmission_weight = m.transmission_weight * transmission;
     // OpenPBR: at a depth of 0 the color "acts as a constant (on-surface) transmission tint".
     float depth = m.transmission_depth * transmission_depth;
     p.transmission_color = thin || depth == 0.0 ? transmission_color : float3(1.0);
-    p.subsurface_weight = m.subsurface_weight * (subsurface_weight * surface_vertex(i, m, TEXTURE_SUBSURFACE_WEIGHT).x);
+    p.subsurface_weight = m.subsurface_weight * subsurface_weight;
     p.subsurface_color = subsurface_color;
     p.subsurface_anisotropy = m.subsurface_scatter_anisotropy * subsurface_anisotropy;
-    p.subsurface_radius = m.subsurface_radius * (subsurface_radius * surface_vertex(i, m, TEXTURE_SUBSURFACE_RADIUS).x) * m.subsurface_radius_scale;
+    p.subsurface_radius = m.subsurface_radius * subsurface_radius * m.subsurface_radius_scale;
     if (more)
         p.subsurface_radius *= subsurface_radius_scale;
-    p.coat_weight = m.coat_weight * coat * surface_vertex(i, m, TEXTURE_COAT).x;
+    p.coat_weight = m.coat_weight * coat;
     p.coat_color = coat_color;
-    p.coat_roughness = m.coat_roughness * (coat_roughness * surface_vertex(i, m, TEXTURE_COAT_ROUGHNESS).x);
-    p.coat_ior = m.coat_ior * (coat_ior * surface_vertex(i, m, TEXTURE_COAT_IOR).x);
-    p.coat_darkening = m.coat_darkening * (coat_darkening * surface_vertex(i, m, TEXTURE_COAT_DARKENING).x);
-    p.fuzz_weight = m.fuzz_weight * (fuzz_weight * surface_vertex(i, m, TEXTURE_FUZZ_WEIGHT).x);
+    p.coat_roughness = m.coat_roughness * coat_roughness;
+    p.coat_ior = m.coat_ior * coat_ior;
+    p.coat_darkening = m.coat_darkening * coat_darkening;
+    p.fuzz_weight = m.fuzz_weight * fuzz_weight;
     p.fuzz_color = fuzz_color;
-    p.fuzz_roughness = m.fuzz_roughness * (fuzz_roughness * surface_vertex(i, m, TEXTURE_FUZZ_ROUGHNESS).x);
-    p.thin_film_weight = m.thin_film_weight * (thin_film_weight * surface_vertex(i, m, TEXTURE_THIN_FILM_WEIGHT).x);
-    p.thin_film_thickness = m.thin_film_thickness * (thin_film_thickness * surface_vertex(i, m, TEXTURE_THIN_FILM_THICKNESS).x);
-    p.thin_film_ior = m.thin_film_ior * (thin_film_ior * surface_vertex(i, m, TEXTURE_THIN_FILM_IOR).x);
-    p.emission = (emission_luminance * surface_vertex(i, m, TEXTURE_EMISSION_LUMINANCE).x) * emission;
+    p.fuzz_roughness = m.fuzz_roughness * fuzz_roughness;
+    p.thin_film_weight = m.thin_film_weight * thin_film_weight;
+    p.thin_film_thickness = m.thin_film_thickness * thin_film_thickness;
+    p.thin_film_ior = m.thin_film_ior * thin_film_ior;
+    p.emission = (emission_luminance) * emission;
 
     GSurface s = GSurface();
     s.normal = material_bound(m, TEXTURE_NORMAL) ? material_texel_normal(i, m, TEXTURE_NORMAL, normal) : i.normal;
@@ -970,7 +997,7 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset)
         p.flags |= BSDF_METAL_FLAT;
     if (anisotropic)
     {
-        p.specular_anisotropy = m.specular_anisotropy * (specular_anisotropy * surface_vertex(i, m, TEXTURE_ANISOTROPY).x);
+        p.specular_anisotropy = m.specular_anisotropy * specular_anisotropy;
         float direction = more && material_bound(m, TEXTURE_TANGENT) ? material_texel_direction(m, TEXTURE_TANGENT, tangent) : 0.0;
         p.tangent_angle = surface_tangent_angle(i.tangent, s.normal, m.specular_rotation + direction);
         p.flags |= BSDF_ANISOTROPY;
@@ -978,7 +1005,7 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset)
     p.coat_normal = (m.flags & MATERIAL_COAT_ON_BASE) != 0 ? s.normal : i.normal;
     if (more && material_bound(m, TEXTURE_COAT_NORMAL))
         p.coat_normal = material_texel_normal(i, m, TEXTURE_COAT_NORMAL, coat_normal);
-    p.coat_anisotropy = m.coat_anisotropy * (coat_anisotropy * surface_vertex(i, m, TEXTURE_COAT_ANISOTROPY).x);
+    p.coat_anisotropy = m.coat_anisotropy * coat_anisotropy;
     p.coat_tangent_angle = 0.0;
     if (p.coat_weight > 0.0 && p.coat_anisotropy > 0.0)
     {
