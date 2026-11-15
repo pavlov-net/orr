@@ -93,6 +93,12 @@ const SURFACE: Switch = Switch {
             args: "i",
             optional: true,
         },
+        Method {
+            decl: "uint coverage_reads(SurfaceInput i)",
+            name: "coverage_reads",
+            args: "i",
+            optional: true,
+        },
     ],
     wrap: Some("Surfaces"),
 };

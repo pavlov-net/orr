@@ -71,6 +71,13 @@ public struct SurfaceInput
     public uint64_t data;           // the material's consumer data, else the scene's
 }
 
+// What a coverage reads of its candidate's input beside the scene, the view, the ray's direction
+// and context, the material, its surface id and data, the copy's slot or the producer's entry
+// (`instance`), its `user_tag`, the triangle and the barycentrics, which every candidate has.
+public static const uint COVERAGE_UV = 1 << 0;       // the uv sets, at no footprint
+public static const uint COVERAGE_COLOR = 1 << 1;    // the vertex color
+public static const uint COVERAGE_WHOLE = 0xffffffffu; // all of the hit's input
+
 // What a linked surface type implements. Every method is optional: what a type leaves out, or
 // declines at a hit, the standard surface does, from `MaterialGpu` and its textures. A kernel
 // holds one copy of the standard surface per site however many types link (`Surfaces`), so a
@@ -116,6 +123,14 @@ public interface ISurface
     static void coverage_feedback(SurfaceInput i)
     {
     }
+
+    // What `coverage` and `coverage_feedback` read of their input beside what every candidate
+    // has (COVERAGE_*): a ray tracing pipeline's any-hit shader resolves that much of a
+    // candidate and leaves the rest as an empty input holds it.
+    static uint coverage_reads(SurfaceInput i)
+    {
+        return COVERAGE_WHOLE;
+    }
 }
 
 // A linked surface that leaves every hit to the standard surface: surface id 0's and that of
@@ -136,6 +151,9 @@ public interface ISurfaces
     // else the surface's coverage. With `report`, reports what it reads to the frame's texture
     // feedback.
     static float coverage(SurfaceInput i, bool presence, bool report);
+
+    // `ISurface.coverage_reads` of the surface of `i.surface`.
+    static uint coverage_reads(SurfaceInput i);
 }
 
 // The kernel's surfaces over linked surface `L`, the build's switch over the linked types by
@@ -177,6 +195,11 @@ public struct Surfaces<L : ISurface> : ISurfaces
         if (presence)
             return opacity;
         return opacity >= i.scene.materials[i.material].alpha_cutoff ? 1.0 : 0.0;
+    }
+
+    public static uint coverage_reads(SurfaceInput i)
+    {
+        return L.coverage_reads(i);
     }
 }
 
@@ -745,6 +768,11 @@ public struct FeedbackSurface<S : ISurfaces> : ISurfaces
     {
         return S.coverage(i, presence, report);
     }
+
+    public static uint coverage_reads(SurfaceInput i)
+    {
+        return S.coverage_reads(i);
+    }
 }
 
 // `S` whose alpha tests and presence layers' opacity report their texture feedback where their
@@ -760,6 +788,11 @@ public struct CoverageFeedback<S : ISurfaces> : ISurfaces
     public static float coverage(SurfaceInput i, bool presence, bool report)
     {
         return S.coverage(i, presence, report || (may2(MAY2_STREAMS) && i.context.feedback));
+    }
+
+    public static uint coverage_reads(SurfaceInput i)
+    {
+        return S.coverage_reads(i);
     }
 }
 

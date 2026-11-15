@@ -1108,7 +1108,7 @@ public float record_presence<S : ISurfaces>(SceneRoot* s, ViewConstants* v, floa
     if (alpha && !tested)
         return 1.0;
     SurfaceInput i;
-    if (!coverage_input(s, v, d, instance_index, cluster_id, primitive, bary, context, material, attributes, i))
+    if (!coverage_input<S>(s, v, d, instance_index, cluster_id, primitive, bary, context, material, attributes, i))
         return 0.0;
     uint flags = s.materials[material].flags;
     float coverage = S.coverage(i, !alpha && (flags & MATERIAL_PRESENCE) != 0, false);
@@ -1119,52 +1119,94 @@ public float record_presence<S : ISurfaces>(SceneRoot* s, ViewConstants* v, floa
 }
 
 // What a coverage reads of a triangle candidate of section material `material`, its copy's mesh's
-// vertex `attributes` on a copy's cluster: the standard surface's, a material's opacity, reads
-// the uvs and the vertex color, interpolated here from the triangle's corners. A material of a
-// linked surface id takes the whole input, which its coverage may read any of, and is false
-// where that names nothing to resolve, as `hit_input` is.
-bool coverage_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, uint material, uint attributes, out SurfaceInput i)
+// vertex `attributes` on a copy's cluster. The standard surface's, a material's opacity, reads the
+// uvs and with a vertex stream the vertex color, interpolated here from the triangle's corners.
+// A material of a linked surface id takes what its type's coverage says it reads
+// (`ISurface.coverage_reads`): that much of the input, or the whole of it, which is false where
+// that names nothing to resolve, as `hit_input` is.
+bool coverage_input<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, uint material, uint attributes, out SurfaceInput i)
 {
-    if (hit_surface_id(s.materials[material].surface) != 0)
+    MaterialGpu* m = s.materials + material;
+    uint surface = hit_surface_id(m.surface);
+    uint reads = COVERAGE_UV | COVERAGE_COLOR;
+    if (surface != 0)
     {
-        HitInput h;
-        bool found = hit_input_by(s, v, d, instance_index, cluster_id, primitive, bary, Corners(), false, false, false, context, section_given(material), h);
-        i = h.input;
-        return found;
+        SurfaceInput asked = SurfaceInput();
+        asked.surface = surface;
+        reads = S.coverage_reads(asked);
+        if (reads == COVERAGE_WHOLE)
+        {
+            HitInput h;
+            bool found = hit_input_by(s, v, d, instance_index, cluster_id, primitive, bary, Corners(), false, false, false, context, section_given(material), h);
+            i = h.input;
+            return found;
+        }
     }
-    VertexAttributes a[3];
+    i = SurfaceInput();
+    // A linked coverage that leaves a candidate to the material's alpha test reads the vertex
+    // stream where the material has one, whatever it reads itself.
+    bool colored = may2(MAY2_VERTEX_COLORS) && ((m.flags & MATERIAL_VERTEX) != 0 || (surface != 0 && (reads & COVERAGE_COLOR) != 0));
+    float2 uv[3][2];
+    float4 color[3];
+    for (uint k = 0; k < 3; k++)
+    {
+        uv[k][0] = uv[k][1] = float2(0.0);
+        color[k] = float4(1.0);
+    }
     uint entry;
     if (hit_producer(s, instance_index, entry))
     {
-        ProducerBatch b = s.batches[entry];
-        a = producer_triangle(b, b.clusters[cluster_id], primitive, false).corners.attributes;
+        i.instance = instance_index;
+        i.user_tag = s.producers[entry].user_tag;
+        if ((reads & (COVERAGE_UV | COVERAGE_COLOR)) != 0)
+        {
+            ProducerBatch b = s.batches[entry];
+            VertexAttributes a[3] = producer_triangle(b, b.clusters[cluster_id], primitive, false).corners.attributes;
+            for (uint k = 0; k < 3; k++)
+            {
+                uv[k] = a[k].uv;
+                color[k] = a[k].color;
+            }
+        }
     }
     else
     {
-        ClusterRef r = s.clusters[cluster_id];
-        Cluster c = load_cluster(r.page, r.local);
-        PageHeader h = load_page_header(r.page);
-        uint3 k = load_triangle(r.page, h, c, primitive);
-        a[0] = load_attributes(r.page, h, c, k.x, attributes);
-        a[1] = load_attributes(r.page, h, c, k.y, attributes);
-        a[2] = load_attributes(r.page, h, c, k.z, attributes);
+        if (surface != 0)
+        {
+            uint copy;
+            if (!hit_copy(s, instance_index, copy))
+                return false;
+            i.instance = copy;
+            i.user_tag = copy_record(s, copy).user_tag;
+        }
+        else
+            i.instance = instance_index;
+        if ((reads & (COVERAGE_UV | COVERAGE_COLOR)) != 0)
+        {
+            ClusterRef r = s.clusters[cluster_id];
+            Cluster c = load_cluster(r.page, r.local);
+            PageHeader h = load_page_header(r.page);
+            uint3 corners = load_triangle(r.page, h, c, primitive);
+            for (uint k = 0; k < 3; k++)
+                load_coverage_attributes(r.page, h, c, corners[k], attributes, colored, uv[k], color[k]);
+        }
     }
-    i = SurfaceInput();
     float3 w = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
     for (uint set = 0; set < 2; set++)
     {
-        float2 along1 = a[1].uv[set] - a[0].uv[set];
-        float2 along2 = a[2].uv[set] - a[0].uv[set];
-        i.uv[set].uv = a[0].uv[set] + bary.x * along1 + bary.y * along2;
-        i.uv[set].inward = a[0].uv[set] + (along1 + along2) / 3.0 - i.uv[set].uv;
+        float2 along1 = uv[1][set] - uv[0][set];
+        float2 along2 = uv[2][set] - uv[0][set];
+        i.uv[set].uv = uv[0][set] + bary.x * along1 + bary.y * along2;
+        i.uv[set].inward = uv[0][set] + (along1 + along2) / 3.0 - i.uv[set].uv;
         i.uv[set].tap = context.tap;
     }
-    i.vertex_color = w.x * a[0].color + w.y * a[1].color + w.z * a[2].color;
+    i.vertex_color = w.x * color[0] + w.y * color[1] + w.z * color[2];
     i.context = context;
-    i.instance = instance_index;
     i.primitive = primitive;
     i.barycentrics = bary;
     i.material = material;
+    i.surface = surface;
+    i.data = m.data != 0 ? m.data : s.surface_data;
     i.scene = s;
     i.view = v;
     i.view_direction = d;
