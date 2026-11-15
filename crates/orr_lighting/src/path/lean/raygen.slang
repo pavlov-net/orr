@@ -28,11 +28,12 @@ import orr_lighting.path.lean.vertex;
 // The miss shaders: of a path's ray and of its shadow ray.
 public static const uint MISS_SCATTER = 0;
 public static const uint MISS_SHADOW = 1;
+// The callable that runs a path's first vertex from the G-buffer.
+public static const uint CALL_FIRST = 0;
 
-// Starts the path of `pixel` in hot words `at` on its camera ray from the near plane, which its
-// throughput `throughput` rides: the surface the ray meets is the path's first vertex, which its
-// hit's shader runs as any other. A pixel whose G-buffer holds no surface sees the sky, which its
-// ray of no length misses into.
+// Starts the path of `pixel` in hot words `at` on its camera ray, which its throughput
+// `throughput` rides: its first vertex is the G-buffer's surface, and a pixel whose G-buffer holds
+// none sees the sky, which its ray of no length misses into.
 void start_path(PathRoot r, uint2 pixel, uint4* at, float throughput)
 {
     PathStart s = pinhole_start(r.view, r.gbuffer, pixel, true);
@@ -44,7 +45,7 @@ void start_path(PathRoot r, uint2 pixel, uint4* at, float throughput)
     p.pdf = 0.0;
     p.throughput = float3(throughput);
     p.run = 1.0;
-    p.cone = float2(cone_width(cone, s.offset), cone.spread);
+    p.cone = float2(cone.width, cone.spread);
     p.normal = s.dir;
     p.radiance = float3(0.0);
     p.light = NO_LIGHT;
@@ -80,9 +81,9 @@ void trace_shadow(PathRoot r, uint4* at, uint flags)
     trace(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, path_ray(origin, dir, t_max), p);
 }
 
-// Traces the ray in hot words `at`, whose first word is `w0`, up to `t_max`, and runs the shader of
-// what it met.
-void trace_ray(PathRoot r, uint slot, uint4* at, uint4 w0, float t_max)
+// Traces the ray in hot words `at`, whose first word is `w0`, and runs the shader of what it met.
+// A camera ray, which a sky pixel alone traces, has no length.
+void trace_ray(PathRoot r, uint slot, uint4* at, uint4 w0)
 {
     uint4 w1 = load_coherent(at + 1);
     float2 cone = halves(load_coherent(at + 2).x);
@@ -92,19 +93,26 @@ void trace_ray(PathRoot r, uint slot, uint4* at, uint4 w0, float t_max)
     RayCone c = { cone.x, cone.y };
     uint seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x;
     PathCover cover = new_path_cover(MASK_OPAQUE, COVER_ALPHA, PRESENCE_NONE, pcg(seed ^ depth),
-        hit_context(camera ? HIT_PRIMARY : HIT_SECONDARY, depth, c, 0.0, float2(-1.0), texture_feedback_drawn(pixel, r.frame)));
+        hit_context(HIT_SECONDARY, depth, c, 0.0, float2(-1.0), texture_feedback_drawn(pixel, r.frame)));
     Payload p;
     p.words = path_payload(cover);
-    Traced h = trace_hit(r.scene.tlas, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, MASK_OPAQUE, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), t_max), p);
+    Traced h = trace_hit(r.scene.tlas, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, MASK_OPAQUE, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), camera ? 0.0 : positive_infinity()), p);
     if (h.hit())
         reorder_invoke(h, p);
     else
         h.invoke(p);
 }
 
-// Runs the path in hot words `at` from its camera ray, which ends at `t_max`, to its end.
-void run_path(PathRoot r, uint slot, uint4* at, float t_max)
+// Runs the path in hot words `at` to its end, from the G-buffer's surface where its pixel holds
+// one (`surface`).
+void run_path(PathRoot r, uint slot, uint4* at, bool surface)
 {
+    if (surface)
+    {
+        Payload p;
+        p.words = uint4(0);
+        call(CALL_FIRST, p);
+    }
     for (;;)
     {
         uint4 w0 = load_coherent(at);
@@ -112,8 +120,7 @@ void run_path(PathRoot r, uint slot, uint4* at, float t_max)
             trace_shadow(r, at, w0.w);
         if ((w0.w & HOT_RAY) == 0)
             break;
-        trace_ray(r, slot, at, w0, t_max);
-        t_max = positive_infinity();
+        trace_ray(r, slot, at, w0);
     }
 }
 
@@ -136,7 +143,7 @@ public void lean_paths(PathRoot r)
     if (depth == 0.0 || runs_path(r, pixel))
     {
         start_path(r, pixel, at, depth > 0.0 ? 1.0 / r.pixel_fraction : 1.0);
-        run_path(r, slot, at, depth > 0.0 ? positive_infinity() : 0.0);
+        run_path(r, slot, at, depth > 0.0);
         radiance = asfloat(load_coherent(at + 3).xyz);
         lights = reinterpret<StoredViewLights>(load_coherent(record));
     }
@@ -164,13 +171,15 @@ public void lean_updates(PathRoot r)
     CacheUpdate update = CacheUpdate();
     uint state = pcg3d(uint3(pixel, r.frame ^ path_stream(r))).y;
     start_path(r, pixel, at, 1.0);
-    float t_max = positive_infinity();
+    Payload first;
+    first.words = uint4(0);
+    call(CALL_FIRST, first);
     for (;;)
     {
         uint4 w0 = load_coherent(at);
         if ((w0.w & HOT_ARRIVED) != 0)
         {
-            // The vertex the path's last hit left, with the radiance the path arrived with.
+            // The vertex the path's last shader left, with the radiance the path arrived with.
             uint4 a = load_coherent(record + UPDATE_VERTEX_AT);
             uint4 b = load_coherent(record + UPDATE_VERTEX_AT + 1);
             state = pcg(state);
@@ -181,7 +190,7 @@ public void lean_updates(PathRoot r)
             trace_shadow(r, at, w0.w);
         if ((w0.w & HOT_RAY) == 0)
             break;
-        trace_ray(r, slot, at, w0, t_max);
+        trace_ray(r, slot, at, w0);
     }
     update.finish(r, asfloat(load_coherent(at + 3).xyz), 0);
 }

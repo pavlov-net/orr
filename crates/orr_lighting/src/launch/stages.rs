@@ -30,7 +30,7 @@ fn may2(feature: SceneFeatures) -> u64 {
 pub enum Role {
     Raygen,
     Miss,
-    /// A closest-hit shader, which runs a whole vertex.
+    /// A closest-hit shader or the first vertex's callable, which run a whole vertex.
     Hit,
     /// An any-hit shader of a candidate that is not opaque.
     AnyHit,
@@ -104,6 +104,8 @@ struct Table {
     /// The raygen stage of each source by its id, where the pipeline runs the source.
     raygens: [Option<u32>; 4],
     misses: [u32; 2],
+    /// The callable of a path's first vertex.
+    first: u32,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
 }
@@ -145,6 +147,7 @@ impl Table {
             Self::stage(&mut specs, folded("miss_scatter", Role::Miss)),
             Self::stage(&mut specs, folded("miss_shadow", Role::Miss)),
         ];
+        let first = Self::stage(&mut specs, folded("first_vertex", Role::Hit));
         // `hit_surface` of the hit shaders of each pin: any id, then each id from 0 on. Where
         // no surface links every material shows id 0.
         let pinned = |entry, role, pin: u32, geometry: Geometry| Spec {
@@ -206,6 +209,7 @@ impl Table {
             specs,
             raygens,
             misses,
+            first,
             hit_groups,
             groups,
         }
@@ -335,7 +339,7 @@ impl PathPipeline {
             raygens: &records,
             misses: &table.misses.map(ShaderRecord::new),
             hit_groups: &table.hit_groups,
-            callables: &[],
+            callables: &[Some(ShaderRecord::new(table.first))],
             max_recursion: 1,
             flags: RayPipelineFlags::scene(device.caps()),
             threads,
