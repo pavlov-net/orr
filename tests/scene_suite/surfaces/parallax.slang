@@ -39,4 +39,9 @@ public struct Parallax : ISurface
         coverage = t >= 0.0 && all(abs(h.xy) <= HALF) ? 1.0 : 0.0;
         return true;
     }
+
+    public override static uint coverage_reads(SurfaceInput i)
+    {
+        return COVERAGE_WHOLE;
+    }
 }

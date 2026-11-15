@@ -2,6 +2,7 @@
 //! folded with that and held to a cap on what it hands the driver, its hit groups, and its
 //! creation.
 
+use std::ffi::CString;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -52,7 +53,7 @@ impl Role {
 pub const PIPELINE_CAP: u32 = PIPELINE_INSTRUCTIONS;
 
 /// The geometry a hit group's shaders run on, which their stages are made for.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Geometry {
     /// Copies' clusters, cooked or skinned.
     Copies,
@@ -63,6 +64,14 @@ enum Geometry {
 }
 
 impl Geometry {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Copies => ".copies",
+            Self::Producers => ".producers",
+            Self::Triangles => ".triangles",
+        }
+    }
+
     /// The `path_may2` bits (in the high word) its stages are made without.
     fn without(self) -> u64 {
         let producers = may2(SceneFeatures::PRODUCERS);
@@ -81,11 +90,25 @@ impl Geometry {
 struct Spec {
     entry: &'static str,
     role: Role,
+    /// The geometry of the hit group the stage serves; none for a stage no group holds.
+    geometry: Option<Geometry>,
     may: u64,
     hit_surface: u32,
 }
 
 impl Spec {
+    /// The name a driver's tools show the stage by: its entry, the geometry it is made for and
+    /// the linked surface id it is made for, so a trace tells stages of one entry apart.
+    fn label(&self) -> CString {
+        let surface = match (self.geometry, self.hit_surface) {
+            (None, _) => String::new(),
+            (Some(_), u32::MAX) => ".any".into(),
+            (Some(_), id) => format!(".surface{id}"),
+        };
+        let geometry = self.geometry.map_or("", Geometry::label);
+        CString::new(format!("{}{geometry}{surface}", self.entry)).expect("no nul in a label")
+    }
+
     fn constants(&self) -> ([u8; 32], &'static [SpecEntry]) {
         let s = lean_paths::Spec {
             path_may: self.may as u32,
@@ -130,6 +153,7 @@ impl Table {
         let folded = |entry, role| Spec {
             entry,
             role,
+            geometry: None,
             may,
             hit_surface: lean_paths::Spec::default().hit_surface,
         };
@@ -153,6 +177,7 @@ impl Table {
         let pinned = |entry, role, pin: u32, geometry: Geometry| Spec {
             entry,
             role,
+            geometry: Some(geometry),
             may: may & !geometry.without(),
             hit_surface: if surfaces == 0 {
                 0
@@ -315,16 +340,18 @@ impl PathPipeline {
             log::warn!("{name}: {message}");
         }
         let bytes: Vec<_> = table.specs.iter().map(Spec::constants).collect();
+        let labels: Vec<CString> = table.specs.iter().map(Spec::label).collect();
         // Every stage takes its constants: a stage with none is handed the whole module, with
         // every other entry point in it.
         let stages = table
             .specs
             .iter()
             .zip(&bytes)
-            .map(|(spec, (bytes, entries))| {
-                ShaderStage::new(lean, spec.entry, SpecData { entries, bytes })
+            .zip(&labels)
+            .map(|((spec, (bytes, entries)), label)| {
+                Ok(ShaderStage::new(lean, spec.entry, SpecData { entries, bytes })?.labeled(label))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, Error>>()?;
         // A source's record is its place among the raygens the pipeline holds.
         let mut records = Vec::new();
         let mut raygens = [None; 4];

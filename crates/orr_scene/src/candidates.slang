@@ -79,7 +79,7 @@ public PathCover path_cover(uint4 payload)
 // Whether a path ray commits the non-opaque triangle candidate with hit record data `d` on cluster
 // `cluster_id` of instance `instance_index` along unit `dir`, by `c`'s policy: ANY_HIT_ACCEPT or
 // ANY_HIT_IGNORE. `cover_decision` as the record has it.
-public uint cover_path<S : ISurfaces>(SceneRoot* s, ViewConstants* v, PathCover c, HitData d, float3 dir, uint instance_index, int cluster_id, uint primitive, float2 bary)
+public uint cover_path<S : ISurfaces>(SceneRoot* s, ViewConstants* v, PathCover c, HitData d, float3 dir, uint instance_index, int cluster_id, uint primitive, float2 bary, CandidateRay ray)
 {
     if (cluster_id < 0)
         return ANY_HIT_IGNORE;
@@ -100,7 +100,7 @@ public uint cover_path<S : ISurfaces>(SceneRoot* s, ViewConstants* v, PathCover 
         if (class_id == CLASS_DIELECTRIC ? !d.has(HIT_SOLID) : class_id != CLASS_OPAQUE)
             return ANY_HIT_IGNORE;
     }
-    float coverage = record_presence<S>(s, v, dir, instance_index, uint(cluster_id), primitive, bary, c.context, d.material, d.attributes, d.has(HIT_ALPHA_TESTED), alpha);
+    float coverage = record_presence<S>(s, v, dir, instance_index, uint(cluster_id), primitive, bary, c.context, d.material, d.attributes, d.has(HIT_ALPHA_TESTED), alpha, ray);
     bool accept = !layer || c.presence == PRESENCE_ANY ? coverage > 0.0 : presence_drawn(c.seed, instance_index, uint(cluster_id), primitive) < coverage;
     return accept ? ANY_HIT_ACCEPT : ANY_HIT_IGNORE;
 }
@@ -152,7 +152,8 @@ public bool cover_decision<S : ISurfaces>(SceneRoot* s, ViewConstants* v, uint p
 // `payload` holds, as `S` resolves surfaces: ANY_HIT_ACCEPT or ANY_HIT_IGNORE.
 public uint path_any_hit<S : ISurfaces, H : IHit>(SceneRoot* s, ViewConstants* v, uint4 payload, HitData d, H h)
 {
-    return cover_path<S>(s, v, path_cover(payload), d, h.world_direction(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.barycentrics());
+    CandidateRay ray = { h.world_origin(), h.t(), { h.corner(0), h.corner(1), h.corner(2) } };
+    return cover_path<S>(s, v, path_cover(payload), d, h.world_direction(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.barycentrics(), ray);
 }
 
 // A shadow ray's any-hit at triangle candidate `h` with hit record data `d`, the shadow's state in
@@ -160,7 +161,8 @@ public uint path_any_hit<S : ISurfaces, H : IHit>(SceneRoot* s, ViewConstants* v
 public uint shadow_any_hit<S : ISurfaces, H : IHit>(SceneRoot* s, ViewConstants* v, inout uint4 payload, HitData d, H h)
 {
     ShadowCover c = ShadowCover.of_words(payload);
-    uint decision = cover_shadow<S>(s, v, c.context(), c, d, h.world_direction(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.barycentrics());
+    CandidateRay ray = { h.world_origin(), h.t(), { h.corner(0), h.corner(1), h.corner(2) } };
+    uint decision = cover_shadow<S>(s, v, c.context(), c, d, h.world_direction(), h.instance_index(), h.cluster_id(), h.primitive_index(), h.barycentrics(), ray);
     payload = c.words();
     return decision;
 }
@@ -367,7 +369,7 @@ float3 thin_present<W : IThinWall>(uint mode, uint class_id, bool layer, bool la
 
 // A shadow ray's non-opaque triangle candidate with hit record data `d`, as `cover_path` takes
 // it, as `thin_candidate` decides: ANY_HIT_END where it ends the search, else ANY_HIT_IGNORE.
-public uint cover_shadow<S : ISurfaces>(SceneRoot* s, ViewConstants* v, HitContext context, inout ShadowCover p, HitData d, float3 dir, uint instance_index, int cluster_id, uint primitive, float2 bary)
+public uint cover_shadow<S : ISurfaces>(SceneRoot* s, ViewConstants* v, HitContext context, inout ShadowCover p, HitData d, float3 dir, uint instance_index, int cluster_id, uint primitive, float2 bary, CandidateRay ray)
 {
     if (cluster_id < 0)
         return ANY_HIT_IGNORE;
@@ -381,7 +383,7 @@ public uint cover_shadow<S : ISurfaces>(SceneRoot* s, ViewConstants* v, HitConte
     if (mode != SHADOW_PROBE || class_id == CLASS_DIELECTRIC)
     {
         bool layer = class_id == CLASS_PRESENCE || class_id == CLASS_PARTICLE;
-        float present = record_presence<S>(s, v, dir, instance_index, uint(cluster_id), primitive, bary, context, d.material, d.attributes, d.has(HIT_ALPHA_TESTED), !layer);
+        float present = record_presence<S>(s, v, dir, instance_index, uint(cluster_id), primitive, bary, context, d.material, d.attributes, d.has(HIT_ALPHA_TESTED), !layer, ray);
         RecordWall wall = { d };
         t = thin_present(mode, class_id, layer, true, present, wall, counted, flags);
     }

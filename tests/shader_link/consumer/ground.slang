@@ -15,4 +15,9 @@ public struct GroundBlend : ISurface
         coverage = i.context.kind == HIT_PRIMARY ? 0.75 : 0.5;
         return true;
     }
+
+    override static uint coverage_reads(SurfaceInput i)
+    {
+        return 0;
+    }
 }

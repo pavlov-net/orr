@@ -32,9 +32,18 @@ pub struct ShaderStage<'a> {
     pub debug_info: &'a str,
     pub entry: &'a EntryPoint,
     pub spec: SpecData<'a>,
+    /// The name the stage's entry point takes in the code the driver is handed, which its tools
+    /// show the stage by; empty for the entry's own.
+    pub label: &'a CStr,
 }
 
 impl<'a> ShaderStage<'a> {
+    /// The stage named `label` for the driver's tools: stages made of one entry with different
+    /// constants are told apart by it.
+    pub fn labeled(self, label: &'a CStr) -> Self {
+        Self { label, ..self }
+    }
+
     /// The entry point `entry` of `module`.
     pub fn new(module: &'a ShaderModule, entry: &str, spec: SpecData<'a>) -> Result<Self, Error> {
         let entry = module
@@ -49,6 +58,7 @@ impl<'a> ShaderStage<'a> {
             debug_info: module.debug_info,
             entry,
             spec,
+            label: c"",
         })
     }
 }
@@ -246,6 +256,14 @@ impl<'a> StageParts<'a> {
             }
             folded.map_or(code, Cow::Owned)
         };
+        let (code, entry) = match specialize::rename_entry(
+            &code,
+            s.entry.spirv_name.to_bytes(),
+            s.label.to_bytes(),
+        ) {
+            Some(renamed) if !s.label.is_empty() => (Cow::Owned(renamed), s.label),
+            _ => (code, s.entry.spirv_name),
+        };
         if shared.caps.cooperative_vector.is_empty() && spirv::cooperative_vectors(&code) {
             return Err(Error::Shader(format!(
                 "{name}: the module uses cooperative vectors, which the device has none of; build the shaders with ORR_SHADER_NEURAL=0"
@@ -268,7 +286,7 @@ impl<'a> StageParts<'a> {
         }
         Ok(Self {
             code,
-            entry: s.entry.spirv_name,
+            entry,
             // A ray tracing stage's root, if any, is inline: the build checks it.
             mappings: if s.inline_root_bytes > 0 || want.ray_tracing() {
                 Vec::new()

@@ -20,6 +20,15 @@ struct ProbeLinks : ISurface
             return Veil.coverage(i, coverage);
         return NoSurface.coverage(i, coverage);
     }
+
+    override static uint coverage_reads(SurfaceInput i)
+    {
+        if (i.surface == 2)
+            return Rings.coverage_reads(i);
+        if (i.surface == 3)
+            return Veil.coverage_reads(i);
+        return NoSurface.coverage_reads(i);
+    }
 }
 
 typealias ProbeSurface = Surfaces<ProbeLinks>;
