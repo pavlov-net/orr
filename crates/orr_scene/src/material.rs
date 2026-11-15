@@ -425,11 +425,6 @@ impl MaterialTable {
         self.features.lock().unwrap().any()
     }
 
-    /// Whether any material casts caustics.
-    pub(crate) fn casts(&self) -> bool {
-        self.features.lock().unwrap().casts()
-    }
-
     /// Whether material `id`'s record bounds an interior (`MaterialFeatures::bounds_interior`).
     pub(crate) fn bounds_interior(&self, id: MaterialId) -> bool {
         self.features.lock().unwrap().bounds_interior(id.0)
@@ -444,6 +439,12 @@ impl MaterialTable {
     pub(crate) fn any_casts<'a>(&self, ids: impl IntoIterator<Item = &'a MaterialId>) -> bool {
         let features = self.features.lock().unwrap();
         features.casts() && ids.into_iter().any(|id| features.casting(id.0))
+    }
+
+    /// Whether any of `ids` has the stack face flag.
+    pub(crate) fn any_stack_face<'a>(&self, ids: impl IntoIterator<Item = &'a MaterialId>) -> bool {
+        let features = self.features.lock().unwrap();
+        features.stack_faces() && ids.into_iter().any(|id| features.stack_face(id.0))
     }
 
     /// Whether any of `ids` displaces by a world length.

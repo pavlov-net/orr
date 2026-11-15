@@ -367,10 +367,11 @@ pub(crate) struct Producer {
     pub(crate) raster_clusters: u32,
     /// The clusters its batch holds at most.
     pub(crate) max_clusters: u32,
-    /// Rays trace its clusters, so those of a material that casts are caustic casters.
-    pub(crate) casts: bool,
-    /// Its materials where rays meet its clusters at opaque vertices: none where its clusters
-    /// are dielectric or presence layers, or rays do not trace them.
+    /// Its materials where rays trace its clusters, none where they do not: its clusters of
+    /// one that casts are caustic casters, and of one with a stack face are a plane stack's.
+    pub(crate) traced_materials: Vec<MaterialId>,
+    /// Those where rays meet its clusters at opaque vertices: none where its clusters are
+    /// dielectric or presence layers.
     pub(crate) opaque_materials: Vec<MaterialId>,
     /// Its templates have built.
     pub(crate) templates_built: bool,
@@ -999,7 +1000,11 @@ pub(crate) fn build(
                 desc.max_clusters
             },
             max_clusters: desc.max_clusters,
-            casts,
+            traced_materials: if casts {
+                desc.materials.to_vec()
+            } else {
+                Vec::new()
+            },
             opaque_materials: if casts
                 && !matches!(desc.opacity, Opacity::Dielectric | Opacity::Presence)
             {

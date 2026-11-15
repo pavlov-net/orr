@@ -1667,17 +1667,22 @@ impl Core {
     fn scene_features(&self, cpu: &mut SceneCpu, environment: &str) -> SceneFeatures {
         let mut features = self.features() | cpu.features();
         let work = cpu.work(&self.model_cpu, &self.chains, |m| self.mounts.is_live(m));
-        let traced = cpu.producers.iter().flatten().any(|p| p.casts);
-        if work.caster_copies > 0 || (traced && self.materials.casts()) {
+        // A replaced entry's geometry stays until its frame has completed.
+        let traced = || {
+            let retired = cpu.retired.iter().map(|(_, p)| p);
+            let entries = cpu.producers.iter().flatten().chain(retired);
+            entries.flat_map(|p| &p.traced_materials)
+        };
+        if work.caster_copies > 0 || self.materials.any_casts(traced()) {
             features |= SceneFeatures::CASTERS;
         }
-        // The light set counts a stack entry for a caster section or a producer entry that can
-        // show a stack face, the entries of producers replaced this frame among them, which
-        // PRODUCERS holds too.
-        let producers = features.contains(SceneFeatures::PRODUCERS);
+        // The light set counts a stack entry for a caster section whose material has a stack
+        // face, which no copy here names, and for a producer entry with such a material.
+        let stacks = (work.caster_copies > 0 && self.materials.stack_faces())
+            || self.materials.any_stack_face(traced());
         // Decal bins a changed list remakes in this frame's update count once it has run.
         let decals = !cpu.decals_changed && (cpu.decal_globals > 0 || cpu.decal_bin_slots > 0);
-        if self.materials.stack_faces() && (work.caster_copies > 0 || producers) && !decals {
+        if stacks && !decals {
             features |= SceneFeatures::PLANE_STACKS;
         }
         let opaque_producer = self.materials.any_casts(

@@ -1148,7 +1148,8 @@ pub struct Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
-    /// What `scene` may hold now, which the path pipelines of its views are made for.
+    /// What `scene` may hold now, which with any declared content ([`Renderer::set_content`])
+    /// the path pipelines of its views are made for.
     pub fn scene_features(&self, scene: SceneId) -> Result<orr_scene::SceneFeatures> {
         Ok(self.scenes.scene_features(scene)?)
     }
