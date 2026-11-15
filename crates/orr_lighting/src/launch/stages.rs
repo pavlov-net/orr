@@ -17,10 +17,12 @@ use crate::mask_sets::Members;
 use crate::shaders::consts::{
     ANY_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, MISS_INSTRUCTIONS,
     PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
-    PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
+    PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
 };
-use crate::shaders::path::lean_paths;
-use crate::staged::{MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_TRACED, MAY_UPDATE, MAY_VIEW};
+use crate::shaders::path::{lean_paths, lean_rich};
+use crate::staged::{
+    MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_LOBES, MAY_TRACED, MAY_UPDATE, MAY_VIEW,
+};
 use crate::{Error, KernelSet, module};
 
 /// The bit of `path_may2`, in the high word, that `feature` decides.
@@ -73,11 +75,29 @@ impl Geometry {
     }
 }
 
-/// A stage of the table: its entry in the lean kernel, its role, and the constants it is made
+/// The lean kernel a stage comes from: the one whose BSDF has the plain lobes alone, or the one
+/// with a coat, a fuzz, a thin film and a thin wall's transmission too.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kernel {
+    Plain,
+    Rich,
+}
+
+impl Kernel {
+    fn own(self) -> &'static orr_shaders::ShaderModule {
+        match self {
+            Self::Plain => &lean_paths::MODULE,
+            Self::Rich => &lean_rich::MODULE,
+        }
+    }
+}
+
+/// A stage of the table: its entry in its lean kernel, its role, and the constants it is made
 /// with: what it may meet (`path_may` in the low word, `path_may2` in the high one) and the
 /// linked surface id its shader is made for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Spec {
+    kernel: Kernel,
     entry: &'static str,
     role: Role,
     /// The geometry of the hit group the stage serves; none for a stage no group holds.
@@ -102,7 +122,12 @@ impl Spec {
         } else {
             ""
         };
-        CString::new(format!("{}{geometry}{surface}{emitter}", self.entry))
+        let rich = if self.kernel == Kernel::Rich {
+            ".rich"
+        } else {
+            ""
+        };
+        CString::new(format!("{}{geometry}{surface}{rich}{emitter}", self.entry))
             .expect("no nul in a label")
     }
 
@@ -131,17 +156,33 @@ impl Spec {
         let traced = if primary { TRACED_HIT_INSTRUCTIONS } else { 0 };
         let emitter = self.role == Role::Hit && self.may & MAY_EMITTER != 0;
         let emitter = if emitter { EMITTER_HIT_INSTRUCTIONS } else { 0 };
-        Some(base + if producers { producer } else { 0 } + traced + emitter)
+        let rich = self.role == Role::Hit && self.kernel == Kernel::Rich;
+        let rich = if rich { RICH_HIT_INSTRUCTIONS } else { 0 };
+        Some(base + if producers { producer } else { 0 } + traced + emitter + rich)
     }
 
     fn constants(&self) -> ([u8; 32], &'static [SpecEntry]) {
-        let s = lean_paths::Spec {
-            path_may: self.may as u32,
-            path_may2: (self.may >> 32) as u32,
-            hit_surface: self.hit_surface,
-            ..lean_paths::Spec::default()
-        };
-        (s.bytes(), lean_paths::Spec::ENTRIES)
+        let (may, may2) = (self.may as u32, (self.may >> 32) as u32);
+        match self.kernel {
+            Kernel::Plain => {
+                let s = lean_paths::Spec {
+                    path_may: may,
+                    path_may2: may2,
+                    hit_surface: self.hit_surface,
+                    ..lean_paths::Spec::default()
+                };
+                (s.bytes(), lean_paths::Spec::ENTRIES)
+            }
+            Kernel::Rich => {
+                let s = lean_rich::Spec {
+                    path_may: may,
+                    path_may2: may2,
+                    hit_surface: self.hit_surface,
+                    ..lean_rich::Spec::default()
+                };
+                (s.bytes(), lean_rich::Spec::ENTRIES)
+            }
+        }
     }
 }
 
@@ -188,7 +229,10 @@ impl Table {
         let emits = may & MAY_EMISSIVE != 0;
         // The stage made for a surface that may emit is the only one with `MAY_EMITTER`.
         let may = may & !MAY_EMITTER;
+        // Whether the scene's surfaces may have a coat, a fuzz, a thin film or subsurface.
+        let lobes = may & MAY_LOBES != 0;
         let folded = |entry, role| Spec {
+            kernel: Kernel::Plain,
             entry,
             role,
             geometry: None,
@@ -209,18 +253,28 @@ impl Table {
             Self::stage(&mut specs, folded("miss_scatter", Role::Miss)),
             Self::stage(&mut specs, folded("miss_shadow", Role::Miss)),
         ];
+        // Any surface of the G-buffer may be a path's first vertex.
         let first = Self::stage(
             &mut specs,
             Spec {
+                kernel: if lobes { Kernel::Rich } else { Kernel::Plain },
                 may: may | if emits { MAY_EMITTER } else { 0 },
                 ..folded("first_vertex", Role::Hit)
             },
         );
-        let first_view = (may & MAY_DEBUG != 0)
-            .then(|| Self::stage(&mut specs, folded("first_view", Role::Hit)));
+        let first_view = (may & MAY_DEBUG != 0).then(|| {
+            Self::stage(
+                &mut specs,
+                Spec {
+                    kernel: if lobes { Kernel::Rich } else { Kernel::Plain },
+                    ..folded("first_view", Role::Hit)
+                },
+            )
+        });
         // `hit_surface` of the hit shaders of each pin: any id, then each id from 0 on. Where
         // no surface links every material shows id 0.
         let pinned = |entry, role, pin: u32, geometry: Geometry| Spec {
+            kernel: Kernel::Plain,
             entry,
             role,
             geometry: Some(geometry),
@@ -252,17 +306,43 @@ impl Table {
                 declared & surface_declares::EMISSION != 0 || linked_factors
             }
         };
+        // Whether the closest-hit of pin `pin` comes from the kernel with the rich lobes, where
+        // it is the one made for materials that may have one (`rich`): as its emission, a linked
+        // type that declares a lobe has it in its one stage, and the standard surface's
+        // materials whose weights give them one take a stage of their own.
+        let factors = may & may2(SceneFeatures::LOBE_FACTORS) != 0;
+        let linked_factors = may & may2(SceneFeatures::LINKED_LOBE_FACTORS) != 0;
+        let rich_lobes = surface_declares::SUBSURFACE
+            | surface_declares::COAT
+            | surface_declares::FUZZ
+            | surface_declares::THIN_FILM;
+        let lobed = |pin: u32, rich: bool| {
+            if !lobes {
+                false
+            } else if surfaces == 0 || pin == 1 {
+                rich && factors
+            } else if pin == 0 {
+                true
+            } else {
+                let declared = kernels.surface_declares[pin as usize - 2];
+                declared & rich_lobes != 0 || linked_factors
+            }
+        };
         let producers = may & may2(SceneFeatures::PRODUCERS) != 0;
         let mut hit_groups = Vec::new();
         let pins = groups.pins();
         // Each pinned kind's groups one after another by pin, the first named in `groups`.
-        for (first, hit, any_hit, geometry, linked, emissive) in [
+        // Each kind: its groups, shaders and geometry, whether the table holds it, and whether its
+        // materials may emit and may have a rich lobe. A rich material that emits takes the rich
+        // kind.
+        for (first, hit, any_hit, geometry, linked, emissive, rich) in [
             (
                 &mut groups.path,
                 Some("surface_hit"),
                 "cover_hit",
                 Geometry::Copies,
                 true,
+                false,
                 false,
             ),
             (
@@ -272,6 +352,16 @@ impl Table {
                 Geometry::Copies,
                 emits,
                 true,
+                false,
+            ),
+            (
+                &mut groups.rich_path,
+                Some("surface_hit"),
+                "cover_hit",
+                Geometry::Copies,
+                lobes,
+                true,
+                true,
             ),
             (
                 &mut groups.producer_path,
@@ -279,6 +369,7 @@ impl Table {
                 "cover_hit",
                 Geometry::Producers,
                 producers,
+                false,
                 false,
             ),
             (
@@ -288,6 +379,16 @@ impl Table {
                 Geometry::Producers,
                 producers && emits,
                 true,
+                false,
+            ),
+            (
+                &mut groups.producer_rich_path,
+                Some("surface_hit"),
+                "cover_hit",
+                Geometry::Producers,
+                producers && lobes,
+                true,
+                true,
             ),
             (
                 &mut groups.shadow,
@@ -295,6 +396,7 @@ impl Table {
                 "shadow_hit",
                 Geometry::Triangles,
                 true,
+                false,
                 false,
             ),
         ] {
@@ -320,9 +422,15 @@ impl Table {
                         } else {
                             0
                         };
+                        let kernel = if lobed(pin, rich) {
+                            Kernel::Rich
+                        } else {
+                            Kernel::Plain
+                        };
                         Self::stage(
                             &mut specs,
                             Spec {
+                                kernel,
                                 may: spec.may | bit,
                                 ..spec
                             },
@@ -336,10 +444,6 @@ impl Table {
                 });
             }
         }
-        // A material with a coat, fuzz, thin film or subsurface that may emit shows its light
-        // through the stage of those that may.
-        groups.rich_path = groups.emissive_path;
-        groups.producer_rich_path = groups.producer_emissive_path;
         Self {
             specs,
             raygens,
@@ -376,7 +480,8 @@ pub struct StageSize {
     pub own: Option<i64>,
 }
 
-/// What `spec`'s stage of `module` hands the driver: its entry folded with its constants.
+/// What `spec`'s stage of `module`, the build of its kernel, hands the driver: its entry folded
+/// with its constants.
 fn handed(module: &'static orr_shaders::ShaderModule, spec: &Spec) -> Result<u32, Error> {
     let (bytes, entries) = spec.constants();
     let stage = ShaderStage::new(
@@ -397,14 +502,14 @@ fn handed(module: &'static orr_shaders::ShaderModule, spec: &Spec) -> Result<u32
 /// What each stage of the pipeline of paths that may meet `may` hands the driver, from
 /// `kernels`, and what of it is orr's own.
 pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>, Error> {
-    let lean = module(kernels, &lean_paths::MODULE)?;
-    // Kernels that link a type compile the lean stages anew, with the types' code in them.
-    let own: &'static orr_shaders::ShaderModule = &lean_paths::MODULE;
-    let plain = (!std::ptr::eq(lean, own)).then_some(own);
     let specs = Table::new(may, kernels).specs;
     let mut sizes = specs
         .iter()
         .map(|spec| {
+            let own = spec.kernel.own();
+            let lean = module(kernels, own)?;
+            // Kernels that link a type compile the lean stages anew, with the types' code in them.
+            let plain = (!std::ptr::eq(lean, own)).then_some(own);
             let instructions = handed(lean, spec)?;
             let linked = plain
                 .map(|plain| {
@@ -442,7 +547,7 @@ pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>,
         };
         let instructions = match specs.iter().position(|s| *s == standard) {
             Some(i) => sizes[i].instructions,
-            None => handed(lean, &standard)?,
+            None => handed(module(kernels, standard.kernel.own())?, &standard)?,
         };
         sizes[at].own = Some(i64::from(sizes[at].instructions) - i64::from(instructions));
     }
@@ -490,7 +595,6 @@ impl PathPipeline {
         threads: CompileThreads<'_>,
         may: u64,
     ) -> Result<Self, Error> {
-        let lean = module(kernels, &lean_paths::MODULE)?;
         let table = Table::new(may, kernels);
         let name = format!("path pipeline {may:#x}");
         let sizes = path_stage_sizes(kernels, may)?;
@@ -522,6 +626,7 @@ impl PathPipeline {
             .zip(&bytes)
             .zip(&labels)
             .map(|((spec, (bytes, entries)), label)| {
+                let lean = module(kernels, spec.kernel.own())?;
                 Ok(ShaderStage::new(lean, spec.entry, SpecData { entries, bytes })?.labeled(label))
             })
             .collect::<Result<Vec<_>, Error>>()?;

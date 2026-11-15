@@ -49,6 +49,9 @@ import orr_shaders.pipeline;
 // What a hit made for materials that may emit holds more: their light toward the path, weighed
 // against the light pick of the vertex its ray left.
 [Host] public static const uint EMITTER_HIT_INSTRUCTIONS = 2500;
+// What a hit or first vertex made for surfaces with a coat, a fuzz, a thin film or a thin wall's
+// transmission holds more: those lobes of the BSDF, as far as the scene's mask keeps them.
+[Host] public static const uint RICH_HIT_INSTRUCTIONS = 8500;
 [Host] public static const uint PIPELINE_INSTRUCTIONS = 1000000;
 
 // `PathHot.flags`.

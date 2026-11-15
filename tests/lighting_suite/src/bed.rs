@@ -304,6 +304,9 @@ pub const SKINNED_EMITTER: &str = "skinned emitter";
 pub const LEAF: &str = "leaf";
 /// [`LEAF`] cooked without opacity micromaps.
 pub const BARE_LEAF: &str = "bare leaf";
+/// An upright green 2 m square facing +z, thin-walled with a full subsurface, which carries light
+/// diffusely through it, and double-sided.
+pub const TRANSLUCENT_SHEET: &str = "translucent sheet";
 /// [`LEAF`] as thin-walled clear glass of IOR 1.5, cut out by the same rings, in one model with
 /// a small opaque quad 2 m below it.
 pub const MASKED_PANE: &str = "masked pane";
@@ -958,6 +961,15 @@ fn cook() -> Arc<[u8]> {
         ..Material::default()
     };
     let linked_leaf = move |surface| Material { surface, ..leaf };
+    let sheet = Material {
+        base_color: [0.3, 0.6, 0.2],
+        subsurface_weight: 1.0,
+        subsurface_color: [0.4, 0.8, 0.3],
+        specular_roughness: 0.5,
+        thin_walled: 1,
+        double_sided: 1,
+        ..Material::default()
+    };
     leaf.textures[slot::OPACITY].texture = AssetId::from_name("rings");
     let glass = Material {
         base_color: [1.0; 3],
@@ -1336,6 +1348,7 @@ fn cook() -> Arc<[u8]> {
                     vec![emitter],
                 ),
                 model(LEAF, upright(1.0), vec![leaf]),
+                model(TRANSLUCENT_SHEET, upright(1.0), vec![sheet]),
                 AssetSpec {
                     name: BARE_LEAF.into(),
                     source: Source::Mesh {

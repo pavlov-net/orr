@@ -256,6 +256,7 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
             "media/froxel_light",
             "media/particle_draw",
             "path/lean_paths",
+            "path/lean_rich",
             "path/staged/primary",
             "path/staged/shade_opaque",
             "path/staged/shade_other",

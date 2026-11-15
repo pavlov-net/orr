@@ -52,6 +52,10 @@ public static const uint MAY2_LINKED = 1 << 11;
 // them: a ray tracing pipeline makes its hit groups' stages by them.
 public static const uint MAY2_EMISSION_FACTORS = 1 << 12;
 public static const uint MAY2_LINKED_EMISSION_FACTORS = 1 << 13;
+// A material's own weights give it a coat, fuzz, thin film or subsurface; one of a linked surface
+// id's do. No shader tests them either.
+public static const uint MAY2_LOBE_FACTORS = 1 << 14;
+public static const uint MAY2_LINKED_LOBE_FACTORS = 1 << 15;
 
 public bool may2(uint bit)
 {
