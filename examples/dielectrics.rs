@@ -8,9 +8,10 @@
 //! water scatter, so a dive shows the light in it. A still camera averages its frames in a
 //! scene-referred hook.
 //!
-//! `dielectrics [--dive] [--turbid] [--still] [--frames N] [--headless] [--out file.png]`: headless runs
-//! keep the camera still, render 480 x 270 for 120 frames unless told otherwise and write the
-//! last frame as a PNG.
+//! `dielectrics [--dive] [--turbid] [--still] [--reference] [--frames N] [--headless]
+//! [--out file.png]`: `--reference` renders the accumulation reference at 64 bounces and 64
+//! dielectric vertices. Headless runs keep the camera still, render 480 x 270 for 120 frames
+//! unless told otherwise and write the last frame as a PNG.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -24,9 +25,9 @@ use orr::orr_pack::{AssetId, Target};
 use orr::{
     BoundTexture, ClusterTopology, DirectionalLight, DiscProfile, Display, DisplayRequest,
     FrameDesc, FrameTime, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light,
-    LightId, LitView, MaterialGpu, PackSource, ProducerId, Projection, Renderer, SceneDesc,
-    SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, ViewHooks,
-    ViewLighting, ViewOutput, ViewTarget,
+    LightId, LitView, MaterialGpu, PackSource, ProducerId, Projection, ReferenceSettings, Renderer,
+    SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc,
+    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source, TextureSettings, Usage,
@@ -65,6 +66,8 @@ const ORBIT_RATE: f64 = 0.15;
 const STILL_ANGLE: f64 = 0.5;
 /// Frames a still camera renders before it starts averaging, while exposure settles.
 const ACCUMULATE_AFTER: u64 = 30;
+/// The reference's bounces and dielectric vertices.
+const REFERENCE_DEPTH: u32 = 64;
 
 fn main() {
     let options = Options::from_args();
@@ -237,6 +240,16 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     let still = options.headless || options.has("--still");
     let dive = options.has("--dive");
     let average_frames = still && !dive;
+    let lighting = if options.has("--reference") {
+        ViewLighting {
+            max_bounces: REFERENCE_DEPTH,
+            dielectric_depth: REFERENCE_DEPTH,
+            reference: Some(ReferenceSettings::default()),
+            ..ViewLighting::default()
+        }
+    } else {
+        ViewLighting::default()
+    };
     let mut average = Average::new(&mut renderer, gpu, desc.frames_in_flight, ACCUMULATE_AFTER);
     let frames = options
         .frames
@@ -269,7 +282,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         // The pixels flip the eye's medium where the near plane crosses the surface.
         let lighting = ViewLighting {
             camera_medium: (dive && eye.y < WATER_LEVEL).then_some(water),
-            ..ViewLighting::default()
+            ..lighting
         };
 
         let mut f = renderer
