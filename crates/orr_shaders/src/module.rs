@@ -127,6 +127,8 @@ pub mod surface_declares {
     pub const EMISSION: u32 = 1 << 5;
     pub const ANISOTROPY: u32 = 1 << 6;
     pub const OTHER_SIDE: u32 = 1 << 7;
+    /// The type shades every hit itself (`always_shades`).
+    pub const ALWAYS_SHADES: u32 = 1 << 8;
 }
 
 /// Kernels compiled by a consumer's build with its own link-time types: `KERNELS` in the

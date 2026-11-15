@@ -79,6 +79,9 @@ public interface ISurface
     static void other_side()
     {
     }
+    static void always_shades()
+    {
+    }
     static bool coverage(SurfaceInput i, out float coverage)
     {
         coverage = 0.0;

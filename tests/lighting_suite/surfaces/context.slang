@@ -23,4 +23,8 @@ public struct Context : ISurface
         lobe.emission = i.context.depth < 2 ? NEAR : FAR;
         lobe.unlit = true;
     }
+
+    public override static void always_shades()
+    {
+    }
 }

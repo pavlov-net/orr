@@ -325,7 +325,9 @@ fn the_pipeline_renders_linked_types_geometry_kinds_and_rich_materials_as_the_st
 /// the standard surface's stages hold their caps as where nothing links, and a stage made for
 /// one linked type holds that type's code alone. One that shades its own hits is the smaller
 /// for the standard surface it leaves out, one that only covers shades as the standard does,
-/// and neither declares its other side, so no stage serves any type.
+/// and neither declares its other side, so no stage serves any type. Where records' own weights
+/// may give them a lobe, only the type that leaves hits to the standard surface takes the
+/// stage with the lobes.
 #[test]
 fn the_stages_of_a_pipeline_with_linked_surfaces_hold_their_caps() {
     use linked::surface::{CONTEXT, RINGS};
@@ -340,6 +342,18 @@ fn the_stages_of_a_pipeline_with_linked_surfaces_hold_their_caps() {
             .expect("a stage made for the type")
     };
     assert!(own("surface_hit", CONTEXT) < 0);
+    // Where any record's own weights may give it a lobe, a type that leaves hits to the standard
+    // surface shades them with its kernel, and one that shades every hit itself does not.
+    let rich = |surface: u8| {
+        sizes
+            .iter()
+            .find(|s| {
+                (s.entry, s.geometry, s.hit_surface) == ("surface_hit", ".copies", surface.into())
+            })
+            .map(|s| s.rich)
+    };
+    assert_eq!(rich(CONTEXT), Some(false));
+    assert_eq!(rich(RINGS), Some(true));
     assert_eq!(own("surface_hit", RINGS), 0);
     assert!((1..1500).contains(&own("cover_hit", RINGS)));
     assert!(

@@ -102,14 +102,16 @@ impl SceneFeatures {
     const STACK_FACES: Self = Self(1 << 32);
     /// A material is of a linked surface type, which shades its hits.
     pub const LINKED_SURFACES: Self = Self(1 << 33);
-    /// A material's own emission is not zero, whatever its linked surface type declares.
+    /// A material the standard surface shades emits by its own emission factor.
     pub const EMISSION_FACTORS: Self = Self(1 << 34);
-    /// As [`Self::EMISSION_FACTORS`], of a material with a linked surface id.
+    /// As [`Self::EMISSION_FACTORS`], of a material of a linked type that may leave a hit to
+    /// the standard surface: one that does not declare that it shades every hit itself.
     pub const LINKED_EMISSION_FACTORS: Self = Self(1 << 35);
-    /// A material's own weights give it a coat, fuzz, thin film or subsurface, whatever its
-    /// linked surface type declares.
+    /// A material the standard surface shades has a coat, fuzz, thin film or subsurface by its
+    /// own weights.
     pub const LOBE_FACTORS: Self = Self(1 << 36);
-    /// As [`Self::LOBE_FACTORS`], of a material with a linked surface id.
+    /// As [`Self::LOBE_FACTORS`], of a material of a linked type that may leave a hit to the
+    /// standard surface.
     pub const LINKED_LOBE_FACTORS: Self = Self(1 << 37);
     /// What a mesh keeps from the material it was built with, whatever the record holds now:
     /// once a record has shown one of these, the table keeps it.
@@ -153,8 +155,8 @@ impl SceneFeatures {
 
     /// What record `m`, as the material table stores it, may show: the lobes of its record and
     /// of its linked surface type (`MaterialGpu::lobes`), and what its flags and its own medium
-    /// decide.
-    pub(crate) fn of_material(m: &MaterialGpu) -> Self {
+    /// decide, with the linked types' `declares` by id from 1.
+    pub(crate) fn of_material(m: &MaterialGpu, declares: &[u32]) -> Self {
         use crate::material::material_lobes as l;
         let lobe = |lobe: u32| m.lobes & lobe != 0;
         let thin = m.flags & f::THIN_WALLED != 0;
@@ -164,7 +166,11 @@ impl SceneFeatures {
         let walks = !thin && (lobe(l::SUBSURFACE) || (lobe(l::TRANSMISSION) && scatters));
         let disperses =
             m.transmission_dispersion_scale > 0.0 && m.transmission_dispersion_abbe_number > 0.0;
-        let factors = crate::material::record_lobes(m, &[]) & l::RICH != 0;
+        // What the record's own weights show, and whether a linked type shades it.
+        let own = crate::material::shown_lobes(m, declares);
+        let linked = crate::material::linked_type(declares, m.surface);
+        let factors = own & l::RICH != 0;
+        let emits = own & l::EMISSION != 0;
         let mut out = Self::NONE;
         for (on, bit) in [
             (walks, Self::WALKING),
@@ -195,13 +201,10 @@ impl SceneFeatures {
             ),
             (m.flags & f::STACK_FACE != 0, Self::STACK_FACES),
             (m.surface != 0, Self::LINKED_SURFACES),
-            (m.emission_luminance != 0.0, Self::EMISSION_FACTORS),
-            (
-                m.emission_luminance != 0.0 && m.surface != 0,
-                Self::LINKED_EMISSION_FACTORS,
-            ),
-            (factors, Self::LOBE_FACTORS),
-            (factors && m.surface != 0, Self::LINKED_LOBE_FACTORS),
+            (emits && !linked, Self::EMISSION_FACTORS),
+            (emits && linked, Self::LINKED_EMISSION_FACTORS),
+            (factors && !linked, Self::LOBE_FACTORS),
+            (factors && linked, Self::LINKED_LOBE_FACTORS),
         ] {
             if on {
                 out |= bit;
@@ -349,8 +352,8 @@ mod tests {
     fn record(edit: impl FnOnce(&mut MaterialGpu)) -> SceneFeatures {
         let mut m: MaterialGpu = bytemuck::Zeroable::zeroed();
         edit(&mut m);
-        m.lobes = crate::material::record_lobes(&m, &[]);
-        SceneFeatures::of_material(&m)
+        m.lobes = crate::material::record_lobes(&m, &[0]);
+        SceneFeatures::of_material(&m, &[0])
     }
 
     /// Each surface feature a record decides is set by the flag or sampler mode the shaders
@@ -381,8 +384,8 @@ mod tests {
             SceneFeatures::COATED_EMITTERS.surface_may() & DEFINED,
             1 << 8
         );
-        // An emission factor is the standard surface's emitter; on a linked record it is its
-        // type's too, whatever the type declares.
+        // An emission factor is the standard surface's emitter, and on a record of a linked type
+        // that may leave a hit to it, its type's.
         let emits = record(|m| m.emission_luminance = 2.0);
         assert_eq!(emits.surface_may() & DEFINED, 1 << 12);
         assert!(emits.contains(SceneFeatures::EMISSIVE));
@@ -390,15 +393,21 @@ mod tests {
             m.emission_luminance = 2.0;
             m.surface = 1;
         });
-        assert_eq!(linked.surface_may() & DEFINED, 1 << 11 | 1 << 12 | 1 << 13);
+        assert_eq!(linked.surface_may() & DEFINED, 1 << 11 | 1 << 13);
         // So is a coat, fuzz, thin film or subsurface the record's weights give it.
         let coated = record(|m| m.coat_weight = 1.0);
         assert_eq!(coated.surface_may() & DEFINED, 1 << 14);
         let skin = record(|m| {
             m.subsurface_weight = 1.0;
+            m.surface = 1;
+        });
+        assert_eq!(skin.surface_may() & DEFINED, 1 << 11 | 1 << 15);
+        // An id nothing links is the standard surface's.
+        let unlinked = record(|m| {
+            m.subsurface_weight = 1.0;
             m.surface = 2;
         });
-        assert_eq!(skin.surface_may() & DEFINED, 1 << 11 | 1 << 14 | 1 << 15);
+        assert_eq!(unlinked.surface_may() & DEFINED, 1 << 11 | 1 << 14);
     }
 
     /// An emitter's light passes a coat or fuzz only while a record emits and a record has

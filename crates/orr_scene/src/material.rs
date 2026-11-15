@@ -407,10 +407,27 @@ fn declared_lobes(declares: &[u32], surface: u32) -> u32 {
 }
 
 /// `MaterialGpu::lobes` of record `m`: the lobes its weights give it where the standard surface
-/// shades it, and those its linked type declares.
+/// shades it ([`shown_lobes`]), and those its linked type declares.
 pub(crate) fn record_lobes(m: &MaterialGpu, declares: &[u32]) -> u32 {
-    use {material_flags as f, material_lobes as l};
-    let own = [
+    shown_lobes(m, declares) | declared_lobes(declares, m.surface)
+}
+
+/// Whether surface id `surface` names a linked type among `declares`, the types' by id from 1.
+pub(crate) fn linked_type(declares: &[u32], surface: u32) -> bool {
+    (surface as usize)
+        .checked_sub(1)
+        .is_some_and(|i| i < declares.len())
+}
+
+/// The lobes record `m`'s own weights give it that a hit may show: where the standard surface
+/// shades the hit, which a linked type that shades every hit itself (`always_shades`) never
+/// leaves it.
+pub(crate) fn shown_lobes(m: &MaterialGpu, declares: &[u32]) -> u32 {
+    use {material_flags as f, material_lobes as l, orr_shaders::surface_declares as d};
+    if declared(declares, m.surface) & d::ALWAYS_SHADES != 0 {
+        return 0;
+    }
+    [
         (m.transmission_weight > 0.0, l::TRANSMISSION),
         (m.subsurface_weight > 0.0, l::SUBSURFACE),
         (m.coat_weight > 0.0, l::COAT),
@@ -421,8 +438,7 @@ pub(crate) fn record_lobes(m: &MaterialGpu, declares: &[u32]) -> u32 {
     ]
     .into_iter()
     .filter(|(on, _)| *on)
-    .fold(0, |lobes, (_, lobe)| lobes | lobe);
-    own | declared_lobes(declares, m.surface)
+    .fold(0, |lobes, (_, lobe)| lobes | lobe)
 }
 
 /// Whether a material of surface id `front` may have one of surface id `back` as its back:
@@ -536,7 +552,7 @@ impl MaterialTable {
         self.features
             .lock()
             .unwrap()
-            .set(id.0, SceneFeatures::of_material(m));
+            .set(id.0, SceneFeatures::of_material(m, self.declares));
         mark(
             &self.world_lengths,
             m.flags & material_flags::DISPLACEMENT_WORLD != 0,
@@ -664,17 +680,28 @@ mod tests {
     fn a_linked_record_shows_what_its_type_declares() {
         use orr_shaders::surface_declares as d;
         use {SceneFeatures as F, material_flags as f};
-        let declares = [0, d::SUBSURFACE | d::EMISSION, d::OTHER_SIDE];
+        let declares = [
+            0,
+            d::SUBSURFACE | d::EMISSION,
+            d::OTHER_SIDE | d::ALWAYS_SHADES,
+        ];
         let features = |surface: u32, edit: fn(&mut MaterialGpu)| {
             let mut m: MaterialGpu = Zeroable::zeroed();
             m.surface = surface;
             edit(&mut m);
             m.lobes = record_lobes(&m, &declares);
-            F::of_material(&m)
+            F::of_material(&m, &declares)
         };
         let linked = F::LINKED_SURFACES;
         assert_eq!(features(1, |_| {}), linked);
-        assert_eq!(features(1, |m| m.coat_weight = 0.5), linked | F::COAT);
+        // A type that may leave a hit to the standard surface shows its record's weights there.
+        assert_eq!(
+            features(1, |m| m.coat_weight = 0.5),
+            linked | F::COAT | F::LINKED_LOBE_FACTORS
+        );
+        // One that shades every hit itself never does.
+        assert_eq!(features(3, |m| m.coat_weight = 0.5), linked);
+        assert_eq!(features(3, |m| m.emission_luminance = 2.0), linked);
         assert_eq!(
             features(2, |_| {}),
             linked | F::SUBSURFACE | F::EMISSIVE | F::WALKING
@@ -684,6 +711,11 @@ mod tests {
             linked | F::SUBSURFACE | F::EMISSIVE
         );
         assert_eq!(features(4, |_| {}), linked, "an id nothing links");
+        assert_eq!(
+            features(4, |m| m.coat_weight = 0.5),
+            linked | F::COAT | F::LOBE_FACTORS,
+            "an id nothing links is the standard's"
+        );
 
         assert!(sides(&declares, 1, 1));
         assert!(!sides(&declares, 1, 0) && !sides(&declares, 0, 2) && !sides(&declares, 1, 2));

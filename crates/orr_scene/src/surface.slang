@@ -227,6 +227,13 @@ public interface ISurface
     {
     }
 
+    // A type has this where `surface` shades every hit it is asked for and never leaves one to
+    // the standard surface: its materials' own lobe weights and emission then never show, and
+    // the build makes no stage richer for them. It has `surface` too. Nothing calls it.
+    static void always_shades()
+    {
+    }
+
     // How much of the triangle at the hit is present, 0 to 1: true where `coverage` holds it,
     // false where the material's alpha test (`material_coverage`) applies.
     static bool coverage(SurfaceInput i, out float coverage)
