@@ -305,14 +305,24 @@ impl Options {
         o
     }
 
-    /// A headless run of `frames` frames with `rest` as the example's own arguments.
+    /// A headless run of `frames` frames with `rest` as the example's own arguments, beside
+    /// `--pipeline-paths`, which picks the tracer as on the command line.
     pub fn headless(frames: u64, rest: &[&str]) -> Self {
+        let pipeline = rest.contains(&"--pipeline-paths");
         Options {
             frames: Some(frames),
             headless: true,
             out: None,
-            path_entry: PathEntry::default(),
-            rest: rest.iter().map(|s| (*s).to_owned()).collect(),
+            path_entry: if pipeline {
+                PathEntry::Pipeline
+            } else {
+                PathEntry::default()
+            },
+            rest: rest
+                .iter()
+                .filter(|&&a| a != "--pipeline-paths")
+                .map(|s| (*s).to_owned())
+                .collect(),
         }
     }
 

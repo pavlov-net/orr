@@ -153,6 +153,17 @@ fn dielectrics_matches_its_reference() {
     assert_clean();
 }
 
+/// The ray tracing pipeline's paths render the same water, glass, amber and jade.
+#[test]
+fn dielectrics_through_the_pipeline_matches_its_reference() {
+    let _serial = serial();
+    compare(
+        "dielectrics",
+        dielectrics::run(&headless(&["--pipeline-paths"])).expect("headless capture"),
+    );
+    assert_clean();
+}
+
 #[test]
 fn producer_field_matches_its_reference() {
     let _serial = serial();
