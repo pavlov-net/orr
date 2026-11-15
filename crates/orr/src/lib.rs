@@ -959,6 +959,13 @@ impl Renderer {
         Ok(self.scenes.set_chain(model, chain)?)
     }
 
+    /// Gives rays another step of `model`'s chain than its copies draw: `traced[k]` is the step
+    /// rays trace of a copy that draws step `k`, 0 the model itself. [`Self::set_chain`] sets
+    /// every step back to tracing as drawn.
+    pub fn set_chain_traced(&mut self, model: ModelId, traced: &[u8]) -> Result<()> {
+        Ok(self.scenes.set_chain_traced(model, traced)?)
+    }
+
     /// Wants every tile of mips `finest..` of the cooked texture `texture` of mount `m`
     /// resident from the next frame on. Requests last one frame.
     pub fn prefetch_texture(&mut self, m: MountId, texture: TextureIndex, finest: u32) {
