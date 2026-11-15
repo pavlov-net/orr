@@ -1,5 +1,5 @@
 // The lean path tracer's stages (`path.lean`): the raygens of a view's paths and of its update
-// paths, the callable of a path's first vertex, the hit shader of a plain opaque surface, the
+// paths, the callable of a path's first vertex and the one of a debug view of it alone, the hit shader of a plain opaque surface, the
 // any-hit shaders of a path's ray and of its shadow ray at a candidate that is not opaque, and
 // the miss shaders of the two.
 #include "orr_root.h"
@@ -51,6 +51,13 @@ void first_vertex(inout Payload p)
 {
     ORR_OMM(first_vertex);
     lean_first<Medium>(root, DispatchRaysIndex().x);
+}
+
+[shader("callable")]
+void first_view(inout Payload p)
+{
+    ORR_OMM(first_view);
+    lean_first_view<Surface>(root, DispatchRaysIndex().x);
 }
 
 [shader("anyhit")]

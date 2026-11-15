@@ -48,6 +48,10 @@ public static const uint MAY2_THIN_DIELECTRICS = 1 << 9;
 public static const uint MAY2_NEURAL_TEXTURES = 1 << 10;
 // A material may be of a linked surface type, which shades its hits.
 public static const uint MAY2_LINKED = 1 << 11;
+// A material emits by its own emission factor; one of a linked surface id does. No shader tests
+// them: a ray tracing pipeline makes its hit groups' stages by them.
+public static const uint MAY2_EMISSION_FACTORS = 1 << 12;
+public static const uint MAY2_LINKED_EMISSION_FACTORS = 1 << 13;
 
 public bool may2(uint bit)
 {

@@ -1,11 +1,11 @@
 // The lean tracer's common path: the whole vertex of a plain opaque hit, which its hit shader runs
 // from the path's hot state, and what a ray that met nothing adds.
 //
-// A vertex resolves its surface, takes the medium along its ray, prepares its BSDF once, ends in
-// the world cache where the cache holds its light, picks one light from a stream of candidates
-// weighed as they are drawn, leaves the pick as a pending shadow job, samples its next ray and
-// stores the hot state. Nothing here knows of interiors, plane stacks, walks, layers or emission:
-// the hits that meet those run other shaders.
+// A vertex resolves its surface, takes the medium along its ray, prepares its BSDF once, adds what
+// its surface emits where its stage is made for emitters, ends in the world cache where the cache
+// holds its light, picks one light from a stream of candidates weighed as they are drawn, leaves
+// the pick as a pending shadow job, samples its next ray and stores the hot state. Nothing here
+// knows of interiors, plane stacks, walks or layers: the hits that meet those run other shaders.
 module vertex;
 
 import orr_shaders.abi;
@@ -243,14 +243,70 @@ LightPick pick_light<let FIRST : uint>(PathRoot r, Bsdf b, float3 position, floa
     return k;
 }
 
+// The light a path's vertex takes from its surface, as the stage that runs the vertex knows it:
+// a hit's stage made for emitters weighs it against the light pick of the vertex its ray left,
+// the first vertex's callable takes the G-buffer's, and every other stage holds none of it.
+interface IVertexLight
+{
+    // What the surface `g` of the vertex, whose BSDF there is `b`, emits toward the path, whose
+    // words are `at` and the first of them `w0`: in nits, for the vertex reached after `scattered`
+    // scatters, its path's first where `first` holds. With `whole` the path is of one technique.
+    float3 light(PathRoot r, uint4* at, Bsdf b, GSurface g, uint2 pixel, uint4 w0, bool first, uint scattered, bool whole);
+}
+
+// A stage made for surfaces that emit nothing.
+struct NoLight : IVertexLight
+{
+    float3 light(PathRoot r, uint4* at, Bsdf b, GSurface g, uint2 pixel, uint4 w0, bool first, uint scattered, bool whole)
+    {
+        return float3(0.0);
+    }
+}
+
+// The G-buffer's surface, which holds its emission pre-exposed.
+struct GBufferLight : IVertexLight
+{
+    float3 light(PathRoot r, uint4* at, Bsdf b, GSurface g, uint2 pixel, uint4 w0, bool first, uint scattered, bool whole)
+    {
+        return b.emission() / r.view.exposure[r.view.exposure_slot].pre_exposure;
+    }
+}
+
+// A ray's hit, with what light sampling draws of its point (`emitter`). A camera ray's vertex
+// shows its light whole. A scattered ray's weighs it against the light pick of the vertex the ray
+// left, which takes that vertex's density from the path's words: a point the light set never
+// draws takes weight 1, as a ray drawn from a delta lobe does and a path of one technique.
+struct HitLight : IVertexLight
+{
+    EmitterHit emitter;
+
+    float3 light(PathRoot r, uint4* at, Bsdf b, GSurface g, uint2 pixel, uint4 w0, bool first, uint scattered, bool whole)
+    {
+        float3 e = b.emission_layer() * g.bsdf.emission;
+        float pdf = asfloat(load_coherent(at + 3)).w;
+        if (first || whole || !(pdf > 0.0) || !(emitter.density > 0.0))
+            return e;
+        uint4 w1 = load_coherent(at + 1);
+        float3 toward = emitter.point - asfloat(w0.xyz);
+        float distance = length(toward);
+        float cos_to = distance > 0.0 ? dot(emitter.normal, toward / distance) : 0.0;
+        // The vertex the ray left drew its candidates with its local sampler where it was the
+        // path's first.
+        LocalLights* local = nullptr;
+        if (may(MAY_LOCAL) && scattered == 1)
+            local = pixel_local_lights(r, pixel);
+        return e * mis_balance(pdf, halves(w1.w).y * nee_emissive_pdf(r.set, local, oct_decode_snorm16(w1.y), emitter, distance, cos_to));
+    }
+}
+
 // The vertex `x` of `slot`'s path, whose hot words are `at`, reached along `dir` by a ray `t` m
 // long whose cone there is `cone`, in a medium `M`: the rest of the vertex past its surface, which
 // the shader of a plain opaque hit runs and, for a path's first vertex, the callable that takes it
 // from the G-buffer. `FIRST` says where the vertex is its path's first: 1 always, the
 // callable's, and 2 where its ray is the camera's, a hit's, which a view that traces its camera
 // rays has. The path's state is loaded here, past the surface's evaluation, which holds enough
-// of its own.
-void lean_vertex<M : IMedium, let FIRST : uint>(PathRoot r, uint slot, uint4* at, PathVertex x, float3 dir, float t, float2 cone)
+// of its own. The vertex takes its surface's light through `L` where its stage may emit.
+void lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight>(PathRoot r, uint slot, uint4* at, PathVertex x, float3 dir, float t, float2 cone, L emits)
 {
     // Of the path's words the vertex holds its flags and its throughput. The radiance it adds
     // goes into the path's word at once, and the ray and the shadow job it leaves are written
@@ -303,6 +359,8 @@ void lean_vertex<M : IMedium, let FIRST : uint>(PathRoot r, uint slot, uint4* at
     flags = (flags & ~(HOT_DEPTH_MASK << HOT_DEPTH_SHIFT)) | (min(opaque, HOT_DEPTH_MASK) << HOT_DEPTH_SHIFT);
     bool alive = (g.flags & GBUFFER_UNLIT) == 0 && (first || path_mode(r) != PATH_DIRECT) && carries(throughput);
     Bsdf b = bsdf_prepare(g.bsdf, g.normal, x.view);
+    if (may(MAY_EMITTER) && along && (first || mode.count_bsdf) && any(g.bsdf.emission > 0.0))
+        added += throughput * emits.light(r, at, b, g, pixel, w0, first, scattered, mode.one_technique);
 
     // The cache holds the light a vertex scatters by its albedo: a path ends in it past its first
     // vertex where its ray was diffuse or its footprint has outgrown the cell.
@@ -416,8 +474,18 @@ void lean_vertex<M : IMedium, let FIRST : uint>(PathRoot r, uint slot, uint4* at
 
 // The whole vertex of a plain opaque hit `h` of `slot`'s ray, invoked with the ray's cover
 // `payload`, through surface `S` with its section material from `material`, in a medium `M`:
-// what the hit shader of such a surface runs.
+// what the hit shader of such a surface runs. A stage made for emitters holds what their light
+// is weighed by, and every other none of it.
 public void lean_hit<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>(PathRoot r, uint slot, uint4 payload, T material, H h)
+{
+    if (may(MAY_EMITTER))
+        lean_hit_as<S, M, H, T, true>(r, slot, payload, material, h);
+    else
+        lean_hit_as<S, M, H, T, false>(r, slot, payload, material, h);
+}
+
+// `lean_hit` of a stage made for emitters, or not.
+void lean_hit_as<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial, let EMITTER : bool>(PathRoot r, uint slot, uint4 payload, T material, H h)
 {
     uint4* at = lean_hot(r, slot);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
@@ -428,7 +496,9 @@ public void lean_hit<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>
     RayCone cone = { c.context.cone_width, c.context.cone_spread };
     HitContext context = hit_context(c.context.kind, c.context.depth, cone, t, texture_tap(r.view, pixel, r.frame, r.seed, c.context.depth), c.context.feedback);
     float3 positions[3] = { h.corner(0), h.corner(1), h.corner(2) };
-    SurfaceHit sh = resolve_hit_by<FeedbackSurface<S>>(r.scene, r.view, dir, h.instance_index(), uint(h.cluster_id()), h.primitive_index(), h.barycentrics(), positions, false, context, material);
+    // An emitter's light is weighed by its triangle as light sampling reads it.
+    HitTriangle traced;
+    SurfaceHit sh = resolve_hit_traced<FeedbackSurface<S>, T, EMITTER>(r.scene, r.view, dir, h.instance_index(), uint(h.cluster_id()), h.primitive_index(), h.barycentrics(), positions, false, context, material, traced);
     if (!sh.valid)
     {
         uint4 w0 = load_coherent(at);
@@ -438,7 +508,17 @@ public void lean_hit<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>
     // A view that traces its camera rays marks them by their context.
     if (may(MAY_TRACED) && c.context.kind == HIT_PRIMARY && traces_primary(r))
         write_primary(r, slot, pixel, sh);
-    lean_vertex<M, 2>(r, slot, at, hit_vertex(r.view, sh, dir), dir, t, float2(cone_width(cone, t), cone.spread));
+    PathVertex x = hit_vertex(r.view, sh, dir);
+    float2 footprint = float2(cone_width(cone, t), cone.spread);
+    if (EMITTER)
+    {
+        HitLight emits = { no_emitter() };
+        if (any(sh.surface.bsdf.emission > 0.0))
+            emits.emitter = emitter_hit_of(r.set, sh, traced, h.instance_index(), uint(h.cluster_id()));
+        lean_vertex<M, 2, HitLight>(r, slot, at, x, dir, t, footprint, emits);
+    }
+    else
+        lean_vertex<M, 2, NoLight>(r, slot, at, x, dir, t, footprint, NoLight());
 }
 
 // The first vertex of `slot`'s path, on the G-buffer's surface of its pixel: the raster's
@@ -456,7 +536,16 @@ public void lean_first<M : IMedium>(PathRoot r, uint slot)
         return;
     }
     RayCone cone = camera_cone(r.view);
-    lean_vertex<M, 1>(r, slot, at, x, -x.view, x.camera_distance, float2(cone_width(cone, x.camera_distance), cone.spread));
+    lean_vertex<M, 1, GBufferLight>(r, slot, at, x, -x.view, x.camera_distance, float2(cone_width(cone, x.camera_distance), cone.spread), GBufferLight());
+}
+
+// A debug view of the first vertex alone (`first_vertex_mode`) of `slot`'s pixel, through surface
+// `S`: what the callable that every pixel of such a view calls in place of a path writes.
+public void lean_first_view<S : ISurfaces>(PathRoot r, uint slot)
+{
+    uint2 pixel = item_pixel(r, r.slice_base + slot);
+    Sampler rng = path_sampler(r, pixel);
+    first_vertex_view<S>(r, pixel, rng);
 }
 
 // Adds to a view path's record that light `id` gave it `contribution` of luminance.

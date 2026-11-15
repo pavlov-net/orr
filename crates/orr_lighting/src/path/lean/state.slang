@@ -46,6 +46,9 @@ import orr_shaders.pipeline;
 // What a hit holds more where the view's paths trace its camera rays, whose hits write the
 // view's G-buffer: the mode's alone, the hit of every other pipeline holds none of it.
 [Host] public static const uint TRACED_HIT_INSTRUCTIONS = 2800;
+// What a hit made for materials that may emit holds more: their light toward the path, weighed
+// against the light pick of the vertex its ray left.
+[Host] public static const uint EMITTER_HIT_INSTRUCTIONS = 2500;
 [Host] public static const uint PIPELINE_INSTRUCTIONS = 1000000;
 
 // `PathHot.flags`.

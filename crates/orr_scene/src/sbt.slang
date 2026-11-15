@@ -39,7 +39,11 @@ import orr_scene.tables;
 [Host] public static const uint KIND_LAYER_PATH = 5;
 [Host] public static const uint KIND_PRODUCER_RICH_PATH = 6;
 [Host] public static const uint KIND_PRODUCER_LAYER_PATH = 7;
-[Host] public static const uint PINNED_KINDS = 8;
+// As KIND_PATH and KIND_PRODUCER_PATH, of clusters whose material may emit (HIT_EMITS) and has
+// none of the above.
+[Host] public static const uint KIND_EMISSIVE_PATH = 8;
+[Host] public static const uint KIND_PRODUCER_EMISSIVE_PATH = 9;
+[Host] public static const uint PINNED_KINDS = 10;
 // No group: a record of zeros.
 static const uint SLOT_NONE = 0xffffffff;
 
@@ -150,6 +154,8 @@ void write_records(SceneRoot* s, uint run)
             path = producer ? KIND_PRODUCER_LAYER_PATH : KIND_LAYER_PATH;
         else if (data.has(HIT_LOBED))
             path = producer ? KIND_PRODUCER_RICH_PATH : KIND_RICH_PATH;
+        else if (data.has(HIT_EMITS))
+            path = producer ? KIND_PRODUCER_EMISSIVE_PATH : KIND_EMISSIVE_PATH;
     }
     // A particle is no path ray's hit: its record keeps it as what lies in front of one.
     write_run(run, uint3(class_id == CLASS_PARTICLE ? KIND_FRONT : pinned(path, pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), data);
