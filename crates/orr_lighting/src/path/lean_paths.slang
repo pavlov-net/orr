@@ -17,6 +17,7 @@ import orr_lighting.path.lean.raygen;
 
 extern struct Surface : ISurfaces = StandardSurface;
 extern struct Medium : IMedium = NoMedium;
+extern struct Environment : IEnvironment = EnvironmentMap;
 export static const bool PATH_SPECIALIZES = true;
 export static const uint BSDF_CLASS = 0;
 
@@ -87,7 +88,7 @@ void shadow_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 void miss_scatter(inout Payload p)
 {
     ORR_OMM(miss_scatter);
-    lean_miss<Medium>(root, DispatchRaysIndex().x);
+    lean_miss<Medium, Environment>(root, DispatchRaysIndex().x);
 }
 
 [shader("miss")]

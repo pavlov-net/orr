@@ -1234,7 +1234,14 @@ public void trace_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
             count_ray(p);
         RayDesc rd = path_ray(ray.origin, ray.dir, camera ? camera_ray.t_max : positive_infinity());
         MayAccept<LayerAccept<CoverageFeedback<S>>> accept = { a };
-        h = trace_closest(scene_traced(s), rd, mask, layer_search_flags(camera && camera_ray.gbuffer), accept, positions);
+        // A camera ray toward the G-buffer's surface looks for layers past opaque geometry.
+        for (;;)
+        {
+            h = trace_closest(scene_traced(s), rd, mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, accept, positions);
+            if (!camera || !camera_ray.gbuffer || !h.hit || is_layer(h))
+                break;
+            rd.TMin = asfloat(asuint(h.t) + 1);
+        }
         // A second trace finds what `front_mask` names in front of the hit.
         bool adds = x.count_bsdf && counted;
         uint front_layers = front_mask(r, p, ray, record, x);
