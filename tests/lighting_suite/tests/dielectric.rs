@@ -13,7 +13,7 @@ use lighting_suite::bed::{
     MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, MIXED_SLAB, NEAR, OverlayFrontLayer, PRESENCE_VEIL,
     PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Particle, ParticleLook,
     Paths, ROUGH_SLAB, SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB,
-    TWO_SIDED_SLAB, WATER_BOX, WHITE_SPHERE, assert_close, fresnel, image_mean, moved_entry,
+    TWO_SIDED_SLAB, WATER_BOX, WHITE_SPHERE, assert_close, both, fresnel, image_mean, moved_entry,
     pixel_of, prism_corners, reference, surface_mean, water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
@@ -769,6 +769,64 @@ fn rough_glass_adds_its_blur_into_the_depth_of_field_guide() {
     for (i, &g) in smooth.iter().enumerate() {
         assert_eq!(g, FILL, "pixel {i} under smooth glass");
     }
+    assert_clean();
+}
+
+/// The pipeline's frosted pixels give the frosted-glass term the background luminance the
+/// staged loop's give it: under rough glass over an emitter's edge, the term's mean on the lit
+/// and on the dark side agrees over seeds.
+#[test]
+fn the_pipeline_blurs_the_background_the_staged_loop_does_under_rough_glass() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    const FILL: f32 = 0.25;
+    let [w, h] = EXTENT;
+    let mut bed = Bed::with(from_above(
+        vec![
+            at(SMOOTH_FLOOR, Vec3::ZERO),
+            at(LIGHT_FLOOR, Vec3::new(1.0, 0.01, 0.0)),
+            at(ROUGH_SLAB, Vec3::new(0.0, 0.5, 0.0)),
+        ],
+        Vec::new(),
+        5.0,
+    ));
+    let (mut staged, mut launched) = both(&KernelSet::default(), ViewLighting::default());
+    for p in [&mut staged, &mut launched] {
+        p.frost_guide = Some(FrostGuide::new(FILL));
+    }
+    // The term's mean over 8 columns left of the edge (dark) and right of it (lit).
+    let sides = |bed: &mut Bed, p: &Paths, seed: u32| {
+        bed.accumulate(1, seed, &mut |list, f| p.record(list, f));
+        let guide = p.frost_guide.as_ref().unwrap().read();
+        let band = |x0: u32| {
+            let rows = h / 2 - 8..h / 2 + 8;
+            let sum: f64 = rows
+                .clone()
+                .flat_map(|y| (x0..x0 + 8).map(move |x| (y * w + x) as usize))
+                .map(|i| f64::from(guide[i] - FILL))
+                .sum();
+            sum / (rows.len() * 8) as f64
+        };
+        [band(w / 2 - 8), band(w / 2)]
+    };
+    let (mut of_staged, mut of_launched) = ([Vec::new(), Vec::new()], [Vec::new(), Vec::new()]);
+    for seed in 1..=16 {
+        for (p, out) in [(&staged, &mut of_staged), (&launched, &mut of_launched)] {
+            let [dark, lit] = sides(&mut bed, p, seed);
+            out[0].push(dark);
+            out[1].push(lit);
+        }
+    }
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    assert!(
+        mean(&of_staged[0]) > 0.0 && mean(&of_staged[1]) < 0.0,
+        "the staged term is {} dark and {} lit",
+        mean(&of_staged[0]),
+        mean(&of_staged[1])
+    );
+    assert_same_mean("the dark side's term", &of_launched[0], &of_staged[0]);
+    assert_same_mean("the lit side's term", &of_launched[1], &of_staged[1]);
     assert_clean();
 }
 
