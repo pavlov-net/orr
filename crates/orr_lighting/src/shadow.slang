@@ -33,15 +33,6 @@ __exported import orr_lighting.interiors;
 // The mask shadow rays trace.
 public static const uint SHADOW_MASK = MASK_OPAQUE | MASK_PARTICLE | MASK_MEDIUM | MASK_DIELECTRIC;
 
-// `visibility` modes.
-public static const uint SHADOW_PATH = 0;
-public static const uint SHADOW_PHOTON = 1;
-public static const uint SHADOW_UNBENT = 2;
-
-// Non-opaque candidates a shadow ray multiplies before it ends with the product so far.
-// Alpha-tested candidates do not count.
-public static const uint SHADOW_CANDIDATES = 16;
-
 // Steps a medium proxy's march takes at most over the ray's span inside it; spans longer than
 // this many voxels step farther than a voxel.
 public static const uint PROXY_STEPS = 64;
@@ -180,35 +171,20 @@ public struct ShadowCandidates<S : ISurfaces, M : IMedium, let MODE : uint> : IC
         }
         if (c.cluster_id < 0)
             return float3(1.0);
-        bool layer = (may(MAY_LAYERS) && c.class_id == CLASS_PRESENCE) || (may(MAY_PARTICLES) && c.class_id == CLASS_PARTICLE);
-        uint section;
-        float present = resolve_presence_section<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context, !layer, section);
-        if (layer)
-        {
-            counted = true;
-            return float3(1.0 - saturate(present));
-        }
-        if (!may(MAY_LAYERS) || c.class_id != CLASS_DIELECTRIC)
-            return present > 0.0 ? float3(0.0) : float3(1.0);
-        if (!(present > 0.0))
-            return float3(1.0);
-        counted = true;
-        return dielectric(c, section);
+        uint flags;
+        float3 t = thin_candidate<S>(scene, view, context, MODE, dir, c.class_id, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, may(MAY_LAYERS), may(MAY_PARTICLES), counted, flags);
+        // Solid glass ends a path's shadow ray whatever its surface is.
+        if ((flags & SHADOW_SOLID) != 0)
+            solid_t = c.t;
+        if ((flags & SHADOW_CROSSES) == 0)
+            return t;
+        return dielectric(c);
     }
 
-    // A dielectric candidate of section material `section` that is present.
+    // A present dielectric candidate that `thin_candidate` passes with SHADOW_CROSSES.
     [mutating]
-    float3 dielectric(Candidate c, uint section)
+    float3 dielectric(Candidate c)
     {
-        if (MODE == SHADOW_PHOTON)
-            return float3(0.0);
-        bool thin = may2(MAY2_THIN_DIELECTRICS) && !crosses_interior(scene, section);
-        // Solid glass ends a path's shadow ray whatever its surface is.
-        if (MODE == SHADOW_PATH && !thin)
-        {
-            solid_t = c.t;
-            return float3(0.0);
-        }
         SurfaceHit sh = resolve_hit<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, c.object_positions, false, context);
         if (!sh.valid)
             return float3(1.0);
@@ -221,6 +197,7 @@ public struct ShadowCandidates<S : ISurfaces, M : IMedium, let MODE : uint> : IC
         }
         if (crossed < SHADOW_CANDIDATES)
         {
+            bool thin = may2(MAY2_THIN_DIELECTRICS) && !crosses_interior(scene, sh.section);
             uint at = crossed;
             for (; at > 0 && crossings[at - 1].t > c.t; at--)
                 crossings[at] = crossings[at - 1];
@@ -305,13 +282,37 @@ public struct ShadowCandidates<S : ISurfaces, M : IMedium, let MODE : uint> : IC
         MediumProxyGpu p;
         if (proxy_unmarched(scene, c, t_max, beer, p, t0, t1))
             return beer;
-        uint3 key = uint3(asuint(origin.x) ^ (c.instance_index * 0x9E3779B9u), asuint(origin.y) ^ (c.primitive_index * 0x85EBCA6Bu), asuint(origin.z) ^ scene.frame_index);
-        float jitter = unit_float(pcg3d(key).x);
-        float h = max(proxy_voxel_step(p, d), (t1 - t0) / float(PROXY_STEPS));
-        ProxyDepth depth = { p, o, d, float3(0.0) };
-        proxy_march(t0, t1, h, jitter, depth);
-        return exp(-max(depth.tau, 0.0));
+        return proxy_volume(scene, p, c.instance_index, c.primitive_index, origin, o, d, t0, t1);
     }
+}
+
+// What the span from `t0` to `t1` of a ray from render-space `origin` lets through inside proxy
+// `p` with a volume, primitive `primitive` of instance `instance_index`, along the object-space
+// ray `o + d * t`, by `ShadowCandidates.proxy`'s march.
+public float3 proxy_volume(SceneRoot* s, MediumProxyGpu p, uint instance_index, uint primitive, float3 origin, float3 o, float3 d, float t0, float t1)
+{
+    uint3 key = uint3(asuint(origin.x) ^ (instance_index * 0x9E3779B9u), asuint(origin.y) ^ (primitive * 0x85EBCA6Bu), asuint(origin.z) ^ s.frame_index);
+    float jitter = unit_float(pcg3d(key).x);
+    float h = max(proxy_voxel_step(p, d), (t1 - t0) / float(PROXY_STEPS));
+    ProxyDepth depth = { p, o, d, float3(0.0) };
+    proxy_march(t0, t1, h, jitter, depth);
+    return exp(-max(depth.tau, 0.0));
+}
+
+// As above for the span from `t0` to `t1` of the render-space ray from `origin` along unit `dir`
+// through the proxy of instance `instance_index`, whose object space its record places.
+public float3 proxy_volume(SceneRoot* s, uint instance_index, uint primitive, float3 origin, float3 dir, float t0, float t1)
+{
+    MediumProxyGpu p = scene_proxy(s, instance_index);
+    // The rows of the inverse of the object-to-world columns, over its determinant.
+    float3 x = cross(p.axis_y, p.axis_z);
+    float3 y = cross(p.axis_z, p.axis_x);
+    float3 z = cross(p.axis_x, p.axis_y);
+    float det = dot(p.axis_x, x);
+    float3 rel = origin - proxy_render_center(s, p);
+    float3 o = float3(dot(x, rel), dot(y, rel), dot(z, rel)) / det;
+    float3 d = float3(dot(x, dir), dot(y, dir), dot(z, dir)) / det;
+    return proxy_volume(s, p, instance_index, primitive, origin, o, d, t0, t1);
 }
 
 // What medium proxy candidate `c` of a ray reaching `t_max` lets through, in `t`, where that
@@ -325,10 +326,7 @@ public bool proxy_unmarched(SceneRoot* s, Candidate c, float t_max, out float3 t
     if (!proxy_span(c.object_origin, c.object_direction, t_max, t0, t1))
         return true;
     p = scene_proxy(s, c.instance_index);
-    if (p.volume != nullptr)
-        return false;
-    t = exp(-max(p.extinction, 0.0) * (t1 - t0));
-    return true;
+    return proxy_beer(p, t0, t1, t);
 }
 
 // The interiors' optical depth along a ray from `t_max` that crosses no interior surface, inside
@@ -444,7 +442,7 @@ public float3 surface_visibility<S : ISurfaces, M : IMedium, let MODE : uint>(Sc
         bool more;
         uint c;
         float c_t;
-        float3 p = trace_transmittance(s.tlas, ray, mask, pass_flags, h, SHADOW_CANDIDATES, more, c, c_t);
+        float3 p = trace_transmittance(scene_traced(s), ray, mask, pass_flags, h, SHADOW_CANDIDATES, more, c, c_t);
         overflow = overflow || more;
         product *= p;
         if (pass == 0)
@@ -630,18 +628,7 @@ struct StackAccept<S : ISurfaces> : IAnyHit
 
     bool accept(Candidate c)
     {
-        if (c.cluster_id < 0)
-            return false;
-        uint entry;
-        if (c.class_id == CLASS_DIELECTRIC && !hit_producer(scene, c.instance_index, entry))
-        {
-            ClusterRef r = scene.clusters[uint(c.cluster_id)];
-            if ((load_cluster(r.page, r.local).flags & CLUSTER_SOLID) == 0)
-                return false;
-        }
-        else if (c.class_id != CLASS_OPAQUE)
-            return false;
-        return resolve_alpha<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context);
+        return c.cluster_id >= 0 && cover_decision<S>(scene, view, COVER_STACK, PRESENCE_NONE, 0, context, dir, c.class_id, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics);
     }
 }
 
@@ -654,7 +641,7 @@ public Hit stack_trace<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 ori
     ray.Direction = dir;
     ray.TMin = 0.0;
     ray.TMax = t_max;
-    return trace_closest(s.tlas, ray, MASK_OPAQUE | MASK_DIELECTRIC, flags, a);
+    return trace_closest(scene_traced(s), ray, MASK_OPAQUE | MASK_DIELECTRIC, flags, a);
 }
 
 // Whether a plane stack's probe from `origin` along unit `dir` toward a directional light meets a

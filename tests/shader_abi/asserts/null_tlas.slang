@@ -20,5 +20,5 @@ void main(uint3 id: SV_DispatchThreadID)
     ray.Direction = float3(0.0, 0.0, 1.0);
     ray.TMin = 0.0;
     ray.TMax = 4.0;
-    root.out[id.x] = trace_any(root.scene, ray, 0xff, RAY_FLAG_NONE, AcceptAll()) ? 1 : 0;
+    root.out[id.x] = trace_any(opaque_clusters(root.scene), ray, 0xff, RAY_FLAG_NONE, AcceptAll()) ? 1 : 0;
 }

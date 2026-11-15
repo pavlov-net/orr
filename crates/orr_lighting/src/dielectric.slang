@@ -98,7 +98,7 @@ public LayerGuide layer_guides<S : ISurfaces>(PathRoot r, LayerVertex l, Bsdf b,
     // The mirror reflection's virtual point.
     float3 reflected = reflect(dir, lean);
     LayerAccept<S> ra = { s, v, reflected, hit_context(HIT_SECONDARY, 1, cone, 0.0), 0, PRESENCE_ANY };
-    Hit rh = trace_closest(s.tlas, path_ray(vertex_origin(l.x, reflected), reflected, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, ra);
+    Hit rh = trace_closest(scene_traced(s), path_ray(vertex_origin(l.x, reflected), reflected, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, ra);
     float3 camera = l.x.surface.position - v.eye_render.xyz;
     g.specular_motion = rh.hit ? reprojected_motion(v, dir * (length(camera) + rh.t), 1.0) : reprojected_motion(v, dir, 0.0);
     g.specular_distance = rh.hit ? rh.t : positive_infinity();
@@ -182,7 +182,7 @@ public void layer_guide_body<S : ISurfaces>(PathRoot r, uint2 pixel)
     float3 positions[3];
     // Micromaps forced to two states, as the path's camera ray reads them, so alpha-tested
     // geometry hides a layer from both or neither.
-    Hit h = trace_closest(s.tlas, path_ray(start.origin, dir, start.t_max), start.mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+    Hit h = trace_closest(scene_traced(s), path_ray(start.origin, dir, start.t_max), start.mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
     LayerGuide guide = LayerGuide();
     if (is_layer(h) && h.cluster_id >= 0)
     {

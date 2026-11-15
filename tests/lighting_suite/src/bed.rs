@@ -2,6 +2,7 @@
 //! public API, rendered from a fixed camera, with a kernel's radiance accumulated over
 //! frames and compared with FLIP.
 
+use std::any::Any;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -14,10 +15,11 @@ use orr_cook::{
     VolumeSettings,
 };
 use orr_gpu::{
-    Allocation, CommandList, ComputePipeline, Format, GpuPtr, Hazards, KernelSet, MemoryKind,
-    Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory, TextureRegion,
-    TextureUsage,
+    Allocation, CommandList, ComputePipeline, Format, GpuPtr, Hazards, HitTable, KernelSet,
+    MemoryKind, RayPipeline, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex,
+    TextureMemory, TextureRegion, TextureUsage,
 };
+use orr_lighting::path_may::{MAY_BACKGROUND, MAY_PHOTON, MAY_UPDATE, MAY_VIEW};
 use orr_lighting::{
     BsdfTables, DirectionalLight, DiscProfile, DofBackgroundPass, EnvironmentMapGpu, ExtraGuides,
     Light, LightId, LightingKernels, LightingView, ParticleDraw, PathEntry, PathNeeds,
@@ -28,12 +30,13 @@ use orr_pack::material::{Material, slot};
 use orr_pack::{AssetId, Span, Target};
 use orr_scene::testing::{FlipError, Image, Pixels, flip, mount_pending};
 use orr_scene::{
-    ClusterTopology, Decal, DecalChannels, DecalId, FrameDesc, FrameTime, GroupWriter,
-    InstanceFlags, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, MediumProxy,
-    MediumProxyId, MountId, Opacity, PackSource, ProducerDesc, ProducerId, ProducerUpdate,
-    Projection, RasterView, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter,
-    Scenes, SkinStateGpu, SkinnedDesc, TextureFilter, TransformGroupDesc, TransformGroupId,
-    Urgency, ViewArena, ViewDesc, ViewHistoryId, VolumeRef, material_flags,
+    ClusterTopology, Decal, DecalChannels, DecalId, FrameDesc, FrameTime, GroupWriter, HitGroups,
+    HitTableWriter, InstanceFlags, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId,
+    MediumProxy, MediumProxyId, ModelId, MountId, Opacity, PackSource, ProducerDesc, ProducerId,
+    ProducerUpdate, Projection, RasterView, RendererDesc, SceneCompute, SceneDesc, SceneId,
+    SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, SlotStateGpu, TextureFilter,
+    TransformGroupDesc, TransformGroupId, Urgency, ViewArena, ViewDesc, ViewHistoryId, VolumeRef,
+    material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 
@@ -282,6 +285,8 @@ pub const WHITE_FLOOR_ALBEDO: f32 = 0.8;
 pub const WHITE_SPHERE: &str = "white sphere";
 /// A unit sphere with no reflection at all, so only the medium in front of it shows.
 pub const BLACK_SPHERE: &str = "black sphere";
+/// A unit red sphere under a clear coat, a fuzz and a thin film.
+pub const LAYERED_SPHERE: &str = "layered sphere";
 pub const CORNELL: &str = "cornell box";
 pub const TALL_BOX: &str = "tall box";
 pub const SHORT_BOX: &str = "short box";
@@ -1241,6 +1246,20 @@ fn cook() -> Arc<[u8]> {
                     vec![diffuse([0.0; 3])],
                 ),
                 model(
+                    LAYERED_SPHERE,
+                    mesh(|b| b.sphere(0, 24, 1.0)),
+                    vec![Material {
+                        base_color: [0.7, 0.1, 0.1],
+                        coat_weight: 1.0,
+                        coat_roughness: 0.1,
+                        fuzz_weight: 0.5,
+                        fuzz_color: [0.9, 0.9, 1.0],
+                        thin_film_weight: 1.0,
+                        thin_film_thickness: 0.4,
+                        ..Material::default()
+                    }],
+                ),
+                model(
                     CORNELL,
                     cornell,
                     vec![
@@ -1656,6 +1675,10 @@ pub struct BedFrame<'a> {
     pub lighting: &'a SceneLighting,
     /// The radiance target the kernel writes, at [`EXTENT`].
     pub target: &'a mut LightingView,
+    /// The scene's hit table for the pipeline [`Bed::set_hit_pipeline`] names.
+    pub hits: Option<HitTable>,
+    /// What writes the scene's hit tables for the pipelines the frame's paths run through.
+    pub scene_hits: &'a HitTableWriter<'a>,
     /// The bed draws particles after the kernel.
     particles: bool,
     roots: &'a mut Roots,
@@ -1906,6 +1929,8 @@ pub struct Bed {
     light_writes: Vec<(LightId, Option<Light>)>,
     proxy_writes: Vec<(MediumProxyId, Option<MediumProxy>)>,
     scene_compute: Option<SceneComputeHook>,
+    /// The pipeline whose hit table every frame's kernel takes in [`BedFrame::hits`].
+    hit_pipeline: Option<(&'static RayPipeline, &'static HitGroups)>,
     /// Frames add the background layer instead of the radiance.
     background_layer: bool,
     kernels: &'static KernelSet,
@@ -2158,6 +2183,7 @@ impl Bed {
             light_writes: Vec::new(),
             proxy_writes: Vec::new(),
             scene_compute: None,
+            hit_pipeline: None,
             background_layer: false,
             kernels,
             particle_group,
@@ -2220,6 +2246,42 @@ impl Bed {
         render()
             .wait_while_completing(point, Duration::from_secs(10))
             .unwrap();
+    }
+
+    /// The bed's model `name`.
+    pub fn model(&self, name: &str) -> ModelId {
+        self.scenes
+            .model(self.mount, AssetId::from_name(name))
+            .unwrap_or_else(|e| panic!("model {name}: {e}"))
+    }
+
+    /// Runs one frame of no view in which `write` changes the scene.
+    pub fn write(&mut self, write: impl FnOnce(&mut SceneWriter<'_>)) {
+        self.frame += 1;
+        let list = [self.scene];
+        let f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        write(&mut f.scene(self.scene).unwrap());
+        let point = f.end(&[]).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
+    }
+
+    /// The root of the scene at the last frame run.
+    pub fn scene_root(&self) -> SceneRoot {
+        read(self.last_root, 1)[0]
+    }
+
+    /// The state the last frame left instance slot `slot` in.
+    pub fn slot_state(&self, slot: u32) -> SlotStateGpu {
+        read(self.scene_root().slot_state.offset(u64::from(slot)), 1)[0]
     }
 
     /// The state the last frame left skinned entry `entry` in, the bed's skinned copies taking
@@ -2551,6 +2613,20 @@ impl Bed {
         self.last_id
     }
 
+    /// The frames the bed has begun: mounting took as many of them as its loads needed.
+    pub fn frames_begun(&self) -> u64 {
+        self.frame
+    }
+
+    /// Runs frames of no view until the bed has begun `frames`, so two beds whose mounts took
+    /// different numbers of frames go on from the same scene frame id: the light tiles, which
+    /// follow it, then draw alike in both.
+    pub fn run_to(&mut self, frames: u64) {
+        while self.frame < frames {
+            self.write(|_| {});
+        }
+    }
+
     /// Sets light `id` from the next frame on.
     pub fn set_light(&mut self, id: LightId, light: Option<Light>) {
         self.light_writes.push((id, light));
@@ -2571,6 +2647,15 @@ impl Bed {
         self.scenes
             .volume(self.mount, AssetId::from_name(name))
             .unwrap_or_else(|e| panic!("volume {name}: {e}"))
+    }
+
+    /// Gives every frame from the next on the scene's hit table for `pipeline`'s groups in
+    /// [`BedFrame::hits`]; `None` gives none.
+    pub fn set_hit_pipeline(
+        &mut self,
+        pipeline: Option<(&'static RayPipeline, &'static HitGroups)>,
+    ) {
+        self.hit_pipeline = pipeline;
     }
 
     /// Runs `hook` at the scene compute point of every frame from the next on.
@@ -2615,6 +2700,7 @@ impl Bed {
         capture.guides()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_frame(
         &mut self,
         index: u32,
@@ -2691,7 +2777,10 @@ impl Bed {
         let id = f.id();
         self.last_id = id;
         self.last_root = view.scene;
-        let list = f.list().unwrap();
+        let (list, scene_hits) = f.list_and_hits(self.scene).unwrap();
+        let hits = self
+            .hit_pipeline
+            .map(|(p, g)| scene_hits.table(list, p, g).unwrap());
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         self.lighting
             .record(
@@ -2716,6 +2805,8 @@ impl Bed {
                 desc,
                 lighting: &self.lighting,
                 target: &mut self.target,
+                hits,
+                scene_hits: &scene_hits,
                 particles: self.particles.is_some(),
                 roots: &mut self.roots,
             },
@@ -2914,6 +3005,305 @@ pub fn assert_within_noise(
     );
 }
 
+/// `frames` frames of `paths` on `bed` from seed `seed`.
+pub fn render_paths(bed: &mut Bed, paths: &Paths, frames: u32, seed: u32) -> Accumulated {
+    bed.accumulate(frames, seed, &mut |list, f| paths.record(list, f))
+}
+
+/// A copy of `model` turned by `linear` at `at`.
+fn item_at(model: &'static str, linear: Mat3, at: Vec3) -> Item {
+    Item { model, linear, at }
+}
+
+/// The glass scene of [`glass_cases`] named `what`.
+pub fn glass_scene(what: &str) -> Spec {
+    let lit = |copies: Vec<Item>, lights: Vec<Light>, eye: Vec3, target: Vec3| Spec {
+        copies: [vec![item_at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)], copies].concat(),
+        lights,
+        environment: Some(SKY),
+        eye,
+        target,
+        fov_y: 0.8,
+        focus: None,
+    };
+    match what {
+        "slabs" => lit(
+            vec![
+                item_at(GLASS_SLAB, Mat3::IDENTITY, Vec3::new(-0.5, 0.5, 0.0)),
+                item_at(TINTED_SLAB, Mat3::IDENTITY, Vec3::new(0.9, 0.4, -0.6)),
+            ],
+            Vec::new(),
+            Vec3::new(0.0, 2.0, 3.5),
+            Vec3::new(0.0, 0.4, 0.0),
+        ),
+        "frosted" => lit(
+            vec![item_at(
+                ROUGH_SLAB,
+                Mat3::IDENTITY,
+                Vec3::new(0.0, 0.5, 0.0),
+            )],
+            Vec::new(),
+            Vec3::new(0.0, 2.0, 3.5),
+            Vec3::new(0.0, 0.4, 0.0),
+        ),
+        "lens" => lit(
+            vec![item_at(
+                GLASS_SPHERE,
+                Mat3::IDENTITY,
+                Vec3::new(0.0, 1.5, 0.0),
+            )],
+            vec![Light::Directional(SUN)],
+            Vec3::new(0.0, 3.0, 4.5),
+            Vec3::new(0.0, 0.5, 0.0),
+        ),
+        "pane" => lit(
+            vec![
+                item_at(MASKED_PANE, Mat3::IDENTITY, Vec3::new(0.0, 1.1, 0.0)),
+                item_at(MASKED_PANE, Mat3::IDENTITY, Vec3::new(0.0, 1.1, 0.3)),
+            ],
+            vec![Light::Directional(SUN)],
+            Vec3::new(0.5, 1.5, 3.5),
+            Vec3::new(0.0, 0.9, 0.0),
+        ),
+        "prism" => lit(
+            vec![item_at(
+                DISPERSIVE_SPHERE,
+                Mat3::IDENTITY,
+                Vec3::new(0.0, 1.0, 0.0),
+            )],
+            Vec::new(),
+            Vec3::new(0.0, 2.0, 4.0),
+            Vec3::new(0.0, 0.8, 0.0),
+        ),
+        // The water box widened to 24 m, its top 4 m up.
+        "water" => lit(
+            vec![
+                item_at(
+                    WATER_BOX,
+                    Mat3::from_diagonal(Vec3::new(4.0, 1.0, 4.0)),
+                    Vec3::new(0.0, 1.99, 0.0),
+                ),
+                item_at(TINTED_SLAB, Mat3::IDENTITY, Vec3::new(0.0, 0.6, 0.0)),
+            ],
+            Vec::new(),
+            Vec3::new(0.0, 1.5, 2.0),
+            Vec3::ZERO,
+        ),
+        // Scattering interiors: scatters in them, and walks where they scatter densely.
+        "milk" => lit(
+            vec![
+                item_at(MILKY_SLAB, Mat3::IDENTITY, Vec3::new(0.0, 0.5, 0.0)),
+                item_at(CLOUD_SPHERE, Mat3::IDENTITY, Vec3::new(0.5, 2.3, -0.5)),
+            ],
+            Vec::new(),
+            Vec3::new(0.0, 3.0, 6.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ),
+        _ => panic!("no glass scene {what}"),
+    }
+}
+
+/// A floor under six stacked emissive particles.
+pub fn particle_bed() -> Bed {
+    let mut bed = Bed::with(Spec {
+        copies: vec![item_at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
+        lights: Vec::new(),
+        environment: Some(SKY.map(|c| c / 2000.0)),
+        eye: Vec3::new(0.0, 2.0, 4.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        focus: None,
+    });
+    let stack: Vec<Particle> = (0..6)
+        .map(|k| Particle {
+            center: Vec3::new(0.1 * k as f32, 0.5 + 0.12 * k as f32, -1.0),
+            size: 0.6,
+        })
+        .collect();
+    let look = ParticleLook {
+        albedo: [0.0; 3],
+        emission: [40.0, 30.0, 20.0],
+        opacity: 0.4,
+        anisotropy: 0.0,
+    };
+    bed.set_particles(&stack, look, Opacity::Particle);
+    bed
+}
+
+/// A sphere and a rect light over a glossy floor.
+pub fn light_bed() -> Bed {
+    Bed::with(Spec {
+        copies: vec![item_at(GLOSSY_FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
+        lights: vec![
+            Light::Sphere {
+                position: DVec3::new(-0.6, 1.2, -0.5),
+                radius: 0.15,
+                intensity: Vec3::splat(40.0),
+                cone: None,
+            },
+            Light::Rect {
+                center: DVec3::new(0.6, 1.2, -0.5),
+                edge_x: Vec3::new(0.4, 0.0, 0.0),
+                edge_y: Vec3::new(0.0, 0.0, 0.3),
+                luminance: Vec3::splat(200.0),
+            },
+        ],
+        environment: None,
+        eye: Vec3::new(0.0, 1.0, 3.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        focus: None,
+    })
+}
+
+/// The sun through a smoke plume's medium proxy.
+pub fn plume_bed() -> Bed {
+    let mut bed = Bed::new(Analytic::SunAndGround);
+    let v = bed.volume(PLUME);
+    bed.set_medium_proxy(
+        MediumProxyId(0),
+        Some(MediumProxy {
+            position: DVec3::new(1.2, 0.0, -0.5),
+            rotation: Quat::from_rotation_y(0.4),
+            scale: 1.25,
+            density: v.density(v.grid("density").unwrap()),
+            extinction: Vec3::new(1.6, 1.2, 0.9),
+            albedo: Vec3::splat(0.9),
+            anisotropy: 0.5,
+        }),
+    );
+    bed
+}
+
+/// A tinted slab over the floor under the sun, whose shadow the sun's light through both faces
+/// fills; with `emitter`, under a sky too, beside an emitter with a coat and fuzz.
+pub fn plane_stack_spec(emitter: bool) -> Spec {
+    let mut copies = vec![
+        item_at(FLOOR, Mat3::IDENTITY, Vec3::ZERO),
+        item_at(TINTED_SLAB, Mat3::IDENTITY, Vec3::new(0.0, 0.8, 0.0)),
+    ];
+    if emitter {
+        copies.push(item_at(
+            COATED_EMITTER,
+            Mat3::from_rotation_x(-0.6),
+            Vec3::new(-1.4, 0.9, -0.4),
+        ));
+    }
+    Spec {
+        copies,
+        lights: vec![Light::Directional(SUN)],
+        environment: emitter.then_some(SKY),
+        eye: Vec3::new(0.0, 2.0, 3.5),
+        target: Vec3::new(0.0, 0.4, 0.0),
+        fov_y: 0.8,
+        focus: None,
+    }
+}
+
+/// Code a path pipeline holds only behind bits of `specialize.slang`, and a scene whose paths run
+/// it.
+pub struct Gate<'a> {
+    pub what: &'static str,
+    /// Per source whose pipeline runs the code: the source's bit with the gate's bits
+    /// (`path_may2`'s in the high word).
+    pub held: &'a [u64],
+    pub bed: &'a dyn Fn() -> Bed,
+    /// What the scene and its paths take before its frames, and what those must outlive.
+    pub setup: &'a dyn Fn(&mut Bed, &mut Paths) -> Box<dyn Any>,
+    pub settings: ViewLighting,
+}
+
+/// `gate`'s scene renders through the pipelines of `kernels` made for exactly what it and its
+/// settings may meet as through the ones that may meet everything, and the pipeline each of the
+/// gate's sources ran holds the gate's bits. The two sets of shaders are compiled apart, so a
+/// path can round apart by its last bits and, at a draw that falls on a threshold, take another
+/// branch: under a thousandth of the pixels may differ, with the images' means the same. A
+/// feature a mask left out changes every pixel it lights.
+pub fn assert_gate(kernels: &KernelSet, gate: &Gate<'_>) {
+    let mut beds = [(gate.bed)(), (gate.bed)()];
+    let frames = beds.iter().map(Bed::frames_begun).max().unwrap();
+    let mut images = Vec::new();
+    for (bed, specialize) in beds.iter_mut().zip([false, true]) {
+        bed.run_to(frames);
+        let mut paths = Paths::exactly(kernels, PathEntry::Pipeline, gate.settings);
+        paths.specialize = specialize;
+        let _kept = (gate.setup)(bed, &mut paths);
+        images.push(render_paths(bed, &paths, 4, 1));
+    }
+    let ran = beds[1].view().paths_ran().expect("the paths ran");
+    for &held in gate.held {
+        let source = held & u64::from(MAY_VIEW | MAY_BACKGROUND | MAY_UPDATE | MAY_PHOTON);
+        let may = ran
+            .ran
+            .iter()
+            .find(|&&may| may & source != 0)
+            .unwrap_or_else(|| panic!("{}: no pipeline ran source {source:#x}", gate.what));
+        assert!(
+            may & held == held,
+            "{}: the pipeline {may:#x} of source {source:#x} lacks {:#x}",
+            gate.what,
+            held & !may
+        );
+    }
+    let apart = images[0]
+        .mean
+        .iter()
+        .zip(&images[1].mean)
+        .filter(|(a, b)| {
+            a.iter()
+                .zip(*b)
+                .any(|(a, b)| (a - b).abs() > 1e-3 * a.abs().max(b.abs()))
+        })
+        .count();
+    assert!(
+        apart * 1000 <= images[0].mean.len(),
+        "{}: the specialized pipelines changed {apart} pixels",
+        gate.what
+    );
+    assert_close(
+        gate.what,
+        image_mean(&images[1]),
+        image_mean(&images[0]),
+        1e-4,
+    );
+}
+
+/// The staged loop and the pipeline path tracer of `kernels`, both with `settings`.
+pub fn both(kernels: &KernelSet, settings: ViewLighting) -> (Paths, Paths) {
+    (
+        Paths::exactly(kernels, PathEntry::Compute, settings),
+        Paths::exactly(kernels, PathEntry::Pipeline, settings),
+    )
+}
+
+/// Real-time frames redraw the light tiles, so runs differ by their noise: the pipeline's frames
+/// at the staged loop's seed sit as close to the staged loop's as its frames at another seed do.
+/// The world cache settles over the staged loop's frames first.
+pub fn assert_pipeline_within_noise(what: &str, bed: &mut Bed, staged: &Paths, launched: &Paths) {
+    render_paths(bed, staged, 32, 3);
+    let piped = render_paths(bed, launched, 32, 1);
+    let same_seed = render_paths(bed, staged, 32, 1);
+    let noise = render_paths(bed, staged, 32, 2);
+    assert_within_noise(what, &piped, &same_seed, &noise, 1.25);
+}
+
+/// [`assert_pipeline_within_noise`], and the two means agree over frames that alternate, which
+/// see the world cache alike.
+pub fn assert_pipeline_renders_as_staged(
+    what: &str,
+    bed: &mut Bed,
+    staged: &Paths,
+    launched: &Paths,
+) {
+    assert_pipeline_within_noise(what, bed, staged, launched);
+    let (mut of_staged, mut of_launched) = (Vec::new(), Vec::new());
+    for k in 0..24 {
+        of_staged.push(image_mean(&render_paths(bed, staged, 1, 4 + k))[1]);
+        of_launched.push(image_mean(&render_paths(bed, launched, 1, 4 + k))[1]);
+    }
+    crate::welch::assert_same_mean(what, &of_launched, &of_staged);
+}
+
 /// orr_lighting's view dispatch and guide resolve recording into bed frames with
 /// `settings`.
 pub struct Paths {
@@ -2936,15 +3326,34 @@ pub struct Paths {
     pub every_tile: bool,
 }
 
+/// The entry [`Paths::new`] runs for `entry`: with `ORR_TEST_PIPELINE_PATHS` set, the staged loop's
+/// entries move to the ray tracing pipeline, so every bed's paths run on it.
+pub fn moved_entry(entry: PathEntry) -> PathEntry {
+    match entry {
+        PathEntry::Fastest | PathEntry::Compute | PathEntry::RayDispatch
+            if std::env::var_os("ORR_TEST_PIPELINE_PATHS").is_some() =>
+        {
+            PathEntry::Pipeline
+        }
+        e => e,
+    }
+}
+
 /// Threads that compile a bed's pipelines at once: the machine's.
 fn compile_threads() -> usize {
     std::thread::available_parallelism().map_or(2, std::num::NonZero::get)
 }
 
 impl Paths {
-    /// The kernels of a set and entry compile once per process, on threads of their own, and
-    /// stay: under the validation layer each compile takes minutes.
+    /// The paths of [`moved_entry`]`(entry)`.
     pub fn new(kernels: &KernelSet, entry: PathEntry, settings: ViewLighting) -> Self {
+        Self::exactly(kernels, moved_entry(entry), settings)
+    }
+
+    /// The paths of `entry` whatever `ORR_TEST_PIPELINE_PATHS` says, for tests that compare
+    /// entries. The kernels of a set and entry compile once per process, on threads of their
+    /// own, and stay: under the validation layer each compile takes minutes.
+    pub fn exactly(kernels: &KernelSet, entry: PathEntry, settings: ViewLighting) -> Self {
         type Key = (Vec<usize>, PathEntry);
         type Compiled = (LightingKernels, Arc<orr_scene::Loading>);
         static COMPILED: Mutex<Vec<(Key, &'static OnceLock<Compiled>)>> = Mutex::new(Vec::new());
@@ -3077,7 +3486,7 @@ impl Paths {
             .record_media(list, lighting, target, pass, settings)
             .unwrap();
         self.kernels
-            .record_paths(list, lighting, target, pass, settings)
+            .record_paths(list, lighting, target, pass, settings, Some(f.scene_hits))
             .unwrap();
         // A frame that waited for its pipelines runs the ones made for exactly what it asked.
         if let Some(ran) = target.paths_ran().filter(|_| settings.specialize) {

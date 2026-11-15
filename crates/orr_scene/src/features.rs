@@ -71,7 +71,8 @@ impl SceneFeatures {
     /// layers of the side it shows.
     pub const COATED_EMITTERS: Self = Self(1 << 22);
     /// Geometry of the dielectric class may show a material that bounds no interior: a
-    /// thin-walled dielectric, or a record rewritten under a mesh built as glass.
+    /// thin-walled dielectric, a record rewritten under a mesh built as glass, a material set
+    /// over a section cooked as one, or a dielectric producer entry's other material.
     pub const THIN_DIELECTRICS: Self = Self(1 << 23);
     /// The scene may hold a caustic caster: a copy of a model with a caster section, or a
     /// producer entry of clusters that rays trace while a material casts.
@@ -248,6 +249,13 @@ impl MaterialFeatures {
             *count = *count + u32::from(features.0 & mask != 0) - u32::from(was & mask != 0);
         }
         was
+    }
+
+    /// Whether material `id`'s record bounds an interior: a dielectric that is not thin-walled.
+    pub(crate) fn bounds_interior(&self, id: u32) -> bool {
+        self.held
+            .get(&id)
+            .is_some_and(|&f| f & SceneFeatures::INTERIORS.0 != 0)
     }
 
     /// The features any record holds.

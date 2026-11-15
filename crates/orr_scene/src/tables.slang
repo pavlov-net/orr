@@ -84,6 +84,8 @@ public struct InstanceGpu
     public uint first_emissive; // in SceneRoot.emissive, or NO_EMISSIVE
     // Entries from it: one per emissive section rank of its model, then one per caster rank.
     public uint emissive_count;
+    public uint run;           // with a material set, the first run of the row its set shows (`orr_scene.runs`)
+    public uint _pad1;
 }
 
 public float instance_rt_range(InstanceGpu inst)
@@ -143,10 +145,12 @@ public struct SlotStateGpu
     public uint2 rt_key;            // hash of the transform, model and shown sections it was written with
     public uint rt_age;             // frames its pending PTLAS work has waited
     public uint rt_model;           // the model it holds while RT_WRITTEN
+    public uint rt_run;             // the first run of the hit records it was written with (`copy_run`)
     public uint part_run;           // first part instance of the run it holds
     public uint part_count;         // part instances in the run; 0: none
     public uint far_part;           // 1 + the part instance tracing its far chain step; 0: none
     public uint far_model;          // the model that part instance holds
+    public uint far_run;            // the first run of the hit records that part instance was written with
 }
 
 // A transform group: `count` transforms relative to the group's anchor. A null `current`
@@ -423,6 +427,13 @@ public struct ModelGpu
     public uint _pad;
 }
 
+// One run of `SceneRoot.runs` (`orr_scene.runs`' ROW_*).
+public struct RunGpu
+{
+    public uint source;            // by ROW_*: an entry of the table that holds its material, or a producer entry
+    public uint word;              // ROW_*, and a copy's cooked class or a producer's material slot
+}
+
 public struct SceneRoot
 {
     public InstanceGpu* instances;
@@ -476,6 +487,8 @@ public struct SceneRoot
     public uint proxy_capacity;
     public uint light_base;          // PTLAS index of the proxy of LightId 0
     public uint* emissive_lists;     // per entry of `emissive`: an instance entry's gathered list (`gathered_list`)
+    public RunGpu* runs;             // the runs of the scene's hit tables (orr_scene.runs)
+    public uint* model_runs;         // by ModelId: the first run of the model's own row in this scene
 }
 
 // The entry of `SceneRoot.emissive` that producer entry `p` holds; false where the producer

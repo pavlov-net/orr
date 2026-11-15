@@ -22,7 +22,7 @@ void trace(uint2 id, Tlas scene)
     ray.Direction = float3(0.0, 0.0, 1.0);
     ray.TMin = 0.0;
     ray.TMax = 4.0;
-    Hit h = trace_closest(scene, ray, 0xff, RAY_FLAG_NONE, AcceptAll());
+    Hit h = trace_closest(opaque_clusters(scene), ray, 0xff, RAY_FLAG_NONE, AcceptAll());
     root.out[id.y * root.width + id.x] = h.hit ? h.custom_index + 1 : 0;
 }
 

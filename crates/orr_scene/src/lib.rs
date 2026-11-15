@@ -51,6 +51,7 @@ mod detail;
 mod drawn;
 mod edit;
 mod features;
+mod hits;
 mod lights;
 mod loading;
 mod material;
@@ -98,6 +99,7 @@ pub use decals::{Decal, DecalChannels, DecalId};
 pub use drawn::{OpaqueHook, OpaquePass};
 pub use edit::{EditDesc, EditId, EditRef};
 pub use features::SceneFeatures;
+pub use hits::HitGroups;
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId, LightTables};
 pub use loading::{JobResult, Loading, ReadArenaStats, Urgency};
 pub use material::{BoundTexture, MaterialId, MaterialWriter, binding_sampler, material_flags};
@@ -121,8 +123,8 @@ pub use scene::{
     SceneWriter, SkinnedPageRef, TransformGroupDesc, TransformGroupId,
 };
 pub use scenes::{
-    Budgets, ConsumerMarker, DetailStats, Frame, FrameDesc, FrameStats, PoolSize, RendererDesc,
-    SceneCompute, Scenes,
+    Budgets, ConsumerMarker, DetailStats, Frame, FrameDesc, FrameStats, HitTableWriter, PoolSize,
+    RendererDesc, SceneCompute, Scenes,
 };
 pub use shaders::pixel_probe::{ProbeGpu, ProbeTexture};
 pub(crate) use shaders::types::{

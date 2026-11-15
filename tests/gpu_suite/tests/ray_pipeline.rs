@@ -120,11 +120,11 @@ fn create(salt: u32, threads: CompileThreads<'_>, flags: RayPipelineFlags) -> Ra
             },
         ],
         callables: &[
-            ShaderRecord {
+            Some(ShaderRecord {
                 stage: 7,
                 data: bytemuck::bytes_of(&call),
-            },
-            ShaderRecord::new(12),
+            }),
+            Some(ShaderRecord::new(12)),
         ],
         max_recursion: 1,
         flags: flags | RayPipelineFlags::CLUSTERS,

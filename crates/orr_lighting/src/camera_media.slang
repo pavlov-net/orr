@@ -195,7 +195,7 @@ void trace_camera<H : ICandidate>(FroxelRoot f, float3 dir, uint mask, float t_m
     ray.TMin = t_min;
     ray.TMax = t_max;
     bool overflow;
-    trace_transmittance(f.scene.tlas, ray, mask, RAY_FLAG_NONE, handler, 0, overflow);
+    trace_transmittance(scene_traced(f.scene), ray, mask, RAY_FLAG_NONE, handler, 0, overflow);
 }
 
 // Spans of the ray from the eye along `dir` to `t_max` through the proxies on screen.

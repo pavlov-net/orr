@@ -13,7 +13,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use orr_shaders::abi::SpecEntry;
+use std::ffi::CStr;
+
+use orr_shaders::abi::{SpecData, SpecEntry};
 
 const HEADER_WORDS: usize = 5;
 const BOUND: usize = 3;
@@ -343,11 +345,30 @@ fn mark_defined(inst: &[u32], defined: &mut [bool]) {
     }
 }
 
+/// How many instructions the functions of entry point `entry` of `code` hold once `spec` is
+/// folded in, without debug lines: the size of the code a driver is handed for the stage.
+pub fn handed_instructions(code: &[u32], entry: &CStr, spec: SpecData<'_>) -> u32 {
+    let folded = specialize(code, entry.to_bytes(), spec.entries, spec.bytes);
+    let code = folded.as_deref().unwrap_or(code);
+    let mut inside = false;
+    let mut count = 0;
+    for (_, inst) in instructions(code, HEADER_WORDS).map_while(|i| i) {
+        match op(inst) {
+            OP_FUNCTION => inside = true,
+            OP_FUNCTION_END => inside = false,
+            OP_LINE | OP_NO_LINE => {}
+            _ if inside => count += 1,
+            _ => {}
+        }
+    }
+    count
+}
+
 /// `code` with the constants `entries` name set to their values in `bytes`, the blocks of its
 /// functions those values leave unreachable removed, and only entry point `entry` left.
 /// `None` where there is nothing to fold or prune, or the module is not laid out as the pass
 /// expects, so the caller keeps `code`.
-pub(super) fn specialize(
+pub(crate) fn specialize(
     code: &[u32],
     entry: &[u8],
     entries: &[SpecEntry],

@@ -118,6 +118,10 @@ fn every_lint_has_a_failing_fixture() {
             kernel("CoopVec<half, 4> v = CoopVec<half, 4>(half(root.count)); root.out[id.x] = float4(v[0]);"),
         ),
         (
+            Lint::PointerStep,
+            kernel("float4* p = root.out + id.x + 2 - 1; *p = float4(1.0);"),
+        ),
+        (
             Lint::Atomic64,
             "struct Root { uint64_t* v; uint n; uint pad; }\n[[vk::binding(0, 0)]] ConstantBuffer<Root> root;\n\
              [shader(\"compute\")] [numthreads(32, 1, 1)] void main(uint3 id: SV_DispatchThreadID) { InterlockedAdd(root.v[id.x], 1ull); }\n"
@@ -407,7 +411,7 @@ fn omm_builds_declare_the_mode_on_every_ray_query_entry() {
             struct Root {{ uint* out; Tlas scene; }}\nORR_ROOT_INLINE(Root);\n\
             void body(uint2 i) {{\n\
             RayDesc r; r.Origin = float3(i, 0); r.Direction = float3(0, 0, 1); r.TMin = 0; r.TMax = 1;\n\
-            Hit h = trace_closest(root.scene, r, MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, AcceptAll());\n\
+            Hit h = trace_closest(opaque_clusters(root.scene), r, MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, AcceptAll());\n\
             root.out[i.x] = h.hit ? h.instance_index : 0; }}\n\
             [shader(\"raygeneration\")] void main_rays() {{ ORR_OMM(main_rays); body(DispatchRaysIndex().xy); }}\n\
             [shader(\"compute\")] [numthreads(8, 4, 1)] void main_compute(uint3 id: SV_DispatchThreadID) {{ {compute_mode} body(id.xy); }}\n"

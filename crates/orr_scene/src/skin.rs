@@ -235,9 +235,11 @@ pub(crate) struct SkinFrame {
     blas_records: GpuAddress,
     readback: Allocation<u32>,
     _memory: Allocation<u8>,
-    /// The clusters and copies a frame skins at most, and the frames in flight.
+    /// The clusters and copies a frame skins at most, the most sections a skinned mesh has, and
+    /// the frames in flight.
     clusters: u32,
     copies: u32,
+    sections: u32,
     fif: u32,
 }
 
@@ -247,16 +249,34 @@ impl SkinFrame {
     /// frames in flight stay where they read them. Fails without device memory, changing
     /// nothing.
     pub(crate) fn follow_copies(&mut self, device: &Device, copies: u32) -> Result<()> {
-        if copies <= self.copies {
+        self.follow(device, copies, self.sections)
+    }
+
+    /// As [`Self::follow_copies`], for skinned meshes of up to `sections` sections: a cluster's
+    /// section is its geometry index, which the instantiation bounds.
+    pub(crate) fn follow_sections(&mut self, device: &Device, sections: u32) -> Result<()> {
+        self.follow(device, self.copies, sections)
+    }
+
+    fn follow(&mut self, device: &Device, copies: u32, sections: u32) -> Result<()> {
+        if copies <= self.copies && sections <= self.sections {
             return Ok(());
         }
-        let mut next = Self::new(device, self.clusters, copies, self.fif)?;
+        let copies = copies.max(self.copies);
+        let sections = sections.max(self.sections);
+        let mut next = Self::new(device, self.clusters, copies, sections, self.fif)?;
         std::mem::swap(&mut next.readback, &mut self.readback);
         *self = next;
         Ok(())
     }
 
-    pub(crate) fn new(device: &Device, clusters: u32, copies: u32, fif: u32) -> Result<Self> {
+    pub(crate) fn new(
+        device: &Device,
+        clusters: u32,
+        copies: u32,
+        sections: u32,
+        fif: u32,
+    ) -> Result<Self> {
         let caps = device.caps();
         let traced = caps.cluster.max_tris > 0 && caps.cluster.max_partitions > 0;
         let n = u64::from(clusters.max(1));
@@ -300,7 +320,7 @@ impl SkinFrame {
                         max_verts_per_cluster: 256,
                         max_total_tris: clusters.max(1) * 128,
                         max_total_verts: clusters.max(1) * 256,
-                        max_geometry_index: accel::MAX_GEOMETRY_INDEX,
+                        max_geometry_index: sections.max(1) - 1,
                         max_geometries_per_cluster: 1,
                         min_truncate_bits: 0,
                     }),
@@ -354,6 +374,7 @@ impl SkinFrame {
             _memory: memory,
             clusters,
             copies,
+            sections,
             fif,
         })
     }

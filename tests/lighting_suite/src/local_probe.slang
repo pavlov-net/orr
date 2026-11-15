@@ -53,7 +53,7 @@ float density(float3 dir)
         return d;
     RayDesc ray = { x, 0.0, dir, 1e30 };
     AcceptAll all;
-    Hit h = trace_closest(s.tlas, ray, MASK_OPAQUE | MASK_DIELECTRIC | MASK_PARTICLE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, all);
+    Hit h = trace_closest(scene_traced(s), ray, MASK_OPAQUE | MASK_DIELECTRIC | MASK_PARTICLE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, all);
     TracedTriangle t;
     if (!h.hit || h.cluster_id < 0 || !traced_triangle(s, h.instance_index, uint(h.cluster_id), h.primitive_index, false, t))
         return d;

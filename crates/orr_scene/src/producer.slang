@@ -89,7 +89,7 @@ public struct ProducerGpu
     public uint strands;         // 1: a strand entry, which emits segments instead of clusters
     public uint drawn;           // linked IDrawn id of a drawn entry, whose opaque raster the view's opaque hook draws; 0: its clusters raster
     public uint emissive;        // its entry in SceneRoot.emissive
-    public uint _pad;
+    public uint runs;            // its row's first run (`orr_scene.runs`), a run per material
 }
 
 // `ProducerStateGpu.rt_flags`.

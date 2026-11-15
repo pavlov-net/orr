@@ -452,6 +452,9 @@ fn triangles(
     g.setVertexFormat(MTLAttributeFormat::Float3);
     g.setIndexType(MTLIndexType::UInt32);
     g.setOpaque(opaque);
+    // Cluster triangles take each candidate once, opaque ones too, since rays and instances
+    // can force them non-opaque.
+    g.setAllowDuplicateIntersectionFunctionInvocation(false);
     Retained::into_super(g)
 }
 

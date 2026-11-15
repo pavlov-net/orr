@@ -60,6 +60,6 @@ void main(uint3 id: SV_DispatchThreadID)
     Count h;
     h.seen = Seen();
     bool overflow;
-    trace_transmittance(root.scene.tlas, ray, root.mask, RAY_FLAG_NONE, h, 16, overflow);
+    trace_transmittance(scene_traced(root.scene), ray, root.mask, RAY_FLAG_NONE, h, 16, overflow);
     root.seen[id.x] = h.seen;
 }

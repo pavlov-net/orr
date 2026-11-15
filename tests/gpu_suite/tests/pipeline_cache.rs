@@ -118,7 +118,7 @@ impl Set {
                             intersection: Some(4),
                         },
                     ],
-                    callables: &[ShaderRecord::new(6)],
+                    callables: &[Some(ShaderRecord::new(6))],
                     max_recursion: 1,
                     flags: RayPipelineFlags::empty(),
                     // A deferred creation's feedback reports no cache hit on NVIDIA's 621.24.

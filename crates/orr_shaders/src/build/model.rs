@@ -186,6 +186,18 @@ pub(super) struct SpecConstant {
     pub(crate) default: u64,
 }
 
+/// A module-scope integer `static const` marked `[Host]`, which the crate's Rust takes as a `const`
+/// of its name and value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HostConst {
+    pub(crate) name: String,
+    pub(super) scalar: Scalar,
+    /// The value's bits, sign-extended from the scalar's width.
+    pub(crate) value: i64,
+    /// The file that declares it.
+    pub(crate) file: PathBuf,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Entry {
     pub(crate) name: String,
@@ -212,9 +224,13 @@ pub(super) struct Model {
     pub(super) root: Option<String>,
     pub(super) structs: BTreeMap<String, StructDef>,
     pub(super) spec: Vec<SpecConstant>,
+    /// The `[Host]` constants of every module the program loads.
+    pub(crate) consts: Vec<HostConst>,
     pub(crate) stray_params: Vec<StrayParam>,
     /// 64-bit atomics other than a max whose result is unused, by opcode.
     pub(super) bad_atomics: Vec<u16>,
+    /// Pointers stepped by a negative constant.
+    pub(super) negative_steps: u32,
     /// An entry point declares the opacity-micromap execution mode.
     pub(super) omm: bool,
     /// The root is held in the push data (`ORR_ROOT_INLINE`).
@@ -242,11 +258,15 @@ struct Extract<'a> {
     structs: BTreeMap<String, StructDef>,
 }
 
-/// Declaring files of the structs and global variables of every loaded module, by name.
+/// Declaring files of the structs and global variables of every loaded module, by name, and the
+/// `[Host]` constants among those variables.
 #[derive(Default)]
 struct Decls {
     structs: HashMap<String, PathBuf>,
     globals: HashMap<String, PathBuf>,
+    consts: Vec<HostConst>,
+    /// Why a `[Host]` variable is no integer constant.
+    errors: Vec<String>,
 }
 
 /// Reads the model of a linked program. `layout` must stay alive for the call.
@@ -297,8 +317,11 @@ fn declarations(session: &Session) -> Decls {
                 if let Some(map) = map
                     && let Some((file, _)) = session.decl_location(child)
                 {
-                    map.entry(text(api.spReflectionDecl_getName(child)))
-                        .or_insert(file);
+                    let name = text(api.spReflectionDecl_getName(child));
+                    if kind == K::SLANG_DECL_KIND_VARIABLE {
+                        host_const(api, child, &name, &file, &mut out.consts, &mut out.errors);
+                    }
+                    map.entry(name).or_insert(file);
                 }
                 if kind != K::SLANG_DECL_KIND_FUNC {
                     stack.push((child, false));
@@ -307,6 +330,56 @@ fn declarations(session: &Session) -> Decls {
         }
     }
     out
+}
+
+/// The attribute that marks a constant for the host, `orr_shaders.abi`'s `HostAttribute`.
+const HOST_ATTRIBUTE: &str = "Host";
+
+/// Adds module-scope variable `decl`, `name` in `file`, to `consts` where it is marked `[Host]`,
+/// or why it cannot be one to `errors`.
+///
+/// # Safety
+/// `decl` is a variable declaration of a module the session owns.
+unsafe fn host_const(
+    api: &sys::SlangLib,
+    decl: *mut sys::SlangReflectionDecl,
+    name: &str,
+    file: &std::path::Path,
+    consts: &mut Vec<HostConst>,
+    errors: &mut Vec<String>,
+) {
+    // SAFETY: as the caller guarantees.
+    unsafe {
+        let var = api.spReflectionDecl_castToVariable(decl);
+        if var.is_null() {
+            return;
+        }
+        let marked = (0..api.spReflectionVariable_GetUserAttributeCount(var)).any(|i| {
+            let a = api.spReflectionVariable_GetUserAttribute(var, i);
+            !a.is_null() && text(api.spReflectionUserAttribute_GetName(a)) == HOST_ATTRIBUTE
+        });
+        if !marked {
+            return;
+        }
+        let scalar = Scalar::from_slang(
+            api.spReflectionType_GetScalarType(api.spReflectionVariable_GetType(var)),
+        )
+        .filter(|s| !matches!(s, Scalar::Bool | Scalar::F16 | Scalar::F32 | Scalar::F64));
+        let mut value = 0i64;
+        let folded = api.spReflectionVariable_GetDefaultValueInt(var, &raw mut value) >= 0;
+        match scalar {
+            Some(scalar) if folded => consts.push(HostConst {
+                name: name.to_owned(),
+                scalar,
+                value,
+                file: file.to_owned(),
+            }),
+            _ => errors.push(format!(
+                "{name} in {} is marked [Host] but is no integer static const whose value folds",
+                file.display()
+            )),
+        }
+    }
 }
 
 impl Extract<'_> {
@@ -460,13 +533,18 @@ impl Extract<'_> {
             } else {
                 Vec::new()
             };
+            if !self.decls.errors.is_empty() {
+                return Err(self.decls.errors.join("\n"));
+            }
             Ok(Model {
                 entries,
                 root,
                 structs: std::mem::take(&mut self.structs),
                 spec,
+                consts: self.decls.consts.clone(),
                 stray_params,
                 bad_atomics,
+                negative_steps: self.spv.negative_steps,
                 omm: !self.spv.omm_entries.is_empty(),
                 inline_root,
                 no_omm_mode,

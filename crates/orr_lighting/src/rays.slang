@@ -203,9 +203,6 @@ public uint list_index(uint3 group, uint lane)
     return (group.y * RAY_ROW + group.x) * RAY_GROUP + lane;
 }
 
-// The thin tracer's pass that looks for a dielectric before a plane stack's probe ends.
-static const uint SHADOW_PROBE = 3;
-
 // The thin tracer's candidates of one shadow ray, as `ShadowCandidates` takes them in mode
 // `mode`, except those it flags: a medium proxy with a volume to march and a dielectric surface
 // that a SHADOW_PATH ray takes as a window or a SHADOW_UNBENT ray crosses. A flagged candidate
@@ -244,36 +241,17 @@ struct ThinShadow<S : ISurfaces> : ICandidate
             flagged = true;
             return float3(1.0);
         }
-        if (c.cluster_id < 0 || (mode == SHADOW_PROBE && c.class_id != CLASS_DIELECTRIC))
+        if (c.cluster_id < 0)
             return float3(1.0);
-        bool layer = (may(MAY_LAYERS) && c.class_id == CLASS_PRESENCE) || (may(MAY_PARTICLES) && c.class_id == CLASS_PARTICLE);
-        uint section;
-        float present = resolve_presence_section<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context, !layer, section);
-        if (mode == SHADOW_PROBE)
-        {
-            flagged = present > 0.0;
-            return flagged ? float3(0.0) : float3(1.0);
-        }
-        if (layer)
-        {
-            counted = true;
-            return float3(1.0 - saturate(present));
-        }
-        if (!may(MAY_LAYERS) || c.class_id != CLASS_DIELECTRIC)
-            return present > 0.0 ? float3(0.0) : float3(1.0);
-        if (!(present > 0.0))
-            return float3(1.0);
-        counted = true;
-        if (mode == SHADOW_PHOTON)
-            return float3(0.0);
-        bool thin = may2(MAY2_THIN_DIELECTRICS) && !crosses_interior(scene, section);
-        if (mode == SHADOW_PATH && !thin)
-        {
+        uint found;
+        float3 t = thin_candidate<S>(scene, view, context, mode, dir, c.class_id, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, may(MAY_LAYERS), may(MAY_PARTICLES), counted, found);
+        if ((found & SHADOW_SOLID) != 0)
             solid_t = c.t;
-            return float3(0.0);
-        }
-        flagged = true;
-        return float3(1.0);
+        if (mode == SHADOW_PROBE && c.class_id == CLASS_DIELECTRIC)
+            flagged = (found & SHADOW_CROSSES) != 0;
+        else if ((found & SHADOW_CROSSES) != 0)
+            flagged = true;
+        return t;
     }
 }
 
@@ -306,7 +284,7 @@ public ShadowResult trace_shadow<S : ISurfaces>(SceneRoot* s, ViewConstants* v, 
         bool more;
         uint c;
         float c_t;
-        float3 p = trace_transmittance(s.tlas, ray, mask, pass_flags, h, SHADOW_CANDIDATES, more, c, c_t);
+        float3 p = trace_transmittance(scene_traced(s), ray, mask, pass_flags, h, SHADOW_CANDIDATES, more, c, c_t);
         if (pass == 1 && h.mode == SHADOW_PROBE)
         {
             // Light that ends at anything but a dielectric is 0.

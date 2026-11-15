@@ -56,12 +56,15 @@
 mod bsdf;
 mod caustics;
 mod environment;
+mod launch;
+mod mask_sets;
 mod media;
 pub mod openpbr;
 mod particles;
 mod probe;
 mod scene;
 mod staged;
+pub mod standins;
 mod subsurface;
 mod subsurface_table;
 mod support;
@@ -71,6 +74,7 @@ mod world_cache;
 pub use bsdf::BsdfTables;
 pub use caustics::{CausticSettings, CausticStats, MAX_CAUSTIC_CAPACITY_LOG2, MAX_PHOTONS};
 pub use environment::{ENVIRONMENT_SIZE, EnvironmentMapGpu};
+pub use launch::{PIPELINE_CAP, Role, StageSize, over_cap, path_stage_sizes};
 pub use media::{
     AERIAL_SIZE, MAX_FROXEL_SHADOWED_LIGHTS, MAX_PROXY_RAYS, MediaSettings, MediaStats,
 };
@@ -101,6 +105,18 @@ use orr_scene::orr_gpu::{ComputePipeline, Device, ShaderModule, ShaderStage, Spe
 /// dependents' shader builds generate.
 pub mod types {
     pub use crate::shaders::types::*;
+}
+
+/// `specialize.slang`'s bits of `path_may`, what the paths of a path pipeline may meet, which
+/// the low word of [`PathsRan`]'s masks holds.
+pub mod path_may {
+    pub use crate::shaders::consts::{
+        MAY_BACKGROUND, MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG,
+        MAY_DIRECTIONAL, MAY_DISPERSION, MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ,
+        MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES,
+        MAY_PHOTON, MAY_PROXIES, MAY_REFERENCE, MAY_SMOKE, MAY_STACK, MAY_SUBSURFACE, MAY_UPDATE,
+        MAY_VIEW, MAY_WALK,
+    };
 }
 
 /// orr_lighting's compiled-in kernel modules.
@@ -138,6 +154,10 @@ pub enum Error {
         kernel: &'static str,
         message: String,
     },
+    /// A stage of a path pipeline, or the pipeline, is over the cap on what it may hand the
+    /// driver.
+    #[error("path pipeline: {0}")]
+    StageSize(String),
     /// A replacement kernel does not match the module it replaces.
     #[error("kernel {kernel}: {reason}")]
     Kernel {

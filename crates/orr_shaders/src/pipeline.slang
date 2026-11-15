@@ -18,6 +18,8 @@
 module pipeline;
 
 import orr_shaders.abi;
+import orr_shaders.trace;
+__exported import orr_shaders.hits;
 
 // What crosses a trace, invoke or call in registers. A launch pays registers in every thread
 // for its widest payload past 16 bytes, so pipelines pass this and keep the rest in memory.
@@ -28,10 +30,6 @@ public struct Payload
 
 // The attributes of a triangle hit; an intersection shader reports its own type.
 public typealias TriangleAttributes = BuiltInTriangleIntersectionAttributes;
-
-// Ray flags beside Slang's `RAY_FLAG_*`: opacity micromaps forced to two states. Pipelines
-// see micromaps only when created for them; builds without micromaps drop the flag.
-public static const uint RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE = 0x400;
 
 // Loads `*p` as another shader of the path stored it, made visible at device scope.
 [ForceInline]
@@ -53,6 +51,28 @@ public void store_coherent<T>(T* p, T v)
     };
 }
 
+// `load_coherent` of texel `at` of `image`.
+[ForceInline]
+public float4 load_texel_coherent(RWTexture2D<float4> image, uint2 at)
+{
+    return spirv_asm {
+        OpCapability VulkanMemoryModelDeviceScope;
+        result : $$float4 = OpImageRead $image $at MakeTexelVisible|NonPrivateTexel $(1u);
+    };
+}
+
+// `store_coherent` of texel `at` of `image`.
+[ForceInline]
+public void store_texel_coherent(RWTexture2D<float4> image, uint2 at, float4 v)
+{
+    spirv_asm {
+        OpCapability VulkanMemoryModelDeviceScope;
+        OpImageWrite $image $at $v MakeTexelAvailable|NonPrivateTexel $(1u);
+    };
+}
+
+// `flags` with `orr_shaders.trace`'s RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, which pipelines see
+// only when created for micromaps, and builds without micromaps drop.
 [ForceInline]
 uint ray_flags(uint flags)
 {
@@ -69,6 +89,17 @@ uint ray_flags(uint flags)
 #else
     return flags & ~RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE;
 #endif
+}
+
+// Ends an any-hit shader by its decision `d` (ANY_HIT_*): ignores the candidate, accepts it, or
+// accepts it and ends the search.
+[ForceInline]
+public void any_hit_decides(uint d)
+{
+    if (d == ANY_HIT_END)
+        AcceptHitAndEndSearch();
+    if (d == ANY_HIT_IGNORE)
+        IgnoreHit();
 }
 
 // Traces `ray` and runs the closest-hit or miss shader it finds, from a raygen, closest-hit or
@@ -128,7 +159,7 @@ public extension HitObject
     // The hit's distance; on a miss, the ray's TMax.
     public float t()
     {
-        return this.GetRayTCurrent();
+        return this.GetRayDesc().TMax;
     }
 
     public uint instance_index()
@@ -160,6 +191,20 @@ public extension HitObject
     public float2 barycentrics()
     {
         return this.GetAttributes<TriangleAttributes>().barycentrics;
+    }
+
+    // A triangle hit's corners in object space, as its acceleration structure holds them.
+    public float3[3] corners()
+    {
+        return this.GetTriangleVertexPositions();
+    }
+
+    // The linear part of a hit's object-to-world transform, which takes an object-space direction
+    // `v` to `mul(linear, v)`.
+    public float3x3 object_to_world()
+    {
+        float4x3 m = this.GetObjectToWorld();
+        return transpose(float3x3(m[0], m[1], m[2]));
     }
 
     // The index of the hit or miss record `invoke` runs.
@@ -201,6 +246,40 @@ public extension HitObject
     {
         HitObject::Invoke(this, payload);
     }
+
+}
+
+// `h.reorder()` then `h.invoke(payload)` as the extension's one instruction, which Slang has no
+// name for: the driver keeps no hit object of the caller's across the regrouping.
+[ForceInline]
+public void reorder_invoke<P>(Traced h, inout P payload)
+{
+    [__vulkanRayPayload]
+    static P p;
+    p = payload;
+    spirv_asm
+    {
+        OpExtension "SPV_EXT_shader_invocation_reorder";
+        OpCapability ShaderInvocationReorderEXT;
+        OpHitObjectReorderExecuteShaderEXT &h &p
+    };
+    payload = p;
+}
+
+// As above, after `h.reorder(hint, bits)`.
+[ForceInline]
+public void reorder_invoke<P>(Traced h, uint hint, uint bits, inout P payload)
+{
+    [__vulkanRayPayload]
+    static P p;
+    p = payload;
+    spirv_asm
+    {
+        OpExtension "SPV_EXT_shader_invocation_reorder";
+        OpCapability ShaderInvocationReorderEXT;
+        OpHitObjectReorderExecuteShaderEXT &h &p $hint $bits
+    };
+    payload = p;
 }
 
 // Traces `ray` running only intersection and any-hit shaders: what it found, to read, reorder
@@ -225,33 +304,23 @@ public Traced traced_nothing()
     return HitObject::MakeNop();
 }
 
-// What a hit shader's body reads of the hit, so the same body compiles as the shader and as
-// a compute stand-in that reads it from memory.
-public interface IHit
-{
-    // The index of the thread in the launch.
-    uint3 launch();
-    uint instance_index();
-    uint custom_index();
-    uint geometry_index();
-    uint primitive_index();
-    // -1 outside cluster geometry.
-    int cluster_id();
-    float t();
-    float2 barycentrics();
-    bool front_face();
-    float3 world_origin();
-    float3 world_direction();
-    float3 object_origin();
-    float3 object_direction();
-    // Corner `i` of a triangle hit in object space; the geometry allows data access.
-    float3 corner(uint i);
-}
-
-// The hit as built-ins give it, in closest-hit and any-hit shaders of triangle geometry.
-public struct TriangleHit : IHit
+// The hit as built-ins give it in closest-hit and any-hit shaders: `TriangleHit` for geometry of
+// triangles only, `BuiltInHit` for geometry that is triangles or linear swept spheres. A
+// swept-sphere hit has no corners, cluster or barycentrics: its first corner is the hit point in
+// object space, the others and its barycentrics 0, and its cluster id -1, as `orr_shaders.trace`
+// gives an inline hit on one.
+public struct BuiltIns<let SWEPT : bool> : IHit
 {
     public TriangleAttributes attributes;
+
+    // Whether the hit is on a triangle.
+    public bool triangle()
+    {
+        if (!SWEPT)
+            return true;
+        uint kind = HitKind();
+        return kind == HIT_KIND_TRIANGLE_FRONT_FACE || kind == HIT_KIND_TRIANGLE_BACK_FACE;
+    }
 
     public uint3 launch()
     {
@@ -280,7 +349,7 @@ public struct TriangleHit : IHit
 
     public int cluster_id()
     {
-        return GetClusterID();
+        return triangle() ? GetClusterID() : -1;
     }
 
     public float t()
@@ -290,7 +359,7 @@ public struct TriangleHit : IHit
 
     public float2 barycentrics()
     {
-        return attributes.barycentrics;
+        return triangle() ? attributes.barycentrics : float2(0.0);
     }
 
     public bool front_face()
@@ -320,106 +389,11 @@ public struct TriangleHit : IHit
 
     public float3 corner(uint i)
     {
-        return HitTriangleVertexPosition(i);
+        if (triangle())
+            return HitTriangleVertexPosition(i);
+        return i == 0 ? ObjectRayOrigin() + RayTCurrent() * ObjectRayDirection() : float3(0.0);
     }
 }
 
-// A hit as a compute stand-in reads it: the values `TriangleHit` gives, from memory.
-public struct HitInputs
-{
-    public uint3 launch;
-    public uint instance_index;
-    public uint custom_index;
-    public uint geometry_index;
-    public uint primitive_index;
-    public int cluster_id;
-    public float2 barycentrics;
-    public float t;
-    public uint front_face;
-    public float3 world_origin;
-    public uint pad0;
-    public float3 world_direction;
-    public uint pad1;
-    public float3 object_origin;
-    public uint pad2;
-    public float3 object_direction;
-    public uint pad3;
-    public float3 corners[3];
-    public uint pad4;
-}
-
-// The hit a compute stand-in reads from `HitInputs` in memory.
-public struct StoredHit : IHit
-{
-    public HitInputs* at;
-
-    public uint3 launch()
-    {
-        return at.launch;
-    }
-
-    public uint instance_index()
-    {
-        return at.instance_index;
-    }
-
-    public uint custom_index()
-    {
-        return at.custom_index;
-    }
-
-    public uint geometry_index()
-    {
-        return at.geometry_index;
-    }
-
-    public uint primitive_index()
-    {
-        return at.primitive_index;
-    }
-
-    public int cluster_id()
-    {
-        return at.cluster_id;
-    }
-
-    public float t()
-    {
-        return at.t;
-    }
-
-    public float2 barycentrics()
-    {
-        return at.barycentrics;
-    }
-
-    public bool front_face()
-    {
-        return at.front_face != 0;
-    }
-
-    public float3 world_origin()
-    {
-        return at.world_origin;
-    }
-
-    public float3 world_direction()
-    {
-        return at.world_direction;
-    }
-
-    public float3 object_origin()
-    {
-        return at.object_origin;
-    }
-
-    public float3 object_direction()
-    {
-        return at.object_direction;
-    }
-
-    public float3 corner(uint i)
-    {
-        return at.corners[i];
-    }
-}
+public typealias TriangleHit = BuiltIns<false>;
+public typealias BuiltInHit = BuiltIns<true>;

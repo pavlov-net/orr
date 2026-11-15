@@ -9,26 +9,66 @@ module trace;
 import orr_shaders.abi;
 
 // TLAS instance mask bits.
-public static const uint MASK_OPAQUE = 0x01;     // opaque and alpha-tested geometry
-public static const uint MASK_PARTICLE = 0x02;   // particle batches
-public static const uint MASK_MEDIUM = 0x04;     // medium proxies (AABBs)
+[Host] public static const uint MASK_OPAQUE = 0x01;     // opaque and alpha-tested geometry
+[Host] public static const uint MASK_PARTICLE = 0x02;   // particle batches
+[Host] public static const uint MASK_MEDIUM = 0x04;     // medium proxies (AABBs)
 public static const uint MASK_LIGHT = 0x08;      // sphere and rect light proxies (AABBs)
-public static const uint MASK_DIELECTRIC = 0x80; // dielectric and presence surfaces
+[Host] public static const uint MASK_DIELECTRIC = 0x80; // dielectric and presence surfaces
 
-// Candidate classes. Cluster geometry holds its class in the geometry index, per cluster, under an
-// instance with custom index 0 whose mask covers what it shows; other instances hold it in their
-// custom index.
+// What an any-hit shader does with its candidate: ignore it, accept it, or accept it and end the
+// search.
+public static const uint ANY_HIT_IGNORE = 0;
+public static const uint ANY_HIT_ACCEPT = 1;
+public static const uint ANY_HIT_END = 2;
+
+// Candidate classes. An instance with a custom index holds its class there; under one with custom
+// index 0, whose mask covers every class it shows, each cluster has its own (`ITraced`) and other
+// geometry is CLASS_OPAQUE.
 public static const uint CLASS_OPAQUE = 0; // opaque or alpha-tested
-public static const uint CLASS_DIELECTRIC = 1;
+[Host] public static const uint CLASS_DIELECTRIC = 1;
 public static const uint CLASS_PRESENCE = 2;
 public static const uint CLASS_PARTICLE = 3;
 public static const uint CLASS_MEDIUM = 4;
 public static const uint CLASS_LIGHT = 5;
 
-// The class of a candidate or hit from its instance's custom index and its geometry index.
-public uint class_of(uint custom_index, uint geometry_index)
+// What a trace traverses, and where its candidates' classes come from beside the custom index.
+public interface ITraced
 {
-    return custom_index != 0 ? custom_index : geometry_index;
+    Tlas tlas();
+    // The CLASS_* of cluster `cluster_id` on instance `instance_index`, whose custom index is 0.
+    uint cluster_class(uint instance_index, uint cluster_id);
+}
+
+// A TLAS whose cluster geometry under custom index 0 is all CLASS_OPAQUE: a structure that holds
+// no scene's classes.
+public struct OpaqueClusters : ITraced
+{
+    public Tlas at;
+
+    public Tlas tlas()
+    {
+        return at;
+    }
+
+    public uint cluster_class(uint instance_index, uint cluster_id)
+    {
+        return CLASS_OPAQUE;
+    }
+}
+
+public OpaqueClusters opaque_clusters(Tlas tlas)
+{
+    OpaqueClusters t = { tlas };
+    return t;
+}
+
+// The class of a candidate or hit of `traced` on instance `instance_index`, from its custom index
+// and its cluster (-1 outside cluster geometry).
+public uint class_of<T : ITraced>(T traced, uint custom_index, uint instance_index, int cluster_id)
+{
+    if (custom_index != 0)
+        return custom_index;
+    return cluster_id < 0 ? CLASS_OPAQUE : traced.cluster_class(instance_index, uint(cluster_id));
 }
 
 // The mask bit of candidate class `class_id`. Other classes pass every mask.
@@ -54,14 +94,14 @@ public uint class_mask(uint class_id)
 
 // Ray flags beside Slang's `RAY_FLAG_*`: opacity micromaps forced to two states. Builds
 // without micromaps drop it.
-public static const uint RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE = 0x400;
+[Host] public static const uint RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE = 0x400;
 
 // A non-opaque candidate as the candidate handlers see it.
 public struct Candidate
 {
     public uint instance_index; // TLAS or PTLAS instance index
     public uint custom_index;   // the instance's custom index
-    public uint geometry_index;
+    public uint geometry_index; // a cluster's section, or its producer cluster's material
     public uint class_id;       // CLASS_*
     public uint primitive_index;
     public int cluster_id;      // -1 outside cluster BLAS
@@ -84,7 +124,7 @@ public struct Hit
     public float t;
     public uint instance_index;
     public uint custom_index;
-    public uint geometry_index;
+    public uint geometry_index; // as `Candidate.geometry_index`
     public uint class_id;  // CLASS_*
     public uint primitive_index;
     public int cluster_id; // -1 outside cluster BLAS and on swept sphere hits
@@ -135,34 +175,34 @@ public interface ITranslucent : IAnyHit
 // The closest hit, with non-opaque triangle candidates committed where `any_hit` accepts
 // them. Procedural candidates are skipped.
 [ForceInline]
-public Hit trace_closest<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint flags, A any_hit)
+public Hit trace_closest<T : ITraced, A : IAnyHit>(T traced, RayDesc ray, uint mask, uint flags, A any_hit)
 {
     float3 positions[3];
-    return closest(tlas, ray, mask, flags, any_hit, false, positions);
+    return closest(traced, ray, mask, flags, any_hit, false, positions);
 }
 
 // As above, and the object-space corner positions of a triangle hit, whose BLAS must allow
 // data access. On any other hit the first position is the object-space hit point and the
 // others are zero.
 [ForceInline]
-public Hit trace_closest<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint flags, A any_hit, out float3 positions[3])
+public Hit trace_closest<T : ITraced, A : IAnyHit>(T traced, RayDesc ray, uint mask, uint flags, A any_hit, out float3 positions[3])
 {
-    return closest(tlas, ray, mask, flags, any_hit, true, positions);
+    return closest(traced, ray, mask, flags, any_hit, true, positions);
 }
 
 // True when anything is hit; the first accepted hit ends the search.
 [ForceInline]
-public bool trace_any<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint flags, A any_hit)
+public bool trace_any<T : ITraced, A : IAnyHit>(T traced, RayDesc ray, uint mask, uint flags, A any_hit)
 {
     RayQuery<RAY_FLAG_NONE> q;
-    begin(q, tlas, ray, mask, flags | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH);
+    begin(q, traced.tlas(), ray, mask, flags | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH);
     while (q.Proceed())
     {
         if (opaque_candidate(q, flags))
             q.CommitNonOpaqueTriangleHit();
         else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
         {
-            Candidate c = candidate(q);
+            Candidate c = candidate(q, traced);
             if (takes(c, mask) && any_hit.accept(c))
                 q.CommitNonOpaqueTriangleHit();
         }
@@ -174,17 +214,17 @@ public bool trace_any<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint flags
 // committing one. An opaque hit gives 0. A counted candidate past the first
 // `max_candidates` ends the trace with the product so far and sets `overflow`.
 [ForceInline]
-public float3 trace_transmittance<H : ICandidate>(Tlas tlas, RayDesc ray, uint mask, uint flags, inout H handler, uint max_candidates, out bool overflow)
+public float3 trace_transmittance<T : ITraced, H : ICandidate>(T traced, RayDesc ray, uint mask, uint flags, inout H handler, uint max_candidates, out bool overflow)
 {
     uint committed_class;
     float committed_t;
-    return trace_transmittance(tlas, ray, mask, flags, handler, max_candidates, overflow, committed_class, committed_t);
+    return trace_transmittance(traced, ray, mask, flags, handler, max_candidates, overflow, committed_class, committed_t);
 }
 
 // As above, and in `committed_class` and `committed_t` the CLASS_* and distance of the opaque hit
 // that gave 0, or ~0 and +inf for none.
 [ForceInline]
-public float3 trace_transmittance<H : ICandidate>(Tlas tlas, RayDesc ray, uint mask, uint flags, inout H handler, uint max_candidates, out bool overflow, out uint committed_class, out float committed_t)
+public float3 trace_transmittance<T : ITraced, H : ICandidate>(T traced, RayDesc ray, uint mask, uint flags, inout H handler, uint max_candidates, out bool overflow, out uint committed_class, out float committed_t)
 {
     overflow = false;
     committed_class = ~0u;
@@ -192,7 +232,7 @@ public float3 trace_transmittance<H : ICandidate>(Tlas tlas, RayDesc ray, uint m
     float3 product = 1;
     uint count = 0;
     RayQuery<RAY_FLAG_NONE> q;
-    begin(q, tlas, ray, mask, flags);
+    begin(q, traced.tlas(), ray, mask, flags);
     while (q.Proceed())
     {
         if (opaque_candidate(q, flags))
@@ -200,7 +240,7 @@ public float3 trace_transmittance<H : ICandidate>(Tlas tlas, RayDesc ray, uint m
             q.CommitNonOpaqueTriangleHit();
             continue;
         }
-        Candidate c = candidate(q);
+        Candidate c = candidate(q, traced);
         if (c.triangle && !takes(c, mask))
             continue;
         if (c.triangle && handler.positions(c))
@@ -227,7 +267,7 @@ public float3 trace_transmittance<H : ICandidate>(Tlas tlas, RayDesc ray, uint m
     if (q.CommittedStatus() != COMMITTED_NOTHING)
     {
         product = 0;
-        Hit h = committed(q);
+        Hit h = committed(q, traced);
         committed_class = h.class_id;
         committed_t = h.t;
     }
@@ -245,42 +285,42 @@ public static const uint TRANSLUCENT_BINS = 4;
 // behind the hit, so a ray that holds every opaque hit out with `TMax` keeps none behind
 // one. At most `max_candidates` candidates are visited.
 [ForceInline]
-public Hit trace_resolve_translucent<H : ITranslucent>(Tlas tlas, RayDesc ray, uint mask, uint flags, H handler, uint max_candidates, out float4 layers)
+public Hit trace_resolve_translucent<T : ITraced, H : ITranslucent>(T traced, RayDesc ray, uint mask, uint flags, H handler, uint max_candidates, out float4 layers)
 {
     float3 positions[3];
-    return translucent(tlas, ray, mask, flags, handler, max_candidates, false, positions, layers);
+    return translucent(traced, ray, mask, flags, handler, max_candidates, false, positions, layers);
 }
 
 // As above, with the hit's corner positions as in `trace_closest`.
 [ForceInline]
-public Hit trace_resolve_translucent<H : ITranslucent>(Tlas tlas, RayDesc ray, uint mask, uint flags, H handler, uint max_candidates, out float4 layers, out float3 positions[3])
+public Hit trace_resolve_translucent<T : ITraced, H : ITranslucent>(T traced, RayDesc ray, uint mask, uint flags, H handler, uint max_candidates, out float4 layers, out float3 positions[3])
 {
-    return translucent(tlas, ray, mask, flags, handler, max_candidates, true, positions, layers);
+    return translucent(traced, ray, mask, flags, handler, max_candidates, true, positions, layers);
 }
 
 [ForceInline]
-Hit closest<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint flags, A any_hit, bool fetch, out float3 positions[3])
+Hit closest<T : ITraced, A : IAnyHit>(T traced, RayDesc ray, uint mask, uint flags, A any_hit, bool fetch, out float3 positions[3])
 {
     RayQuery<RAY_FLAG_NONE> q;
-    begin(q, tlas, ray, mask, flags);
+    begin(q, traced.tlas(), ray, mask, flags);
     while (q.Proceed())
     {
         if (opaque_candidate(q, flags))
             q.CommitNonOpaqueTriangleHit();
         else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
         {
-            Candidate c = candidate(q);
+            Candidate c = candidate(q, traced);
             if (takes(c, mask) && any_hit.accept(c))
                 q.CommitNonOpaqueTriangleHit();
         }
     }
-    Hit h = committed(q);
+    Hit h = committed(q, traced);
     committed_positions(q, fetch, h, positions);
     return h;
 }
 
 [ForceInline]
-Hit translucent<H : ITranslucent>(Tlas tlas, RayDesc ray, uint mask, uint flags, H handler, uint max_candidates, bool fetch, out float3 positions[3], out float4 layers)
+Hit translucent<T : ITraced, H : ITranslucent>(T traced, RayDesc ray, uint mask, uint flags, H handler, uint max_candidates, bool fetch, out float3 positions[3], out float4 layers)
 {
     float4 bins[TRANSLUCENT_BINS];
     float depth[TRANSLUCENT_BINS];
@@ -293,7 +333,7 @@ Hit translucent<H : ITranslucent>(Tlas tlas, RayDesc ray, uint mask, uint flags,
     float tail_near = ray.TMax;
     uint count = 0;
     RayQuery<RAY_FLAG_NONE> q;
-    begin(q, tlas, ray, mask, flags);
+    begin(q, traced.tlas(), ray, mask, flags);
     while (q.Proceed())
     {
         if (count == max_candidates)
@@ -307,7 +347,7 @@ Hit translucent<H : ITranslucent>(Tlas tlas, RayDesc ray, uint mask, uint flags,
             q.CommitNonOpaqueTriangleHit();
             continue;
         }
-        Candidate c = candidate(q);
+        Candidate c = candidate(q, traced);
         if (c.triangle && !takes(c, mask))
             continue;
         float4 layer = handler.layer(c);
@@ -338,7 +378,7 @@ Hit translucent<H : ITranslucent>(Tlas tlas, RayDesc ray, uint mask, uint flags,
             q.CommitNonOpaqueTriangleHit();
         }
     }
-    Hit h = committed(q);
+    Hit h = committed(q, traced);
     committed_positions(q, fetch, h, positions);
     float limit = h.hit ? h.t : ray.TMax;
     layers = 0;
@@ -402,7 +442,7 @@ inline metal::raytracing::intersection_params orr_ray_params(uint flags)
 }
 
 [ForceInline]
-Candidate candidate(inout RayQuery<RAY_FLAG_NONE> q)
+Candidate candidate<T : ITraced>(inout RayQuery<RAY_FLAG_NONE> q, T traced)
 {
     Candidate c;
     c.instance_index = q.CandidateInstanceIndex();
@@ -433,7 +473,7 @@ Candidate candidate(inout RayQuery<RAY_FLAG_NONE> q)
     default:
         c.cluster_id = q.CandidateClusterID();
     }
-    c.class_id = class_of(c.custom_index, c.geometry_index);
+    c.class_id = class_of(traced, c.custom_index, c.instance_index, c.cluster_id);
     return c;
 }
 
@@ -466,16 +506,22 @@ uint64_t metal_committed_data(inout RayQuery<RAY_FLAG_NONE> q)
     __intrinsic_asm "reinterpret_cast<ulong>(($0)->get_committed_primitive_data())";
 }
 
-// Whether a ray with mask `mask` takes triangle candidate `c`. An instance's mask covers every
-// class it shows, so a ray whose mask misses a class still meets that class's clusters in a mixed
-// BLAS, where the class in the geometry index turns away its non-opaque candidates. Solid glass
-// is opaque in the AS, so it commits before any screening and stops a ray that reaches it, unless
-// the ray or its instance forces it non-opaque. A ray that takes both opaque and dielectric
-// geometry has no class to turn away.
+// Whether a ray with mask `mask` takes a triangle candidate of class `class_id`. An instance's
+// mask covers every class it shows, so a ray whose mask misses a class still meets that class's
+// clusters in a mixed BLAS, where the cluster's class turns away its non-opaque candidates. Solid
+// glass is opaque in the AS, so it commits before any screening and stops a ray that reaches it,
+// unless the ray or its instance forces it non-opaque. A ray that takes both opaque and
+// dielectric geometry has no class to turn away.
+[ForceInline]
+public bool class_taken(uint class_id, uint mask)
+{
+    return (mask & (MASK_OPAQUE | MASK_DIELECTRIC)) == (MASK_OPAQUE | MASK_DIELECTRIC) || (class_mask(class_id) & mask) != 0;
+}
+
 [ForceInline]
 bool takes(Candidate c, uint mask)
 {
-    return (mask & (MASK_OPAQUE | MASK_DIELECTRIC)) == (MASK_OPAQUE | MASK_DIELECTRIC) || (class_mask(c.class_id) & mask) != 0;
+    return class_taken(c.class_id, mask);
 }
 
 // Whether a non-opaque candidate is an opaque triangle of a cluster: Metal makes a whole
@@ -499,7 +545,7 @@ bool opaque_candidate(inout RayQuery<RAY_FLAG_NONE> q, uint flags)
 }
 
 [ForceInline]
-Hit committed(inout RayQuery<RAY_FLAG_NONE> q)
+Hit committed<T : ITraced>(inout RayQuery<RAY_FLAG_NONE> q, T traced)
 {
     Hit h;
     uint status = q.CommittedStatus();
@@ -527,7 +573,7 @@ Hit committed(inout RayQuery<RAY_FLAG_NONE> q)
     default:
         h.cluster_id = h.hit ? q.CommittedClusterID() : -1;
     }
-    h.class_id = class_of(h.custom_index, h.geometry_index);
+    h.class_id = class_of(traced, h.custom_index, h.instance_index, h.cluster_id);
     return h;
 }
 

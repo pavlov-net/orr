@@ -153,6 +153,8 @@ struct PlacedMesh {
     page_clusters: u64,
     cluster_count: u32,
     sections: u32,
+    /// Per section, the class and solid bits it cooked with ([`cooked_section`]).
+    section_flags: Vec<u8>,
     header: MeshHeader,
     /// The ranks of its emissive and caster sets.
     ranks: [u32; 2],
@@ -1185,6 +1187,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             page_clusters: block.gpu() + page_clusters_at,
             cluster_count: first,
             sections: info.sections.len() as u32,
+            section_flags: info.sections.iter().copied().map(cooked_section).collect(),
             header,
             ranks: [info.emissive.rank_count(), info.casters.rank_count()],
             opaque_casters: info
@@ -1620,6 +1623,7 @@ struct ResolvedMesh {
     /// A skinned mesh's skin table.
     skin_record: Option<SkinMeshGpu>,
     sections: u32,
+    section_flags: Vec<u8>,
     /// A caster section of the opaque class.
     opaque_casters: bool,
     header: MeshHeader,
@@ -1894,6 +1898,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                 page_addresses,
                 skin_record: None,
                 sections: m.sections,
+                section_flags: m.section_flags,
                 opaque_casters: m.opaque_casters,
                 header: m.header,
                 levels: m.level_ranges,
@@ -2535,6 +2540,23 @@ impl MeshPages {
     }
 }
 
+/// The bits of a section's flags its clusters trace by: its [`SurfaceClass`] and whether it is
+/// solid glass.
+fn cooked_section(s: Section) -> u8 {
+    s.flags & (Section::CLASS_MASK | Section::SOLID)
+}
+
+/// What every scene's row of a resident model's own materials reads: its first entry of
+/// `model_materials`, per section what [`cooked_section`] keeps (0 for a cage's sections, which
+/// no cluster names) and its mesh's vertex attributes, made at `made` of [`Mounts::rows_epoch`].
+#[derive(Clone)]
+pub(crate) struct ModelRow {
+    pub(crate) materials: u32,
+    pub(crate) cooked: Arc<[u8]>,
+    pub(crate) attributes: u8,
+    pub(crate) made: u64,
+}
+
 /// The render thread's mounts and the global model and mesh tables they fill.
 pub(crate) struct Mounts {
     entries: Vec<Option<Entry>>,
@@ -2555,6 +2577,10 @@ pub(crate) struct Mounts {
     pub(crate) streaming: Streaming,
     /// The mount and mesh of each resident model.
     owners: FxHashMap<ModelId, (MountId, u32)>,
+    /// The row of each model in `owners`, which scenes give runs of their hit tables.
+    pub(crate) rows: FxHashMap<ModelId, ModelRow>,
+    /// Counts the changes to `rows`.
+    pub(crate) rows_epoch: u64,
     /// The mount and mesh whose pages, node pages and finer cuts take each range of the mesh
     /// page table, by its first entry. An edit's range takes its source mesh's pages.
     entry_owners: BTreeMap<u32, EntryOwner>,
@@ -2861,7 +2887,9 @@ impl Mounts {
             accel: Arc::clone(accel),
             models: Table::new(device, MemoryPriority::Normal, "models")?,
             meshes: Table::new(device, MemoryPriority::Normal, "meshes")?,
-            model_materials: Table::new(device, MemoryPriority::Normal, "model materials")?,
+            // Hit tables read every entry up to the capacity as a material, free ones too.
+            model_materials: Table::new(device, MemoryPriority::Normal, "model materials")?
+                .zeroed(),
             pages: Vec::new(),
             page_keys: Vec::new(),
             page_generations: Vec::new(),
@@ -2869,6 +2897,8 @@ impl Mounts {
             streaming: Streaming::new(device, budgets, pools, accel, &mesh_pages, streams, fif)?,
             mesh_pages,
             owners: FxHashMap::default(),
+            rows: FxHashMap::default(),
+            rows_epoch: 0,
             entry_owners: BTreeMap::new(),
             masks: HashMap::new(),
             transient: Vec::new(),
@@ -3231,6 +3261,9 @@ impl Mounts {
         };
         w.cages[i] = None;
         self.owners.insert(id, (p.mount, p.mesh));
+        if let Some(row) = self.rows.get(&p.model).cloned() {
+            self.put_row(id, row.materials, row.cooked, row.attributes);
+        }
         // As a mesh without entries, an edit of one owns none.
         if page_count > 0 {
             self.entry_owners.insert(
@@ -3378,9 +3411,32 @@ impl Mounts {
                     .remove_mirror(e.mount, e.source_mesh, &e.mirror);
                 self.streaming.release(&e.holds);
                 self.owners.remove(&e.model);
+                self.drop_row(e.model);
                 self.retired_edits.push((frame, e));
             }
             Some(EditEntry::Failed(_)) | None => {}
+        }
+    }
+
+    /// Gives `model` the row of its materials from entry `materials`, with `cooked` section bits
+    /// and vertex `attributes`.
+    fn put_row(&mut self, model: ModelId, materials: u32, cooked: Arc<[u8]>, attributes: u8) {
+        self.rows_epoch += 1;
+        let made = self.rows_epoch;
+        self.rows.insert(
+            model,
+            ModelRow {
+                materials,
+                cooked,
+                attributes,
+                made,
+            },
+        );
+    }
+
+    fn drop_row(&mut self, model: ModelId) {
+        if self.rows.remove(&model).is_some() {
+            self.rows_epoch += 1;
         }
     }
 
@@ -3803,6 +3859,7 @@ impl Mounts {
     fn release(&mut self, mut r: Resident, materials: &MaterialTable) {
         for id in r.models.values() {
             self.owners.remove(id);
+            self.drop_row(*id);
             self.models.free(id.0, 1);
         }
         for &id in &r.meshes {
@@ -4031,6 +4088,9 @@ impl Mounts {
             };
             self.owners.insert(id, (mount, mesh_index as u32));
             let mesh = &meshes[mesh_index];
+            let mut cooked = mesh.section_flags.clone();
+            cooked.resize(n as usize, 0);
+            self.put_row(id, start, cooked.into(), mesh.header.attributes);
             let skinned = mesh.header.attributes & MeshHeader::SKIN != 0;
             w.model_cpu[i] = ModelCpu {
                 sections: n,

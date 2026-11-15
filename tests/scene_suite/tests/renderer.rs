@@ -723,6 +723,86 @@ fn a_chain_marks_its_scenes_for_ray_candidates() {
     assert_clean();
 }
 
+/// A material set over a section cooked as glass may show a material that bounds no interior,
+/// which the glass's rays then pass as a thin wall: a scene says it may hold thin dielectrics
+/// from the frame a copy shows such a set, and not before.
+#[test]
+fn a_material_set_over_glass_marks_its_scene_for_thin_dielectrics() {
+    let d = device();
+    let mut r = Renderer::new(d, RendererDesc::default()).unwrap();
+    let loading = r.loading();
+    let worker = {
+        let l = Arc::clone(&loading);
+        std::thread::spawn(move || l.run_worker())
+    };
+    let mut frame = 0;
+    let glass = Material {
+        transmission_weight: 1.0,
+        specular_roughness: 0.0,
+        ..Material::default()
+    };
+    let pack = pack_of([
+        ("glass", cube(), glass),
+        ("plaster", cube(), Material::default()),
+    ]);
+    let mount = mount_pack(&mut r, &pack, &mut frame);
+    let model = r.model(mount, AssetId::from_name("glass")).unwrap();
+    let plaster = r
+        .material(mount, AssetId::from_name("plaster/material/0"))
+        .unwrap();
+    loading.stop_workers();
+    worker.join().unwrap();
+    let scene = r
+        .create_scene(&SceneDesc::default(), &Default::default())
+        .unwrap();
+    let listed = [scene];
+    let thin = orr_scene::SceneFeatures::THIN_DIELECTRICS;
+    let mut features = |r: &mut Renderer, set: Option<u32>| {
+        frame += 1;
+        let mut f = r
+            .begin_frame(FrameDesc {
+                time: time(frame),
+                scenes: &listed,
+                display: None,
+            })
+            .unwrap();
+        {
+            let mut s = f.scene(scene).unwrap();
+            if let Some(base) = set {
+                s.material_sets(base, 1).unwrap()[0] = plaster;
+            }
+            let group = s
+                .create_transform_group(&TransformGroupDesc {
+                    count: 1,
+                    writer: GroupWriter::Cpu,
+                    anchor: DVec3::ZERO,
+                })
+                .unwrap();
+            s.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
+            s.add_instances(&InstancesDesc {
+                model,
+                copies: 1,
+                transforms: group,
+                first: 0,
+                pose: None,
+                material_set: set,
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: 1000.0,
+                animation_range: 0.0,
+                user_tag: 0,
+            })
+            .unwrap();
+        }
+        f.update_scenes(&mut |_| {}).unwrap();
+        let features = f.scene_features(scene).unwrap();
+        wait(f.end().unwrap());
+        features
+    };
+    assert!(!features(&mut r, None).contains(thin));
+    assert!(features(&mut r, Some(0)).contains(thin));
+    assert_clean();
+}
+
 /// A copy fading between two steps of its chain is written with every triangle a candidate of
 /// the rays that meet it. Path pipelines made for a scene of plain materials take them too: a
 /// view on them renders each frame of the box's fade as a view of the same frames on the

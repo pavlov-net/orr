@@ -1516,7 +1516,7 @@ impl<'a> Frame<'a> {
                 probe,
             )?;
         }
-        let (list, arena) = self.scenes.list_and_arena(view.history)?;
+        let (list, arena, hits) = self.scenes.list_arena_and_hits(view.history, view.scene)?;
         arena.enter(ViewStep::Lighting, list);
 
         if !self.lit.contains(&view.scene) {
@@ -1567,7 +1567,7 @@ impl<'a> Frame<'a> {
         let traced = Stages::COMPUTE | Stages::RAY;
         list.barrier(Stages::ALL, traced, Hazards::empty());
         kernels.record_media(list, scene, paths, &pass, lighting)?;
-        kernels.record_paths(list, scene, paths, &pass, lighting)?;
+        kernels.record_paths(list, scene, paths, &pass, lighting, Some(&hits))?;
         let exact_paths = paths.paths_ran().is_none_or(|ran| ran.exact());
         state.samples = state.samples.wrapping_add(1);
         list.barrier(traced, Stages::COMPUTE, Hazards::empty());

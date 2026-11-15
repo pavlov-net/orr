@@ -38,6 +38,7 @@ import orr_shaders.math;
 import orr_shaders.trace;
 import orr_gpu.rtas;
 import orr_scene.hit;
+import orr_scene.runs;
 import orr_scene.lights;
 import orr_scene.producer;
 
@@ -399,7 +400,10 @@ void want(uint3 id: SV_DispatchThreadID)
     // chain can replace a step's model, and a model past step 0 shows other materials,
     // sections and no pose.
     bool stepped = written && (((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) != near || st.rt_model != inst.model);
-    bool restep = stepped || (written && ((st.rt_flags & RT_FADING) != 0) != fading);
+    // A copy that shows another row of hit records (another material set) takes its contribution
+    // now, so traces through the records never read another row's.
+    bool rerun = written && st.rt_run != copy_run(s, inst);
+    bool restep = stepped || (written && ((st.rt_flags & RT_FADING) != 0) != fading) || rerun;
     bool has_focus = root.focus_cell.w != 0;
     uint cell_log2 = uint(s.origin_cell.w);
 
@@ -473,8 +477,9 @@ void want(uint3 id: SV_DispatchThreadID)
     if (!active || !in_range)
     {
         // A removed slot's instances go now: its slot may be handed out again. So does one
-        // holding another chain step than the copy's, whose hits resolve through the copy's.
-        bool mandatory = inst.flags == 0 || held_built || stepped || st.far_part != 0;
+        // holding another chain step than the copy's, whose hits resolve through the copy's,
+        // and one whose contribution names another row's hit records.
+        bool mandatory = inst.flags == 0 || held_built || stepped || rerun || st.far_part != 0;
         if (written)
             op.op = OP_WRITE | OP_NULL;
         if (release)
@@ -552,14 +557,15 @@ void want(uint3 id: SV_DispatchThreadID)
     bool far_moved = false;
     if (fading)
     {
-        uint far_model = step_record(s, base, chain_far(*st)).model;
+        InstanceGpu far_record = step_record(s, base, chain_far(*st));
+        uint far_model = far_record.model;
         MeshGpu* far_mesh = s.meshes + s.models[far_model].mesh;
         far = far_mesh.rt_cut_count > 0;
         op.far_cut = far ? s.cut.slots[slot].far_cut : 0;
-        // A fade can turn to another far step, or its chain replace the far step's model,
-        // while the near one stays.
+        // A fade can turn to another far step, or its chain replace the far step's model, or
+        // the far step's row of hit records change, while the near one stays.
         far_moved = (op.op & OP_WRITE) != 0 || op.far_cut != ((st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff)
-            || far_model != st.far_model || target != st.rt_partition;
+            || far_model != st.far_model || copy_run(s, far_record) != st.far_run || target != st.rt_partition;
     }
     bool far_held = st.far_part != 0;
     uint far_op = far && !far_held ? OP_FAR_TAKE : far && far_moved ? OP_FAR_WRITE : !far && far_held ? OP_FAR_RELEASE : 0;
@@ -650,8 +656,9 @@ bool reserve(uint counter, uint capacity, uint count, out uint index)
     return true;
 }
 
-// The write of an instance over `blas` placed by `pl` with mesh-space bounds `lo`..`hi`.
-PtlasWrite instance_write(uint index, uint partition, Placement pl, float3 lo, float3 hi, uint64_t blas, uint custom_index, uint mask)
+// The write of an instance over `blas` placed by `pl` with mesh-space bounds `lo`..`hi`, whose
+// hit records start at run `run`.
+PtlasWrite instance_write(uint index, uint partition, Placement pl, float3 lo, float3 hi, uint64_t blas, uint custom_index, uint mask, uint run)
 {
     PtlasWrite w = PtlasWrite();
     w.instance_index = index;
@@ -674,6 +681,7 @@ PtlasWrite instance_write(uint index, uint partition, Placement pl, float3 lo, f
     w.blas = blas;
     w.custom_index = custom_index;
     w.mask = mask;
+    w.hit_group = contribution(run);
     w.flags = INSTANCE_EXPLICIT_AABB;
     return w;
 }
@@ -765,7 +773,7 @@ PtlasWrite copy_write(SceneRoot* s, PtlasGpu* t, uint index, uint partition, Ins
     float3 lo, hi;
     if ((inst.flags & INSTANCE_SKINNED) == 0 || !skinned_reach(s, inst, lo, hi))
         copy_bounds(s, inst, lo, hi);
-    return instance_write(index, partition, pl, lo, hi, blas, 0, section_ray_mask(s.meshes + s.models[inst.model].mesh, shown_sections(inst)));
+    return instance_write(index, partition, pl, lo, hi, blas, 0, section_ray_mask(s.meshes + s.models[inst.model].mesh, shown_sections(inst)), copy_run(s, inst));
 }
 
 // Writes the slot's far instance: its copy's far chain step at `cut`, non-opaque.
@@ -781,6 +789,7 @@ void write_far(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, InstanceGpu base, ui
     store((uint64_t)t.writes, index, w);
     st.rt_flags = (st.rt_flags & ~(0xffu << RT_FAR_CUT_SHIFT)) | (cut << RT_FAR_CUT_SHIFT);
     st.far_model = far.model;
+    st.far_run = copy_run(s, far);
 }
 
 // Writes every part instance of the slot's run: the cut's part BLAS posed by the copy's
@@ -812,7 +821,7 @@ void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot, Instanc
         w.instance_index = s.part_base + st.part_run + j;
         w.partition = ptlas_partition(partition);
         if (shown && blas != 0 && (part.sections & ~hidden) != 0 && part_pose(s, inst, mesh, mesh.first_animated + j, false, pose))
-            w = instance_write(w.instance_index, partition, placed_after(copy, pose), part.bounds_min, part.bounds_max, blas, 0, section_ray_mask(mesh, part.sections & ~hidden));
+            w = instance_write(w.instance_index, partition, placed_after(copy, pose), part.bounds_min, part.bounds_max, blas, 0, section_ray_mask(mesh, part.sections & ~hidden), copy_run(s, inst));
         if (fading && w.blas != 0)
             w.flags |= INSTANCE_FORCE_NO_OPAQUE;
         store((uint64_t)t.writes, index + j, w);
@@ -877,7 +886,7 @@ void emit(uint3 id: SV_DispatchThreadID)
             PtlasUpdate u;
             u.blas = blas;
             u.instance_index = slot;
-            u.hit_group = 0;
+            u.hit_group = contribution(st.rt_run);
             store((uint64_t)t.updates, index, u);
             st.rt_blas = blas;
             st.rt_lod = uint8_t(op.cut);
@@ -914,6 +923,7 @@ void emit(uint3 id: SV_DispatchThreadID)
         st.rt_partition = op.partition;
         st.rt_key = op.key;
         st.rt_model = inst.model;
+        st.rt_run = copy_run(s, inst);
         uint chain = disable ? 0 : (near << RT_STEP_SHIFT) | (fading ? RT_FADING : 0);
         st.rt_flags = (st.rt_flags & ~(RT_WRITTEN | RT_GLOBAL | RT_FADING | (CHAIN_STEP_MASK << RT_STEP_SHIFT)))
             | (disable ? 0 : RT_WRITTEN) | (global ? RT_GLOBAL : 0) | chain;
@@ -936,8 +946,9 @@ void emit(uint3 id: SV_DispatchThreadID)
 static const uint PRODUCER_RT_WRITE = 4;
 static const uint PRODUCER_RT_NULL = 8;
 
-// What a producer instance is written with besides its BLAS address: transform and class.
-uint2 producer_key(GroupGpu* g, ProducerGpu p)
+// What a producer instance is written with besides its BLAS address: transform, class and the
+// first run of its hit records.
+uint2 producer_key(GroupGpu* g, ProducerGpu p, uint run)
 {
     float3x4 m = group_transform(g, p.group_index);
     uint a = 0x811c9dc5u;
@@ -950,7 +961,7 @@ uint2 producer_key(GroupGpu* g, ProducerGpu p)
             b = mix(b, asuint(m[r][c]) + 0x632be5abu);
         }
     }
-    return uint2(mix(mix(a, p.class_id), p.group), mix(b, p.group_index ^ (p.class_id << 24)));
+    return uint2(mix(mix(mix(a, p.class_id), p.group), run), mix(b, p.group_index ^ (p.class_id << 24)));
 }
 
 // The rays producer entry `p` meets: its class's, or the classes of its materials.
@@ -991,7 +1002,7 @@ void producer_want(uint3 id: SV_DispatchThreadID)
         && producer_render_placement(s, p, pl);
     if (active)
     {
-        uint2 key = producer_key(s.groups + p.group, p);
+        uint2 key = producer_key(s.groups + p.group, p, producer_run(s, p));
         bool rebased = (root.flags & PTLAS_REBASE) != 0;
         if (!written || (flags & PRODUCER_RT_BUILT) != 0 || rebased || any(st.rt_key != key))
             flags |= PRODUCER_RT_WRITE;
@@ -1035,8 +1046,9 @@ void producer_emit(uint3 id: SV_DispatchThreadID)
         float3 lo, hi;
         producer_render_placement(s, p, pl);
         producer_bounds(*st, lo, hi);
-        w = instance_write(w.instance_index, global_partition(), pl, lo, hi, st.blas, p.class_id, producer_ray_mask(s, p));
-        st.rt_key = producer_key(s.groups + p.group, p);
+        uint run = producer_run(s, p);
+        w = instance_write(w.instance_index, global_partition(), pl, lo, hi, st.blas, p.class_id, producer_ray_mask(s, p), run);
+        st.rt_key = producer_key(s.groups + p.group, p, run);
     }
     store((uint64_t)t.writes, index, w);
     bool was = (flags & PRODUCER_RT_WRITTEN) != 0;
@@ -1105,7 +1117,7 @@ void proxy_write(uint3 id: SV_DispatchThreadID)
         w.instance_index = s.light_base + light;
         Placement pl;
         if (light_placement(s.lights[light], pl))
-            w = instance_write(w.instance_index, global_partition(), pl, float3(-1.0), float3(1.0), root.proxy_blas, CLASS_LIGHT, MASK_LIGHT);
+            w = instance_write(w.instance_index, global_partition(), pl, float3(-1.0), float3(1.0), root.proxy_blas, CLASS_LIGHT, MASK_LIGHT, RUN_LIGHT);
         store((uint64_t)t.writes, index, w);
         return;
     }
@@ -1117,7 +1129,7 @@ void proxy_write(uint3 id: SV_DispatchThreadID)
         pl.linear = transpose(float3x3(p.axis_x, p.axis_y, p.axis_z));
         pl.translation = proxy_render_center(s, p);
         pl.scale = max(length(p.axis_x), max(length(p.axis_y), length(p.axis_z)));
-        w = instance_write(w.instance_index, global_partition(), pl, float3(-1.0), float3(1.0), root.proxy_blas, CLASS_MEDIUM, MASK_MEDIUM);
+        w = instance_write(w.instance_index, global_partition(), pl, float3(-1.0), float3(1.0), root.proxy_blas, CLASS_MEDIUM, MASK_MEDIUM, RUN_MEDIUM);
     }
     store((uint64_t)t.writes, index, w);
 }

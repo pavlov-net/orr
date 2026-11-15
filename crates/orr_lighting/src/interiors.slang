@@ -8,6 +8,7 @@ import orr_shaders.random;
 import orr_shaders.trace;
 import orr_scene.hit;
 import orr_scene.visibility;
+__exported import orr_scene.candidates;
 
 // Interior list entries a path keeps.
 public static const uint INTERIOR_ENTRIES = 4;
@@ -187,12 +188,8 @@ public struct EyeInterior
     }
 }
 
-// Non-opaque candidates of rays that may meet layers: presence layers commit by `presence`,
-// the rest by the alpha test.
-public static const uint PRESENCE_NONE = 0;      // never: rays that look for dielectrics only
-public static const uint PRESENCE_ANY = 1;       // wherever its opacity is above 0
-public static const uint PRESENCE_DRAWN = 2;     // where a hashed draw from `seed` falls below its opacity
-
+// Non-opaque candidates of rays that may meet layers: presence layers commit by `presence`
+// (PRESENCE_*), the rest by the alpha test.
 public struct LayerAccept<S : ISurfaces> : IAnyHit
 {
     public SceneRoot* scene;
@@ -204,16 +201,7 @@ public struct LayerAccept<S : ISurfaces> : IAnyHit
 
     public bool accept(Candidate c)
     {
-        if (c.cluster_id < 0)
-            return false;
-        bool layer = c.class_id == CLASS_PRESENCE;
-        if (layer && presence == PRESENCE_NONE)
-            return false;
-        float coverage = resolve_presence<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context, !layer);
-        if (!layer || presence == PRESENCE_ANY)
-            return coverage > 0.0;
-        uint h = pcg(seed ^ pcg(c.instance_index ^ pcg(uint(c.cluster_id) ^ pcg(c.primitive_index))));
-        return unit_float(h) < coverage;
+        return c.cluster_id >= 0 && cover_decision<S>(scene, view, COVER_LAYERS, presence, seed, context, dir, c.class_id, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics);
     }
 }
 
@@ -233,7 +221,7 @@ public bool next_surface<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 o
     ray.Direction = dir;
     ray.TMin = 0.0;
     ray.TMax = t_max;
-    Hit h = trace_closest(s.tlas, ray, MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+    Hit h = trace_closest(scene_traced(s), ray, MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
     float3 n;
     uint m;
     if (!h.hit || h.cluster_id < 0 || !hit_geometry(s, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, n, m))

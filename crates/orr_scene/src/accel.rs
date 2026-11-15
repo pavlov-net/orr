@@ -35,9 +35,6 @@ use crate::{ClusterRef, PartGpu, Result, RtCutGpu};
 const CLAS_MICROMAP: u32 = 1;
 const CLAS_NON_OPAQUE: u32 = 2;
 
-/// Clusters keep their class in the geometry index, `orr_shaders.trace` `CLASS_OPAQUE` to
-/// `CLASS_PRESENCE`.
-pub(crate) const MAX_GEOMETRY_INDEX: u32 = 2;
 const CLAS_TEMPLATE: u32 = 4;
 /// `AccelRoot.op` of `records`.
 const ACCEL_BLAS: u32 = 0;
@@ -1386,6 +1383,8 @@ pub(crate) fn clas_batch<'a>(
     let mut jobs = Vec::new();
     let (mut vertices, mut triangles) = (0u32, 0u32);
     let (mut max_tris, mut max_verts, mut min_truncate) = (1, 1, u32::MAX);
+    // A cluster's geometry index is its section.
+    let mut max_section = 0;
     for s in sources {
         let c = s.cluster;
         let mut flags = 0;
@@ -1415,6 +1414,7 @@ pub(crate) fn clas_batch<'a>(
         triangles += c.tri_count;
         max_tris = max_tris.max(c.tri_count);
         max_verts = max_verts.max(c.vertex_count);
+        max_section = max_section.max(u32::from(c.section));
         min_truncate = min_truncate.min(s.truncate_bits);
     }
     let mut flags = RtasFlags::FAST_TRACE | RtasFlags::ALLOW_DATA_ACCESS;
@@ -1436,7 +1436,7 @@ pub(crate) fn clas_batch<'a>(
             max_verts_per_cluster: max_verts,
             max_total_tris: triangles,
             max_total_verts: vertices,
-            max_geometry_index: MAX_GEOMETRY_INDEX,
+            max_geometry_index: max_section,
             max_geometries_per_cluster: 1,
             min_truncate_bits: min_truncate,
         }),

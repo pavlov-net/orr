@@ -34,6 +34,7 @@ pub(super) mod op {
     pub(crate) const SPEC_CONSTANT_FALSE: u16 = 49;
     pub(crate) const SPEC_CONSTANT: u16 = 50;
     pub(crate) const VARIABLE: u16 = 59;
+    pub(crate) const PTR_ACCESS_CHAIN: u16 = 67;
     pub(crate) const DECORATE: u16 = 71;
     pub(crate) const MEMBER_DECORATE: u16 = 72;
     pub(crate) const MODULE_PROCESSED: u16 = 330;
@@ -139,6 +140,8 @@ pub(super) struct Module {
     member_decorations: HashMap<(u32, u32), Decorations>,
     pub(super) types: HashMap<u32, Type>,
     constants: HashMap<u32, u64>,
+    /// Each constant's type.
+    constant_types: HashMap<u32, u32>,
     /// Result type and literal words of spec constants; booleans carry one word, 0 or 1.
     spec_constants: HashMap<u32, (u32, Vec<u32>)>,
     variables: Vec<(u32, u32, u32)>,
@@ -147,6 +150,8 @@ pub(super) struct Module {
     /// Entry points with the opacity-micromap execution mode.
     pub(super) omm_entries: HashSet<u32>,
     pub(crate) atomics64: Vec<Atomic64>,
+    /// Pointers stepped by a negative constant.
+    pub(crate) negative_steps: u32,
     pub(super) ray_query: bool,
 }
 
@@ -158,6 +163,7 @@ impl Module {
         let mut m = Self::default();
         let mut uses: HashSet<u32> = HashSet::new();
         let mut atomics: Vec<(u16, u32, u32)> = Vec::new();
+        let mut steps: Vec<u32> = Vec::new();
         for (_, inst) in instructions(words) {
             let a = inst.args;
             match inst.op {
@@ -238,6 +244,7 @@ impl Module {
                 op::CONSTANT => {
                     let value = u64::from(a[2]) | a.get(3).map_or_default(|&h| u64::from(h) << 32);
                     m.constants.insert(a[1], value);
+                    m.constant_types.insert(a[1], a[0]);
                 }
                 op::SPEC_CONSTANT_TRUE | op::SPEC_CONSTANT_FALSE => {
                     let v = u32::from(inst.op == op::SPEC_CONSTANT_TRUE);
@@ -269,6 +276,10 @@ impl Module {
                 op::COMPOSITE_EXTRACT => {
                     uses.insert(a[2]);
                 }
+                op::PTR_ACCESS_CHAIN => {
+                    steps.push(a[3]);
+                    uses.extend(inst.args);
+                }
                 op::COMPOSITE_INSERT | op::VECTOR_SHUFFLE => uses.extend(&a[2..4]),
                 op::SWITCH => {
                     uses.insert(a[0]);
@@ -280,6 +291,20 @@ impl Module {
                 o if takes_literals(o) => {}
                 _ => uses.extend(inst.args),
             }
+        }
+        for element in steps {
+            let ty = m.constant_types.get(&element).and_then(|t| m.types.get(t));
+            let negative = match (ty, m.constants.get(&element)) {
+                (
+                    Some(Type::Int {
+                        width,
+                        signed: true,
+                    }),
+                    Some(&v),
+                ) => v >> (width - 1) & 1 != 0,
+                _ => false,
+            };
+            m.negative_steps += u32::from(negative);
         }
         for (o, ty, result) in atomics {
             if m.scalar_width(ty) == Some(64) {

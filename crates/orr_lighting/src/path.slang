@@ -37,6 +37,7 @@ import orr_color.luminance;
 import orr_shaders.random;
 import orr_shaders.sampling;
 import orr_shaders.trace;
+import orr_shaders.hits;
 import orr_shaders.coherence;
 import orr_pack.mesh;
 import orr_scene.hit;
@@ -139,6 +140,26 @@ public struct PathStages
     public uint _pad0;
 }
 
+// Where a pipeline launch's paths keep their state (path/launch/slot.slang): every slot's
+// HOT_WORDS hot words at a fixed stride, its cold words, `cold_words` a slot, with the first word
+// of each cold part a root's source and features keep (PART_NONE for one it does not), its scratch,
+// `scratch_words` a slot, and its record. The host lays them out from the root alone.
+public struct LaunchHeader
+{
+    public uint4* hot;
+    public uint4* cold;
+    public uint4* scratch;
+    public uint4* records;              // RECORD_WORDS a slot, UPDATE_RECORD_WORDS an update path's
+    public uint cold_words;
+    public uint scratch_words;
+    public uint walk_at;
+    public uint layer_at;
+    public uint interior_at;
+    public uint stack_at;
+    public uint light_at;
+    public uint spectral_at;
+}
+
 // A queue of path slots in one round: the workgroups its stage runs over, which whoever
 // appends to the queue counts, and the slots appended.
 public struct StageQueue
@@ -215,14 +236,14 @@ public struct PathRoot
     public PathStages* stages;
     public uint slice_base;
     public uint slice_count;
-    public uint features;           // FEATURE_* (path/stages.slang)
+    public uint features;           // FEATURE_* (path/common.slang)
     // The round a stage runs in, the first round of its pass, where every path of the pass
     // finishes, and the first round of the next pass.
     public uint round;
     public uint round_first;
     public uint round_next;
-    public uint _pad0;
-    public uint _pad1;
+    // A pipeline launch's slots and records.
+    public LaunchHeader* launch;
 }
 
 // A pixel's front layer over the G-buffer: the top 24 bits of the reverse-Z device depth, so
@@ -355,21 +376,95 @@ public bool sides_agree(float3 n, float3 ng, float3 wi)
     return dot(wi, n) * dot(wi, ng) > 0.0;
 }
 
+// The vertex of surface `g` reached along `dir`, its normals as `g` has them: `origin_error` is
+// what its ray origin offset must cover, and its visible triangle's plane lies `depth_offset` m
+// back along `dir`.
+PathVertex vertex_on(ViewConstants* v, GSurface g, float origin_error, float depth_offset, float3 dir)
+{
+    PathVertex x;
+    x.surface = g;
+    x.view = -dir;
+    x.origin_error = origin_error;
+    x.plane_point = g.position - dir * depth_offset;
+    x.camera_distance = length(g.position - v.eye_render.xyz);
+    return x;
+}
+
+// `vertex_on` with the shading normal leaned toward the ray's origin where a normal map tilts it
+// away, and with `hit` the geometric normal facing the ray.
+PathVertex facing_vertex(ViewConstants* v, GSurface g, float origin_error, float depth_offset, float3 dir, bool hit)
+{
+    PathVertex x = vertex_on(v, g, origin_error, depth_offset, dir);
+    x.surface.normal = lean_normal(x.surface.normal, x.view);
+    if (hit && dot(x.surface.geometric_normal, x.view) < 0.0)
+        x.surface.geometric_normal = -x.surface.geometric_normal;
+    return x;
+}
+
 // The vertex of a resolved hit of a ray along `dir`, whose frame the hit turned toward the ray
 // on a back face: the shading normal leaned toward the ray's origin where a normal map tilts it
 // away, and the geometric normal facing it.
 public PathVertex hit_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
 {
-    PathVertex x;
-    x.surface = sh.surface;
-    x.view = -dir;
-    x.surface.normal = lean_normal(x.surface.normal, x.view);
-    if (dot(x.surface.geometric_normal, x.view) < 0.0)
-        x.surface.geometric_normal = -x.surface.geometric_normal;
-    x.origin_error = sh.geometric_error;
-    x.plane_point = sh.surface.position - dir * sh.depth_offset;
-    x.camera_distance = length(sh.surface.position - v.eye_render.xyz);
-    return x;
+    return facing_vertex(v, sh.surface, sh.geometric_error, sh.depth_offset, dir, true);
+}
+
+// Inline trace hit `h`, with its triangle's corners `positions`, reached along `dir`, as a value.
+public ValueHit value_hit(Hit h, float3 positions[3], float3 dir)
+{
+    ValueHit v = { h.instance_index, h.custom_index, h.cluster_id, h.primitive_index, h.barycentrics, h.t, dir, positions };
+    return v;
+}
+
+// The vertex of packed surface `ps`, reached along `dir`: a hit's as `hit_vertex` makes it, and
+// the G-buffer's as `gbuffer_vertex` does, `dir` from the eye.
+public PathVertex surface_vertex(ViewConstants* v, PackedSurface ps, float3 dir)
+{
+    return facing_vertex(v, unpack_surface(ps), ps.origin_error, ps.depth_offset, dir, (ps.flags & SURFACE_HIT) != 0);
+}
+
+// The opaque surface at hit `h` through `S`, packed, with `context` the hit's: the closest-hit
+// shader's body. A caller that reports the hit's texture feedback passes `FeedbackSurface<S>`.
+// False where the hit names nothing this module resolves.
+public bool resolve_opaque<S : ISurfaces, H : IHit>(PathRoot r, H h, HitContext context, out PackedSurface ps)
+{
+    ps = PackedSurface();
+    float3 positions[3] = { h.corner(0), h.corner(1), h.corner(2) };
+    uint instance = h.instance_index();
+    uint cluster = uint(h.cluster_id());
+    SurfaceHit sh = resolve_hit<S>(r.scene, r.view, h.world_direction(), instance, cluster, h.primitive_index(), h.barycentrics(), positions, false, context);
+    if (!sh.valid)
+        return false;
+    GSurface g = sh.surface;
+    uint flags = (sh.swapped ? SURFACE_SWAPPED : 0) | (may(MAY_CAUSTICS) && surface_chains(r, sh.surface) ? SURFACE_CHAINS : 0);
+    ps = pack_hit_surface(g, instance, cluster, h.primitive_index(), h.barycentrics(), sh.geometric_error, sh.depth_offset, flags);
+    return true;
+}
+
+// The G-buffer's surface at `pixel` packed, the first vertex of its path; false for a sky pixel.
+public bool gbuffer_surface(PathRoot r, uint2 pixel, out PackedSurface ps)
+{
+    ps = PackedSurface();
+    GBufferWords w;
+    GSurface at;
+    if (!load_gwords(r.view, r.gbuffer, pixel, w, at))
+        return false;
+    GSurface g = decode_gsurface(w);
+    g.instance = at.instance;
+    g.cluster = at.cluster;
+    g.material = at.material;
+    ps.position = at.position;
+    ps.origin_error = max(g.raster_error, traced_error(r.scene, at.instance));
+    ps.a = w.a;
+    ps.b = w.b;
+    ps.x = w.x;
+    ps.y = w.y;
+    ps.instance = at.instance;
+    ps.cluster = at.cluster;
+    ps.primitive = at.primitive;
+    ps.material = at.material;
+    ps.flags = may(MAY_CAUSTICS) && surface_chains(r, g) ? SURFACE_CHAINS : 0;
+    return true;
 }
 
 // The error of the cut ray tracing holds for slot copy `copy`, in render space; 0 when the
@@ -438,7 +533,7 @@ public struct Alpha<S : ISurfaces> : IAnyHit
 
     public bool accept(Candidate c)
     {
-        return c.cluster_id >= 0 && resolve_alpha<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context);
+        return c.cluster_id >= 0 && cover_decision<S>(scene, view, COVER_ALPHA, PRESENCE_NONE, 0, context, dir, c.class_id, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics);
     }
 }
 
@@ -689,13 +784,22 @@ public float3 nee_bent<F : IScatter>(NeeDraw d, F f, float3 vis, StackLight stac
     scatter_pdf = d.scatter_pdf;
     if (!any(stack.bent != d.toward) || !any(vis > 0.0))
         return d.e;
+    return bent_value(f, d.l, stack, keep, chain, scatter_pdf);
+}
+
+// What a vertex weighed by `f` gives of a directional light of radiance `l` that reaches it
+// through plane stack `stack`, along its bent direction, before a resampling weight; at a
+// `chain` vertex its share outside the diffuse lobes keeps `keep`. `scatter_pdf` is the
+// vertex's density of the way the light takes.
+public float3 bent_value<F : IScatter>(F f, float3 l, StackLight stack, float3 keep, bool chain, out float scatter_pdf)
+{
     float3 db;
     float3 fb = f.eval_and_pdf(stack.bent, scatter_pdf, db);
     scatter_pdf *= stack.density;
     float3 fe = fb;
     if (chain)
         fe = db + max(fb - db, 0.0) * keep;
-    return fe * d.l * stack.jacobian;
+    return fe * l * stack.jacobian;
 }
 
 // Whether a vertex on `s` at path depth `depth` walks its subsurface share, on a path that
@@ -732,7 +836,7 @@ public struct WalkTrace<S : ISurfaces> : IWalkTrace
     public Hit trace(float3 origin, float3 dir, float t_max, out float3 positions[3])
     {
         Alpha<S> a = { scene, view, dir, context };
-        return trace_closest(scene.tlas, path_ray(origin, dir, t_max), MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+        return trace_closest(scene_traced(scene), path_ray(origin, dir, t_max), MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
     }
 
     public WalkMeet meet(Hit h, float3 origin, float3 dir, float3 positions[3], inout Sampler rng)
@@ -818,18 +922,15 @@ public void walk_part<T : IWalkTrace>(PathRoot r, inout Walk walk, T tracer, ino
     walk_steps(walk, tracer, r.sss_max_steps, r.subsurface_table, r.sss_max_steps, share, rays);
 }
 
-// The exit vertex of a walk whose last step along `dir` reached `sh`: its normals face out.
-public PathVertex exit_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
+// The exit vertex of a walk whose last step along `dir` reached opaque surface `ps`: its normals
+// face out.
+public PathVertex exit_vertex(ViewConstants* v, PackedSurface ps, float3 dir)
 {
-    PathVertex x;
-    x.surface = sh.surface;
-    float3 ng = dot(sh.surface.geometric_normal, dir) < 0.0 ? -sh.surface.geometric_normal : sh.surface.geometric_normal;
+    PathVertex x = vertex_on(v, unpack_surface(ps), ps.origin_error, ps.depth_offset, dir);
+    float3 ng = dot(x.surface.geometric_normal, dir) < 0.0 ? -x.surface.geometric_normal : x.surface.geometric_normal;
     x.surface.geometric_normal = ng;
-    x.surface.normal = dot(sh.surface.normal, ng) < 0.0 ? -sh.surface.normal : sh.surface.normal;
+    x.surface.normal = dot(x.surface.normal, ng) < 0.0 ? -x.surface.normal : x.surface.normal;
     x.view = x.surface.normal;
-    x.origin_error = sh.geometric_error;
-    x.plane_point = sh.surface.position - dir * sh.depth_offset;
-    x.camera_distance = length(sh.surface.position - v.eye_render.xyz);
     return x;
 }
 
@@ -1031,27 +1132,91 @@ public struct LayerVertex
     public bool stack;              // a layer on a plane stack face (`stack_face`)
 }
 
-// The vertex of a layer hit by a ray along `dir`: the shading normal leaned toward the ray's
-// origin on the side the ray arrived from, both normals kept on the material's front side so
-// the BSDF sees which side the path is on.
-public LayerVertex layer_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
+// The layer vertex of surface `g` of section material `section`, as `vertex_on` places it, reached
+// from its front side where `front` holds: the shading normal leaned toward the ray's origin on
+// that side, both normals kept on the material's front side so the BSDF sees which side the path
+// is on.
+LayerVertex layer_on(ViewConstants* v, GSurface g, float origin_error, float depth_offset, float3 dir, uint section, bool front)
 {
     LayerVertex l;
     l.kind = VERTEX_LAYER;
-    l.section = sh.section;
-    l.front = dot(sh.surface.geometric_normal, dir) < 0.0;
+    l.section = section;
+    l.front = front;
     l.anisotropy = 0.0;
     l.stack = false;
-    PathVertex x;
-    x.surface = sh.surface;
-    x.view = -dir;
-    float side = l.front ? 1.0 : -1.0;
-    x.surface.normal = side * lean_normal(side * sh.surface.normal, x.view);
-    x.origin_error = sh.geometric_error;
-    x.plane_point = sh.surface.position - dir * sh.depth_offset;
-    x.camera_distance = length(sh.surface.position - v.eye_render.xyz);
-    l.x = x;
+    l.x = vertex_on(v, g, origin_error, depth_offset, dir);
+    float side = front ? 1.0 : -1.0;
+    l.x.surface.normal = side * lean_normal(side * g.normal, l.x.view);
     return l;
+}
+
+// The vertex of a layer hit by a ray along `dir`, as `layer_on` makes it.
+public LayerVertex layer_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
+{
+    return layer_on(v, sh.surface, sh.geometric_error, sh.depth_offset, dir, sh.section, dot(sh.surface.geometric_normal, dir) < 0.0);
+}
+
+// What a layer's surface keeps beside the G-buffer's words, which hold no transmission and the
+// IOR at 8 bits: the IOR as resolved, since the interiors take the material's, the transmission's
+// color and weight as halves, the section and what its medium reads where the ray met it.
+public struct LayerWords
+{
+    public float specular_ior;
+    public uint transmission_rg;
+    public uint transmission_b_weight;
+    public uint section;
+    public float4 medium_point;
+}
+
+// A resolved layer as a path vertex holds it between the shaders of one vertex.
+public struct PackedLayer
+{
+    public PackedSurface surface;
+    public LayerWords layer;
+}
+
+// The layer at resolved hit `sh` of instance `instance`, cluster `cluster`, triangle `primitive`
+// at `bary`, met by a ray along `dir`, packed; on a plane stack face (`LayerVertex.stack`) where
+// `stack` holds.
+public PackedLayer pack_layer(PathRoot r, SurfaceHit sh, uint instance, uint cluster, uint primitive, float2 bary, float3 dir, bool stack)
+{
+    GSurface g = sh.surface;
+    bool front = dot(g.geometric_normal, dir) < 0.0;
+    uint flags = (sh.swapped ? SURFACE_SWAPPED : 0) | (may(MAY_CAUSTICS) && surface_chains(r, g) ? SURFACE_CHAINS : 0) | (front ? SURFACE_FRONT : 0)
+        | (stack ? SURFACE_STACK : 0);
+    PackedLayer pl;
+    pl.surface = pack_hit_surface(g, instance, cluster, primitive, bary, sh.geometric_error, sh.depth_offset, flags);
+    BsdfParams p = g.bsdf;
+    pl.layer.specular_ior = p.specular_ior;
+    pl.layer.transmission_rg = pack_half2x16(p.transmission_color.xy);
+    pl.layer.transmission_b_weight = pack_half2x16(float2(p.transmission_color.z, p.transmission_weight));
+    pl.layer.section = sh.section;
+    pl.layer.medium_point = g.medium_point;
+    return pl;
+}
+
+// The layer vertex of `pl`, reached along `dir`, as `layer_vertex` makes it of the surface `pl`
+// holds.
+public LayerVertex unpack_layer(ViewConstants* v, PackedLayer pl, float3 dir)
+{
+    PackedSurface ps = pl.surface;
+    GSurface g = unpack_surface(ps);
+    g.bsdf.specular_ior = pl.layer.specular_ior;
+    float2 rg = unpack_half2x16(pl.layer.transmission_rg);
+    float2 bw = unpack_half2x16(pl.layer.transmission_b_weight);
+    g.bsdf.transmission_color = float3(rg, bw.x);
+    g.bsdf.transmission_weight = bw.y;
+    g.medium_point = pl.layer.medium_point;
+    LayerVertex l = layer_on(v, g, ps.origin_error, ps.depth_offset, dir, pl.layer.section, (ps.flags & SURFACE_FRONT) != 0);
+    l.stack = (ps.flags & SURFACE_STACK) != 0;
+    l.chains = (ps.flags & SURFACE_CHAINS) != 0;
+    return l;
+}
+
+// The light layer `pl`, its BSDF `b` prepared, sends toward the path.
+public float3 layer_emission(Bsdf b, PackedLayer pl)
+{
+    return b.emission_layer() * unpack_rgbe(pl.surface.emission);
 }
 
 public LayerVertex opaque_vertex(PathVertex x)
@@ -1155,6 +1320,15 @@ public Bsdf prepare_vertex(SceneRoot* s, LayerVertex l, Interior interior, bool 
         exterior = dispersed_material_ior(s, outside, exterior, nm, interior.point(outside));
     }
     return bsdf_prepare(p, l.x.surface.normal, l.x.view, exterior, adjoint);
+}
+
+// Opaque vertex `l`'s BSDF in a medium of IOR `exterior`, prepared as `prepare_vertex` prepares
+// it up to its fitted coefficients: what its coat and fuzz pass of its emission
+// (`Bsdf.emission_layer`, `Bsdf.emission`), which they do not change.
+public Bsdf opaque_emission_layers(LayerVertex l, float exterior, bool collapse, bool walks, bool adjoint)
+{
+    BsdfLayers layers;
+    return bsdf_prepare_layers(walk_params(vertex_params(l, collapse), walks), l.x.surface.normal, l.x.view, exterior, adjoint, layers);
 }
 
 // A path's wavelengths once it meets a dispersive layer; before that its colors are plain
@@ -1295,7 +1469,7 @@ public struct InteriorWalk<S : ISurfaces> : IWalkTrace
     public Hit trace(float3 origin, float3 dir, float t_max, out float3 positions[3])
     {
         LayerAccept<S> a = { scene, view, dir, context, seed, PRESENCE_DRAWN };
-        return trace_closest(scene.tlas, path_ray(origin, dir, t_max), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+        return trace_closest(scene_traced(scene), path_ray(origin, dir, t_max), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
     }
 
     public WalkMeet meet(Hit h, float3 origin, float3 dir, float3 positions[3], inout Sampler rng)
@@ -1304,24 +1478,31 @@ public struct InteriorWalk<S : ISurfaces> : IWalkTrace
         uint m;
         if (h.cluster_id < 0 || !hit_geometry(scene, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, normal, m))
             return WalkMeet(WALK_BOUNDARY);
-        float c = dot(normal, dir);
-        if (m != material || !(c > 0.0))
-            return WalkMeet(WALK_BOUNDARY);
-        float3 p = origin + dir * h.t;
-        float3 way_out = refract(dir, -normal, ior);
-        if (rng.next() < openpbr_fresnel(1.0 / ior, c) || all(way_out == 0.0))
-        {
-            WalkMeet back = WalkMeet(WALK_REFLECT);
-            back.dir = reflect(dir, normal);
-            back.origin = ray_origin(p, p, normal, back.dir, ORIGIN_DEFAULT, 0.0, length(p - view.eye_render.xyz));
-            return back;
-        }
-        WalkMeet leave = WalkMeet(WALK_LEAVE);
-        leave.dir = normalize(way_out);
-        leave.origin = p;
-        leave.normal = normal;
-        return leave;
+        return interior_meet(view, material, ior, m, normal, origin, dir, h.t, rng);
     }
+}
+
+// What a step of the walk in interior `material`, its surface `ior` times the outside's, from
+// `origin` along `dir` does at a face of material `m` with geometric normal `normal` `t` along.
+public WalkMeet interior_meet(ViewConstants* view, uint material, float ior, uint m, float3 normal, float3 origin, float3 dir, float t, inout Sampler rng)
+{
+    float c = dot(normal, dir);
+    if (m != material || !(c > 0.0))
+        return WalkMeet(WALK_BOUNDARY);
+    float3 p = origin + dir * t;
+    float3 way_out = refract(dir, -normal, ior);
+    if (rng.next() < openpbr_fresnel(1.0 / ior, c) || all(way_out == 0.0))
+    {
+        WalkMeet back = WalkMeet(WALK_REFLECT);
+        back.dir = reflect(dir, normal);
+        back.origin = ray_origin(p, p, normal, back.dir, ORIGIN_DEFAULT, 0.0, length(p - view.eye_render.xyz));
+        return back;
+    }
+    WalkMeet leave = WalkMeet(WALK_LEAVE);
+    leave.dir = normalize(way_out);
+    leave.origin = p;
+    leave.normal = normal;
+    return leave;
 }
 
 // The walk of interior medium `im` from a scatter at `from` reached along `dir`, its surface
@@ -1559,10 +1740,17 @@ public struct CacheUpdate : IPathRecord
         float u = rng.next();
         if (count >= UPDATE_VERTICES)
             return;
-        float3 albedo = cache_albedo(b.albedo(), x.surface.bsdf) * throughput;
-        if (!any(albedo > 1e-6))
+        vertex_at(r, cache_albedo(b.albedo(), x.surface.bsdf) * throughput, x.surface.position, x.surface.geometric_normal, radiance, u);
+    }
+
+    // `vertex` of a vertex at `position` with geometric normal `normal` whose albedo, as the cache
+    // holds light by it, times the path's throughput is `albedo`, from its draw `u`.
+    [mutating]
+    public void vertex_at(PathRoot r, float3 albedo, float3 position, float3 normal, float3 radiance, float u)
+    {
+        if (count >= UPDATE_VERTICES || !any(albedo > 1e-6))
             return;
-        CacheCell cell = cache_cell(r.cache, r.scene, x.surface.position, x.surface.geometric_normal, float3(0.5, 0.5, u), false);
+        CacheCell cell = cache_cell(r.cache, r.scene, position, normal, float3(0.5, 0.5, u), false);
         keys[count] = cell.key;
         scale[count] = select(albedo > 1e-6, 1.0 / albedo, float3(0.0));
         before[count] = radiance;
@@ -1581,6 +1769,13 @@ public struct CacheUpdate : IPathRecord
         for (uint i = 0; i < count; i++)
             cache_add(r.cache, keys[i], (radiance - before[i]) * scale[i]);
     }
+}
+
+// The albedo a photon's deposit at a surface prepared as `b` takes: its diffuse and subsurface
+// lobes'.
+public float3 photon_albedo(Bsdf b)
+{
+    return b.diffuse_reflection() + b.diffuse_transmission() + b.albedo().subsurface;
 }
 
 // A caustic photon from caster entry `entry`: it deposits its flux in the caustics of the path
@@ -1637,16 +1832,24 @@ public struct CausticPhoton : IPathRecord
     public void deposit(PathRoot r, LayerVertex l, Bsdf b, float3 flux, inout Sampler rng)
     {
         float4 u = rng.next4();
-        float3 albedo = b.diffuse_reflection() + b.diffuse_transmission() + b.albedo().subsurface;
-        if (!any(albedo > 0.0) || !any(flux > 0.0) || !all(isfinite(flux)))
-            return;
         GSurface g = l.x.surface;
         float3 n = dot(g.geometric_normal, l.x.view) < 0.0 ? -g.geometric_normal : g.geometric_normal;
+        deposit_at(r, any(photon_albedo(b) > 0.0), g.position, n, l.x.view, flux, u);
+    }
+
+    // `deposit` at `position` with geometric normal `n` facing the side the photon arrives from
+    // along `-view`, at a surface with diffuse or subsurface albedo where `albedo`, from its draws
+    // `u`.
+    [mutating]
+    public void deposit_at(PathRoot r, bool albedo, float3 position, float3 n, float3 view, float3 flux, float4 u)
+    {
+        if (!albedo || !any(flux > 0.0) || !all(isfinite(flux)))
+            return;
         CausticsGpu* c = r.caustics;
         if (c.mode == CAUSTICS_MAP)
-            map_deposit(c, g.position, n, flux, l.x.view);
+            map_deposit(c, position, n, flux, view);
         else
-            grid_deposit(c, r.scene, g.position, n, flux, u);
+            grid_deposit(c, r.scene, position, n, flux, u);
         deposited = true;
     }
 
@@ -1959,7 +2162,34 @@ public struct PhotonStart
 // both densities and the frame's photon count. False for a photon that starts with no flux.
 public bool photon_start<S : ISurfaces, M : IMedium>(PathRoot r, uint index, inout Sampler rng, out PhotonStart p)
 {
+    PhotonRay ray;
+    if (!photon_emit<S>(r, index, rng, p, ray))
+        return false;
+    p.flux *= visibility<S, M, SHADOW_PHOTON>(r.scene, r.view, ray.origin, ray.dir, ray.t_max, RAY_FLAG_NONE, photon_ray_context(), false, p.interior, r.set.shadow_overflows);
+    return any(p.flux > 0.0);
+}
+
+// The shadow ray from a photon's start toward its light, in mode SHADOW_PHOTON.
+public struct PhotonRay
+{
+    public float3 origin;
+    public float3 dir;
+    public float t_max;
+}
+
+// The context of a photon's start and its shadow ray.
+public HitContext photon_ray_context()
+{
+    RayCone cone = { 0.0, 0.0 };
+    return hit_context(HIT_SECONDARY, 0, cone, 0.0);
+}
+
+// `photon_start` but for its shadow ray, which `ray` holds: `p.flux` is the photon's before what
+// the ray lets through. False for a photon that starts with no flux.
+public bool photon_emit<S : ISurfaces>(PathRoot r, uint index, inout Sampler rng, out PhotonStart p, out PhotonRay ray)
+{
     p = PhotonStart();
+    ray = PhotonRay();
     SceneRoot* s = r.scene;
     CausticsGpu* g = r.caustics;
     PhotonSourceGpu* source = g.source;
@@ -2014,18 +2244,13 @@ public bool photon_start<S : ISurfaces, M : IMedium>(PathRoot r, uint index, ino
     h.primitive_index = triangle;
     h.barycentrics = bary;
     h.front_face = dot(n, p.dir) < 0.0;
+    // The class a ray that met the triangle would find.
     uint entry_producer;
-    if (hit_producer(s, instance_index, entry_producer))
-        h.class_id = material_class(s.materials + t.material);
-    else
-    {
-        ClusterRef cr = s.clusters[cluster_id];
-        h.class_id = cluster_class(load_cluster(cr.page, cr.local));
-    }
+    h.custom_index = hit_producer(s, instance_index, entry_producer) ? s.producers[entry_producer].class_id : 0;
+    h.class_id = class_of(scene_traced(s), h.custom_index, instance_index, h.cluster_id);
     p.hit = h;
     p.positions = t.corners.position;
-    RayCone cone = { 0.0, 0.0 };
-    HitContext context = hit_context(HIT_SECONDARY, 0, cone, 0.0);
+    HitContext context = photon_ray_context();
     if (!resolve_alpha<S>(s, r.view, p.dir, instance_index, cluster_id, triangle, bary, context))
         return false;
     if ((s.materials[t.material].flags & MATERIAL_PRESENCE) != 0)
@@ -2042,8 +2267,10 @@ public bool photon_start<S : ISurfaces, M : IMedium>(PathRoot r, uint index, ino
         float magnitude = max(abs(c.point.x), max(abs(c.point.y), abs(c.point.z)));
         t_max = max(0.0, length_to - max(1e-4 * length_to, magnitude * F32_PRECISION));
     }
-    flux *= visibility<S, M, SHADOW_PHOTON>(s, r.view, origin, toward, t_max, RAY_FLAG_NONE, context, false, p.interior, set.shadow_overflows);
-    if (c.view && any(flux > 0.0))
+    ray.origin = origin;
+    ray.dir = toward;
+    ray.t_max = t_max;
+    if (c.view)
         flux *= emitter_view_layer<S>(set, c, interior_ior(s, p.interior.innermost()));
     p.flux = flux;
     return any(flux > 0.0);

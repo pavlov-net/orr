@@ -177,6 +177,9 @@ fn instance_and_material_tables_read_back_as_written() {
                 variant,
                 first_emissive: u32::MAX,
                 emissive_count: 0,
+                // Copies of one material set show one row of runs.
+                run: got[0].run,
+                _pad1: 0,
             }
         } else {
             InstanceGpu {
@@ -198,6 +201,8 @@ fn instance_and_material_tables_read_back_as_written() {
                 variant,
                 first_emissive: u32::MAX,
                 emissive_count: 0,
+                run: 0,
+                _pad1: 0,
             }
         };
         assert_eq!(

@@ -33,6 +33,12 @@ public uint cluster_class(Cluster c)
     return (c.flags >> CLUSTER_CLASS_SHIFT) & 3;
 }
 
+// The class of cluster `cluster` of a page, read alone.
+public uint cluster_class_at(uint8_t* page, uint cluster)
+{
+    return (cluster_at(page, cluster).flags >> CLUSTER_CLASS_SHIFT) & 3;
+}
+
 // 96 B. Cluster records follow it.
 public struct PageHeader
 {

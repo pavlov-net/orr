@@ -1,6 +1,6 @@
 //! The global material table and its writer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -306,6 +306,25 @@ pub(crate) struct MaterialTable {
     features: Mutex<MaterialFeatures>,
     /// Materials whose displacement is a world length.
     world_lengths: Mutex<HashSet<u32>>,
+    /// What each record gives the hit records of the runs that show it (`hit_key`).
+    hit_keys: Mutex<HashMap<u32, [u32; 4]>>,
+    /// Counts the records whose `hit_key` changed: a hit table written before then is rewritten
+    /// whole.
+    hit_epoch: AtomicU64,
+}
+
+/// What `orr_scene.runs`' `hit_data` and `sbt.slang`'s pin read of a record: the flags they test,
+/// its back, its linked surface id and whether it has a lobe that `HIT_LOBED` names.
+fn hit_key(m: &MaterialGpu) -> [u32; 4] {
+    use material_flags as f;
+    let flags =
+        f::ALPHA_TESTED | f::THIN_WALLED | f::DIELECTRIC | f::PRESENCE | f::EMISSIVE | f::HAS_BACK;
+    let lobed = m.surface != 0
+        || m.coat_weight > 0.0
+        || m.fuzz_weight > 0.0
+        || m.thin_film_weight > 0.0
+        || m.subsurface_weight > 0.0;
+    [m.flags & flags, m.back, m.surface, u32::from(lobed)]
 }
 
 /// Whether record `m` takes [`material_flags::STACK_FACE`].
@@ -349,6 +368,8 @@ impl MaterialTable {
             extended: Mutex::new(HashSet::new()),
             features: Mutex::new(MaterialFeatures::default()),
             world_lengths: Mutex::new(HashSet::new()),
+            hit_keys: Mutex::new(HashMap::new()),
+            hit_epoch: AtomicU64::new(0),
         })
     }
 
@@ -383,6 +404,15 @@ impl MaterialTable {
             &self.world_lengths,
             m.flags & material_flags::DISPLACEMENT_WORLD != 0,
         );
+        let key = hit_key(m);
+        if self.hit_keys.lock().unwrap().insert(id.0, key) != Some(key) {
+            self.hit_epoch.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Counts the records whose hit records changed (`hit_key`).
+    pub(crate) fn hit_epoch(&self) -> u64 {
+        self.hit_epoch.load(Ordering::Relaxed)
     }
 
     /// Whether any material may write the extended G-buffer targets.
@@ -398,6 +428,11 @@ impl MaterialTable {
     /// Whether any material casts caustics.
     pub(crate) fn casts(&self) -> bool {
         self.features.lock().unwrap().casts()
+    }
+
+    /// Whether material `id`'s record bounds an interior (`MaterialFeatures::bounds_interior`).
+    pub(crate) fn bounds_interior(&self, id: MaterialId) -> bool {
+        self.features.lock().unwrap().bounds_interior(id.0)
     }
 
     /// Whether any record has the stack face flag.
@@ -426,6 +461,7 @@ impl MaterialTable {
         self.extended.lock().unwrap().remove(&id.0);
         self.features.lock().unwrap().free(id.0);
         self.world_lengths.lock().unwrap().remove(&id.0);
+        self.hit_keys.lock().unwrap().remove(&id.0);
         self.table.free(id.0, 1);
     }
 }

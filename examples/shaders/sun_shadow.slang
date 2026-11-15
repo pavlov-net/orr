@@ -60,7 +60,7 @@ bool sun_visible(SceneRoot* s, ViewConstants* v, GSurface g, float3 l)
     a.v = v;
     a.d = l;
     a.context = hit_context(HIT_SECONDARY, 1, cone_after_hit(camera_cone(v), distance, 0.0), 0.0);
-    return !trace_any(s.tlas, ray, MASK_OPAQUE, RAY_FLAG_NONE, a);
+    return !trace_any(scene_traced(s), ray, MASK_OPAQUE, RAY_FLAG_NONE, a);
 }
 
 // A stable color per cluster of each instance.

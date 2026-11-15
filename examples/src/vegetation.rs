@@ -21,11 +21,12 @@
 //! `--no-part-animation`, `--rt-range M`, `--animation-range M`, `--directional-lights L,T`,
 //! `--sw-raster-px P`, `--lod0-only`, `--world-km K`, `--world-density N` (trees per km^2
 //! outside the tile), `--particles N`, `--stream-load`, `--no-chain`, `--extent WxH`,
-//! `--script NAME` (walk, turn, overview, flythrough, flyout), `--script-frames N`,
+//! `--script NAME` (walk, turn, overview, flythrough, flyout, shore), `--script-frames N`,
 //! `--exact-frame N` and `--exact-frames K` (the first of the first script's frames whose
 //! passes are timed exactly, with `Renderer::set_exact_timing`, and how many, 3 unless given;
 //! they are not samples), `--stage-passes` (`ViewLighting::stage_passes`: each stage of the path
-//! loop and each froxel kernel in a pass of its own), `--froxel-shadowed-lights N`
+//! loop and each froxel kernel in a pass of its own), `--pipeline-paths` (`PathEntry::Pipeline`:
+//! paths through the ray tracing pipeline path tracer), `--froxel-shadowed-lights N`
 //! (`MediaSettings::froxel_shadowed_lights`), `--counter-frame N` (with the `nsight-perf`
 //! feature: the frame of the first script whose per-pass Nsight Perf SDK counters the run
 //! collects, when the device has `Caps::perf_counters`) and `--counter-metrics A,B,...` (the
@@ -49,10 +50,11 @@ use orr::{
     AffineRows, BoundTexture, ClusterTopology, CopyVariant, DirectionalLight, DiscProfile, Display,
     DisplayRequest, FrameDesc, FrameStats, FrameTime, GroupWriter, InstanceFlags, InstancesDesc,
     Lens, Light, LightId, LightingStats, LitView, LoadState, MaterialGpu, MediaSettings, ModelId,
-    MountId, Opacity, OpaquePass, PackSource, PipelineId, Pose, ProducerDesc, ProducerId,
-    ProducerUpdate, Projection, Renderer, RendererDesc, SceneCompute, SceneDesc, SceneId,
-    SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, TransformGroupId,
-    TransparencyPass, ViewHistoryId, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    MountId, Opacity, OpaquePass, PackSource, PathEntry, PipelineId, Pose, ProducerDesc,
+    ProducerId, ProducerUpdate, Projection, Renderer, RendererDesc, SceneCompute, SceneDesc,
+    SceneId, SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc,
+    TransformGroupId, TransparencyPass, ViewHistoryId, ViewHooks, ViewLighting, ViewOutput,
+    ViewTarget,
 };
 use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::{Atmosphere, AtmosphereState, MAX_SKY_LIGHTS};
@@ -128,6 +130,9 @@ pub enum Script {
     Flythrough,
     /// From the forest's edge out to 8 km in a minute, climbing, looking back at it.
     Flyout,
+    /// Standing on the pond's north-west shore at eye height, looking south-east across the
+    /// water at the trees beyond, panning slowly. Not among [`Script::ALL`].
+    Shore,
 }
 
 impl Script {
@@ -146,12 +151,14 @@ impl Script {
             Script::Overview => "overview",
             Script::Flythrough => "flythrough",
             Script::Flyout => "flyout",
+            Script::Shore => "shore",
         }
     }
 
     fn parse(s: &str) -> Self {
         Self::ALL
             .into_iter()
+            .chain([Script::Shore])
             .find(|c| c.name() == s)
             .unwrap_or_else(|| panic!("unknown script {s}"))
     }
@@ -190,6 +197,15 @@ impl Script {
                 let s = -420.0 + 2.0 * WALK_SPEED * t * std::f32::consts::FRAC_1_SQRT_2;
                 let eye = Vec3::new(s, ground(s, s) + 25.0, s);
                 (eye, eye + Vec3::new(30.0, -8.0, 30.0))
+            }
+            Script::Shore => {
+                let (x, z) = (100.0, -85.0);
+                let eye = Vec3::new(x, ground(x, z) + EYE_HEIGHT, z);
+                let yaw = -0.96 + 0.15 * (0.3 * t).sin();
+                (
+                    eye,
+                    eye + Vec3::new(yaw.cos() * 12.0, -1.2, yaw.sin() * 12.0),
+                )
             }
         }
     }
@@ -258,6 +274,8 @@ pub struct Settings {
     pub exact_frames: u64,
     /// `ViewLighting::stage_passes`.
     pub stage_passes: bool,
+    /// Paths run through the ray tracing pipeline (`PathEntry::Pipeline`).
+    pub pipeline_paths: bool,
     /// `MediaSettings::froxel_shadowed_lights`.
     pub froxel_shadowed_lights: u32,
     /// The frame of the first script that is replayed as a counter frame.
@@ -301,6 +319,7 @@ impl Settings {
             exact_frame: None,
             exact_frames: 3,
             stage_passes: false,
+            pipeline_paths: false,
             froxel_shadowed_lights: MediaSettings::default().froxel_shadowed_lights,
             #[cfg(feature = "nsight-perf")]
             counter_frame: None,
@@ -376,6 +395,7 @@ impl Settings {
                 "--exact-frame" => s.exact_frame = Some(number(value()) as u64),
                 "--exact-frames" => s.exact_frames = number(value()) as u64,
                 "--stage-passes" => s.stage_passes = true,
+                "--pipeline-paths" => s.pipeline_paths = true,
                 "--froxel-shadowed-lights" => {
                     s.froxel_shadowed_lights = number(value()) as u32;
                 }
@@ -977,6 +997,11 @@ fn renderer_desc(settings: &Settings) -> RendererDesc {
             0.0
         } else {
             RendererDesc::default().raster_error_pixels
+        },
+        path_entry: if settings.pipeline_paths {
+            PathEntry::Pipeline
+        } else {
+            PathEntry::default()
         },
         ..RendererDesc::default()
     }

@@ -94,41 +94,87 @@ pub struct RayDispatchPipeline(pub(super) Box<RayPipeline>);
 struct Joined {
     shared: Arc<Shared>,
     op: vk::DeferredOperationKHR,
-    done: Mutex<bool>,
-    completed: Condvar,
+    state: Mutex<JoinState>,
+    /// Signaled when the operation completes or a thread leaves it.
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct JoinState {
+    /// A join returned success: the operation is complete.
+    done: bool,
+    /// Threads inside a join, which may yet complete it.
+    joined: u32,
+    /// The first error a join returned.
+    error: Option<vk::Result>,
+}
+
+/// How a thread's join of a deferred operation ended.
+enum Join {
+    /// The operation completed in it.
+    Complete,
+    /// The driver had no more work for the thread.
+    NoWork,
+    Failed(vk::Result),
 }
 
 impl Joined {
-    /// Joins the operation until it has no more work for this thread. Returns whether it
-    /// completed here.
-    fn join(&self) -> bool {
+    /// Joins the operation until it has no more work for this thread. While the driver has no
+    /// work for the thread yet, it waits for the operation to complete elsewhere and joins again.
+    fn join(&self) -> Join {
         let f = &self.shared.deferred_fn;
-        loop {
+        self.state.lock().unwrap().joined += 1;
+        let out = loop {
             // SAFETY: the operation is live while `self` is.
             match unsafe { f.deferred_operation_join(self.op) } {
-                Ok(()) => {
-                    *self.done.lock().unwrap() = true;
-                    self.completed.notify_all();
-                    return true;
+                Ok(()) => break Join::Complete,
+                Err(vk::Result::THREAD_IDLE_KHR) => {
+                    let state = self.state.lock().unwrap();
+                    let (state, _) = self
+                        .changed
+                        .wait_timeout_while(state, Duration::from_millis(1), |s| !s.done)
+                        .unwrap();
+                    if state.done {
+                        break Join::NoWork;
+                    }
                 }
-                Err(vk::Result::THREAD_IDLE_KHR) => std::thread::yield_now(),
-                Err(_) => return false,
+                Err(vk::Result::THREAD_DONE_KHR) => break Join::NoWork,
+                Err(e) => break Join::Failed(e),
             }
+        };
+        let mut state = self.state.lock().unwrap();
+        state.joined -= 1;
+        match out {
+            Join::Complete => state.done = true,
+            Join::Failed(e) => {
+                state.error.get_or_insert(e);
+            }
+            Join::NoWork => {}
         }
+        drop(state);
+        self.changed.notify_all();
+        out
     }
 
     /// The operation's result once it is complete. Joins until then: a thread that runs out of
-    /// work waits for the others, and joins again in case none is left.
+    /// work waits while others are joined, and joins again once none is, unless a join failed,
+    /// whose error it returns.
     fn finish(&self) -> vk::Result {
         let f = &self.shared.deferred_fn;
-        while !self.join() {
-            let done = self.done.lock().unwrap();
-            let (done, _) = self
-                .completed
-                .wait_timeout_while(done, Duration::from_millis(1), |d| !*d)
-                .unwrap();
-            if *done {
+        loop {
+            if matches!(self.join(), Join::Complete) {
                 break;
+            }
+            let state = self.state.lock().unwrap();
+            let state = self
+                .changed
+                .wait_while(state, |s| !s.done && s.joined > 0)
+                .unwrap();
+            if state.done {
+                break;
+            }
+            if let Some(e) = state.error {
+                return e;
             }
         }
         // SAFETY: the operation is live and complete.
@@ -173,8 +219,8 @@ fn create_deferred(
     let joined = Arc::new(Joined {
         shared: Arc::clone(shared),
         op,
-        done: Mutex::new(false),
-        completed: Condvar::new(),
+        state: Mutex::new(JoinState::default()),
+        changed: Condvar::new(),
     });
     match create(op) {
         vk::Result::OPERATION_DEFERRED_KHR => {}
@@ -262,10 +308,10 @@ fn vk_stage(stage: Stage) -> vk::ShaderStageFlags {
     }
 }
 
-/// One region of the pipeline's own table: its records' groups and data, and its stride.
+/// One region of the pipeline's own table: each record's group and data, `None` for zeros, and
+/// its stride.
 struct Region<'a> {
-    first_group: usize,
-    records: &'a [ShaderRecord<'a>],
+    records: Vec<Option<(usize, &'a [u8])>>,
     stride: u64,
 }
 
@@ -408,39 +454,49 @@ impl Device {
                     .intersection_shader(isect),
             );
         }
+        let mut callables = Vec::with_capacity(desc.callables.len());
         for r in desc.callables {
-            record(r, Stage::Callable)?;
-            groups.push(general(r.stage));
+            callables.push(match r {
+                Some(r) => {
+                    record(r, Stage::Callable)?;
+                    groups.push(general(r.stage));
+                    Some((groups.len() - 1, r.data))
+                }
+                None => None,
+            });
         }
         let handle_bytes = limits.ray_handle_bytes as usize;
         let handle_align = u64::from(limits.ray_handle_align);
         let base = u64::from(limits.ray_table_align);
-        let data = |records: &[ShaderRecord<'_>]| {
-            records
+        fn region(records: Vec<Option<(usize, &[u8])>>, align: u64, handle: u64) -> Region<'_> {
+            let data = records
                 .iter()
-                .map(|r| r.data.len() as u64)
+                .flatten()
+                .map(|r| r.1.len() as u64)
                 .max()
-                .unwrap_or(0)
-        };
-        let stride = |records: &[ShaderRecord<'_>], align: u64| {
-            (handle_bytes as u64 + data(records)).next_multiple_of(align)
-        };
+                .unwrap_or(0);
+            Region {
+                records,
+                stride: (handle + data).next_multiple_of(align),
+            }
+        }
+        let handle = handle_bytes as u64;
+        let raygens = desc.raygens.iter().enumerate();
+        let misses = desc.misses.iter().enumerate();
         let regions = [
-            Region {
-                first_group: 0,
-                records: desc.raygens,
-                stride: stride(desc.raygens, base),
-            },
-            Region {
-                first_group: desc.raygens.len(),
-                records: desc.misses,
-                stride: stride(desc.misses, handle_align),
-            },
-            Region {
-                first_group: groups.len() - desc.callables.len(),
-                records: desc.callables,
-                stride: stride(desc.callables, handle_align),
-            },
+            region(
+                raygens.map(|(i, r)| Some((i, r.data))).collect(),
+                base,
+                handle,
+            ),
+            region(
+                misses
+                    .map(|(i, r)| Some((desc.raygens.len() + i, r.data)))
+                    .collect(),
+                handle_align,
+                handle,
+            ),
+            region(callables, handle_align, handle),
         ];
         let hit_stride = (handle_bytes as u64
             + u64::from(hit_records.iter().copied().max().unwrap_or(0)))
@@ -530,6 +586,49 @@ impl Device {
             started.elapsed().as_secs_f64() * 1e3,
             desc.threads
         );
+        // A shader's stack is what it keeps in memory across its calls and traces, which the driver
+        // reports per group and no pipeline statistic does.
+        if log::log_enabled!(log::Level::Debug) {
+            let mut logged = std::collections::BTreeSet::new();
+            for (i, g) in groups.iter().enumerate() {
+                for (which, stage, kind) in [
+                    (
+                        vk::ShaderGroupShaderKHR::GENERAL,
+                        g.general_shader,
+                        "general",
+                    ),
+                    (
+                        vk::ShaderGroupShaderKHR::CLOSEST_HIT,
+                        g.closest_hit_shader,
+                        "closest-hit",
+                    ),
+                    (
+                        vk::ShaderGroupShaderKHR::ANY_HIT,
+                        g.any_hit_shader,
+                        "any-hit",
+                    ),
+                    (
+                        vk::ShaderGroupShaderKHR::INTERSECTION,
+                        g.intersection_shader,
+                        "intersection",
+                    ),
+                ] {
+                    if stage == vk::SHADER_UNUSED_KHR || !logged.insert(stage) {
+                        continue;
+                    }
+                    // SAFETY: the group and its shader exist in the pipeline just made.
+                    let bytes =
+                        unsafe { rt.get_ray_tracing_shader_group_stack_size(raw, i as u32, which) };
+                    let entry = desc.stages[stage as usize]
+                        .entry
+                        .spirv_name
+                        .to_string_lossy();
+                    log::debug!(
+                        "ray pipeline {name}: {kind} shader {entry} keeps a stack of {bytes} bytes"
+                    );
+                }
+            }
+        }
         // SAFETY: nothing uses the pipeline until it is returned.
         let raw = DropGuard::new(raw, |p| unsafe { shared.device.destroy_pipeline(p, None) });
         // SAFETY: the pipeline has `groups.len()` groups.
@@ -563,7 +662,10 @@ impl Device {
         })?;
         for (r, start) in regions.iter().zip(starts) {
             for (i, rec) in r.records.iter().enumerate() {
-                let group = r.first_group + i;
+                // Upload memory is zeroed, which a record of zeros leaves as it is.
+                let Some((group, data)) = *rec else {
+                    continue;
+                };
                 let at = (start + r.stride * i as u64) as usize;
                 let handle = &handles[group * handle_bytes..][..handle_bytes];
                 // SAFETY: the record lies inside the mapped buffer, which nothing else
@@ -571,11 +673,7 @@ impl Device {
                 unsafe {
                     let dst = ptr.as_ptr().add(at);
                     std::ptr::copy_nonoverlapping(handle.as_ptr(), dst, handle_bytes);
-                    std::ptr::copy_nonoverlapping(
-                        rec.data.as_ptr(),
-                        dst.add(handle_bytes),
-                        rec.data.len(),
-                    );
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), dst.add(handle_bytes), data.len());
                 }
             }
         }

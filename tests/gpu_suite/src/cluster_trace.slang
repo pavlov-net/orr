@@ -63,7 +63,7 @@ void body(uint2 id)
         flags |= RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE;
     Candidates handler = { o };
     float3 p[3];
-    Hit h = trace_closest(root.scene, ray, 0xff, flags, handler, p);
+    Hit h = trace_closest(opaque_clusters(root.scene), ray, 0xff, flags, handler, p);
     o[0] = h.hit ? 1 : 0;
     o[1] = h.hit ? h.custom_index : NONE;
     o[2] = h.hit ? h.instance_index : NONE;

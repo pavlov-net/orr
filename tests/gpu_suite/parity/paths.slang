@@ -148,7 +148,7 @@ void body<C : ICoherence>(uint2 px)
         h.hit = false;
         float3 corners[3] = { float3(0), float3(0), float3(0) };
         if (alive)
-            h = trace_closest(root.scene, ray(o, d), 0xff, RAY_FLAG_NONE, LeafAlpha(), corners);
+            h = trace_closest(opaque_clusters(root.scene), ray(o, d), 0xff, RAY_FLAG_NONE, LeafAlpha(), corners);
         uint m = h.hit ? material(h) : 0;
         C.point(h.hit ? 1 | (m << 1) : 0, 3);
         if (alive)
@@ -170,7 +170,7 @@ void body<C : ICoherence>(uint2 px)
                 float3 a = albedo(m, p);
                 float3 po = offset_ray_origin(p, n);
                 float ndl = dot(n, root.sun.xyz);
-                if (ndl > 0.0 && !trace_any(root.scene, ray(po, root.sun.xyz), 0xff, RAY_FLAG_NONE, LeafAlpha()))
+                if (ndl > 0.0 && !trace_any(opaque_clusters(root.scene), ray(po, root.sun.xyz), 0xff, RAY_FLAG_NONE, LeafAlpha()))
                     rad += thr * a * (root.sun.w * ndl);
                 thr *= a;
                 o = po;

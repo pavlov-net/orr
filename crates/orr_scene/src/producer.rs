@@ -14,7 +14,7 @@
 
 use std::assert_matches;
 
-use orr_gpu::rtas::consts::GEOMETRY_OPAQUE;
+use orr_gpu::rtas::consts::{GEOMETRY_NO_DUPLICATE_ANY_HIT, GEOMETRY_OPAQUE};
 use orr_gpu::{
     Allocation, BlasLimits, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicKind,
     ClusterLimits, ClusterVertexFormat, CommandList, Device, DispatchArgs, GpuAddress, GpuPtr,
@@ -388,6 +388,9 @@ pub(crate) struct Producer {
     pub(crate) model: Option<ModelId>,
     /// Its entry of its scene's emissive list, which the scene gives it.
     pub(crate) emissive: u32,
+    /// Its row of hit table runs, a run per material, from the scene's producer runs: first
+    /// and count.
+    pub(crate) runs: (u32, u32),
     /// The consumer's name for it.
     pub(crate) id: Option<ProducerId>,
     accel: Option<Accel>,
@@ -417,7 +420,15 @@ pub(crate) struct Built {
     pub(crate) static_at: GpuPtr<u32>,
 }
 
-fn cluster_desc(op: RtasOp, args: u32, tris: u32, verts: u32) -> RtasOpDesc {
+/// An entry's cluster build: `max_geometry_index` bounds its clusters' materials, which are
+/// their geometry indices.
+fn cluster_desc(
+    op: RtasOp,
+    args: u32,
+    tris: u32,
+    verts: u32,
+    max_geometry_index: u32,
+) -> RtasOpDesc {
     RtasOpDesc {
         op,
         mode: RtasMode::Implicit,
@@ -429,7 +440,7 @@ fn cluster_desc(op: RtasOp, args: u32, tris: u32, verts: u32) -> RtasOpDesc {
             max_verts_per_cluster: verts.max(3),
             max_total_tris: args.max(1) * tris.max(1),
             max_total_verts: args.max(1) * verts.max(3),
-            max_geometry_index: crate::accel::MAX_GEOMETRY_INDEX,
+            max_geometry_index,
             max_geometries_per_cluster: 1,
             min_truncate_bits: 0,
         }),
@@ -752,7 +763,7 @@ pub(crate) fn build(
         swept_blas: swept.as_ref().map_or_default(|s| s.blas.address().0),
         topology_count: built_topologies as u32,
         direct_capacity: direct_clusters,
-        geometry_flags: if opaque { GEOMETRY_OPAQUE } else { 0 },
+        geometry_flags: GEOMETRY_NO_DUPLICATE_ANY_HIT | if opaque { GEOMETRY_OPAQUE } else { 0 },
         strands: if swept.is_some() {
             STRANDS_SWEPT
         } else if tubes {
@@ -843,8 +854,10 @@ pub(crate) fn build(
                 name,
             )
         };
+        // Templates hold geometry index 0; instantiations add the cluster's material.
+        let max_material = (desc.materials.len() as u32).max(1) - 1;
         let topology_op =
-            |op_kind, args| cluster_desc(op_kind, args, topology_tris, topology_verts);
+            |op_kind, args, max| cluster_desc(op_kind, args, topology_tris, topology_verts, max);
         Some(Accel {
             record: at(build_at).cast(),
             grid: count(BUILD_GRID).cast(),
@@ -852,7 +865,7 @@ pub(crate) fn build(
             templates: own_templates
                 .then(|| {
                     op(
-                        topology_op(RtasOp::BuildTemplates, n_topo as u32),
+                        topology_op(RtasOp::BuildTemplates, n_topo as u32, 0),
                         template_records_at,
                         BUILD_TEMPLATES,
                         templates_at,
@@ -863,7 +876,7 @@ pub(crate) fn build(
             instantiate: instantiated
                 .then(|| {
                     op(
-                        topology_op(RtasOp::InstantiateTemplates, built_clusters),
+                        topology_op(RtasOp::InstantiateTemplates, built_clusters, max_material),
                         instantiate_records_at,
                         BUILD_INSTANTIATED,
                         instantiated_at,
@@ -874,7 +887,7 @@ pub(crate) fn build(
             direct: direct
                 .then(|| {
                     op(
-                        cluster_desc(RtasOp::BuildClas, direct_clusters, 128, 256),
+                        cluster_desc(RtasOp::BuildClas, direct_clusters, 128, 256, max_material),
                         direct_records_at,
                         BUILD_DIRECT,
                         direct_at,
@@ -962,7 +975,7 @@ pub(crate) fn build(
             strands: u32::from(strands),
             drawn: u32::from(desc.drawn),
             emissive: 0,
-            _pad: 0,
+            runs: 0,
         },
         batch: drawn_batch,
         patches,
@@ -1006,6 +1019,7 @@ pub(crate) fn build(
             subd: subd.map(|s| (copy_ptr, s.shape)),
             model: None,
             emissive: 0,
+            runs: (0, desc.materials.len() as u32),
             id: None,
             accel,
             _memory: memory,
@@ -1253,11 +1267,11 @@ pub struct ProducerStats {
     /// Segments emitted past `max_segments`, dropped.
     pub dropped_segments: u32,
     /// Emitted clusters the builds of traced entries refused: more than 128 triangles or 256
-    /// vertices, vertices outside the batch, or an unknown topology; and emitted segments with
-    /// a vertex outside the batch or a position or radius that is not finite or a negative
-    /// radius, which are neither drawn nor traced; and direct clusters past an entry's
-    /// `max_direct_clusters` that its kernel wrote into the batch without `emit_direct_cluster`,
-    /// which are drawn but not traced.
+    /// vertices, vertices outside the batch, an unknown topology or a material past the entry's;
+    /// and emitted segments with a vertex outside the batch or a position or radius that is not
+    /// finite or a negative radius, which are neither drawn nor traced; and direct clusters past
+    /// an entry's `max_direct_clusters` that its kernel wrote into the batch without
+    /// `emit_direct_cluster`, which are drawn but not traced.
     pub refused: u32,
     /// CLAS in the entries' BLAS, and segments of strand entries' BLAS.
     pub built: u32,

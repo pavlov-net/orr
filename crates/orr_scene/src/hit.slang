@@ -9,6 +9,7 @@ import orr_shaders.math;
 import orr_shaders.packing;
 import orr_shaders.random;
 import orr_pack.mesh;
+import orr_shaders.trace;
 import orr_scene.producer;
 import orr_scene.scene_may;
 __exported import orr_scene.surface;
@@ -104,6 +105,40 @@ public bool hit_producer(SceneRoot* s, uint index, out uint entry)
 {
     entry = index - s.producer_base;
     return may2(MAY2_PRODUCERS) && index >= s.producer_base && index < s.proxy_base;
+}
+
+// The scene's PTLAS, its candidates classed as the scene built them: a copy's cluster by the class
+// its section cooked with, a producer entry's cluster by the entry's class or, with
+// PRODUCER_SECTIONS, by its material's.
+public struct SceneTraced : ITraced
+{
+    public SceneRoot* scene;
+
+    public Tlas tlas()
+    {
+        return scene.tlas;
+    }
+
+    public uint cluster_class(uint instance_index, uint cluster_id)
+    {
+        uint entry;
+        if (hit_producer(scene, instance_index, entry))
+        {
+            ProducerGpu* p = scene.producers + entry;
+            if (p.opacity != PRODUCER_SECTIONS)
+                return p.class_id;
+            // The build refuses a cluster whose material is past the entry's.
+            return material_class(scene.materials + p.materials[scene.batches[entry].clusters[cluster_id].material]);
+        }
+        ClusterRef* r = scene.clusters + cluster_id;
+        return cluster_class_at(r.page, r.local);
+    }
+}
+
+public SceneTraced scene_traced(SceneRoot* s)
+{
+    SceneTraced t = { s };
+    return t;
 }
 
 // The transform of producer entry `p`, current or previous, relative to the point at
@@ -680,10 +715,62 @@ public struct TracedTriangle
     public uint origin;          // a producer entry's origin policy, else ORIGIN_DEFAULT
 }
 
+// Where a hit's reconstruction takes its triangle's section material from.
+public interface ISectionMaterial
+{
+    // Of section `section` of copy record `inst` of `model`.
+    uint copy(SceneRoot* s, InstanceGpu inst, ModelGpu* model, uint section);
+    // Of cluster `k` of producer entry `p`.
+    uint producer(ProducerGpu p, ProducerClusterGpu k);
+}
+
+// The copy's or the entry's tables: what a hit with nothing else to go by reads.
+public struct SectionLookup : ISectionMaterial
+{
+    public uint copy(SceneRoot* s, InstanceGpu inst, ModelGpu* model, uint section)
+    {
+        return section_material(s, inst, model, section);
+    }
+
+    public uint producer(ProducerGpu p, ProducerClusterGpu k)
+    {
+        return producer_material(p, k);
+    }
+}
+
+// A material the caller has, as a hit record's data names it (`orr_scene.runs`' `HitData`).
+public struct SectionGiven : ISectionMaterial
+{
+    public uint material;
+
+    public uint copy(SceneRoot* s, InstanceGpu inst, ModelGpu* model, uint section)
+    {
+        return material;
+    }
+
+    public uint producer(ProducerGpu p, ProducerClusterGpu k)
+    {
+        return material;
+    }
+}
+
+public SectionGiven section_given(uint material)
+{
+    SectionGiven g = { material };
+    return g;
+}
+
 // Triangle `primitive` of cluster `cluster_id` on PTLAS instance `instance_index`; false for a
 // strand entry, an index outside the batch, a hidden group or pose, and a material outside
 // the entry's.
 public bool traced_triangle(SceneRoot* s, uint instance_index, uint cluster_id, uint primitive, bool previous, out TracedTriangle t)
+{
+    SectionLookup lookup;
+    return traced_triangle_by(s, instance_index, cluster_id, primitive, previous, lookup, t);
+}
+
+// `traced_triangle` with its section material from `m`.
+public bool traced_triangle_by<M : ISectionMaterial>(SceneRoot* s, uint instance_index, uint cluster_id, uint primitive, bool previous, M m, out TracedTriangle t)
 {
     t = TracedTriangle();
     uint cell_log2 = uint(s.origin_cell.w);
@@ -699,7 +786,7 @@ public bool traced_triangle(SceneRoot* s, uint instance_index, uint cluster_id, 
             return false;
         ProducerTriangle pt = producer_triangle(b, k, primitive, previous);
         t.corners = pt.corners;
-        t.material = producer_material(p, k);
+        t.material = m.producer(p, k);
         t.instance = instance_index;
         t.cluster = cluster_id;
         t.user_tag = p.user_tag;
@@ -723,7 +810,7 @@ public bool traced_triangle(SceneRoot* s, uint instance_index, uint cluster_id, 
         skinned_corners(k, mesh, r.page, c, r.mesh_cluster, primitive, previous, t.corners);
     else if (previous)
         t.deformed = edited_corners(mesh, r.page, r.local, primitive, t.corners);
-    t.material = section_material(s, inst, model, c.section);
+    t.material = m.copy(s, inst, model, c.section);
     t.attributes = mesh.attributes;
     GroupGpu* g = s.groups + inst.group;
     if (!placement(g, previous, inst.group_index, s.origin_cell.xyz, float3(0.0), cell_log2, t.placement))
@@ -781,7 +868,7 @@ void finish_input(SceneRoot* s, ViewConstants* v, float3 d, uint material, Place
     i.uv[0].tap = i.uv[1].tap = context.tap;
     i.context = context;
     i.material = material;
-    i.surface = m.surface;
+    i.surface = hit_surface_id(m.surface);
     i.position = place(pl, i.object_position);
     world_cell(s.origin_cell.xyz, float3(0.0), i.position, cell_log2, i.cell, i.offset);
     i.view_direction = d;
@@ -827,6 +914,13 @@ public SurfaceInput emitter_input(SceneRoot* s, TracedTriangle t, uint primitive
 // With `sided` the input is that of the side `d` meets, else of the section's material.
 bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, out HitInput h)
 {
+    SectionLookup lookup;
+    return hit_input_by(s, v, d, instance_index, cluster_id, primitive, bary, t, fetched, previous, sided, context, lookup, h);
+}
+
+// `hit_input` with the section material from `m`.
+bool hit_input_by<M : ISectionMaterial>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, M m, out HitInput h)
+{
     h = HitInput();
     uint entry;
     if (may2(MAY2_STRANDS) && hit_producer(s, instance_index, entry) && s.producers[entry].strands != 0)
@@ -855,7 +949,7 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
         return true;
     }
     TracedTriangle tri;
-    if (!traced_triangle(s, instance_index, cluster_id, primitive, previous, tri))
+    if (!traced_triangle_by(s, instance_index, cluster_id, primitive, previous, m, tri))
         return false;
     triangle_input(s, v, d, tri, primitive, bary, t, fetched, previous, sided, context, h);
     return true;
@@ -899,6 +993,23 @@ void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bo
     i.barycentrics = bary;
 }
 
+// The surface at hit input `i` through `S`, with its depth offset (m along the view ray, at
+// least 0): the surface evaluation the material resolve and every ray hit share, with the
+// origin policy of material `i.material` and producer policy `origin` and the visible triangle
+// set. Position and raster error are the caller's.
+public GSurface hit_surface<S : ISurfaces>(SceneRoot* s, SurfaceInput i, uint origin, bool report, out float depth_offset)
+{
+    GSurface g = S.surface(i, depth_offset, report);
+    depth_offset = max(depth_offset, 0.0);
+    MaterialGpu* m = s.materials + i.material;
+    g.flags = (g.flags & ~GBUFFER_ORIGIN_MASK) | (hit_origin(m, origin) << GBUFFER_ORIGIN_SHIFT);
+    g.instance = i.instance;
+    g.cluster = i.cluster;
+    g.primitive = i.primitive;
+    g.material = i.material;
+    return g;
+}
+
 // The surface at a ray hit through linked surface `S` (the kernel's `Surface`): the
 // committed hit's instance index, cluster id, primitive, barycentrics and fetched
 // object-space positions (`orr_shaders.trace`'s: on a swept-sphere hit the first is the hit point),
@@ -907,26 +1018,27 @@ void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bo
 // On a strand entry the surface's `cluster` is the segment and its `primitive` 0.
 public SurfaceHit resolve_hit<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], bool previous, HitContext context)
 {
+    SectionLookup lookup;
+    return resolve_hit_by<S>(s, v, d, instance_index, cluster_id, primitive, bary, object_positions, previous, context, lookup);
+}
+
+// `resolve_hit` with the section material from `m`: a hit shader's, `section_given` the material
+// its record names, reads no section table.
+public SurfaceHit resolve_hit_by<S : ISurfaces, M : ISectionMaterial>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], bool previous, HitContext context, M m)
+{
     SurfaceHit hit = SurfaceHit();
     Corners t;
     t.position = object_positions;
     HitInput h;
-    if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, true, previous, true, context, h))
+    if (!hit_input_by(s, v, d, instance_index, cluster_id, primitive, bary, t, true, previous, true, context, m, h))
         return hit;
     float offset;
-    GSurface g = S.surface(h.input, offset, false);
-    offset = max(offset, 0.0);
+    GSurface g = hit_surface<S>(s, h.input, h.origin, false, offset);
     // The back of a single-sided material emits nothing.
     if (h.input.back_face && (s.materials[h.section].flags & MATERIAL_DOUBLE_SIDED) == 0)
         g.bsdf.emission = float3(0.0);
-    MaterialGpu* m = s.materials + h.input.material;
     g.position = h.input.position + d * offset;
     g.raster_error = 0.0;
-    g.flags = (g.flags & ~GBUFFER_ORIGIN_MASK) | (hit_origin(m, h.origin) << GBUFFER_ORIGIN_SHIFT);
-    g.instance = h.input.instance;
-    g.cluster = h.input.cluster;
-    g.primitive = h.input.primitive;
-    g.material = h.input.material;
     g.medium_point = float4(h.input.uv[0].uv, h.input.uv[1].uv);
     hit.surface = g;
     hit.uv = h.input.uv;
@@ -982,6 +1094,81 @@ public float resolve_presence_section<S : ISurfaces>(SceneRoot* s, ViewConstants
         return coverage;
     uint3 key = uint3(asuint(bary.x) ^ (instance_index * 0x9E3779B9u), asuint(bary.y) ^ (primitive * 0x85EBCA6Bu), s.frame_index ^ cluster_id);
     return coverage > unit_float(pcg3d(key).x) ? 1.0 : 0.0;
+}
+
+// `resolve_presence` of a triangle candidate whose hit record names its section material
+// `material`, `tested` where that takes the alpha test, and on a copy's cluster its mesh's MESH_*
+// vertex `attributes`: the pipeline's any-hit shaders' decision, which reads no instance, model or
+// section table, and for a material that takes no alpha test nothing of the triangle. The inline
+// handlers keep `resolve_presence`.
+public float record_presence<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, uint material, uint attributes, bool tested, bool alpha)
+{
+    if (material == MATERIAL_NONE || !fade_present(s, d, instance_index))
+        return 0.0;
+    if (alpha && !tested)
+        return 1.0;
+    SurfaceInput i;
+    if (!coverage_input(s, v, d, instance_index, cluster_id, primitive, bary, context, material, attributes, i))
+        return 0.0;
+    uint flags = s.materials[material].flags;
+    float coverage = S.coverage(i, !alpha && (flags & MATERIAL_PRESENCE) != 0, false);
+    if (!alpha)
+        return coverage;
+    uint3 key = uint3(asuint(bary.x) ^ (instance_index * 0x9E3779B9u), asuint(bary.y) ^ (primitive * 0x85EBCA6Bu), s.frame_index ^ cluster_id);
+    return coverage > unit_float(pcg3d(key).x) ? 1.0 : 0.0;
+}
+
+// What a coverage reads of a triangle candidate of section material `material`, its copy's mesh's
+// vertex `attributes` on a copy's cluster: the standard surface's, a material's opacity, reads
+// the uvs and the vertex color, interpolated here from the triangle's corners. A material of a
+// linked surface id takes the whole input, which its coverage may read any of, and is false
+// where that names nothing to resolve, as `hit_input` is.
+bool coverage_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context, uint material, uint attributes, out SurfaceInput i)
+{
+    if (hit_surface_id(s.materials[material].surface) != 0)
+    {
+        HitInput h;
+        bool found = hit_input_by(s, v, d, instance_index, cluster_id, primitive, bary, Corners(), false, false, false, context, section_given(material), h);
+        i = h.input;
+        return found;
+    }
+    VertexAttributes a[3];
+    uint entry;
+    if (hit_producer(s, instance_index, entry))
+    {
+        ProducerBatch b = s.batches[entry];
+        a = producer_triangle(b, b.clusters[cluster_id], primitive, false).corners.attributes;
+    }
+    else
+    {
+        ClusterRef r = s.clusters[cluster_id];
+        Cluster c = load_cluster(r.page, r.local);
+        PageHeader h = load_page_header(r.page);
+        uint3 k = load_triangle(r.page, h, c, primitive);
+        a[0] = load_attributes(r.page, h, c, k.x, attributes);
+        a[1] = load_attributes(r.page, h, c, k.y, attributes);
+        a[2] = load_attributes(r.page, h, c, k.z, attributes);
+    }
+    i = SurfaceInput();
+    float3 w = float3(1.0 - bary.x - bary.y, bary.x, bary.y);
+    for (uint set = 0; set < 2; set++)
+    {
+        float2 along1 = a[1].uv[set] - a[0].uv[set];
+        float2 along2 = a[2].uv[set] - a[0].uv[set];
+        i.uv[set].uv = a[0].uv[set] + bary.x * along1 + bary.y * along2;
+        i.uv[set].inward = a[0].uv[set] + (along1 + along2) / 3.0 - i.uv[set].uv;
+        i.uv[set].tap = context.tap;
+    }
+    i.vertex_color = w.x * a[0].color + w.y * a[1].color + w.z * a[2].color;
+    i.context = context;
+    i.instance = instance_index;
+    i.primitive = primitive;
+    i.barycentrics = bary;
+    i.material = material;
+    i.scene = s;
+    i.view = v;
+    i.view_direction = d;
+    return true;
 }
 
 // Whether a non-opaque triangle candidate is present: on a fading copy's step, by its share

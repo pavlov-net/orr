@@ -17,17 +17,20 @@
 
 use bytemuck::{Pod, Zeroable};
 use lighting_suite::bed::{
-    Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Item, LEAF, MIRROR, NEAR, PLUME,
+    Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Gate, Item, LEAF, MIRROR, NEAR, PLUME,
     Particle, ParticleLook, Paths, RT_RANGE, SKY, SUN, Spec, TURBID_WATER, WATER_BOX, WHITE_SPHERE,
-    fresnel, look, pixel_of, plume_volume, water_transmission,
+    assert_gate, fresnel, look, pixel_of, plume_volume, water_transmission,
 };
 use lighting_suite::shaders::{
     fog_aerial, fog_apply, fog_directional, fog_froxel, fog_froxel_light, fog_particles,
     froxel_lookup, froxel_probe, segment_probe,
 };
-use lighting_suite::{assert_clean, finish, kernels, pipeline, readback, render, upload};
+use lighting_suite::{
+    assert_clean, device, finish, kernels, pipeline, readback, render, require, upload,
+};
 use orr_color::luminance;
 use orr_gpu::{Allocation, DEFAULT_ENVIRONMENT, Hazards, KernelSet, Stages};
+use orr_lighting::path_may::{MAY_FROXELS, MAY_VIEW};
 use orr_lighting::{
     AERIAL_SIZE, DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, MediaSettings,
     PathEntry, ReferenceSettings, ViewLighting,
@@ -37,6 +40,7 @@ use orr_pack::volume::GridSampler;
 use orr_scene::{
     MaterialId, MediumData, MediumProxy, MediumProxyId, Opacity, ProxyDensity, RendererDesc,
 };
+use std::cell::RefCell;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// Kernels with the stock height fog linked as the medium (`media_types.slang`).
@@ -259,6 +263,45 @@ fn slices_map_distances_and_back() {
             );
         }
     }
+    assert_clean();
+}
+
+/// The pipelines made for exactly what a fogged scene may meet hold what its paths read of the
+/// froxels: a glass sphere on a floor under the sun in haze renders through them as through the
+/// pipelines that may meet everything.
+#[test]
+fn specialized_pipelines_launch_the_paths_the_general_one_does_through_fog() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    let fogs = RefCell::new(Vec::new());
+    assert_gate(
+        fog_kernels(),
+        &Gate {
+            what: "a glass sphere in haze",
+            held: &[u64::from(MAY_VIEW | MAY_FROXELS)],
+            bed: &|| {
+                let (bed, fog) = foggy(
+                    &HAZE,
+                    vec![
+                        at(FLOOR, Vec3::ZERO),
+                        at(GLASS_SPHERE, Vec3::new(0.0, 1.0, 0.0)),
+                    ],
+                    vec![Light::Directional(SUN)],
+                    Some(SKY),
+                    Vec3::new(0.0, 2.0, 5.0),
+                    Vec3::new(0.0, 0.8, 0.0),
+                );
+                fogs.borrow_mut().push(fog);
+                bed
+            },
+            setup: &|bed, _| {
+                bed.set_pre_exposure(1.0 / 64.0);
+                Box::new(())
+            },
+            settings: ViewLighting::default(),
+        },
+    );
     assert_clean();
 }
 

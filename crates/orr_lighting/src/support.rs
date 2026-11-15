@@ -12,12 +12,13 @@ use orr_scene::orr_gpu::{ComputePipeline, Device, ShaderModule, ShaderStage, Spe
 use orr_scene::{Loading, SceneFeatures, Urgency};
 use orr_shaders::abi::SpecEntry;
 
+use crate::mask_sets::Late;
 use crate::media::links_medium;
 use crate::shaders::dielectric::layer_guides;
 use crate::shaders::guides::resolve;
 use crate::shaders::media::{apply, froxel_light};
 use crate::shaders::rays::shadow;
-use crate::staged::{Late, MAY_ALL, PATH_MAY_ID};
+use crate::staged::{MAY_ALL, PATH_MAY_ID};
 use crate::{Error, KernelSet, module};
 
 /// A support kernel made per mask.

@@ -94,16 +94,20 @@ impl Stage {
     }
 }
 
-/// Which entry point runs of a kernel with a raygen and a compute entry over one body.
+/// Which path tracer runs a view's paths: the staged loop, whose shade stages have a compute
+/// and a raygen entry over one body, or the ray tracing pipeline.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum PathEntry {
-    /// The entry that renders a frame in the least time: the compute entry.
+    /// The entry that renders a frame in the least time: the staged loop's compute entries.
     #[default]
     Fastest,
     Compute,
-    /// The raygen entry, which reorders at coherence points. Fails on devices without
-    /// ray-dispatch pipelines.
+    /// The staged loop's raygen entries, which reorder at coherence points. Fails on devices
+    /// without ray-dispatch pipelines.
     RayDispatch,
+    /// The ray tracing pipeline path tracer: a raygen per source runs each path to its end
+    /// through hit, miss and callable shaders. Fails on devices without ray tracing pipelines.
+    Pipeline,
 }
 
 /// The Slang type of the environment kernels declare, which reads null data as black.

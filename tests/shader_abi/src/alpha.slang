@@ -36,6 +36,6 @@ void main(uint3 id: SV_DispatchThreadID)
     ray.TMin = 0.0;
     ray.TMax = 4.0;
     AlphaTest alpha;
-    Hit h = trace_closest(root.scene, ray, 0xff, root.flags, alpha);
+    Hit h = trace_closest(opaque_clusters(root.scene), ray, 0xff, root.flags, alpha);
     root.out[id.y * root.width + id.x] = h.hit ? uint4(1, h.instance_index, h.primitive_index, uint(h.cluster_id)) : uint4(0);
 }
