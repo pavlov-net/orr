@@ -57,6 +57,9 @@ pub struct EntryPoint {
     /// The bytes of shader record data a ray tracing entry reads after its group handle: the
     /// extent of the entry's `uniform` parameters. 0 for other entries.
     pub record_bytes: u32,
+    /// The SPIR-V instructions inside the functions the entry reaches: what a stage made of it
+    /// hands a driver to compile.
+    pub instructions: u32,
     /// A hash of the root type's layout, the specialization constants and the entries' record
     /// sizes. Two builds whose hashes match can swap SPIR-V without rebuilding the Rust that
     /// fills the root and the records.
