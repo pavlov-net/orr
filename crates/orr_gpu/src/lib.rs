@@ -34,6 +34,7 @@ mod queue;
 mod raster;
 mod ray;
 pub mod rtas;
+mod specialize;
 mod sync;
 mod texture;
 
@@ -113,6 +114,7 @@ pub use rtas::{
     PtlasLimits, RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, RtasSizes,
     partition_translation,
 };
+pub use specialize::handed_instructions;
 pub use sync::{Hazards, Stages, TimelinePoint};
 pub use texture::{
     AddressMode, CompareOp, Filter, PageBind, SamplerDesc, SparseLayout, TextureDesc, TextureKind,

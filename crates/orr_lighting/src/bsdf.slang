@@ -34,6 +34,28 @@ import orr_lighting.specialize;
 __exported import orr_scene.gbuffer;
 
 // `BsdfSample.lobe` flags (adobe's `OpenPBR_BsdfLobeType` values).
+// The lobes the BSDFs of a kernel's materials may have beside the base's diffuse and specular
+// reflection. A kernel that shades one class of material exports the class's set as
+// `BSDF_CLASS`, and the code of every other lobe stays out of it; a kernel that exports none
+// shades every material.
+public static const uint CLASS_COAT = 1 << 0;
+public static const uint CLASS_FUZZ = 1 << 1;
+public static const uint CLASS_FILM = 1 << 2;
+// Light through the surface: specular transmission and its refraction, a subsurface walk's entry,
+// and from inside.
+public static const uint CLASS_TRANSMISSION = 1 << 3;
+// A thin wall's diffuse and specular transmission.
+public static const uint CLASS_THIN = 1 << 4;
+public static const uint CLASS_SUBSURFACE = 1 << 5;
+public static const uint CLASS_EVERY = 0x3f;
+public extern static const uint BSDF_CLASS = CLASS_EVERY;
+
+// Whether the kernel's materials may have lobe set `lobes` (CLASS_*).
+bool class_has(uint lobes)
+{
+    return (BSDF_CLASS & lobes) != 0;
+}
+
 public static const uint LOBE_REFLECTION = 1 << 0;
 public static const uint LOBE_TRANSMISSION = 1 << 1;
 public static const uint LOBE_DIFFUSE = 1 << 2;
@@ -366,7 +388,7 @@ public struct Bsdf : IDifferentiable
         {
         case COAT:
         {
-            if (!may(MAY_COAT))
+            if (!class_has(CLASS_COAT) || !may(MAY_COAT))
                 return r;
             delta = coat_mirror;
             float3 c = delta ? float3(-coat_v.xy, coat_v.z) : sample_ggx_vndf_bounded(coat_v, coat_alpha, uv);
@@ -378,7 +400,7 @@ public struct Bsdf : IDifferentiable
         }
         case FUZZ:
         {
-            if (!may(MAY_FUZZ))
+            if (!class_has(CLASS_FUZZ) || !may(MAY_FUZZ))
                 return r;
             float3 f = sample_fuzz(uv);
             facing = f.z;
@@ -389,10 +411,20 @@ public struct Bsdf : IDifferentiable
         case SPECULAR:
         {
             delta = mirror;
-            if (!mirror && bounded)
+            if (!mirror && (bounded || !class_has(CLASS_TRANSMISSION)))
             {
                 l = sample_ggx_vndf_bounded(v, alpha, uv);
                 lobe |= LOBE_REFLECTION;
+                break;
+            }
+            if (!class_has(CLASS_TRANSMISSION))
+            {
+                // A mirror of a class that lets no light through reflects.
+                float3 rc, tc;
+                coefficients(v.z, rc, tc);
+                l = float3(-v.xy, v.z);
+                lobe |= LOBE_REFLECTION;
+                w = rc * layer * leaving(l) + fold;
                 break;
             }
             float3 h = mirror ? float3(0.0, 0.0, 1.0) : openpbr_sample_aniso_ggx_smith_vndf(alpha, v, uv);
@@ -418,6 +450,8 @@ public struct Bsdf : IDifferentiable
             break;
         }
         case WALK:
+            if (!class_has(CLASS_SUBSURFACE))
+                return r;
             lobe |= LOBE_TRANSMISSION | LOBE_VOLUME;
             if (u.z < walk_ms_share)
             {
@@ -439,7 +473,7 @@ public struct Bsdf : IDifferentiable
             break;
         case DIELECTRIC_MS:
         {
-            bool up = uv.x < dms_ratio;
+            bool up = !class_has(CLASS_TRANSMISSION | CLASS_SUBSURFACE) || uv.x < dms_ratio;
             float z = up ? uv.x / dms_ratio : (uv.x - dms_ratio) / (1.0 - dms_ratio);
             z = min(z, LARGEST_BELOW_ONE);
             l = sample_uniform_hemisphere(float2(z, uv.y));
@@ -457,12 +491,16 @@ public struct Bsdf : IDifferentiable
             lobe = LOBE_REFLECTION | LOBE_DIFFUSE;
             break;
         case THIN_SPECULAR:
+            if (!class_has(CLASS_THIN))
+                return r;
             delta = mirror;
             l = delta ? -v : mirrored(sample_ggx_vndf_bounded(v, alpha, uv));
             w = thin_specular * layer;
             lobe |= LOBE_TRANSMISSION;
             break;
         default:
+            if (!class_has(CLASS_THIN))
+                return r;
             l = mirrored(sample_cosine_hemisphere(uv));
             lobe = LOBE_TRANSMISSION | LOBE_DIFFUSE;
             break;
@@ -643,11 +681,14 @@ public struct Bsdf : IDifferentiable
         float lobe_pdf;
         // The specular and walk lobes share the microfacet toward `l` and its coefficients.
         bool specular = probability[SPECULAR] > 0.0 && !mirror;
-        bool walks = !(l.z > 0.0) && probability[WALK] > 0.0 && !mirror;
+        bool walks = class_has(CLASS_SUBSURFACE) && !(l.z > 0.0) && probability[WALK] > 0.0 && !mirror;
+        // A class that lets no light through has nothing below the surface.
+        if (!class_has(CLASS_TRANSMISSION | CLASS_THIN | CLASS_SUBSURFACE) && !(l.z > 0.0))
+            return float3(0.0);
         Facet micro = Facet();
-        if ((specular && (l.z > 0.0 || any(transmit != 0.0))) || walks)
+        if ((specular && (l.z > 0.0 || (class_has(CLASS_TRANSMISSION) && any(transmit != 0.0)))) || walks)
             micro = facet_coefficients(l);
-        if (may(MAY_COAT) && probability[COAT] > 0.0 && !coat_mirror)
+        if (class_has(CLASS_COAT) && may(MAY_COAT) && probability[COAT] > 0.0 && !coat_mirror)
         {
             float3 c = in_frame(l, coat_basis);
             if (c.z > 0.0)
@@ -656,7 +697,7 @@ public struct Bsdf : IDifferentiable
                 pdf += probability[COAT] * lobe_pdf;
             }
         }
-        if (may(MAY_FUZZ) && probability[FUZZ] > 0.0)
+        if (class_has(CLASS_FUZZ) && may(MAY_FUZZ) && probability[FUZZ] > 0.0)
         {
             float3 f = in_frame(l, fuzz_basis);
             if (f.z > 0.0)
@@ -680,7 +721,7 @@ public struct Bsdf : IDifferentiable
                 pdf += probability[METAL_MS] * INV_TWO_PI;
             }
         }
-        else
+        else if (class_has(CLASS_THIN | CLASS_SUBSURFACE))
         {
             float3 m = mirrored(l);
             if (probability[THIN_DIFFUSE] > 0.0)
@@ -913,7 +954,7 @@ public struct Bsdf : IDifferentiable
         if (metal > 0.0)
             reflection += metal * (metal_flat ? f0 : openpbr_metal_schlick_with_f82_tint(f0, f82, c));
         transmission = float3(1.0 - ft);
-        if (may(MAY_FILM) && film > 0.0)
+        if (class_has(CLASS_FILM) && may(MAY_FILM) && film > 0.0)
         {
             bool dielectric = any(reflect_transparent > 0.0) || any(reflect_opaque > 0.0);
             OpenPBR_ThinFilmResults r = openpbr_thin_film_and_base_reflectance(
@@ -1237,7 +1278,7 @@ public Bsdf bsdf_prepare(BsdfParams p, float3 n, float3 wo, float exterior_ior =
 public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterior_ior, bool adjoint, out BsdfLayers layers)
 {
     // A pipeline whose surfaces have none of a lobe (`may`) reads its weight as the 0 it is.
-    return prepare_layers(p, n, wo, exterior_ior, adjoint, layers, may(MAY_COAT), may(MAY_FUZZ), may(MAY_FILM), may(MAY_SUBSURFACE));
+    return prepare_layers(p, n, wo, exterior_ior, adjoint, layers, class_has(CLASS_COAT) && may(MAY_COAT), class_has(CLASS_FUZZ) && may(MAY_FUZZ), class_has(CLASS_FILM) && may(MAY_FILM), class_has(CLASS_SUBSURFACE | CLASS_THIN) && may(MAY_SUBSURFACE));
 }
 
 // What the coat and fuzz of a surface of `p` pass of its emission toward `wo`
@@ -1247,12 +1288,6 @@ public float3 bsdf_emission_layer(BsdfParams p, float3 n, float3 wo, float exter
 {
     BsdfLayers layers;
     return prepare_layers(p, n, wo, exterior_ior, false, layers, true, true, true, true).emission_layer();
-}
-
-// TEMP-EXPERIMENT
-public Bsdf bsdf_prepare_some(BsdfParams p, float3 n, float3 wo, float exterior_ior, bool adjoint, out BsdfLayers layers, bool coat, bool fuzz, bool film, bool subsurface)
-{
-    return prepare_layers(p, n, wo, exterior_ior, adjoint, layers, coat, fuzz, film, subsurface);
 }
 
 // `bsdf_prepare_layers` of a surface that has a coat, a fuzz, a thin film and subsurface only

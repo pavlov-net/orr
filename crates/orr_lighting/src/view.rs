@@ -17,7 +17,7 @@ use orr_scene::{
 };
 
 use crate::caustics::PhotonMap;
-use crate::launch::{LaunchMemory, PathPipeline, PathPipelines, SlotLayout, SourceMemory};
+use crate::launch::{LaunchMemory, PathPipeline, PathPipelines, SourceMemory};
 use crate::mask_sets::{MaskSet, MaskSets};
 use crate::media::{
     MediaKernels, MediaSettings, MediaStats, MediaView, fogged, links_medium, readers, shows_media,
@@ -31,14 +31,12 @@ use crate::shaders::types::{
     ParticleLighting, PathRoot,
 };
 use crate::staged::{
-    FEATURE_COATED_EMITTERS, FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_LAYERS,
-    FEATURE_SEGMENTS, FEATURE_STACK, FEATURE_WALK, MAX_ROUNDS, MAY_ALL, MAY_CACHE, MAY_CAUSTICS,
-    MAY_COAT, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION, MAY_EMISSIVE, MAY_FILM,
-    MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOCAL,
-    MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES, MAY_REFERENCE, MAY_SMOKE, MAY_STACK,
-    MAY_SUBSURFACE, MAY_WALK, PATH_SOURCE_BACKGROUND, PATH_SOURCE_PHOTON, PATH_SOURCE_UPDATE,
-    PATH_SOURCE_VIEW, Source, SourcePaths, Stage, StageSet, StagedKernels, StagedMemory,
-    StateParts, UPDATE_FEATURES,
+    FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_STACK, FEATURE_WALK, MAX_ROUNDS, MAY_ALL,
+    MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION,
+    MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS,
+    MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES, MAY_REFERENCE, MAY_SMOKE, MAY_STACK,
+    MAY_SUBSURFACE, MAY_WALK, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, Source, SourcePaths, Stage,
+    StageSet, StagedKernels, StagedMemory, StateParts, UPDATE_FEATURES,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::support::{Masked, MaskedFrame, MaskedSupport, Runs};
@@ -1131,19 +1129,9 @@ fn runs_rays(entry: PathEntry) -> bool {
     }
 }
 
-/// How a frame's caustic photons run: through the staged loop's stages for what they may meet,
-/// or through the pipeline path tracer's pipeline made for what they may meet, over the scene's
-/// hit records.
+/// How a frame's caustic photons run: through the staged loop's stages for what they may meet.
 enum PhotonPaths<'a> {
-    Staged {
-        paths: &'a StagedPaths,
-        may: u64,
-    },
-    Launched {
-        paths: &'a PipelinePaths,
-        hits: &'a HitTableWriter<'a>,
-        may: u64,
-    },
+    Staged { paths: &'a StagedPaths, may: u64 },
 }
 
 /// The pipeline path tracer's pipelines that a frame's paths run through, and what writes the
@@ -1728,22 +1716,17 @@ impl PipelinePaths {
         self.sets.start_general(&PIPELINE);
     }
 
-    /// What the pipelines each source of a frame with `needs` takes under `lighting` may meet:
-    /// its own source's bit, and what its paths may meet.
+    /// What the pipeline a frame with `needs` takes under `lighting` may meet: the bits of the
+    /// sources it runs, the view's paths and outside the reference its update paths, and what
+    /// their paths may meet. One pipeline runs every source, a raygen each, over one set of hit
+    /// groups.
     fn wanted(&self, scene: &SceneLighting, needs: PathNeeds, lighting: &ViewLighting) -> Vec<u64> {
         let may = predict(self.linked_medium, scene, needs, lighting);
-        let mut wanted = vec![may.view | Source::View.may()];
-        if needs.dof_background {
-            wanted.push(may.background | Source::Background.may());
-        }
-        // Update paths run outside the reference.
+        let mut wanted = may.view | Source::View.may();
         if lighting.reference.is_none() {
-            wanted.push(may.update | Source::Update.may());
+            wanted |= may.update | Source::Update.may();
         }
-        if gathers_caustics(scene, needs.features, lighting) {
-            wanted.push(may.photons | Source::Photon.may());
-        }
-        wanted
+        vec![wanted]
     }
 
     /// Asks for pipelines that hold each of `wanted`, as [`Self::wanted`] gives them, and says
@@ -2476,40 +2459,25 @@ impl LightingKernels {
             dof_background: pass.dof_background.is_some(),
             particle_lighting: pass.particle_lighting,
         };
+        if pass.dof_background.is_some() {
+            return Err(Error::Settings(
+                "the pipeline path tracer traces no background layer",
+            ));
+        }
         let wanted = launch.wanted(scene, needs, lighting);
         launch.ask(&wanted, lighting)?;
+        let may = wanted[0];
         view.launched_ran = LaunchedRan {
-            asked: wanted.iter().fold(0, |all, may| all | may),
+            asked: may,
             held: Vec::new(),
         };
-        let predicted = predict(launch.linked_medium, scene, needs, lighting);
         self.record_layers(list, view, pass, lighting, path)?;
         let reference = lighting.reference.is_some();
-        let segments = self.support.masked.linked_medium() || path.froxels != GpuPtr::NULL;
-        let layers = pass.scene_features.contains(SceneFeatures::LAYERS);
-        let coated = pass.scene_features.contains(SceneFeatures::COATED_EMITTERS);
-        let features = path.features
-            & (FEATURE_WALK | FEATURE_INTERIORS | FEATURE_DISPERSION | FEATURE_STACK)
-            | if segments { FEATURE_SEGMENTS } else { 0 }
-            | if layers { FEATURE_LAYERS } else { 0 }
-            | if coated { FEATURE_COATED_EMITTERS } else { 0 };
-        // A path that may meet a layer or lie in an interior takes the dielectric depth's
-        // iterations too.
-        let depth = if layers || features & FEATURE_INTERIORS != 0 {
-            path.dielectric_depth
-        } else {
-            0
-        };
+        // The pipeline traces no caustic photons, so its paths gather none.
         let root = PathRoot {
-            features,
-            dielectric_flags: path.dielectric_flags,
+            features: 0,
             source: PATH_SOURCE_VIEW,
-            round_next: rounds(
-                lighting.max_bounces,
-                depth,
-                reference,
-                path.features & FEATURE_WALK != 0,
-            )?,
+            caustics: GpuPtr::NULL,
             ..*path
         };
         let pixels = view.extent[0] * view.extent[1];
@@ -2519,42 +2487,14 @@ impl LightingKernels {
             let blocks = view.extent.map(|e| e.div_ceil(path.update_block));
             blocks[0] * blocks[1]
         };
-        // The update paths keep the view's layers and light parts but split by no wavelength.
-        let update_features =
-            update_root(&root).features | (features & (FEATURE_LAYERS | FEATURE_COATED_EMITTERS));
-        let candidates = root.primary_candidates.max(root.bounce_candidates);
-        let view_layout = SlotLayout::new(root.features, true, candidates);
-        let update_layout = SlotLayout::new(update_features, false, candidates);
         if !view
             .launched
             .as_ref()
-            .is_some_and(|m| m.fits(pixels, view_layout, update, update_layout))
+            .is_some_and(|m| m.fits(pixels, update))
         {
             view.launched = None;
-            view.launched = Some(LaunchMemory::new(
-                &view.device,
-                pixels,
-                view_layout,
-                update,
-                update_layout,
-            )?);
+            view.launched = Some(LaunchMemory::new(&view.device, pixels, update)?);
         }
-        let root = PathRoot {
-            caustics: self.record_photons(
-                list,
-                scene,
-                view,
-                pass,
-                lighting,
-                &root,
-                PhotonPaths::Launched {
-                    paths: launch,
-                    hits,
-                    may: predicted.photons | Source::Photon.may(),
-                },
-            )?,
-            ..root
-        };
         let memory = view.launched.as_ref().expect("made above");
         list.begin_pass(
             if update == 0 || lighting.stage_passes {
@@ -2566,7 +2506,6 @@ impl LightingKernels {
         );
         let features = pass.scene_features;
         let ran = &mut view.launched_ran;
-        let may = predicted.view | Source::View.may();
         launch.record(list, hits, ran, features, &root, may, &memory.view, pixels)?;
         if update > 0 && lighting.stage_passes {
             list.end_pass();
@@ -2575,10 +2514,9 @@ impl LightingKernels {
         if update > 0 {
             let update_root = PathRoot {
                 source: PATH_SOURCE_UPDATE,
-                features: update_features,
+                features: 0,
                 ..update_root(&root)
             };
-            let may = predicted.update | Source::Update.may();
             launch.record(
                 list,
                 hits,
@@ -2591,22 +2529,6 @@ impl LightingKernels {
             )?;
         }
         list.end_pass();
-        if pass.dof_background.is_some() {
-            // The background layer's paths take the view's slots once its paths are done.
-            list.barrier(Stages::RAY, Stages::RAY, Hazards::empty());
-            list.begin_pass("background paths", false);
-            // The background layer's path is the full one at the view path's other settings.
-            let background_root = PathRoot {
-                mode: 0,
-                pixel_fraction: 1.0,
-                source: PATH_SOURCE_BACKGROUND,
-                ..root
-            };
-            let may = predicted.background | Source::Background.may();
-            let root = &background_root;
-            launch.record(list, hits, ran, features, root, may, &memory.view, pixels)?;
-            list.end_pass();
-        }
         list.barrier(Stages::RAY, Stages::COMPUTE | Stages::RAY, Hazards::empty());
         Ok(())
     }
@@ -2707,37 +2629,6 @@ impl LightingKernels {
                     may,
                     photons,
                 )?;
-            }
-            PhotonPaths::Launched { paths, hits, may } => {
-                // Photons that may meet a layer or lie in an interior take the dielectric depth's
-                // iterations too.
-                let layers = photon_root.features & (FEATURE_LAYERS | FEATURE_INTERIORS) != 0;
-                let root = PathRoot {
-                    source: PATH_SOURCE_PHOTON,
-                    round_next: rounds(
-                        photon_root.max_bounces,
-                        if layers {
-                            photon_root.dielectric_depth
-                        } else {
-                            0
-                        },
-                        lighting.reference.is_some(),
-                        false,
-                    )?,
-                    ..photon_root
-                };
-                let memory = view
-                    .launched
-                    .as_mut()
-                    .expect("made by record_launched")
-                    .photons(
-                        &view.device,
-                        slots,
-                        SlotLayout::new(root.features, false, 0),
-                    )?;
-                let ran = &mut view.launched_ran;
-                let features = pass.scene_features;
-                paths.record(list, hits, ran, features, &root, may, memory, photons)?;
             }
         }
         if lighting.stage_passes {

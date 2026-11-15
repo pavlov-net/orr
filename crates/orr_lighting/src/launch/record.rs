@@ -21,6 +21,8 @@ impl PathPipeline {
             launch: memory.header.gpu(),
             ..*root
         };
+        let raygen =
+            self.raygens[root.source as usize].expect("the pipeline runs the root's source");
         let mut base = 0;
         while base < items {
             if base > 0 {
@@ -28,7 +30,13 @@ impl PathPipeline {
             }
             root.slice_base = base;
             root.slice_count = (items - base).min(memory.slots);
-            list.trace_rays(&self.pipeline, 0, hits, &root, [root.slice_count, 1, 1]);
+            list.trace_rays(
+                &self.pipeline,
+                raygen,
+                hits,
+                &root,
+                [root.slice_count, 1, 1],
+            );
             base += root.slice_count;
         }
     }

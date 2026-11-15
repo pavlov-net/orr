@@ -27,6 +27,14 @@ import orr_shaders.pipeline;
 // largest shader up to 128, past which that shader spills.
 [Host] public static const uint HIT_REGISTERS = 128;
 [Host] public static const uint ANY_HIT_REGISTERS = 64;
+// The most instructions a stage may hand the driver, by what it does, and the stages of a
+// pipeline together: the driver compiles a pipeline's stages side by side, so its largest stage
+// sets how long a cold start waits, and the total what the threads share.
+[Host] public static const uint RAYGEN_INSTRUCTIONS = 4000;
+[Host] public static const uint MISS_INSTRUCTIONS = 4000;
+[Host] public static const uint HIT_INSTRUCTIONS = 40000;
+[Host] public static const uint ANY_HIT_INSTRUCTIONS = 2000;
+[Host] public static const uint PIPELINE_INSTRUCTIONS = 1000000;
 
 // `PathHot.flags`.
 public static const uint HOT_SHADOW = 1 << 0;       // a shadow job is pending: the raygen traces it before the path's ray
@@ -36,6 +44,7 @@ public static const uint HOT_CAMERA = 1 << 3;       // which is its camera ray: 
 public static const uint HOT_DIFFUSE = 1 << 4;      // the ray left a diffuse lobe
 public static const uint HOT_COUNTED = 1 << 5;      // light its ray meets counts toward the root's mode
 public static const uint HOT_MEDIUM = 1 << 6;       // the ray left a point in a medium, which has no normal
+public static const uint HOT_ARRIVED = 1 << 7;      // an update path's hit left its vertex for the raygen to record
 // From HOT_DEPTH_SHIFT, the vertices the path has scattered at, HOT_DEPTH_MASK at most.
 public static const uint HOT_DEPTH_SHIFT = 8;
 public static const uint HOT_DEPTH_MASK = 0xff;
@@ -82,13 +91,25 @@ public struct PathHot
     }
 }
 
+// Two halves in a word, x in its low 16 bits, as the device converts them: a path's throughput
+// past the largest half is infinite, which ends it (`carries`).
+public float2 halves(uint w)
+{
+    return float2(f16tof32(w), f16tof32(w >> 16));
+}
+
+public uint as_halves(float2 v)
+{
+    return f32tof16(v.x) | (f32tof16(v.y) << 16);
+}
+
 // The hot words of a path, in order:
 //   0  origin, flags
 //   1  dir as a 2 x 16-bit octahedral code, normal as one, throughput as three halves and run as a half
-//   2  the cone as two halves, a spare word, the shadow job's light as rgb9e5, the job's light id
+//   2  the cone as two halves, the blue of the shadow job's light, a spare word, the job's light id
 //   3  radiance, pdf
-//   4  shadow origin, a spare word
-//   5  shadow target, a spare word
+//   4  shadow origin, the red of the job's light
+//   5  shadow target, the green of the job's light
 // A direction keeps 16 bits a component: under 4e-5 rad, which no scatter's lobe resolves.
 public PathHot load_hot(uint4* at)
 {
@@ -100,11 +121,11 @@ public PathHot load_hot(uint4* at)
     p.flags = w0.w;
     p.dir = oct_decode_snorm16(w1.x);
     p.normal = oct_decode_snorm16(w1.y);
-    float2 b_run = unpack_half2x16(w1.w);
-    p.throughput = float3(unpack_half2x16(w1.z), b_run.x);
+    float2 b_run = halves(w1.w);
+    p.throughput = float3(halves(w1.z), b_run.x);
     p.run = b_run.y;
-    p.cone = unpack_half2x16(w2.x);
-    p.shadow_light = unpack_rgb9e5(w2.z);
+    p.cone = halves(w2.x);
+    p.shadow_light = float3(0.0);
     p.light = w2.w;
     float4 w3 = asfloat(load_coherent(at + 3));
     p.radiance = w3.xyz;
@@ -114,17 +135,35 @@ public PathHot load_hot(uint4* at)
     return p;
 }
 
-// Stores `p` but its shadow job's ray, which `store_shadow` stores where one is pending.
+// Stores `p` but its shadow job's ray and the rest of its light, which `store_shadow` stores where
+// one is pending.
 public void store_hot(uint4* at, PathHot p)
 {
     store_coherent(at, uint4(asuint(p.origin), p.flags));
-    store_coherent(at + 1, uint4(oct_encode_snorm16(p.dir), oct_encode_snorm16(p.normal), pack_half2x16(p.throughput.xy), pack_half2x16(float2(p.throughput.z, p.run))));
-    store_coherent(at + 2, uint4(pack_half2x16(p.cone), 0, pack_rgb9e5(p.shadow_light), p.light));
+    store_coherent(at + 1, uint4(oct_encode_snorm16(p.dir), oct_encode_snorm16(p.normal), as_halves(p.throughput.xy), as_halves(float2(p.throughput.z, p.run))));
+    store_coherent(at + 2, uint4(as_halves(p.cone), asuint(p.shadow_light.z), 0, p.light));
     store_coherent(at + 3, uint4(asuint(p.radiance), asuint(p.pdf)));
 }
 
 public void store_shadow(uint4* at, PathHot p)
 {
-    store_coherent(at + 4, uint4(asuint(p.shadow_origin), 0));
-    store_coherent(at + 5, uint4(asuint(p.shadow_target), 0));
+    store_coherent(at + 4, uint4(asuint(p.shadow_origin), asuint(p.shadow_light.x)));
+    store_coherent(at + 5, uint4(asuint(p.shadow_target), asuint(p.shadow_light.y)));
+}
+
+// A view path's record, a word in its slot of the launch's records: the light its feedback names,
+// one of those that lit it, kept in proportion to what each added (`view_light`).
+[Host] public static const uint LEAN_VIEW_RECORD_WORDS = 1;
+// An update path's: its `CacheUpdate`, then the vertex its last hit left for the raygen to record,
+// two words (`UpdateVertex`).
+[Host] public static const uint LEAN_UPDATE_RECORD_WORDS = 11;
+public static const uint UPDATE_VERTEX_AT = 9;
+
+// What an update path's hit leaves of its vertex, which the raygen adds to the path's record.
+public struct UpdateVertex
+{
+    public float3 position;
+    public uint normal;             // the geometric normal, as a 2 x 16-bit octahedral code
+    public float3 albedo;           // as the cache holds light by it, times the path's throughput there
+    public uint spare;
 }

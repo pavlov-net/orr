@@ -1,7 +1,9 @@
-// The lean path tracer's common stages (`path.lean`): the hit shader of a plain opaque surface and
-// the miss shaders of a path's ray and of its shadow ray.
+// The lean path tracer's common stages (`path.lean`): the raygens of a view's paths and of its
+// update paths, the hit shader of a plain opaque surface, the any-hit shaders of a path's ray and
+// of its shadow ray at a candidate that is not opaque, and the miss shaders of the two.
 #include "orr_root.h"
 import orr_shaders.pipeline;
+import orr_shaders.trace;
 import orr_lighting.environment;
 import orr_lighting.media;
 import orr_scene.surface;
@@ -15,6 +17,7 @@ import orr_lighting.path.lean.raygen;
 extern struct Surface : ISurfaces = StandardSurface;
 extern struct Medium : IMedium = NoMedium;
 export static const bool PATH_SPECIALIZES = true;
+export static const uint BSDF_CLASS = 0;
 
 ORR_ROOT_INLINE(PathRoot);
 
@@ -33,11 +36,34 @@ void surface_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
     lean_hit<Surface, Medium, TriangleHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
 }
 
+[shader("raygeneration")]
+void updates()
+{
+    ORR_OMM(updates);
+    lean_updates(root);
+}
+
+[shader("anyhit")]
+void cover_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
+{
+    ORR_OMM(cover_hit);
+    TriangleHit h = { a };
+    any_hit_decides(path_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, p.words, data, h));
+}
+
+[shader("anyhit")]
+void shadow_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
+{
+    ORR_OMM(shadow_hit);
+    TriangleHit h = { a };
+    any_hit_decides(shadow_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, p.words, data, h));
+}
+
 [shader("miss")]
 void miss_scatter(inout Payload p)
 {
     ORR_OMM(miss_scatter);
-    lean_miss(root, DispatchRaysIndex().x);
+    lean_miss<Medium>(root, DispatchRaysIndex().x);
 }
 
 [shader("miss")]

@@ -12,8 +12,8 @@ use ash::vk::TaggedStructure as _;
 use super::debug::name_object;
 use super::device::{Device, Shared};
 use super::garbage::Item;
-use super::specialize;
 use super::spirv;
+use crate::specialize;
 use crate::{CodeStatistics, EntryPoint, Error, ShaderModule, SpecData, Stage};
 
 /// One shader stage of a pipeline: SPIR-V words, the entry point and specialization data.

@@ -206,9 +206,6 @@ pub(crate) struct Entry {
     /// The bytes of shader record data a ray tracing entry reads: the extent of its `uniform`
     /// parameters, which Slang places in the shader record after the group handle.
     pub(super) record_bytes: u32,
-    /// The SPIR-V instructions of the functions the entry reaches
-    /// (`spirv::entry_instructions`).
-    pub(super) instructions: u32,
 }
 
 /// A global parameter other than the root and specialization constants, or an entry-point
@@ -279,7 +276,6 @@ pub(super) fn extract(
     words: &[u32],
 ) -> Result<Model, String> {
     let spv = spirv::Module::parse(words)?;
-    let sizes = spirv::entry_instructions(words);
     let decls = declarations(session);
     let api = &session.lib.api;
     let mut x = Extract {
@@ -290,35 +286,7 @@ pub(super) fn extract(
         structs: BTreeMap::new(),
     };
     // SAFETY: `layout` is the live program layout of the session's linked program.
-    let mut model = unsafe { x.run() }?;
-    // An entry's name in the module is the module's for `main`, else ends in `.` and its
-    // function's name (`entry_symbol`).
-    let others: Vec<String> = model
-        .entries
-        .iter()
-        .filter(|e| e.name != "main")
-        .map(|e| format!(".{}", e.name))
-        .collect();
-    for e in &mut model.entries {
-        let suffix = format!(".{}", e.name);
-        let named: Vec<u32> = sizes
-            .iter()
-            .filter(|(n, _)| match e.name.as_str() {
-                "main" => !others.iter().any(|o| n.ends_with(o.as_str())),
-                _ => n.ends_with(&suffix),
-            })
-            .map(|(_, &count)| count)
-            .collect();
-        let [count] = named[..] else {
-            return Err(format!(
-                "{} SPIR-V entry points are named for {}",
-                named.len(),
-                e.name
-            ));
-        };
-        e.instructions = count;
-    }
-    Ok(model)
+    unsafe { x.run() }
 }
 
 /// Every struct and module-scope variable declared in a module loaded into the session.
@@ -541,7 +509,6 @@ impl Extract<'_> {
                     stage,
                     workgroup,
                     record_bytes,
-                    instructions: 0,
                 });
             }
 

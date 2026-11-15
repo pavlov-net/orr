@@ -33,9 +33,6 @@ pub(super) mod op {
     pub(crate) const SPEC_CONSTANT_TRUE: u16 = 48;
     pub(crate) const SPEC_CONSTANT_FALSE: u16 = 49;
     pub(crate) const SPEC_CONSTANT: u16 = 50;
-    pub(crate) const FUNCTION: u16 = 54;
-    pub(crate) const FUNCTION_END: u16 = 56;
-    pub(crate) const FUNCTION_CALL: u16 = 57;
     pub(crate) const VARIABLE: u16 = 59;
     pub(crate) const PTR_ACCESS_CHAIN: u16 = 67;
     pub(crate) const DECORATE: u16 = 71;
@@ -126,51 +123,6 @@ fn string(words: &[u32]) -> (String, &[u32]) {
         ),
         None => (String::from_utf8_lossy(bytes).into_owned(), &[]),
     }
-}
-
-/// The instructions inside the functions each entry point of the module reaches through its
-/// calls, by the entry's name in the module: what a stage made of that entry hands a driver to
-/// compile, whatever else the module holds.
-pub(crate) fn entry_instructions(words: &[u32]) -> HashMap<String, u32> {
-    let mut entries: Vec<(u32, String)> = Vec::new();
-    // Per function: its instructions and the functions it calls.
-    let mut functions: HashMap<u32, (u32, Vec<u32>)> = HashMap::new();
-    let mut current = None;
-    for (_, inst) in instructions(words) {
-        match inst.op {
-            op::ENTRY_POINT => entries.push((inst.args[1], string(&inst.args[2..]).0)),
-            op::FUNCTION => {
-                current = Some(inst.args[1]);
-                functions.insert(inst.args[1], (0, Vec::new()));
-            }
-            _ => {}
-        }
-        if let Some(f) = current.and_then(|id| functions.get_mut(&id)) {
-            f.0 += 1;
-            if inst.op == op::FUNCTION_CALL {
-                f.1.push(inst.args[2]);
-            }
-        }
-        if inst.op == op::FUNCTION_END {
-            current = None;
-        }
-    }
-    entries
-        .into_iter()
-        .map(|(id, name)| {
-            let mut reached = HashSet::from([id]);
-            let mut stack = vec![id];
-            let mut count = 0;
-            while let Some(f) = stack.pop() {
-                let Some((own, calls)) = functions.get(&f) else {
-                    continue;
-                };
-                count += own;
-                stack.extend(calls.iter().copied().filter(|c| reached.insert(*c)));
-            }
-            (name, count)
-        })
-        .collect()
 }
 
 /// A 64-bit atomic instruction.

@@ -74,6 +74,7 @@ mod world_cache;
 pub use bsdf::BsdfTables;
 pub use caustics::{CausticSettings, CausticStats, MAX_CAUSTIC_CAPACITY_LOG2, MAX_PHOTONS};
 pub use environment::{ENVIRONMENT_SIZE, EnvironmentMapGpu};
+pub use launch::{PIPELINE_CAP, Role, StageSize, over_cap, path_stage_sizes};
 pub use media::{
     AERIAL_SIZE, MAX_FROXEL_SHADOWED_LIGHTS, MAX_PROXY_RAYS, MediaSettings, MediaStats,
 };
@@ -152,6 +153,10 @@ pub enum Error {
         kernel: &'static str,
         message: String,
     },
+    /// A stage of a path pipeline, or the pipeline, is over the cap on what it may hand the
+    /// driver.
+    #[error("path pipeline: {0}")]
+    StageSize(String),
     /// A replacement kernel does not match the module it replaces.
     #[error("kernel {kernel}: {reason}")]
     Kernel {
