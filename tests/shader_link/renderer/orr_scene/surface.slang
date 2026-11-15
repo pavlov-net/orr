@@ -53,6 +53,10 @@ public interface ISurface
     static void coverage_feedback(SurfaceInput i)
     {
     }
+    static uint coverage_reads(SurfaceInput i)
+    {
+        return 0xffffffffu;
+    }
 }
 
 public struct NoSurface : ISurface

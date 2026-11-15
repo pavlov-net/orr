@@ -251,6 +251,21 @@ public VertexAttributes load_attributes(uint8_t* page, PageHeader h, Cluster c, 
     return v;
 }
 
+// The uv sets of vertex `i` and, with `colored`, its color, as `load_attributes` gives them: what
+// an alpha test reads of a corner.
+public void load_coverage_attributes(uint8_t* page, PageHeader h, Cluster c, uint i, uint attributes, bool colored, out float2 uv[2], out float4 color)
+{
+    uint* a = (uint*)(page + h.attrs_offset + (c.vertex_first + i) * h.attr_stride);
+    uint at = (attributes & MESH_TANGENT) != 0 ? 2 : 1;
+    uv[0] = load_uv(a[at++], c, 0);
+    uv[1] = float2(0.0);
+    if ((attributes & MESH_UV1) != 0)
+        uv[1] = load_uv(a[at++], c, 1);
+    color = float4(1.0);
+    if (colored && (attributes & MESH_COLOR) != 0)
+        color = float4(unpack_half2x16(a[at]), unpack_half2x16(a[at + 1]));
+}
+
 // Cluster-local corners of triangle `t`; triangles from `alpha_first` on are alpha-tested.
 public uint3 load_triangle(uint8_t* page, PageHeader h, Cluster c, uint t)
 {
