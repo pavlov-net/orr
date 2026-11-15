@@ -6,7 +6,7 @@ use orr_scene::orr_gpu::{Allocation, Device, GpuPtr, MemoryKind};
 
 use crate::Error;
 use crate::shaders::consts::{
-    LEAN_HOT_WORDS, LEAN_UPDATE_RECORD_WORDS, LEAN_VIEW_RECORD_WORDS, PART_NONE,
+    LEAN_COLD_WORDS, LEAN_HOT_WORDS, LEAN_UPDATE_RECORD_WORDS, LEAN_VIEW_RECORD_WORDS, PART_NONE,
 };
 use crate::shaders::types::LaunchHeader;
 
@@ -47,12 +47,20 @@ pub(crate) struct SourceMemory {
     layout: SlotLayout,
     pub(super) header: Allocation<LaunchHeader>,
     _hot: Allocation<[u32; 4]>,
+    cold: Option<Allocation<[u32; 4]>>,
     _records: Allocation<[u32; 4]>,
 }
 
 impl SourceMemory {
-    /// The slots of `items` paths, at most [`MAX_SLOTS`], laid out as `layout`.
-    fn new(device: &Device, items: u32, layout: SlotLayout, name: &str) -> Result<Self, Error> {
+    /// The slots of `items` paths, at most [`MAX_SLOTS`], laid out as `layout`, with their cold
+    /// words where `cold` holds.
+    fn new(
+        device: &Device,
+        items: u32,
+        layout: SlotLayout,
+        cold: bool,
+        name: &str,
+    ) -> Result<Self, Error> {
         let slots = slots(items);
         let n = u64::from(slots);
         let words = |count: u32, what: &str| {
@@ -63,14 +71,17 @@ impl SourceMemory {
             )
         };
         let hot = words(LEAN_HOT_WORDS, "paths")?;
+        let cold = cold
+            .then(|| words(LEAN_COLD_WORDS, "path interiors"))
+            .transpose()?;
         let records = words(layout.record_words, "path records")?;
         let mut header = device.gpu_malloc::<LaunchHeader>(MemoryKind::Upload, 1, name)?;
         header.as_mut_slice().expect("mapped")[0] = LaunchHeader {
             hot: hot.gpu(),
-            cold: GpuPtr::NULL,
+            cold: cold.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
             scratch: GpuPtr::NULL,
             records: records.gpu(),
-            cold_words: 0,
+            cold_words: if cold.is_some() { LEAN_COLD_WORDS } else { 0 },
             scratch_words: 0,
             walk_at: PART_NONE,
             layer_at: PART_NONE,
@@ -84,6 +95,7 @@ impl SourceMemory {
             layout,
             header,
             _hot: hot,
+            cold,
             _records: records,
         })
     }
@@ -100,12 +112,23 @@ pub(crate) struct LaunchMemory {
 }
 
 impl LaunchMemory {
-    /// Slots for a slice of a view of `pixels` pixels and one of its `update` update paths.
-    pub(crate) fn new(device: &Device, pixels: u32, update: u32) -> Result<Self, Error> {
-        let memory = Self {
-            view: SourceMemory::new(device, pixels, SlotLayout::view(), "launched view")?,
-            update: SourceMemory::new(device, update, SlotLayout::update(), "launched update")?,
-        };
+    /// Slots for a slice of a view of `pixels` pixels and one of its `update` update paths, with
+    /// cold words for the interiors where `cold` holds.
+    pub(crate) fn new(
+        device: &Device,
+        pixels: u32,
+        update: u32,
+        cold: bool,
+    ) -> Result<Self, Error> {
+        let view = SourceMemory::new(device, pixels, SlotLayout::view(), cold, "launched view")?;
+        let update = SourceMemory::new(
+            device,
+            update,
+            SlotLayout::update(),
+            cold,
+            "launched update",
+        )?;
+        let memory = Self { view, update };
         log::debug!(
             "launched paths: {} view slots of {} bytes and {} update slots of {} bytes",
             memory.view.slots,
@@ -117,7 +140,9 @@ impl LaunchMemory {
     }
 
     /// Whether it holds the slots [`Self::new`] makes for its arguments.
-    pub(crate) fn fits(&self, pixels: u32, update: u32) -> bool {
-        self.view.slots == slots(pixels) && self.update.slots == slots(update)
+    pub(crate) fn fits(&self, pixels: u32, update: u32, cold: bool) -> bool {
+        self.view.slots == slots(pixels)
+            && self.update.slots == slots(update)
+            && self.view.cold.is_some() == cold
     }
 }

@@ -16,6 +16,10 @@ import orr_shaders.pipeline;
 // The budget of the common path: what a plain ray pays whatever else its pipeline links.
 // A path's hot state.
 [Host] public static const uint LEAN_HOT_WORDS = 6;
+// The words a path keeps beside its hot ones where the scene may hold a layer or an interior: the
+// interior list (`Interior`: its entries, then where each was entered), and the layers it met
+// beside the extinction of the innermost interior's medium.
+[Host] public static const uint LEAN_COLD_WORDS = 6;
 [Host] public static const uint LEAN_HOT_BYTES = 16 * LEAN_HOT_WORDS;
 // What a raygen keeps across a trace or an invoke, bytes: the driver's stack size of the raygen
 // beyond its hit object.
@@ -52,6 +56,8 @@ import orr_shaders.pipeline;
 // What a hit or first vertex made for surfaces with a coat, a fuzz, a thin film or a thin wall's
 // transmission holds more: those lobes of the BSDF, as far as the scene's mask keeps them.
 [Host] public static const uint RICH_HIT_INSTRUCTIONS = 8500;
+// What a hit made for dielectrics holds more: their transmission and the interiors they bound.
+[Host] public static const uint LAYER_HIT_INSTRUCTIONS = 14000;
 [Host] public static const uint PIPELINE_INSTRUCTIONS = 1000000;
 
 // `PathHot.flags`.
@@ -63,11 +69,13 @@ public static const uint HOT_DIFFUSE = 1 << 4;      // the ray left a diffuse lo
 public static const uint HOT_COUNTED = 1 << 5;      // light its ray meets counts toward the root's mode
 public static const uint HOT_MEDIUM = 1 << 6;       // the ray left a point in a medium, which has no normal
 public static const uint HOT_ARRIVED = 1 << 7;      // an update path's hit left its vertex for the raygen to record
+public static const uint HOT_INTERIOR = 1 << 16;    // the path lies in an interior, which its cold words list
 // From HOT_DEPTH_SHIFT, the vertices the path has scattered at, HOT_DEPTH_MASK at most.
 public static const uint HOT_DEPTH_SHIFT = 8;
 public static const uint HOT_DEPTH_MASK = 0xff;
 // From HOT_DIMENSION_SHIFT, the sampler dimension the path's next draw takes.
-public static const uint HOT_DIMENSION_SHIFT = 16;
+public static const uint HOT_DIMENSION_SHIFT = 17;
+static const uint HOT_BELOW_DIMENSION = (1u << HOT_DIMENSION_SHIFT) - 1;
 
 // A path's hot state as its shaders hold it.
 public struct PathHot
@@ -105,7 +113,7 @@ public struct PathHot
     [mutating]
     public void set_dimension(uint dimension)
     {
-        flags = (flags & 0xffff) | (dimension << HOT_DIMENSION_SHIFT);
+        flags = (flags & HOT_BELOW_DIMENSION) | (dimension << HOT_DIMENSION_SHIFT);
     }
 }
 
@@ -165,7 +173,7 @@ public float3 hot_throughput(uint4 w1)
 // `flags` with the sampler dimension `dimension`.
 public uint hot_flags(uint flags, uint dimension)
 {
-    return (flags & 0xffff) | (dimension << HOT_DIMENSION_SHIFT);
+    return (flags & HOT_BELOW_DIMENSION) | (dimension << HOT_DIMENSION_SHIFT);
 }
 
 // Stores `p` but its shadow job's ray and the rest of its light, which `store_shadow` stores where

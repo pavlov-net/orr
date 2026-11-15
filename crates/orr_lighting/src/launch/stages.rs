@@ -15,13 +15,15 @@ use orr_shaders::surface_declares;
 
 use crate::mask_sets::Members;
 use crate::shaders::consts::{
-    ANY_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, MISS_INSTRUCTIONS,
-    PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
-    PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
+    ANY_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, LAYER_HIT_INSTRUCTIONS,
+    MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS,
+    PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
+    RICH_HIT_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
 };
-use crate::shaders::path::{lean_paths, lean_rich};
+use crate::shaders::path::{lean_layer, lean_paths, lean_rich};
 use crate::staged::{
-    MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_LOBES, MAY_TRACED, MAY_UPDATE, MAY_VIEW,
+    MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_INTERIORS, MAY_LAYERS, MAY_LOBES, MAY_TRACED,
+    MAY_UPDATE, MAY_VIEW,
 };
 use crate::{Error, KernelSet, module};
 
@@ -75,12 +77,14 @@ impl Geometry {
     }
 }
 
-/// The lean kernel a stage comes from: the one whose BSDF has the plain lobes alone, or the one
-/// with a coat, a fuzz, a thin film and a thin wall's transmission too.
+/// The lean kernel a stage comes from: the one whose BSDF has the plain lobes alone, the one
+/// with a coat, a fuzz, a thin film and a thin wall's transmission too, or the dielectric
+/// class's, whose BSDF transmits and whose vertex crosses interiors.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kernel {
     Plain,
     Rich,
+    Layer,
 }
 
 impl Kernel {
@@ -88,6 +92,7 @@ impl Kernel {
         match self {
             Self::Plain => &lean_paths::MODULE,
             Self::Rich => &lean_rich::MODULE,
+            Self::Layer => &lean_layer::MODULE,
         }
     }
 }
@@ -122,10 +127,10 @@ impl Spec {
         } else {
             ""
         };
-        let rich = if self.kernel == Kernel::Rich {
-            ".rich"
-        } else {
-            ""
+        let rich = match self.kernel {
+            Kernel::Plain => "",
+            Kernel::Rich => ".rich",
+            Kernel::Layer => ".layer",
         };
         CString::new(format!("{}{geometry}{surface}{rich}{emitter}", self.entry))
             .expect("no nul in a label")
@@ -156,8 +161,11 @@ impl Spec {
         let traced = if primary { TRACED_HIT_INSTRUCTIONS } else { 0 };
         let emitter = self.role == Role::Hit && self.may & MAY_EMITTER != 0;
         let emitter = if emitter { EMITTER_HIT_INSTRUCTIONS } else { 0 };
-        let rich = self.role == Role::Hit && self.kernel == Kernel::Rich;
-        let rich = if rich { RICH_HIT_INSTRUCTIONS } else { 0 };
+        let rich = match (self.role, self.kernel) {
+            (Role::Hit, Kernel::Rich) => RICH_HIT_INSTRUCTIONS,
+            (Role::Hit, Kernel::Layer) => LAYER_HIT_INSTRUCTIONS,
+            _ => 0,
+        };
         Some(base + if producers { producer } else { 0 } + traced + emitter + rich)
     }
 
@@ -182,6 +190,15 @@ impl Spec {
                 };
                 (s.bytes(), lean_rich::Spec::ENTRIES)
             }
+            Kernel::Layer => {
+                let s = lean_layer::Spec {
+                    path_may: may,
+                    path_may2: may2,
+                    hit_surface: self.hit_surface,
+                    ..lean_layer::Spec::default()
+                };
+                (s.bytes(), lean_layer::Spec::ENTRIES)
+            }
         }
     }
 }
@@ -197,6 +214,9 @@ struct Table {
     /// one of a debug view of the first vertex alone.
     first: u32,
     first_view: Option<u32>,
+    /// The callable that starts a path in the interiors around the eye, where the paths may lie
+    /// in one.
+    eye_interior: Option<u32>,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
 }
@@ -271,6 +291,8 @@ impl Table {
                 },
             )
         });
+        let eye_interior = (may & MAY_INTERIORS != 0)
+            .then(|| Self::stage(&mut specs, folded("eye_interior", Role::Hit)));
         // `hit_surface` of the hit shaders of each pin: any id, then each id from 0 on. Where
         // no surface links every material shows id 0.
         let pinned = |entry, role, pin: u32, geometry: Geometry| Spec {
@@ -331,6 +353,18 @@ impl Table {
                 declared & rich_lobes != 0 || falls_back && linked_factors
             }
         };
+        // Whether pin `pin` may shade a dielectric layer: the standard surface, any id, a linked
+        // type that declares its transmission, and one that leaves hits to the standard surface.
+        let layers = may & MAY_LAYERS != 0;
+        let transmits = |pin: u32| {
+            if surfaces == 0 || pin <= 1 {
+                true
+            } else {
+                let declared = kernels.surface_declares[pin as usize - 2];
+                declared & surface_declares::TRANSMISSION != 0
+                    || declared & surface_declares::ALWAYS_SHADES == 0
+            }
+        };
         let producers = may & may2(SceneFeatures::PRODUCERS) != 0;
         let mut hit_groups = Vec::new();
         let pins = groups.pins();
@@ -338,13 +372,14 @@ impl Table {
         // Each kind: its groups, shaders and geometry, whether the table holds it, and whether its
         // materials may emit and may have a rich lobe. A rich material that emits takes the rich
         // kind.
-        for (first, hit, any_hit, geometry, linked, emissive, rich) in [
+        for (first, hit, any_hit, geometry, linked, emissive, rich, layer) in [
             (
                 &mut groups.path,
                 Some("surface_hit"),
                 "cover_hit",
                 Geometry::Copies,
                 true,
+                false,
                 false,
                 false,
             ),
@@ -356,6 +391,7 @@ impl Table {
                 emits,
                 true,
                 false,
+                false,
             ),
             (
                 &mut groups.rich_path,
@@ -365,6 +401,7 @@ impl Table {
                 lobes,
                 true,
                 true,
+                false,
             ),
             (
                 &mut groups.producer_path,
@@ -372,6 +409,7 @@ impl Table {
                 "cover_hit",
                 Geometry::Producers,
                 producers,
+                false,
                 false,
                 false,
             ),
@@ -383,6 +421,7 @@ impl Table {
                 producers && emits,
                 true,
                 false,
+                false,
             ),
             (
                 &mut groups.producer_rich_path,
@@ -392,6 +431,27 @@ impl Table {
                 producers && lobes,
                 true,
                 true,
+                false,
+            ),
+            (
+                &mut groups.layer_path,
+                Some("surface_hit"),
+                "cover_hit",
+                Geometry::Copies,
+                layers,
+                true,
+                false,
+                true,
+            ),
+            (
+                &mut groups.producer_layer_path,
+                Some("surface_hit"),
+                "cover_hit",
+                Geometry::Producers,
+                producers && layers,
+                true,
+                false,
+                true,
             ),
             (
                 &mut groups.shadow,
@@ -399,6 +459,7 @@ impl Table {
                 "shadow_hit",
                 Geometry::Triangles,
                 true,
+                false,
                 false,
                 false,
             ),
@@ -425,7 +486,9 @@ impl Table {
                         } else {
                             0
                         };
-                        let kernel = if lobed(pin, rich) {
+                        let kernel = if layer && transmits(pin) {
+                            Kernel::Layer
+                        } else if lobed(pin, rich || layer) {
                             Kernel::Rich
                         } else {
                             Kernel::Plain
@@ -453,6 +516,7 @@ impl Table {
             misses,
             first,
             first_view,
+            eye_interior,
             hit_groups,
             groups,
         }
@@ -653,6 +717,7 @@ impl PathPipeline {
             callables: &[
                 Some(ShaderRecord::new(table.first)),
                 table.first_view.map(ShaderRecord::new),
+                table.eye_interior.map(ShaderRecord::new),
             ],
             max_recursion: 1,
             flags: RayPipelineFlags::scene(device.caps()),

@@ -54,6 +54,13 @@ void first_vertex(inout Payload p)
 }
 
 [shader("callable")]
+void eye_interior(inout Payload p)
+{
+    ORR_OMM(eye_interior);
+    lean_eye_interior(root, DispatchRaysIndex().x);
+}
+
+[shader("callable")]
 void first_view(inout Payload p)
 {
     ORR_OMM(first_view);
