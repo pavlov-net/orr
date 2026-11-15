@@ -71,11 +71,12 @@ impl SceneFeatures {
     /// layers of the side it shows.
     pub const COATED_EMITTERS: Self = Self(1 << 22);
     /// Geometry of the dielectric class may show a material that bounds no interior: a
-    /// thin-walled dielectric, a record rewritten under a mesh built as glass, a material set
-    /// over a section cooked as one, or a dielectric producer entry's other material.
+    /// thin-walled dielectric, a record rewritten under a mesh built as glass, a consumer's
+    /// material set over a section cooked as one, a page's set that puts such a material on
+    /// one, or a dielectric producer entry's other material.
     pub const THIN_DIELECTRICS: Self = Self(1 << 23);
     /// The scene may hold a caustic caster: a copy of a model with a caster section, or a
-    /// producer entry of clusters that rays trace while a material casts.
+    /// producer entry of clusters that rays trace with a material that casts.
     pub const CASTERS: Self = Self(1 << 26);
     /// A photon may meet a caster at an opaque vertex, where its chain goes on: a copy of a
     /// model with a caster section of the opaque class, or a producer entry that rays trace as
@@ -88,13 +89,13 @@ impl SceneFeatures {
     /// A record has the coat or fuzz flag, which with [`Self::EMISSIVE`] makes
     /// [`Self::COATED_EMITTERS`].
     const LAYERED: Self = Self(1 << 24);
-    /// A record has the caster flag, which with a producer entry that rays trace makes
+    /// A record has the caster flag, which on a producer entry that rays trace makes
     /// [`Self::CASTERS`].
     const CASTING: Self = Self(1 << 28);
-    /// A plane stack face may bend a directional light's ray: a record has the stack face flag,
-    /// a copy holds a caster entry or the scene a producer entry, either of which can show it
-    /// (`tiles.slang`'s `stack_entry`), and the scene lists no decal, which any face may show
-    /// (`shadow.slang`'s `stack_material`).
+    /// A plane stack face may bend a directional light's ray: a record has the stack face flag
+    /// while a copy holds a caster entry, which can show it, or a producer entry that rays
+    /// trace names such a record (`tiles.slang`'s `stack_entry`), and the scene lists no decal,
+    /// which any face may show (`shadow.slang`'s `stack_material`).
     pub const PLANE_STACKS: Self = Self(1 << 31);
     /// A record has the stack face flag, which with a caster or producer entry makes
     /// [`Self::PLANE_STACKS`].
@@ -282,6 +283,13 @@ impl MaterialFeatures {
     /// Whether any record has the caster flag.
     pub(crate) fn casts(&self) -> bool {
         self.counts[SceneFeatures::CASTING.0.trailing_zeros() as usize] > 0
+    }
+
+    /// Whether material `id`'s record has the stack face flag.
+    pub(crate) fn stack_face(&self, id: u32) -> bool {
+        self.held
+            .get(&id)
+            .is_some_and(|&f| f & SceneFeatures::STACK_FACES.0 != 0)
     }
 
     /// Whether material `id`'s record has the caster flag.

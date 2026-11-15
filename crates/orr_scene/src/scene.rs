@@ -732,8 +732,9 @@ pub(crate) struct SetRow {
     count: u32,
     /// The copies and pages that show it.
     refs: u32,
-    /// A section of its model cooked as a dielectric, which may show a set's material that bounds
-    /// no interior.
+    /// A section of its model cooked as a dielectric may show a material that bounds no
+    /// interior: any section so cooked under a consumer's set, and under a page's set one whose
+    /// material bounds none.
     glass: bool,
 }
 
@@ -745,6 +746,16 @@ pub(crate) struct ModelRows {
 }
 
 impl SceneCpu {
+    /// Keeps what a page's material sets hold from entry `first` of their table on.
+    fn note_page_sets(&mut self, first: u32, set: impl Iterator<Item = MaterialId>) {
+        for (at, m) in (first as usize..).zip(set) {
+            if self.page_sets.len() <= at {
+                self.page_sets.resize(at + 1, MaterialId(0));
+            }
+            self.page_sets[at] = m;
+        }
+    }
+
     /// What the scene itself may hold, beside what the material table's records may show.
     pub(crate) fn features(&self) -> crate::SceneFeatures {
         let mut out = self.lights.features();
@@ -766,7 +777,6 @@ impl SceneCpu {
         if self.hung || self.skinned_high_water > 0 {
             out |= crate::SceneFeatures::SKINNING;
         }
-        // A set shows what the consumer writes into it, which no record of it here vouches for.
         if self.glass_rows > 0 {
             out |= crate::SceneFeatures::THIN_DIELECTRICS;
         }
@@ -807,10 +817,11 @@ pub(crate) struct SceneCpu {
     /// `rows_epoch`.
     model_rows: FxHashMap<u32, ModelRows>,
     rows_epoch: u64,
-    /// The rows of material sets copies show, and how many of them are over sections cooked
-    /// as dielectrics.
+    /// The rows of material sets copies show, and how many of them are glass ([`SetRow`]).
     set_rows: FxHashMap<SetKey, SetRow>,
     glass_rows: u32,
+    /// What the pages' material sets hold, by entry of the table, from a page's placement on.
+    page_sets: Vec<MaterialId>,
     /// The hit tables frames asked for.
     pub(crate) hits: crate::hits::HitTables,
     /// The entry each of the consumer's producers holds, by `ProducerId`.
@@ -1226,6 +1237,7 @@ impl Scene {
         sections: u32,
         model: &ModelRow,
         refs: u32,
+        materials: &MaterialTable,
     ) -> Result<u32> {
         if let Some(row) = cpu.set_rows.get_mut(&key) {
             row.refs += refs;
@@ -1245,10 +1257,12 @@ impl Scene {
             })
             .collect();
         let first = self.take_runs(cpu, device, window, seq, &rows)?;
-        let glass = model
-            .cooked
-            .iter()
-            .any(|&c| SurfaceClass::from_flags(c) == Some(SurfaceClass::Dielectric));
+        // A consumer writes its sets when it likes, so nothing here knows what one holds; a
+        // page's set holds what its pack gave it.
+        let glass = model.cooked.iter().enumerate().any(|(i, &c)| {
+            SurfaceClass::from_flags(c) == Some(SurfaceClass::Dielectric)
+                && (kind == ROW_SET || !materials.bounds_interior(cpu.page_sets[at as usize + i]))
+        });
         cpu.glass_rows += u32::from(glass);
         cpu.set_rows.insert(
             key,
@@ -1997,6 +2011,7 @@ impl Scene {
                 rows_epoch: 0,
                 set_rows: FxHashMap::default(),
                 glass_rows: 0,
+                page_sets: Vec::new(),
                 hits: crate::hits::HitTables::default(),
                 producer_ids: FxHashMap::default(),
                 producers_removed: Vec::new(),
@@ -2533,6 +2548,14 @@ impl<'f> SceneWriter<'f> {
                 (None, None) => NO_MATERIAL_SET,
             });
         }
+        cpu.note_page_sets(
+            set_base,
+            protos
+                .iter()
+                .zip(named)
+                .filter(|(_, base)| base.is_none())
+                .flat_map(|(p, _)| p.sets.iter().flatten().copied()),
+        );
         let mut rows: Vec<SetKey> = Vec::new();
         let mut runs_of = Vec::with_capacity(protos.len());
         for (p, &base) in protos.iter().zip(&bases) {
@@ -2830,6 +2853,7 @@ impl<'f> SceneWriter<'f> {
                 .page_sets
                 .alloc(self.device, set_entries)?;
             if let Some(set) = cooked {
+                cpu.note_page_sets(set_base, set.iter().copied());
                 for (o, m) in sets_out.iter_mut().zip(set) {
                     *o = m.0;
                 }
@@ -3326,6 +3350,7 @@ impl<'f> SceneWriter<'f> {
             sections,
             row,
             refs,
+            self.materials,
         )
     }
 

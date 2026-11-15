@@ -18,20 +18,23 @@ use orr::orr_output::{
 };
 use orr::{
     ArenaReport, AutoExposure, DirectionalLight, DiscProfile, Exposure, FrameDesc, FrameTime,
-    Glare, GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId,
-    LitView, LoadState, MountId, OutputDebug, PackSource, PathEntry, PipelineId, PostQuality,
-    Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId, TextureFilter,
-    TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks, ViewLighting, ViewOutput,
-    ViewTarget,
+    Glare, GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancePageRef, InstancesDesc, Lens,
+    Light, LightId, LitView, LoadState, MountId, OutputDebug, PackSource, PageId, PathEntry,
+    PipelineId, PostQuality, Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId,
+    TextureFilter, TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks, ViewLighting,
+    ViewOutput, ViewTarget,
 };
-use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source};
+use orr_cook::{
+    ArchiveSpec, AssetSpec, Instances, Linear, Manifest, MeshInput, MeshSettings, Placement,
+    PrototypeSpec, SectionSpec, Source,
+};
 use orr_gpu::{
     Allocation, CommandList, Format, GpuPtr, Hazards, MemoryKind, SpecData, Stages, TextureDesc,
     TextureMemory, TextureRegion, TextureUsage,
 };
 use orr_math::{Affine3, DVec3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::Material;
-use orr_pack::{AssetId, Span, Target};
+use orr_pack::{Archive, AssetId, Class, Entry, Span, Target};
 use orr_scene::testing::{assert_clean, device, read_buffer, read_texture, wait};
 use scene_suite::hot::fill;
 
@@ -275,6 +278,40 @@ fn cube() -> MeshInput {
 
 /// A pack of `models`, each a mesh with one material.
 fn pack_of<const N: usize>(models: [(&str, MeshInput, Material); N]) -> Arc<[u8]> {
+    pack_with(models, Vec::new())
+}
+
+/// An instance page of one copy of `model` at the origin that wears `material` on its section.
+fn dressed_page(name: &str, model: &str, material: &str) -> AssetSpec {
+    AssetSpec {
+        name: name.into(),
+        source: Source::Instances(Instances {
+            records: vec![Placement {
+                position: [0.0; 3],
+                linear: Linear::Scaled {
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                    scale: [1.0; 3],
+                },
+                prototype: 0,
+            }],
+            prototypes: vec![PrototypeSpec {
+                model: model.into(),
+                sections: vec![SectionSpec {
+                    material: Some(material.into()),
+                    hidden: false,
+                }],
+                ..PrototypeSpec::default()
+            }],
+            ..Instances::default()
+        }),
+    }
+}
+
+/// A pack of `models`, each a mesh with one material, and `others`.
+fn pack_with<const N: usize>(
+    models: [(&str, MeshInput, Material); N],
+    others: Vec<AssetSpec>,
+) -> Arc<[u8]> {
     let model = |(name, mut mesh, material): (&str, MeshInput, Material)| {
         mesh.sections = vec![Span {
             first: 0,
@@ -292,7 +329,7 @@ fn pack_of<const N: usize>(models: [(&str, MeshInput, Material); N]) -> Arc<[u8]
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
-            models.into_iter().map(model).collect(),
+            models.into_iter().map(model).chain(others).collect(),
         )],
     };
     orr_cook::cook(&manifest, &Default::default())
@@ -725,7 +762,8 @@ fn a_chain_marks_its_scenes_for_ray_candidates() {
 
 /// A material set over a section cooked as glass may show a material that bounds no interior,
 /// which the glass's rays then pass as a thin wall: a scene says it may hold thin dielectrics
-/// from the frame a copy shows such a set, and not before.
+/// from the frame a copy shows a set of the consumer's, whose materials nothing here knows, or
+/// a page's set that puts such a material there, and not for a page's set of other glass.
 #[test]
 fn a_material_set_over_glass_marks_its_scene_for_thin_dielectrics() {
     let d = device();
@@ -741,22 +779,73 @@ fn a_material_set_over_glass_marks_its_scene_for_thin_dielectrics() {
         specular_roughness: 0.0,
         ..Material::default()
     };
-    let pack = pack_of([
-        ("glass", cube(), glass),
-        ("plaster", cube(), Material::default()),
-    ]);
+    let amber = Material {
+        transmission_color: [1.0, 0.6, 0.2],
+        ..glass
+    };
+    let pack = pack_with(
+        [
+            ("glass", cube(), glass),
+            ("amber", cube(), amber),
+            ("plaster", cube(), Material::default()),
+        ],
+        vec![
+            dressed_page("glazed", "glass", "amber/material/0"),
+            dressed_page("plastered", "glass", "plaster/material/0"),
+        ],
+    );
     let mount = mount_pack(&mut r, &pack, &mut frame);
     let model = r.model(mount, AssetId::from_name("glass")).unwrap();
+    let archive = Archive::from_memory(Arc::clone(&pack)).unwrap();
+    let pages = ["glazed/", "plastered/"].map(|prefix| {
+        let is_page = |e: &&Entry| {
+            e.class == Class::InstancePage as u16 && archive.name(e).starts_with(prefix)
+        };
+        let entry = archive.entries().iter().find(is_page).expect("the page");
+        r.instance_page(mount, entry.id).unwrap()
+    });
     let plaster = r
         .material(mount, AssetId::from_name("plaster/material/0"))
         .unwrap();
     loading.stop_workers();
     worker.join().unwrap();
-    let scene = r
-        .create_scene(&SceneDesc::default(), &Default::default())
-        .unwrap();
-    let listed = [scene];
+    let scenes = [(); 2].map(|()| {
+        r.create_scene(&SceneDesc::default(), &Default::default())
+            .unwrap()
+    });
     let thin = orr_scene::SceneFeatures::THIN_DIELECTRICS;
+    let mut placed = |r: &mut Renderer, scene: SceneId, page: PageId| {
+        frame += 1;
+        let listed = [scene];
+        let mut f = r
+            .begin_frame(FrameDesc {
+                time: time(frame),
+                scenes: &listed,
+                display: None,
+            })
+            .unwrap();
+        f.scene(scene)
+            .unwrap()
+            .add_instance_page(&InstancePageRef {
+                page,
+                frame: None,
+                poses: &[],
+                material_sets: &[],
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: 1000.0,
+                animation_range: 0.0,
+                user_tag: 0,
+            })
+            .unwrap();
+        f.update_scenes(&mut |_| {}).unwrap();
+        let features = f.scene_features(scene).unwrap();
+        wait(f.end().unwrap());
+        features
+    };
+    assert!(!placed(&mut r, scenes[1], pages[0]).contains(thin));
+    assert!(placed(&mut r, scenes[1], pages[1]).contains(thin));
+    let scene = scenes[0];
+    let listed = [scene];
     let mut features = |r: &mut Renderer, set: Option<u32>| {
         frame += 1;
         let mut f = r
