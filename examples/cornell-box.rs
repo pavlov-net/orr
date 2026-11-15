@@ -26,7 +26,7 @@ use orr::orr_pack::{AssetId, Target};
 use orr::{
     CausticSettings, Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameStats, FrameTime,
     GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, LitView, PackSource, Projection,
-    ReferenceSettings, Renderer, RendererDesc, ResolvedDisplay, SceneDesc, SceneLightingSettings,
+    ReferenceSettings, Renderer, ResolvedDisplay, SceneDesc, SceneLightingSettings,
     ScreenshotRequest, TextureFilter, TransformGroupDesc, UiPass, ViewHooks, ViewLighting,
     ViewOutput, ViewTarget,
 };
@@ -369,7 +369,7 @@ fn run(options: &Options) -> Option<Capture> {
     let gpu = device();
     let mut window =
         (!options.headless).then(|| Window::new(&title(&cameras[current]), 1920, 1080));
-    let desc = RendererDesc::default();
+    let desc = options.renderer_desc();
     let mut display = window.as_ref().map(|w| {
         Display::new(
             gpu,

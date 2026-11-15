@@ -117,7 +117,7 @@ fn run(options: &Options) {
     let mut window = Window::new("orr dlss", 1920, 1080);
     let desc = RendererDesc {
         kernels: &KERNELS,
-        ..RendererDesc::default()
+        ..options.renderer_desc()
     };
     let request = |encoding: Option<OutputFormat>, hdr: bool| DisplayRequest {
         hdr,
@@ -391,7 +391,7 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
     let mut window = (!options.headless).then(|| Window::new("orr dlss sr", 1920, 1080));
     let desc = RendererDesc {
         kernels: &KERNELS,
-        ..RendererDesc::default()
+        ..options.renderer_desc()
     };
     let mut display = window.as_ref().map(|w| {
         Display::new(

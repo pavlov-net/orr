@@ -20,7 +20,8 @@ use orr::orr_lighting::EnvironmentMapGpu;
 use orr::orr_output::orr_dlss::Uuid;
 use orr::orr_pack::{Archive, AssetId};
 use orr::{
-    FrameDesc, FrameTime, Lens, LoadState, Loading, MountId, PackSource, Renderer, Screenshot,
+    FrameDesc, FrameTime, Lens, LoadState, Loading, MountId, PackSource, PathEntry, Renderer,
+    RendererDesc, Screenshot,
 };
 
 pub mod average;
@@ -267,17 +268,22 @@ pub struct Options {
     pub headless: bool,
     /// Where `main` writes the headless capture.
     pub out: Option<PathBuf>,
+    /// The path tracer views run: `--pipeline-paths` picks the ray tracing pipeline
+    /// (`PathEntry::Pipeline`), else the staged loop's default entry.
+    pub path_entry: PathEntry,
     /// Arguments the example reads itself.
     pub rest: Vec<String>,
 }
 
 impl Options {
-    /// Reads `[--headless] [--frames N] [--out file.png] [other...]` from the command line.
+    /// Reads `[--headless] [--frames N] [--out file.png] [--pipeline-paths] [other...]` from the
+    /// command line.
     pub fn from_args() -> Self {
         let mut o = Options {
             frames: None,
             headless: false,
             out: None,
+            path_entry: PathEntry::default(),
             rest: Vec::new(),
         };
         let mut args = std::env::args().skip(1);
@@ -292,6 +298,7 @@ impl Options {
                     );
                 }
                 "--out" => o.out = Some(args.next().expect("--out takes a path").into()),
+                "--pipeline-paths" => o.path_entry = PathEntry::Pipeline,
                 _ => o.rest.push(a),
             }
         }
@@ -304,7 +311,17 @@ impl Options {
             frames: Some(frames),
             headless: true,
             out: None,
+            path_entry: PathEntry::default(),
             rest: rest.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    /// The renderer description an example starts from: the defaults, with the path tracer the
+    /// command line picks.
+    pub fn renderer_desc(&self) -> RendererDesc {
+        RendererDesc {
+            path_entry: self.path_entry,
+            ..RendererDesc::default()
         }
     }
 

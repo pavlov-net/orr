@@ -17,8 +17,8 @@ use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens,
-    LoadState, PackSource, Projection, Renderer, RendererDesc, SceneDesc, SceneLightingSettings,
-    TextureFilter, TransformGroupDesc, ViewDesc,
+    LoadState, PackSource, Projection, Renderer, SceneDesc, SceneLightingSettings, TextureFilter,
+    TransformGroupDesc, ViewDesc,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Source, TextureSettings,
@@ -59,7 +59,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     let gpu = device();
     let clusters = options.has("--clusters");
     let mut window = (!options.headless).then(|| Window::new("orr cluster-rt", 1920, 1080));
-    let desc = RendererDesc::default();
+    let desc = options.renderer_desc();
     let mut display = window.as_ref().map(|w| {
         Display::new(
             gpu,

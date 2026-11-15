@@ -16,8 +16,8 @@ use orr::orr_output::Image;
 use orr::orr_pack::material::{Material, slot};
 use orr::{
     BoundTexture, ClusterTopology, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter,
-    Lens, MaterialGpu, ProducerId, Projection, Renderer, RendererDesc, SceneDesc,
-    SceneLightingSettings, TextureFilter, TransformGroupDesc, ViewDesc,
+    Lens, MaterialGpu, ProducerId, Projection, Renderer, SceneDesc, SceneLightingSettings,
+    TextureFilter, TransformGroupDesc, ViewDesc,
 };
 use orr_examples::field::{Grass, Heights, Slab, Terrain, blade_triangles, patch_triangles};
 use orr_examples::shaders::{capture, grass, grass_tint, pond, slab, sun_shadow, terrain};
@@ -65,7 +65,7 @@ fn ground(x: f32, z: f32) -> f32 {
 pub(crate) fn run(options: &Options) -> Option<Capture> {
     let gpu = device();
     let mut window = (!options.headless).then(|| Window::new("orr producer-field", 1920, 1080));
-    let desc = RendererDesc::default();
+    let desc = options.renderer_desc();
     let mut display = window.as_ref().map(|w| {
         Display::new(
             gpu,

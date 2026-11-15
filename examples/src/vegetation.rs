@@ -25,8 +25,7 @@
 //! `--exact-frame N` and `--exact-frames K` (the first of the first script's frames whose
 //! passes are timed exactly, with `Renderer::set_exact_timing`, and how many, 3 unless given;
 //! they are not samples), `--stage-passes` (`ViewLighting::stage_passes`: each stage of the path
-//! loop and each froxel kernel in a pass of its own), `--pipeline-paths` (`PathEntry::Pipeline`:
-//! paths through the ray tracing pipeline path tracer), `--froxel-shadowed-lights N`
+//! loop and each froxel kernel in a pass of its own), `--froxel-shadowed-lights N`
 //! (`MediaSettings::froxel_shadowed_lights`), `--counter-frame N` (with the `nsight-perf`
 //! feature: the frame of the first script whose per-pass Nsight Perf SDK counters the run
 //! collects, when the device has `Caps::perf_counters`) and `--counter-metrics A,B,...` (the
@@ -50,11 +49,10 @@ use orr::{
     AffineRows, BoundTexture, ClusterTopology, CopyVariant, DirectionalLight, DiscProfile, Display,
     DisplayRequest, FrameDesc, FrameStats, FrameTime, GroupWriter, InstanceFlags, InstancesDesc,
     Lens, Light, LightId, LightingStats, LitView, LoadState, MaterialGpu, MediaSettings, ModelId,
-    MountId, Opacity, OpaquePass, PackSource, PathEntry, PipelineId, Pose, ProducerDesc,
-    ProducerId, ProducerUpdate, Projection, Renderer, RendererDesc, SceneCompute, SceneDesc,
-    SceneId, SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc,
-    TransformGroupId, TransparencyPass, ViewHistoryId, ViewHooks, ViewLighting, ViewOutput,
-    ViewTarget,
+    MountId, Opacity, OpaquePass, PackSource, PipelineId, Pose, ProducerDesc, ProducerId,
+    ProducerUpdate, Projection, Renderer, RendererDesc, SceneCompute, SceneDesc, SceneId,
+    SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, TransformGroupId,
+    TransparencyPass, ViewHistoryId, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::{Atmosphere, AtmosphereState, MAX_SKY_LIGHTS};
@@ -274,8 +272,6 @@ pub struct Settings {
     pub exact_frames: u64,
     /// `ViewLighting::stage_passes`.
     pub stage_passes: bool,
-    /// Paths run through the ray tracing pipeline (`PathEntry::Pipeline`).
-    pub pipeline_paths: bool,
     /// `MediaSettings::froxel_shadowed_lights`.
     pub froxel_shadowed_lights: u32,
     /// The frame of the first script that is replayed as a counter frame.
@@ -319,7 +315,6 @@ impl Settings {
             exact_frame: None,
             exact_frames: 3,
             stage_passes: false,
-            pipeline_paths: false,
             froxel_shadowed_lights: MediaSettings::default().froxel_shadowed_lights,
             #[cfg(feature = "nsight-perf")]
             counter_frame: None,
@@ -395,7 +390,6 @@ impl Settings {
                 "--exact-frame" => s.exact_frame = Some(number(value()) as u64),
                 "--exact-frames" => s.exact_frames = number(value()) as u64,
                 "--stage-passes" => s.stage_passes = true,
-                "--pipeline-paths" => s.pipeline_paths = true,
                 "--froxel-shadowed-lights" => {
                     s.froxel_shadowed_lights = number(value()) as u32;
                 }
@@ -985,7 +979,7 @@ fn mount(renderer: &mut Renderer, source: PackSource, mut frame: u64) -> (MountI
 const FIRST_FRAME: u64 = 1000;
 
 /// The renderer's settings for `settings`.
-fn renderer_desc(settings: &Settings) -> RendererDesc {
+fn renderer_desc(options: &Options, settings: &Settings) -> RendererDesc {
     RendererDesc {
         kernels: match settings.grass {
             GrassMode::Drawn | GrassMode::Stored => &crate::linked_blades::KERNELS,
@@ -998,12 +992,7 @@ fn renderer_desc(settings: &Settings) -> RendererDesc {
         } else {
             RendererDesc::default().raster_error_pixels
         },
-        path_entry: if settings.pipeline_paths {
-            PathEntry::Pipeline
-        } else {
-            PathEntry::default()
-        },
-        ..RendererDesc::default()
+        ..options.renderer_desc()
     }
 }
 
@@ -1152,7 +1141,7 @@ impl DenseVegetation {
         };
         let blade_field =
             matches!(settings.grass, GrassMode::Drawn | GrassMode::Stored).then(|| {
-                let fif = renderer_desc(settings).frames_in_flight;
+                let fif = RendererDesc::default().frames_in_flight;
                 Blades::new(renderer, gpu, MEADOW, MEADOW_SIDE, settings.blades, fif)
             });
         let glow = gpu
@@ -1638,7 +1627,7 @@ const WARM_UP: u64 = 20;
 pub fn run(options: &Options, settings: &Settings) -> Run {
     let gpu = device();
     let mut window = (!options.headless).then(|| Window::new("orr dense vegetation", 1920, 1080));
-    let desc = renderer_desc(settings);
+    let desc = renderer_desc(options, settings);
     let mut display = window.as_ref().map(|w| {
         Display::new(
             gpu,

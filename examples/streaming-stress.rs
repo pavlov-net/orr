@@ -262,7 +262,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             mesh_resident_max: 0,
             ..Budgets::default()
         },
-        ..RendererDesc::default()
+        ..options.renderer_desc()
     };
     let mut window = (!options.headless).then(|| Window::new("orr streaming stress", 1920, 1080));
     let mut display = window.as_ref().map(|w| {

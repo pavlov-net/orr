@@ -18,8 +18,8 @@ use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens,
-    PackSource, Projection, Renderer, RendererDesc, SceneDesc, SceneLightingSettings, SkinnedDesc,
-    TextureFilter, TransformGroupDesc, ViewDesc,
+    PackSource, Projection, Renderer, SceneDesc, SceneLightingSettings, SkinnedDesc, TextureFilter,
+    TransformGroupDesc, ViewDesc,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MeshInput, MeshSettings, Source,
@@ -63,7 +63,7 @@ fn main() {
 pub(crate) fn run(options: &Options) -> Option<Capture> {
     let gpu = device();
     let mut window = (!options.headless).then(|| Window::new("orr skinned", 1920, 1080));
-    let desc = RendererDesc::default();
+    let desc = options.renderer_desc();
     let mut display = window.as_ref().map(|w| {
         Display::new(
             gpu,
