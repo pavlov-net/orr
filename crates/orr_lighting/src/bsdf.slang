@@ -379,6 +379,69 @@ public struct Bsdf : IDifferentiable
         return density;
     }
 
+    // `pdf` without the value: what a caller that picks among directions weighs one by before
+    // it evaluates its pick. Each lobe `evaluate` adds has its density here.
+    public float density(float3 wi)
+    {
+        float3 l = local(wi);
+        if (l.z == 0.0)
+            return 0.0;
+        if (!class_has(CLASS_TRANSMISSION | CLASS_THIN | CLASS_SUBSURFACE) && !(l.z > 0.0))
+            return 0.0;
+        float pdf = 0.0;
+        if (class_has(CLASS_COAT) && may(MAY_COAT) && probability[COAT] > 0.0 && !coat_mirror)
+        {
+            float3 c = in_frame(l, coat_basis);
+            if (c.z > 0.0)
+                pdf += probability[COAT] * ggx_vndf_bounded_pdf(coat_v, c, coat_alpha);
+        }
+        if (class_has(CLASS_FUZZ) && may(MAY_FUZZ) && probability[FUZZ] > 0.0)
+        {
+            float3 f = in_frame(l, fuzz_basis);
+            if (f.z > 0.0)
+                pdf += probability[FUZZ] * ltc_eval(view_aligned(f, float2(fuzz_v.x, -fuzz_v.y)));
+        }
+        if (l.z > 0.0)
+            pdf += probability[DIFFUSE] * l.z * INV_PI + probability[METAL_MS] * INV_TWO_PI;
+        else if (class_has(CLASS_THIN | CLASS_SUBSURFACE))
+        {
+            float3 m = mirrored(l);
+            pdf += probability[THIN_DIFFUSE] * m.z * INV_PI;
+            if (probability[THIN_SPECULAR] > 0.0 && !mirror)
+                pdf += probability[THIN_SPECULAR] * ggx_vndf_bounded_pdf(v, m, alpha);
+            if (probability[WALK] > 0.0)
+            {
+                float lobe = walk_ms_share * INV_TWO_PI;
+                if (class_has(CLASS_SUBSURFACE) && !mirror)
+                {
+                    Facet f = facet(l);
+                    if (f.valid)
+                        lobe += (1.0 - walk_ms_share) * f.d * g1v * f.jacobian;
+                }
+                pdf += probability[WALK] * lobe;
+            }
+        }
+        if (probability[SPECULAR] > 0.0 && !mirror)
+        {
+            // Reflection drawn by the bounded visible normals takes no coefficient of the facet.
+            if (bounded)
+            {
+                if (l.z > 0.0)
+                    pdf += probability[SPECULAR] * ggx_vndf_bounded_pdf(v, l, alpha);
+            }
+            else if (l.z > 0.0 || class_has(CLASS_TRANSMISSION))
+            {
+                float lobe;
+                float shape;
+                specular_lobe(l, facet_coefficients(l), lobe, shape);
+                pdf += probability[SPECULAR] * lobe;
+            }
+        }
+        if (probability[DIELECTRIC_MS] > 0.0)
+            pdf += probability[DIELECTRIC_MS] * INV_TWO_PI * (l.z > 0.0 ? dms_ratio : 1.0 - dms_ratio);
+        return pdf;
+    }
+
     // The direction `sample` draws from three uniform numbers in [0, 1), before its value: a
     // caller that evaluates other directions too evaluates it among them (`eval_and_pdf` at
     // `wi`, unless it is `delta`) and makes the sample of it with `drawn_sample`, so its kernel

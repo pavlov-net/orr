@@ -38,6 +38,11 @@ export __extern_cpp float lighting_bsdf_pdf(Bsdf* p, float* wi)
     return p.pdf(load3(wi));
 }
 
+export __extern_cpp float lighting_bsdf_density(Bsdf* p, float* wi)
+{
+    return p.density(load3(wi));
+}
+
 export __extern_cpp uint lighting_bsdf_specular_only(Bsdf* p)
 {
     return p.specular_only() ? 1 : 0;

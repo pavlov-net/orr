@@ -65,6 +65,12 @@ impl RealTime {
         Self::with_collapse(false)
     }
 
+    /// `Bsdf.density` toward `wi`.
+    pub fn density(&self, wi: V3) -> f32 {
+        // SAFETY: as in `eval`.
+        unsafe { ffi::lighting_bsdf_density(self.ptr(), wi.as_ptr()) }
+    }
+
     /// Prepares every material through `bsdf_collapse` first.
     pub fn collapsed() -> Self {
         Self::with_collapse(true)
@@ -450,6 +456,7 @@ mod ffi {
             specular: *mut f32,
         );
         pub(crate) fn lighting_bsdf_pdf(p: *const c_void, wi: *const f32) -> f32;
+        pub(crate) fn lighting_bsdf_density(p: *const c_void, wi: *const f32) -> f32;
         pub(crate) fn lighting_bsdf_specular_only(p: *const c_void) -> u32;
         pub(crate) fn lighting_bsdf_sample(
             p: *const c_void,
