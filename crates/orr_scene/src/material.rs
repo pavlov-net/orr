@@ -72,6 +72,22 @@ pub mod material_flags {
     pub const MEDIUM_TEXTURED: u32 = 1 << 31;
 }
 
+/// `MaterialGpu::lobes` bits (`material.slang`'s `MATERIAL_LOBE_*`): what a material's surface may show
+/// beyond the plain part. The material table sets them on every record it stores, from the
+/// record's weights, which the standard surface shades by, and from what the record's linked
+/// surface type declares.
+pub mod material_lobes {
+    pub const TRANSMISSION: u32 = 1 << 0;
+    pub const SUBSURFACE: u32 = 1 << 1;
+    pub const COAT: u32 = 1 << 2;
+    pub const FUZZ: u32 = 1 << 3;
+    pub const THIN_FILM: u32 = 1 << 4;
+    pub const EMISSION: u32 = 1 << 5;
+    pub const ANISOTROPY: u32 = 1 << 6;
+    /// The lobes a path's rich stages hold.
+    pub const RICH: u32 = SUBSURFACE | COAT | FUZZ | THIN_FILM;
+}
+
 /// `TEXTURE_TILED`, beside the filter bits in `TextureSamplerGpu::modes`.
 pub(crate) const TILED: u32 = 1 << 10;
 /// `TEXTURE_UV_SET`, `TEXTURE_CHANNEL_SHIFT` and `TEXTURE_PRIMARIES_SHIFT`.
@@ -286,6 +302,8 @@ impl MaterialGpu {
             transmission_dispersion_scale: m.transmission_dispersion_scale,
             transmission_dispersion_abbe_number: m.transmission_dispersion_abbe_number,
             back: 0,
+            lobes: 0,
+            _pad: 0,
             data: 0,
             texture_streams: GpuPtr::NULL,
             tiles: textures.map(|t| t.tiles),
@@ -311,6 +329,10 @@ pub(crate) struct MaterialTable {
     /// Counts the records whose `hit_key` changed: a hit table written before then is rewritten
     /// whole.
     hit_epoch: AtomicU64,
+    /// What each linked surface type declares (`KernelSet::surface_declares`), by id from 1.
+    declares: &'static [u32],
+    /// By material, the materials that name it as their back.
+    fronts: Mutex<HashMap<u32, HashSet<u32>>>,
 }
 
 /// What `orr_scene.runs`' `hit_data` and `sbt.slang`'s pin read of a record: the flags they test,
@@ -319,11 +341,7 @@ fn hit_key(m: &MaterialGpu) -> [u32; 4] {
     use material_flags as f;
     let flags =
         f::ALPHA_TESTED | f::THIN_WALLED | f::DIELECTRIC | f::PRESENCE | f::EMISSIVE | f::HAS_BACK;
-    let lobed = m.surface != 0
-        || m.coat_weight > 0.0
-        || m.fuzz_weight > 0.0
-        || m.thin_film_weight > 0.0
-        || m.subsurface_weight > 0.0;
+    let lobed = m.lobes & material_lobes::RICH != 0;
     [m.flags & flags, m.back, m.surface, u32::from(lobed)]
 }
 
@@ -347,18 +365,79 @@ fn stack_face(m: &MaterialGpu) -> bool {
         && (1.0 - m.metalness) * m.transmission_weight > 0.0
 }
 
-/// Whether pixels of `m` may use the extended G-buffer targets. A linked surface may set any
-/// lobe.
-fn needs_extended(m: &MaterialGpu) -> bool {
-    use material_flags as f;
-    let thin_sss = m.flags & f::THIN_WALLED != 0 && m.subsurface_weight > 0.0;
+/// Whether pixels of `m` may use the extended G-buffer targets: by its record where the
+/// standard surface shades it, and by the lobes `declared` of its linked surface type.
+fn needs_extended(m: &MaterialGpu, declared: u32) -> bool {
+    use {material_flags as f, material_lobes as l};
+    let subsurface = m.subsurface_weight > 0.0 || declared & l::SUBSURFACE != 0;
+    let thin_sss = m.flags & f::THIN_WALLED != 0 && subsurface;
     let lobes = f::SUBSURFACE | f::COAT | f::FUZZ | f::THIN_FILM | f::ANISOTROPY;
-    thin_sss || m.flags & lobes != 0 || m.surface != 0
+    thin_sss || m.flags & lobes != 0 || declared & (l::RICH | l::ANISOTROPY) != 0
+}
+
+/// What the linked type of surface id `surface` declares among `declares`, the types' by id
+/// from 1; nothing for id 0 and an id nothing links, which the standard surface shades.
+fn declared(declares: &[u32], surface: u32) -> u32 {
+    (surface as usize)
+        .checked_sub(1)
+        .and_then(|i| declares.get(i))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// The lobes that the linked type of surface id `surface` declares.
+fn declared_lobes(declares: &[u32], surface: u32) -> u32 {
+    use {material_lobes as l, orr_shaders::surface_declares as d};
+    let declared = declared(declares, surface);
+    [
+        (d::TRANSMISSION, l::TRANSMISSION),
+        (d::SUBSURFACE, l::SUBSURFACE),
+        (d::COAT, l::COAT),
+        (d::FUZZ, l::FUZZ),
+        (d::THIN_FILM, l::THIN_FILM),
+        (d::EMISSION, l::EMISSION),
+        (d::ANISOTROPY, l::ANISOTROPY),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| declared & bit != 0)
+    .fold(0, |lobes, (_, lobe)| lobes | lobe)
+}
+
+/// `MaterialGpu::lobes` of record `m`: the lobes its weights give it where the standard surface
+/// shades it, and those its linked type declares.
+pub(crate) fn record_lobes(m: &MaterialGpu, declares: &[u32]) -> u32 {
+    use {material_flags as f, material_lobes as l};
+    let own = [
+        (m.transmission_weight > 0.0, l::TRANSMISSION),
+        (m.subsurface_weight > 0.0, l::SUBSURFACE),
+        (m.coat_weight > 0.0, l::COAT),
+        (m.fuzz_weight > 0.0, l::FUZZ),
+        (m.thin_film_weight > 0.0, l::THIN_FILM),
+        (m.emission_luminance != 0.0, l::EMISSION),
+        (m.flags & f::ANISOTROPY != 0, l::ANISOTROPY),
+    ]
+    .into_iter()
+    .filter(|(on, _)| *on)
+    .fold(0, |lobes, (_, lobe)| lobes | lobe);
+    own | declared_lobes(declares, m.surface)
+}
+
+/// Whether a material of surface id `front` may have one of surface id `back` as its back:
+/// hit shaders made for one linked type shade neither side of another's, so the two are one id
+/// or a linked type among them declares its other side.
+fn sides(declares: &[u32], front: u32, back: u32) -> bool {
+    // An id nothing links is the standard surface's, as id 0 is.
+    let linked = |id: u32| if id as usize <= declares.len() { id } else { 0 };
+    let (front, back) = (linked(front), linked(back));
+    let either = declared(declares, front) | declared(declares, back);
+    front == back || either & orr_shaders::surface_declares::OTHER_SIDE != 0
 }
 
 impl MaterialTable {
-    pub(crate) fn new(device: &Device) -> Result<Self> {
+    pub(crate) fn new(device: &Device, declares: &'static [u32]) -> Result<Self> {
         Ok(Self {
+            declares,
+            fronts: Mutex::new(HashMap::new()),
             table: Table::new(device, MemoryPriority::Normal, "materials")?,
             streams: device.gpu_malloc(
                 MemoryKind::DeviceLocal,
@@ -374,18 +453,70 @@ impl MaterialTable {
     }
 
     /// `m` as the table stores it: pointing at the texture stream table, with the stack face
-    /// flag as its other fields decide.
+    /// flag as its other fields decide and the lobes its surface may show.
     pub(crate) fn record(&self, m: &MaterialGpu) -> MaterialGpu {
         use material_flags as f;
         let stack = if stack_face(m) { f::STACK_FACE } else { 0 };
         MaterialGpu {
             texture_streams: self.streams.gpu(),
             flags: m.flags & !f::STACK_FACE | stack,
+            lobes: record_lobes(m, self.declares),
             ..*m
         }
     }
 
-    /// Records what material `id` now holds: `m`, as [`Self::record`] gave it.
+    /// Fails where `m` as material `id` would share a triangle with a material of another
+    /// surface id that neither linked type declares ([`sides`]): as the front of its back, or
+    /// as the back of the materials that name it.
+    pub(crate) fn check_sides(&self, id: MaterialId, m: &MaterialGpu) -> Result<()> {
+        use material_flags as f;
+        let keys = self.hit_keys.lock().unwrap();
+        if m.flags & f::HAS_BACK != 0 {
+            let back = if m.back == id.0 {
+                Some(m.surface)
+            } else {
+                keys.get(&m.back).map(|k| k[2])
+            };
+            if back.is_some_and(|back| !sides(self.declares, m.surface, back)) {
+                return Err(crate::Error::UndeclaredOtherSide {
+                    front: id,
+                    back: MaterialId(m.back),
+                });
+            }
+        }
+        let fronts = self.fronts.lock().unwrap();
+        for &front in fronts.get(&id.0).into_iter().flatten() {
+            if front != id.0 && !sides(self.declares, keys[&front][2], m.surface) {
+                return Err(crate::Error::UndeclaredOtherSide {
+                    front: MaterialId(front),
+                    back: id,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Material `id` names `back` as its back in place of `was`.
+    fn note_back(&self, id: u32, was: Option<u32>, back: Option<u32>) {
+        if was == back {
+            return;
+        }
+        let mut fronts = self.fronts.lock().unwrap();
+        if let Some(was) = was
+            && let Some(set) = fronts.get_mut(&was)
+        {
+            set.remove(&id);
+            if set.is_empty() {
+                fronts.remove(&was);
+            }
+        }
+        if let Some(back) = back {
+            fronts.entry(back).or_default().insert(id);
+        }
+    }
+
+    /// Records what material `id` now holds: `m`, as [`Self::record`] gave it and
+    /// [`Self::check_sides`] passed it.
     pub(crate) fn note(&self, id: MaterialId, m: &MaterialGpu) {
         let mark = |set: &Mutex<HashSet<u32>>, on: bool| {
             let mut set = set.lock().unwrap();
@@ -395,7 +526,10 @@ impl MaterialTable {
                 set.remove(&id.0);
             }
         };
-        mark(&self.extended, needs_extended(m));
+        mark(
+            &self.extended,
+            needs_extended(m, declared_lobes(self.declares, m.surface)),
+        );
         self.features
             .lock()
             .unwrap()
@@ -405,7 +539,10 @@ impl MaterialTable {
             m.flags & material_flags::DISPLACEMENT_WORLD != 0,
         );
         let key = hit_key(m);
-        if self.hit_keys.lock().unwrap().insert(id.0, key) != Some(key) {
+        let was = self.hit_keys.lock().unwrap().insert(id.0, key);
+        let back = |k: [u32; 4]| (k[0] & material_flags::HAS_BACK != 0).then_some(k[1]);
+        self.note_back(id.0, was.and_then(back), back(key));
+        if was != Some(key) {
             self.hit_epoch.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -462,7 +599,9 @@ impl MaterialTable {
         self.extended.lock().unwrap().remove(&id.0);
         self.features.lock().unwrap().free(id.0);
         self.world_lengths.lock().unwrap().remove(&id.0);
-        self.hit_keys.lock().unwrap().remove(&id.0);
+        let was = self.hit_keys.lock().unwrap().remove(&id.0);
+        let back = |k: [u32; 4]| (k[0] & material_flags::HAS_BACK != 0).then_some(k[1]);
+        self.note_back(id.0, was.and_then(back), None);
         self.table.free(id.0, 1);
     }
 }
@@ -480,7 +619,10 @@ impl MaterialWriter<'_> {
     /// A new material holding `m`.
     pub fn create(&mut self, m: &MaterialGpu) -> Result<MaterialId> {
         let id = self.table.alloc(self.device)?;
-        self.update(id, m)?;
+        if let Err(e) = self.update(id, m) {
+            self.table.free(id);
+            return Err(e);
+        }
         Ok(id)
     }
 
@@ -495,6 +637,7 @@ impl MaterialWriter<'_> {
             "{id:?} is outside the material table"
         );
         let record = self.table.record(m);
+        self.table.check_sides(id, &record)?;
         let src = self.window.put(self.device, &record)?;
         self.table.note(id, &record);
         let dst = self.table.table.entry(id.0);
@@ -510,6 +653,43 @@ impl MaterialWriter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A linked record shows the lobes of its type's lobe methods and of its own weights and
+    /// no others, walks only off a thin wall, and stands back to back with another surface id
+    /// only where one of the two types declares its other side.
+    #[test]
+    fn a_linked_record_shows_what_its_type_declares() {
+        use orr_shaders::surface_declares as d;
+        use {SceneFeatures as F, material_flags as f};
+        let declares = [0, d::SUBSURFACE | d::EMISSION, d::OTHER_SIDE];
+        let features = |surface: u32, edit: fn(&mut MaterialGpu)| {
+            let mut m: MaterialGpu = Zeroable::zeroed();
+            m.surface = surface;
+            edit(&mut m);
+            m.lobes = record_lobes(&m, &declares);
+            F::of_material(&m)
+        };
+        let linked = F::LINKED_SURFACES;
+        assert_eq!(features(1, |_| {}), linked);
+        assert_eq!(features(1, |m| m.coat_weight = 0.5), linked | F::COAT);
+        assert_eq!(
+            features(2, |_| {}),
+            linked | F::SUBSURFACE | F::EMISSIVE | F::WALKING
+        );
+        assert_eq!(
+            features(2, |m| m.flags = f::THIN_WALLED),
+            linked | F::SUBSURFACE | F::EMISSIVE
+        );
+        assert_eq!(features(4, |_| {}), linked, "an id nothing links");
+
+        assert!(sides(&declares, 1, 1));
+        assert!(!sides(&declares, 1, 0) && !sides(&declares, 0, 2) && !sides(&declares, 1, 2));
+        assert!(sides(&declares, 0, 3) && sides(&declares, 3, 1));
+        assert!(
+            sides(&declares, 0, 7),
+            "an id nothing links is the standard's"
+        );
+    }
 
     #[test]
     fn cooked_materials_take_their_flags_cost_class_and_slot_bits() {

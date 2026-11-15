@@ -111,8 +111,9 @@ fn every_surface_method_reaches_the_type_linked_for_its_id() {
                 if c.depth == 0 { 0.5 } else { 0.0 },
                 0.25,
             ),
-            // Moss adjusts StandardSurface past depth 0.
-            s if s == u32::from(MOSS) && c.depth > 0 => ([0.5, 0.5, 0.5, c.cone_width], 0.25, 0.25),
+            // Moss adjusts StandardSurface past depth 0, and its fuzz shows at every depth.
+            s if s == u32::from(MOSS) && c.depth > 0 => ([4.5, 0.5, 0.5, c.cone_width], 0.25, 0.25),
+            s if s == u32::from(MOSS) => ([4.5, 0.5, 0.5, 1.0], 0.0, 0.25),
             // StandardSurface, for id 0 and for an id nothing links to.
             _ => ([0.5, 0.5, 0.5, 1.0], 0.0, 0.25),
         };

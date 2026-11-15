@@ -46,6 +46,8 @@ public static const uint MAY2_THIN_DIELECTRICS = 1 << 9;
 // A neural texture set may stand in for a texture a kernel that exports `NEURAL_TEXTURES` reads:
 // a texture's record names one (`TextureStreamGpu.neural`).
 public static const uint MAY2_NEURAL_TEXTURES = 1 << 10;
+// A material may be of a linked surface type, which shades its hits.
+public static const uint MAY2_LINKED = 1 << 11;
 
 public bool may2(uint bit)
 {

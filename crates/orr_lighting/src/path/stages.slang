@@ -65,9 +65,10 @@ __exported import orr_lighting.path.common;
 [Host] public static const uint QUEUE_WALK = 2;
 [Host] public static const uint QUEUE_TRACE = 3;
 [Host] public static const uint QUEUE_FINISH = 4;
-// Opaque vertices whose surface may have a coat, fuzz, a thin film or a subsurface weight, or
-// that the trace stage reads no material for. QUEUE_OPAQUE's pipeline is compiled without
-// those lobes; with none in the scene every opaque vertex goes there.
+// Opaque vertices whose surface may have a coat, fuzz, a thin film or a subsurface weight or is
+// of a linked type, or that the trace stage reads no material for. QUEUE_OPAQUE's pipeline is
+// compiled without those lobes and without the linked types; with neither in the scene every
+// opaque vertex goes there.
 [Host] public static const uint QUEUE_RICH = 5;
 [Host] public static const uint STAGE_QUEUES = 6;
 // Not a queue: the shade stage `K` of the primary stage, which shades only the vertex a path
@@ -1134,15 +1135,16 @@ struct MayAccept<A : IAnyHit> : IAnyHit
     }
 }
 
-// Whether material `material` may give a surface one of MAY_LOBES' lobes, on either side.
+// Whether material `material` may give a surface one of MAY_LOBES' lobes or shades through a
+// linked type, on either side.
 bool rich_material(SceneRoot* s, uint material)
 {
     MaterialGpu* m = s.materials + material;
-    bool rich = m.surface != 0 || m.coat_weight > 0.0 || m.fuzz_weight > 0.0 || m.thin_film_weight > 0.0 || m.subsurface_weight > 0.0;
+    bool rich = (m.lobes & MATERIAL_LOBES_RICH) != 0 || m.surface != 0;
     if (!rich && (m.flags & MATERIAL_HAS_BACK) != 0)
     {
         MaterialGpu* b = s.materials + m.back;
-        rich = b.surface != 0 || b.coat_weight > 0.0 || b.fuzz_weight > 0.0 || b.thin_film_weight > 0.0 || b.subsurface_weight > 0.0;
+        rich = (b.lobes & MATERIAL_LOBES_RICH) != 0 || b.surface != 0;
     }
     return rich;
 }
@@ -1151,7 +1153,7 @@ bool rich_material(SceneRoot* s, uint material)
 // material this stage does not read.
 uint opaque_queue(SceneRoot* s, Hit h, bool gbuffer)
 {
-    if (!may_any(MAY_LOBES))
+    if (!may_any(MAY_LOBES) && !may2(MAY2_LINKED))
         return QUEUE_OPAQUE;
     uint material = gbuffer ? MATERIAL_NONE : hit_material(s, h);
     return material == MATERIAL_NONE || rich_material(s, material) ? QUEUE_RICH : QUEUE_OPAQUE;
@@ -2173,8 +2175,8 @@ bool vertex_scatter<S : ISurfaces, let X : uint, R : IPathRecord>(PathRoot r, Pa
         spread = delta ? 0.0 : diffuse ? 1.0 : 2.0 * roughness * roughness;
         // The walk takes the place of an opaque vertex's ray.
         walking = record.walks() && alive && (bs.lobe & LOBE_VOLUME) != 0;
-        crossed = on_layer && (bs.lobe & LOBE_TRANSMISSION) != 0 && crosses_interior(s, l.section);
-        null_crossing = on_layer && delta && (bs.lobe & LOBE_TRANSMISSION) != 0 && thin_walled(l.x.surface);
+        crossed = on_layer && (bs.lobe & MATERIAL_LOBE_TRANSMISSION) != 0 && crosses_interior(s, l.section);
+        null_crossing = on_layer && delta && (bs.lobe & MATERIAL_LOBE_TRANSMISSION) != 0 && thin_walled(l.x.surface);
         stack_crossing = may(MAY_STACK) && crossed && delta && c.stack.valid && c.stack.crossed < STACK_CROSSINGS && l.stack
             && (c.stack.crossed == 0 || abs(dot(l.x.surface.normal, c.stack.normal)) >= STACK_PARALLEL);
         float3 chained = max(bs.weight - bs.diffuse, 0.0);

@@ -3983,6 +3983,7 @@ impl Mounts {
         }
         for (m, &mid) in records.iter().zip(&material_ids) {
             let record = w.materials.record(m);
+            w.materials.check_sides(mid, &record)?;
             w.materials.note(mid, &record);
             w.put(w.materials.table.entry(mid.0), &[record])?;
         }

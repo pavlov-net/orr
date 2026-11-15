@@ -34,16 +34,23 @@ fn every_surface_method_reaches_the_type_linked_for_its_id() {
                 "an id nothing links to falls back to the default"
             );
 
-            // Moss adjusts StandardSurface past depth 0.
+            // Moss adjusts StandardSurface past depth 0, and its fuzz, the one lobe method
+            // among the three types, shows on it alone.
             let moss = call(MOSS);
             if depth == 0 {
-                assert_eq!(moss, standard);
+                assert_eq!(moss.albedo, [4.5, 0.5, 0.5, 1.0]);
+                assert_eq!((moss.depth_offset, moss.coverage), (0.0, 0.25));
             } else {
-                assert_eq!(moss.albedo, [0.5, 0.5, 0.5, 0.01]);
+                assert_eq!(moss.albedo, [4.5, 0.5, 0.5, 0.01]);
                 assert_eq!((moss.depth_offset, moss.coverage), (0.25, 0.25));
             }
         }
     }
+    assert_eq!(
+        linked::KERNELS.surface_declares,
+        [0, 0, orr_shaders::surface_declares::FUZZ],
+        "what each type declares, in link order"
+    );
 }
 
 #[test]

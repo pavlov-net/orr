@@ -11,12 +11,13 @@ use orr_scene::orr_gpu::{
     ShaderStage, SpecData, SpecEntry, handed_instructions,
 };
 use orr_scene::{HitGroups, Loading, SceneFeatures};
+use orr_shaders::surface_declares;
 
 use crate::mask_sets::Members;
 use crate::shaders::consts::{
-    ANY_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, LINKED_ANY_HIT_INSTRUCTIONS, LINKED_HIT_INSTRUCTIONS,
-    MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS,
-    PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
+    ANY_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE,
+    PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
+    PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
 };
 use crate::shaders::path::lean_paths;
 use crate::staged::{MAY_UPDATE, MAY_VIEW};
@@ -98,26 +99,26 @@ impl Spec {
         CString::new(format!("{}{geometry}{surface}", self.entry)).expect("no nul in a label")
     }
 
+    /// Whether the stage is made for a linked surface type, or for any of them.
+    fn linked(&self, surfaces: u32) -> bool {
+        surfaces != 0 && self.hit_surface != 0 && self.geometry.is_some()
+    }
+
     /// The most instructions the stage may hand the driver: its role's, with what a producer
-    /// entry's geometry and a linked surface's own code add to a hit or an any-hit shader.
-    fn cap(&self, surfaces: u32) -> u32 {
+    /// entry's geometry adds to a hit or an any-hit shader. A stage made for a linked surface
+    /// has none of its own: it holds the application's code beside the standard stage's.
+    fn cap(&self, surfaces: u32) -> Option<u32> {
+        if self.linked(surfaces) {
+            return None;
+        }
         let producers = !matches!(self.geometry, None | Some(Geometry::Copies));
-        let linked = surfaces != 0 && self.hit_surface != 0 && self.geometry.is_some();
-        let (base, producer, own) = match self.role {
-            Role::Raygen => return RAYGEN_INSTRUCTIONS,
-            Role::Miss => return MISS_INSTRUCTIONS,
-            Role::Hit => (
-                HIT_INSTRUCTIONS,
-                PRODUCER_HIT_INSTRUCTIONS,
-                LINKED_HIT_INSTRUCTIONS,
-            ),
-            Role::AnyHit => (
-                ANY_HIT_INSTRUCTIONS,
-                PRODUCER_ANY_HIT_INSTRUCTIONS,
-                LINKED_ANY_HIT_INSTRUCTIONS,
-            ),
+        let (base, producer) = match self.role {
+            Role::Raygen => return Some(RAYGEN_INSTRUCTIONS),
+            Role::Miss => return Some(MISS_INSTRUCTIONS),
+            Role::Hit => (HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS),
+            Role::AnyHit => (ANY_HIT_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS),
         };
-        base + if producers { producer } else { 0 } + if linked { own } else { 0 }
+        Some(base + if producers { producer } else { 0 })
     }
 
     fn constants(&self) -> ([u8; 32], &'static [SpecEntry]) {
@@ -154,8 +155,16 @@ impl Table {
         }) as u32
     }
 
-    /// The table of a pipeline whose paths may meet `may`, with `surfaces` linked surface types.
-    fn new(may: u64, surfaces: u32) -> Self {
+    /// The table of a pipeline whose paths may meet `may`, with the linked surface types of
+    /// `kernels`.
+    fn new(may: u64, kernels: &KernelSet) -> Self {
+        let surfaces = kernels.surfaces;
+        // A triangle of two surface ids is shaded by the groups that serve any id, which only
+        // a type that declares its other side can stand on.
+        let two_sided = kernels
+            .surface_declares
+            .iter()
+            .any(|d| d & surface_declares::OTHER_SIDE != 0);
         let mut specs = Vec::new();
         let mut groups = HitGroups {
             surfaces,
@@ -230,6 +239,15 @@ impl Table {
             }
             *first = Some(hit_groups.len() as u32);
             for pin in 0..pins {
+                // The pin keeps its place among the kind's groups, with no shader.
+                if surfaces != 0 && pin == 0 && !two_sided {
+                    hit_groups.push(HitGroup {
+                        closest_hit: None,
+                        any_hit: None,
+                        intersection: None,
+                    });
+                    continue;
+                }
                 hit_groups.push(HitGroup {
                     closest_hit: hit
                         .map(|e| Self::stage(&mut specs, pinned(e, Role::Hit, pin, geometry))),
@@ -257,18 +275,25 @@ impl Table {
 pub struct StageSize {
     pub entry: &'static str,
     pub role: Role,
+    /// The geometry of the hit group it serves, as its label names it; empty for a stage no
+    /// group holds.
+    pub geometry: &'static str,
     /// The linked surface id the stage is made for; `u32::MAX` for any.
     pub hit_surface: u32,
     pub instructions: u32,
-    /// The most it may hand the driver.
-    pub cap: u32,
+    /// The most it may hand the driver; none for a stage made for a linked surface.
+    pub cap: Option<u32>,
+    /// Of a stage made for a linked surface, what it holds beyond the stage of its entry and
+    /// geometry made for the standard surface: the surface's own code, less the standard code
+    /// it replaces.
+    pub own: Option<i64>,
 }
 
 /// What each stage of the pipeline of paths that may meet `may` hands the driver, from
 /// `kernels`: the stages' entries folded with their constants.
 pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>, Error> {
     let lean = module(kernels, &lean_paths::MODULE)?;
-    Table::new(may, kernels.surfaces)
+    let mut sizes = Table::new(may, kernels)
         .specs
         .iter()
         .map(|spec| {
@@ -284,22 +309,36 @@ pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>,
             Ok(StageSize {
                 entry: spec.entry,
                 role: spec.role,
+                geometry: spec.geometry.map_or("", Geometry::label),
                 hit_surface: spec.hit_surface,
                 instructions: handed_instructions(stage.spirv, stage.entry.spirv_name, stage.spec),
                 cap: spec.cap(kernels.surfaces),
+                own: None,
             })
         })
-        .collect()
+        .collect::<Result<Vec<StageSize>, Error>>()?;
+    let standard: Vec<_> = sizes
+        .iter()
+        .filter(|s| s.hit_surface == 0)
+        .map(|s| (s.entry, s.geometry, s.instructions))
+        .collect();
+    for s in sizes.iter_mut().filter(|s| s.cap.is_none()) {
+        s.own = standard
+            .iter()
+            .find(|&&(entry, geometry, _)| (entry, geometry) == (s.entry, s.geometry))
+            .map(|&(.., instructions)| i64::from(s.instructions) - i64::from(instructions));
+    }
+    Ok(sizes)
 }
 
-/// The first of `sizes` over its role's cap, or the pipeline's total where that is over
-/// [`PIPELINE_CAP`].
+/// The first of `sizes` over its cap, or the pipeline's total, the stages made for linked
+/// surfaces among it, where that is over [`PIPELINE_CAP`].
 pub fn over_cap(sizes: &[StageSize]) -> Option<String> {
     for s in sizes {
-        if s.instructions > s.cap {
+        if let Some(cap) = s.cap.filter(|&cap| s.instructions > cap) {
             return Some(format!(
-                "stage {} for surface {:#x} hands the driver {} instructions, over its {} as a {:?}",
-                s.entry, s.hit_surface, s.instructions, s.cap, s.role
+                "stage {}{} hands the driver {} instructions, over its {cap} as a {:?}",
+                s.entry, s.geometry, s.instructions, s.role
             ));
         }
     }
@@ -331,23 +370,28 @@ impl PathPipeline {
         may: u64,
     ) -> Result<Self, Error> {
         let lean = module(kernels, &lean_paths::MODULE)?;
-        let table = Table::new(may, kernels.surfaces);
+        let table = Table::new(may, kernels);
         let name = format!("path pipeline {may:#x}");
         let sizes = path_stage_sizes(kernels, may)?;
         for s in &sizes {
-            log::debug!(
-                "{name}: {} for surface {:#x}: {} instructions",
-                s.entry,
-                s.hit_surface,
-                s.instructions
-            );
+            match s.own {
+                Some(own) => log::info!(
+                    "{name}: {}{} for surface {:#x}: {} instructions, {own:+} its surface's own",
+                    s.entry,
+                    s.geometry,
+                    s.hit_surface,
+                    s.instructions
+                ),
+                None => log::debug!(
+                    "{name}: {}{}: {} instructions",
+                    s.entry,
+                    s.geometry,
+                    s.instructions
+                ),
+            }
         }
         if let Some(message) = over_cap(&sizes) {
-            // TEMP-EXPERIMENT: measure a pipeline that is over its caps.
-            if std::env::var_os("ORR_PATH_CAPS_REPORT").is_none() {
-                return Err(Error::StageSize(message));
-            }
-            log::warn!("{name}: {message}");
+            return Err(Error::StageSize(message));
         }
         let bytes: Vec<_> = table.specs.iter().map(Spec::constants).collect();
         let labels: Vec<CString> = table.specs.iter().map(Spec::label).collect();

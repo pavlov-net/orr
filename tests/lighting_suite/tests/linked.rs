@@ -322,9 +322,29 @@ fn the_pipeline_renders_linked_types_geometry_kinds_and_rich_materials_as_the_st
 }
 
 /// The pipeline that may meet everything, from the kernels that link the suite's surface types:
-/// a stage made for one linked surface holds that type's code alone, under its cap.
+/// the standard surface's stages hold their caps as where nothing links, and a stage made for
+/// one linked type holds that type's code alone. One that shades its own hits is the smaller
+/// for the standard surface it leaves out, one that only covers shades as the standard does,
+/// and neither declares its other side, so no stage serves any type.
 #[test]
 fn the_stages_of_a_pipeline_with_linked_surfaces_hold_their_caps() {
+    use linked::surface::{CONTEXT, RINGS};
     let sizes = orr_lighting::path_stage_sizes(&linked::KERNELS, u64::MAX).unwrap();
     assert_eq!(orr_lighting::over_cap(&sizes), None);
+    let own = |entry: &str, surface: u8| {
+        let stage = sizes
+            .iter()
+            .find(|s| (s.entry, s.geometry, s.hit_surface) == (entry, ".copies", surface.into()));
+        stage
+            .and_then(|s| s.own)
+            .expect("a stage made for the type")
+    };
+    assert!(own("surface_hit", CONTEXT) < 0);
+    assert_eq!(own("surface_hit", RINGS), 0);
+    assert!((1..1500).contains(&own("cover_hit", RINGS)));
+    assert!(
+        sizes
+            .iter()
+            .all(|s| s.hit_surface != u32::MAX || s.geometry.is_empty())
+    );
 }

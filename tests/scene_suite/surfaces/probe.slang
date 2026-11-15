@@ -6,9 +6,9 @@ import orr_scene.surface;
 
 public struct Probe : ISurface
 {
-    public override static void adjust(SurfaceInput i, inout GSurface g, inout float depth_offset)
+    public override static void adjust(SurfaceInput i, inout PlainSurface s, inout float depth_offset)
     {
-        g.bsdf.base_color = float3(float(i.context.kind), float(i.context.depth), i.context.cone_width);
-        g.bsdf.specular_roughness = i.context.cone_spread;
+        s.base_color = float3(float(i.context.kind), float(i.context.depth), i.context.cone_width);
+        s.specular_roughness = i.context.cone_spread;
     }
 }

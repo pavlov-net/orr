@@ -100,6 +100,8 @@ impl SceneFeatures {
     /// A record has the stack face flag, which with a caster or producer entry makes
     /// [`Self::PLANE_STACKS`].
     const STACK_FACES: Self = Self(1 << 32);
+    /// A material is of a linked surface type, which shades its hits.
+    pub const LINKED_SURFACES: Self = Self(1 << 33);
     /// What a mesh keeps from the material it was built with, whatever the record holds now:
     /// once a record has shown one of these, the table keeps it.
     const BUILT: Self = Self(Self::LAYERS.0 | Self::COVERAGE.0);
@@ -123,6 +125,7 @@ impl SceneFeatures {
             (Self::COATED_EMITTERS, 1 << 8),
             (Self::THIN_DIELECTRICS, 1 << 9),
             (Self::NEURAL_TEXTURES, 1 << 10),
+            (Self::LINKED_SURFACES, 1 << 11),
         ] {
             if !self.contains(feature) {
                 ruled_out |= bit;
@@ -135,17 +138,17 @@ impl SceneFeatures {
         self.0 & other.0 == other.0
     }
 
-    /// What record `m` may show. A linked surface may set any lobe, so its record counts for
-    /// every lobe, for walks and for emission; what a material's flags and its own medium
-    /// decide stays as the record has it.
+    /// What record `m`, as the material table stores it, may show: the lobes of its record and
+    /// of its linked surface type (`MaterialGpu::lobes`), and what its flags and its own medium
+    /// decide.
     pub(crate) fn of_material(m: &MaterialGpu) -> Self {
-        let linked = m.surface != 0;
+        use crate::material::material_lobes as l;
+        let lobe = |lobe: u32| m.lobes & lobe != 0;
         let thin = m.flags & f::THIN_WALLED != 0;
         let scatters =
             m.transmission_depth > 0.0 && m.transmission_scatter.iter().any(|&c| c > 0.0);
         let bounds = m.flags & (f::DIELECTRIC | f::THIN_WALLED) == f::DIELECTRIC;
-        let walks = linked
-            || (!thin && (m.subsurface_weight > 0.0 || (m.transmission_weight > 0.0 && scatters)));
+        let walks = !thin && (lobe(l::SUBSURFACE) || (lobe(l::TRANSMISSION) && scatters));
         let disperses =
             m.transmission_dispersion_scale > 0.0 && m.transmission_dispersion_abbe_number > 0.0;
         let mut out = Self::NONE;
@@ -154,17 +157,17 @@ impl SceneFeatures {
             (bounds, Self::INTERIORS),
             (bounds && scatters, Self::SCATTERING_INTERIORS),
             (disperses, Self::DISPERSIVE),
-            (linked || m.coat_weight > 0.0, Self::COAT),
-            (linked || m.fuzz_weight > 0.0, Self::FUZZ),
-            (linked || m.thin_film_weight > 0.0, Self::THIN_FILM),
-            (linked || m.subsurface_weight > 0.0, Self::SUBSURFACE),
+            (lobe(l::COAT), Self::COAT),
+            (lobe(l::FUZZ), Self::FUZZ),
+            (lobe(l::THIN_FILM), Self::THIN_FILM),
+            (lobe(l::SUBSURFACE), Self::SUBSURFACE),
             (m.flags & (f::DIELECTRIC | f::PRESENCE) != 0, Self::LAYERS),
             (
                 m.flags & (f::ALPHA_TESTED | f::PRESENCE) != 0
                     || m.flags & (f::DIELECTRIC | f::THIN_WALLED) == f::DIELECTRIC | f::THIN_WALLED,
                 Self::COVERAGE,
             ),
-            (linked || m.emission_luminance != 0.0, Self::EMISSIVE),
+            (lobe(l::EMISSION), Self::EMISSIVE),
             (m.flags & f::VERTEX != 0, Self::VERTEX_COLORS),
             (
                 m.samplers.iter().any(|s| s.modes & TILED != 0),
@@ -177,6 +180,7 @@ impl SceneFeatures {
                 Self::THIN_DIELECTRICS,
             ),
             (m.flags & f::STACK_FACE != 0, Self::STACK_FACES),
+            (m.surface != 0, Self::LINKED_SURFACES),
         ] {
             if on {
                 out |= bit;
@@ -324,6 +328,7 @@ mod tests {
     fn record(edit: impl FnOnce(&mut MaterialGpu)) -> SceneFeatures {
         let mut m: MaterialGpu = bytemuck::Zeroable::zeroed();
         edit(&mut m);
+        m.lobes = crate::material::record_lobes(&m, &[]);
         SceneFeatures::of_material(&m)
     }
 
@@ -343,18 +348,18 @@ mod tests {
         let solid = record(|m| m.flags = f::DIELECTRIC);
         assert!(!solid.contains(SceneFeatures::THIN_DIELECTRICS));
         // A plain scene rules every surface feature out; each one found sets its bit alone.
-        assert_eq!(plain.surface_may(), !0b111_1110_1111);
-        assert_eq!(vertex.surface_may(), !0b111_1110_1110);
-        assert_eq!(tiled.surface_may(), !0b111_1110_1101);
-        assert_eq!(thin.surface_may() & 0b111_1110_1111, 1 << 9);
+        assert_eq!(plain.surface_may(), !0b1111_1110_1111);
+        assert_eq!(vertex.surface_may(), !0b1111_1110_1110);
+        assert_eq!(tiled.surface_may(), !0b1111_1110_1101);
+        assert_eq!(thin.surface_may() & 0b1111_1110_1111, 1 << 9);
         let scene = SceneFeatures::DECALS | SceneFeatures::PRODUCERS | SceneFeatures::STRANDS;
-        assert_eq!(scene.surface_may() & 0b111_1110_1111, 0b0110_1000);
+        assert_eq!(scene.surface_may() & 0b1111_1110_1111, 0b0110_1000);
         assert_eq!(
-            SceneFeatures::SKINNING.surface_may() & 0b111_1110_1111,
+            SceneFeatures::SKINNING.surface_may() & 0b1111_1110_1111,
             1 << 7
         );
         assert_eq!(
-            SceneFeatures::COATED_EMITTERS.surface_may() & 0b111_1110_1111,
+            SceneFeatures::COATED_EMITTERS.surface_may() & 0b1111_1110_1111,
             1 << 8
         );
     }

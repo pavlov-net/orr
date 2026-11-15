@@ -924,8 +924,8 @@ pub(super) struct LinkFile {
     pub(super) module: String,
     pub(super) path: PathBuf,
     pub(super) point: LinkPoint,
-    /// The linked types, each with the canonical path of its module.
-    pub(super) types: Vec<(String, PathBuf)>,
+    /// The linked types, each with the canonical path of its module and what it declares.
+    pub(super) types: Vec<(String, PathBuf, u32)>,
 }
 
 /// One compiled module as the build remembers it between runs.

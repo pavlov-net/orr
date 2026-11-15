@@ -85,6 +85,77 @@ public static const uint COVERAGE_FACE = 1 << 3;     // `back_face`
 public static const uint COVERAGE_RAY = 1 << 4;      // the ray's origin and the distance to the candidate
 public static const uint COVERAGE_WHOLE = 0xffffffffu; // all of the hit's input
 
+// The plain part of a shaded surface: a diffuse base under a specular layer, on its shading
+// frame. What a linked type gives of a hit it shades and may change of one the standard surface
+// shades; each further lobe is a method of its own (`ISurface`).
+public struct PlainSurface
+{
+    public float3 base_color;       // base_weight x base_color
+    public float metalness;
+    public float3 specular_color;
+    public float specular_weight;
+    public float specular_roughness;
+    public float specular_ior;
+    public float diffuse_roughness;
+    public float3 normal;           // unit shading normal, toward the viewer's side
+    public float3 geometric_normal; // unit, on the shading normal's side
+    public float4 own;              // the type's own, from its `surface` or `adjust` to its lobe methods at the hit
+}
+
+// The parameters of each further lobe, as `BsdfParams` documents them.
+public struct TransmissionLobe
+{
+    public float weight;
+    public float3 color;
+}
+
+public struct SubsurfaceLobe
+{
+    public float weight;
+    public float3 color;
+    public float anisotropy;
+    public float3 radius;           // m
+}
+
+public struct CoatLobe
+{
+    public float weight;
+    public float3 color;
+    public float roughness;
+    public float ior;
+    public float darkening;
+    public float anisotropy;
+    public float tangent_angle;     // rad
+    public float3 normal;           // unit
+}
+
+public struct FuzzLobe
+{
+    public float weight;
+    public float3 color;
+    public float roughness;
+}
+
+public struct ThinFilmLobe
+{
+    public float weight;
+    public float thickness;         // nm
+    public float ior;
+}
+
+public struct EmissionLobe
+{
+    public float3 emission;
+    public bool unlit;              // the surface shows its emission alone
+}
+
+// The specular layer's anisotropy.
+public struct AnisotropyLobe
+{
+    public float anisotropy;
+    public float tangent_angle;     // rad
+}
+
 // What a linked surface type implements. Every method is optional: what a type leaves out, or
 // declines at a hit, the standard surface does, from `MaterialGpu` and its textures. A kernel
 // holds one copy of the standard surface per site however many types link (`Surfaces`), so a
@@ -92,22 +163,67 @@ public static const uint COVERAGE_WHOLE = 0xffffffffu; // all of the hit's input
 // that computes the standard surface itself adds a whole copy at every site of every kernel.
 // Light sampling draws an emitter's points by its material's emission (`surface_emission`),
 // whatever a linked surface makes of it.
+//
+// A type declares what its materials may show by the methods it has. One with a lobe method
+// (`transmission` to `anisotropy`) may show that lobe, and the build counts its materials for
+// it; one without shows the lobe only where the standard surface shades a hit and the
+// material's record has it. The build calls a lobe method only on the types whose source
+// declares it, so no type shows a lobe the host does not know of.
 public interface ISurface
 {
-    // The shaded surface and a depth offset in m (non-negative, along the view ray) that
+    // The plain surface and a depth offset in m (non-negative, along the view ray) that
     // moves the visible point behind the triangle, in place of the standard surface: true
-    // where `g` and `depth_offset` hold them. Position, the visible triangle and the raster
-    // error are the caller's; the rest is the surface's, but the flags of the lobes the
-    // weights turn on (`surface_lobes`).
-    static bool surface(SurfaceInput i, out GSurface g, out float depth_offset)
+    // where `s` and `depth_offset` hold them. Thin walls and the Fresnel and metal models
+    // stay the material record's.
+    static bool surface(SurfaceInput i, out PlainSurface s, out float depth_offset)
     {
-        g = GSurface();
+        s = PlainSurface();
         depth_offset = 0.0;
         return false;
     }
 
-    // Changes the standard surface `g` and its depth offset at a hit where `surface` declined.
-    static void adjust(SurfaceInput i, inout GSurface g, inout float depth_offset)
+    // Changes the standard surface's plain part `s` and its depth offset at a hit where
+    // `surface` declined.
+    static void adjust(SurfaceInput i, inout PlainSurface s, inout float depth_offset)
+    {
+    }
+
+    // Each lobe of the hit whose plain surface is `s`. It comes in off, at weight 0, where
+    // `surface` shaded the hit, and as the standard surface has it where `surface` declined.
+    static void transmission(SurfaceInput i, PlainSurface s, inout TransmissionLobe lobe)
+    {
+    }
+
+    static void subsurface(SurfaceInput i, PlainSurface s, inout SubsurfaceLobe lobe)
+    {
+    }
+
+    static void coat(SurfaceInput i, PlainSurface s, inout CoatLobe lobe)
+    {
+    }
+
+    static void fuzz(SurfaceInput i, PlainSurface s, inout FuzzLobe lobe)
+    {
+    }
+
+    static void thin_film(SurfaceInput i, PlainSurface s, inout ThinFilmLobe lobe)
+    {
+    }
+
+    static void emission(SurfaceInput i, PlainSurface s, inout EmissionLobe lobe)
+    {
+    }
+
+    static void anisotropy(SurfaceInput i, PlainSurface s, inout AnisotropyLobe lobe)
+    {
+    }
+
+    // A type has this where a material of it may share a triangle with a material of another
+    // surface id, as the front of one that is its back or as that back (`MaterialGpu.back`).
+    // Hit shaders made for one type cannot shade such a triangle: the build keeps the ones
+    // that serve any type while a linked type has this, and the material table refuses such a
+    // pair that neither type has it for. Nothing calls it.
+    static void other_side()
     {
     }
 
@@ -171,15 +287,70 @@ public struct Surfaces<L : ISurface> : ISurfaces
 {
     public static GSurface surface(SurfaceInput i, out float depth_offset, bool report)
     {
-        GSurface g;
-        bool own = L.surface(i, g, depth_offset);
+        PlainSurface s;
+        bool own = L.surface(i, s, depth_offset);
         if (report)
             L.feedback(i);
-        if (!own)
+        GSurface g;
+        if (own)
+        {
+            g = unlobed_surface(i);
+        }
+        else
         {
             g = standard_surface(i, depth_offset, report);
-            L.adjust(i, g, depth_offset);
+            s = plain_surface(g);
+            L.adjust(i, s, depth_offset);
         }
+        set_plain_surface(g, s);
+
+        TransmissionLobe transmission = { g.bsdf.transmission_weight, g.bsdf.transmission_color };
+        L.transmission(i, s, transmission);
+        g.bsdf.transmission_weight = transmission.weight;
+        g.bsdf.transmission_color = transmission.color;
+
+        SubsurfaceLobe subsurface = { g.bsdf.subsurface_weight, g.bsdf.subsurface_color, g.bsdf.subsurface_anisotropy, g.bsdf.subsurface_radius };
+        L.subsurface(i, s, subsurface);
+        g.bsdf.subsurface_weight = subsurface.weight;
+        g.bsdf.subsurface_color = subsurface.color;
+        g.bsdf.subsurface_anisotropy = subsurface.anisotropy;
+        g.bsdf.subsurface_radius = subsurface.radius;
+
+        CoatLobe coat = { g.bsdf.coat_weight, g.bsdf.coat_color, g.bsdf.coat_roughness, g.bsdf.coat_ior, g.bsdf.coat_darkening, g.bsdf.coat_anisotropy, g.bsdf.coat_tangent_angle, g.bsdf.coat_normal };
+        L.coat(i, s, coat);
+        g.bsdf.coat_weight = coat.weight;
+        g.bsdf.coat_color = coat.color;
+        g.bsdf.coat_roughness = coat.roughness;
+        g.bsdf.coat_ior = coat.ior;
+        g.bsdf.coat_darkening = coat.darkening;
+        g.bsdf.coat_anisotropy = coat.anisotropy;
+        g.bsdf.coat_tangent_angle = coat.tangent_angle;
+        g.bsdf.coat_normal = coat.normal;
+
+        FuzzLobe fuzz = { g.bsdf.fuzz_weight, g.bsdf.fuzz_color, g.bsdf.fuzz_roughness };
+        L.fuzz(i, s, fuzz);
+        g.bsdf.fuzz_weight = fuzz.weight;
+        g.bsdf.fuzz_color = fuzz.color;
+        g.bsdf.fuzz_roughness = fuzz.roughness;
+
+        ThinFilmLobe film = { g.bsdf.thin_film_weight, g.bsdf.thin_film_thickness, g.bsdf.thin_film_ior };
+        L.thin_film(i, s, film);
+        g.bsdf.thin_film_weight = film.weight;
+        g.bsdf.thin_film_thickness = film.thickness;
+        g.bsdf.thin_film_ior = film.ior;
+
+        EmissionLobe emission = { g.bsdf.emission, (g.flags & GBUFFER_UNLIT) != 0 };
+        L.emission(i, s, emission);
+        g.bsdf.emission = emission.emission;
+        g.flags = emission.unlit ? GBUFFER_UNLIT : 0;
+
+        AnisotropyLobe anisotropy = { g.bsdf.specular_anisotropy, g.bsdf.tangent_angle };
+        L.anisotropy(i, s, anisotropy);
+        g.bsdf.specular_anisotropy = anisotropy.anisotropy;
+        g.bsdf.tangent_angle = anisotropy.tangent_angle;
+        if (anisotropy.anisotropy > 0.0)
+            g.bsdf.flags |= BSDF_ANISOTROPY;
+
         surface_lobes(g);
         return g;
     }
@@ -1035,6 +1206,55 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset, bool report)
     s.bsdf = p;
     s.flags = (m.flags & MATERIAL_UNLIT) != 0 ? GBUFFER_UNLIT : 0;
     return s;
+}
+
+// The plain part of `g`.
+PlainSurface plain_surface(GSurface g)
+{
+    PlainSurface s;
+    s.base_color = g.bsdf.base_color;
+    s.metalness = g.bsdf.metalness;
+    s.specular_color = g.bsdf.specular_color;
+    s.specular_weight = g.bsdf.specular_weight;
+    s.specular_roughness = g.bsdf.specular_roughness;
+    s.specular_ior = g.bsdf.specular_ior;
+    s.diffuse_roughness = g.bsdf.diffuse_roughness;
+    s.normal = g.normal;
+    s.geometric_normal = g.geometric_normal;
+    s.own = float4(0.0);
+    return s;
+}
+
+void set_plain_surface(inout GSurface g, PlainSurface s)
+{
+    g.bsdf.base_color = s.base_color;
+    g.bsdf.metalness = s.metalness;
+    g.bsdf.specular_color = s.specular_color;
+    g.bsdf.specular_weight = s.specular_weight;
+    g.bsdf.specular_roughness = s.specular_roughness;
+    g.bsdf.specular_ior = s.specular_ior;
+    g.bsdf.diffuse_roughness = s.diffuse_roughness;
+    g.normal = s.normal;
+    g.geometric_normal = s.geometric_normal;
+}
+
+// The surface of a hit that a linked type shades, before its plain part and its lobes: every
+// lobe off, with the thin wall and the Fresnel and metal models of the material's record.
+GSurface unlobed_surface(SurfaceInput i)
+{
+    MaterialGpu* m = i.scene.materials + i.material;
+    GSurface g = GSurface();
+    g.bsdf.transmission_color = float3(1.0);
+    g.bsdf.coat_color = float3(1.0);
+    g.bsdf.coat_ior = 1.5;
+    g.bsdf.coat_normal = i.normal;
+    if ((m.flags & MATERIAL_THIN_WALLED) != 0)
+        g.bsdf.flags |= BSDF_THIN_WALLED;
+    if ((m.flags & MATERIAL_FRESNEL_MIX) != 0)
+        g.bsdf.flags |= BSDF_FRESNEL_MIX;
+    if ((m.flags & MATERIAL_METAL_FLAT) != 0)
+        g.bsdf.flags |= BSDF_METAL_FLAT;
+    return g;
 }
 
 // Sets the flags of the lobes `g`'s weights turn on and clears the others': the coat, with a

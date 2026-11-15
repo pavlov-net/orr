@@ -12,6 +12,7 @@ use super::model;
 use super::roots::Root;
 use super::slang::Session;
 use super::sys;
+use crate::surface_declares;
 
 /// A link-time extension point of orr's kernels. A kernel uses a point when its source
 /// declares `extern struct <Name> : I<Point> = <Default>;`.
@@ -40,6 +41,11 @@ struct Method {
     args: &'static str,
     /// The interface gives it a body, so the switch type marks it `override`.
     optional: bool,
+    /// What a linked type declares by having it ([`crate::surface_declares`]), 0 for nothing:
+    /// the switch forwards it to the types that declare it alone.
+    declares: u32,
+    /// The switch forwards it; a method nothing calls only declares.
+    forward: bool,
 }
 
 /// A point whose linked types are chosen per call by an id.
@@ -66,45 +72,112 @@ const SURFACE: Switch = Switch {
     linked: "ISurface",
     methods: &[
         Method {
-            decl: "bool surface(SurfaceInput i, out GSurface g, out float depth_offset)",
+            decl: "bool surface(SurfaceInput i, out PlainSurface s, out float depth_offset)",
             name: "surface",
-            args: "i, g, depth_offset",
+            args: "i, s, depth_offset",
             optional: true,
+            declares: 0,
+            forward: true,
         },
         Method {
-            decl: "void adjust(SurfaceInput i, inout GSurface g, inout float depth_offset)",
+            decl: "void adjust(SurfaceInput i, inout PlainSurface s, inout float depth_offset)",
             name: "adjust",
-            args: "i, g, depth_offset",
+            args: "i, s, depth_offset",
             optional: true,
+            declares: 0,
+            forward: true,
         },
         Method {
             decl: "bool coverage(SurfaceInput i, out float coverage)",
             name: "coverage",
             args: "i, coverage",
             optional: true,
+            declares: 0,
+            forward: true,
         },
         Method {
             decl: "void feedback(SurfaceInput i)",
             name: "feedback",
             args: "i",
             optional: true,
+            declares: 0,
+            forward: true,
         },
         Method {
             decl: "void coverage_feedback(SurfaceInput i)",
             name: "coverage_feedback",
             args: "i",
             optional: true,
+            declares: 0,
+            forward: true,
         },
         Method {
             decl: "uint coverage_reads(SurfaceInput i)",
             name: "coverage_reads",
             args: "i",
             optional: true,
+            declares: 0,
+            forward: true,
+        },
+        lobe(
+            "void transmission(SurfaceInput i, PlainSurface s, inout TransmissionLobe lobe)",
+            "transmission",
+            surface_declares::TRANSMISSION,
+        ),
+        lobe(
+            "void subsurface(SurfaceInput i, PlainSurface s, inout SubsurfaceLobe lobe)",
+            "subsurface",
+            surface_declares::SUBSURFACE,
+        ),
+        lobe(
+            "void coat(SurfaceInput i, PlainSurface s, inout CoatLobe lobe)",
+            "coat",
+            surface_declares::COAT,
+        ),
+        lobe(
+            "void fuzz(SurfaceInput i, PlainSurface s, inout FuzzLobe lobe)",
+            "fuzz",
+            surface_declares::FUZZ,
+        ),
+        lobe(
+            "void thin_film(SurfaceInput i, PlainSurface s, inout ThinFilmLobe lobe)",
+            "thin_film",
+            surface_declares::THIN_FILM,
+        ),
+        lobe(
+            "void emission(SurfaceInput i, PlainSurface s, inout EmissionLobe lobe)",
+            "emission",
+            surface_declares::EMISSION,
+        ),
+        lobe(
+            "void anisotropy(SurfaceInput i, PlainSurface s, inout AnisotropyLobe lobe)",
+            "anisotropy",
+            surface_declares::ANISOTROPY,
+        ),
+        Method {
+            decl: "void other_side()",
+            name: "other_side",
+            args: "",
+            optional: true,
+            declares: surface_declares::OTHER_SIDE,
+            forward: false,
         },
     ],
     with: &[("coverage", "coverage_reads")],
     wrap: Some("Surfaces"),
 };
+
+/// A lobe method of the surface interface, which a type declares the lobe by.
+const fn lobe(decl: &'static str, name: &'static str, declares: u32) -> Method {
+    Method {
+        decl,
+        name,
+        args: "i, s, lobe",
+        optional: true,
+        declares,
+        forward: true,
+    }
+}
 
 const DISPLACEMENT: Switch = Switch {
     id: "i.displacement",
@@ -115,6 +188,8 @@ const DISPLACEMENT: Switch = Switch {
         name: "displace",
         args: "i",
         optional: false,
+        declares: 0,
+        forward: true,
     }],
     with: &[],
     wrap: None,
@@ -129,6 +204,8 @@ const DRAWN: Switch = Switch {
         name: "triangle",
         args: "i",
         optional: false,
+        declares: 0,
+        forward: true,
     }],
     with: &[],
     wrap: None,
@@ -194,6 +271,8 @@ pub(super) struct Link {
     pub(super) ty: String,
     /// The name `module` is imported by when it is under a prefixed root; set by [`resolve`].
     import: Option<String>,
+    /// What the type declares by the methods its source has; set by [`resolve`].
+    pub(super) declares: u32,
 }
 
 impl Link {
@@ -204,6 +283,7 @@ impl Link {
             module: module.to_path_buf(),
             ty: ty.to_owned(),
             import: None,
+            declares: 0,
         }
     }
 
@@ -282,9 +362,14 @@ pub(super) fn resolve(links: &[Link], roots: &[Root]) -> Result<Vec<Link>, Error
         .iter()
         .map(|l| {
             let module = resolve_module(&l.module)?;
+            let declares = match l.point.switch() {
+                Some(switch) => declared_methods(switch, &super::compile::read(&module)?, &l.ty),
+                None => 0,
+            };
             Ok(Link {
                 import: roots.iter().find_map(|r| r.module_name(&module)),
                 module,
+                declares,
                 ..l.clone()
             })
         })
@@ -323,6 +408,42 @@ fn check(links: &[Link]) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// What struct `ty` of `src` declares by the declaring methods of `switch` it has: a method is
+/// `static <type> <name>(` between `struct <ty>` and the next `struct`.
+fn declared_methods(switch: &Switch, src: &str, ty: &str) -> u32 {
+    let t = tokens(src);
+    let Some(start) = t
+        .windows(2)
+        .position(|w| w[0].0 == "struct" && w[1].0 == ty)
+    else {
+        return 0;
+    };
+    let body = &t[start + 2..];
+    let end = body
+        .iter()
+        .position(|w| w.0 == "struct")
+        .unwrap_or(body.len());
+    let mut out = 0;
+    for w in body[..end].windows(3) {
+        if w[0].0 != "static" || !w[2].2 {
+            continue;
+        }
+        if let Some(m) = switch.methods.iter().find(|m| m.name == w[2].0) {
+            out |= m.declares;
+        }
+    }
+    out
+}
+
+/// What each linked surface type declares, by id from 1.
+pub(super) fn surface_declares(links: &[Link]) -> Vec<u32> {
+    links
+        .iter()
+        .filter(|l| l.point == LinkPoint::Surface)
+        .map(|l| l.declares)
+        .collect()
 }
 
 /// The id constants of each switch point, in link order from 1.
@@ -366,8 +487,8 @@ pub(super) struct LinkModule {
     pub(crate) path: PathBuf,
     pub(super) source: String,
     pub(super) point: LinkPoint,
-    /// The linked types, each with the canonical path of its module.
-    pub(super) types: Vec<(String, PathBuf)>,
+    /// The linked types, each with the canonical path of its module and what it declares.
+    pub(super) types: Vec<(String, PathBuf, u32)>,
 }
 
 /// Writes the link module for `decl` under `dir` and returns it; `None` when nothing links
@@ -392,7 +513,7 @@ pub(super) fn write_module(
         point: decl.point,
         types: linked
             .iter()
-            .map(|l| (l.ty.clone(), l.module.clone()))
+            .map(|l| (l.ty.clone(), l.module.clone(), l.declares))
             .collect(),
     }))
 }
@@ -425,7 +546,7 @@ fn source(decl: &Declared, linked: &[&Link], key_bits: u32) -> String {
         None => (decl.name.clone(), "export "),
     };
     let _ = writeln!(out, "\n{export}struct {ty} : {}\n{{", switch.linked);
-    for m in switch.methods {
+    for m in switch.methods.iter().filter(|m| m.forward) {
         let modifier = if m.optional { "override " } else { "" };
         // A void method's cases call, then return: `return` takes no void expression.
         let (call, end) = if m.decl.starts_with("void ") {
@@ -439,6 +560,9 @@ fn source(decl: &Declared, linked: &[&Link], key_bits: u32) -> String {
             m.decl, switch.id
         );
         for (i, l) in linked.iter().enumerate() {
+            if m.declares & !l.declares != 0 {
+                continue;
+            }
             let _ = writeln!(
                 out,
                 "        case {}: {call}{}.{}({});{end}",
@@ -506,15 +630,15 @@ pub(super) fn check_overrides(session: &Session, m: &LinkModule) -> Result<(), S
                 }
                 // A linked type is the struct of its name in its own module.
                 let ty = model::text(api.spReflectionDecl_getName(child));
-                let linked = m.types.iter().any(|(t, module)| {
+                let linked = m.types.iter().find(|(t, module, _)| {
                     *t == ty
                         && session.decl_location(child).is_some_and(|(file, _)| {
                             super::compile::canonical_lossy(&file) == *module
                         })
                 });
-                if !linked {
+                let Some(&(_, _, scanned)) = linked else {
                     continue;
-                }
+                };
                 // The signatures the type declares under each optional method's name.
                 let mut declared: Vec<(&Method, String)> = Vec::new();
                 for j in 0..api.spReflectionDecl_getChildrenCount(child) {
@@ -528,6 +652,18 @@ pub(super) fn check_overrides(session: &Session, m: &LinkModule) -> Result<(), S
                         switch.methods.iter().find(|x| x.optional && x.name == name)
                     {
                         declared.push((method, signature(api, f)));
+                    }
+                }
+                // The switch and the host go by what the scan of the source found.
+                let found = declared.iter().fold(0, |bits, (x, _)| bits | x.declares);
+                for x in switch.methods {
+                    if (found ^ scanned) & x.declares != 0 {
+                        wrong.push(format!(
+                            "{ty} and the build's scan of its source differ on `{}`, which a \
+                             type declares as `static <type> {}(` in its struct, and whose \
+                             declaration takes a build",
+                            x.name, x.name
+                        ));
                     }
                 }
                 for (has, needs) in switch.with {
@@ -610,6 +746,7 @@ fn declared_signature(decl: &str) -> String {
     let params: Vec<&str> = params
         .trim_end_matches(')')
         .split(',')
+        .filter(|p| !p.trim().is_empty())
         .map(|p| {
             p.trim()
                 .rsplit_once(' ')

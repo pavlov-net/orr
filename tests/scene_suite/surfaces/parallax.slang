@@ -22,14 +22,14 @@ float3 behind(SurfaceInput i, out float t)
 
 public struct Parallax : ISurface
 {
-    public override static void adjust(SurfaceInput i, inout GSurface g, inout float depth_offset)
+    public override static void adjust(SurfaceInput i, inout PlainSurface s, inout float depth_offset)
     {
         float t;
         behind(i, t);
         depth_offset = max(t, 0.0);
         float3 n = normalize(mul(transpose(linear_inverse(i.object_to_render)), float3(SLOPE, 0.0, 1.0)));
-        g.normal = n;
-        g.geometric_normal = n;
+        s.normal = n;
+        s.geometric_normal = n;
     }
 
     public override static bool coverage(SurfaceInput i, out float coverage)

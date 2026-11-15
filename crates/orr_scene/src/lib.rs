@@ -102,7 +102,9 @@ pub use features::SceneFeatures;
 pub use hits::HitGroups;
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId, LightTables};
 pub use loading::{JobResult, Loading, ReadArenaStats, Urgency};
-pub use material::{BoundTexture, MaterialId, MaterialWriter, binding_sampler, material_flags};
+pub use material::{
+    BoundTexture, MaterialId, MaterialWriter, binding_sampler, material_flags, material_lobes,
+};
 pub use medium_proxy::{MediumProxy, MediumProxyId, ProxyDensity, VolumeRef};
 pub use memory::{ClasPages, PoolFill, SceneMemory, WindowFill};
 pub use mount::{ClipRef, InstancePage, LoadState, MountId, PackSource, PageId, SkeletonRef};
@@ -231,6 +233,12 @@ pub enum Error {
     UnknownEdit(EditId),
     #[error("{0:?} does not exist")]
     UnknownPage(PageId),
+    /// A material's back is of another surface id than its own, and neither linked surface
+    /// type has `ISurface.other_side`: hit shaders made for one type shade no triangle of two.
+    #[error(
+        "{front:?} has {back:?} of another surface id as its back, which neither linked surface type declares"
+    )]
+    UndeclaredOtherSide { front: MaterialId, back: MaterialId },
     /// A page hangs from an entry of a transform group that is not a page's.
     #[error("{0:?} holds no palette entry {1}")]
     NoFrameJoint(TransformGroupId, u32),
