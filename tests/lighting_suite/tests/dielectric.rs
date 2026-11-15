@@ -7,14 +7,14 @@
 //! through glass, and each pixel's front layer.
 
 use lighting_suite::bed::{
-    Accumulated, Analytic, Bed, CLOUD_SPHERE, Capture, DEPTH_SPLIT_SLAB, DISPERSIVE_SPHERE,
-    EMITTER_LUMINANCE, EXTENT, FLOOR, FURNACE_RADIANCE, FlatColor, FrostGuide, GLASS_SPHERE, Item,
-    LIGHT_FLOOR, LINE, LINE_HALF_HEIGHT, LINE_HALF_WIDTH, LIT_SLAB, MILK_SIGMA_S, MILK_SIGMA_T,
-    MILKY_SLAB, MIXED_SLAB, NEAR, OverlayFrontLayer, PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, PRISM,
-    PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Particle, ParticleLook, Paths, ROUGH_SLAB,
-    SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB, TWO_SIDED_SLAB, WATER_BOX,
-    WHITE_SPHERE, assert_close, fresnel, image_mean, moved_entry, pixel_of, prism_corners,
-    reference, surface_mean, water_transmission,
+    Accumulated, Analytic, BLACK_SPHERE, Bed, CLOUD_SPHERE, Capture, DEPTH_SPLIT_SLAB,
+    DISPERSIVE_SPHERE, EMITTER_LUMINANCE, EXTENT, FLOOR, FURNACE_RADIANCE, FlatColor, FrostGuide,
+    GLASS_SPHERE, Item, LIGHT_FLOOR, LINE, LINE_HALF_HEIGHT, LINE_HALF_WIDTH, LIT_SLAB,
+    MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, MIXED_SLAB, NEAR, OverlayFrontLayer, PRESENCE_VEIL,
+    PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Particle, ParticleLook,
+    Paths, ROUGH_SLAB, SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB,
+    TWO_SIDED_SLAB, WATER_BOX, WHITE_SPHERE, assert_close, fresnel, image_mean, moved_entry,
+    pixel_of, prism_corners, reference, surface_mean, water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
@@ -326,6 +326,45 @@ fn a_model_mixing_classes_traces_each_cluster_by_its_class() {
     let [w, h] = EXTENT;
     let held = surface.mean[(h / 2 * w + w / 2) as usize];
     assert_eq!(held, [0.0, 0.0, 0.0, 1.0], "the G-buffer's center pixel");
+    assert_clean();
+}
+
+/// Opaque geometry that rays trace and no raster draws, between the eye and the tinted slab,
+/// leaves the slab as the camera sees it: the camera ray of a layered tile looks for layers alone,
+/// since the G-buffer holds the opaque surface the camera sees. A black sphere is a model of
+/// opaque geometry alone; the mixed slab's emitter, with its own slab off to the side, is opaque
+/// geometry of a model that mixes classes, which the search goes on past.
+#[test]
+fn traced_opaque_geometry_before_the_gbuffer_surface_hides_no_layer() {
+    let (f, t) = (fresnel(1.5, 1.0), 0.5);
+    let through = (1.0 - f) * (1.0 - f) * t / (1.0 - f * f * t * t);
+    let settings = paths(reference(2));
+    for traced in [
+        Item {
+            model: BLACK_SPHERE,
+            linear: Mat3::from_diagonal(Vec3::splat(0.2)),
+            at: Vec3::new(0.0, 1.5, 0.0),
+        },
+        at(MIXED_SLAB, Vec3::new(0.0, 1.2, -0.8)),
+    ] {
+        let mut bed = Bed::with(from_above(
+            vec![
+                at(LIGHT_FLOOR, Vec3::ZERO),
+                at(TINTED_SLAB, Vec3::new(0.0, 0.5, 0.0)),
+            ],
+            Vec::new(),
+            3.0,
+        ));
+        bed.add_traced(traced);
+        let frames: Vec<f64> =
+            Vec::from_fn(8, |_| center(&render_paths(&mut bed, &settings, 4), 8)[1]);
+        assert_mean(
+            traced.model,
+            &frames,
+            f64::from(EMITTER_LUMINANCE) * through,
+            0.01,
+        );
+    }
     assert_clean();
 }
 

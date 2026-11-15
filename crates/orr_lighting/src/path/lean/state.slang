@@ -36,6 +36,9 @@ import orr_shaders.pipeline;
 // sets how long a cold start waits, and the total what the threads share.
 [Host] public static const uint RAYGEN_INSTRUCTIONS = 4000;
 [Host] public static const uint MISS_INSTRUCTIONS = 4000;
+// What a raygen holds more where the scene may hold a layer: the camera ray's search for layers,
+// the walk of a shadow ray through thin walls and a frosted pixel's second path.
+[Host] public static const uint RAYGEN_LAYER_INSTRUCTIONS = 1200;
 // A hit's cap is the standard surface's hit on a copy's clusters, with every scene flag set; the
 // standard alpha test's any-hit likewise. They stand for the cold compile of the pipeline and the
 // weight of the shaders at run time, and what is left in either is not code held twice. A stage

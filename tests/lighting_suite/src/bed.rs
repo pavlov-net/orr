@@ -2412,6 +2412,52 @@ impl Bed {
             .unwrap();
     }
 
+    /// Places `item` for rays alone: no raster draws it, so the G-buffer never holds it.
+    pub fn add_traced(&mut self, item: Item) {
+        self.frame += 1;
+        let model = self
+            .scenes
+            .model(self.mount, AssetId::from_name(item.model))
+            .unwrap_or_else(|e| panic!("model {}: {e}", item.model));
+        let list = [self.scene];
+        let f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        let mut w = f.scene(self.scene).unwrap();
+        let group = w
+            .create_transform_group(&TransformGroupDesc {
+                count: 1,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            })
+            .unwrap();
+        w.transforms(group, 0, 1).unwrap()[0] =
+            Affine3::from_mat3_translation(item.linear, item.at).into();
+        w.add_instances(&InstancesDesc {
+            model,
+            copies: 1,
+            transforms: group,
+            first: 0,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RAY,
+            rt_range: RT_RANGE,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+        drop(w);
+        let point = f.end(&[]).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
+    }
+
     /// The entries of the scene's producer table and of its emissive list at the last frame
     /// run.
     pub fn table_entries(&self) -> (u32, u32) {

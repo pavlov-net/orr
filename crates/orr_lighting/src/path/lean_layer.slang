@@ -14,6 +14,7 @@ import orr_scene.runs;
 import orr_scene.hit;
 import orr_lighting.path;
 import orr_lighting.path.lean.vertex;
+import orr_lighting.specialize;
 
 extern struct Surface : ISurfaces = StandardSurface;
 extern struct Medium : IMedium = NoMedium;
@@ -27,7 +28,9 @@ void surface_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(surface_hit);
     TriangleHit h = { a };
+    bool window = may2(MAY2_THIN_DIELECTRICS) && is_window(p.words);
     lean_layer_hit<Surface, Medium, TriangleHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
     // Tells the raygen a shader took the hit.
-    p.words.x = 0;
+    if (!window)
+        p.words.x = 0;
 }
