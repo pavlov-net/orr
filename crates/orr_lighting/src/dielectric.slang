@@ -179,9 +179,9 @@ public void layer_guide_body<S : ISurfaces>(PathRoot r, uint2 pixel)
     HitContext primary = hit_context(HIT_PRIMARY, 0, cone, 0.0);
     LayerAccept<S> a = { s, v, dir, primary, 0, PRESENCE_ANY };
     float3 positions[3];
-    // Micromaps forced to two states, as the path's camera ray reads them, so alpha-tested
-    // geometry hides a layer from both or neither.
-    Hit h = trace_closest(scene_traced(s), path_ray(start.origin, dir, start.t_max), start.mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+    // Micromaps forced to two states, as the path's camera ray reads them, so both find the same
+    // layers.
+    Hit h = trace_closest(scene_traced(s), path_ray(start.origin, dir, start.t_max), start.mask, layer_search_flags(true), a, positions);
     LayerGuide guide = LayerGuide();
     if (is_layer(h) && h.cluster_id >= 0)
     {

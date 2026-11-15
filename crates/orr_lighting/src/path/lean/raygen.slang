@@ -24,6 +24,7 @@ import orr_lighting.path;
 import orr_lighting.path.common;
 import orr_lighting.path.lean.state;
 import orr_lighting.path.lean.vertex;
+import orr_color.luminance;
 import orr_lighting.interiors;
 
 // The miss shaders: of a path's ray and of its shadow ray.
@@ -43,12 +44,20 @@ bool layered(PathRoot r, uint2 pixel)
     return may(MAY_LAYERS) && !traces_primary(r) && r.layers != nullptr && pixel_traced(r, pixel);
 }
 
+// Whether hit `h` is on a dielectric or presence layer, as its record's class says.
+bool layer_record(Traced h)
+{
+    uint class_id = h.record<HitData>().class_id();
+    return class_id == CLASS_DIELECTRIC || class_id == CLASS_PRESENCE;
+}
+
 // Starts the path of `pixel` in hot words `at` on its camera ray, which its throughput
 // `throughput` rides: its first vertex is the G-buffer's surface, and a pixel whose G-buffer holds
 // none sees the sky, which its ray of no length misses into. On a `layers` tile the ray reaches up
 // to the G-buffer's surface, and the path starts in the interiors at the near plane, which its
-// cold words `cold` take: true where those are not empty.
-bool start_path(PathRoot r, uint2 pixel, uint4* at, uint4* cold, float throughput, bool layers)
+// cold words `cold` take: true where those are not empty. A path `behind` the layers starts on the
+// G-buffer's surface inside the interiors there.
+bool start_path(PathRoot r, uint2 pixel, uint4* at, uint4* cold, float throughput, bool layers, bool behind)
 {
     PathStart s = pinhole_start(r.view, r.gbuffer, pixel, true);
     RayCone cone = camera_cone(r.view);
@@ -58,11 +67,10 @@ bool start_path(PathRoot r, uint2 pixel, uint4* at, uint4* cold, float throughpu
     bool carried = false;
     if (may_any(MAY_LAYERS | MAY_INTERIORS))
     {
-        // A camera inside an interior starts its path in it, through a callable.
-        carried = may(MAY_INTERIORS) && layers && !r.layers[pixel.y * r.gbuffer.extent.x + pixel.x].near_interior.empty();
-        if (carried)
-            p.flags |= HOT_INTERIOR;
-        else
+        // A camera inside an interior starts its path in it, through a callable, as does a path
+        // behind the layers.
+        carried = may(MAY_INTERIORS) && (behind || layers && !r.layers[pixel.y * r.gbuffer.extent.x + pixel.x].near_interior.empty());
+        if (!carried)
         {
             store_coherent(cold, uint4(MATERIAL_NONE));
             store_coherent(cold + 1 + INTERIOR_ENTRIES, uint4(0));
@@ -83,10 +91,11 @@ bool start_path(PathRoot r, uint2 pixel, uint4* at, uint4* cold, float throughpu
     if (carried)
     {
         Payload eye;
-        eye.words = uint4(0);
+        eye.words = uint4(behind ? 1 : 0, 0, 0, 0);
         call(CALL_EYE_INTERIOR, eye);
     }
-    // The camera ray's reach, in the lane of the cone's word a vertex's ray leaves 0.
+    // The camera ray's reach, in the lane of the cone's word where a vertex's ray keeps its
+    // origin's offset.
     if (layers)
     {
         uint4 w2 = load_coherent(at + 2);
@@ -119,17 +128,56 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags)
     cover.product = float3(asfloat(w4.w), asfloat(w5.w), asfloat(load_coherent(at + 2).y));
     Payload p;
     p.words = cover.words();
-    trace(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, path_ray(origin, dir, t_max), p);
-    if ((p.words.w & SHADOW_MISSED) != 0)
-        lean_shadow_add(r, slot, asfloat(p.words.xyz));
+    RayDesc ray = path_ray(origin, dir, t_max);
+    trace(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, ray, p);
+    if ((p.words.w & SHADOW_MISSED) == 0)
+        return;
+    float3 passed = asfloat(p.words.xyz);
+    // Thin walls the ray passed let through what they pass straight, walked one after the other.
+    if (may2(MAY2_THIN_DIELECTRICS) && ShadowCover.of_words(p.words).has(SHADOW_CROSSES) && any(passed > 0.0))
+        passed *= cross_walls(r, slot, at, flags, ray);
+    lean_shadow_add(r, slot, passed);
+}
+
+// What the thin walls along `ray`, the shadow ray of `slot`'s path in hot words `at` with flags
+// `flags`, let straight through: a trace over the dielectrics commits the nearest past the last
+// crossing, and the wall's hit, invoked with a window
+// payload, hands back what it lets through. Solid glass ended the shadow trace, so every
+// dielectric along the ray is a thin wall. The walls lie in the medium the path is in.
+float3 cross_walls(PathRoot r, uint slot, uint4* at, uint flags, RayDesc ray)
+{
+    float exterior = 1.0;
+    if (may(MAY_INTERIORS) && (flags & HOT_INTERIOR) != 0)
+        exterior = interior_ior(r.scene, innermost_of(load_coherent(lean_cold(r, slot))));
+    float2 cone = halves(load_coherent(at + 2).x);
+    RayCone c = { cone.x, cone.y };
+    uint4 cover = path_payload(new_path_cover(MASK_DIELECTRIC, COVER_ALPHA, PRESENCE_NONE, 0, hit_context(HIT_SECONDARY, 1, c, 0.0)));
+    float3 through = float3(1.0);
+    for (;;)
+    {
+        Payload w;
+        w.words = cover;
+        Traced h = trace_hit(r.scene.tlas, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, MASK_DIELECTRIC, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, ray, w);
+        if (!h.hit())
+            break;
+        ray.TMin = asfloat(asuint(h.t()) + 1);
+        w.words = window_payload(exterior, cone);
+        h.invoke(w);
+        through *= asfloat(w.words.xyz);
+        if (!any(through > 0.0))
+            break;
+    }
+    return through;
 }
 
 // Traces the ray in hot words `at`, whose first word is `w0`, and runs the shader of what it met.
 // A camera ray has no length where the path starts on the G-buffer's surface, which a sky pixel
 // alone traces it on; on a layered tile it looks for layers up to that surface, and the path
 // starts there where it meets none; where the view's paths trace their camera rays it is the ray
-// the camera sees along. Its hit is a primary one in either.
-void trace_ray(PathRoot r, uint slot, uint4* at, uint4 w0)
+// the camera sees along. Its hit is a primary one in either. A layered tile's ray takes only
+// layers, since the G-buffer holds the opaque surface the camera sees; paths that start on the
+// G-buffer's surface alone, whose camera rays look for none, have no `SEARCH`.
+void trace_ray<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint4 w0)
 {
     uint4 w1 = load_coherent(at + 1);
     uint4 w2 = load_coherent(at + 2);
@@ -139,21 +187,36 @@ void trace_ray(PathRoot r, uint slot, uint4* at, uint4 w0)
     // A camera ray reaches as far as its path's start says where the paths start on the
     // G-buffer's surface.
     float reach = asfloat(w2.z);
-    bool layers = may(MAY_LAYERS) && camera && !traces_primary(r) && reach > 0.0;
-    bool primary = camera && traces_primary(r) || layers;
-    uint mask = (primary ? MASK_CAMERA : MASK_OPAQUE) | (may(MAY_LAYERS) ? MASK_DIELECTRIC : 0);
+    bool layers = SEARCH && may(MAY_LAYERS) && camera && !traces_primary(r) && reach > 0.0;
+    // The lane keeps a ray's origin offset for the shader it reaches, which a camera ray has none of.
+    if (layers)
+        store_coherent(at + 2, uint4(w2.xy, 0, w2.w));
+    bool traced_camera = camera && traces_primary(r);
+    bool primary = traced_camera || layers;
+    uint mask = layers ? MASK_DIELECTRIC : (traced_camera ? MASK_CAMERA : MASK_OPAQUE) | (may(MAY_LAYERS) ? MASK_DIELECTRIC : 0);
     float t_max = camera && !traces_primary(r) ? reach : positive_infinity();
     // What the camera sees of an alpha-tested triangle is its coverage itself; a scattered
-    // ray takes the micromap's two states for it.
-    uint flags = primary ? RAY_FLAG_NONE : RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE;
+    // ray, and a layered tile's, which the layer guides trace alike, take the micromap's two
+    // states for it.
+    uint flags = traced_camera ? RAY_FLAG_NONE : RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE;
     uint depth = (w0.w >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK;
     RayCone c = { cone.x, cone.y };
     uint seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x;
     PathCover cover = new_path_cover(mask, COVER_ALPHA, PRESENCE_NONE, pcg(seed ^ depth),
         hit_context(primary ? HIT_PRIMARY : HIT_SECONDARY, depth, c, 0.0, float2(-1.0), texture_feedback_drawn(pixel, r.frame)));
     Payload p;
-    p.words = path_payload(cover);
-    Traced h = trace_hit(r.scene.tlas, flags, mask, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), t_max), p);
+    RayDesc ray = path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), t_max);
+    Traced h;
+    // A model that mixes classes holds opaque geometry a layered tile's mask can't turn away: the
+    // search goes on past it.
+    for (;;)
+    {
+        p.words = path_payload(cover);
+        h = trace_hit(r.scene.tlas, flags, mask, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, ray, p);
+        if (!layers || !h.hit() || layer_record(h))
+            break;
+        ray.TMin = asfloat(asuint(h.t()) + 1);
+    }
     if (h.hit())
     {
         reorder_invoke(h, p);
@@ -193,7 +256,7 @@ void run_path(PathRoot r, uint slot, uint4* at, bool surface)
             trace_shadow(r, slot, at, w0.w);
         if ((w0.w & HOT_RAY) == 0)
             break;
-        trace_ray(r, slot, at, w0);
+        trace_ray<true>(r, slot, at, w0);
     }
 }
 
@@ -229,27 +292,48 @@ public void lean_paths(PathRoot r)
     bool surface = !traced && depth > 0.0;
     bool carried = false;
     // A surface's path runs on the view's share of pixels; the sky shows in all.
-    if (traced || depth == 0.0 || runs_path(r, pixel))
-    {
-        carried = start_path(r, pixel, at, lean_cold(r, slot), surface ? 1.0 / r.pixel_fraction : 1.0, layers);
-        run_path(r, slot, at, surface && !layers);
-        radiance = asfloat(load_coherent(at + 3).xyz);
-        lights = reinterpret<StoredViewLights>(load_coherent(record));
-    }
-    float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
-    // The layer a layered pixel's camera ray met first, as far from the eye as the record says.
-    float layer_distance = layers ? lights.first_distance : 0.0;
-    float first_distance = traced || layer_distance > 0.0 ? lights.first_distance : surface ? length(view_position(v, uv, depth)) : 0.0;
-    // Where the camera segment through the linked medium ends, for the media's apply: at the
-    // layer the pixel shows, at its G-buffer surface or the sky (0), or nowhere where the path
-    // carries it through an interior.
-    if (layers)
-        r.layers[pixel.y * r.gbuffer.extent.x + pixel.x].medium_end = carried ? -1.0 : layer_distance;
+    bool runs = traced || depth == 0.0 || runs_path(r, pixel);
+    // A frosted pixel runs a second path, from the G-buffer's surface behind its layers, for what
+    // the frosted-glass term blurs: its luminance, which the layer memory keeps. Every other pixel
+    // keeps its own there.
+    bool two = runs && surface && frost_pass(r) && two_passes(r, pixel);
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
-    r.radiance.get<RWTexture2D<float4>>()[pixel] = float4(apply_hdr_ceiling(pre_exposure * radiance), first_distance > 0.0 ? 1.0 : 0.0);
-    r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(lights.feedback, asuint(first_distance));
-    if ((r.light_flags & LIGHT_FEEDBACK_COUNT) != 0 && lights.feedback != NO_LIGHT)
-        count_feedback(r.set, lights.feedback);
+    uint index = pixel.y * r.gbuffer.extent.x + pixel.x;
+    for (uint pass = 0; pass < (two ? 2u : 1u); pass++)
+    {
+        bool second = pass == 1;
+        if (runs)
+        {
+            bool starts_inside = start_path(r, pixel, at, lean_cold(r, slot), surface && !second ? 1.0 / r.pixel_fraction : 1.0, layers && !second, second);
+            run_path(r, slot, at, surface && (second || !layers));
+            radiance = asfloat(load_coherent(at + 3).xyz);
+            if (!second)
+            {
+                carried = starts_inside;
+                lights = reinterpret<StoredViewLights>(load_coherent(record));
+            }
+        }
+        if (second)
+        {
+            r.layers[index].background = guide_luminance(pre_exposure * radiance);
+            break;
+        }
+        float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
+        // The layer a layered pixel's camera ray met first, as far from the eye as the record says.
+        float layer_distance = layers ? lights.first_distance : 0.0;
+        float first_distance = traced || layer_distance > 0.0 ? lights.first_distance : surface ? length(view_position(v, uv, depth)) : 0.0;
+        // Where the camera segment through the linked medium ends, for the media's apply: at the
+        // layer the pixel shows, at its G-buffer surface or the sky (0), or nowhere where the path
+        // carries it through an interior.
+        if (layers)
+            r.layers[index].medium_end = carried ? -1.0 : layer_distance;
+        r.radiance.get<RWTexture2D<float4>>()[pixel] = float4(apply_hdr_ceiling(pre_exposure * radiance), first_distance > 0.0 ? 1.0 : 0.0);
+        r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(lights.feedback, asuint(first_distance));
+        if ((r.light_flags & LIGHT_FEEDBACK_COUNT) != 0 && lights.feedback != NO_LIGHT)
+            count_feedback(r.set, lights.feedback);
+        if (frost_pass(r) && !two)
+            r.layers[index].background = guide_luminance(pre_exposure * radiance);
+    }
 }
 
 // The raygen of a view's update paths: the path of a block's pixel, which adds to the world
@@ -266,7 +350,7 @@ public void lean_updates(PathRoot r)
     uint4* record = lean_record(r, slot);
     CacheUpdate update = CacheUpdate();
     uint state = pcg3d(uint3(pixel, r.frame ^ path_stream(r))).y;
-    start_path(r, pixel, at, lean_cold(r, slot), 1.0, false);
+    start_path(r, pixel, at, lean_cold(r, slot), 1.0, false, false);
     Payload first;
     first.words = uint4(0);
     call(CALL_FIRST, first);
@@ -286,7 +370,7 @@ public void lean_updates(PathRoot r)
             trace_shadow(r, slot, at, w0.w);
         if ((w0.w & HOT_RAY) == 0)
             break;
-        trace_ray(r, slot, at, w0);
+        trace_ray<false>(r, slot, at, w0);
     }
     update.finish(r, asfloat(load_coherent(at + 3).xyz), 0);
 }

@@ -67,11 +67,25 @@ uint trace_path(PathRoot r, uint slot, out float t)
         Payload p;
         p.words = load_coherent(at + RAY_COVER_AT);
         uint mask = ((d.word >> LAUNCH_MASK_SHIFT) | (d.word >> LAUNCH_FRONT_SHIFT)) & 0xff;
-        Traced h = trace_hit(r.scene.tlas, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, mask, RAY_TYPE_PATH, RAY_TYPES, 0, path_ray(o.origin, d.dir, o.reach), p);
-        bool hit = h.hit();
-        uint flags = hit ? h.record<HitData>().flags : 0;
-        uint class_id = flags & HIT_CLASS_MASK;
-        bool layer = hit && (class_id == CLASS_DIELECTRIC || class_id == CLASS_PRESENCE);
+        RayDesc ray = path_ray(o.origin, d.dir, o.reach);
+        Traced h;
+        bool hit;
+        uint flags;
+        bool layer;
+        // A camera ray toward the G-buffer's surface takes layers alone; a model that mixes
+        // classes holds opaque geometry its mask can't turn away, which the search goes on past.
+        for (;;)
+        {
+            h = trace_hit(r.scene.tlas, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, mask, RAY_TYPE_PATH, RAY_TYPES, 0, ray, p);
+            hit = h.hit();
+            flags = hit ? h.record<HitData>().flags : 0;
+            uint class_id = flags & HIT_CLASS_MASK;
+            layer = hit && (class_id == CLASS_DIELECTRIC || class_id == CLASS_PRESENCE);
+            if (!may(MAY_VIEW) || (d.word & LAUNCH_GBUFFER) == 0 || !hit || layer)
+                break;
+            ray.TMin = asfloat(asuint(h.t()) + 1);
+            p.words = load_coherent(at + RAY_COVER_AT);
+        }
         bool given = may(MAY_VIEW) && (d.word & LAUNCH_GBUFFER) != 0 && !layer;
         reach = hit ? h.t() : o.reach;
         // A surface's arrival takes the transmittance of an interior that scatters nothing.

@@ -18,7 +18,7 @@ use crate::shaders::consts::{
     ANY_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, LAYER_HIT_INSTRUCTIONS,
     MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS,
     PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
-    RICH_HIT_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
+    RAYGEN_LAYER_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
 };
 use crate::shaders::path::{lean_layer, lean_paths, lean_rich};
 use crate::staged::{
@@ -150,7 +150,12 @@ impl Spec {
         }
         let producers = !matches!(self.geometry, None | Some(Geometry::Copies));
         let (base, producer) = match self.role {
-            Role::Raygen => return Some(RAYGEN_INSTRUCTIONS),
+            Role::Raygen => {
+                let layers = self.may & MAY_LAYERS != 0;
+                return Some(
+                    RAYGEN_INSTRUCTIONS + if layers { RAYGEN_LAYER_INSTRUCTIONS } else { 0 },
+                );
+            }
             Role::Miss => return Some(MISS_INSTRUCTIONS),
             Role::Hit => (HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS),
             Role::AnyHit => (ANY_HIT_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS),

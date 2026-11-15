@@ -1978,8 +1978,17 @@ public Interior lens_interior<S : ISurfaces>(PathRoot r, float3 origin)
     return interior;
 }
 
+// The flags of a trace that takes layers alone where `search` (a camera ray toward the G-buffer's
+// surface, `pinhole_start`), else of any path ray. A model that mixes classes holds opaque
+// geometry such a ray's mask can't turn away, which forced non-opaque its class turns away.
+public uint layer_search_flags(bool search)
+{
+    return RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE | (search ? RAY_FLAG_FORCE_NON_OPAQUE : RAY_FLAG_NONE);
+}
+
 // The camera ray of `pixel` of view `v` from the near plane: toward the G-buffer `gb`'s
-// surface, where the tile may hold a layer before it.
+// surface, where the tile may hold a layer before it. It takes layers alone, through
+// `layer_search_flags`, since the G-buffer holds the opaque surface the camera sees.
 public PathStart pinhole_start(ViewConstants* v, GBufferGpu* gb, uint2 pixel, bool traced)
 {
     float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
@@ -1990,7 +1999,7 @@ public PathStart pinhole_start(ViewConstants* v, GBufferGpu* gb, uint2 pixel, bo
     float depth = gb.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
     start.t_max = depth > 0.0 ? max((length(view_position(v, uv, depth)) - start.offset) * (1.0 - 1e-5), 0.0) : positive_infinity();
     start.axis = 1.0;
-    start.mask = traced ? MASK_CAMERA | MASK_DIELECTRIC : 0;
+    start.mask = traced ? MASK_DIELECTRIC : 0;
     start.gbuffer = true;
     start.interior = Interior();
     start.throughput = float3(1.0);
