@@ -14,8 +14,9 @@ use orr_scene::{HitGroups, Loading, SceneFeatures};
 
 use crate::mask_sets::Members;
 use crate::shaders::consts::{
-    ANY_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE,
-    PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
+    ANY_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, LINKED_ANY_HIT_INSTRUCTIONS, LINKED_HIT_INSTRUCTIONS,
+    MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS,
+    PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
 };
 use crate::shaders::path::lean_paths;
 use crate::staged::{MAY_UPDATE, MAY_VIEW};
@@ -35,18 +36,6 @@ pub enum Role {
     Hit,
     /// An any-hit shader of a candidate that is not opaque.
     AnyHit,
-}
-
-impl Role {
-    /// The most instructions a stage of the role may hand the driver.
-    pub fn cap(self) -> u32 {
-        match self {
-            Self::Raygen => RAYGEN_INSTRUCTIONS,
-            Self::Miss => MISS_INSTRUCTIONS,
-            Self::Hit => HIT_INSTRUCTIONS,
-            Self::AnyHit => ANY_HIT_INSTRUCTIONS,
-        }
-    }
 }
 
 /// The most instructions the stages of a pipeline may hand the driver together.
@@ -107,6 +96,28 @@ impl Spec {
         };
         let geometry = self.geometry.map_or("", Geometry::label);
         CString::new(format!("{}{geometry}{surface}", self.entry)).expect("no nul in a label")
+    }
+
+    /// The most instructions the stage may hand the driver: its role's, with what a producer
+    /// entry's geometry and a linked surface's own code add to a hit or an any-hit shader.
+    fn cap(&self, surfaces: u32) -> u32 {
+        let producers = !matches!(self.geometry, None | Some(Geometry::Copies));
+        let linked = surfaces != 0 && self.hit_surface != 0 && self.geometry.is_some();
+        let (base, producer, own) = match self.role {
+            Role::Raygen => return RAYGEN_INSTRUCTIONS,
+            Role::Miss => return MISS_INSTRUCTIONS,
+            Role::Hit => (
+                HIT_INSTRUCTIONS,
+                PRODUCER_HIT_INSTRUCTIONS,
+                LINKED_HIT_INSTRUCTIONS,
+            ),
+            Role::AnyHit => (
+                ANY_HIT_INSTRUCTIONS,
+                PRODUCER_ANY_HIT_INSTRUCTIONS,
+                LINKED_ANY_HIT_INSTRUCTIONS,
+            ),
+        };
+        base + if producers { producer } else { 0 } + if linked { own } else { 0 }
     }
 
     fn constants(&self) -> ([u8; 32], &'static [SpecEntry]) {
@@ -249,6 +260,8 @@ pub struct StageSize {
     /// The linked surface id the stage is made for; `u32::MAX` for any.
     pub hit_surface: u32,
     pub instructions: u32,
+    /// The most it may hand the driver.
+    pub cap: u32,
 }
 
 /// What each stage of the pipeline of paths that may meet `may` hands the driver, from
@@ -273,6 +286,7 @@ pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>,
                 role: spec.role,
                 hit_surface: spec.hit_surface,
                 instructions: handed_instructions(stage.spirv, stage.entry.spirv_name, stage.spec),
+                cap: spec.cap(kernels.surfaces),
             })
         })
         .collect()
@@ -282,14 +296,10 @@ pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>,
 /// [`PIPELINE_CAP`].
 pub fn over_cap(sizes: &[StageSize]) -> Option<String> {
     for s in sizes {
-        if s.instructions > s.role.cap() {
+        if s.instructions > s.cap {
             return Some(format!(
-                "stage {} for surface {:#x} hands the driver {} instructions, over the {} of a {:?}",
-                s.entry,
-                s.hit_surface,
-                s.instructions,
-                s.role.cap(),
-                s.role
+                "stage {} for surface {:#x} hands the driver {} instructions, over its {} as a {:?}",
+                s.entry, s.hit_surface, s.instructions, s.cap, s.role
             ));
         }
     }

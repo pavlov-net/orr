@@ -41,16 +41,10 @@ impl ShaderKind {
 /// A shader body of the pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Body {
-    /// An opaque hit into the packed surface, as a hit shader that runs no vertex leaves it.
-    Resolve,
-    /// An opaque hit's whole vertex: the closest-hit shader.
+    /// A plain opaque hit's whole vertex: the closest-hit shader.
     Vertex,
-    /// A layer hit's whole vertex.
-    VertexLayer,
-    /// The light an opaque vertex sends along the path.
-    Emission,
-    /// The caustic photons' light a vertex gathers of their grid.
-    Gather,
+    /// A path's first vertex, on the G-buffer's surface: its callable.
+    First,
     /// A path ray's any-hit at a non-opaque triangle.
     CoverPath,
     /// A shadow ray's any-hit at a non-opaque triangle.
@@ -62,12 +56,9 @@ pub enum Body {
 }
 
 impl Body {
-    pub const ALL: [Self; 9] = [
-        Self::Resolve,
+    pub const ALL: [Self; 6] = [
         Self::Vertex,
-        Self::VertexLayer,
-        Self::Emission,
-        Self::Gather,
+        Self::First,
         Self::CoverPath,
         Self::CoverShadow,
         Self::BoxMedium,
@@ -76,11 +67,8 @@ impl Body {
 
     pub fn name(self) -> &'static str {
         match self {
-            Self::Resolve => "resolve",
             Self::Vertex => "vertex",
-            Self::VertexLayer => "vertex layer",
-            Self::Emission => "emission",
-            Self::Gather => "gather",
+            Self::First => "first vertex",
             Self::CoverPath => "cover path",
             Self::CoverShadow => "cover shadow",
             Self::BoxMedium => "box medium",
@@ -90,20 +78,17 @@ impl Body {
 
     pub fn kind(self) -> ShaderKind {
         match self {
-            Self::Resolve | Self::Vertex | Self::VertexLayer => ShaderKind::ClosestHit,
+            Self::Vertex => ShaderKind::ClosestHit,
             Self::CoverPath | Self::CoverShadow | Self::ProxyShadow => ShaderKind::AnyHit,
             Self::BoxMedium => ShaderKind::Intersection,
-            Self::Emission | Self::Gather => ShaderKind::Callable,
+            Self::First => ShaderKind::Callable,
         }
     }
 
     fn entry(self) -> &'static str {
         match self {
-            Self::Resolve => "resolve",
             Self::Vertex => "vertex_hit",
-            Self::VertexLayer => "layer_hit",
-            Self::Emission => "emission",
-            Self::Gather => "gather",
+            Self::First => "first_vertex",
             Self::CoverPath => "cover_path_hit",
             Self::CoverShadow => "cover_shadow_hit",
             Self::BoxMedium => "box_medium_hit",

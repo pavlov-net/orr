@@ -32,8 +32,17 @@ import orr_shaders.pipeline;
 // sets how long a cold start waits, and the total what the threads share.
 [Host] public static const uint RAYGEN_INSTRUCTIONS = 4000;
 [Host] public static const uint MISS_INSTRUCTIONS = 4000;
-[Host] public static const uint HIT_INSTRUCTIONS = 40000;
-[Host] public static const uint ANY_HIT_INSTRUCTIONS = 2000;
+// A hit's cap is the standard surface's hit on a copy's clusters, with every scene flag set; the
+// standard alpha test's any-hit likewise. They stand for the cold compile of the pipeline and the
+// weight of the shaders at run time, and what is left in either is not code held twice. A stage
+// made for producer entries, or for both kinds of geometry, adds what resolves a producer's
+// triangle; a stage made for a linked surface adds what that surface's own code may take.
+[Host] public static const uint HIT_INSTRUCTIONS = 46000;
+[Host] public static const uint ANY_HIT_INSTRUCTIONS = 4800;
+[Host] public static const uint PRODUCER_HIT_INSTRUCTIONS = 2000;
+[Host] public static const uint PRODUCER_ANY_HIT_INSTRUCTIONS = 800;
+[Host] public static const uint LINKED_HIT_INSTRUCTIONS = 3000;
+[Host] public static const uint LINKED_ANY_HIT_INSTRUCTIONS = 5200;
 [Host] public static const uint PIPELINE_INSTRUCTIONS = 1000000;
 
 // `PathHot.flags`.

@@ -17,28 +17,16 @@ const BENCH_MAY: u64 = 0xffff_fc30_0378_700d;
 /// somewhere, so the list cannot outlive the redesign that takes a body off it.
 const OVER: &[(Body, &str)] = &[
     (
-        Body::Resolve,
-        "the standard surface's evaluation, and its decals with every path_may2 bit",
-    ),
-    (
         Body::Vertex,
-        "the surface's evaluation, then the path with the BSDF across its light candidates",
+        "the standard surface's evaluation, which holds every slot's value until it assembles them",
     ),
     (
-        Body::VertexLayer,
-        "the surface's evaluation, then the path with the BSDF across its light candidates",
-    ),
-    (
-        Body::Emission,
-        "the emitter's triangle, rebuilt for the light set's density at the hit",
-    ),
-    (
-        Body::CoverPath,
-        "the hit reconstruction its presence resolve shares with the inline handlers",
+        Body::First,
+        "the prepared BSDF and the path's state across its light candidates",
     ),
     (
         Body::CoverShadow,
-        "the hit reconstruction its presence resolve shares with the inline handlers",
+        "the candidate's attributes and the texture read at the mask that may meet everything",
     ),
 ];
 
