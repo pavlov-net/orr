@@ -1,4 +1,4 @@
-// The pipeline path tracer's shaders by the bodies they run (`path.launch`,
+// The pipeline path tracer's shaders by the bodies they run (`path.lean`,
 // `orr_scene.candidates`), as compute stand-ins compiled for the registers and memory the driver
 // reports of them (`orr_lighting::standins`). A lane's slot is its index; its hit, its payload or
 // its callable's data come from memory, and what its body hands back goes there, so the body is
@@ -14,11 +14,13 @@ import orr_scene.runs;
 import orr_scene.hit;
 import orr_lighting.path;
 import orr_lighting.path.common;
+import orr_lighting.path.lean.vertex;
 
 extern struct Surface : ISurfaces = StandardSurface;
 extern struct Environment : IEnvironment = EnvironmentMap;
 extern struct Medium : IMedium = NoMedium;
 export static const bool PATH_SPECIALIZES = true;
+export static const uint BSDF_CLASS = 0;
 
 ORR_ROOT_INLINE(PathRoot);
 
@@ -41,6 +43,24 @@ HitData lane_data(uint lane)
     uint4 w = lane_words(lane)[1];
     HitData d = { w.x, w.y, w.z, w.w };
     return d;
+}
+
+[shader("compute")]
+[numthreads(STAGE_GROUP, 1, 1)]
+void vertex_hit(uint3 id: SV_DispatchThreadID)
+{
+    ORR_OMM(vertex_hit);
+    uint4* w = lane_words(id.x);
+    HitData data = lane_data(id.x);
+    lean_hit<Surface, Medium, StoredHit, SectionGiven>(root, id.x, w[0], section_given(data.material), lane_hit(id.x));
+}
+
+[shader("compute")]
+[numthreads(STAGE_GROUP, 1, 1)]
+void first_vertex(uint3 id: SV_DispatchThreadID)
+{
+    ORR_OMM(first_vertex);
+    lean_first<Medium>(root, id.x);
 }
 
 [shader("compute")]

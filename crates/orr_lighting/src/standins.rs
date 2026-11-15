@@ -41,6 +41,10 @@ impl ShaderKind {
 /// A shader body of the pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Body {
+    /// A plain opaque hit's whole vertex: the closest-hit shader.
+    Vertex,
+    /// A path's first vertex, on the G-buffer's surface: its callable.
+    First,
     /// A path ray's any-hit at a non-opaque triangle.
     CoverPath,
     /// A shadow ray's any-hit at a non-opaque triangle.
@@ -52,7 +56,9 @@ pub enum Body {
 }
 
 impl Body {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
+        Self::Vertex,
+        Self::First,
         Self::CoverPath,
         Self::CoverShadow,
         Self::BoxMedium,
@@ -61,6 +67,8 @@ impl Body {
 
     pub fn name(self) -> &'static str {
         match self {
+            Self::Vertex => "vertex",
+            Self::First => "first vertex",
             Self::CoverPath => "cover path",
             Self::CoverShadow => "cover shadow",
             Self::BoxMedium => "box medium",
@@ -70,13 +78,17 @@ impl Body {
 
     pub fn kind(self) -> ShaderKind {
         match self {
+            Self::Vertex => ShaderKind::ClosestHit,
             Self::CoverPath | Self::CoverShadow | Self::ProxyShadow => ShaderKind::AnyHit,
             Self::BoxMedium => ShaderKind::Intersection,
+            Self::First => ShaderKind::Callable,
         }
     }
 
     fn entry(self) -> &'static str {
         match self {
+            Self::Vertex => "vertex_hit",
+            Self::First => "first_vertex",
             Self::CoverPath => "cover_path_hit",
             Self::CoverShadow => "cover_shadow_hit",
             Self::BoxMedium => "box_medium_hit",
