@@ -726,6 +726,10 @@ public struct StagedRecord : IVertexRecord
         if (!view_record())
             return;
         StoredView p = load_record<StoredView>(st, slot);
+        // The background layer's texel takes how deep its first vertex lies along the view's
+        // axis: its camera ray starts past the mask's depth, from a point of the lens.
+        if (background)
+            t = -dot(r.view.view_from_world_rotation[2].xyz, x.surface.position - r.view.eye_render.xyz);
         view_arrive(p, x, b, t, layer);
         store_record(st, slot, p);
     }

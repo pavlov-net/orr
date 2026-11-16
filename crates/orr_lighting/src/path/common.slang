@@ -807,6 +807,6 @@ public void background_texel<E : IEnvironment, M : IMedium>(PathRoot r, uint2 pi
     if (!(record.first_distance > 0.0))
         texel = float4(apply_hdr_ceiling(pre_exposure * sky_radiance<E, M>(r.set, v.eye_render.xyz, camera_ray.dir)), 0.0);
     else
-        texel = float4(apply_hdr_ceiling(pre_exposure * radiance), near / (camera_ray.axis * view_first_t(record)));
+        texel = float4(apply_hdr_ceiling(pre_exposure * radiance), near / view_first_t(record));
     r.dof_background.get<RWTexture2D<float4>>()[pixel] = texel;
 }
