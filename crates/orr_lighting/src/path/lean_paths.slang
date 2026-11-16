@@ -1,9 +1,9 @@
 // The lean path tracer's stages (`path.lean`): the raygens of a view's paths and of its update
 // paths, the callable of a path's first vertex and the one of a debug view of it alone, the ones
 // that start a path in the interiors around the eye and run its vertex in an interior's medium,
-// the one of a step of a directional job's walk through a plane stack, the hit shader of a plain
-// opaque surface, the any-hit shaders of a path's ray and of its shadow ray at a candidate that
-// is not opaque, and the miss shaders of the two.
+// the one of a step of a directional job's walk through a plane stack, the hit shaders of a plain
+// opaque surface and of a strand, the any-hit shaders of a path's ray and of its shadow ray at a
+// candidate that is not opaque, and the miss shaders of the two.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_shaders.trace;
@@ -39,6 +39,16 @@ void surface_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
     ORR_OMM(surface_hit);
     TriangleHit h = { a };
     lean_hit<Surface, Medium, TriangleHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
+    // Tells the raygen a shader took the hit.
+    p.words.x = 0;
+}
+
+[shader("closesthit")]
+void strand_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
+{
+    ORR_OMM(strand_hit);
+    BuiltInHit h = { a };
+    lean_hit<Surface, Medium, BuiltInHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
     // Tells the raygen a shader took the hit.
     p.words.x = 0;
 }
