@@ -16,18 +16,19 @@ use orr_shaders::surface_declares;
 use crate::mask_sets::Members;
 use crate::shaders::consts::{
     ANY_HIT_INSTRUCTIONS, COATED_EMITTER_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS,
-    EMITTER_VIEW_INSTRUCTIONS, HIT_INSTRUCTIONS, INTERIOR_HIT_INSTRUCTIONS, LAYER_HIT_INSTRUCTIONS,
-    MEDIUM_VERTEX_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW,
-    PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS,
-    RAYGEN_INSTRUCTIONS, RAYGEN_LAYER_INSTRUCTIONS, RAYGEN_STACK_INSTRUCTIONS,
-    RAYGEN_WALK_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS, STACK_LAYER_INSTRUCTIONS,
-    STACK_STEP_INSTRUCTIONS, STACK_VERTEX_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
-    WALK_EXIT_INSTRUCTIONS, WALK_HIT_INSTRUCTIONS,
+    EMITTER_VIEW_INSTRUCTIONS, FRONT_INSTRUCTIONS, HIT_INSTRUCTIONS, INTERIOR_HIT_INSTRUCTIONS,
+    LAYER_HIT_INSTRUCTIONS, MEDIUM_VERTEX_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE,
+    PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
+    PRODUCER_HIT_INSTRUCTIONS, RAYGEN_FRONT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
+    RAYGEN_LAYER_INSTRUCTIONS, RAYGEN_STACK_INSTRUCTIONS, RAYGEN_WALK_INSTRUCTIONS,
+    RICH_HIT_INSTRUCTIONS, STACK_LAYER_INSTRUCTIONS, STACK_STEP_INSTRUCTIONS,
+    STACK_VERTEX_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS, WALK_EXIT_INSTRUCTIONS,
+    WALK_HIT_INSTRUCTIONS,
 };
 use crate::shaders::path::{lean_layer, lean_paths, lean_rich, lean_walk};
 use crate::staged::{
-    MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_INTERIORS, MAY_LAYERS, MAY_LOBES, MAY_SCATTERING,
-    MAY_STACK, MAY_TRACED, MAY_UPDATE, MAY_VIEW, MAY_WALK,
+    MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_INTERIORS, MAY_LAYERS, MAY_LOBES, MAY_LOCAL_LIGHTS,
+    MAY_PARTICLES, MAY_SCATTERING, MAY_STACK, MAY_TRACED, MAY_UPDATE, MAY_VIEW, MAY_WALK,
 };
 use crate::{Error, KernelSet, module};
 
@@ -54,6 +55,9 @@ pub enum Role {
     View,
     /// The callable of a step of a directional job's walk through a plane stack.
     Stack,
+    /// The callable that takes what a path's ray meets in front of its hit: particles and the
+    /// proxies of sphere and rect lights.
+    Front,
 }
 
 /// The most instructions the stages of a pipeline may hand the driver together.
@@ -178,11 +182,13 @@ impl Spec {
             Role::Raygen => {
                 let layers = self.may & MAY_LAYERS != 0;
                 let walks = self.may & (MAY_SCATTERING | MAY_WALK) != 0;
+                let front = self.may & (MAY_PARTICLES | MAY_LOCAL_LIGHTS) != 0;
                 return Some(
                     RAYGEN_INSTRUCTIONS
                         + if layers { RAYGEN_LAYER_INSTRUCTIONS } else { 0 }
                         + if walks { RAYGEN_WALK_INSTRUCTIONS } else { 0 }
-                        + if stacks { RAYGEN_STACK_INSTRUCTIONS } else { 0 },
+                        + if stacks { RAYGEN_STACK_INSTRUCTIONS } else { 0 }
+                        + if front { RAYGEN_FRONT_INSTRUCTIONS } else { 0 },
                 );
             }
             Role::Miss => return Some(MISS_INSTRUCTIONS),
@@ -190,6 +196,7 @@ impl Spec {
             Role::Exit => return Some(WALK_EXIT_INSTRUCTIONS + vertex_stack),
             Role::View => return Some(EMITTER_VIEW_INSTRUCTIONS),
             Role::Stack => return Some(STACK_STEP_INSTRUCTIONS),
+            Role::Front => return Some(FRONT_INSTRUCTIONS),
             Role::Hit => (HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS),
             Role::AnyHit => (ANY_HIT_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS),
         };
@@ -303,6 +310,9 @@ struct Table {
     /// The callable of a step of a directional job's walk through a plane stack, where the paths
     /// may meet one.
     stack_step: Option<u32>,
+    /// The callable that takes what a path's ray meets in front of its hit, where the paths may
+    /// meet particles or sphere and rect lights.
+    front: Option<u32>,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
 }
@@ -408,6 +418,8 @@ impl Table {
         });
         let stack_step = (may & MAY_STACK != 0)
             .then(|| Self::stage(&mut specs, folded("stack_step", Role::Stack)));
+        let front = (may & (MAY_PARTICLES | MAY_LOCAL_LIGHTS) != 0)
+            .then(|| Self::stage(&mut specs, folded("front", Role::Front)));
         // `hit_surface` of the hit shaders of each pin: any id, then each id from 0 on. Where
         // no surface links every material shows id 0.
         let pinned = |entry, role, pin: u32, geometry: Geometry| Spec {
@@ -649,6 +661,7 @@ impl Table {
             walk_exit,
             emitter_view,
             stack_step,
+            front,
             hit_groups,
             groups,
         }
@@ -854,6 +867,7 @@ impl PathPipeline {
                 table.walk_exit.map(ShaderRecord::new),
                 table.emitter_view.map(ShaderRecord::new),
                 table.stack_step.map(ShaderRecord::new),
+                table.front.map(ShaderRecord::new),
             ],
             max_recursion: 1,
             flags: RayPipelineFlags::scene(device.caps()),

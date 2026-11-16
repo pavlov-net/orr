@@ -49,6 +49,9 @@ public static const uint CALL_EXIT = 4;
 // The callable of a step of a directional job's walk through a plane stack, which a pipeline
 // whose paths may meet one holds.
 public static const uint CALL_STACK = 6;
+// The callable that takes what a path's ray meets in front of its hit, which a pipeline whose paths
+// may meet particles or sphere and rect lights holds.
+public static const uint CALL_FRONT = 7;
 
 // Whether `pixel` lies on a tile whose layers the layer guides traced, which a camera ray meets
 // before the G-buffer's surface.
@@ -686,10 +689,7 @@ uint scatter_segment(PathRoot r, uint slot, uint4* at, uint4 w0, float t, inout 
     float3 sigma_t = asfloat(load_coherent(cold + 1 + INTERIOR_ENTRIES).yzw);
     Sampler rng = path_sampler(r, item_pixel(r, r.slice_base + slot));
     rng.dimension = w0.w >> HOT_DIMENSION_SHIFT;
-    float u_channel = rng.next();
-    float u_distance = rng.next();
-    float sigma = sigma_t[min(uint(u_channel * 3.0), 2u)];
-    float sampled = sigma > 0.0 ? -log(1.0 - u_distance) / sigma : positive_infinity();
+    float sampled = free_flight(sigma_t, rng);
     bool scattered = sampled < span;
     uint4 w1 = load_coherent(at + 1);
     float3 throughput = hot_throughput(w1);
@@ -720,17 +720,33 @@ uint scatter_segment(PathRoot r, uint slot, uint4* at, uint4 w0, float t, inout 
     return walks ? NEXT_INTERIOR : NEXT_RAY;
 }
 
+// The instance mask of what the ray of `slot`'s path, whose first hot word is `w0`, sees in front
+// of its hit beside what covers it, as the staged loop's `front_mask` takes it: particles for a
+// view path's rays that leave a layer, a scatter or a walk's way out (`chain`) and for the first
+// vertex's ray, and for every ray whose light counts the proxies of sphere and rect lights, which
+// cover nothing. The camera ray sees neither.
+uint lean_front_mask(PathRoot r, uint slot, uint4 w0, bool view, bool chain)
+{
+    if ((w0.w & HOT_CAMERA) != 0)
+        return 0;
+    bool particles = may(MAY_PARTICLES) && view && r.set.particle_entries > 0 && (chain || context_depth(r, slot, w0.w) == 1);
+    bool lights = may(MAY_LOCAL_LIGHTS) && r.set.local_lights > 0 && path_mode(r) != PATH_NEE_ONLY && (w0.w & HOT_COUNTED) != 0;
+    return (particles ? MASK_PARTICLE : 0) | (lights ? MASK_LIGHT : 0);
+}
+
 // Traces the ray in hot words `at`, whose first word is `w0`, into `h`, with payload `p`, and says
 // what the raygen runs next: the shader of what it met where it `invokes` it. A camera ray has no
 // length where the path starts on the G-buffer's surface, which a sky pixel alone traces it on; on
 // a layered tile it looks for layers up to that surface, and the path starts there where it meets
 // none; where the view's paths trace their camera rays it is the ray the camera sees along. Its
 // hit is a primary one in either. A layered tile's ray takes only layers, since the G-buffer holds
-// the opaque surface the camera sees; paths that start on the G-buffer's surface alone, whose
-// camera rays look for none, have no `SEARCH`, and take a scattering interior's transmittance
-// alone, as update paths do. Every ray of a view path inside one may scatter: in real time the
-// world cache's light for the medium ends the path there, which costs no more than going on.
-uint trace_ray<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, inout PathTrail trail, out Traced h, out Payload p, out bool invokes)
+// the opaque surface the camera sees. Update paths, which start on the G-buffer's surface alone
+// and are no `VIEW`'s, have camera rays that look for none, take a scattering interior's
+// transmittance alone and see no particles. Every ray of a view path inside one may scatter: in
+// real time the world cache's light for the medium ends the path there, which costs no more than
+// going on. What the ray meets in front of its hit or its scatter runs in a callable first
+// (`lean_front_mask`).
+uint trace_ray<let VIEW : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, inout PathTrail trail, out Traced h, out Payload p, out bool invokes)
 {
     uint4 w1 = load_coherent(at + 1);
     uint4 w2 = load_coherent(at + 2);
@@ -740,7 +756,7 @@ uint trace_ray<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, in
     // A camera ray reaches as far as its path's start says where the paths start on the
     // G-buffer's surface.
     float reach = asfloat(w2.z);
-    bool layers = SEARCH && may(MAY_LAYERS) && camera && !traces_primary(r) && reach > 0.0;
+    bool layers = VIEW && may(MAY_LAYERS) && camera && !traces_primary(r) && reach > 0.0;
     // The lane keeps a ray's origin offset for the shader it reaches, which a camera ray has none of.
     if (layers)
         store_coherent(at + 2, uint4(w2.xy, 0, w2.w));
@@ -770,7 +786,23 @@ uint trace_ray<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, in
         ray.TMin = asfloat(asuint(h.t()) + 1);
     }
     invokes = false;
-    if (SEARCH && may(MAY_SCATTERING) && (w0.w & HOT_INTERIOR) != 0)
+    if (may_any(MAY_PARTICLES | MAY_LOCAL_LIGHTS))
+    {
+        uint front = lean_front_mask(r, slot, w0, VIEW, trail.chain);
+        if (front != 0)
+        {
+            Payload f;
+            f.words = uint4(asuint(h.hit() ? h.t() : positive_infinity()), front, VIEW ? 1 : 0, 0);
+            call(CALL_FRONT, f);
+            // What covers the ray in front of its hit may leave the path no light to carry on.
+            if (f.words.x == 0)
+            {
+                end_path(at);
+                return NEXT_RAY;
+            }
+        }
+    }
+    if (VIEW && may(MAY_SCATTERING) && (w0.w & HOT_INTERIOR) != 0)
     {
         bool on;
         uint next = scatter_segment(r, slot, at, w0, h.hit() ? h.t() : positive_infinity(), trail, on);
@@ -784,10 +816,9 @@ uint trace_ray<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, in
     return NEXT_RAY;
 }
 
-// Runs the path in hot words `at` to its end from `next`, NEXT_FIRST where it starts on the
-// G-buffer's surface, with camera rays that look for layers where `SEARCH`: the rays it traced, as
-// `count_ray` counts them.
-uint run_path<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint next)
+// Runs the view path in hot words `at` to its end from `next`, NEXT_FIRST where it starts on the
+// G-buffer's surface: the rays it traced, as `count_ray` counts them.
+uint run_path(PathRoot r, uint slot, uint4* at, uint next)
 {
     PathTrail trail = { false, false, 0, 0.0 };
     // The ray's hit and a walk's last step's, each recorded by its trace: a hit object is never
@@ -826,7 +857,7 @@ uint run_path<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint next)
         else if ((w0.w & HOT_RAY) == 0)
             break;
         else
-            next = trace_ray<SEARCH>(r, slot, at, w0, trail, h, p, invokes);
+            next = trace_ray<true>(r, slot, at, w0, trail, h, p, invokes);
         if (!invokes)
             continue;
         // A hit past a walk takes it as walked, but where a walk leaves.
@@ -932,7 +963,7 @@ public void lean_paths(PathRoot r)
         if (runs)
         {
             bool starts_inside = start_path(r, pixel, at, lean_cold(r, slot), surface && !second ? 1.0 / r.pixel_fraction : 1.0, layers && !second, second);
-            rays = run_path<true>(r, slot, at, surface && (second || !layers) ? NEXT_FIRST : NEXT_RAY);
+            rays = run_path(r, slot, at, surface && (second || !layers) ? NEXT_FIRST : NEXT_RAY);
             radiance = asfloat(load_coherent(at + 3).xyz);
             if (!second)
             {

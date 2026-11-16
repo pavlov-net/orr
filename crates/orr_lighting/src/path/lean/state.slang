@@ -111,6 +111,13 @@ public static const uint PAYLOAD_BENT = 1;
 // The callable of a step of that walk: the light's bend at the vertex, and per leg the medium,
 // the crossing of the face it ends at and its Fresnel.
 [Host] public static const uint STACK_STEP_INSTRUCTIONS = 5000;
+// What a raygen holds more where its paths may meet particles or sphere and rect lights: whether a
+// ray sees them, and the call that takes what it meets in front of its hit.
+[Host] public static const uint RAYGEN_FRONT_INSTRUCTIONS = 200;
+// That callable: a ray query over particles and light proxies that composites them in depth order,
+// each particle's look resolved and each one's light weighed against next-event estimation at the
+// vertex the ray left, and inside a scattering medium the free flight that ends the ray.
+[Host] public static const uint FRONT_INSTRUCTIONS = 15500;
 // What a stage that runs a vertex holds more there: its re-run, which weighs its directional job's
 // light through the stack along the bent direction, and what the job leaves the walk; and in a
 // layer's stage the stack question's answer and the track of a ray its ideal transmission passes
