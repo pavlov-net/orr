@@ -53,6 +53,14 @@ public static const uint LEAN_EXIT_WORD = 12;
 [Host] public static const uint MEDIUM_VERTEX_INSTRUCTIONS = 12500;
 // The callable of the vertex where a subsurface walk leaves.
 [Host] public static const uint WALK_EXIT_INSTRUCTIONS = 17000;
+// The callable that weighs a coated emitter's light by what its coat and fuzz pass toward a
+// vertex.
+[Host] public static const uint EMITTER_VIEW_INSTRUCTIONS = 27200;
+
+// The callable that weighs the light of an emitter that has a coat or a fuzz by what they pass
+// toward a vertex's shadow ray (`emitter_view_layer`), which a pipeline whose emitters may have
+// one holds. It evaluates the emitter's surface, which no hit stage holds a second copy of.
+public static const uint CALL_EMITTER_VIEW = 5;
 // What a hit made for surfaces that may walk holds more than one with the rich lobes alone: the
 // subsurface lobe, the start of its walk and what it leaves of the surface where a walk leaves.
 [Host] public static const uint WALK_HIT_INSTRUCTIONS = 5400;

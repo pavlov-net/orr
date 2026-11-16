@@ -357,6 +357,11 @@ struct LightPick
     float target;               // what it was resampled by
     float sum;
     uint drawn;
+    // An emissive winner whose radiance is not yet through its side's coat and fuzz
+    // (`ResolvedLightSample.view`), and where it lies in its list and cluster.
+    bool view;
+    uint position;
+    uint triangle;
 }
 
 // Draws the light candidates of the vertex at `position` with shading normal `normal`, weighed by
@@ -382,6 +387,9 @@ LightPick pick_light<let FIRST : uint, B : ILeanScatter>(PathRoot r, B b, float3
     k.target = 0.0;
     k.sum = 0.0;
     k.drawn = 0;
+    k.view = false;
+    k.position = 0;
+    k.triangle = 0;
     f = float3(0.0);
     pdf = 0.0;
     diffuse = float3(0.0);
@@ -432,6 +440,12 @@ LightPick pick_light<let FIRST : uint, B : ILeanScatter>(PathRoot r, B b, float3
             k.kind = c.kind;
             k.light = c.light;
             k.target = target;
+            if (may2(MAY2_COATED_EMITTERS))
+            {
+                k.view = c.view;
+                k.position = c.position;
+                k.triangle = c.triangle;
+            }
         }
     }
     // The winner's value and the scatter's, through one evaluation of the BSDF in the stage.
@@ -684,12 +698,15 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
             e *= beer(sigma, k.distance);
         else if (k.kind != LIGHT_SAMPLE_ENVIRONMENT)
             e *= medium_transmittance<M>(r.scene.medium, origin, k.dir, k.distance);
+        // The point drawn on the light is the candidate's distance along its direction from the
+        // vertex.
+        float3 target = far ? k.dir : g.position + k.dir * k.distance;
+        if (may(MAY_EMISSIVE) && may2(MAY2_COATED_EMITTERS) && k.view && any(e > 0.0))
+            e *= emitter_view(at, k, origin, target, inside);
         if (any(e > 0.0))
         {
-            // The point drawn on the light is the candidate's distance along its direction
-            // from the vertex.
             store_coherent(at + 4, uint4(asuint(origin), asuint(e.x)));
-            store_coherent(at + 5, uint4(asuint(far ? k.dir : g.position + k.dir * k.distance), asuint(e.y)));
+            store_coherent(at + 5, uint4(asuint(target), asuint(e.y)));
             job_blue = e.z;
             job_light = k.kind != LIGHT_SAMPLE_DIRECTIONAL ? k.light : NO_LIGHT;
             flags |= HOT_SHADOW | (far ? HOT_SHADOW_FAR : 0);
@@ -800,18 +817,69 @@ public Walk load_walk(uint4* cold, uint frame, out uint owner)
     return walk_start(asfloat(a.xyz), oct_decode_snorm16(d.y), volume, c.w, rng);
 }
 
+// What the coat and fuzz of the emitter that light pick `k` drew pass of its light toward a vertex,
+// `inside` an interior, along the shadow ray from `origin` to `target`: its callable evaluates the
+// emitter's surface there. The ray reaches it in the shadow job's words `at`, which the job then
+// takes back.
+float3 emitter_view(uint4* at, LightPick k, float3 origin, float3 target, bool inside)
+{
+    store_coherent(at + 4, uint4(asuint(origin), k.light));
+    store_coherent(at + 5, uint4(asuint(target), k.position));
+    Payload p;
+    p.words = uint4(k.triangle, inside ? 1 : 0, 0, 0);
+    // The compute stand-ins (`path.standins`), compiled for their statistics alone, hold no
+    // callables.
+    __stage_switch
+    {
+    case raygen:
+    case closesthit:
+    case miss:
+    case callable:
+        call(CALL_EMITTER_VIEW, p);
+        break;
+    default:
+        break;
+    }
+    return asfloat(p.words.xyz);
+}
+
+// The emitter view's callable (`emitter_view`) for `slot`'s path, with its payload's `words`: what
+// the coat and fuzz of the surface `S` evaluates there pass toward the vertex, in the medium of the
+// interior it lies in, into the first three.
+public void lean_emitter_view<S : ISurfaces>(PathRoot r, uint slot, inout uint4 words)
+{
+    uint4* at = lean_hot(r, slot);
+    uint4 a = load_coherent(at + 4);
+    uint4 b = load_coherent(at + 5);
+    float3 to = asfloat(b.xyz) - asfloat(a.xyz);
+    ResolvedLightSample c = no_candidate();
+    c.distance = length(to);
+    c.dir = to / c.distance;
+    c.kind = LIGHT_SAMPLE_EMISSIVE;
+    c.light = a.w;
+    c.position = b.w;
+    c.triangle = words.x;
+    c.view = true;
+    c.point = asfloat(b.xyz);
+    uint medium = words.y != 0 ? innermost_of(load_coherent(lean_cold(r, slot))) : MATERIAL_NONE;
+    words.xyz = asuint(emitter_view_layer<S>(r.set, c, interior_ior(r.scene, medium)));
+}
+
 // What a vertex's scatter leaves of light pick `k` as the path's shadow job: `e` where its ray from
-// `origin`, off the vertex at `point`, reaches the light. The job's blue and light id, which share
-// the cone's word, and its flags in `flags`.
-void store_job(uint4* at, LightPick k, float3 origin, float3 point, float3 e, inout uint flags, out float job_blue, out uint job_light)
+// `origin`, off the vertex at `point`, `inside` an interior or not, reaches the light. The job's
+// blue and light id, which share the cone's word, and its flags in `flags`.
+void store_job(uint4* at, LightPick k, float3 origin, float3 point, float3 e, bool inside, inout uint flags, out float job_blue, out uint job_light)
 {
     job_blue = 0.0;
     job_light = NO_LIGHT;
+    bool far = !isfinite(k.distance);
+    float3 target = far ? k.dir : point + k.dir * k.distance;
+    if (may(MAY_EMISSIVE) && may2(MAY2_COATED_EMITTERS) && k.view && any(e > 0.0))
+        e *= emitter_view(at, k, origin, target, inside);
     if (!any(e > 0.0))
         return;
-    bool far = !isfinite(k.distance);
     store_coherent(at + 4, uint4(asuint(origin), asuint(e.x)));
-    store_coherent(at + 5, uint4(asuint(far ? k.dir : point + k.dir * k.distance), asuint(e.y)));
+    store_coherent(at + 5, uint4(asuint(target), asuint(e.y)));
     job_blue = e.z;
     job_light = k.kind != LIGHT_SAMPLE_DIRECTIONAL ? k.light : NO_LIGHT;
     flags |= HOT_SHADOW | (far ? HOT_SHADOW_FAR : 0);
@@ -994,7 +1062,7 @@ public void lean_medium_vertex(PathRoot r, uint slot, float distance, uint kind,
     {
         float3 origin = leaves ? surface_ray_origin(r, point, normal, k.dir) : point;
         float3 e = picked_light(r, k, throughput, 1.0, mode.one_technique || leaves) * (inside ? beer(sigma, k.distance) : float3(1.0));
-        store_job(at, k, origin, point, e, flags, job_blue, job_light);
+        store_job(at, k, origin, point, e, inside, flags, job_blue, job_light);
     }
     // The phase function draws its own density, so the next ray keeps the throughput; a way out is
     // the direction the walk took.
@@ -1070,11 +1138,12 @@ void lean_exit_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathVertex 
     {
         float3 origin = vertex_origin(x, k.dir);
         float3 e = picked_light(r, k, throughput, 1.0, mode.one_technique);
-        if (may(MAY_INTERIORS) && (flags & HOT_INTERIOR) != 0)
+        bool inside = may(MAY_INTERIORS) && (flags & HOT_INTERIOR) != 0;
+        if (inside)
             e *= beer(interior_sigma(lean_cold(r, slot)), k.distance);
         else if (k.kind != LIGHT_SAMPLE_ENVIRONMENT)
             e *= medium_transmittance<M>(r.scene.medium, origin, k.dir, k.distance);
-        store_job(at, k, origin, g.position, e, flags, job_blue, job_light);
+        store_job(at, k, origin, g.position, e, inside, flags, job_blue, job_light);
     }
     bool goes = scatter_pdf > 0.0 && sides_agree(g.normal, g.geometric_normal, wi);
     if (goes)
