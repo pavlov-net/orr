@@ -122,10 +122,14 @@ bool start_path(PathRoot r, uint2 pixel, uint4* at, uint4* cold, float throughpu
 }
 
 // Traces the pending shadow job of `slot`'s path in hot words `at`: any hit ends it, and where
-// its miss shader ran the job's light, times what the ray's candidates let through, is the
-// path's. The ray's shaders know nothing of the path: they read and write the payload alone. The
-// thin walls it crosses lie in a medium of IOR `exterior` where the job's vertex said, else 0.
-// Where the paths may meet a plane stack, `stack_shadow` traces it.
+// it met nothing the job's light, times what the ray's candidates let through, is the path's. The
+// ray's shaders know nothing of the path: they read and write the payload alone. The thin walls
+// it crosses lie in a medium of IOR `exterior` where the job's vertex said, else 0. Where the
+// paths may meet a plane stack, a directional job's ray in a scene that holds one traces into a
+// hit object, whose record says what it ended at: one that ends at solid glass may reach its
+// light through a stack past it (`stack_walk`), and one that starts in an interior and meets
+// nothing left that interior through none of its surfaces: it lies in no closed interior and
+// takes no light. Every other job's ray is a plain one, whose miss shader says it met nothing.
 void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior)
 {
     uint4 w4 = load_coherent(at + 4);
@@ -143,17 +147,35 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior)
         float magnitude = max(abs(target.x), max(abs(target.y), abs(target.z)));
         t_max = max(0.0, reach - max(1e-4 * reach, magnitude * F32_PRECISION));
     }
-    if (may(MAY_STACK))
-    {
-        stack_shadow(r, slot, at, flags, exterior, origin, dir, t_max);
-        return;
-    }
     ShadowCover cover = shadow_cover(SHADOW_PATH, SHADOW_MASK, context_depth(r, slot, flags), false);
     cover.product = float3(asfloat(w4.w), asfloat(w5.w), asfloat(load_coherent(at + 2).y));
     Payload p;
     p.words = cover.words();
     RayDesc ray = path_ray(origin, dir, t_max);
-    trace(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, ray, p);
+    bool stacks = false;
+    if (may(MAY_STACK))
+    {
+        uint light = load_coherent(at + 2).w;
+        stacks = (flags & HOT_SHADOW_FAR) != 0 && (light == NO_LIGHT || light == STACK_JOB_LIGHT) && lean_stacks(r);
+    }
+    if (stacks)
+    {
+        Traced h = trace_hit(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, ray, p);
+        if (h.hit())
+        {
+            // The ray ends at the first opaque surface or solid glass it found, which need not be
+            // the nearest; the probe reaches past it by its rounding.
+            if (h.record<HitData>().class_id() == CLASS_DIELECTRIC)
+                stack_walk(r, slot, at, cover.word, exterior, h.t() * (1.0 + 1e-4) + T_MIN_BASE);
+            return;
+        }
+        if (load_coherent(at + 2).w == STACK_JOB_LIGHT)
+            return;
+        // A hit object's trace runs no miss shader, whose mark the ray takes here.
+        p.words.w |= SHADOW_MISSED;
+    }
+    else
+        trace(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, ray, p);
     if ((p.words.w & SHADOW_MISSED) == 0)
         return;
     float3 passed = asfloat(p.words.xyz);
@@ -163,28 +185,27 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior)
     lean_shadow_add(r, slot, passed);
 }
 
-// `trace_shadow` where the paths may meet a plane stack, of the job's ray from `origin` along
-// `dir` to `t_max`: the ray traces into a hit object, whose
-// record says what it ended at, and a directional job's ray that ends at solid glass may reach its
-// light through a stack past it. A probe along the light's direction up to past the glass, a
+// The walk of `slot`'s directional job in hot words `at`, whose ray ended at solid glass short of
+// `reach`, through a plane stack past it: a probe along the light's direction up to `reach`, a
 // stack ray (`stack_ray`), finds the stack's face, and legs go face to face along the bent
-// directions, each a stack ray to its face and a shadow ray here up to it, the stack's callable
+// directions, each a stack ray to its face and a plain shadow ray up to it, the stack's callable
 // stepping from one to the next (`lean_stack_step`). Where the light bent at the vertex, the
-// vertex's re-run weighs it again (`bent_rerun`). A job whose ray starts in an interior and meets
-// nothing left that interior through none of its surfaces: it lies in no closed interior and takes
-// no light.
-void stack_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior, float3 origin, float3 dir, float t_max)
+// vertex's re-run weighs it again (`bent_rerun`). The legs' shadow rays take the job ray's cover
+// word `word`, and the job's ray lies in a medium of IOR `exterior` where the vertex said, which
+// the first leg's thin walls take.
+void stack_walk(PathRoot r, uint slot, uint4* at, uint word, float exterior, float reach)
 {
+    uint flags = load_coherent(at).w;
     uint4 w4 = load_coherent(at + 4);
     uint4 w5 = load_coherent(at + 5);
     uint4 w2 = load_coherent(at + 2);
     float3 job = float3(asfloat(w4.w), asfloat(w5.w), asfloat(w2.y));
     bool inside = w2.w == STACK_JOB_LIGHT;
-    bool stacks = (flags & HOT_SHADOW_FAR) != 0 && (w2.w == NO_LIGHT || inside) && lean_stacks(r);
-    uint depth = context_depth(r, slot, flags);
-    RayDesc ray = path_ray(origin, dir, t_max);
-    // 0: the job's ray, 1: the probe, 2: the legs.
-    uint phase = 0;
+    float3 dir = asfloat(w5.xyz);
+    uint depth = word >> 21;
+    RayDesc ray = path_ray(asfloat(w4.xyz), dir, reach);
+    // 1: the probe, 2: the legs.
+    uint phase = 1;
     uint met = MET_NONE;
     float met_t = 0.0;
     bool probed = false;
@@ -198,56 +219,32 @@ void stack_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior, 
     uint4 face = NO_STACK_FACE;
     StackStep q;
     q.leg = uint4(0);
-    for (uint k = 0; k < STACK_CROSSINGS + 3; k++)
+    for (uint k = 0; k < STACK_CROSSINGS + 2; k++)
     {
-        if (phase > 0 && !probed)
-            met = stack_ray(r, phase == 1 ? path_ray(origin, dir, met_t) : path_ray(ray.Origin, ray.Direction, positive_infinity()), depth, met_t, face);
+        if (!probed)
+            met = stack_ray(r, phase == 1 ? ray : path_ray(ray.Origin, ray.Direction, positive_infinity()), depth, met_t, face);
         probed = false;
         // The step at the face the stack ray met, before the leg's shadow ray up to it, whose
         // shadow ray then decides whether the light goes on.
-        uint step = STEP_ON;
-        if (phase > 0)
+        q.words = uint4((phase == 1 ? STEP_START : STEP_LEG) | (met << 4) | (inside ? STEP_INSIDE : 0) | (crossed << STEP_CROSSED_SHIFT), asuint(met_t), 0, 0);
+        q.face = face;
+        call(CALL_STACK, q);
+        uint step = q.words.x;
+        if (step == STEP_DARK)
+            return;
+        if (phase == 2)
         {
-            q.words = uint4((phase == 1 ? STEP_START : STEP_LEG) | (met << 4) | (inside ? STEP_INSIDE : 0) | (crossed << STEP_CROSSED_SHIFT), asuint(met_t), 0, 0);
-            q.face = face;
-            call(CALL_STACK, q);
-            step = q.words.x;
-            if (step == STEP_DARK)
-                return;
-        }
-        if (phase != 1)
-        {
-            if (phase == 2)
-                ray.TMax = met == MET_NONE ? positive_infinity() : short_of(ray.Origin, ray.Direction, met_t);
-            ShadowCover cover = shadow_cover(SHADOW_PATH, SHADOW_MASK, depth, false);
-            cover.product = phase == 0 ? job : float3(1.0);
+            ray.TMax = met == MET_NONE ? positive_infinity() : short_of(ray.Origin, ray.Direction, met_t);
             Payload p;
-            p.words = cover.words();
-            Traced h = trace_hit(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, ray, p);
-            bool missed = h.miss();
-            bool glass = stacks && h.hit() && h.record<HitData>().class_id() == CLASS_DIELECTRIC;
-            float committed = h.t();
-            float3 passed = asfloat(p.words.xyz);
-            // Thin walls the ray passed let through what they pass straight, walked one after
-            // the other.
-            if (missed && may2(MAY2_THIN_DIELECTRICS) && ShadowCover.of_words(p.words).has(SHADOW_CROSSES) && any(passed > 0.0))
-                passed *= cross_walls(r, slot, at, flags, ray, walls);
-            if (!missed)
-            {
-                if (phase != 0 || !glass)
-                    return;
-                // The ray ends at the first opaque surface or solid glass it found, which need not
-                // be the nearest; the probe reaches past it by its rounding.
-                phase = 1;
-                met_t = committed * (1.0 + 1e-4) + T_MIN_BASE;
-                continue;
-            }
-            if (phase == 0)
-            {
-                if (!inside)
-                    lean_shadow_add(r, slot, passed);
+            p.words = uint4(asuint(float3(1.0)), word);
+            trace(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, ray, p);
+            if ((p.words.w & SHADOW_MISSED) == 0)
                 return;
-            }
+            float3 passed = asfloat(p.words.xyz);
+            // Thin walls the leg passed let through what they pass straight, walked one after
+            // the other.
+            if (may2(MAY2_THIN_DIELECTRICS) && ShadowCover.of_words(p.words).has(SHADOW_CROSSES) && any(passed > 0.0))
+                passed *= cross_walls(r, slot, at, flags, ray, walls);
             through *= passed;
             if (!any(through > 0.0))
                 return;
