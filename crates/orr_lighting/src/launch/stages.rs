@@ -15,12 +15,12 @@ use orr_shaders::surface_declares;
 
 use crate::mask_sets::Members;
 use crate::shaders::consts::{
-    ANY_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS, EMITTER_VIEW_INSTRUCTIONS, HIT_INSTRUCTIONS,
-    INTERIOR_HIT_INSTRUCTIONS, LAYER_HIT_INSTRUCTIONS, MEDIUM_VERTEX_INSTRUCTIONS,
-    MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS,
-    PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
-    RAYGEN_LAYER_INSTRUCTIONS, RAYGEN_WALK_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS,
-    TRACED_HIT_INSTRUCTIONS, WALK_EXIT_INSTRUCTIONS, WALK_HIT_INSTRUCTIONS,
+    ANY_HIT_INSTRUCTIONS, COATED_EMITTER_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS,
+    EMITTER_VIEW_INSTRUCTIONS, HIT_INSTRUCTIONS, INTERIOR_HIT_INSTRUCTIONS, LAYER_HIT_INSTRUCTIONS,
+    MEDIUM_VERTEX_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW,
+    PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS,
+    RAYGEN_INSTRUCTIONS, RAYGEN_LAYER_INSTRUCTIONS, RAYGEN_WALK_INSTRUCTIONS,
+    RICH_HIT_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS, WALK_EXIT_INSTRUCTIONS, WALK_HIT_INSTRUCTIONS,
 };
 use crate::shaders::path::{lean_layer, lean_paths, lean_rich, lean_walk};
 use crate::staged::{
@@ -183,6 +183,12 @@ impl Spec {
         let primary =
             self.role == Role::Hit && self.geometry.is_some() && self.may & MAY_TRACED != 0;
         let traced = if primary { TRACED_HIT_INSTRUCTIONS } else { 0 };
+        let coated = self.role == Role::Hit && self.may & may2(SceneFeatures::COATED_EMITTERS) != 0;
+        let coated = if coated {
+            COATED_EMITTER_HIT_INSTRUCTIONS
+        } else {
+            0
+        };
         let emitter = self.role == Role::Hit && self.may & MAY_EMITTER != 0;
         let emitter = if emitter { EMITTER_HIT_INSTRUCTIONS } else { 0 };
         let interiors = self.role == Role::Hit && self.may & MAY_INTERIORS != 0;
@@ -197,7 +203,14 @@ impl Spec {
             (Role::Hit, Kernel::Layer) => LAYER_HIT_INSTRUCTIONS,
             _ => 0,
         };
-        Some(base + if producers { producer } else { 0 } + traced + emitter + interiors + rich)
+        Some(
+            base + if producers { producer } else { 0 }
+                + traced
+                + emitter
+                + interiors
+                + rich
+                + coated,
+        )
     }
 
     fn constants(&self) -> ([u8; 32], &'static [SpecEntry]) {

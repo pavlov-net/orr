@@ -56,6 +56,9 @@ public static const uint LEAN_EXIT_WORD = 12;
 // The callable that weighs a coated emitter's light by what its coat and fuzz pass toward a
 // vertex.
 [Host] public static const uint EMITTER_VIEW_INSTRUCTIONS = 27200;
+// What a hit holds more where the scene's emitters may have a coat or a fuzz: the call of that
+// callable, and the winner's place in its list and cluster through the light candidates' loop.
+[Host] public static const uint COATED_EMITTER_HIT_INSTRUCTIONS = 340;
 
 // The callable that weighs the light of an emitter that has a coat or a fuzz by what they pass
 // toward a vertex's shadow ray (`emitter_view_layer`), which a pipeline whose emitters may have
