@@ -29,9 +29,9 @@ use crate::shaders::consts::{
 };
 use crate::shaders::path::{lean_layer, lean_paths, lean_rich, lean_walk};
 use crate::staged::{
-    MAY_BACKGROUND, MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_INTERIORS, MAY_LAYERS, MAY_LENS,
-    MAY_LOBES, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES, MAY_SCATTERING, MAY_STACK, MAY_TRACED,
-    MAY_UPDATE, MAY_VIEW, MAY_WALK,
+    MAY_ALL, MAY_BACKGROUND, MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_INTERIORS, MAY_LAYERS,
+    MAY_LENS, MAY_LOBES, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES, MAY_SCATTERING, MAY_STACK,
+    MAY_TRACED, MAY_UPDATE, MAY_VIEW, MAY_WALK,
 };
 use crate::{Error, KernelSet, module};
 
@@ -373,6 +373,11 @@ impl Table {
             surfaces,
             ..HitGroups::default()
         };
+        // The pipeline that may meet everything stands in while a scene's own compiles, and runs a
+        // view that specializes nothing: each pin's group shades its surfaces with the stage that
+        // serves any id, so the table holds one per kind and not one per linked type. A scene's
+        // own mask is never all of it.
+        let general = may == MAY_ALL && surfaces != 0;
         let emits = may & MAY_EMISSIVE != 0;
         // The stage made for a surface that may emit is the only one with `MAY_EMITTER`.
         let may = may & !MAY_EMITTER;
@@ -657,6 +662,7 @@ impl Table {
                     });
                     continue;
                 }
+                let pin = if general { 0 } else { pin };
                 hit_groups.push(HitGroup {
                     closest_hit: hit.map(|e| {
                         let spec = pinned(e, Role::Hit, pin, geometry);
