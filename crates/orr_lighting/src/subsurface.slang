@@ -48,13 +48,15 @@ public struct SubsurfaceTableGpu
     public uint _pad0;
 }
 
-// What a step does at a surface it reaches: WALK_NONE, WALK_BOUNDARY, WALK_REFLECT or WALK_LEAVE.
+// What a step does at a surface it reaches: WALK_NONE, WALK_BOUNDARY, WALK_REFLECT or WALK_LEAVE,
+// the last two weighing the walk's throughput by `weight`.
 public struct WalkMeet
 {
     public uint kind;
     public float3 origin;
     public float3 dir;
     public float3 normal;
+    public float weight;
 
     public __init(uint k)
     {
@@ -62,6 +64,7 @@ public struct WalkMeet
         origin = float3(0.0);
         dir = float3(0.0);
         normal = float3(0.0);
+        weight = 1.0;
     }
 }
 
@@ -254,7 +257,7 @@ public bool walk_met(inout Walk e, WalkDraw d, float t, WalkMeet met)
         walk_end(e);
         return false;
     }
-    e.throughput = e.throughput * a / mix;
+    e.throughput = e.throughput * a / mix * met.weight;
     if (met.kind == WALK_REFLECT)
     {
         e.origin = met.origin;

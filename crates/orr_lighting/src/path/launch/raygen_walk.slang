@@ -86,7 +86,7 @@ public uint walk_path(PathRoot r, uint slot, out float t)
             if (!interior)
                 met = WalkMeet(on_instance(r.scene, b.instance, f.owner) ? WALK_BOUNDARY : WALK_NONE);
             else if (b.triangle && b.material == f.owner)
-                met = interior_meet(r.view, f.owner, e.ior, b.material, boundary_normal(r.scene, h, b, e.dir), e.origin, e.dir, b.t, e.rng);
+                met = interior_meet(r.scene, r.view, f.owner, e.ior, b.material, boundary_normal(r.scene, h, b, e.dir), e.origin, e.dir, b.t, !share, e.rng);
             if (walk_met(e, d, b.t, met))
                 continue;
             store_walk_moving(at, e, m.kind, m.rays);

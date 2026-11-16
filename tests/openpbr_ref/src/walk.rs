@@ -350,36 +350,68 @@ pub fn fresnel(eta: f64, c: f64) -> f64 {
     0.5 * (rs * rs + rp * rp)
 }
 
-/// The interior of a smooth dielectric holding `medium`, in air, with the real-time walk's rules:
-/// the camera's ray refracts in, the walk reflects back or refracts out of the surface by Fresnel,
-/// its way out sees uniform light as it is, and a sun as Lambert reflection on the outward normal
-/// times the Fresnel transmission from the sun over that transmission's cosine-weighted mean.
+/// The interior of a dielectric holding `medium`, in air, with the real-time walk's rules: the
+/// camera's ray refracts in, the walk reflects back or refracts out wherever it meets the surface,
+/// by Fresnel where the surface is smooth and by adobe's BSDF of the rough dielectric seen from
+/// inside where it is rough, its way out sees uniform light as it is, and a sun as Lambert
+/// reflection on the outward normal times the Fresnel transmission from the sun over that
+/// transmission's cosine-weighted mean. With `exact_sun` a rough surface lets a sun in as the
+/// reference does: through its BSDF from inside, wherever the walk meets it.
 pub struct DielectricWalks {
     pub shape: Shape,
     pub medium: Medium,
+    /// The surface's GGX roughness; 0 for a smooth surface.
+    pub roughness: f64,
+    pub exact_sun: bool,
 }
 
 impl DielectricWalks {
+    /// adobe's inputs of the surface: a plain transmitting dielectric of the medium's IOR, whose
+    /// color lies in the medium.
+    fn surface(&self) -> Inputs {
+        Inputs {
+            specular_roughness: self.roughness as f32,
+            specular_ior: self.medium.surface_ior as f32,
+            transmission_weight: 1.0,
+            ..Inputs::default()
+        }
+    }
+
+    /// The Fresnel transmission from a sun at cosine `cos` over its cosine-weighted mean: the
+    /// real-time way out's weight of a sun.
+    fn exit_lobe(&self, cos: f64) -> f64 {
+        let ior = self.medium.surface_ior;
+        let mean = (0..16)
+            .map(|i| 1.0 - fresnel(ior, ((f64::from(i) + 0.5) / 16.0).sqrt()))
+            .sum::<f64>()
+            / 16.0;
+        (1.0 - fresnel(ior, cos)) / mean
+    }
+
     /// One estimate, one walk per channel, of the radiance toward `view` at boundary point
     /// `p0` with outward normal `n0` that crosses the surface from inside.
     pub fn radiance(
         &self,
+        bsdf: &mut Reference,
         p0: DVec3,
         n0: DVec3,
         view: DVec3,
         light: Light,
         rng: &mut Rng,
     ) -> DVec3 {
+        if self.roughness > 0.0 {
+            return self.rough_radiance(bsdf, p0, n0, view, light, rng);
+        }
+        assert!(
+            !(self.exact_sun && matches!(light, Light::Sun { .. })),
+            "a smooth surface lets a sun in only along its way out"
+        );
         let c0 = n0.dot(view);
         let ior = self.medium.surface_ior;
         let eta = 1.0 / ior;
         let cos_t = (1.0 - eta * eta * (1.0 - c0 * c0)).sqrt();
         let entry = (-view * eta + n0 * (eta * c0 - cos_t)).normalize();
         let weight = 1.0 - fresnel(ior, c0);
-        let mean = (0..16)
-            .map(|i| 1.0 - fresnel(ior, ((f64::from(i) + 0.5) / 16.0).sqrt()))
-            .sum::<f64>()
-            / 16.0;
         let mut out = DVec3::ZERO;
         for c in 0..3 {
             let Some((n, throughput)) =
@@ -394,7 +426,7 @@ impl DielectricWalks {
                 } => {
                     let cos = n.dot(direction);
                     if cos > 0.0 {
-                        (1.0 - fresnel(ior, cos)) / mean * cos / PI * illuminance[c]
+                        self.exit_lobe(cos) * cos / PI * illuminance[c]
                     } else {
                         0.0
                     }
@@ -406,6 +438,103 @@ impl DielectricWalks {
         out
     }
 
+    /// [`Self::radiance`] through a rough surface: the camera's ray enters along a transmitted
+    /// draw of adobe's BSDF from the view, weighted by it.
+    fn rough_radiance(
+        &self,
+        bsdf: &mut Reference,
+        p0: DVec3,
+        n0: DVec3,
+        view: DVec3,
+        light: Light,
+        rng: &mut Rng,
+    ) -> DVec3 {
+        let inputs = self.surface();
+        bsdf.prepare(&inputs, to_local(view, n0).as_vec3().to_array());
+        let u = [rng.f32(), rng.f32(), rng.f32()];
+        let Some(s) = bsdf.sample(u).filter(|s| s.wi[2] < 0.0) else {
+            return DVec3::ZERO;
+        };
+        let entry = to_world(DVec3::from_array(s.wi.map(f64::from)), n0).normalize();
+        let weight = DVec3::from_array(s.weight.map(f64::from));
+        let mut out = DVec3::ZERO;
+        for c in 0..3 {
+            out[c] = weight[c] * self.rough_walk(bsdf, c, p0, entry, light, rng);
+        }
+        out
+    }
+
+    /// What channel `c`'s walk from `p` along unit `w` carries out through the rough surface
+    /// under `light`, scattered by the surface's BSDF from inside wherever it meets it.
+    fn rough_walk(
+        &self,
+        bsdf: &mut Reference,
+        c: usize,
+        mut p: DVec3,
+        mut w: DVec3,
+        light: Light,
+        rng: &mut Rng,
+    ) -> f64 {
+        let inputs = self.surface();
+        let (sigma, albedo) = (self.medium.extinction[c], self.medium.albedo[c]);
+        let mut throughput = 1.0;
+        let mut out = 0.0;
+        loop {
+            let t = -(1.0 - rng.f64()).ln() / sigma;
+            let (tb, nb) = self.shape.exit(p, w);
+            if t >= tb {
+                p += w * tb;
+                bsdf.prepare(&inputs, to_local(-w, nb).as_vec3().to_array());
+                if let Light::Sun {
+                    direction,
+                    illuminance,
+                } = light
+                    && self.exact_sun
+                    && nb.dot(direction) > 0.0
+                {
+                    let f = bsdf.eval(to_local(direction, nb).as_vec3().to_array());
+                    out += throughput * f64::from(f.total()[c]) * illuminance[c];
+                }
+                let u = [rng.f32(), rng.f32(), rng.f32()];
+                let Some(s) = bsdf.sample(u) else {
+                    return out;
+                };
+                throughput *= f64::from(s.weight[c]);
+                let wi = to_world(DVec3::from_array(s.wi.map(f64::from)), nb).normalize();
+                if s.wi[2] > 0.0 {
+                    return out
+                        + throughput
+                            * match light {
+                                Light::Uniform { radiance } => radiance[c],
+                                Light::Sun { .. } if self.exact_sun => 0.0,
+                                Light::Sun {
+                                    direction,
+                                    illuminance,
+                                } => {
+                                    let cos = nb.dot(direction);
+                                    if cos > 0.0 {
+                                        self.exit_lobe(cos) * cos / PI * illuminance[c]
+                                    } else {
+                                        0.0
+                                    }
+                                }
+                            };
+                }
+                w = wi;
+                continue;
+            }
+            p += w * t;
+            throughput *= albedo;
+            if throughput < 0.05 {
+                if rng.f64() >= throughput / 0.05 {
+                    return out;
+                }
+                throughput = 0.05;
+            }
+            w = sample_hg(w, self.medium.anisotropy, rng);
+        }
+    }
+
     /// The mean of [`Self::radiance`] over `count` estimates, each at a boundary point, its
     /// outward normal and the view there from `point`.
     pub fn mean(
@@ -415,9 +544,9 @@ impl DielectricWalks {
         seed: u64,
         point: impl Fn(&mut Rng) -> (DVec3, DVec3, DVec3) + Sync,
     ) -> DVec3 {
-        mean_of(count, seed, &|| (), |_, rng| {
+        mean_of(count, seed, &Reference::new, |bsdf, rng| {
             let (p, n, v) = point(rng);
-            self.radiance(p, n, v, light, rng)
+            self.radiance(bsdf, p, n, v, light, rng)
         })
     }
 }
