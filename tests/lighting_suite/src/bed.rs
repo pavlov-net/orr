@@ -3356,20 +3356,30 @@ pub fn assert_pipeline_within_noise(what: &str, bed: &mut Bed, staged: &Paths, l
 }
 
 /// [`assert_pipeline_within_noise`], and the two means agree over frames that alternate, which
-/// see the world cache alike.
+/// see the world cache alike. The cache carries light from frame to frame, so a frame's mean
+/// leans on the last ones': the test takes the means of runs of frames, which lean on each
+/// other little enough to count as independent.
 pub fn assert_pipeline_renders_as_staged(
     what: &str,
     bed: &mut Bed,
     staged: &Paths,
     launched: &Paths,
 ) {
+    const RUN: usize = 8;
+    const RUNS: usize = 12;
     assert_pipeline_within_noise(what, bed, staged, launched);
     let (mut of_staged, mut of_launched) = (Vec::new(), Vec::new());
-    for k in 0..24 {
+    for k in 0..(RUN * RUNS) as u32 {
         of_staged.push(image_mean(&render_paths(bed, staged, 1, 4 + k))[1]);
         of_launched.push(image_mean(&render_paths(bed, launched, 1, 4 + k))[1]);
     }
-    crate::welch::assert_same_mean(what, &of_launched, &of_staged);
+    let runs = |frames: &[f64]| -> Vec<f64> {
+        frames
+            .chunks(RUN)
+            .map(|run| run.iter().sum::<f64>() / RUN as f64)
+            .collect()
+    };
+    crate::welch::assert_same_mean(what, &runs(&of_launched), &runs(&of_staged));
 }
 
 /// orr_lighting's view dispatch and guide resolve recording into bed frames with
