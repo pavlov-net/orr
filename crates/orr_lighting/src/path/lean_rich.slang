@@ -41,6 +41,13 @@ void first_vertex(inout Payload p)
 }
 
 [shader("callable")]
+void emitter_view(inout Payload p)
+{
+    ORR_OMM(emitter_view);
+    lean_emitter_view<Surface>(root, DispatchRaysIndex().x, p.words);
+}
+
+[shader("callable")]
 void first_view(inout Payload p)
 {
     ORR_OMM(first_view);

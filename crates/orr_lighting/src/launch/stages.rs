@@ -15,12 +15,12 @@ use orr_shaders::surface_declares;
 
 use crate::mask_sets::Members;
 use crate::shaders::consts::{
-    ANY_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, INTERIOR_HIT_INSTRUCTIONS,
-    LAYER_HIT_INSTRUCTIONS, MEDIUM_VERTEX_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE,
-    PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
-    PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS, RAYGEN_LAYER_INSTRUCTIONS,
-    RAYGEN_WALK_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
-    WALK_EXIT_INSTRUCTIONS, WALK_HIT_INSTRUCTIONS,
+    ANY_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS, EMITTER_VIEW_INSTRUCTIONS, HIT_INSTRUCTIONS,
+    INTERIOR_HIT_INSTRUCTIONS, LAYER_HIT_INSTRUCTIONS, MEDIUM_VERTEX_INSTRUCTIONS,
+    MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS,
+    PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
+    RAYGEN_LAYER_INSTRUCTIONS, RAYGEN_WALK_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS,
+    TRACED_HIT_INSTRUCTIONS, WALK_EXIT_INSTRUCTIONS, WALK_HIT_INSTRUCTIONS,
 };
 use crate::shaders::path::{lean_layer, lean_paths, lean_rich, lean_walk};
 use crate::staged::{
@@ -48,6 +48,8 @@ pub enum Role {
     Medium,
     /// The callable of the vertex where a subsurface walk leaves.
     Exit,
+    /// The callable that weighs a coated emitter's light by what its coat and fuzz pass.
+    View,
 }
 
 /// The most instructions the stages of a pipeline may hand the driver together.
@@ -173,6 +175,7 @@ impl Spec {
             Role::Miss => return Some(MISS_INSTRUCTIONS),
             Role::Medium => return Some(MEDIUM_VERTEX_INSTRUCTIONS),
             Role::Exit => return Some(WALK_EXIT_INSTRUCTIONS),
+            Role::View => return Some(EMITTER_VIEW_INSTRUCTIONS),
             Role::Hit => (HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS),
             Role::AnyHit => (ANY_HIT_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS),
         };
@@ -258,6 +261,9 @@ struct Table {
     medium: Option<u32>,
     /// The callable of the vertex where a subsurface walk leaves, where surfaces may walk.
     walk_exit: Option<u32>,
+    /// The callable that weighs a coated emitter's light by its coat and fuzz, where an emitter
+    /// may have one.
+    emitter_view: Option<u32>,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
 }
@@ -348,6 +354,16 @@ impl Table {
                 Spec {
                     kernel: Kernel::Walk,
                     ..folded("walk_leaves", Role::Exit)
+                },
+            )
+        });
+        let coated = emits && lobes && may & may2(SceneFeatures::COATED_EMITTERS) != 0;
+        let emitter_view = coated.then(|| {
+            Self::stage(
+                &mut specs,
+                Spec {
+                    kernel: rich,
+                    ..folded("emitter_view", Role::View)
                 },
             )
         });
@@ -579,6 +595,7 @@ impl Table {
             eye_interior,
             medium,
             walk_exit,
+            emitter_view,
             hit_groups,
             groups,
         }
@@ -782,6 +799,7 @@ impl PathPipeline {
                 table.eye_interior.map(ShaderRecord::new),
                 table.medium.map(ShaderRecord::new),
                 table.walk_exit.map(ShaderRecord::new),
+                table.emitter_view.map(ShaderRecord::new),
             ],
             max_recursion: 1,
             flags: RayPipelineFlags::scene(device.caps()),
