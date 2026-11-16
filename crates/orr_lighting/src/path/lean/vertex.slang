@@ -989,7 +989,7 @@ struct LeanMediumScatter : ILeanScatter
 // lights but the environment as `InteriorExitScatter` gathers them, which its ray along the way
 // out meets for nothing (`PDF_LIT`); the reference leaves all light to that ray. The walk was the
 // bounce of the vertex where it leaves.
-public void lean_medium_vertex(PathRoot r, uint slot, float distance, uint kind, bool walked)
+public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, float distance, uint kind, bool walked)
 {
     uint4* at = lean_hot(r, slot);
     uint4 w0 = load_coherent(at);
@@ -1093,7 +1093,13 @@ public void lean_medium_vertex(PathRoot r, uint slot, float distance, uint kind,
     if (k.sum > 0.0)
     {
         float3 origin = leaves ? surface_ray_origin(r, point, normal, k.dir) : point;
-        float3 e = picked_light(r, k, throughput, 1.0, mode.one_technique || leaves) * (inside ? beer(sigma, k.distance) : float3(1.0));
+        float3 e = picked_light(r, k, throughput, 1.0, mode.one_technique || leaves);
+        // The medium toward the light: the interior's, or past a way out of every interior the
+        // linked medium's, whose transmittance the environment's map holds of its own.
+        if (inside)
+            e *= beer(sigma, k.distance);
+        else if (k.kind != LIGHT_SAMPLE_ENVIRONMENT)
+            e *= medium_transmittance<M>(r.scene.medium, origin, k.dir, k.distance);
         store_job(at, k, origin, point, e, inside, flags, job_blue, job_light);
     }
     // The phase function draws its own density, so the next ray keeps the throughput; a way out is
