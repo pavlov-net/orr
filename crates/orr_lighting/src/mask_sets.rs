@@ -62,7 +62,7 @@ impl<T: Send + 'static> Late<T> {
                 let _ = self.ready.set(p);
             }
             Err(e) => {
-                log::warn!("{} failed to compile: {e}", self.name);
+                log::error!("{} failed to compile: {e}", self.name);
                 let _ = self.failed.set(e.to_string());
             }
         }
@@ -380,7 +380,8 @@ impl<K: Members> MaskSets<K> {
     /// Asks for pipelines that hold `members` for paths that may meet `may`, and says whether
     /// some are ready. With none ready, those for exactly `may` compile at once; with a ready
     /// set that holds more, they compile behind everything else once the view has asked for
-    /// `may` for [`STABLE`]. An error where one made for `may` failed to compile.
+    /// `may` for [`STABLE`]. An error where one made for `may` failed to compile, or one that
+    /// may meet everything, which any view may come to need.
     pub(crate) fn prepare(&self, may: u64, members: &[usize]) -> Result<bool, Error> {
         let now = Instant::now();
         let stable = self.note(may, now);
@@ -392,8 +393,8 @@ impl<K: Members> MaskSets<K> {
             }
             Some(_) => {}
         }
-        if let Some(set) = self.find(may) {
-            for member in self.kind.runs(may, members) {
+        for set in [self.find(may), self.find(MAY_ALL)].into_iter().flatten() {
+            for member in self.kind.runs(set.may, members) {
                 if let Some(e) = set.member(member).failure() {
                     return Err(e);
                 }
