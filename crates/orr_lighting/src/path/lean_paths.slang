@@ -1,11 +1,12 @@
-// The lean path tracer's stages (`path.lean`): the raygens of a view's paths and of its update
-// paths, the callable of a path's first vertex and the one of a debug view of it alone, the ones
-// that start a path in the interiors around the eye and run its vertex in an interior's medium,
-// the one of a step of a directional job's walk through a plane stack, the one that takes what a
-// path's ray meets in front of its hit and the one that marches the medium proxies with a volume a
-// shadow ray passed, the hit shaders of a plain opaque surface and of a strand, the any-hit shaders
-// of a path's ray and of its shadow ray at a candidate that is not opaque, a medium proxy's
-// intersection and any-hit shaders under a shadow ray, and the miss shaders of the two.
+// The lean path tracer's stages (`path.lean`): the raygens of a view's paths, of its background
+// layer's and of its update paths; the callables of a path's first vertex and of a debug view of it
+// alone, the ones that start a path in the interiors around the eye or at a thin lens's point, the
+// one that runs its vertex in an interior's medium, the one of a step of a directional job's walk
+// through a plane stack, the one that takes what a path's ray meets in front of its hit and the one
+// that marches the medium proxies with a volume a shadow ray passed; the hit shaders of a plain
+// opaque surface and of a strand, the any-hit shaders of a path's ray and of its shadow ray at a
+// candidate that is not opaque, a medium proxy's intersection and any-hit shaders under a shadow
+// ray, and the miss shaders of the two.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_shaders.trace;
@@ -56,6 +57,13 @@ void strand_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 }
 
 [shader("raygeneration")]
+void backgrounds()
+{
+    ORR_OMM(backgrounds);
+    lean_backgrounds<Environment, Medium>(root);
+}
+
+[shader("raygeneration")]
 void updates()
 {
     ORR_OMM(updates);
@@ -74,6 +82,13 @@ void eye_interior(inout Payload p)
 {
     ORR_OMM(eye_interior);
     p.words.x = lean_eye_interior<Surface>(root, DispatchRaysIndex().x, p.words.x != 0) ? 1 : 0;
+}
+
+[shader("callable")]
+void eye_lens(inout Payload p)
+{
+    ORR_OMM(eye_lens);
+    lean_lens_interior<Surface>(root, DispatchRaysIndex().x);
 }
 
 [shader("callable")]

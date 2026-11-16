@@ -35,9 +35,9 @@ use crate::staged::{
     MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION,
     MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS,
     MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING,
-    MAY_SMOKE, MAY_STACK, MAY_SUBSURFACE, MAY_TRACED, MAY_WALK, PATH_SOURCE_UPDATE,
-    PATH_SOURCE_VIEW, Source, SourcePaths, Stage, StageSet, StagedKernels, StagedMemory,
-    StateParts, UPDATE_FEATURES,
+    MAY_SMOKE, MAY_STACK, MAY_SUBSURFACE, MAY_TRACED, MAY_WALK, PATH_SOURCE_BACKGROUND,
+    PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, Source, SourcePaths, Stage, StageSet, StagedKernels,
+    StagedMemory, StateParts, UPDATE_FEATURES,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::support::{Masked, MaskedFrame, MaskedSupport, Runs};
@@ -1743,6 +1743,9 @@ impl PipelinePaths {
     fn wanted(&self, scene: &SceneLighting, needs: PathNeeds, lighting: &ViewLighting) -> Vec<u64> {
         let may = predict(self.linked_medium, scene, needs, lighting);
         let mut wanted = may.view | Source::View.may();
+        if needs.dof_background {
+            wanted |= may.background | Source::Background.may();
+        }
         if lighting.reference.is_none() {
             wanted |= may.update | Source::Update.may();
         }
@@ -2496,11 +2499,6 @@ impl LightingKernels {
             dof_background: pass.dof_background.is_some(),
             particle_lighting: pass.particle_lighting,
         };
-        if pass.dof_background.is_some() {
-            return Err(Error::Settings(
-                "the pipeline path tracer traces no background layer",
-            ));
-        }
         let wanted = launch.wanted(scene, needs, lighting);
         launch.ask(&wanted, lighting)?;
         let may = wanted[0];
@@ -2581,6 +2579,29 @@ impl LightingKernels {
             )?;
         }
         list.end_pass();
+        if pass.dof_background.is_some() {
+            list.begin_pass("background paths", false);
+            // The background layer's paths take the view paths' slots, which they are done with.
+            list.barrier(Stages::RAY, Stages::RAY, Hazards::empty());
+            // The background layer's path is the full one at the view path's other settings.
+            let background_root = PathRoot {
+                source: PATH_SOURCE_BACKGROUND,
+                mode: 0,
+                pixel_fraction: 1.0,
+                ..root
+            };
+            launch.record(
+                list,
+                hits,
+                ran,
+                features,
+                &background_root,
+                may,
+                &memory.view,
+                pixels,
+            )?;
+            list.end_pass();
+        }
         list.barrier(Stages::RAY, Stages::COMPUTE | Stages::RAY, Hazards::empty());
         Ok(())
     }

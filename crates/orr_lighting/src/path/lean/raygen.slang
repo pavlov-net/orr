@@ -16,6 +16,7 @@ import orr_scene.lights;
 import orr_scene.runs;
 import orr_scene.candidates;
 import orr_lighting.media;
+import orr_lighting.environment;
 import orr_lighting.light_sampling;
 import orr_lighting.shadow;
 import orr_lighting.specialize;
@@ -55,6 +56,10 @@ public static const uint CALL_FRONT = 7;
 // The callable that marches the medium proxies with a volume a shadow ray passed, which a pipeline
 // whose scene may hold medium proxies holds.
 public static const uint CALL_PROXY_MARCH = 8;
+// The callable that starts a thin lens's path in the interiors at the lens's point, which a
+// pipeline whose view traces its camera rays through one and whose paths may lie in an interior
+// holds.
+public static const uint CALL_EYE_LENS = 9;
 
 // Whether `pixel` lies on a tile whose layers the layer guides traced, which a camera ray meets
 // before the G-buffer's surface.
@@ -125,6 +130,33 @@ bool start_path(PathRoot r, uint2 pixel, uint4* at, uint4* cold, float throughpu
         store_coherent(at + 2, uint4(w2.xy, asuint(s.t_max), w2.w));
     }
     return carried;
+}
+
+// Whether the root's camera rays are a thin lens's, traced from a point of the lens: a view's
+// through the reference's lens, and every background layer's path.
+bool lens_paths(PathRoot r)
+{
+    return thin_lens(r) || from_background(r);
+}
+
+// Turns the camera ray of the path in hot words `at`, which `start_path` started, into a thin
+// lens's, `s`, whose draws left the path's sampler at `dimension`: its first vertex is the ray's
+// hit. Where the pipeline's paths may lie in an interior and `interiors` holds, the path starts in
+// those at the lens's point, which the camera's medium and the surfaces between the eye and that
+// point give (`lens_interior`), through a callable; else in none.
+void lens_ray(uint4* at, PathStart s, uint dimension, bool interiors)
+{
+    uint4 w0 = load_coherent(at);
+    uint4 w1 = load_coherent(at + 1);
+    uint dir = oct_encode_snorm16(s.dir);
+    store_coherent(at, uint4(asuint(s.origin), hot_flags(w0.w, dimension)));
+    store_coherent(at + 1, uint4(dir, dir, w1.zw));
+    if (may(MAY_INTERIORS) && interiors)
+    {
+        Payload eye;
+        eye.words = uint4(0);
+        call(CALL_EYE_LENS, eye);
+    }
 }
 
 // Traces the pending shadow job of `slot`'s path in hot words `at`: any hit ends it, and where
@@ -778,10 +810,12 @@ uint trace_ray<let VIEW : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, inou
     // The lane keeps a ray's origin offset for the shader it reaches, which a camera ray has none of.
     if (layers)
         store_coherent(at + 2, uint4(w2.xy, 0, w2.w));
-    bool traced_camera = camera && traces_primary(r);
+    // A traced camera ray is the one the camera sees along: the view's, or a thin lens's.
+    bool lens = VIEW && may_any(MAY_LENS | MAY_BACKGROUND) && camera && lens_paths(r);
+    bool traced_camera = camera && traces_primary(r) || lens;
     bool primary = traced_camera || layers;
     uint mask = layers ? MASK_DIELECTRIC : (traced_camera ? MASK_CAMERA : MASK_OPAQUE) | (may(MAY_LAYERS) ? MASK_DIELECTRIC : 0);
-    float t_max = camera && !traces_primary(r) ? reach : positive_infinity();
+    float t_max = camera && !traced_camera ? reach : positive_infinity();
     // What the camera sees of an alpha-tested triangle is its coverage itself; a scattered
     // ray, and a layered tile's, which the layer guides trace alike, take the micromap's two
     // states for it.
@@ -804,6 +838,16 @@ uint trace_ray<let VIEW : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, inou
         ray.TMin = asfloat(asuint(h.t()) + 1);
     }
     invokes = false;
+    // A thin lens's camera ray writes what its pixel shows first: for a view, how far from the eye
+    // it lies, and for the background layer, how deep along the view's axis.
+    if (lens && h.hit())
+    {
+        uint4* record = lean_record(r, slot);
+        StoredViewLights lights = reinterpret<StoredViewLights>(load_coherent(record));
+        float3 from_eye = ray.Origin + ray.Direction * h.t() - r.view.eye_render.xyz;
+        lights.first_distance = from_background(r) ? -dot(r.view.view_from_world_rotation[2].xyz, from_eye) : length(from_eye);
+        store_coherent(record, reinterpret<uint4>(lights));
+    }
     if (may_any(MAY_PARTICLES | MAY_LOCAL_LIGHTS))
     {
         uint front = lean_front_mask(r, slot, w0, VIEW, trail.chain);
@@ -958,9 +1002,11 @@ public void lean_paths(PathRoot r)
     store_coherent(record, reinterpret<uint4>(lights));
     float3 radiance = float3(0.0);
     // Where the paths trace the view's camera rays every pixel's is traced: its hit writes the
-    // G-buffer and the record's distance, and takes the view's share of pixels on from there.
-    bool traced = traces_primary(r);
-    bool layers = layered(r, pixel);
+    // G-buffer and the record's distance, and takes the view's share of pixels on from there. A
+    // thin lens's is traced from a point of the lens, and its hit writes the record's distance.
+    bool lens = thin_lens(r);
+    bool traced = traces_primary(r) || lens;
+    bool layers = !lens && layered(r, pixel);
     float depth = 0.0;
     if (!traced)
         depth = r.gbuffer.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
@@ -981,6 +1027,12 @@ public void lean_paths(PathRoot r)
         if (runs)
         {
             bool starts_inside = start_path(r, pixel, at, lean_cold(r, slot), surface && !second ? 1.0 / r.pixel_fraction : 1.0, layers && !second, second);
+            if (may(MAY_LENS) && lens)
+            {
+                Sampler rng = path_sampler(r, pixel);
+                PathStart s = lens_start(r, pixel, r.aperture_radius, r.focus_distance, 0.0, MASK_CAMERA | MASK_DIELECTRIC, rng);
+                lens_ray(at, s, rng.dimension, true);
+            }
             rays = run_path(r, slot, at, surface && (second || !layers) ? NEXT_FIRST : NEXT_RAY);
             radiance = asfloat(load_coherent(at + 3).xyz);
             if (!second)
@@ -1013,6 +1065,41 @@ public void lean_paths(PathRoot r)
         if (frost_pass(r) && !two)
             r.layers[index].background = guide_luminance(pre_exposure * radiance);
     }
+}
+
+// The raygen of a view's background layer: on a pixel its mask marks, the path of a thin lens's
+// camera ray past the mask's depth, at the view path's settings but its mode and its share of
+// pixels; its texel the pre-exposed radiance and the reverse-Z depth of its first hit, or past
+// a miss the sky the camera sees, at depth 0. A pixel the mask leaves out writes (0, 0, 0, -1).
+public void lean_backgrounds<E : IEnvironment, M : IMedium>(PathRoot r)
+{
+    uint slot = DispatchRaysIndex().x;
+    uint2 extent = r.gbuffer.extent;
+    if (slot >= r.slice_count || r.slice_base + slot >= extent.x * extent.y)
+        return;
+    uint2 pixel = item_pixel(r, r.slice_base + slot);
+    Sampler rng = path_sampler(r, pixel);
+    PathStart s;
+    if (!background_path_start(r, pixel, rng, s))
+        return;
+    uint4* at = lean_hot(r, slot);
+    uint4* record = lean_record(r, slot);
+    StoredViewLights lights = { NO_LIGHT, 0.0, pcg3d(uint3(pixel, r.frame ^ path_stream(r))).x, 0.0 };
+    store_coherent(record, reinterpret<uint4>(lights));
+    start_path(r, pixel, at, lean_cold(r, slot), 1.0, false, false);
+    lens_ray(at, s, rng.dimension, false);
+    run_path(r, slot, at, NEXT_RAY);
+    float3 radiance = asfloat(load_coherent(at + 3).xyz);
+    float depth = reinterpret<StoredViewLights>(load_coherent(record)).first_distance;
+    ViewConstants* v = r.view;
+    float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
+    float near = v.clip_from_view[2][3];
+    float4 texel;
+    if (!(depth > 0.0))
+        texel = float4(apply_hdr_ceiling(pre_exposure * sky_radiance<E, M>(r.set, v.eye_render.xyz, camera_start(r, pixel).dir)), 0.0);
+    else
+        texel = float4(apply_hdr_ceiling(pre_exposure * radiance), near / depth);
+    r.dof_background.get<RWTexture2D<float4>>()[pixel] = texel;
 }
 
 // The raygen of a view's update paths: the path of a block's pixel, which adds to the world

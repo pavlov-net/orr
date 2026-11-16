@@ -118,6 +118,10 @@ public static const uint PAYLOAD_BENT = 1;
 // each particle's look resolved and each one's light weighed against next-event estimation at the
 // vertex the ray left, and inside a scattering medium the free flight that ends the ray.
 [Host] public static const uint FRONT_INSTRUCTIONS = 15500;
+// What a raygen holds more where the view traces its camera rays through a thin lens or draws a
+// background layer: the lens's camera ray, the record of its first hit, and the background
+// layer's texel.
+[Host] public static const uint RAYGEN_LENS_INSTRUCTIONS = 2000;
 // What a raygen holds more where the scene may hold medium proxies: the call that marches those
 // with a volume that a shadow ray passed, after the job's ray and after a leg of a plane stack's
 // walk.

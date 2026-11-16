@@ -17,20 +17,20 @@ use crate::mask_sets::Members;
 use crate::shaders::consts::{
     ANY_HIT_INSTRUCTIONS, COATED_EMITTER_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS,
     EMITTER_VIEW_INSTRUCTIONS, FRONT_INSTRUCTIONS, HIT_INSTRUCTIONS, INTERIOR_HIT_INSTRUCTIONS,
-    LAYER_HIT_INSTRUCTIONS, MEDIUM_VERTEX_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE,
-    PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
+    LAYER_HIT_INSTRUCTIONS, MEDIUM_VERTEX_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_BACKGROUND,
+    PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
     PRODUCER_HIT_INSTRUCTIONS, PROXY_ANY_HIT_INSTRUCTIONS, PROXY_INTERSECTION_INSTRUCTIONS,
     PROXY_MARCH_INSTRUCTIONS, RAYGEN_FRONT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
-    RAYGEN_LAYER_INSTRUCTIONS, RAYGEN_PROXY_INSTRUCTIONS, RAYGEN_STACK_INSTRUCTIONS,
-    RAYGEN_WALK_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS, STACK_LAYER_INSTRUCTIONS,
-    STACK_STEP_INSTRUCTIONS, STACK_VERTEX_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
-    WALK_EXIT_INSTRUCTIONS, WALK_HIT_INSTRUCTIONS,
+    RAYGEN_LAYER_INSTRUCTIONS, RAYGEN_LENS_INSTRUCTIONS, RAYGEN_PROXY_INSTRUCTIONS,
+    RAYGEN_STACK_INSTRUCTIONS, RAYGEN_WALK_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS,
+    STACK_LAYER_INSTRUCTIONS, STACK_STEP_INSTRUCTIONS, STACK_VERTEX_INSTRUCTIONS,
+    TRACED_HIT_INSTRUCTIONS, WALK_EXIT_INSTRUCTIONS, WALK_HIT_INSTRUCTIONS,
 };
 use crate::shaders::path::{lean_layer, lean_paths, lean_rich, lean_walk};
 use crate::staged::{
-    MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_INTERIORS, MAY_LAYERS, MAY_LOBES, MAY_LOCAL_LIGHTS,
-    MAY_PARTICLES, MAY_PROXIES, MAY_SCATTERING, MAY_STACK, MAY_TRACED, MAY_UPDATE, MAY_VIEW,
-    MAY_WALK,
+    MAY_BACKGROUND, MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_INTERIORS, MAY_LAYERS, MAY_LENS,
+    MAY_LOBES, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES, MAY_SCATTERING, MAY_STACK, MAY_TRACED,
+    MAY_UPDATE, MAY_VIEW, MAY_WALK,
 };
 use crate::{Error, KernelSet, module};
 
@@ -191,6 +191,7 @@ impl Spec {
                 let walks = self.may & (MAY_SCATTERING | MAY_WALK) != 0;
                 let front = self.may & (MAY_PARTICLES | MAY_LOCAL_LIGHTS) != 0;
                 let proxies = self.may & MAY_PROXIES != 0;
+                let lens = self.may & (MAY_LENS | MAY_BACKGROUND) != 0;
                 return Some(
                     RAYGEN_INSTRUCTIONS
                         + if layers { RAYGEN_LAYER_INSTRUCTIONS } else { 0 }
@@ -201,7 +202,8 @@ impl Spec {
                             RAYGEN_PROXY_INSTRUCTIONS
                         } else {
                             0
-                        },
+                        }
+                        + if lens { RAYGEN_LENS_INSTRUCTIONS } else { 0 },
                 );
             }
             Role::Miss => return Some(MISS_INSTRUCTIONS),
@@ -332,6 +334,9 @@ struct Table {
     /// The callable that marches the medium proxies with a volume a shadow ray passed, where the
     /// scene may hold medium proxies.
     proxy_march: Option<u32>,
+    /// The callable that starts a thin lens's path in the interiors at the lens's point, where the
+    /// view traces its camera rays through one and the paths may lie in an interior.
+    eye_lens: Option<u32>,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
 }
@@ -383,6 +388,7 @@ impl Table {
         let mut raygens = [None; 4];
         for (source, bit, entry) in [
             (PATH_SOURCE_VIEW, MAY_VIEW, "paths"),
+            (PATH_SOURCE_BACKGROUND, MAY_BACKGROUND, "backgrounds"),
             (PATH_SOURCE_UPDATE, MAY_UPDATE, "updates"),
         ] {
             if may & bit != 0 {
@@ -414,6 +420,8 @@ impl Table {
         });
         let eye_interior = (may & MAY_INTERIORS != 0)
             .then(|| Self::stage(&mut specs, folded("eye_interior", Role::Hit)));
+        let eye_lens = (may & MAY_INTERIORS != 0 && may & MAY_LENS != 0)
+            .then(|| Self::stage(&mut specs, folded("eye_lens", Role::Hit)));
         let medium = (may & MAY_SCATTERING != 0)
             .then(|| Self::stage(&mut specs, folded("medium_vertex", Role::Medium)));
         let walk_exit = (may & MAY_WALK != 0).then(|| {
@@ -700,6 +708,7 @@ impl Table {
             stack_step,
             front,
             proxy_march,
+            eye_lens,
             hit_groups,
             groups,
         }
@@ -907,6 +916,7 @@ impl PathPipeline {
                 table.stack_step.map(ShaderRecord::new),
                 table.front.map(ShaderRecord::new),
                 table.proxy_march.map(ShaderRecord::new),
+                table.eye_lens.map(ShaderRecord::new),
             ],
             max_recursion: 1,
             flags: RayPipelineFlags::scene(device.caps()),
