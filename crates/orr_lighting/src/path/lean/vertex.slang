@@ -546,7 +546,7 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
         }
         throughput /= r.pixel_fraction;
     }
-    bool walked = (bits & PAYLOAD_WALKED) != 0;
+    bool walked = may_any(MAY_WALK | MAY_SCATTERING) && (bits & PAYLOAD_WALKED) != 0;
     // A surface of a stage that may walk shades its subsurface share as diffuse reflection where
     // the vertex walks none of it.
     bool walks = false;
@@ -571,7 +571,7 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     float u_segment = rng.next();
     // A walk's step weighed the stretch of the ray inside.
     if (inside)
-        throughput *= (bits & PAYLOAD_WEIGHED) != 0 ? float3(1.0) : beer(sigma, inside_length(at, t));
+        throughput *= may(MAY_SCATTERING) && (bits & PAYLOAD_WEIGHED) != 0 ? float3(1.0) : beer(sigma, inside_length(at, t));
     else if (!first)
     {
         float3 origin = asfloat(w0.xyz);
