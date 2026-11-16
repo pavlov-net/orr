@@ -1,6 +1,7 @@
-//! Builds the suite's kernels against orr_lighting's shader roots, and orr_scene's and
+//! Builds the suite's kernels against orr_lighting's shader roots, orr_scene's and
 //! orr_lighting's kernels with `surfaces/context.slang` linked as surface 1 and
-//! `src/rings.slang`'s `Rings` as surface 2.
+//! `src/rings.slang`'s `Rings` as surface 2, and orr_lighting's with `src/media_types.slang`'s
+//! `StockFog` linked as the medium.
 
 use std::env;
 use std::path::PathBuf;
@@ -32,6 +33,20 @@ fn main() {
             .compile()
     });
     if let Err(e) = linked {
+        panic!("{e}");
+    }
+    let fogged = Build::new().and_then(|b| {
+        b.dep("orr_lighting")
+            .out_dir(out.join("fogged"))
+            .link(
+                LinkPoint::Medium,
+                "fog",
+                dir.join("src/media_types.slang"),
+                "StockFog",
+            )
+            .compile()
+    });
+    if let Err(e) = fogged {
         panic!("{e}");
     }
 }
