@@ -66,6 +66,18 @@ const OP_COMPOSITE_CONSTRUCT: u32 = 80;
 const OP_COMPOSITE_EXTRACT: u32 = 81;
 const OP_COMPOSITE_INSERT: u32 = 82;
 const OP_TRANSPOSE: u32 = 84;
+const OP_SAMPLED_IMAGE: u32 = 86;
+const OP_IMAGE_SAMPLE_IMPLICIT_LOD: u32 = 87;
+const OP_IMAGE_SAMPLE_DREF_IMPLICIT_LOD: u32 = 89;
+const OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u32 = 90;
+const OP_IMAGE_SAMPLE_PROJ_DREF_IMPLICIT_LOD: u32 = 93;
+const OP_IMAGE_SAMPLE_PROJ_DREF_EXPLICIT_LOD: u32 = 94;
+const OP_IMAGE_GATHER: u32 = 96;
+const OP_IMAGE_DREF_GATHER: u32 = 97;
+const OP_IMAGE_READ: u32 = 98;
+const OP_IMAGE_WRITE: u32 = 99;
+const OP_IMAGE: u32 = 100;
+const OP_IMAGE_QUERY_SAMPLES: u32 = 107;
 const OP_CONVERT_F_TO_U: u32 = 109;
 const OP_S_NEGATE: u32 = 126;
 const OP_S_MUL_EXTENDED: u32 = 152;
@@ -665,8 +677,8 @@ fn fold_function(
     folder.joins.clear();
     // How many stores name each variable, as the function is written.
     let mut written: HashMap<u32, u32> = HashMap::new();
-    // The scalar variables only loads and stores name. An id anywhere else, a literal of its
-    // value among them, leaves the variable out.
+    // The scalar variables only loads and stores name. An id anywhere else leaves the variable
+    // out.
     for item in instructions(&code[..end], at) {
         let (_, inst) = item?;
         if op(inst) == OP_STORE {
@@ -685,10 +697,6 @@ fn fold_function(
     }
     for item in instructions(&code[..end], at) {
         let (_, inst) = item?;
-        // Their literals are not ids, and a line table must not change what the pass folds.
-        if matches!(op(inst), OP_LINE | OP_NO_LINE) {
-            continue;
-        }
         for (place, &word) in inst.iter().enumerate().skip(1) {
             let named = match op(inst) {
                 OP_VARIABLE => place == 2,
@@ -696,7 +704,10 @@ fn fold_function(
                 OP_STORE => place == 1,
                 _ => false,
             };
-            if !named && folder.local.get(word as usize).copied().unwrap_or(false) {
+            if !named
+                && may_use(inst, place)
+                && folder.local.get(word as usize).copied().unwrap_or(false)
+            {
                 folder.local[word as usize] = false;
             }
         }
@@ -1160,14 +1171,12 @@ fn drop_unused_values(
             *pointer.get_mut(inst[2] as usize)? = true;
             touched.push(inst[2]);
         }
-        // A line's literals are no ids, and a value names its own result alone. A literal with
-        // an id's value only keeps that id's value.
-        let skip = match op(inst) {
-            OP_LINE | OP_NO_LINE => continue,
-            _ if pure(inst, glsl, pointer) => 3,
-            _ => 1,
-        };
-        for &word in inst.iter().skip(skip) {
+        // A value names its own result alone.
+        let skip = if pure(inst, glsl, pointer) { 3 } else { 1 };
+        for (place, &word) in inst.iter().enumerate().skip(skip) {
+            if !may_use(inst, place) {
+                continue;
+            }
             if let Some(count) = uses.get_mut(word as usize) {
                 if *count == 0 {
                     touched.push(word);
@@ -1188,7 +1197,10 @@ fn drop_unused_values(
             continue;
         }
         dropped[k] = true;
-        for &word in &inst[3..] {
+        for (place, &word) in inst.iter().enumerate().skip(3) {
+            if !may_use(inst, place) {
+                continue;
+            }
             if let Some(count) = uses.get_mut(word as usize) {
                 *count = count.saturating_sub(1);
             }
@@ -1221,13 +1233,14 @@ fn drop_unread_variables(out: &mut Vec<u32>, from: usize, unread: &mut [bool]) -
                 *unread.get_mut(inst[2] as usize)? = true;
                 variables.push(inst[2]);
             }
-            // Their literals are not ids.
-            OP_LINE | OP_NO_LINE | OP_VARIABLE => {}
+            OP_VARIABLE => {}
             _ => {
-                // A word that names a variable anywhere but as a store's pointer reads it. A
-                // literal with a variable's id only keeps that variable.
+                // A word that names a variable anywhere but as a store's pointer reads it.
                 let skip = if op(inst) == OP_STORE { 2 } else { 1 };
-                for &word in inst.iter().skip(skip) {
+                for (place, &word) in inst.iter().enumerate().skip(skip) {
+                    if !may_use(inst, place) {
+                        continue;
+                    }
                     if let Some(slot) = unread.get_mut(word as usize) {
                         *slot = false;
                     }
@@ -1404,6 +1417,21 @@ fn reads_value(inst: &[u32], place: usize) -> Option<bool> {
         OP_EXT_INST => place == 3 || place >= 5,
         OP_BRANCH_CONDITIONAL | OP_SWITCH | OP_RETURN_VALUE => place == 1,
         OP_ATOMIC_STORE | OP_TRACE_RAY | OP_EXECUTE_CALLABLE => true,
+        // The image operands' mask follows the coordinate, and a depth reference or a gather's
+        // component where the instruction has one; the operands it names are ids.
+        OP_IMAGE_SAMPLE_IMPLICIT_LOD..=OP_IMAGE_READ => {
+            let mask = match op(inst) {
+                OP_IMAGE_SAMPLE_DREF_IMPLICIT_LOD
+                | OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD
+                | OP_IMAGE_SAMPLE_PROJ_DREF_IMPLICIT_LOD
+                | OP_IMAGE_SAMPLE_PROJ_DREF_EXPLICIT_LOD
+                | OP_IMAGE_GATHER
+                | OP_IMAGE_DREF_GATHER => 6,
+                _ => 5,
+            };
+            place >= 3 && place != mask
+        }
+        OP_IMAGE_WRITE => place != 4,
         OP_FUNCTION_CALL
         | OP_ACCESS_CHAIN
         | OP_IN_BOUNDS_ACCESS_CHAIN
@@ -1414,6 +1442,8 @@ fn reads_value(inst: &[u32], place: usize) -> Option<bool> {
         | OP_VECTOR_INSERT_DYNAMIC
         | OP_COMPOSITE_CONSTRUCT
         | OP_TRANSPOSE
+        | OP_SAMPLED_IMAGE
+        | OP_IMAGE..=OP_IMAGE_QUERY_SAMPLES
         | OP_CONVERT_F_TO_U..=OP_BITCAST
         | OP_S_NEGATE..=OP_S_MUL_EXTENDED
         | OP_ANY..=OP_BIT_COUNT
@@ -1422,6 +1452,13 @@ fn reads_value(inst: &[u32], place: usize) -> Option<bool> {
         | OP_PTR_EQUAL..=OP_PTR_DIFF => place >= 3,
         _ => return None,
     })
+}
+
+/// Whether word `place` of `inst`, an instruction of a function, may name an id the instruction
+/// uses: every word but those [`reads_value`] knows for a literal, a label, the result or its
+/// type. A literal is a number, whose value may equal any id's.
+fn may_use(inst: &[u32], place: usize) -> bool {
+    reads_value(inst, place) != Some(false)
 }
 
 /// Forwards to its loads the value of each variable of the function in `out[from..]` that the
@@ -1509,8 +1546,11 @@ fn forward_single_stores(
             }
             _ => {}
         }
-        // A variable named anywhere else, a literal with its id among those, keeps its loads.
-        for &word in &inst[1..] {
+        // A variable named anywhere else keeps its loads.
+        for (place, &word) in inst.iter().enumerate().skip(1) {
+            if !may_use(inst, place) {
+                continue;
+            }
             if let Some(c) = candidates.get_mut(&word) {
                 c.kept = true;
             }
@@ -1996,10 +2036,10 @@ mod tests {
     /// A test stored to a scalar local in both arms of a folded branch reaches the branch
     /// that loads it: only the store that runs counts, and once that branch folds nothing uses
     /// the load, which goes with the variable and its store. A variable something else names
-    /// is not followed.
+    /// is not followed; a literal of its id's value, a switch's case, names nothing.
     #[test]
     fn a_test_reaches_its_branch_through_a_local() {
-        let build = |escapes: bool| {
+        let build = |escapes: bool, literal: bool| {
             let mut parts = vec![
                 named(OP_ENTRY_POINT, &[5, 8], "keep"),
                 inst(OP_DECORATE, &[5, DECORATION_SPEC_ID, 7]),
@@ -2009,6 +2049,7 @@ mod tests {
                 inst(OP_TYPE_POINTER, &[9, STORAGE_FUNCTION, 3]),
                 inst(OP_CONSTANT_TRUE, &[3, 21]),
                 inst(OP_CONSTANT_FALSE, &[3, 22]),
+                inst(OP_UNDEF, &[4, 25]),
                 inst(OP_FUNCTION, &[1, 8, 0, 2]),
                 inst(OP_LABEL, &[10]),
                 inst(OP_VARIABLE, &[9, 20, STORAGE_FUNCTION]),
@@ -2028,6 +2069,13 @@ mod tests {
                 parts.push(inst(OP_COPY_OBJECT, &[9, 23, 20]));
                 parts.push(inst(OP_STORE, &[23, 21]));
             }
+            if literal {
+                parts.extend([
+                    inst(OP_SELECTION_MERGE, &[26, 0]),
+                    inst(OP_SWITCH, &[25, 26, 20, 26]),
+                    inst(OP_LABEL, &[26]),
+                ]);
+            }
             parts.extend([
                 inst(OP_LOAD, &[3, 16, 20]),
                 inst(OP_SELECTION_MERGE, &[18, 0]),
@@ -2038,22 +2086,31 @@ mod tests {
                 inst(OP_RETURN, &[]),
                 inst(OP_FUNCTION_END, &[]),
             ]);
-            module(24, &parts)
+            module(27, &parts)
         };
-        let folded =
-            |escapes| specialize(&build(escapes), b"keep", &SPEC, &0u32.to_le_bytes()).unwrap();
+        let folded = |escapes, literal| {
+            specialize(
+                &build(escapes, literal),
+                b"keep",
+                &SPEC,
+                &0u32.to_le_bytes(),
+            )
+            .unwrap()
+        };
         let has = |code: &[u32], i: Vec<u32>| code.windows(i.len()).any(|w| w == i);
-        let through = folded(false);
-        assert!(!has(&through, inst(OP_LABEL, &[13])));
-        assert!(!has(&through, inst(OP_LABEL, &[17])));
-        assert!(!has(&through, inst(OP_BRANCH_CONDITIONAL, &[16, 17, 18])));
-        assert!(!has(&through, inst(OP_LOAD, &[3, 16, 20])));
-        assert!(!has(&through, inst(OP_STORE, &[20, 22])));
-        assert!(!has(
-            &through,
-            inst(OP_VARIABLE, &[9, 20, STORAGE_FUNCTION])
-        ));
-        let kept = folded(true);
+        for literal in [false, true] {
+            let through = folded(false, literal);
+            assert!(!has(&through, inst(OP_LABEL, &[13])));
+            assert!(!has(&through, inst(OP_LABEL, &[17])));
+            assert!(!has(&through, inst(OP_BRANCH_CONDITIONAL, &[16, 17, 18])));
+            assert!(!has(&through, inst(OP_LOAD, &[3, 16, 20])));
+            assert!(!has(&through, inst(OP_STORE, &[20, 22])));
+            assert!(!has(
+                &through,
+                inst(OP_VARIABLE, &[9, 20, STORAGE_FUNCTION])
+            ));
+        }
+        let kept = folded(true, false);
         assert!(!has(&kept, inst(OP_LABEL, &[13])));
         assert!(has(&kept, inst(OP_BRANCH_CONDITIONAL, &[16, 17, 18])));
     }
