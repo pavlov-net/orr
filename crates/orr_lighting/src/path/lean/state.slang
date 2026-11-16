@@ -175,6 +175,10 @@ public static const uint CALL_EMITTER_VIEW = 5;
 // What a hit made for materials that may emit holds more: their light toward the path, weighed
 // against the light pick of the vertex its ray left.
 [Host] public static const uint EMITTER_HIT_INSTRUCTIONS = 2500;
+// What a hit holds more where its vertex may be a path's first, which draws with its pixel's local
+// sampler: where the paths may meet local lights and a camera ray may reach a hit, through layers or
+// as the view's or a thin lens's camera ray.
+[Host] public static const uint LOCAL_FIRST_HIT_INSTRUCTIONS = 750;
 // What a hit or first vertex made for surfaces with a coat, a fuzz, a thin film or a thin wall's
 // transmission holds more: those lobes of the BSDF, as far as the scene's mask keeps them.
 [Host] public static const uint RICH_HIT_INSTRUCTIONS = 8500;
@@ -245,7 +249,7 @@ public struct PathHot
     public float3 dir;              // of its ray, unit
     public float pdf;               // the density its vertex's scatter gave `dir`; 0 for an ideal-specular one
     public float3 throughput;
-    public float run;               // the probability its vertex ran next-event estimation
+    public float run;               // the probability its vertex ran next-event estimation, negated where `ran_local` (`ray_run_word`)
     public float2 cone;             // the ray cone's width at the origin and its spread
     public float3 normal;           // the shading normal of the vertex the ray left; none with HOT_MEDIUM
     public float3 radiance;         // gathered so far
@@ -275,6 +279,21 @@ public struct PathHot
     {
         flags = (flags & HOT_BELOW_DIMENSION) | (dimension << HOT_DIMENSION_SHIFT);
     }
+}
+
+// A ray's `run` as its words carry it: `run` itself, negated where its vertex drew its light
+// candidates from a mixture with its pixel's local sampler, whose density the light the ray meets
+// is weighed by. The words have no other bit free for it.
+public float ray_run_word(float run, bool local)
+{
+    return local ? -run : run;
+}
+
+// Whether a ray's vertex drew its light candidates with its pixel's local sampler, from the run its
+// words carry.
+public bool ran_local(float run)
+{
+    return (asuint(run) >> 31) != 0;
 }
 
 // Two halves in a word, x in its low 16 bits, as the device converts them: a path's throughput
