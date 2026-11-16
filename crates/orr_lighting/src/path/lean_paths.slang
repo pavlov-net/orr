@@ -142,6 +142,37 @@ void shadow_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
     any_hit_decides(shadow_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, p.words, data, h));
 }
 
+// A particle under a path ray whose mask takes particles, and a sphere or rect light's proxy where
+// it takes lights: the ray marks its payload and goes on past it (`FRONT_MET`). A proxy's box reports
+// where the ray meets its light.
+[shader("anyhit")]
+void front_met_hit(inout Payload p, TriangleAttributes a)
+{
+    ORR_OMM(front_met_hit);
+    lean_front_met(p.words);
+    IgnoreHit();
+}
+
+[shader("intersection")]
+void light_box_hit()
+{
+    ORR_OMM(light_box_hit);
+    float t;
+    if (lean_light_box(root, InstanceIndex(), WorldRayOrigin(), WorldRayDirection(), RayTMin(), RayTCurrent(), t))
+    {
+        SpanAttributes a = { float2(t, t) };
+        ReportHit(t, 0, a);
+    }
+}
+
+[shader("anyhit")]
+void light_met_hit(inout Payload p, SpanAttributes a)
+{
+    ORR_OMM(light_met_hit);
+    lean_front_met(p.words);
+    IgnoreHit();
+}
+
 // A medium proxy under a shadow ray: its box reports the ray's span inside it, at the span's start,
 // and the any-hit takes Beer's law over the span, or marks a proxy with a volume for its march.
 [shader("intersection")]

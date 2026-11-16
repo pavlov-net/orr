@@ -2203,6 +2203,30 @@ public void lean_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, bool
     store_hot(at, p);
 }
 
+// The bit of a path ray's cover word (`path_payload`) its any-hit shaders set where it met a
+// particle or a sphere or rect light's proxy, in front of the nearest hit traversal had found by
+// then: the raygen takes what lies in front of the ray's hit in a callable for those rays alone.
+// The raygen clears it before the hit's shader reads the word.
+public static const uint FRONT_MET = 1 << COVER_FRONT_SHIFT;
+
+// The any-hit of a path ray at a particle or a light's proxy, which its mask takes: it marks the
+// payload and lets the ray go on.
+public void lean_front_met(inout uint4 payload)
+{
+    payload.x |= FRONT_MET;
+}
+
+// Where the path ray from `origin` along unit `dir` between `t_min` and `t_max` meets the sphere or
+// rect light whose proxy is instance `instance_index`, in `t`, where the light sends any light
+// toward it: what its intersection shader reports.
+public bool lean_light_box(PathRoot r, uint instance_index, float3 origin, float3 dir, float t_min, float t_max, out float t)
+{
+    t = 0.0;
+    uint id = instance_index - r.scene.light_base;
+    float3 radiance;
+    return id < r.scene.light_capacity && light_proxy_hit(r.set, id, origin, dir, t_max, origin, t, radiance) && t >= t_min && any(radiance > 0.0);
+}
+
 // Where a ray inside an interior's medium of extinction `sigma_t` scatters, by `rng`: a free flight
 // by one channel's extinction, the channel picked uniformly, along the ray's stretch in the medium.
 // The raygen draws it for the ray's segment, and the callable of what the ray meets in front of its
