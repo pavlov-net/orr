@@ -60,7 +60,7 @@ void first_vertex(inout Payload p)
 void eye_interior(inout Payload p)
 {
     ORR_OMM(eye_interior);
-    lean_eye_interior<Surface>(root, DispatchRaysIndex().x, p.words.x != 0);
+    p.words.x = lean_eye_interior<Surface>(root, DispatchRaysIndex().x, p.words.x != 0) ? 1 : 0;
 }
 
 [shader("callable")]

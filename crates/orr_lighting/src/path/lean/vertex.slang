@@ -165,11 +165,13 @@ public void store_met_layers(uint4* at, uint layers)
 // Starts `slot`'s path in the interiors around the eye at its pixel's near-plane point, which the
 // layer guides list, its cold words empty but for them; or, `behind`, in those around the G-buffer's
 // surface, past the surfaces the camera ray crosses up to it, for a path that starts there. Its hot
-// words say whether the path lies in one. A path behind marks its offset word for its first vertex,
-// which takes no medium along the camera ray: what lies before the surface, its layers and their
-// interiors' media, is the layer chain's to weigh. The callable a camera inside an interior, and a
-// frosted pixel's second path, start with.
-public void lean_eye_interior<S : ISurfaces>(PathRoot r, uint slot, bool behind)
+// words say whether its camera ray takes their medium, which it returns: where it lies in one and
+// the frame has no froxels, which otherwise hold the ray's segment as media apply composes it, and
+// its first vertex takes the interiors on (HOT_INTERIOR_HELD). A path behind marks its offset word for
+// its first vertex, which takes no medium along the camera ray: what lies before the surface, its
+// layers and their interiors' media, is the layer chain's to weigh. The callable a camera inside an
+// interior, and a frosted pixel's second path, start with.
+public bool lean_eye_interior<S : ISurfaces>(PathRoot r, uint slot, bool behind)
 {
     uint2 pixel = item_pixel(r, r.slice_base + slot);
     uint4* cold = lean_cold(r, slot);
@@ -189,7 +191,12 @@ public void lean_eye_interior<S : ISurfaces>(PathRoot r, uint slot, bool behind)
         store_coherent(at + 2, uint4(w2.xy, 1, w2.w));
     }
     uint4 w0 = load_coherent(at);
-    store_coherent(at, uint4(w0.xyz, interior.count > 0 ? w0.w | HOT_INTERIOR : w0.w & ~HOT_INTERIOR));
+    bool carries = interior.count > 0 && !has_froxels(r);
+    uint flags = w0.w & ~(HOT_INTERIOR | HOT_INTERIOR_HELD);
+    if (interior.count > 0)
+        flags |= carries ? HOT_INTERIOR : HOT_INTERIOR_HELD;
+    store_coherent(at, uint4(w0.xyz, flags));
+    return carries;
 }
 
 // A vertex's light lies in the interior the path does, which its cold words list.
@@ -667,6 +674,14 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
         }
         else
             throughput *= medium_transmittance<M>(r.scene.medium, origin, dir, t);
+    }
+    // A camera ray whose segment the froxels hold took none of the medium of the interiors around
+    // the eye, but its vertex lies in them.
+    if (may(MAY_INTERIORS) && may(MAY_FROXELS) && (flags & HOT_INTERIOR_HELD) != 0)
+    {
+        inside = true;
+        sigma = interior_sigma(cold);
+        flags = (flags | HOT_INTERIOR) & ~HOT_INTERIOR_HELD;
     }
     // A layer is no bounce: its path counts the layers it meets apart.
     uint scattered = (flags >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK;
