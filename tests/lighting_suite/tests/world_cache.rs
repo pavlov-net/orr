@@ -4,7 +4,8 @@
 
 use bytemuck::Zeroable;
 use lighting_suite::bed::{
-    Accumulated, Analytic, Bed, CORNELL, EMITTER, FLOOR, Item, Paths, Spec, WHITE_SPHERE, reference,
+    Accumulated, Analytic, Bed, CLOUD_SPHERE, CORNELL, EMITTER, FLOOR, Item, Paths, SKY, Spec,
+    WHITE_SPHERE, assert_within_noise, reference,
 };
 use lighting_suite::shaders::cache_probe;
 use lighting_suite::{TestScene, assert_clean, finish, pipeline, readback, render, upload};
@@ -775,5 +776,58 @@ fn cache_terminated_paths_stay_finite_on_every_analytic_scene() {
             "{analytic:?}: {found} of {surface} first vertices in a resolved cell"
         );
     }
+    assert_clean();
+}
+
+/// The pipeline's update paths fill the cache as the staged loop's do, each tracer warming a cache
+/// of its own under the sky: the floor inside a glass sphere sunk into it holds the light that
+/// crossed the sphere's medium, as its update paths start inside the interiors around their
+/// surface. The pipeline's view of its cache sits as close to the staged loop's as the staged
+/// loop's from other frames does.
+#[test]
+fn the_pipelines_update_paths_fill_the_cache_as_the_staged_loops_do() {
+    if !lighting_suite::require(
+        lighting_suite::device().caps().ray_dispatch,
+        "no ray tracing pipelines",
+    ) {
+        return;
+    }
+    let spec = Spec {
+        copies: vec![
+            at(FLOOR, Vec3::ZERO),
+            at(CLOUD_SPHERE, Vec3::new(0.0, 0.4, 0.0)),
+        ],
+        lights: Vec::new(),
+        environment: Some(SKY),
+        eye: Vec3::new(0.0, 3.0, 3.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        focus: None,
+    };
+    let cache = |entry, first| {
+        let run = Paths::exactly(&KernelSet::default(), entry, realtime());
+        let view = Paths::exactly(
+            &KernelSet::default(),
+            entry,
+            ViewLighting {
+                debug_view: LightingDebugView::WorldCache,
+                ..realtime()
+            },
+        );
+        let mut bed = Bed::with(spec.clone());
+        bed.set_pre_exposure(1.0 / 64.0);
+        render_paths(&mut bed, &run, first, 120);
+        render_paths(&mut bed, &view, first + 120, 1)
+    };
+    let staged = cache(PathEntry::Compute, 0);
+    let other = cache(PathEntry::Compute, 1000);
+    let piped = cache(PathEntry::Pipeline, 0);
+    assert_within_noise(
+        "the cache by a sunken cloud sphere",
+        &piped,
+        &staged,
+        &other,
+        1.25,
+    );
     assert_clean();
 }
