@@ -68,6 +68,8 @@ enum Geometry {
     Producers,
     /// Either of those.
     Triangles,
+    /// Strand entries' segments, linear swept spheres.
+    Strands,
 }
 
 impl Geometry {
@@ -76,6 +78,7 @@ impl Geometry {
             Self::Copies => ".copies",
             Self::Producers => ".producers",
             Self::Triangles => ".triangles",
+            Self::Strands => ".strands",
         }
     }
 
@@ -86,6 +89,7 @@ impl Geometry {
         match self {
             Self::Copies => producers | strands,
             Self::Producers | Self::Triangles => strands,
+            Self::Strands => 0,
         }
     }
 }
@@ -479,6 +483,7 @@ impl Table {
             }
         };
         let producers = may & may2(SceneFeatures::PRODUCERS) != 0;
+        let strands = producers && may & may2(SceneFeatures::STRANDS) != 0;
         let mut hit_groups = Vec::new();
         let pins = groups.pins();
         // Each pinned kind's groups one after another by pin, the first named in `groups`.
@@ -489,7 +494,7 @@ impl Table {
             (
                 &mut groups.path,
                 Some("surface_hit"),
-                "cover_hit",
+                Some("cover_hit"),
                 Geometry::Copies,
                 true,
                 false,
@@ -499,7 +504,7 @@ impl Table {
             (
                 &mut groups.emissive_path,
                 Some("surface_hit"),
-                "cover_hit",
+                Some("cover_hit"),
                 Geometry::Copies,
                 emits,
                 true,
@@ -509,7 +514,7 @@ impl Table {
             (
                 &mut groups.rich_path,
                 Some("surface_hit"),
-                "cover_hit",
+                Some("cover_hit"),
                 Geometry::Copies,
                 lobes,
                 true,
@@ -519,7 +524,7 @@ impl Table {
             (
                 &mut groups.producer_path,
                 Some("surface_hit"),
-                "cover_hit",
+                Some("cover_hit"),
                 Geometry::Producers,
                 producers,
                 false,
@@ -529,7 +534,7 @@ impl Table {
             (
                 &mut groups.producer_emissive_path,
                 Some("surface_hit"),
-                "cover_hit",
+                Some("cover_hit"),
                 Geometry::Producers,
                 producers && emits,
                 true,
@@ -539,7 +544,7 @@ impl Table {
             (
                 &mut groups.producer_rich_path,
                 Some("surface_hit"),
-                "cover_hit",
+                Some("cover_hit"),
                 Geometry::Producers,
                 producers && lobes,
                 true,
@@ -549,7 +554,7 @@ impl Table {
             (
                 &mut groups.layer_path,
                 Some("surface_hit"),
-                "cover_hit",
+                Some("cover_hit"),
                 Geometry::Copies,
                 layers,
                 true,
@@ -559,17 +564,29 @@ impl Table {
             (
                 &mut groups.producer_layer_path,
                 Some("surface_hit"),
-                "cover_hit",
+                Some("cover_hit"),
                 Geometry::Producers,
                 producers && layers,
                 true,
                 false,
                 true,
             ),
+            // A strand is opaque: its rays take no any-hit. Its kind serves all of its materials,
+            // which may emit or have a rich lobe.
+            (
+                &mut groups.strand_path,
+                Some("strand_hit"),
+                None,
+                Geometry::Strands,
+                strands,
+                true,
+                true,
+                false,
+            ),
             (
                 &mut groups.shadow,
                 None,
-                "shadow_hit",
+                Some("shadow_hit"),
                 Geometry::Triangles,
                 true,
                 false,
@@ -615,10 +632,8 @@ impl Table {
                             },
                         )
                     }),
-                    any_hit: Some(Self::stage(
-                        &mut specs,
-                        pinned(any_hit, Role::AnyHit, pin, geometry),
-                    )),
+                    any_hit: any_hit
+                        .map(|e| Self::stage(&mut specs, pinned(e, Role::AnyHit, pin, geometry))),
                     intersection: None,
                 });
             }
