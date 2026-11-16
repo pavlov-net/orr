@@ -81,7 +81,9 @@ public static const uint LEAN_EXIT_WORD = 12;
 // What a hit holds more where the scene's paths may lie in an interior: the medium's
 // transmittance over the whole of a ray inside it, from the surface its origin lies off.
 [Host] public static const uint INTERIOR_HIT_INSTRUCTIONS = 100;
-[Host] public static const uint PIPELINE_INSTRUCTIONS = 1000000;
+// The stages of a pipeline together. What it stands for is the cold compile of the largest
+// pipeline a full scene links, linked surface types and water among them: under 10 s.
+[Host] public static const uint PIPELINE_INSTRUCTIONS = 1500000;
 
 // `PathHot.flags`.
 public static const uint HOT_SHADOW = 1 << 0;       // a shadow job is pending: the raygen traces it before the path's ray
