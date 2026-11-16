@@ -3,8 +3,9 @@
 //! The driver folds them too, but only after it has read the whole module, and a kernel made
 //! for many feature masks is mostly code its mask rules out. [`specialize`] gives the constants
 //! their values, follows them through the integer and boolean tests that read them, and removes
-//! the blocks no path of the function reaches, with every other entry point's function and the
-//! local variables nothing left reads. It changes nothing a reachable instruction computes.
+//! the blocks no path of the function reaches, with every other entry point's function, the
+//! loads of local variables whose values nothing uses and the variables nothing left reads. It
+//! changes nothing a reachable instruction computes.
 //!
 //! A test may reach its branch as a value or through a scalar local variable that only loads
 //! and stores touch. A load of such a variable reads the store that reaches it, and where the
@@ -52,6 +53,20 @@ const OP_FUNCTION_END: u32 = 56;
 const OP_VARIABLE: u32 = 59;
 const OP_LOAD: u32 = 61;
 const OP_STORE: u32 = 62;
+const OP_ACCESS_CHAIN: u32 = 65;
+const OP_IN_BOUNDS_ACCESS_CHAIN: u32 = 66;
+const OP_PTR_ACCESS_CHAIN: u32 = 67;
+const OP_VECTOR_EXTRACT_DYNAMIC: u32 = 77;
+const OP_TRANSPOSE: u32 = 84;
+const OP_CONVERT_F_TO_U: u32 = 109;
+const OP_S_NEGATE: u32 = 126;
+const OP_S_MUL_EXTENDED: u32 = 152;
+const OP_ANY: u32 = 154;
+const OP_BIT_COUNT: u32 = 205;
+const OP_EXT_INST: u32 = 12;
+/// GLSL.std.450's instructions that write through a pointer operand.
+const GLSL_MODF: u32 = 35;
+const GLSL_FREXP: u32 = 51;
 const STORAGE_FUNCTION: u32 = 7;
 const OP_DECORATE: u32 = 71;
 const OP_MEMBER_DECORATE: u32 = 72;
@@ -187,6 +202,11 @@ struct Folder<'a> {
     dense: Vec<u32>,
     /// Scratch for [`drop_unread_variables`].
     unread: Vec<bool>,
+    /// Scratch for [`drop_unused_values`].
+    pointer: Vec<bool>,
+    uses: Vec<u32>,
+    /// The id of the GLSL.std.450 instructions' import, `u32::MAX` where the module has none.
+    glsl: u32,
 }
 
 impl Folder<'_> {
@@ -438,6 +458,7 @@ pub(crate) fn specialize(
     let mut kept_entry = None;
     let mut dropped: HashSet<u32> = HashSet::new();
     let mut functions_at = code.len();
+    let mut glsl = u32::MAX;
     for item in instructions(code, HEADER_WORDS) {
         let (at, inst) = item?;
         let id = |place: usize| inst.get(place).copied().filter(|&id| (id as usize) < bound);
@@ -446,6 +467,7 @@ pub(crate) fn specialize(
                 functions_at = at;
                 break;
             }
+            OP_EXT_INST_IMPORT if string(inst.get(2..)?) == b"GLSL.std.450" => glsl = id(1)?,
             OP_ENTRY_POINT => {
                 let function = id(2)?;
                 if string(inst.get(3..)?) == entry {
@@ -511,6 +533,9 @@ pub(crate) fn specialize(
         joins: Vec::new(),
         dense: vec![u32::MAX; bound],
         unread: vec![false; bound],
+        pointer: vec![false; bound],
+        uses: vec![0; bound],
+        glsl,
     };
     let mut body: Vec<u32> = Vec::with_capacity(code.len() - functions_at);
     // Undefined values a kept loop's removed continue block hands its header, by type.
@@ -633,6 +658,10 @@ fn fold_function(
     }
     for item in instructions(&code[..end], at) {
         let (_, inst) = item?;
+        // Their literals are not ids, and a line table must not change what the pass folds.
+        if matches!(op(inst), OP_LINE | OP_NO_LINE) {
+            continue;
+        }
         for (place, &word) in inst.iter().enumerate().skip(1) {
             let named = match op(inst) {
                 OP_VARIABLE => place == 2,
@@ -889,7 +918,267 @@ fn fold_function(
         }
     }
     out.extend_from_slice(&code[function_end..end]);
-    drop_unread_variables(out, function_at, &mut folder.unread)
+    // A branch the pass folded leaves the values that fed it, the loads among them, and the
+    // variables those loads read are left with stores alone.
+    loop {
+        let before = out.len();
+        drop_unused_values(
+            out,
+            function_at,
+            folder.glsl,
+            &mut folder.pointer,
+            &mut folder.uses,
+        )?;
+        drop_unread_variables(out, function_at, &mut folder.unread)?;
+        if out.len() == before {
+            break;
+        }
+    }
+    merge_straight_blocks(out, function_at)
+}
+
+/// Merges into each block of the function in `out[from..]` that ends in a plain branch and
+/// heads no construct the block it branches to, where nothing else branches to that block, no
+/// construct names it as its merge or continue block, and it has no phi and heads no loop: the
+/// chains of blocks a folded branch leaves become one block.
+fn merge_straight_blocks(out: &mut Vec<u32>, from: usize) -> Option<()> {
+    struct Span {
+        label: u32,
+        start: usize,
+        end: usize,
+        last: usize,
+        header: bool,
+        loops: bool,
+        phi: bool,
+    }
+    let mut spans: Vec<Span> = Vec::new();
+    let mut first_label = None;
+    let mut function_end = out.len();
+    let mut named: HashSet<u32> = HashSet::new();
+    for item in instructions(out, from) {
+        let (start, inst) = item?;
+        match op(inst) {
+            OP_LABEL => {
+                match spans.last_mut() {
+                    Some(last) => last.end = start,
+                    None => first_label = Some(start),
+                }
+                spans.push(Span {
+                    label: *inst.get(1)?,
+                    start,
+                    end: start,
+                    last: start,
+                    header: false,
+                    loops: false,
+                    phi: false,
+                });
+            }
+            OP_FUNCTION_END => {
+                function_end = start;
+                if let Some(last) = spans.last_mut() {
+                    last.end = start;
+                }
+            }
+            OP_LINE | OP_NO_LINE => {}
+            _ => {
+                let Some(span) = spans.last_mut() else {
+                    continue;
+                };
+                span.last = start;
+                match op(inst) {
+                    OP_PHI => span.phi = true,
+                    OP_SELECTION_MERGE => {
+                        span.header = true;
+                        named.insert(*inst.get(1)?);
+                    }
+                    OP_LOOP_MERGE => {
+                        span.header = true;
+                        span.loops = true;
+                        named.extend(inst.get(1..3)?);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let first_label = first_label?;
+    let inst_at = |start: usize| {
+        let count = (out[start] >> 16) as usize;
+        &out[start..start + count]
+    };
+    let index: HashMap<u32, usize> = spans
+        .iter()
+        .enumerate()
+        .map(|(k, s)| (s.label, k))
+        .collect();
+    let mut predecessors: HashMap<u32, u32> = HashMap::new();
+    for span in &spans {
+        for target in targets(inst_at(span.last)) {
+            *predecessors.entry(target).or_default() += 1;
+        }
+    }
+    let mut next: Vec<Option<usize>> = vec![None; spans.len()];
+    let mut merged = vec![false; spans.len()];
+    for (k, span) in spans.iter().enumerate() {
+        let last = inst_at(span.last);
+        if op(last) != OP_BRANCH || span.header {
+            continue;
+        }
+        let target = *last.get(1)?;
+        let j = *index.get(&target)?;
+        let t = &spans[j];
+        if j != k
+            && predecessors.get(&target) == Some(&1)
+            && !named.contains(&target)
+            && !t.phi
+            && !t.loops
+        {
+            next[k] = Some(j);
+            merged[j] = true;
+        }
+    }
+    if !merged.contains(&true) {
+        return Some(());
+    }
+    // A phi past a merged block names the block it merged into.
+    let mut into: HashMap<u32, u32> = HashMap::new();
+    let mut body: Vec<u32> = Vec::with_capacity(out.len() - from);
+    body.extend_from_slice(&out[from..first_label]);
+    for (k, span) in spans.iter().enumerate() {
+        if merged[k] {
+            continue;
+        }
+        let mut at = k;
+        let mut begin = span.start;
+        while let Some(j) = next[at] {
+            body.extend_from_slice(&out[begin..spans[at].last]);
+            into.insert(spans[j].label, span.label);
+            begin = spans[j].start + (out[spans[j].start] >> 16) as usize;
+            at = j;
+        }
+        body.extend_from_slice(&out[begin..spans[at].end]);
+    }
+    body.extend_from_slice(&out[function_end..]);
+    let mut at = 0;
+    while at < body.len() {
+        let count = (body[at] >> 16) as usize;
+        if body[at] & 0xffff == OP_PHI {
+            for parent in (at + 4..at + count).step_by(2) {
+                if let Some(&root) = into.get(&body[parent]) {
+                    body[parent] = root;
+                }
+            }
+        }
+        at += count;
+    }
+    out.truncate(from);
+    out.extend_from_slice(&body);
+    Some(())
+}
+
+/// Whether `inst` computes a value and does nothing else, so it may go where nothing uses the
+/// value: arithmetic, tests, conversions, composites, pointers, phis and the instructions of
+/// GLSL.std.450 import `glsl` that write through no pointer. A load counts where it reads a local
+/// variable or a place in one (`pointer`) and is not volatile.
+fn pure(inst: &[u32], glsl: u32, pointer: &[bool]) -> bool {
+    match op(inst) {
+        OP_LOAD => {
+            let volatile = inst.get(4).is_some_and(|&m| m & 1 != 0);
+            let local = inst
+                .get(3)
+                .is_some_and(|&p| pointer.get(p as usize).copied().unwrap_or(false));
+            local && !volatile
+        }
+        OP_ACCESS_CHAIN
+        | OP_IN_BOUNDS_ACCESS_CHAIN
+        | OP_PTR_ACCESS_CHAIN
+        | OP_PHI
+        | OP_VECTOR_EXTRACT_DYNAMIC..=OP_TRANSPOSE
+        | OP_CONVERT_F_TO_U..=OP_BITCAST
+        | OP_S_NEGATE..=OP_S_MUL_EXTENDED
+        | OP_ANY..=OP_BIT_COUNT => true,
+        OP_EXT_INST => {
+            inst.get(3) == Some(&glsl) && !matches!(inst.get(4), Some(&(GLSL_MODF | GLSL_FREXP)))
+        }
+        _ => false,
+    }
+}
+
+/// Removes from the function in `out[from..]` the values ([`pure`]) nothing uses, of GLSL.std.450
+/// import `glsl`, and then those only they used. `pointer` and `uses` are clear for every id on
+/// entry and on return.
+fn drop_unused_values(
+    out: &mut Vec<u32>,
+    from: usize,
+    glsl: u32,
+    pointer: &mut [bool],
+    uses: &mut [u32],
+) -> Option<()> {
+    let mut touched: Vec<u32> = Vec::new();
+    let mut starts: Vec<usize> = Vec::new();
+    for item in instructions(out, from) {
+        let (start, inst) = item?;
+        starts.push(start);
+        let based = match op(inst) {
+            OP_VARIABLE => inst.get(3) == Some(&STORAGE_FUNCTION),
+            OP_ACCESS_CHAIN | OP_IN_BOUNDS_ACCESS_CHAIN | OP_PTR_ACCESS_CHAIN => pointer
+                .get(*inst.get(3)? as usize)
+                .copied()
+                .unwrap_or(false),
+            _ => false,
+        };
+        if based {
+            *pointer.get_mut(inst[2] as usize)? = true;
+            touched.push(inst[2]);
+        }
+        // A line's literals are no ids, and a value names its own result alone. A literal with
+        // an id's value only keeps that id's value.
+        let skip = match op(inst) {
+            OP_LINE | OP_NO_LINE => continue,
+            _ if pure(inst, glsl, pointer) => 3,
+            _ => 1,
+        };
+        for &word in inst.iter().skip(skip) {
+            if let Some(count) = uses.get_mut(word as usize) {
+                if *count == 0 {
+                    touched.push(word);
+                }
+                *count += 1;
+            }
+        }
+    }
+    // Uses follow their values but for phis, so one pass from the end frees chains of values.
+    let mut dropped = vec![false; starts.len()];
+    for (k, &start) in starts.iter().enumerate().rev() {
+        let count = (out[start] >> 16) as usize;
+        let inst = &out[start..start + count];
+        if inst.len() < 3
+            || !pure(inst, glsl, pointer)
+            || uses.get(inst[2] as usize).copied() != Some(0)
+        {
+            continue;
+        }
+        dropped[k] = true;
+        for &word in &inst[3..] {
+            if let Some(count) = uses.get_mut(word as usize) {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
+    let mut to = from;
+    for (k, &start) in starts.iter().enumerate() {
+        let count = (out[start] >> 16) as usize;
+        if !dropped[k] {
+            out.copy_within(start..start + count, to);
+            to += count;
+        }
+    }
+    out.truncate(to);
+    for id in touched {
+        pointer[id as usize] = false;
+        uses[id as usize] = 0;
+    }
+    Some(())
 }
 
 /// Removes from the function in `out[from..]` its variables that only stores name, with
@@ -1236,6 +1525,8 @@ fn switch_target(inst: &[u32], selector: u32) -> Option<u32> {
 mod tests {
     use super::*;
 
+    const STORAGE_PRIVATE: u32 = 6;
+
     const OP_TYPE_VOID: u32 = 19;
     const OP_TYPE_FUNCTION: u32 = 33;
     const OP_RETURN: u32 = 253;
@@ -1291,6 +1582,16 @@ mod tests {
         ]
     }
 
+    /// Ids 40 to 43: a private bool and uint, whose stores keep the values a test looks for.
+    fn sinks() -> Vec<Vec<u32>> {
+        vec![
+            inst(OP_TYPE_POINTER, &[40, STORAGE_PRIVATE, 3]),
+            inst(OP_VARIABLE, &[40, 41, STORAGE_PRIVATE]),
+            inst(OP_TYPE_POINTER, &[42, STORAGE_PRIVATE, 4]),
+            inst(OP_VARIABLE, &[42, 43, STORAGE_PRIVATE]),
+        ]
+    }
+
     /// A branch on a test of the constant loses its dead side: the side's block and name go,
     /// the merge's phi keeps the live value, a loop whose body can no longer reach its
     /// continue block keeps that block as a stub with an undefined value for the header's
@@ -1307,10 +1608,11 @@ mod tests {
             inst(OP_EXECUTION_MODE, &[9, 17, 1, 1, 1]),
             named(OP_NAME, &[20], "gone"),
             named(OP_NAME, &[9], "drop"),
-            named(OP_NAME, &[12], "kept"),
+            named(OP_NAME, &[15], "kept"),
             inst(OP_DECORATE, &[5, DECORATION_SPEC_ID, 7]),
         ];
         parts.extend(declarations(inst(OP_SPEC_CONSTANT, &[4, 5, 1])));
+        parts.extend(sinks());
         parts.extend([
             inst(OP_FUNCTION, &[1, 8, 0, 2]),
             inst(OP_LABEL, &[10]),
@@ -1323,12 +1625,14 @@ mod tests {
             inst(OP_BRANCH, &[14]),
             inst(OP_LABEL, &[14]),
             inst(OP_PHI, &[4, 15, 6, 10, 20, 13]),
+            inst(OP_STORE, &[43, 15]),
             inst(OP_BRANCH, &[16]),
             inst(OP_LABEL, &[16]),
             inst(OP_PHI, &[4, 17, 7, 14, 21, 19]),
             inst(OP_LOOP_MERGE, &[18, 19, 0]),
             inst(OP_BRANCH, &[22]),
             inst(OP_LABEL, &[22]),
+            inst(OP_STORE, &[43, 17]),
             inst(OP_BRANCH_CONDITIONAL, &[12, 19, 18]),
             inst(OP_LABEL, &[19]),
             inst(OP_NOT, &[4, 21, 17]),
@@ -1341,28 +1645,30 @@ mod tests {
             inst(OP_RETURN, &[]),
             inst(OP_FUNCTION_END, &[]),
         ]);
-        let code = module(24, &parts);
+        let code = module(44, &parts);
 
+        // The test's values feed folded branches alone, and go with them.
         let mut want = vec![
             named(OP_ENTRY_POINT, &[5, 8], "keep"),
-            named(OP_NAME, &[12], "kept"),
+            named(OP_NAME, &[15], "kept"),
         ];
         want.extend(declarations(inst(OP_CONSTANT, &[4, 5, 0])));
+        want.extend(sinks());
         want.extend([
-            inst(OP_UNDEF, &[4, 24]),
+            inst(OP_UNDEF, &[4, 44]),
             inst(OP_FUNCTION, &[1, 8, 0, 2]),
             inst(OP_LABEL, &[10]),
-            test[0].clone(),
-            test[1].clone(),
             inst(OP_BRANCH, &[14]),
             inst(OP_LABEL, &[14]),
             inst(OP_PHI, &[4, 15, 6, 10]),
+            inst(OP_STORE, &[43, 15]),
             inst(OP_BRANCH, &[16]),
             inst(OP_LABEL, &[16]),
-            inst(OP_PHI, &[4, 17, 7, 14, 24, 19]),
+            inst(OP_PHI, &[4, 17, 7, 14, 44, 19]),
             inst(OP_LOOP_MERGE, &[18, 19, 0]),
             inst(OP_BRANCH, &[22]),
             inst(OP_LABEL, &[22]),
+            inst(OP_STORE, &[43, 17]),
             inst(OP_BRANCH, &[18]),
             inst(OP_LABEL, &[19]),
             inst(OP_BRANCH, &[16]),
@@ -1372,7 +1678,7 @@ mod tests {
         ]);
         assert_eq!(
             specialize(&code, b"keep", &SPEC, &0u32.to_le_bytes()),
-            Some(module(25, &want))
+            Some(module(45, &want))
         );
         // A constant the caller gives no value stays the driver's, and so does the branch.
         let other = [SpecEntry {
@@ -1391,8 +1697,9 @@ mod tests {
     }
 
     /// A test stored to a scalar local in both arms of a folded branch reaches the branch
-    /// that loads it: only the store that runs counts. A variable something else names is not
-    /// followed.
+    /// that loads it: only the store that runs counts, and once that branch folds nothing uses
+    /// the load, which goes with the variable and its store. A variable something else names
+    /// is not followed.
     #[test]
     fn a_test_reaches_its_branch_through_a_local() {
         let build = |escapes: bool| {
@@ -1441,8 +1748,13 @@ mod tests {
         let through = folded(false);
         assert!(!has(&through, inst(OP_LABEL, &[13])));
         assert!(!has(&through, inst(OP_LABEL, &[17])));
-        assert!(has(&through, inst(OP_STORE, &[20, 22])));
         assert!(!has(&through, inst(OP_BRANCH_CONDITIONAL, &[16, 17, 18])));
+        assert!(!has(&through, inst(OP_LOAD, &[3, 16, 20])));
+        assert!(!has(&through, inst(OP_STORE, &[20, 22])));
+        assert!(!has(
+            &through,
+            inst(OP_VARIABLE, &[9, 20, STORAGE_FUNCTION])
+        ));
         let kept = folded(true);
         assert!(!has(&kept, inst(OP_LABEL, &[13])));
         assert!(has(&kept, inst(OP_BRANCH_CONDITIONAL, &[16, 17, 18])));
@@ -1459,6 +1771,7 @@ mod tests {
             inst(OP_DECORATE, &[30, DECORATION_SPEC_ID, 8]),
         ];
         parts.extend(declarations(inst(OP_SPEC_CONSTANT, &[4, 5, 1])));
+        parts.extend(sinks());
         parts.extend([
             inst(OP_TYPE_POINTER, &[9, STORAGE_FUNCTION, 3]),
             inst(OP_CONSTANT_TRUE, &[3, 21]),
@@ -1475,6 +1788,7 @@ mod tests {
             inst(OP_SELECTION_MERGE, &[14, 0]),
             inst(OP_BRANCH_CONDITIONAL, &[16, 13, 14]),
             inst(OP_LABEL, &[13]),
+            inst(OP_STORE, &[41, 21]),
             inst(OP_BRANCH, &[14]),
             inst(OP_LABEL, &[14]),
             inst(OP_STORE, &[20, 22]),
@@ -1501,10 +1815,10 @@ mod tests {
             inst(OP_RETURN, &[]),
             inst(OP_FUNCTION_END, &[]),
         ]);
-        let folded = specialize(&module(31, &parts), b"keep", &SPEC, &0u32.to_le_bytes()).unwrap();
+        let folded = specialize(&module(44, &parts), b"keep", &SPEC, &0u32.to_le_bytes()).unwrap();
         let has = |i: Vec<u32>| folded.windows(i.len()).any(|w| w == i);
         // The first load reads true, the second false.
-        assert!(has(inst(OP_LABEL, &[13])));
+        assert!(has(inst(OP_STORE, &[41, 21])));
         assert!(!has(inst(OP_BRANCH_CONDITIONAL, &[16, 13, 14])));
         assert!(!has(inst(OP_LABEL, &[27])));
         // The third reads true from one arm and false from the other.
@@ -1512,6 +1826,57 @@ mod tests {
         assert!(!has(inst(OP_VARIABLE, &[9, 28, STORAGE_FUNCTION])));
         assert!(!has(inst(OP_STORE, &[28, 21])));
         assert!(has(inst(OP_VARIABLE, &[9, 20, STORAGE_FUNCTION])));
+    }
+
+    /// The blocks a folded branch leaves in a row become one, and a phi past them names the
+    /// block they merged into. A block with a phi keeps its own.
+    #[test]
+    fn a_folded_branch_leaves_one_block() {
+        let mut parts = vec![
+            named(OP_ENTRY_POINT, &[5, 8], "keep"),
+            inst(OP_DECORATE, &[5, DECORATION_SPEC_ID, 7]),
+        ];
+        parts.extend(declarations(inst(OP_SPEC_CONSTANT, &[4, 5, 1])));
+        parts.extend(sinks());
+        parts.extend([
+            inst(OP_FUNCTION, &[1, 8, 0, 2]),
+            inst(OP_LABEL, &[10]),
+            inst(OP_BITWISE_AND, &[4, 11, 5, 6]),
+            inst(OP_I_NOT_EQUAL, &[3, 12, 11, 7]),
+            inst(OP_SELECTION_MERGE, &[14, 0]),
+            inst(OP_BRANCH_CONDITIONAL, &[12, 13, 15]),
+            inst(OP_LABEL, &[13]),
+            inst(OP_NOT, &[4, 20, 6]),
+            inst(OP_BRANCH, &[14]),
+            inst(OP_LABEL, &[15]),
+            inst(OP_NOT, &[4, 25, 6]),
+            inst(OP_BRANCH, &[16]),
+            inst(OP_LABEL, &[16]),
+            inst(OP_NOT, &[4, 26, 25]),
+            inst(OP_BRANCH, &[14]),
+            inst(OP_LABEL, &[14]),
+            inst(OP_PHI, &[4, 27, 20, 13, 26, 16]),
+            inst(OP_STORE, &[43, 27]),
+            inst(OP_RETURN, &[]),
+            inst(OP_FUNCTION_END, &[]),
+        ]);
+        let folded = specialize(&module(44, &parts), b"keep", &SPEC, &0u32.to_le_bytes()).unwrap();
+        let has = |i: Vec<u32>| folded.windows(i.len()).any(|w| w == i);
+        for label in [13, 15, 16] {
+            assert!(!has(inst(OP_LABEL, &[label])));
+        }
+        // The test fed the folded branch alone.
+        let row = [
+            inst(OP_LABEL, &[10]),
+            inst(OP_NOT, &[4, 25, 6]),
+            inst(OP_NOT, &[4, 26, 25]),
+            inst(OP_BRANCH, &[14]),
+            inst(OP_LABEL, &[14]),
+            inst(OP_PHI, &[4, 27, 26, 10]),
+            inst(OP_STORE, &[43, 27]),
+        ]
+        .concat();
+        assert!(has(row));
     }
 
     /// A switch on a constant keeps its merge instruction and its one live target: a block
