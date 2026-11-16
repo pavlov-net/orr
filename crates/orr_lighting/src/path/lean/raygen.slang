@@ -637,7 +637,8 @@ public void lean_paths(PathRoot r)
 }
 
 // The raygen of a view's update paths: the path of a block's pixel, which adds to the world
-// cache's cell of each of its first vertices the light that vertex scattered.
+// cache's cell of each of its first opaque vertices the light that vertex scattered. On a tile the
+// layer guides traced it starts inside the interiors around its G-buffer surface.
 public void lean_updates(PathRoot r)
 {
     uint slot = DispatchRaysIndex().x;
@@ -650,7 +651,7 @@ public void lean_updates(PathRoot r)
     uint4* record = lean_record(r, slot);
     CacheUpdate update = CacheUpdate();
     uint state = pcg3d(uint3(pixel, r.frame ^ path_stream(r))).y;
-    start_path(r, pixel, at, lean_cold(r, slot), 1.0, false, false);
+    start_path(r, pixel, at, lean_cold(r, slot), 1.0, false, layered(r, pixel));
     Payload first;
     first.words = uint4(0);
     call(CALL_FIRST, first);

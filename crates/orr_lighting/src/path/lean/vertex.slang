@@ -654,7 +654,8 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
         store_coherent(at, uint4(0, 0, 0, hot_flags(flags, rng.dimension)));
         return 0;
     }
-    if (update)
+    // The cache holds the light of opaque surfaces: a layer's vertex adds to no cell.
+    if (update && !LAYER)
     {
         UpdateVertex v = { g.position, oct_encode_snorm16(g.geometric_normal), cache_albedo(b.albedo(), g.bsdf) * throughput, 0 };
         uint4* record = lean_record(r, slot) + UPDATE_VERTEX_AT;
