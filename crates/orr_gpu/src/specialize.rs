@@ -4,7 +4,9 @@
 //! for many feature masks is mostly code its mask rules out. [`specialize`] gives the constants
 //! their values, follows them through the integer and boolean tests that read them, and removes
 //! the blocks no path of the function reaches, with every other entry point's function, the
-//! loads of local variables whose values nothing uses and the variables nothing left reads. It
+//! loads of local variables whose values nothing uses and the variables nothing left reads. A
+//! variable the removed blocks also wrote, left one store that reaches its every load, gives
+//! those loads the stored value, so a branch a mask rules out leaves no variable behind. It
 //! changes nothing a reachable instruction computes.
 //!
 //! A test may reach its branch as a value or through a scalar local variable that only loads
@@ -50,6 +52,7 @@ const OP_SPEC_CONSTANT_FALSE: u32 = 49;
 const OP_SPEC_CONSTANT: u32 = 50;
 const OP_FUNCTION: u32 = 54;
 const OP_FUNCTION_END: u32 = 56;
+const OP_FUNCTION_CALL: u32 = 57;
 const OP_VARIABLE: u32 = 59;
 const OP_LOAD: u32 = 61;
 const OP_STORE: u32 = 62;
@@ -57,12 +60,21 @@ const OP_ACCESS_CHAIN: u32 = 65;
 const OP_IN_BOUNDS_ACCESS_CHAIN: u32 = 66;
 const OP_PTR_ACCESS_CHAIN: u32 = 67;
 const OP_VECTOR_EXTRACT_DYNAMIC: u32 = 77;
+const OP_VECTOR_INSERT_DYNAMIC: u32 = 78;
+const OP_VECTOR_SHUFFLE: u32 = 79;
+const OP_COMPOSITE_CONSTRUCT: u32 = 80;
+const OP_COMPOSITE_EXTRACT: u32 = 81;
+const OP_COMPOSITE_INSERT: u32 = 82;
 const OP_TRANSPOSE: u32 = 84;
 const OP_CONVERT_F_TO_U: u32 = 109;
 const OP_S_NEGATE: u32 = 126;
 const OP_S_MUL_EXTENDED: u32 = 152;
 const OP_ANY: u32 = 154;
 const OP_BIT_COUNT: u32 = 205;
+const OP_ATOMIC_LOAD: u32 = 227;
+const OP_ATOMIC_STORE: u32 = 228;
+const OP_ATOMIC_EXCHANGE: u32 = 229;
+const OP_ATOMIC_XOR: u32 = 242;
 const OP_EXT_INST: u32 = 12;
 /// GLSL.std.450's instructions that write through a pointer operand.
 const GLSL_MODF: u32 = 35;
@@ -93,11 +105,16 @@ const OP_LABEL: u32 = 248;
 const OP_BRANCH: u32 = 249;
 const OP_BRANCH_CONDITIONAL: u32 = 250;
 const OP_SWITCH: u32 = 251;
+const OP_RETURN_VALUE: u32 = 254;
 const OP_UNREACHABLE: u32 = 255;
 const OP_LIFETIME_START: u32 = 256;
 const OP_LIFETIME_STOP: u32 = 257;
 const OP_NO_LINE: u32 = 317;
 const OP_MODULE_PROCESSED: u32 = 330;
+const OP_PTR_EQUAL: u32 = 401;
+const OP_PTR_DIFF: u32 = 403;
+const OP_TRACE_RAY: u32 = 4445;
+const OP_EXECUTE_CALLABLE: u32 = 4446;
 const OP_EXECUTION_MODE_ID: u32 = 331;
 const OP_DECORATE_ID: u32 = 332;
 const OP_TYPE_UNTYPED_POINTER: u32 = 4417;
@@ -207,6 +224,8 @@ struct Folder<'a> {
     uses: Vec<u32>,
     /// The id of the GLSL.std.450 instructions' import, `u32::MAX` where the module has none.
     glsl: u32,
+    /// The ids a decoration names.
+    decorated: Vec<bool>,
 }
 
 impl Folder<'_> {
@@ -459,6 +478,7 @@ pub(crate) fn specialize(
     let mut dropped: HashSet<u32> = HashSet::new();
     let mut functions_at = code.len();
     let mut glsl = u32::MAX;
+    let mut decorated = vec![false; bound];
     for item in instructions(code, HEADER_WORDS) {
         let (at, inst) = item?;
         let id = |place: usize| inst.get(place).copied().filter(|&id| (id as usize) < bound);
@@ -479,6 +499,7 @@ pub(crate) fn specialize(
             OP_DECORATE if inst.get(2) == Some(&DECORATION_SPEC_ID) => {
                 spec_ids.insert(id(1)?, *inst.get(3)?);
             }
+            OP_DECORATE | OP_DECORATE_ID | OP_DECORATE_STRING => decorated[id(1)? as usize] = true,
             OP_TYPE_BOOL => scalar[id(1)? as usize] = true,
             OP_TYPE_INT => scalar[id(1)? as usize] = inst.get(2) == Some(&32),
             OP_TYPE_POINTER => {
@@ -536,6 +557,7 @@ pub(crate) fn specialize(
         pointer: vec![false; bound],
         uses: vec![0; bound],
         glsl,
+        decorated,
     };
     let mut body: Vec<u32> = Vec::with_capacity(code.len() - functions_at);
     // Undefined values a kept loop's removed continue block hands its header, by type.
@@ -641,10 +663,15 @@ fn fold_function(
 ) -> Option<()> {
     let code = folder.code;
     folder.joins.clear();
+    // How many stores name each variable, as the function is written.
+    let mut written: HashMap<u32, u32> = HashMap::new();
     // The scalar variables only loads and stores name. An id anywhere else, a literal of its
     // value among them, leaves the variable out.
     for item in instructions(&code[..end], at) {
         let (_, inst) = item?;
+        if op(inst) == OP_STORE {
+            *written.entry(*inst.get(1)?).or_default() += 1;
+        }
         if op(inst) == OP_VARIABLE
             && inst.get(3) == Some(&STORAGE_FUNCTION)
             && folder
@@ -919,7 +946,8 @@ fn fold_function(
     }
     out.extend_from_slice(&code[function_end..end]);
     // A branch the pass folded leaves the values that fed it, the loads among them, and the
-    // variables those loads read are left with stores alone.
+    // variables those loads read are left with stores alone. A variable its folded branches
+    // also wrote may be left one store, whose value its loads read.
     loop {
         let before = out.len();
         drop_unused_values(
@@ -930,6 +958,7 @@ fn fold_function(
             &mut folder.uses,
         )?;
         drop_unread_variables(out, function_at, &mut folder.unread)?;
+        forward_single_stores(out, function_at, &written, &folder.decorated)?;
         if out.len() == before {
             break;
         }
@@ -1228,6 +1257,355 @@ fn drop_unread_variables(out: &mut Vec<u32>, from: usize, unread: &mut [bool]) -
     Some(())
 }
 
+/// The blocks a function's entry block reaches and their dominator tree, from each block's
+/// successors by place, the entry block first.
+struct Dominance {
+    /// The blocks the entry block reaches, in reverse postorder.
+    order: Vec<u32>,
+    /// Each block's place in `order`, `u32::MAX` for one the entry block does not reach.
+    number: Vec<u32>,
+    predecessors: Vec<Vec<u32>>,
+    /// Each reached block's immediate dominator, the entry block its own.
+    dominator: Vec<u32>,
+    depth: Vec<u32>,
+    /// The dominator tree's preorder intervals, by which one block dominates another.
+    enters: Vec<u32>,
+    leaves: Vec<u32>,
+}
+
+impl Dominance {
+    fn new(successors: &[Vec<u32>]) -> Self {
+        const NONE: u32 = u32::MAX;
+        let n = successors.len();
+        let mut order: Vec<u32> = Vec::with_capacity(n);
+        let mut number = vec![NONE; n];
+        let mut seen = vec![false; n];
+        let mut stack: Vec<(u32, usize)> = vec![(0, 0)];
+        seen[0] = true;
+        while let Some((b, next)) = stack.last_mut() {
+            if let Some(&to) = successors[*b as usize].get(*next) {
+                *next += 1;
+                if !seen[to as usize] {
+                    seen[to as usize] = true;
+                    stack.push((to, 0));
+                }
+            } else {
+                order.push(*b);
+                stack.pop();
+            }
+        }
+        order.reverse();
+        for (k, &b) in order.iter().enumerate() {
+            number[b as usize] = k as u32;
+        }
+        let mut predecessors: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for &b in &order {
+            for &to in &successors[b as usize] {
+                predecessors[to as usize].push(b);
+            }
+        }
+
+        // Each block's immediate dominator (Cooper, Harvey and Kennedy).
+        let mut dominator = vec![NONE; n];
+        dominator[0] = 0;
+        loop {
+            let mut changed = false;
+            for &b in order.iter().skip(1) {
+                let mut new = NONE;
+                for &p in &predecessors[b as usize] {
+                    if dominator[p as usize] == NONE {
+                        continue;
+                    }
+                    if new == NONE {
+                        new = p;
+                        continue;
+                    }
+                    let (mut x, mut y) = (p, new);
+                    while x != y {
+                        while number[x as usize] > number[y as usize] {
+                            x = dominator[x as usize];
+                        }
+                        while number[y as usize] > number[x as usize] {
+                            y = dominator[y as usize];
+                        }
+                    }
+                    new = x;
+                }
+                if dominator[b as usize] != new {
+                    dominator[b as usize] = new;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut depth = vec![0u32; n];
+        let mut children: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for &b in order.iter().skip(1) {
+            // Reverse postorder visits a block after its dominator.
+            depth[b as usize] = depth[dominator[b as usize] as usize] + 1;
+            children[dominator[b as usize] as usize].push(b);
+        }
+        let mut enters = vec![0u32; n];
+        let mut leaves = vec![0u32; n];
+        let mut clock = 0;
+        let mut stack: Vec<(u32, usize)> = vec![(0, 0)];
+        while let Some((b, next)) = stack.last_mut() {
+            if *next == 0 {
+                enters[*b as usize] = clock;
+                clock += 1;
+            }
+            if let Some(&child) = children[*b as usize].get(*next) {
+                *next += 1;
+                stack.push((child, 0));
+            } else {
+                leaves[*b as usize] = clock;
+                stack.pop();
+            }
+        }
+        Self {
+            order,
+            number,
+            predecessors,
+            dominator,
+            depth,
+            enters,
+            leaves,
+        }
+    }
+
+    /// Whether block `x` dominates block `b`, both reached.
+    fn dominates(&self, x: u32, b: u32) -> bool {
+        let (x, b) = (x as usize, b as usize);
+        self.enters[x] <= self.enters[b] && self.leaves[b] <= self.leaves[x]
+    }
+
+    fn reached(&self, b: u32) -> bool {
+        self.number[b as usize] != u32::MAX
+    }
+}
+
+/// Whether word `place` of `inst`, an instruction of a function, may name a value the
+/// instruction reads: `Some(false)` for a literal, a label, the result or its type, `None`
+/// for an instruction the pass does not know the operands of.
+fn reads_value(inst: &[u32], place: usize) -> Option<bool> {
+    // A memory access whose operands name a scope.
+    let scoped = |mask: Option<&u32>| mask.is_some_and(|&m| m & 0x18 != 0);
+    Some(match op(inst) {
+        OP_LINE | OP_NO_LINE | OP_LABEL | OP_BRANCH | OP_LOOP_MERGE | OP_SELECTION_MERGE
+        | OP_FUNCTION | OP_FUNCTION_END | OP_UNDEF | OP_UNREACHABLE => false,
+        OP_VARIABLE => place == 4,
+        OP_LOAD if scoped(inst.get(4)) => return None,
+        OP_LOAD | OP_COMPOSITE_EXTRACT => place == 3,
+        OP_STORE if scoped(inst.get(3)) => return None,
+        OP_STORE => place <= 2,
+        OP_COMPOSITE_INSERT | OP_VECTOR_SHUFFLE => place == 3 || place == 4,
+        OP_EXT_INST => place == 3 || place >= 5,
+        OP_BRANCH_CONDITIONAL | OP_SWITCH | OP_RETURN_VALUE => place == 1,
+        OP_ATOMIC_STORE | OP_TRACE_RAY | OP_EXECUTE_CALLABLE => true,
+        OP_FUNCTION_CALL
+        | OP_ACCESS_CHAIN
+        | OP_IN_BOUNDS_ACCESS_CHAIN
+        | OP_PTR_ACCESS_CHAIN
+        | OP_PHI
+        | OP_COPY_OBJECT
+        | OP_VECTOR_EXTRACT_DYNAMIC
+        | OP_VECTOR_INSERT_DYNAMIC
+        | OP_COMPOSITE_CONSTRUCT
+        | OP_TRANSPOSE
+        | OP_CONVERT_F_TO_U..=OP_BITCAST
+        | OP_S_NEGATE..=OP_S_MUL_EXTENDED
+        | OP_ANY..=OP_BIT_COUNT
+        | OP_ATOMIC_LOAD
+        | OP_ATOMIC_EXCHANGE..=OP_ATOMIC_XOR
+        | OP_PTR_EQUAL..=OP_PTR_DIFF => place >= 3,
+        _ => return None,
+    })
+}
+
+/// Forwards to its loads the value of each variable of the function in `out[from..]` that the
+/// pass left one store, where that store comes before every load on every path and only plain
+/// loads and stores name the variable: the loads go, the values they gave name the stored one,
+/// and the variable is left with its store alone. A variable `written` counts one store of, as
+/// the function is written, keeps its loads: the pass takes out what its folded branches leave
+/// behind, and leaves the rest of what a driver is handed as it was written. A load a
+/// decoration names (`decorated`) keeps its variable.
+fn forward_single_stores(
+    out: &mut Vec<u32>,
+    from: usize,
+    written: &HashMap<u32, u32>,
+    decorated: &[bool],
+) -> Option<()> {
+    // Each instruction's start and block, and each block's label and successors.
+    let mut starts: Vec<usize> = Vec::new();
+    let mut block_of: Vec<u32> = Vec::new();
+    let mut labels: HashMap<u32, u32> = HashMap::new();
+    let mut terminators: Vec<usize> = Vec::new();
+    for item in instructions(out, from) {
+        let (start, inst) = item?;
+        if op(inst) == OP_LABEL {
+            labels.insert(*inst.get(1)?, terminators.len() as u32);
+            terminators.push(start);
+        } else if let Some(last) = terminators.last_mut()
+            && !matches!(op(inst), OP_LINE | OP_NO_LINE | OP_FUNCTION_END)
+        {
+            *last = start;
+        }
+        starts.push(start);
+        block_of.push(terminators.len() as u32 - u32::from(!terminators.is_empty()));
+    }
+    if terminators.is_empty() {
+        return Some(());
+    }
+    let inst_at = |start: usize| &out[start..start + (out[start] >> 16) as usize];
+
+    struct Candidate {
+        store: Option<(usize, u32)>,
+        stores: u32,
+        loads: Vec<usize>,
+        kept: bool,
+    }
+    let mut candidates: HashMap<u32, Candidate> = HashMap::new();
+    for &start in &starts {
+        let inst = inst_at(start);
+        if op(inst) == OP_VARIABLE
+            && inst.len() == 4
+            && inst[3] == STORAGE_FUNCTION
+            && written.get(&inst[2]).is_some_and(|&n| n > 1)
+        {
+            candidates.insert(
+                inst[2],
+                Candidate {
+                    store: None,
+                    stores: 0,
+                    loads: Vec::new(),
+                    kept: false,
+                },
+            );
+        }
+    }
+    if candidates.is_empty() {
+        return Some(());
+    }
+    for (k, &start) in starts.iter().enumerate() {
+        let inst = inst_at(start);
+        match op(inst) {
+            OP_VARIABLE | OP_LINE | OP_NO_LINE => continue,
+            OP_STORE if inst.len() == 3 && candidates.contains_key(&inst[1]) => {
+                let c = candidates.get_mut(&inst[1])?;
+                c.stores += 1;
+                c.store = Some((k, inst[2]));
+                if let Some(c) = candidates.get_mut(&inst[2]) {
+                    c.kept = true;
+                }
+                continue;
+            }
+            OP_LOAD if inst.len() == 4 && candidates.contains_key(&inst[3]) => {
+                let c = candidates.get_mut(&inst[3])?;
+                c.loads.push(k);
+                c.kept |= decorated.get(inst[2] as usize).copied().unwrap_or(true);
+                continue;
+            }
+            _ => {}
+        }
+        // A variable named anywhere else, a literal with its id among those, keeps its loads.
+        for &word in &inst[1..] {
+            if let Some(c) = candidates.get_mut(&word) {
+                c.kept = true;
+            }
+        }
+    }
+
+    // The store must dominate each load: come before it in its block, or in a block that
+    // dominates the load's.
+    let mut successors: Vec<Vec<u32>> = Vec::with_capacity(terminators.len());
+    for &t in &terminators {
+        successors.push(
+            targets(inst_at(t))
+                .map(|label| labels.get(&label).copied())
+                .collect::<Option<Vec<u32>>>()?,
+        );
+    }
+    let tree = Dominance::new(&successors);
+    let mut value: HashMap<u32, u32> = HashMap::new();
+    for c in candidates.values() {
+        let Some((at, stored)) = c.store.filter(|_| !c.kept && c.stores == 1) else {
+            continue;
+        };
+        let home = block_of[at];
+        let dominated = c.loads.iter().all(|&load| {
+            let b = block_of[load];
+            if b == home {
+                at < load
+            } else {
+                tree.reached(home) && tree.reached(b) && tree.dominates(home, b)
+            }
+        });
+        if dominated {
+            for &load in &c.loads {
+                value.insert(inst_at(starts[load])[2], stored);
+            }
+        }
+    }
+    if value.is_empty() {
+        return Some(());
+    }
+
+    // A forwarded value read where the pass does not know the operands keeps its variable.
+    let mut kept: HashSet<u32> = HashSet::new();
+    for &start in &starts {
+        let inst = inst_at(start);
+        for (place, word) in inst.iter().enumerate().skip(1) {
+            if value.contains_key(word) && reads_value(inst, place).is_none() {
+                kept.insert(*word);
+            }
+        }
+    }
+    if !kept.is_empty() {
+        // The other loads of a variable one of whose loads stays keep theirs too.
+        let stays: HashSet<u32> = candidates
+            .iter()
+            .filter(|(_, c)| {
+                c.loads
+                    .iter()
+                    .any(|&load| kept.contains(&inst_at(starts[load])[2]))
+            })
+            .map(|(&v, _)| v)
+            .collect();
+        for v in stays {
+            for &load in &candidates[&v].loads {
+                value.remove(&inst_at(starts[load])[2]);
+            }
+        }
+    }
+    // A stored value that is itself a forwarded load's names that load's value.
+    let resolve = |mut id: u32| {
+        while let Some(&v) = value.get(&id) {
+            id = v;
+        }
+        id
+    };
+
+    let mut rewritten: Vec<u32> = Vec::with_capacity(out.len() - from);
+    for &start in &starts {
+        let inst = inst_at(start);
+        if op(inst) == OP_LOAD && inst.len() == 4 && value.contains_key(&inst[2]) {
+            continue;
+        }
+        let first = rewritten.len();
+        rewritten.extend_from_slice(inst);
+        for place in 1..inst.len() {
+            if reads_value(inst, place) == Some(true) {
+                rewritten[first + place] = resolve(inst[place]);
+            }
+        }
+    }
+    out.truncate(from);
+    out.extend_from_slice(&rewritten);
+    Some(())
+}
+
 /// The labels `last`, a block's last instruction, may branch to.
 fn targets(last: &[u32]) -> impl Iterator<Item = u32> + '_ {
     let (one, pairs): (&[u32], &[u32]) = match op(last) {
@@ -1268,99 +1646,18 @@ fn reaching_definitions(
         }
         successors.push(to);
     }
-    let mut order: Vec<u32> = Vec::with_capacity(n);
-    let mut number = vec![NONE; n];
-    let mut seen = vec![false; n];
-    let mut stack: Vec<(u32, usize)> = vec![(0, 0)];
-    seen[0] = true;
-    while let Some((b, next)) = stack.last_mut() {
-        if let Some(&to) = successors[*b as usize].get(*next) {
-            *next += 1;
-            if !seen[to as usize] {
-                seen[to as usize] = true;
-                stack.push((to, 0));
-            }
-        } else {
-            order.push(*b);
-            stack.pop();
-        }
-    }
-    order.reverse();
-    for (k, &b) in order.iter().enumerate() {
-        number[b as usize] = k as u32;
-    }
-    let mut predecessors: Vec<Vec<u32>> = vec![Vec::new(); n];
-    for &b in &order {
-        for &to in &successors[b as usize] {
-            predecessors[to as usize].push(b);
-        }
-    }
-
-    // Each block's immediate dominator (Cooper, Harvey and Kennedy), then the dominator
-    // tree's depths and its preorder intervals, by which one block dominates another.
-    let mut dominator = vec![NONE; n];
-    dominator[0] = 0;
-    loop {
-        let mut changed = false;
-        for &b in order.iter().skip(1) {
-            let mut new = NONE;
-            for &p in &predecessors[b as usize] {
-                if dominator[p as usize] == NONE {
-                    continue;
-                }
-                if new == NONE {
-                    new = p;
-                    continue;
-                }
-                let (mut x, mut y) = (p, new);
-                while x != y {
-                    while number[x as usize] > number[y as usize] {
-                        x = dominator[x as usize];
-                    }
-                    while number[y as usize] > number[x as usize] {
-                        y = dominator[y as usize];
-                    }
-                }
-                new = x;
-            }
-            if dominator[b as usize] != new {
-                dominator[b as usize] = new;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    let mut depth = vec![0u32; n];
-    let mut children: Vec<Vec<u32>> = vec![Vec::new(); n];
-    for &b in order.iter().skip(1) {
-        // Reverse postorder visits a block after its dominator.
-        depth[b as usize] = depth[dominator[b as usize] as usize] + 1;
-        children[dominator[b as usize] as usize].push(b);
-    }
-    let mut enters = vec![0u32; n];
-    let mut leaves = vec![0u32; n];
-    let mut clock = 0;
-    let mut stack: Vec<(u32, usize)> = vec![(0, 0)];
-    while let Some((b, next)) = stack.last_mut() {
-        if *next == 0 {
-            enters[*b as usize] = clock;
-            clock += 1;
-        }
-        if let Some(&child) = children[*b as usize].get(*next) {
-            *next += 1;
-            stack.push((child, 0));
-        } else {
-            leaves[*b as usize] = clock;
-            stack.pop();
-        }
-    }
-    let dominates = |x: u32, b: u32| {
-        enters[x as usize] <= enters[b as usize] && leaves[b as usize] <= leaves[x as usize]
-    };
+    let tree = Dominance::new(&successors);
+    let Dominance {
+        order,
+        number,
+        predecessors,
+        dominator,
+        depth,
+        ..
+    } = &tree;
+    let dominates = |x: u32, b: u32| tree.dominates(x, b);
     let mut frontier: Vec<Vec<u32>> = vec![Vec::new(); n];
-    for &b in &order {
+    for &b in order {
         if predecessors[b as usize].len() < 2 {
             continue;
         }
@@ -1729,6 +2026,7 @@ mod tests {
             ]);
             if escapes {
                 parts.push(inst(OP_COPY_OBJECT, &[9, 23, 20]));
+                parts.push(inst(OP_STORE, &[23, 21]));
             }
             parts.extend([
                 inst(OP_LOAD, &[3, 16, 20]),
@@ -1758,6 +2056,60 @@ mod tests {
         let kept = folded(true);
         assert!(!has(&kept, inst(OP_LABEL, &[13])));
         assert!(has(&kept, inst(OP_BRANCH_CONDITIONAL, &[16, 17, 18])));
+    }
+
+    /// A variable a folded branch also wrote, left one store that comes before its load, gives
+    /// the load that store's value and goes with them; one the function writes once keeps its
+    /// load, as one whose store does not come before its load on every path does.
+    #[test]
+    fn a_folded_branch_leaves_no_variable_of_one_store() {
+        let mut parts = vec![
+            named(OP_ENTRY_POINT, &[5, 8], "keep"),
+            inst(OP_DECORATE, &[5, DECORATION_SPEC_ID, 7]),
+        ];
+        parts.extend(declarations(inst(OP_SPEC_CONSTANT, &[4, 5, 1])));
+        parts.extend(sinks());
+        parts.extend([
+            inst(OP_TYPE_POINTER, &[9, STORAGE_FUNCTION, 4]),
+            // A test the pass knows nothing of.
+            inst(OP_UNDEF, &[3, 31]),
+            inst(OP_FUNCTION, &[1, 8, 0, 2]),
+            inst(OP_LABEL, &[10]),
+            inst(OP_VARIABLE, &[9, 20, STORAGE_FUNCTION]),
+            inst(OP_VARIABLE, &[9, 21, STORAGE_FUNCTION]),
+            inst(OP_VARIABLE, &[9, 22, STORAGE_FUNCTION]),
+            inst(OP_BITWISE_AND, &[4, 11, 5, 6]),
+            inst(OP_I_NOT_EQUAL, &[3, 12, 11, 7]),
+            inst(OP_STORE, &[20, 6]),
+            inst(OP_STORE, &[22, 6]),
+            inst(OP_SELECTION_MERGE, &[16, 0]),
+            inst(OP_BRANCH_CONDITIONAL, &[12, 13, 16]),
+            inst(OP_LABEL, &[13]),
+            inst(OP_STORE, &[20, 7]),
+            inst(OP_BRANCH, &[16]),
+            inst(OP_LABEL, &[16]),
+            inst(OP_SELECTION_MERGE, &[14, 0]),
+            inst(OP_BRANCH_CONDITIONAL, &[31, 17, 14]),
+            inst(OP_LABEL, &[17]),
+            inst(OP_STORE, &[21, 6]),
+            inst(OP_BRANCH, &[14]),
+            inst(OP_LABEL, &[14]),
+            inst(OP_LOAD, &[4, 26, 20]),
+            inst(OP_STORE, &[43, 26]),
+            inst(OP_LOAD, &[4, 27, 21]),
+            inst(OP_STORE, &[43, 27]),
+            inst(OP_LOAD, &[4, 28, 22]),
+            inst(OP_STORE, &[43, 28]),
+            inst(OP_RETURN, &[]),
+            inst(OP_FUNCTION_END, &[]),
+        ]);
+        let folded = specialize(&module(50, &parts), b"keep", &SPEC, &0u32.to_le_bytes()).unwrap();
+        let has = |i: Vec<u32>| folded.windows(i.len()).any(|w| w == i);
+        assert!(has(inst(OP_STORE, &[43, 6])));
+        assert!(!has(inst(OP_LOAD, &[4, 26, 20])));
+        assert!(!has(inst(OP_VARIABLE, &[9, 20, STORAGE_FUNCTION])));
+        assert!(has(inst(OP_LOAD, &[4, 27, 21])));
+        assert!(has(inst(OP_LOAD, &[4, 28, 22])));
     }
 
     /// A load reads the store that reaches it: of two stores in a row the nearer, and past a
