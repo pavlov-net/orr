@@ -1493,6 +1493,9 @@ public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
     if (!surface)
         cone.x += cone.y * asfloat(word);
     bool alive = carries(throughput) && opaque <= r.max_bounces + 1;
+    // In real time a scatter takes the cache's light for the medium, which ends the path past the
+    // vertex's next-event estimation.
+    bool cache_ends = false;
     if (mode.cache && !surface)
     {
         if (along && alive)
@@ -1500,7 +1503,7 @@ public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
             float4 gathered = asfloat(load_coherent(at + 3));
             store_coherent(at + 3, asuint(float4(gathered.xyz + throughput * interior_ambient(r, point, dir, rng), gathered.w)));
         }
-        alive = false;
+        cache_ends = true;
     }
     // A meeting's walk goes on whatever its light.
     if (!alive && !meets)
@@ -1604,7 +1607,7 @@ public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
         throughput *= exp(shift - extinction * length);
     // The phase function draws its own density, so the next ray keeps the throughput; a way out is
     // the direction the walk took.
-    bool goes = (leaves || scatter_pdf > 0.0) && (leaves || roulette_survives(r, opaque, u_roulette, throughput)) && carries(throughput);
+    bool goes = !cache_ends && (leaves || scatter_pdf > 0.0) && (leaves || roulette_survives(r, opaque, u_roulette, throughput)) && carries(throughput);
     // A scatter's next ray leaves from the point itself: no offset for the medium to cover. A way
     // out's leaves the interior, and the medium of an outer one covers its offset too.
     float3 origin = leaves ? surface_ray_origin(r, point, normal, wi) : point;
