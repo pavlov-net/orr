@@ -290,8 +290,9 @@ impl MaskedSupport {
         };
         for kernel in runs.kernels() {
             let (kernels, may) = (self.kernels, set.may);
-            set.late(kernel)
-                .start(device, loading, move |d| compile(d, &kernels, kernel, may));
+            set.late(kernel).start(device, loading, move |d, _| {
+                compile(d, &kernels, kernel, may)
+            });
         }
     }
 
@@ -362,10 +363,11 @@ impl MaskedSupport {
             None => (&self.device, None),
         };
         let (kernels, may) = (self.kernels, set.may);
-        set.late(kernel)
-            .start(device, loading.map(|l| (l, Urgency::Needed)), move |d| {
-                compile(d, &kernels, kernel, may)
-            });
+        set.late(kernel).start(
+            device,
+            loading.map(|l| (l, Urgency::Needed)),
+            move |d, _| compile(d, &kernels, kernel, may),
+        );
         set.late(kernel).wait(loading).map(|_| ())
     }
 
