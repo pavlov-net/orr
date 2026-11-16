@@ -20,8 +20,8 @@ import orr_shaders.pipeline;
 // walk: the interior list (`Interior`: its entries, then where each was entered), the layers it
 // met beside the extinction of the innermost interior's medium, that medium's scattering
 // coefficient and anisotropy, the point and outward normal of the surface the path last entered
-// an interior through (`LEAN_ENTERED_WORD`), the start of a walk (`LEAN_WALK_WORD`), and the
-// surface where a subsurface walk leaves, as its hit resolved it (`LEAN_EXIT_WORD`).
+// an interior through (`LEAN_ENTERED_WORD`), a walk where it starts or goes on (`LEAN_WALK_WORD`),
+// and the surface where a subsurface walk leaves, as its hit resolved it (`LEAN_EXIT_WORD`).
 [Host] public static const uint LEAN_COLD_WORDS = 18;
 public static const uint LEAN_SCATTER_WORD = 6;
 public static const uint LEAN_ENTERED_WORD = 7;
@@ -49,8 +49,10 @@ public static const uint LEAN_EXIT_WORD = 12;
 // What a raygen holds more where an interior's medium may scatter or a surface may walk: the draw
 // of where a ray inside an interior scatters, and the steps of a walk.
 [Host] public static const uint RAYGEN_WALK_INSTRUCTIONS = 6400;
-// The callable of a path's vertex at a scatter in an interior's medium, or where a walk leaves it.
-[Host] public static const uint MEDIUM_VERTEX_INSTRUCTIONS = 12500;
+// The callable of a path's vertex at a scatter in an interior's medium, or where a walk leaves it,
+// and of the light a walk takes through its rough surface where it meets it: that surface's
+// transmission seen from inside holds 1,100 of it.
+[Host] public static const uint MEDIUM_VERTEX_INSTRUCTIONS = 13600;
 // The callable of the vertex where a subsurface walk leaves.
 [Host] public static const uint WALK_EXIT_INSTRUCTIONS = 17000;
 // The callable that weighs a coated emitter's light by what its coat and fuzz pass toward a
@@ -117,12 +119,15 @@ public static const uint PAYLOAD_WALKED = 1 << 16;  // the path walked
 public static const uint PAYLOAD_WALKS = 1;
 public static const uint PAYLOAD_EXITS = 2;
 // What the callable of a vertex in an interior's medium runs, by its payload's second word: a
-// scatter's vertex, the walk a scatter starts, or the vertex where a walk leaves the interior or
-// stops at its cap.
+// scatter's vertex, the walk a scatter starts, the vertex where a walk leaves the interior or
+// stops at its cap, the light a walk takes through its rough surface where it meets it and goes
+// on inside, and the vertex where a walk leaves through its rough surface.
 public static const uint MEDIUM_SCATTERS = 0;
 public static const uint MEDIUM_LEAVES = 1;
 public static const uint MEDIUM_WALKS = 2;
 public static const uint MEDIUM_CAPPED = 3;
+public static const uint MEDIUM_MEETS = 4;
+public static const uint MEDIUM_LEAVES_ROUGH = 5;
 // The density word of a ray whose vertex's next-event estimation took the lights it meets, which
 // it meets for nothing: a walk's way out in real time.
 public static const float PDF_LIT = -1.0;

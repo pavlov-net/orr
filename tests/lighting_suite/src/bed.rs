@@ -3398,6 +3398,8 @@ pub fn assert_pipeline_renders_as_staged(
 /// `settings`.
 pub struct Paths {
     kernels: &'static LightingKernels,
+    /// The entry the paths run.
+    pub entry: PathEntry,
     /// Where the kernels compile the path pipelines a frame first asks for.
     loading: &'static orr_scene::Loading,
     pub settings: ViewLighting,
@@ -3489,6 +3491,7 @@ impl Paths {
         });
         Self {
             kernels,
+            entry,
             loading,
             settings,
             specialize: std::env::var_os("ORR_TEST_SPECIALIZED").is_some(),

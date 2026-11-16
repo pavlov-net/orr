@@ -1393,6 +1393,94 @@ public float3 interior_rough_scatter(float alpha, float eta, float3 v, float4 u,
     return l;
 }
 
+// What `interior_rough_scatter` of GGX `alpha` and `eta` passes out of the medium from `v`, in any
+// frame where `n` is the surface's normal into the medium: what does not depend on the way out
+// is drawn once.
+public struct InteriorRoughTransmission
+{
+    float alpha;
+    float eta;
+    float3 n;
+    float3 v;
+    float vz;
+    float ec;                       // the multiple scattering's share of the draws
+    float share;                    // the multiple scattering's share that leaves
+    float average;
+    float g1;                       // the visible normals' masking of `v`
+
+    public __init(float alpha, float eta, float3 n, float3 v)
+    {
+        this.alpha = alpha;
+        this.eta = eta;
+        this.n = n;
+        this.v = v;
+        vz = dot(v, n);
+        ec = alpha >= MIN_MS_ALPHA ? openpbr_look_up_ideal_dielectric_energy_complement(eta, alpha, vz) : 0.0;
+        share = ec > 0.0 ? 1.0 - openpbr_look_up_ideal_dielectric_reflection_ratio(eta, alpha) : 0.0;
+        average = ec > 0.0 ? openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_ideal_dielectric_average_energy_complement(1.0 / eta, alpha)) : 1.0;
+        g1 = smith_g1(v);
+    }
+
+    // `w` in a frame of normal `n`, which isotropy leaves free about it.
+    float3 local(float3 w)
+    {
+        return float3(length(cross(w, n)), 0.0, dot(w, n));
+    }
+
+    float smith_g1(float3 w)
+    {
+        return openpbr_eval_aniso_smith_g1(local(w), float2(alpha));
+    }
+
+    // The single scattering's density toward `l`, below the surface, before the multiple
+    // scattering's share: the visible normal that refracts `v` into `l` times the Fresnel
+    // transmission and the refraction's Jacobian.
+    float single(float3 l)
+    {
+        // That normal lies along `v + eta l`, on the side of `v`.
+        float3 h = normalize(v + eta * l);
+        if (dot(h, n) < 0.0)
+            h = -h;
+        float vh = dot(v, h);
+        float lh = dot(l, h);
+        if (!(vh > 0.0) || !(lh < 0.0))
+            return 0.0;
+        float d = openpbr_eval_aniso_ggx(local(h), float2(alpha));
+        float jacobian = eta * eta * -lh / sq(vh + eta * lh);
+        return (1.0 - openpbr_fresnel(eta, vh)) * g1 * vh * d / vz * jacobian;
+    }
+
+    // The density the draw takes `l` with.
+    public float pdf(float3 l)
+    {
+        if (!(dot(l, n) < 0.0))
+            return 0.0;
+        return ec * share * INV_TWO_PI + (1.0 - ec) * single(l);
+    }
+
+    // Toward `l`, below the surface: the BSDF times the cosine, without the radiance scale of
+    // leaving, and the density the draw takes `l` with, into `pdf`.
+    public float value(float3 l, out float pdf)
+    {
+        pdf = 0.0;
+        float lz = dot(l, n);
+        if (!(lz < 0.0))
+            return 0.0;
+        float s = single(l);
+        pdf = ec * share * INV_TWO_PI + (1.0 - ec) * s;
+        float value = s * smith_g1(l);
+        if (ec > 0.0)
+            value += min(ec * openpbr_look_up_ideal_dielectric_energy_complement(1.0 / eta, alpha, -lz) / average * share, -1.0 / lz) * -lz * INV_PI;
+        return value;
+    }
+}
+
+// `InteriorRoughTransmission` toward `l`, in `interior_rough_scatter`'s frame.
+public float interior_rough_transmission(float alpha, float eta, float3 v, float3 l, out float pdf)
+{
+    return InteriorRoughTransmission(alpha, eta, float3(0.0, 0.0, 1.0), v).value(l, pdf);
+}
+
 // A `Bsdf` for a path that has no vertex yet.
 public Bsdf bsdf_unprepared()
 {
