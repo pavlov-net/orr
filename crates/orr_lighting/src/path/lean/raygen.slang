@@ -135,7 +135,7 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags)
         float magnitude = max(abs(target.x), max(abs(target.y), abs(target.z)));
         t_max = max(0.0, reach - max(1e-4 * reach, magnitude * F32_PRECISION));
     }
-    ShadowCover cover = shadow_cover(SHADOW_PATH, SHADOW_MASK, (flags >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK, false);
+    ShadowCover cover = shadow_cover(SHADOW_PATH, SHADOW_MASK, context_depth(r, slot, flags), false);
     cover.product = float3(asfloat(w4.w), asfloat(w5.w), asfloat(load_coherent(at + 2).y));
     Payload p;
     p.words = cover.words();
@@ -187,6 +187,25 @@ struct PathTrail
 {
     bool chain;     // its last vertex was a layer, a scatter in a medium or a walk's way out
     bool walked;    // it walked
+    uint rays;      // the rays it traced, which a debug view may show
+}
+
+// The depth of the context a hit of a ray of `slot`'s path takes, whose first hot word's flags are
+// `flags`: the vertices before it, as the staged loop counts them, its scatters and the layers it
+// met alike.
+uint context_depth(PathRoot r, uint slot, uint flags)
+{
+    uint depth = (flags >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK;
+    if (may(MAY_LAYERS))
+        depth += met_layers(lean_cold(r, slot));
+    return depth;
+}
+
+// Counts a ray of `trail`'s path where the root's view shows rays per pixel.
+void count_ray(PathRoot r, inout PathTrail trail)
+{
+    if (may(MAY_DEBUG) && path_mode(r) == PATH_RAYS)
+        trail.rays++;
 }
 
 // What the raygen runs next of a path, past its pending shadow job. Each runs at one site of the
@@ -209,7 +228,7 @@ uint4 scattered_cover(PathRoot r, uint slot, uint4* at, uint mask)
 {
     uint2 pixel = item_pixel(r, r.slice_base + slot);
     float2 cone = halves(load_coherent(at + 2).x);
-    uint depth = (load_coherent(at).w >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK;
+    uint depth = context_depth(r, slot, load_coherent(at).w);
     RayCone c = { cone.x, cone.y };
     uint seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x;
     return path_payload(new_path_cover(mask, COVER_ALPHA, PRESENCE_NONE, pcg(seed ^ depth),
@@ -228,7 +247,7 @@ void end_path(uint4* at)
 // hit its last
 // step met. A walk stopped at its cap keeps its throughput: outside the reference the vertex
 // where it leaves takes the subsurface table's share of it.
-void walk_traced(PathRoot r, uint slot, uint4* at, inout Walk e, bool interior, uint owner, out Traced last)
+void walk_traced(PathRoot r, uint slot, uint4* at, inout Walk e, bool interior, uint owner, inout PathTrail trail, out Traced last)
 {
     bool share = !lean_reference(r);
     uint mask = interior ? MASK_OPAQUE | MASK_DIELECTRIC : MASK_OPAQUE;
@@ -242,6 +261,7 @@ void walk_traced(PathRoot r, uint slot, uint4* at, inout Walk e, bool interior, 
         Payload p;
         p.words = cover;
         last = trace_hit(r.scene.tlas, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, mask, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, path_ray(e.origin, e.dir, d.t), p);
+        count_ray(r, trail);
         if (!last.hit())
         {
             if (!walk_scattered(e, d, share))
@@ -273,7 +293,7 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
     uint4* cold = lean_cold(r, slot);
     uint owner;
     Walk e = load_walk(cold, r.frame, owner);
-    walk_traced(r, slot, at, e, interior, owner, h);
+    walk_traced(r, slot, at, e, interior, owner, trail, h);
     trail.walked = true;
     uint4 w0 = load_coherent(at);
     uint4 w1 = load_coherent(at + 1);
@@ -417,7 +437,7 @@ uint trace_ray<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, in
     // ray, and a layered tile's, which the layer guides trace alike, take the micromap's two
     // states for it.
     uint flags = traced_camera ? RAY_FLAG_NONE : RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE;
-    uint depth = (w0.w >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK;
+    uint depth = context_depth(r, slot, w0.w);
     RayCone c = { cone.x, cone.y };
     uint seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x;
     PathCover cover = new_path_cover(mask, COVER_ALPHA, PRESENCE_NONE, pcg(seed ^ depth),
@@ -429,6 +449,7 @@ uint trace_ray<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, in
     {
         p.words = path_payload(cover);
         h = trace_hit(r.scene.tlas, flags, mask, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, ray, p);
+        count_ray(r, trail);
         if (!layers || !h.hit() || layer_record(h))
             break;
         ray.TMin = asfloat(asuint(h.t()) + 1);
@@ -449,10 +470,11 @@ uint trace_ray<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, in
 }
 
 // Runs the path in hot words `at` to its end from `next`, NEXT_FIRST where it starts on the
-// G-buffer's surface, with camera rays that look for layers where `SEARCH`.
-void run_path<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint next)
+// G-buffer's surface, with camera rays that look for layers where `SEARCH`: the rays it traced, as
+// `count_ray` counts them.
+uint run_path<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint next)
 {
-    PathTrail trail = { false, false };
+    PathTrail trail = { false, false, 0 };
     // The ray's hit and a walk's last step's, each recorded by its trace: a hit object is never
     // copied.
     Traced h = traced_nothing();
@@ -461,7 +483,10 @@ void run_path<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint next)
     {
         uint4 w0 = load_coherent(at);
         if ((w0.w & HOT_SHADOW) != 0)
+        {
             trace_shadow(r, slot, at, w0.w);
+            count_ray(r, trail);
+        }
         Payload p;
         bool invokes = false;
         if (may(MAY_WALK) && next == NEXT_EXIT)
@@ -528,6 +553,7 @@ void run_path<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint next)
             call(CALL_EXIT, e);
         }
     }
+    return trail.rays;
 }
 
 // The raygen of a view's paths: a pixel's path, then its outputs, the radiance texel and the
@@ -561,6 +587,7 @@ public void lean_paths(PathRoot r)
         depth = r.gbuffer.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
     bool surface = !traced && depth > 0.0;
     bool carried = false;
+    uint rays = 0;
     // A surface's path runs on the view's share of pixels; the sky shows in all.
     bool runs = traced || depth == 0.0 || runs_path(r, pixel);
     // A frosted pixel runs a second path, from the G-buffer's surface behind its layers, for what
@@ -575,7 +602,7 @@ public void lean_paths(PathRoot r)
         if (runs)
         {
             bool starts_inside = start_path(r, pixel, at, lean_cold(r, slot), surface && !second ? 1.0 / r.pixel_fraction : 1.0, layers && !second, second);
-            run_path<true>(r, slot, at, surface && (second || !layers) ? NEXT_FIRST : NEXT_RAY);
+            rays = run_path<true>(r, slot, at, surface && (second || !layers) ? NEXT_FIRST : NEXT_RAY);
             radiance = asfloat(load_coherent(at + 3).xyz);
             if (!second)
             {
@@ -597,7 +624,10 @@ public void lean_paths(PathRoot r)
         // carries it through an interior.
         if (layers)
             r.layers[index].medium_end = carried ? -1.0 : layer_distance;
-        r.radiance.get<RWTexture2D<float4>>()[pixel] = float4(apply_hdr_ceiling(pre_exposure * radiance), first_distance > 0.0 ? 1.0 : 0.0);
+        float4 texel = float4(apply_hdr_ceiling(pre_exposure * radiance), first_distance > 0.0 ? 1.0 : 0.0);
+        if (may(MAY_DEBUG) && path_mode(r) == PATH_RAYS)
+            texel.xyz = float3(float(rays), all(isfinite(radiance)) ? 0.0 : 1.0, 0.0);
+        r.radiance.get<RWTexture2D<float4>>()[pixel] = texel;
         r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(lights.feedback, asuint(first_distance));
         if ((r.light_flags & LIGHT_FEEDBACK_COUNT) != 0 && lights.feedback != NO_LIGHT)
             count_feedback(r.set, lights.feedback);
@@ -624,7 +654,7 @@ public void lean_updates(PathRoot r)
     Payload first;
     first.words = uint4(0);
     call(CALL_FIRST, first);
-    PathTrail trail = { false, false };
+    PathTrail trail = { false, false, 0 };
     Traced h;
     for (;;)
     {

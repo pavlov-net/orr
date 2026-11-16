@@ -128,7 +128,7 @@ float3 left_normal(uint flags, uint4 w1)
 }
 
 // The layers a path met, which its cold words `at` count.
-uint met_layers(uint4* at)
+public uint met_layers(uint4* at)
 {
     return load_coherent(at + 1 + INTERIOR_ENTRIES).x;
 }
@@ -667,7 +667,9 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     // The blue of the job's light and its light id share a word with the ray's cone.
     float job_blue = 0.0;
     uint job_light = NO_LIGHT;
-    if (k.sum > 0.0)
+    // A surface takes light only from a side its shading and geometric normals agree on, where
+    // its BSDF rays leave too.
+    if (k.sum > 0.0 && sides_agree(g.normal, g.geometric_normal, k.dir))
     {
         float3 radiance = k.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(r.set, k.light, k.dir) : k.radiance;
         float W = k.sum / (float(k.drawn) * k.target);
