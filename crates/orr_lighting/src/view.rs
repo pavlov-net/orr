@@ -1802,7 +1802,9 @@ impl PipelinePaths {
         for &may in wanted {
             ready &= self.sets.prepare(may, &PIPELINE)?;
         }
-        if lighting.specialize {
+        // The pipeline that may meet everything is for what the scene comes to hold later: it
+        // compiles once the view's own are ready, and takes no driver thread from them.
+        if lighting.specialize && ready {
             self.start_general();
         }
         Ok(ready)
@@ -1897,7 +1899,8 @@ impl StagedPaths {
     /// says whether some are ready.
     fn ask(&self, wanted: u64, stages: &[Stage], lighting: &ViewLighting) -> Result<bool, Error> {
         let ready = self.stages.prepare(wanted, stages)?;
-        if lighting.specialize {
+        // As the pipeline tracer's, once the view's own are ready.
+        if lighting.specialize && ready {
             self.start_general();
         }
         Ok(ready)

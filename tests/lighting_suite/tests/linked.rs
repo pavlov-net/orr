@@ -321,9 +321,13 @@ fn the_pipeline_renders_linked_types_geometry_kinds_and_rich_materials_as_the_st
     assert_clean();
 }
 
-/// The pipeline that may meet everything, from the kernels that link the suite's surface types:
-/// the standard surface's stages hold their caps as where nothing links, and a stage made for
-/// one linked type holds that type's code alone. One that shades its own hits is the smaller
+/// The most a scene's own pipeline may meet: every bit but the last of `path_may2`, which no
+/// feature sets. Only the pipeline that may meet everything has that one.
+const SCENE_MOST: u64 = u64::MAX >> 1;
+
+/// The largest pipeline a scene's own mask makes, from the kernels that link the suite's surface
+/// types: the standard surface's stages hold their caps as where nothing links, and a stage made
+/// for one linked type holds that type's code alone. One that shades its own hits is the smaller
 /// for the standard surface it leaves out, one that only covers shades as the standard does,
 /// and neither declares its other side, so no stage serves any type. Where records' own weights
 /// may give them a lobe, only the type that leaves hits to the standard surface takes the
@@ -331,7 +335,7 @@ fn the_pipeline_renders_linked_types_geometry_kinds_and_rich_materials_as_the_st
 #[test]
 fn the_stages_of_a_pipeline_with_linked_surfaces_hold_their_caps() {
     use linked::surface::{CONTEXT, RINGS};
-    let sizes = orr_lighting::path_stage_sizes(&linked::KERNELS, u64::MAX).unwrap();
+    let sizes = orr_lighting::path_stage_sizes(&linked::KERNELS, SCENE_MOST).unwrap();
     assert_eq!(orr_lighting::over_cap(&sizes), None);
     let own = |entry: &str, surface: u8| {
         let stage = sizes
@@ -360,5 +364,26 @@ fn the_stages_of_a_pipeline_with_linked_surfaces_hold_their_caps() {
         sizes
             .iter()
             .all(|s| s.hit_surface != u32::MAX || s.geometry.is_empty())
+    );
+}
+
+/// The pipeline that may meet everything stands in for any scene, linked types and all, so it
+/// shades every linked surface through the stage made for any id, one per kind and kernel, and
+/// holds the pipeline's cap however many types link: it holds no stage made for one type.
+#[test]
+fn the_pipeline_that_may_meet_everything_holds_no_stage_per_linked_type() {
+    let sizes = orr_lighting::path_stage_sizes(&linked::KERNELS, u64::MAX).unwrap();
+    assert_eq!(orr_lighting::over_cap(&sizes), None);
+    let shaded = |s: &&orr_lighting::StageSize| !s.geometry.is_empty();
+    assert!(
+        sizes
+            .iter()
+            .filter(shaded)
+            .all(|s| s.hit_surface == u32::MAX)
+    );
+    let scene = orr_lighting::path_stage_sizes(&linked::KERNELS, SCENE_MOST).unwrap();
+    assert!(
+        sizes.iter().filter(shaded).count() < scene.iter().filter(shaded).count(),
+        "the general pipeline's hit stages against a scene's"
     );
 }
