@@ -142,8 +142,10 @@ public void store_met_layers(uint4* at, uint layers)
 // Starts `slot`'s path in the interiors around the eye at its pixel's near-plane point, which the
 // layer guides list, its cold words empty but for them; or, `behind`, in those around the G-buffer's
 // surface, past the surfaces the camera ray crosses up to it, for a path that starts there. Its hot
-// words say whether the path lies in one. The callable a camera inside an interior, and a frosted
-// pixel's second path, start with.
+// words say whether the path lies in one. A path behind marks its offset word for its first vertex,
+// which takes no medium along the camera ray: what lies before the surface, its layers and their
+// interiors' media, is the layer chain's to weigh. The callable a camera inside an interior, and a
+// frosted pixel's second path, start with.
 public void lean_eye_interior<S : ISurfaces>(PathRoot r, uint slot, bool behind)
 {
     uint2 pixel = item_pixel(r, r.slice_base + slot);
@@ -158,6 +160,11 @@ public void lean_eye_interior<S : ISurfaces>(PathRoot r, uint slot, bool behind)
     }
     store_interior(r.scene, cold, interior);
     uint4* at = lean_hot(r, slot);
+    if (behind)
+    {
+        uint4 w2 = load_coherent(at + 2);
+        store_coherent(at + 2, uint4(w2.xy, 1, w2.w));
+    }
     uint4 w0 = load_coherent(at);
     store_coherent(at, uint4(w0.xyz, interior.count > 0 ? w0.w | HOT_INTERIOR : w0.w & ~HOT_INTERIOR));
 }
@@ -1390,7 +1397,11 @@ public void lean_first<M : IMedium>(PathRoot r, uint slot, inout uint4 payload)
     }
     RayCone cone = camera_cone(r.view);
     float2 footprint = float2(cone_width(cone, x.camera_distance), cone.spread);
-    payload.y = lean_vertex<M, 1, GBufferLight, OnOpaque, false>(r, slot, at, x, -x.view, x.camera_distance, footprint, GBufferLight(), OnOpaque(), 0);
+    // A path behind layers marks its offset word: the camera ray's media are the layer chain's.
+    uint4 w2 = load_coherent(at + 2);
+    bool behind = w2.z != 0;
+    store_coherent(at + 2, uint4(w2.xy, 0, w2.w));
+    payload.y = lean_vertex<M, 1, GBufferLight, OnOpaque, false>(r, slot, at, x, -x.view, behind ? 0.0 : x.camera_distance, footprint, GBufferLight(), OnOpaque(), 0);
     // Where the walk the vertex starts stops at its cap it leaves here.
     if (lean_walks(false) && payload.y == PAYLOAD_WALKS)
         store_exit(lean_cold(r, slot), exit_vertex_of(x, -x.view, true));

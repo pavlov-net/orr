@@ -772,6 +772,76 @@ fn rough_glass_adds_its_blur_into_the_depth_of_field_guide() {
     assert_clean();
 }
 
+/// A frosted pixel's background is its surface's light alone, which the layer chain's
+/// transmittance weighs: under rough glass over an emitter's edge in absorbing water, the
+/// frosted-glass term dims by the water's transmittance down to the surface once, on both path
+/// tracers.
+#[test]
+fn the_frosted_glass_term_takes_the_water_behind_the_glass() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    const FILL: f32 = 0.25;
+    let [w, h] = EXTENT;
+    // The water box is 4 m tall, its surface `depth` m above the floor, the glass in air above it.
+    let pool = |depth: Option<f32>| {
+        let mut copies = vec![
+            at(SMOOTH_FLOOR, Vec3::ZERO),
+            at(LIGHT_FLOOR, Vec3::new(1.0, 0.01, 0.0)),
+            at(ROUGH_SLAB, Vec3::new(0.0, 2.5, 0.0)),
+        ];
+        if let Some(d) = depth {
+            copies.push(at(WATER_BOX, Vec3::new(0.0, d - 2.0, 0.0)));
+        }
+        Bed::with(from_above(copies, Vec::new(), 5.0))
+    };
+    let (mut staged, mut launched) = both(&KernelSet::default(), ViewLighting::default());
+    for p in [&mut staged, &mut launched] {
+        p.frost_guide = Some(FrostGuide::new(FILL));
+    }
+    // The term's step across the edge, its mean over 8 columns left of it (dark) less over 8
+    // right of it (lit), over seeds.
+    let step = |bed: &mut Bed, p: &Paths| {
+        let mut sum = 0.0;
+        for seed in 1..=16 {
+            bed.accumulate(1, seed, &mut |list, f| p.record(list, f));
+            let guide = p.frost_guide.as_ref().unwrap().read();
+            let band = |x0: u32| {
+                let rows = h / 2 - 8..h / 2 + 8;
+                let sum: f64 = rows
+                    .clone()
+                    .flat_map(|y| (x0..x0 + 8).map(move |x| (y * w + x) as usize))
+                    .map(|i| f64::from(guide[i] - FILL))
+                    .sum();
+                sum / (rows.len() * 8) as f64
+            };
+            sum += band(w / 2 - 8) - band(w / 2);
+        }
+        sum / 16.0
+    };
+    // The water's transmittance over `d` m, as the term's luminance weighs it.
+    let t = water_transmission();
+    let through = |d: f64| 0.25 * t[0].powf(d) + 0.5 * t[1].powf(d) + 0.25 * t[2].powf(d);
+    // The background is the surface's light, which the chain's transmittance weighs once: the
+    // water's surface 0.49 m over the emitter passes 1 - F of it.
+    let surface = 1.0 - fresnel(1.33, 1.0);
+    for (what, p) in [("staged", &staged), ("pipeline", &launched)] {
+        let [dry, shallow, deep] =
+            [None, Some(0.5), Some(1.5)].map(|depth| step(&mut pool(depth), p));
+        let pools = [
+            (shallow / dry, surface * through(0.49), "shallow"),
+            (deep / shallow, through(1.0), "deeper"),
+        ];
+        for (got, want, of) in pools {
+            assert!(
+                (got / want - 1.0).abs() < 0.05,
+                "{what}: the {of} pool scales the term by {got}, not by {want}"
+            );
+        }
+    }
+    assert_clean();
+}
+
 /// The pipeline's frosted pixels give the frosted-glass term the background luminance the
 /// staged loop's give it: under rough glass over an emitter's edge, the term's mean on the lit
 /// and on the dark side agrees over seeds.
