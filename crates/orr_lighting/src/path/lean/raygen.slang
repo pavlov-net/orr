@@ -24,6 +24,7 @@ import orr_lighting.path;
 import orr_lighting.path.common;
 import orr_lighting.path.lean.state;
 import orr_lighting.path.lean.vertex;
+import orr_lighting.path.lean.stack;
 import orr_color.luminance;
 import orr_lighting.interiors;
 import orr_lighting.subsurface;
@@ -45,6 +46,9 @@ public static const uint CALL_MEDIUM = 3;
 // The callable of the vertex where a subsurface walk leaves, which a pipeline whose surfaces may
 // walk holds.
 public static const uint CALL_EXIT = 4;
+// The callable of a step of a directional job's walk through a plane stack, which a pipeline
+// whose paths may meet one holds.
+public static const uint CALL_STACK = 6;
 
 // Whether `pixel` lies on a tile whose layers the layer guides traced, which a camera ray meets
 // before the G-buffer's surface.
@@ -121,6 +125,7 @@ bool start_path(PathRoot r, uint2 pixel, uint4* at, uint4* cold, float throughpu
 // its miss shader ran the job's light, times what the ray's candidates let through, is the
 // path's. The ray's shaders know nothing of the path: they read and write the payload alone. The
 // thin walls it crosses lie in a medium of IOR `exterior` where the job's vertex said, else 0.
+// Where the paths may meet a plane stack, `stack_shadow` traces it.
 void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior)
 {
     uint4 w4 = load_coherent(at + 4);
@@ -138,6 +143,11 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior)
         float magnitude = max(abs(target.x), max(abs(target.y), abs(target.z)));
         t_max = max(0.0, reach - max(1e-4 * reach, magnitude * F32_PRECISION));
     }
+    if (may(MAY_STACK))
+    {
+        stack_shadow(r, slot, at, flags, exterior, origin, dir, t_max);
+        return;
+    }
     ShadowCover cover = shadow_cover(SHADOW_PATH, SHADOW_MASK, context_depth(r, slot, flags), false);
     cover.product = float3(asfloat(w4.w), asfloat(w5.w), asfloat(load_coherent(at + 2).y));
     Payload p;
@@ -151,6 +161,191 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior)
     if (may2(MAY2_THIN_DIELECTRICS) && ShadowCover.of_words(p.words).has(SHADOW_CROSSES) && any(passed > 0.0))
         passed *= cross_walls(r, slot, at, flags, ray, exterior);
     lean_shadow_add(r, slot, passed);
+}
+
+// `trace_shadow` where the paths may meet a plane stack, of the job's ray from `origin` along
+// `dir` to `t_max`: the ray traces into a hit object, whose
+// record says what it ended at, and a directional job's ray that ends at solid glass may reach its
+// light through a stack past it. A probe along the light's direction up to past the glass, a
+// stack ray (`stack_ray`), finds the stack's face, and legs go face to face along the bent
+// directions, each a stack ray to its face and a shadow ray here up to it, the stack's callable
+// stepping from one to the next (`lean_stack_step`). Where the light bent at the vertex, the
+// vertex's re-run weighs it again (`bent_rerun`). A job whose ray starts in an interior and meets
+// nothing left that interior through none of its surfaces: it lies in no closed interior and takes
+// no light.
+void stack_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior, float3 origin, float3 dir, float t_max)
+{
+    uint4 w4 = load_coherent(at + 4);
+    uint4 w5 = load_coherent(at + 5);
+    uint4 w2 = load_coherent(at + 2);
+    float3 job = float3(asfloat(w4.w), asfloat(w5.w), asfloat(w2.y));
+    bool inside = w2.w == STACK_JOB_LIGHT;
+    bool stacks = (flags & HOT_SHADOW_FAR) != 0 && (w2.w == NO_LIGHT || inside) && lean_stacks(r);
+    uint depth = context_depth(r, slot, flags);
+    RayDesc ray = path_ray(origin, dir, t_max);
+    // 0: the job's ray, 1: the probe, 2: the legs.
+    uint phase = 0;
+    uint met = MET_NONE;
+    float met_t = 0.0;
+    bool probed = false;
+    bool bends = false;
+    uint crossed = 0;
+    float walls = exterior;
+    // What the legs' shadow rays let through.
+    float3 through = float3(1.0);
+    bool lit = false;
+    for (uint k = 0; k < STACK_CROSSINGS + 3; k++)
+    {
+        if (phase > 0 && !probed)
+            met = stack_ray(r, phase == 1 ? path_ray(origin, dir, met_t) : path_ray(ray.Origin, ray.Direction, positive_infinity()), depth, met_t);
+        probed = false;
+        if (phase != 1)
+        {
+            if (phase == 2)
+                ray.TMax = met == MET_NONE ? positive_infinity() : short_of(ray.Origin, ray.Direction, met_t);
+            ShadowCover cover = shadow_cover(SHADOW_PATH, SHADOW_MASK, depth, false);
+            cover.product = phase == 0 ? job : float3(1.0);
+            Payload p;
+            p.words = cover.words();
+            Traced h = trace_hit(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, ray, p);
+            bool missed = h.miss();
+            bool glass = stacks && h.hit() && h.record<HitData>().class_id() == CLASS_DIELECTRIC;
+            float committed = h.t();
+            float3 passed = asfloat(p.words.xyz);
+            // Thin walls the ray passed let through what they pass straight, walked one after
+            // the other.
+            if (missed && may2(MAY2_THIN_DIELECTRICS) && ShadowCover.of_words(p.words).has(SHADOW_CROSSES) && any(passed > 0.0))
+                passed *= cross_walls(r, slot, at, flags, ray, walls);
+            if (!missed)
+            {
+                if (phase != 0 || !glass)
+                    return;
+                // The ray ends at the first opaque surface or solid glass it found, which need not
+                // be the nearest; the probe reaches past it by its rounding.
+                phase = 1;
+                met_t = committed * (1.0 + 1e-4) + T_MIN_BASE;
+                continue;
+            }
+            if (phase == 0)
+            {
+                if (!inside)
+                    lean_shadow_add(r, slot, passed);
+                return;
+            }
+            through *= passed;
+            if (!any(through > 0.0))
+                return;
+        }
+        Payload q;
+        q.words = uint4((phase == 1 ? STEP_START : STEP_LEG) | (met << 4) | (inside ? STEP_INSIDE : 0) | (crossed << STEP_CROSSED_SHIFT), asuint(met_t), 0, 0);
+        call(CALL_STACK, q);
+        if (q.words.x == STEP_DARK)
+            return;
+        if (q.words.x == STEP_LIT)
+        {
+            lit = true;
+            break;
+        }
+        if (phase == 1)
+        {
+            bends = (q.words.x & STEP_PROBED) == 0;
+            probed = !bends;
+        }
+        else
+            crossed++;
+        phase = 2;
+        walls = asfloat(q.words.y);
+        uint4 leg = load_coherent(lean_stack(r, slot) + STACK_LEG_WORD);
+        ray = path_ray(asfloat(leg.xyz), probed ? dir : oct_decode_snorm16(leg.w), positive_infinity());
+    }
+    if (!lit)
+        return;
+    uint4* walked = lean_stack(r, slot) + STACK_THROUGH_WORD;
+    float4 legs = asfloat(load_coherent(walked));
+    through *= legs.xyz;
+    if (!bends)
+    {
+        lean_shadow_add(r, slot, job * through);
+        return;
+    }
+    store_coherent(walked, asuint(float4(through, legs.w)));
+    bent_rerun(r, slot);
+}
+
+// What the stack ray `ray` of `slot`'s path met (MET_*), and in `t` where, at path depth `depth`:
+// the nearest opaque surface or solid glass, as `stack_trace` traces it. A dielectric's hit is
+// asked the stack question, whose answer its shader leaves in the stack words.
+uint stack_ray(PathRoot r, RayDesc ray, uint depth, out float t)
+{
+    RayCone cone = { 0.0, 0.0 };
+    Payload p;
+    p.words = path_payload(new_path_cover(MASK_SHADOW | MASK_DIELECTRIC, COVER_STACK, PRESENCE_NONE, 0, hit_context(HIT_SECONDARY, depth, cone, 0.0)));
+    Traced h = trace_hit(r.scene.tlas, RAY_FLAG_NONE, MASK_SHADOW | MASK_DIELECTRIC, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, ray, p);
+    t = h.t();
+    if (!h.hit())
+        return MET_NONE;
+    if (h.record<HitData>().class_id() != CLASS_DIELECTRIC)
+        return MET_OTHER;
+    p.words = uint4(0);
+    h.invoke(p);
+    return MET_FACE;
+}
+
+// Runs again the vertex that left `slot`'s bent job, from what it kept (`stack_job`), to weigh
+// the light the walk brought through the stack along the bent direction: a ray's hit by its ray,
+// traced again in the few ulps around the hit with the cover it had, and the others by their
+// callables, each with the re-run's mark.
+void bent_rerun(PathRoot r, uint slot)
+{
+    uint4* kept = lean_stack(r, slot) + STACK_BENT_WORD;
+    uint4 input = load_coherent(kept + 1);
+    uint4 b = load_coherent(kept + 2);
+    Payload p;
+    p.words = input;
+    if (b.w == BENT_HIT)
+    {
+        float t = asfloat(b.z);
+        RayDesc ray = path_ray(asfloat(load_coherent(kept).xyz), oct_decode_snorm16(b.x), asfloat(asuint(t) + 4));
+        ray.TMin = asfloat(asuint(t) - 4);
+        uint mask = input.x & 0xff;
+        Traced h = trace_hit(r.scene.tlas, (mask & MASK_CAMERA) != 0 ? RAY_FLAG_NONE : RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, mask, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, ray, p);
+        p.words = uint4(input.x, PAYLOAD_BENT, input.zw);
+        if (h.hit())
+            h.invoke(p);
+        return;
+    }
+    p.words.y = b.w == BENT_MEDIUM ? input.y | MEDIUM_BENT : PAYLOAD_BENT;
+    call(b.w == BENT_FIRST ? CALL_FIRST : b.w == BENT_EXIT ? CALL_EXIT : CALL_MEDIUM, p);
+}
+
+// Runs the miss shader of `slot`'s path ray in hot words `at`, which met nothing, with payload `p`
+// where the ray crossed plane stack faces since its vertex last scattered (`PDF_STACK`), telling it
+// in the second word whether next-event estimation there takes a directional light's disc through
+// them: false for any other ray, whose miss the caller runs.
+bool stack_miss(PathRoot r, uint slot, uint4* at, inout Payload p)
+{
+    if (asfloat(load_coherent(at + 3)).w != PDF_STACK)
+        return false;
+    float3 dir = oct_decode_snorm16(load_coherent(at + 1).x);
+    p.words.y = stack_owned(r, slot, dir) ? 1 : 0;
+    Traced m = traced_miss(MISS_SCATTER, path_ray(asfloat(load_coherent(at).xyz), dir, positive_infinity()));
+    m.invoke(p);
+    return true;
+}
+
+// Whether the light of a directional light that `slot`'s path ray along `dir` met past plane
+// stack faces is next-event estimation's at the vertex that scattered it (`stack_owns`): the
+// probe from that vertex's ray along `dir` meets a face parallel to the first the ray crossed.
+bool stack_owned(PathRoot r, uint slot, float3 dir)
+{
+    uint4* at = lean_stack(r, slot);
+    uint4 a = load_coherent(at + STACK_TRACK_WORD);
+    uint4 b = load_coherent(at + STACK_TRACK_WORD + 1);
+    float t;
+    if (stack_ray(r, path_ray(asfloat(a.xyz), dir, positive_infinity()), (b.w >> 24) + 1, t) != MET_FACE)
+        return false;
+    uint4 face = load_coherent(at + STACK_FACE_WORD);
+    return face.w != MATERIAL_NONE && abs(dot(asfloat(face.xyz), oct_decode_snorm16(b.z))) >= STACK_PARALLEL;
 }
 
 // What the thin walls along `ray`, the shadow ray of `slot`'s path in hot words `at` with flags
@@ -629,6 +824,18 @@ uint run_path<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint next)
         // A hit past a walk takes it as walked, but where a walk leaves.
         if (trail.walked && (p.words.x & PAYLOAD_EXIT) == 0)
             p.words.x |= PAYLOAD_WALKED;
+        // The second word tells a hit's shader its vertex's re-run apart (`PAYLOAD_BENT`), and a
+        // miss whose ray crossed plane stack faces whether its light through them is next-event
+        // estimation's, which a probe from the vertex before them says.
+        if (may(MAY_STACK))
+        {
+            p.words.y = 0;
+            if (!walked && h.miss() && stack_miss(r, slot, at, p))
+            {
+                trail.chain = false;
+                continue;
+            }
+        }
         bool hit;
         bool layer;
         if (walked)
@@ -792,6 +999,12 @@ public void lean_updates(PathRoot r)
         Payload p;
         bool invokes;
         trace_ray<false>(r, slot, at, w0, trail, h, p, invokes);
+        if (may(MAY_STACK))
+        {
+            p.words.y = 0;
+            if (h.miss() && stack_miss(r, slot, at, p))
+                continue;
+        }
         reorder_invoke(h, p);
         if (h.hit() && p.words.x != 0)
             end_path(at);

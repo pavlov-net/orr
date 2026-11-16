@@ -10,8 +10,8 @@ use lighting_suite::bed::{
     SKY, SMOOTH_FLOOR, SUN, Spec, StrandRow, TILED_FLOOR, TINTED_FLOOR, TRANSLUCENT_SHEET, TROUGH,
     WATER_BOX, WHITE_FLOOR, assert_close, assert_pipeline_renders_as_staged,
     assert_pipeline_within_noise, assert_within_noise, both, glass_scene, image_mean, light_bed,
-    luminance, mean_where, particle_bed, pixel_of, plane_stack_spec, plume_bed, reference,
-    render_paths, surface_mean,
+    luminance, mean_where, particle_bed, pixel_of, plane_stack_spec, plume_bed, producer_stack_bed,
+    reference, render_paths, surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
@@ -405,6 +405,35 @@ fn the_pipeline_renders_plane_stacks_and_coated_emitters_as_the_staged_loop_does
     bed.set_pre_exposure(1.0 / 64.0);
     let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
     assert_pipeline_renders_as_staged("slab and coated emitter", &mut bed, &staged, &launched);
+    assert_clean();
+}
+
+/// A plane stack that a producer entry shows lights the floor under it through the pipelines made
+/// for exactly what the scene may meet as the same stack on a copy does: the entry's glass, whose
+/// material bounds an interior, ends a shadow ray and is solid to the stack's probe, and its faces
+/// are flat, so the sun's light through both of them fills the slab's shadow by next-event
+/// estimation and BSDF rays leave it to it.
+#[test]
+fn a_plane_stack_on_a_producer_entry_lights_the_floor_as_one_on_a_copy() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    let mut launched = Paths::exactly(
+        &KernelSet::default(),
+        PathEntry::Pipeline,
+        ViewLighting::default(),
+    );
+    launched.specialize = true;
+    let mut copy = Bed::with(plane_stack_spec(false));
+    let mut producer = producer_stack_bed();
+    for bed in [&mut copy, &mut producer] {
+        bed.set_pre_exposure(1.0 / 64.0);
+        render_paths(bed, &launched, 32, 3);
+    }
+    let shown = render_paths(&mut producer, &launched, 32, 1);
+    let same_seed = render_paths(&mut copy, &launched, 32, 1);
+    let noise = render_paths(&mut copy, &launched, 32, 2);
+    assert_within_noise("producer slab", &shown, &same_seed, &noise, 1.25);
     assert_clean();
 }
 

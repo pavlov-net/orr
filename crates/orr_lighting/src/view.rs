@@ -2527,13 +2527,21 @@ impl LightingKernels {
         // Paths that may meet a layer keep the interiors they lie in, and paths that may walk the
         // walk a vertex starts.
         let cold = may & (MAY_LAYERS | MAY_INTERIORS | MAY_WALK) != 0;
+        // Paths that may meet a plane stack keep the walk of a shadow job through one.
+        let stack = may & MAY_STACK != 0;
         if !view
             .launched
             .as_ref()
-            .is_some_and(|m| m.fits(pixels, update, cold))
+            .is_some_and(|m| m.fits(pixels, update, cold, stack))
         {
             view.launched = None;
-            view.launched = Some(LaunchMemory::new(&view.device, pixels, update, cold)?);
+            view.launched = Some(LaunchMemory::new(
+                &view.device,
+                pixels,
+                update,
+                cold,
+                stack,
+            )?);
         }
         let memory = view.launched.as_ref().expect("made above");
         list.begin_pass(

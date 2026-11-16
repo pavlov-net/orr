@@ -34,6 +34,49 @@ public static const uint LEAN_FROM_WORD = 18;
 // surface's draw there.
 public static const uint LEAN_INTO_WORD = LEAN_EXIT_WORD;
 [Host] public static const uint LEAN_HOT_BYTES = 16 * LEAN_HOT_WORDS;
+// The words a path keeps where the pipeline may meet a plane stack, apart from its cold ones: the
+// interior list a directional job's walk through a stack works on, which the vertex that left the
+// job gives where the job lies in an interior (`STACK_LIST_WORD`, as the cold list holds one); the
+// walk's leg, from its origin along its direction (`STACK_LEG_WORD`), the point its segment
+// starts from with the stack's normal (`STACK_FROM_WORD`), what the walk let through so far with
+// the ratio of the faces' cosines (`STACK_THROUGH_WORD`), and the light's direction at the vertex
+// and its density there (`STACK_BEND_WORD`); the face a stack ray met, as its hit's shader answers for it
+// (`STACK_FACE_WORD`, two words); what weighs the job's light again where the stack bends it, as
+// the vertex that left the job keeps it (`STACK_BENT_WORD`, four words); and where a path's ray
+// crossed stack faces since its vertex last scattered, that vertex's ray (`STACK_TRACK_WORD`, two
+// words).
+[Host] public static const uint LEAN_STACK_WORDS = 17;
+public static const uint STACK_LIST_WORD = 0;
+public static const uint STACK_LEG_WORD = 5;
+public static const uint STACK_FROM_WORD = 6;
+public static const uint STACK_THROUGH_WORD = 7;
+public static const uint STACK_BEND_WORD = 8;
+public static const uint STACK_FACE_WORD = 9;
+public static const uint STACK_BENT_WORD = 11;
+public static const uint STACK_TRACK_WORD = 15;
+// The last lane of the walk's segment start where the job's list is the path's cold list, which
+// the walk copies, or that list out of the interior a walk of the path's goes through, whose
+// material its walk words keep: a meeting's job lies outside it.
+public static const uint STACK_COLD_LIST = 1;
+public static const uint STACK_COLD_OUT = 2;
+// The light word (NO_LIGHT less one) of a directional job whose ray starts inside an interior,
+// whose medium its light leaves out: the walk through a plane stack takes it, from the list the
+// vertex gave.
+public static const uint STACK_JOB_LIGHT = 0xfffffffeu;
+// The density word of a ray that crossed plane stack faces by ideal transmission since its vertex
+// last scattered, which the stack words keep: it weighs the lights it meets as 0 does, and a
+// directional light's disc against next-event estimation at that vertex where the stack's probe
+// from there owns it.
+public static const float PDF_STACK = -2.0;
+// What the vertex that left a bent job was, which its re-run takes: a ray's hit, the G-buffer's
+// surface, where a subsurface walk leaves, or a point in an interior's medium.
+public static const uint BENT_HIT = 0;
+public static const uint BENT_FIRST = 1;
+public static const uint BENT_EXIT = 2;
+public static const uint BENT_MEDIUM = 3;
+// The second payload word of a vertex's re-run that weighs its bent job's light, which a hit's
+// invoke otherwise leaves 0.
+public static const uint PAYLOAD_BENT = 1;
 // What a raygen keeps across a trace or an invoke, bytes: the driver's stack size of the raygen
 // beyond its hit object.
 [Host] public static const uint RAYGEN_LIVE_BYTES = 32;
@@ -63,6 +106,20 @@ public static const uint LEAN_INTO_WORD = LEAN_EXIT_WORD;
 // that a rough way out weighs by the walk's last scatter, with that way's draw, 1,300; the IOR
 // outside a meeting's shadow job 100.
 [Host] public static const uint MEDIUM_VERTEX_INSTRUCTIONS = 15100;
+// What a raygen holds more where its paths may meet a plane stack: the shadow job's trace into a
+// hit object, the probe and legs of a directional job's walk through a stack, the re-run of the
+// vertex its bent light is weighed at and the probe that decides whose a ray's light through a
+// stack is.
+[Host] public static const uint RAYGEN_STACK_INSTRUCTIONS = 2500;
+// The callable of a step of that walk: the light's bend at the vertex, and per leg the medium,
+// the crossing of the face it ends at and its Fresnel.
+[Host] public static const uint STACK_STEP_INSTRUCTIONS = 5000;
+// What a stage that runs a vertex holds more there: its re-run, which weighs its directional job's
+// light through the stack along the bent direction, and what the job leaves the walk; and in a
+// layer's stage the stack question's answer and the track of a ray its ideal transmission passes
+// on across a stack face.
+[Host] public static const uint STACK_VERTEX_INSTRUCTIONS = 500;
+[Host] public static const uint STACK_LAYER_INSTRUCTIONS = 1000;
 // The callable of the vertex where a subsurface walk leaves.
 [Host] public static const uint WALK_EXIT_INSTRUCTIONS = 17000;
 // The callable that weighs a coated emitter's light by what its coat and fuzz pass toward a
@@ -144,6 +201,8 @@ public static const uint MEDIUM_WALKS = 2;
 public static const uint MEDIUM_CAPPED = 3;
 public static const uint MEDIUM_MEETS = 4;
 public static const uint MEDIUM_LEAVES_ROUGH = 5;
+// With one of those, the vertex's re-run that weighs its bent job's light.
+public static const uint MEDIUM_BENT = 1 << 8;
 // The density word of a ray whose vertex's next-event estimation took the lights it meets, which
 // it meets for nothing: a walk's way out in real time.
 public static const float PDF_LIT = -1.0;

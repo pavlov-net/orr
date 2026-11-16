@@ -146,7 +146,10 @@ void write_records(SceneRoot* s, uint run)
         attributes = (g.word >> ROW_ATTRIBUTES_SHIFT) & 0xff;
     }
     uint pin = material_pin(s, material);
-    HitData data = hit_data(s, material, class_id, (g.word & ROW_SOLID) != 0, attributes);
+    // A copy's section is solid glass as it cooked; a producer entry's glass is solid where its
+    // material bounds an interior, as its shadow rays take it.
+    bool solid = kind == ROW_PRODUCER ? class_id == CLASS_DIELECTRIC && crosses_interior(s, material) : (g.word & ROW_SOLID) != 0;
+    HitData data = hit_data(s, material, class_id, solid, attributes);
     if (path != KIND_STRAND_PATH)
     {
         bool producer = path == KIND_PRODUCER_PATH;

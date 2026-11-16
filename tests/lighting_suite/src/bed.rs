@@ -40,7 +40,9 @@ use orr_scene::{
 };
 use orr_shaders::bytemuck::Zeroable;
 
-use crate::shaders::{accumulate, exposure, flat_color, guide_read, particle_quads, strands};
+use crate::shaders::{
+    accumulate, exposure, flat_color, guide_read, particle_quads, slab_producer, strands,
+};
 use crate::{
     ScenePermit, TestTexture, Workers, device, linear_clamp, pipeline, read, render, texture,
     upload,
@@ -2645,6 +2647,67 @@ impl Bed {
         }));
     }
 
+    /// Makes the bed's producer entry a box of `material` with half extents `half` around
+    /// `center`, six flat faces traced as glass, which each frame's scene compute emits; in place
+    /// of particles and of a hook of [`Self::set_scene_compute`].
+    pub fn set_producer_slab(&mut self, center: Vec3, half: Vec3, material: MaterialId) {
+        self.frame += 1;
+        let list = [self.scene];
+        let f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        let triangles: Vec<[u8; 3]> = (0..6u8)
+            .flat_map(|face| {
+                let k = 4 * face;
+                [[k, k + 1, k + 2], [k, k + 2, k + 3]]
+            })
+            .collect();
+        let topology = [ClusterTopology {
+            vertex_count: 24,
+            triangles: &triangles,
+        }];
+        {
+            let mut w = f.scene(self.scene).unwrap();
+            w.transforms(self.particle_group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
+            w.set_producer(
+                PARTICLES,
+                Some(&ProducerDesc {
+                    max_clusters: 1,
+                    max_vertices: 24,
+                    update: ProducerUpdate::EveryFrame,
+                    topologies: &topology,
+                    materials: &[material],
+                    transform: (self.particle_group, 0),
+                    opacity: Opacity::Dielectric,
+                    ..ProducerDesc::default()
+                }),
+            )
+            .unwrap();
+        }
+        let point = f.end(&[]).unwrap();
+        render()
+            .wait_while_completing(point, Duration::from_secs(10))
+            .unwrap();
+        let emit = pipeline(&slab_producer::MODULE, "main");
+        self.scene_compute = Some(Box::new(move |c| {
+            let root = c
+                .put_root(&slab_producer::Root {
+                    scene: c.root,
+                    producer: c.producer_entry(PARTICLES).unwrap(),
+                    _pad0: 0,
+                    center: [center.x, center.y, center.z, 0.0],
+                    half: [half.x, half.y, half.z, 0.0],
+                })
+                .unwrap();
+            c.cmd.dispatch(&emit, root, [1, 1, 1]);
+        }));
+    }
+
     /// Runs `frames` frames of the scene, each recording `kernel` after the scene pass and
     /// adding the radiance it wrote, and returns the mean. A frame's index and `seed`
     /// choose its samples, except the light tiles', which follow the scene's frame id. That
@@ -3325,6 +3388,21 @@ pub fn plane_stack_spec(emitter: bool) -> Spec {
         fov_y: 0.8,
         focus: None,
     }
+}
+
+/// [`plane_stack_spec`] without its emitter, whose slab a producer entry shows: the same box of
+/// the slab's material, at the same place.
+pub fn producer_stack_bed() -> Bed {
+    let mut spec = plane_stack_spec(false);
+    spec.copies.retain(|c| c.model != TINTED_SLAB);
+    let mut bed = Bed::with(spec);
+    let slab = bed.material(TINTED_SLAB);
+    bed.set_producer_slab(
+        Vec3::new(0.0, 0.8, 0.0),
+        Vec3::new(0.8, SLAB_THICKNESS * 0.5, 0.5),
+        slab,
+    );
+    bed
 }
 
 /// Code a path pipeline holds only behind bits of `specialize.slang`, and a scene whose paths run
