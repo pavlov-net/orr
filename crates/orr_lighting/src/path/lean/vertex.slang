@@ -764,13 +764,14 @@ void store_walk(PathRoot r, uint4* cold, PathVertex x, float3 wi, bool gbuffer, 
 }
 
 // Stores walk `e`, which has taken no step, in a path's cold words `cold`, with what it stays in,
-// `owner`: a copy for a subsurface walk, an interior's material for one through its medium.
+// `owner`: a copy for a subsurface walk, an interior's material for one through its medium. Its
+// sampler goes on from the dimension it reached: an interior's walk drew its first direction.
 public void store_walk_words(uint4* cold, Walk e, uint owner)
 {
     store_coherent(cold + LEAN_WALK_WORD, uint4(asuint(e.origin), owner));
     store_coherent(cold + LEAN_WALK_WORD + 1, asuint(float4(e.volume.extinction, e.volume.anisotropy)));
     store_coherent(cold + LEAN_WALK_WORD + 2, uint4(asuint(e.volume.albedo), asuint(e.ior)));
-    store_coherent(cold + LEAN_WALK_WORD + 3, uint4(e.rng.seed, oct_encode_snorm16(e.dir), 0, 0));
+    store_coherent(cold + LEAN_WALK_WORD + 3, uint4(e.rng.seed, oct_encode_snorm16(e.dir), e.rng.dimension, 0));
 }
 
 // The walk a path's cold words `cold` hold, as `store_walk_words` left it, with the frame's
@@ -789,7 +790,7 @@ public Walk load_walk(uint4* cold, uint frame, out uint owner)
     Sampler rng;
     rng.index = frame;
     rng.seed = d.x;
-    rng.dimension = 0;
+    rng.dimension = d.z;
     return walk_start(asfloat(a.xyz), oct_decode_snorm16(d.y), volume, c.w, rng);
 }
 
