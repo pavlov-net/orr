@@ -2289,6 +2289,52 @@ public bool lean_front<M : IMedium>(PathRoot r, uint slot, float t, uint mask, b
     return carries(throughput);
 }
 
+// What the medium proxies with a volume along a shadow ray from `origin` up to `t_max` let through,
+// each by its march (`proxy_volume`); a proxy without one took Beer's law in the ray's any-hit.
+struct ProxyVolumes : ICandidate
+{
+    SceneRoot* scene;
+    float3 origin;
+    float t_max;
+
+    bool positions(Candidate c)
+    {
+        return false;
+    }
+
+    [mutating]
+    float3 transmittance(Candidate c, out bool counted)
+    {
+        counted = false;
+        float3 beer;
+        MediumProxyGpu p;
+        float t0, t1;
+        if (c.triangle || proxy_unmarched(scene, c, t_max, beer, p, t0, t1))
+            return float3(1.0);
+        return proxy_volume(scene, p, c.instance_index, c.primitive_index, origin, c.object_origin, c.object_direction, t0, t1);
+    }
+}
+
+// What a shadow ray hands the callable that marches the medium proxies with a volume it passed
+// (SHADOW_VOLUME): its origin and reach, and its unit direction. The callable hands back what they
+// let through in the first word.
+public struct ProxyMarch
+{
+    public uint4 ray;
+    public uint4 dir;
+}
+
+// That callable's body: the marches of the proxies along the ray, by a ray query over them alone.
+public void lean_proxy_march(PathRoot r, inout ProxyMarch m)
+{
+    float3 origin = asfloat(m.ray.xyz);
+    float t_max = asfloat(m.ray.w);
+    ProxyVolumes v = { r.scene, origin, t_max };
+    bool overflow;
+    float3 through = trace_transmittance(scene_traced(r.scene), path_ray(origin, asfloat(m.dir.xyz), t_max), MASK_MEDIUM, RAY_FLAG_NONE, v, 0, overflow);
+    m.ray.xyz = asuint(through);
+}
+
 // What `slot`'s shadow ray that met nothing adds: `added`, its job's light times what the
 // candidates along it let through.
 public void lean_shadow_add(PathRoot r, uint slot, float3 added)

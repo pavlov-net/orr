@@ -19,16 +19,18 @@ use crate::shaders::consts::{
     EMITTER_VIEW_INSTRUCTIONS, FRONT_INSTRUCTIONS, HIT_INSTRUCTIONS, INTERIOR_HIT_INSTRUCTIONS,
     LAYER_HIT_INSTRUCTIONS, MEDIUM_VERTEX_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE,
     PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
-    PRODUCER_HIT_INSTRUCTIONS, RAYGEN_FRONT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
-    RAYGEN_LAYER_INSTRUCTIONS, RAYGEN_STACK_INSTRUCTIONS, RAYGEN_WALK_INSTRUCTIONS,
-    RICH_HIT_INSTRUCTIONS, STACK_LAYER_INSTRUCTIONS, STACK_STEP_INSTRUCTIONS,
-    STACK_VERTEX_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS, WALK_EXIT_INSTRUCTIONS,
-    WALK_HIT_INSTRUCTIONS,
+    PRODUCER_HIT_INSTRUCTIONS, PROXY_ANY_HIT_INSTRUCTIONS, PROXY_INTERSECTION_INSTRUCTIONS,
+    PROXY_MARCH_INSTRUCTIONS, RAYGEN_FRONT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
+    RAYGEN_LAYER_INSTRUCTIONS, RAYGEN_PROXY_INSTRUCTIONS, RAYGEN_STACK_INSTRUCTIONS,
+    RAYGEN_WALK_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS, STACK_LAYER_INSTRUCTIONS,
+    STACK_STEP_INSTRUCTIONS, STACK_VERTEX_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
+    WALK_EXIT_INSTRUCTIONS, WALK_HIT_INSTRUCTIONS,
 };
 use crate::shaders::path::{lean_layer, lean_paths, lean_rich, lean_walk};
 use crate::staged::{
     MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_INTERIORS, MAY_LAYERS, MAY_LOBES, MAY_LOCAL_LIGHTS,
-    MAY_PARTICLES, MAY_SCATTERING, MAY_STACK, MAY_TRACED, MAY_UPDATE, MAY_VIEW, MAY_WALK,
+    MAY_PARTICLES, MAY_PROXIES, MAY_SCATTERING, MAY_STACK, MAY_TRACED, MAY_UPDATE, MAY_VIEW,
+    MAY_WALK,
 };
 use crate::{Error, KernelSet, module};
 
@@ -58,6 +60,11 @@ pub enum Role {
     /// The callable that takes what a path's ray meets in front of its hit: particles and the
     /// proxies of sphere and rect lights.
     Front,
+    /// A medium proxy's intersection shader under a shadow ray, its any-hit there, and the
+    /// callable of the marches of those with a volume that the ray passed.
+    ProxyBox,
+    ProxyAnyHit,
+    ProxyMarch,
 }
 
 /// The most instructions the stages of a pipeline may hand the driver together.
@@ -183,12 +190,18 @@ impl Spec {
                 let layers = self.may & MAY_LAYERS != 0;
                 let walks = self.may & (MAY_SCATTERING | MAY_WALK) != 0;
                 let front = self.may & (MAY_PARTICLES | MAY_LOCAL_LIGHTS) != 0;
+                let proxies = self.may & MAY_PROXIES != 0;
                 return Some(
                     RAYGEN_INSTRUCTIONS
                         + if layers { RAYGEN_LAYER_INSTRUCTIONS } else { 0 }
                         + if walks { RAYGEN_WALK_INSTRUCTIONS } else { 0 }
                         + if stacks { RAYGEN_STACK_INSTRUCTIONS } else { 0 }
-                        + if front { RAYGEN_FRONT_INSTRUCTIONS } else { 0 },
+                        + if front { RAYGEN_FRONT_INSTRUCTIONS } else { 0 }
+                        + if proxies {
+                            RAYGEN_PROXY_INSTRUCTIONS
+                        } else {
+                            0
+                        },
                 );
             }
             Role::Miss => return Some(MISS_INSTRUCTIONS),
@@ -197,6 +210,9 @@ impl Spec {
             Role::View => return Some(EMITTER_VIEW_INSTRUCTIONS),
             Role::Stack => return Some(STACK_STEP_INSTRUCTIONS),
             Role::Front => return Some(FRONT_INSTRUCTIONS),
+            Role::ProxyBox => return Some(PROXY_INTERSECTION_INSTRUCTIONS),
+            Role::ProxyAnyHit => return Some(PROXY_ANY_HIT_INSTRUCTIONS),
+            Role::ProxyMarch => return Some(PROXY_MARCH_INSTRUCTIONS),
             Role::Hit => (HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS),
             Role::AnyHit => (ANY_HIT_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS),
         };
@@ -313,6 +329,9 @@ struct Table {
     /// The callable that takes what a path's ray meets in front of its hit, where the paths may
     /// meet particles or sphere and rect lights.
     front: Option<u32>,
+    /// The callable that marches the medium proxies with a volume a shadow ray passed, where the
+    /// scene may hold medium proxies.
+    proxy_march: Option<u32>,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
 }
@@ -420,6 +439,9 @@ impl Table {
             .then(|| Self::stage(&mut specs, folded("stack_step", Role::Stack)));
         let front = (may & (MAY_PARTICLES | MAY_LOCAL_LIGHTS) != 0)
             .then(|| Self::stage(&mut specs, folded("front", Role::Front)));
+        let proxies = may & MAY_PROXIES != 0;
+        let proxy_march =
+            proxies.then(|| Self::stage(&mut specs, folded("volume_march", Role::ProxyMarch)));
         // `hit_surface` of the hit shaders of each pin: any id, then each id from 0 on. Where
         // no surface links every material shows id 0.
         let pinned = |entry, role, pin: u32, geometry: Geometry| Spec {
@@ -650,6 +672,21 @@ impl Table {
                 });
             }
         }
+        // A medium proxy is a box under shadow rays alone.
+        if proxies {
+            groups.medium_shadow = Some(hit_groups.len() as u32);
+            hit_groups.push(HitGroup {
+                closest_hit: None,
+                any_hit: Some(Self::stage(
+                    &mut specs,
+                    folded("proxy_shadow_hit", Role::ProxyAnyHit),
+                )),
+                intersection: Some(Self::stage(
+                    &mut specs,
+                    folded("box_medium_hit", Role::ProxyBox),
+                )),
+            });
+        }
         Self {
             specs,
             raygens,
@@ -662,6 +699,7 @@ impl Table {
             emitter_view,
             stack_step,
             front,
+            proxy_march,
             hit_groups,
             groups,
         }
@@ -868,6 +906,7 @@ impl PathPipeline {
                 table.emitter_view.map(ShaderRecord::new),
                 table.stack_step.map(ShaderRecord::new),
                 table.front.map(ShaderRecord::new),
+                table.proxy_march.map(ShaderRecord::new),
             ],
             max_recursion: 1,
             flags: RayPipelineFlags::scene(device.caps()),

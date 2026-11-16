@@ -118,6 +118,16 @@ public static const uint PAYLOAD_BENT = 1;
 // each particle's look resolved and each one's light weighed against next-event estimation at the
 // vertex the ray left, and inside a scattering medium the free flight that ends the ray.
 [Host] public static const uint FRONT_INSTRUCTIONS = 15500;
+// What a raygen holds more where the scene may hold medium proxies: the call that marches those
+// with a volume that a shadow ray passed, after the job's ray and after a leg of a plane stack's
+// walk.
+[Host] public static const uint RAYGEN_PROXY_INSTRUCTIONS = 200;
+// A medium proxy under a shadow ray: its box's intersection shader, the any-hit that takes Beer's
+// law over the span or marks a proxy with a volume, and the callable of the marches of those with
+// a volume, a ray query over the proxies alone.
+[Host] public static const uint PROXY_INTERSECTION_INSTRUCTIONS = 100;
+[Host] public static const uint PROXY_ANY_HIT_INSTRUCTIONS = 200;
+[Host] public static const uint PROXY_MARCH_INSTRUCTIONS = 2000;
 // What a stage that runs a vertex holds more there: its re-run, which weighs its directional job's
 // light through the stack along the bent direction, and what the job leaves the walk; and in a
 // layer's stage the stack question's answer and the track of a ray its ideal transmission passes

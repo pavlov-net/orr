@@ -52,6 +52,9 @@ public static const uint CALL_STACK = 6;
 // The callable that takes what a path's ray meets in front of its hit, which a pipeline whose paths
 // may meet particles or sphere and rect lights holds.
 public static const uint CALL_FRONT = 7;
+// The callable that marches the medium proxies with a volume a shadow ray passed, which a pipeline
+// whose scene may hold medium proxies holds.
+public static const uint CALL_PROXY_MARCH = 8;
 
 // Whether `pixel` lies on a tile whose layers the layer guides traced, which a camera ray meets
 // before the G-buffer's surface.
@@ -185,7 +188,20 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior)
     // Thin walls the ray passed let through what they pass straight, walked one after the other.
     if (may2(MAY2_THIN_DIELECTRICS) && ShadowCover.of_words(p.words).has(SHADOW_CROSSES) && any(passed > 0.0))
         passed *= cross_walls(r, slot, at, flags, ray, exterior);
+    if (may(MAY_PROXIES) && ShadowCover.of_words(p.words).has(SHADOW_VOLUME) && any(passed > 0.0))
+        passed *= march_proxies(ray);
     lean_shadow_add(r, slot, passed);
+}
+
+// What the medium proxies with a volume that shadow ray `ray` passed let through, by their marches
+// in a callable.
+float3 march_proxies(RayDesc ray)
+{
+    ProxyMarch m;
+    m.ray = uint4(asuint(ray.Origin), asuint(ray.TMax));
+    m.dir = uint4(asuint(ray.Direction), 0);
+    call(CALL_PROXY_MARCH, m);
+    return asfloat(m.ray.xyz);
 }
 
 // The walk of `slot`'s directional job in hot words `at`, whose ray ended at solid glass short of
@@ -248,6 +264,8 @@ void stack_walk(PathRoot r, uint slot, uint4* at, uint word, float exterior, flo
             // the other.
             if (may2(MAY2_THIN_DIELECTRICS) && ShadowCover.of_words(p.words).has(SHADOW_CROSSES) && any(passed > 0.0))
                 passed *= cross_walls(r, slot, at, flags, ray, walls);
+            if (may(MAY_PROXIES) && ShadowCover.of_words(p.words).has(SHADOW_VOLUME) && any(passed > 0.0))
+                passed *= march_proxies(ray);
             through *= passed;
             if (!any(through > 0.0))
                 return;

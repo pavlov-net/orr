@@ -2,9 +2,10 @@
 // paths, the callable of a path's first vertex and the one of a debug view of it alone, the ones
 // that start a path in the interiors around the eye and run its vertex in an interior's medium,
 // the one of a step of a directional job's walk through a plane stack, the one that takes what a
-// path's ray meets in front of its hit, the hit shaders of a plain opaque surface and of a strand,
-// the any-hit shaders of a path's ray and of its shadow ray at a candidate that is not opaque, and
-// the miss shaders of the two.
+// path's ray meets in front of its hit and the one that marches the medium proxies with a volume a
+// shadow ray passed, the hit shaders of a plain opaque surface and of a strand, the any-hit shaders
+// of a path's ray and of its shadow ray at a candidate that is not opaque, a medium proxy's
+// intersection and any-hit shaders under a shadow ray, and the miss shaders of the two.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_shaders.trace;
@@ -97,6 +98,13 @@ void front(inout Payload p)
 }
 
 [shader("callable")]
+void volume_march(inout ProxyMarch m)
+{
+    ORR_OMM(volume_march);
+    lean_proxy_march(root, m);
+}
+
+[shader("callable")]
 void first_view(inout Payload p)
 {
     ORR_OMM(first_view);
@@ -117,6 +125,24 @@ void shadow_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
     ORR_OMM(shadow_hit);
     TriangleHit h = { a };
     any_hit_decides(shadow_any_hit<CoverageFeedback<Surface>>(root.scene, root.view, p.words, data, h));
+}
+
+// A medium proxy under a shadow ray: its box reports the ray's span inside it, at the span's start,
+// and the any-hit takes Beer's law over the span, or marks a proxy with a volume for its march.
+[shader("intersection")]
+void box_medium_hit()
+{
+    ORR_OMM(box_medium_hit);
+    float2 span = box_medium(ObjectRayOrigin(), ObjectRayDirection(), RayTCurrent());
+    SpanAttributes a = { span };
+    ReportHit(clamp(span.x, RayTMin(), RayTCurrent()), 0, a);
+}
+
+[shader("anyhit")]
+void proxy_shadow_hit(inout Payload p, SpanAttributes a)
+{
+    ORR_OMM(proxy_shadow_hit);
+    any_hit_decides(proxy_any_hit(root.scene, p.words, InstanceIndex(), a.span));
 }
 
 [shader("miss")]
