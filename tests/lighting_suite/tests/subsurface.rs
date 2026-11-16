@@ -7,7 +7,7 @@ use lighting_suite::bed::{
     Accumulated, Bed, DenseInterior, EXTENT, FURNACE_RADIANCE, GLASS_PANE, Item, JADE, JADE_SLAB,
     JADE_SLAB_THICKNESS, JADE_SPHERE, MILK, MILK_SPHERE, PANE_IOR, Paths, ROUGH_GLASS_SPHERE,
     ROUGH_JADE_ROUGHNESS, ROUGH_JADE_SPHERE, Spec, VERY_ROUGH_JADE_ROUGHNESS,
-    VERY_ROUGH_JADE_SPHERE, WALK_FURNACE, WALK_SLABS, WALK_SPHERE, look,
+    VERY_ROUGH_JADE_SPHERE, WALK_FURNACE, WALK_SLABS, WALK_SPHERE, assert_within_noise, look,
 };
 use lighting_suite::shaders::walk_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
@@ -244,9 +244,14 @@ const PRE_EXPOSURE: f32 = 1.0 / 64.0;
 /// `spec` through `paths`, accumulated over `frames`, in radiance before pre-exposure. The
 /// reference ends a path whose walk reaches its step cap, so none may.
 fn render_spec(paths: &Paths, spec: Spec, frames: u32) -> Accumulated {
+    render_spec_at(paths, spec, frames, 5)
+}
+
+/// [`render_spec`] from seed `seed`.
+fn render_spec_at(paths: &Paths, spec: Spec, frames: u32, seed: u32) -> Accumulated {
     let mut bed = Bed::with(spec);
     bed.set_pre_exposure(PRE_EXPOSURE);
-    let mut image = bed.accumulate(frames, 5, &mut |list, f| paths.record(list, f));
+    let mut image = bed.accumulate(frames, seed, &mut |list, f| paths.record(list, f));
     for texel in &mut image.mean {
         for c in &mut texel[..3] {
             *c /= PRE_EXPOSURE;
@@ -773,28 +778,14 @@ fn specialized_pipelines_trace_the_paths_the_general_ones_do() {
         };
         paths.specialize = false;
         let general = render_spec(&paths, spec.clone(), 4);
+        let noise = render_spec_at(&paths, spec.clone(), 4, 6);
         paths.specialize = true;
         let specialized = render_spec(&paths, spec, 4);
-        // Each body that shades a vertex prepares its BSDF anew, and the driver may round those
-        // copies apart in two specializations: a path can drift by its last bits, where a feature
-        // a mask left out would change its light.
-        let drift = general
-            .mean
-            .iter()
-            .zip(&specialized.mean)
-            .flat_map(|(a, b)| a.iter().zip(b))
-            .map(|(a, b)| {
-                if a.to_bits() == b.to_bits() {
-                    return 0.0;
-                }
-                let d = (a - b).abs() / a.abs().max(b.abs()).max(f32::MIN_POSITIVE);
-                if d.is_nan() { f32::INFINITY } else { d }
-            })
-            .fold(0.0f32, f32::max);
-        assert!(
-            drift <= 1e-3,
-            "{model}: the specialized pipelines changed the image by {drift} of a channel"
-        );
+        // Each body that shades a vertex prepares its BSDF anew, and the driver need not round
+        // those copies alike in two specializations: a path can drift by its last bits and, at a
+        // draw near a threshold, go elsewhere, so the images agree up to sampling noise. A
+        // feature a mask left out changes its light past the noise between seeds.
+        assert_within_noise(model, &specialized, &general, &noise, 1.25);
     }
     assert_clean();
 }
