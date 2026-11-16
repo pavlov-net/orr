@@ -227,6 +227,21 @@ public bool lean_eye_interior<S : ISurfaces>(PathRoot r, uint slot, bool behind)
     return carries;
 }
 
+// Starts `slot`'s path in the interiors at the point of a thin lens its camera ray leaves, its hot
+// origin (`lens_interior`): its cold words empty but for them, and its hot words saying it lies in
+// one. The callable a thin lens's path starts with where the pipeline's paths may lie in one.
+public void lean_lens_interior<S : ISurfaces>(PathRoot r, uint slot)
+{
+    uint4* cold = lean_cold(r, slot);
+    uint4* at = lean_hot(r, slot);
+    store_coherent(cold + 1 + INTERIOR_ENTRIES, uint4(0));
+    uint4 w0 = load_coherent(at);
+    Interior interior = lens_interior<S>(r, asfloat(w0.xyz));
+    store_interior(r.scene, cold, interior);
+    if (interior.count > 0)
+        store_coherent(at, uint4(w0.xyz, w0.w | (has_froxels(r) ? HOT_INTERIOR_HELD : HOT_INTERIOR)));
+}
+
 // A vertex's light lies in the interior the path does, which its cold words list.
 static const uint PATH_MEDIUM = MATERIAL_NONE - 1;
 
@@ -727,7 +742,7 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
             w0 = load_coherent(lean_stack(r, slot) + STACK_BENT_WORD);
     }
     uint flags = w0.w;
-    bool first = FIRST == 1 || (FIRST == 2 && may_any(MAY_TRACED | MAY_LAYERS) && (flags & HOT_CAMERA) != 0);
+    bool first = FIRST == 1 || (FIRST == 2 && may_any(MAY_TRACED | MAY_LAYERS | MAY_LENS | MAY_BACKGROUND) && (flags & HOT_CAMERA) != 0);
     // Whether light along the ray counts, as the vertex it left had it.
     bool along = (flags & HOT_COUNTED) != 0;
     bool was_diffuse = (flags & HOT_DIFFUSE) != 0;
@@ -740,9 +755,11 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
             throughput = float3(1.0);
     }
     // A traced camera ray's path runs on the view's share of pixels, as one that starts on the
-    // G-buffer's surface does. One that looks for layers in front of the G-buffer's surface
-    // runs on the share its raygen gave it.
-    if (FIRST == 2 && first && traces_primary(r))
+    // G-buffer's surface does, and so does a thin lens's at an opaque surface outside every
+    // interior. One that looks for layers in front of the G-buffer's surface runs on the share its
+    // raygen gave it.
+    bool lens = may_any(MAY_LENS | MAY_BACKGROUND) && !LAYER && (thin_lens(r) || from_background(r)) && (flags & HOT_INTERIOR) == 0;
+    if (FIRST == 2 && first && (traces_primary(r) || lens))
     {
         if (!runs_path(r, pixel))
         {
