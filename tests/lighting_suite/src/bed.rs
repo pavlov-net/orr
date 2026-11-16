@@ -536,6 +536,11 @@ pub const JADE_SPHERE: &str = "jade sphere";
 /// [`ROUGH_JADE_ROUGHNESS`].
 pub const ROUGH_JADE_SPHERE: &str = "rough jade sphere";
 pub const ROUGH_JADE_ROUGHNESS: f32 = 0.35;
+/// A smooth slab of [`JADE`] 20 m square and [`JADE_SLAB_THICKNESS`] thick, its top face at
+/// y = 0: wide enough that the walks in it leave through its faces.
+pub const JADE_SLAB: &str = "jade slab";
+/// About 0.3 m, on the cook's 2^-11 m position grid.
+pub const JADE_SLAB_THICKNESS: f32 = 614.0 / 2048.0;
 /// Green, absorbing and nearly isotropic, a few mean free paths to the radius.
 pub const JADE: DenseInterior = DenseInterior {
     sigma_t: [8.0, 4.0, 6.0],
@@ -1476,6 +1481,16 @@ fn cook() -> Arc<[u8]> {
                 model(
                     JADE_SPHERE,
                     mesh(|b| b.sphere(0, 48, 1.0)),
+                    vec![JADE.material(glass)],
+                ),
+                model(
+                    JADE_SLAB,
+                    mesh(|b| {
+                        b.cuboid(0, Vec3::new(10.0, 0.5 * JADE_SLAB_THICKNESS, 10.0));
+                        for p in &mut b.positions {
+                            p.y -= 0.5 * JADE_SLAB_THICKNESS;
+                        }
+                    }),
                     vec![JADE.material(glass)],
                 ),
                 model(

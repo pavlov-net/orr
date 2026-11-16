@@ -967,6 +967,11 @@ bool roulette_survives(PathRoot r, uint opaque, float u, inout float3 throughput
 // outward normal `n`, `eta` times the IOR outside, its way out (`InteriorExitScatter`), whose rays
 // take the environment's light themselves; or, `rough`, where a walk meets or leaves through a
 // rough surface, the surface's transmission out of the medium (`InteriorRoughTransmission`).
+// Where the walk's last step reached a smooth surface along `travel` from a scatter it reached
+// along `into`, `depth` below the surface (`conditioned`), the way out weighs light by what that
+// scatter sends through the surface's plane toward it over what it sent along the step, whose
+// throughput was divided by the step's chance and multiplied by the least dense channel's
+// transmittance over it, exp(-`shift`), and the medium's `extinction` takes the rest.
 struct LeanMediumScatter : ILeanScatter
 {
     bool leave;
@@ -976,6 +981,11 @@ struct LeanMediumScatter : ILeanScatter
     float3 travel;
     InteriorExitScatter exit;
     InteriorRoughTransmission surface;
+    bool conditioned;
+    float3 into;
+    float depth;
+    float shift;
+    float3 extinction;
 
     bool specular_only()
     {
@@ -1000,7 +1010,17 @@ struct LeanMediumScatter : ILeanScatter
         if (rough)
             return float3(surface.value(wi, pdf));
         if (leave)
-            return exit.eval_and_pdf(wi, pdf, diffuse);
+        {
+            float3 lobe = exit.eval_and_pdf(wi, pdf, diffuse);
+            if (!conditioned || !any(lobe > 0.0))
+                return lobe;
+            // The way inside that leaves toward `wi`.
+            float3 toward = -refract(-wi, exit.n, 1.0 / exit.eta);
+            float c = dot(toward, exit.n);
+            float own = dot(travel, exit.n);
+            float ratio = hg_phase(anisotropy, dot(into, toward)) * own / (hg_phase(anisotropy, dot(into, travel)) * c);
+            return lobe * ratio * exp(shift - extinction * depth / c);
+        }
         pdf = density(wi);
         return float3(pdf);
     }
@@ -1014,20 +1034,25 @@ struct LeanMediumScatter : ILeanScatter
 // interior's transmittance dims, and its next ray from the phase function. A scatter that walks
 // the interior's dense medium leaves the walk in the path's cold words (`MEDIUM_WALKS`) for its
 // raygen to run. Where a walk leaves the interior (`MEDIUM_LEAVES`), at its hot origin through a
-// surface of the walk's IOR, the hot words hold the way out and the surface's outward normal;
-// where one stops at its cap (`MEDIUM_CAPPED`) it leaves where the path entered the interior,
-// along a cosine draw, with the subsurface table's share. The path then lies past the surface: in
-// real time the vertex takes the lights but the environment as `InteriorExitScatter` gathers them,
-// which its ray along the way out meets for nothing (`PDF_LIT`); the reference leaves all light
-// to that ray. Through a rough surface (`MEDIUM_LEAVES_ROUGH`, the payload's first word the
-// direction the walk reached it along, its third the weight of the surface's draw of the way out)
-// the vertex weighs every light by the surface seen from inside instead, against its ray's own
-// density. Where a walk meets its rough surface and goes on inside or ends there (`MEDIUM_MEETS`,
-// the payload's first word the weight of the surface's draw, 0 where it was lost), the hot words
-// hold the point, the direction the walk reached it along, the outward normal and the throughput
-// there, and the vertex leaves the light through the surface there as the shadow job and the
-// throughput the walk goes on with, before the raygen goes on with the walk. The walk was the
-// bounce of the vertex where it leaves, and of each meeting.
+// surface of the walk's IOR, the hot words hold the way out and the surface's outward normal, the
+// payload's first word the direction the walk reached the surface along and its third the length
+// of the walk's last step where a scatter started it, else -1, and the walk words the direction
+// that scatter was reached along and the weight of the surface's draw; where one stops at its cap
+// (`MEDIUM_CAPPED`) it leaves where the path entered the interior, along a cosine draw, with the
+// subsurface table's share. The path then lies past the surface: in real time the vertex takes
+// the lights but the environment as `InteriorExitScatter` gathers them, conditioned on the walk's
+// last scatter where one started its last step (`LeanMediumScatter`), which its ray along the way
+// out meets for nothing (`PDF_LIT`); a way out no scatter started is a mirror's, whose ray takes
+// all of its light, as the reference's take all of theirs. Through a rough surface
+// (`MEDIUM_LEAVES_ROUGH`, the payload's first word the direction the walk reached it along, its
+// third the weight of the surface's draw of the way out) the vertex weighs every light by the
+// surface seen from inside instead, against its ray's own density. Where a walk meets its rough
+// surface and goes on inside or ends there (`MEDIUM_MEETS`, the payload's first word the weight
+// of the surface's draw, 0 where it was lost), the hot words hold the point, the direction the
+// walk reached it along, the outward normal and the throughput there, and the vertex leaves the
+// light through the surface there as the shadow job and the throughput the walk goes on with,
+// before the raygen goes on with the walk. The walk was the bounce of the vertex where it leaves,
+// and of each meeting.
 public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, uint4 words)
 {
     uint word = words.x;
@@ -1048,15 +1073,22 @@ public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, uint4 words)
     float3 dir = oct_decode_snorm16(w1.x);
     float3 point = asfloat(w0.xyz) + (surface ? float3(0.0) : dir * asfloat(word));
     float3 normal = surface ? oct_decode_snorm16(w1.y) : float3(0.0);
-    float3 travel = kind == MEDIUM_LEAVES_ROUGH ? oct_decode_snorm16(word) : dir;
+    float3 travel = kind == MEDIUM_LEAVES || kind == MEDIUM_LEAVES_ROUGH ? oct_decode_snorm16(word) : dir;
     float3 throughput = hot_throughput(w1);
-    // What the rough surface's draw weighs the walk by past the vertex.
-    float weight = asfloat(meets ? word : words.z);
+    // A smooth way out of a step that started at a scatter (`conditioned`), its length, else a
+    // mirror's.
+    float length = asfloat(words.z);
+    bool conditioned = kind == MEDIUM_LEAVES && length >= 0.0;
+    bool mirror = kind == MEDIUM_LEAVES && !conditioned;
+    // What the surface's draw weighs the walk by past the vertex, which a way out's walk words
+    // hold with the direction its last scatter was reached along.
+    uint4* cold = lean_cold(r, slot);
+    uint4 last = load_coherent(cold + LEAN_INTO_WORD);
+    float weight = asfloat(meets ? word : kind == MEDIUM_LEAVES ? last.w : words.z);
     Sampler rng = path_sampler(r, pixel);
     rng.dimension = flags >> HOT_DIMENSION_SHIFT;
     LeanMode mode = lean_mode(r);
     bool reference = may(MAY_REFERENCE) && (r.dielectric_flags & DIELECTRIC_REFERENCE) != 0;
-    uint4* cold = lean_cold(r, slot);
     uint scattered = (flags >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK;
     if (kind == MEDIUM_WALKS)
     {
@@ -1066,6 +1098,7 @@ public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, uint4 words)
         float4 scatter = asfloat(load_coherent(cold + LEAN_SCATTER_WORD));
         InteriorMedium im = { interior_sigma(cold), scatter.xyz, scatter.w };
         store_walk_words(cold, walk_interior(point, dir, im, ior, rng), medium);
+        store_coherent(cold + LEAN_INTO_WORD, uint4(asuint(dir), 0));
         flags = (flags & ~(HOT_DEPTH_MASK << HOT_DEPTH_SHIFT)) | (min(scattered + 1, HOT_DEPTH_MASK) << HOT_DEPTH_SHIFT);
         flags = lean_counted(r, scattered, true) ? flags | HOT_COUNTED : flags & ~HOT_COUNTED;
         store_coherent(at, uint4(w0.xyz, hot_flags(flags, rng.dimension)));
@@ -1075,10 +1108,16 @@ public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, uint4 words)
     uint medium = MATERIAL_NONE;
     bool inside = (flags & HOT_INTERIOR) != 0;
     float3 sigma = float3(0.0);
+    // The phase function of the medium the vertex scatters in, or a walk's way out last
+    // scattered in, whose words the way out replaces with the medium outside.
+    float anisotropy = asfloat(load_coherent(cold + LEAN_SCATTER_WORD).w);
+    float3 extinction = float3(0.0);
     if (surface)
     {
         Walk e = load_walk(cold, r.frame, medium);
         ior = e.ior;
+        extinction = e.volume.extinction;
+        anisotropy = e.volume.anisotropy;
         if (kind == MEDIUM_CAPPED)
         {
             uint4 entered = load_coherent(cold + LEAN_ENTERED_WORD);
@@ -1137,16 +1176,21 @@ public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, uint4 words)
     float alpha = roughness * roughness;
     // Seen from inside, along the way the walk reached the surface.
     InteriorRoughTransmission through = InteriorRoughTransmission(alpha, 1.0 / ior, -normal, -travel);
-    LeanMediumScatter scatter = { leaves, rough, leaves && !rough && mode.count_bsdf, asfloat(load_coherent(cold + LEAN_SCATTER_WORD).w), travel, way_out, through };
-    // The lights a lobe's way out's ray meets count for nothing where its vertex took them.
-    bool lit = leaves && !rough && !reference && mode.count_nee && !mode.one_technique;
+    // The walk's throughput over its last step's chance holds the least dense channel's
+    // transmittance over the step.
+    float shift = min(extinction.x, min(extinction.y, extinction.z)) * length;
+    float3 into = asfloat(last.xyz);
+    LeanMediumScatter scatter = { leaves, rough, leaves && !rough && !mirror && mode.count_bsdf, anisotropy, travel, way_out, through, conditioned, into, length * dot(travel, normal), shift, extinction };
+    // The lights a lobe's way out's ray meets count for nothing where its vertex took them. A
+    // mirror's way out takes them along its ray alone.
+    bool lit = leaves && !rough && !mirror && !reference && mode.count_nee && !mode.one_technique;
     float4 u = rng.next4();
     float u_roulette = rng.next();
     float3 wi = leaves ? dir : sample_hg(scatter.anisotropy, dir, u.xy);
     float3 scatter_f;
     float scatter_pdf;
     float3 scatter_diffuse;
-    bool estimates = alive && mode.count_nee && counted && r.bounce_candidates > 0 && !(leaves && reference);
+    bool estimates = alive && mode.count_nee && counted && r.bounce_candidates > 0 && !(leaves && reference) && !mirror;
     LightPick k = pick_light<0>(r, scatter, point, normal, pixel, r.bounce_candidates, estimates, false, !surface || (leaves && rough), wi, scatter_f, scatter_pdf, scatter_diffuse, rng);
     float job_blue = 0.0;
     uint job_light = NO_LIGHT;
@@ -1171,8 +1215,11 @@ public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, uint4 words)
         store_coherent(at + 2, uint4(w2.x, asuint(job_blue), w2.z, job_light));
         return;
     }
-    if (rough)
+    if (rough || kind == MEDIUM_LEAVES)
         throughput *= weight;
+    // The way out's ray takes the transmittance over the walk's last step.
+    if (conditioned)
+        throughput *= exp(shift - extinction * length);
     // The phase function draws its own density, so the next ray keeps the throughput; a way out is
     // the direction the walk took.
     bool goes = (leaves || scatter_pdf > 0.0) && (leaves || roulette_survives(r, opaque, u_roulette, throughput)) && carries(throughput);

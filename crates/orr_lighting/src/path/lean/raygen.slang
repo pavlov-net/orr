@@ -245,7 +245,9 @@ void end_path(uint4* at)
 // Where an interior's walk last met the surface it walks in: the point, the surface's outward
 // normal there, the direction the walk reached it along, its throughput there and the weight of
 // what the surface did with it, 0 where the surface's draw was lost. `met` where the surface is
-// rough and the walk stopped there.
+// rough and the walk stopped there. Where the walk's step there started at a scatter, its
+// `length`, the direction the walk reached that scatter along and the walk's throughput there over
+// the chance of the step (`walk_unattenuated`); else a `length` of -1.
 struct RoughMeeting
 {
     bool met;
@@ -254,6 +256,9 @@ struct RoughMeeting
     float3 arrival;
     float3 reached;
     float weight;
+    float length;
+    float3 into;
+    float3 unattenuated;
 }
 
 // Runs walk `e` of `slot`'s path in hot words `at` to its end, a trace a step, whose hits run no
@@ -269,8 +274,14 @@ void walk_traced(PathRoot r, uint slot, uint4* at, inout Walk e, bool interior, 
     uint mask = interior ? MASK_OPAQUE | MASK_DIELECTRIC : MASK_OPAQUE;
     uint4 cover = scattered_cover(r, slot, at, mask);
     last = traced_nothing();
-    meeting = { false, float3(0.0), float3(0.0), float3(0.0), float3(0.0), 0.0 };
+    meeting = { false, float3(0.0), float3(0.0), float3(0.0), float3(0.0), 0.0, -1.0, float3(0.0), float3(0.0) };
     bool rough = interior && share && interior_rough(r.scene, owner);
+    // A fresh interior's walk starts at a scatter on the path's ray, whose direction its words
+    // keep.
+    bool scattered = interior && e.step == 0;
+    float3 into = float3(0.0);
+    if (scattered)
+        into = asfloat(load_coherent(lean_cold(r, slot) + LEAN_INTO_WORD).xyz);
     for (; e.step < r.sss_max_steps; e.step++)
     {
         WalkDraw d;
@@ -282,8 +293,11 @@ void walk_traced(PathRoot r, uint slot, uint4* at, inout Walk e, bool interior, 
         count_ray(r, trail);
         if (!last.hit())
         {
+            float3 travel = e.dir;
             if (!walk_scattered(e, d, share))
                 return;
+            into = travel;
+            scattered = true;
             continue;
         }
         Boundary b = boundary_of(last);
@@ -295,13 +309,15 @@ void walk_traced(PathRoot r, uint slot, uint4* at, inout Walk e, bool interior, 
         {
             float3 normal = boundary_normal(r.scene, last, b, e.dir);
             met = interior_meet(r.scene, r.view, owner, e.ior, b.material, normal, e.origin, e.dir, b.t, !share, e.rng);
-            meeting = { rough && met.kind != WALK_BOUNDARY, e.origin + e.dir * b.t, normal, e.dir, float3(0.0), met.kind == WALK_NONE ? 0.0 : met.weight };
+            meeting = { rough && met.kind != WALK_BOUNDARY, e.origin + e.dir * b.t, normal, e.dir, float3(0.0), met.kind == WALK_NONE ? 0.0 : met.weight, scattered ? b.t : -1.0, into, walk_unattenuated(e, d, b.t) };
         }
         bool reaches = walk_reached(e, d, b.t, meeting.reached);
         meeting.met = meeting.met && reaches;
         bool goes = walk_went(e, met, meeting.reached, reaches);
         if (goes && meeting.met)
             e.step++;
+        // A reflection starts a step no scatter starts.
+        scattered = false;
         if (goes && !meeting.met)
             continue;
         return;
@@ -329,9 +345,13 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
     trail.walked = true;
     uint4 w0 = load_coherent(at);
     uint4 w1 = load_coherent(at + 1);
-    // At a rough meeting the path takes the walk's throughput where it reached the surface, which
-    // the vertex there weighs by what the surface did with it.
-    float3 throughput = hot_throughput(w1) * (meeting.met ? meeting.reached : e.throughput);
+    // At a rough meeting or a way out through the surface the path takes the walk's throughput
+    // where it reached the surface, which the vertex there weighs by what the surface did with
+    // it, and where a smooth surface lets out a step that started at a scatter, the throughput
+    // there over the step's chance, which the vertex weighs by the step.
+    bool leaves = interior && e.kind == WALK_LEAVE;
+    bool conditioned = leaves && !meeting.met && meeting.length >= 0.0;
+    float3 throughput = hot_throughput(w1) * (conditioned ? meeting.unattenuated : meeting.met || leaves ? meeting.reached : e.throughput);
     bool lost = meeting.met && e.kind == WALK_NONE;
     bool capped = e.kind == WALK_CAP;
     bool reference = lean_reference(r);
@@ -398,11 +418,14 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
     store_coherent(at, uint4(asuint(e.origin), flags));
     store_coherent(at + 1, uint4(way, across, carried));
     // Through a rough surface the vertex there weighs light by the surface seen along the walk's
-    // last step.
+    // last step, through a smooth one by that step and the scatter it started at, which the walk's
+    // words take with the weight of the surface's draw.
     Payload leave;
-    leave.words = uint4(0, capped ? MEDIUM_CAPPED : MEDIUM_LEAVES, 0, 1);
+    leave.words = uint4(arrived, capped ? MEDIUM_CAPPED : MEDIUM_LEAVES, asuint(meeting.length), 1);
     if (meeting.met)
-        leave.words.xyz = uint3(arrived, MEDIUM_LEAVES_ROUGH, asuint(meeting.weight));
+        leave.words.yz = uint2(MEDIUM_LEAVES_ROUGH, asuint(meeting.weight));
+    else
+        store_coherent(cold + LEAN_INTO_WORD, uint4(asuint(meeting.into), asuint(meeting.weight)));
     call(CALL_MEDIUM, leave);
     trail.chain = true;
     return NEXT_RAY;

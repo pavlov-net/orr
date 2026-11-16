@@ -27,6 +27,10 @@ public static const uint LEAN_SCATTER_WORD = 6;
 public static const uint LEAN_ENTERED_WORD = 7;
 public static const uint LEAN_WALK_WORD = 8;
 public static const uint LEAN_EXIT_WORD = 12;
+// An interior's walk, which no subsurface walk's way out runs beside, keeps the direction its last
+// scatter was reached along in the first of those words, and where it leaves, the weight of the
+// surface's draw there.
+public static const uint LEAN_INTO_WORD = LEAN_EXIT_WORD;
 [Host] public static const uint LEAN_HOT_BYTES = 16 * LEAN_HOT_WORDS;
 // What a raygen keeps across a trace or an invoke, bytes: the driver's stack size of the raygen
 // beyond its hit object.
@@ -47,12 +51,14 @@ public static const uint LEAN_EXIT_WORD = 12;
 // the walk of a shadow ray through thin walls and a frosted pixel's second path.
 [Host] public static const uint RAYGEN_LAYER_INSTRUCTIONS = 1200;
 // What a raygen holds more where an interior's medium may scatter or a surface may walk: the draw
-// of where a ray inside an interior scatters, and the steps of a walk.
-[Host] public static const uint RAYGEN_WALK_INSTRUCTIONS = 6400;
+// of where a ray inside an interior scatters, and the steps of a walk, with the last scatter an
+// interior's way out weighs its light by, 300 of it.
+[Host] public static const uint RAYGEN_WALK_INSTRUCTIONS = 6500;
 // The callable of a path's vertex at a scatter in an interior's medium, or where a walk leaves it,
 // and of the light a walk takes through its rough surface where it meets it: that surface's
-// transmission seen from inside holds 1,100 of it.
-[Host] public static const uint MEDIUM_VERTEX_INSTRUCTIONS = 13600;
+// transmission seen from inside holds 1,100 of it, the way out's weight by the walk's last
+// scatter 400.
+[Host] public static const uint MEDIUM_VERTEX_INSTRUCTIONS = 13700;
 // The callable of the vertex where a subsurface walk leaves.
 [Host] public static const uint WALK_EXIT_INSTRUCTIONS = 17000;
 // The callable that weighs a coated emitter's light by what its coat and fuzz pass toward a
