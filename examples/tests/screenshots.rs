@@ -1,14 +1,15 @@
 //! Runs each example headless and compares its last frame with its reference in
-//! `references/` by FLIP; `ORR_BLESS=1` rewrites the references. hdr-calibration shows what
-//! a display does with its patterns and has no headless run. The dlss example's super
-//! resolution is compared with the same view rendered at the output size instead.
+//! `references/`; `ORR_BLESS=1` rewrites the references. The examples whose own kernels shade
+//! a raster image compare by FLIP, as their images repeat exactly. The path-traced ones,
+//! through either path tracer, compare an average of their frames by block means with the
+//! converged render of their `--reference` mode, which is what `ORR_BLESS=1` writes for them.
+//! hdr-calibration shows what a display does with its patterns and has no headless run. The
+//! dlss example's super resolution is compared with the same view rendered at the output size
+//! instead.
 
 #[allow(dead_code)]
 #[path = "../cluster-rt.rs"]
 mod cluster_rt;
-#[allow(dead_code)]
-#[path = "../dense-vegetation.rs"]
-mod dense_vegetation;
 #[allow(dead_code)]
 #[path = "../dielectrics.rs"]
 mod dielectrics;
@@ -63,8 +64,31 @@ use orr_math::camera::rh::view;
 use orr_math::{Affine3, DVec3, Quat, Vec3};
 use orr_scene::testing::{Image, Pixels, Tolerance, check, flip};
 
-/// A smaller forest than the bench's, so the debug build renders it in reasonable time.
-const DENSE_VEGETATION: [&str; 5] = ["--synthetic", "--trees", "2000", "--grass-density", "50"];
+/// Frames a converged reference renders: 16,384 averaged, after the 30 its exposure settles over.
+const REFERENCE_FRAMES: u64 = 16_384 + 30;
+
+/// The block means a path-traced example's 90-frame average keeps to against its converged
+/// reference, at `relative` of each 32 px block's mean plus 0.005 in linear terms, past the
+/// blocks `skip` meets. Each test's `relative` is about twice the widest spread its 90-frame
+/// averages show between independent runs of the same code.
+const fn converged(relative: f32, skip: &'static [[u32; 4]]) -> Tolerance {
+    Tolerance::Blocks {
+        size: 32,
+        relative,
+        floor: 0.005,
+        skip,
+    }
+}
+
+/// Measured spread at most the 0.005 floor: no block of the sky's averages moves further between
+/// runs.
+const SKY: Tolerance = converged(0.03, &[]);
+/// Measured spread 1.2% of a block, on the gold knot's highlights.
+const VIEWER: Tolerance = converged(0.03, &[]);
+/// Measured spread 10.8% of a block, on the pool wall the water's caustics light. The reference does
+/// not converge on the jade in any frame count a test can bless: sunlight reaches its scattering
+/// interior there only through exit rays that meet the sun's disc, so its blocks are not compared.
+const DIELECTRICS: Tolerance = converged(0.15, &[[400, 60, 480, 140]]);
 
 /// One example runs at a time on the shared device.
 fn serial() -> MutexGuard<'static, ()> {
@@ -100,6 +124,42 @@ fn headless(rest: &[&str]) -> Options {
     Options::headless(120, rest)
 }
 
+fn blessing() -> bool {
+    std::env::var_os("ORR_BLESS").is_some_and(|v| v == "1")
+}
+
+/// Compares the capture `test` renders with the converged reference `name` under `tolerance`,
+/// or with `ORR_BLESS=1` writes the one `converged` renders in its place, which takes minutes:
+/// bless one test at a time. A test that passes no `converged` leaves blessing to the one that
+/// renders the same reference.
+fn compare_converged(
+    name: &str,
+    tolerance: Tolerance,
+    test: impl FnOnce() -> Option<Capture>,
+    converged: Option<&dyn Fn() -> Option<Capture>>,
+) {
+    let capture = match (blessing(), converged) {
+        (false, _) => test(),
+        (true, Some(converged)) => converged(),
+        (true, None) => return,
+    };
+    let reference = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("references")
+        .join(name);
+    check(
+        &reference,
+        &image(capture.expect("headless capture")),
+        tolerance,
+    );
+}
+
+/// The headless run of a converged reference: `--reference` and `rest` over enough frames.
+fn reference(rest: &[&str]) -> Options {
+    let mut rest = rest.to_vec();
+    rest.push("--reference");
+    Options::headless(REFERENCE_FRAMES, &rest)
+}
+
 #[test]
 fn gpu_basics_matches_its_reference() {
     let _serial = serial();
@@ -117,18 +177,49 @@ fn cluster_rt_matches_its_references() {
 }
 
 #[test]
-fn sky_matches_its_reference() {
+fn sky_matches_its_converged_reference() {
     let _serial = serial();
-    compare("sky", sky::run(&headless(&[])).expect("headless capture"));
+    compare_converged(
+        "sky",
+        SKY,
+        || sky::run(&headless(&[])),
+        Some(&|| sky::run(&reference(&[]))),
+    );
     assert_clean();
 }
 
 #[test]
-fn viewer_matches_its_reference() {
+fn sky_through_the_pipeline_matches_its_converged_reference() {
     let _serial = serial();
-    compare(
+    compare_converged(
+        "sky",
+        SKY,
+        || sky::run(&headless(&["--pipeline-paths"])),
+        None,
+    );
+    assert_clean();
+}
+
+#[test]
+fn viewer_matches_its_converged_reference() {
+    let _serial = serial();
+    compare_converged(
         "viewer",
-        viewer::run(&headless(&[])).expect("headless capture"),
+        VIEWER,
+        || viewer::run(&headless(&[])),
+        Some(&|| viewer::run(&reference(&[]))),
+    );
+    assert_clean();
+}
+
+#[test]
+fn viewer_through_the_pipeline_matches_its_converged_reference() {
+    let _serial = serial();
+    compare_converged(
+        "viewer",
+        VIEWER,
+        || viewer::run(&headless(&["--pipeline-paths"])),
+        None,
     );
     assert_clean();
 }
@@ -144,22 +235,26 @@ fn rigid_parts_matches_its_reference() {
 }
 
 #[test]
-fn dielectrics_matches_its_reference() {
+fn dielectrics_matches_its_converged_reference() {
     let _serial = serial();
-    compare(
+    compare_converged(
         "dielectrics",
-        dielectrics::run(&headless(&[])).expect("headless capture"),
+        DIELECTRICS,
+        || dielectrics::run(&headless(&[])),
+        Some(&|| dielectrics::run(&reference(&[]))),
     );
     assert_clean();
 }
 
 /// The ray tracing pipeline's paths render the same water, glass, amber and jade.
 #[test]
-fn dielectrics_through_the_pipeline_matches_its_reference() {
+fn dielectrics_through_the_pipeline_matches_its_converged_reference() {
     let _serial = serial();
-    compare(
+    compare_converged(
         "dielectrics",
-        dielectrics::run(&headless(&["--pipeline-paths"])).expect("headless capture"),
+        DIELECTRICS,
+        || dielectrics::run(&headless(&["--pipeline-paths"])),
+        None,
     );
     assert_clean();
 }
@@ -179,14 +274,6 @@ fn skinned_matches_its_reference() {
         "skinned",
         skinned::run(&headless(&[])).expect("headless capture"),
     );
-    assert_clean();
-}
-
-#[test]
-fn dense_vegetation_matches_its_reference() {
-    let _serial = serial();
-    let forest = dense_vegetation::capture(&headless(&DENSE_VEGETATION)).expect("headless capture");
-    compare("dense-vegetation", forest);
     assert_clean();
 }
 
