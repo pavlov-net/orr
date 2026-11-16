@@ -117,8 +117,9 @@ bool start_path(PathRoot r, uint2 pixel, uint4* at, uint4* cold, float throughpu
 
 // Traces the pending shadow job of `slot`'s path in hot words `at`: any hit ends it, and where
 // its miss shader ran the job's light, times what the ray's candidates let through, is the
-// path's. The ray's shaders know nothing of the path: they read and write the payload alone.
-void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags)
+// path's. The ray's shaders know nothing of the path: they read and write the payload alone. The
+// thin walls it crosses lie in a medium of IOR `exterior` where the job's vertex said, else 0.
+void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior)
 {
     uint4 w4 = load_coherent(at + 4);
     uint4 w5 = load_coherent(at + 5);
@@ -146,20 +147,25 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags)
     float3 passed = asfloat(p.words.xyz);
     // Thin walls the ray passed let through what they pass straight, walked one after the other.
     if (may2(MAY2_THIN_DIELECTRICS) && ShadowCover.of_words(p.words).has(SHADOW_CROSSES) && any(passed > 0.0))
-        passed *= cross_walls(r, slot, at, flags, ray);
+        passed *= cross_walls(r, slot, at, flags, ray, exterior);
     lean_shadow_add(r, slot, passed);
 }
 
 // What the thin walls along `ray`, the shadow ray of `slot`'s path in hot words `at` with flags
 // `flags`, let straight through: a trace over the dielectrics commits the nearest past the last
-// crossing, and the wall's hit, invoked with a window
-// payload, hands back what it lets through. Solid glass ended the shadow trace, so every
-// dielectric along the ray is a thin wall. The walls lie in the medium the path is in.
-float3 cross_walls(PathRoot r, uint slot, uint4* at, uint flags, RayDesc ray)
+// crossing, and the wall's hit, invoked with a window payload, hands back what it lets through.
+// Solid glass ended the shadow trace, so every dielectric along the ray is a thin wall. The walls
+// lie in the medium the ray does: of IOR `job` where the vertex that left the job said, else the
+// path's.
+float3 cross_walls(PathRoot r, uint slot, uint4* at, uint flags, RayDesc ray, float job)
 {
-    float exterior = 1.0;
-    if (may(MAY_INTERIORS) && (flags & HOT_INTERIOR) != 0)
-        exterior = interior_ior(r.scene, innermost_of(load_coherent(lean_cold(r, slot))));
+    float exterior = job;
+    if (!(exterior > 0.0))
+    {
+        exterior = 1.0;
+        if (may(MAY_INTERIORS) && (flags & HOT_INTERIOR) != 0)
+            exterior = interior_ior(r.scene, innermost_of(load_coherent(lean_cold(r, slot))));
+    }
     float2 cone = halves(load_coherent(at + 2).x);
     RayCone c = { cone.x, cone.y };
     uint4 cover = path_payload(new_path_cover(MASK_DIELECTRIC, COVER_ALPHA, PRESENCE_NONE, 0, hit_context(HIT_SECONDARY, 1, c, 0.0)));
@@ -188,6 +194,7 @@ struct PathTrail
     bool chain;     // its last vertex was a layer, a scatter in a medium or a walk's way out
     bool walked;    // it walked
     uint rays;      // the rays it traced, which a debug view may show
+    float exterior; // the IOR its pending shadow job's ray lies in, where its vertex said
 }
 
 // The depth of the context a hit of a ray of `slot`'s path takes, whose first hot word's flags are
@@ -416,6 +423,8 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
         Payload meets;
         meets.words = uint4(asuint(meeting.weight), MEDIUM_MEETS, 0, 1);
         call(CALL_MEDIUM, meets);
+        if (may(MAY_INTERIORS) && may2(MAY2_THIN_DIELECTRICS))
+            trail.exterior = asfloat(meets.words.z);
         return paused ? NEXT_INTERIOR : NEXT_RAY;
     }
     float2 cone = halves(load_coherent(at + 2).x);
@@ -575,7 +584,7 @@ uint trace_ray<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, in
 // `count_ray` counts them.
 uint run_path<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint next)
 {
-    PathTrail trail = { false, false, 0 };
+    PathTrail trail = { false, false, 0, 0.0 };
     // The ray's hit and a walk's last step's, each recorded by its trace: a hit object is never
     // copied.
     Traced h = traced_nothing();
@@ -585,9 +594,10 @@ uint run_path<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint next)
         uint4 w0 = load_coherent(at);
         if ((w0.w & HOT_SHADOW) != 0)
         {
-            trace_shadow(r, slot, at, w0.w);
+            trace_shadow(r, slot, at, w0.w, trail.exterior);
             count_ray(r, trail);
         }
+        trail.exterior = 0.0;
         Payload p;
         bool invokes = false;
         if (may(MAY_WALK) && next == NEXT_EXIT)
@@ -644,6 +654,8 @@ uint run_path<let SEARCH : bool>(PathRoot r, uint slot, uint4* at, uint next)
             break;
         }
         trail.chain = layer;
+        if (layer && may(MAY_INTERIORS) && may2(MAY2_THIN_DIELECTRICS))
+            trail.exterior = asfloat(p.words.z);
         if (may(MAY_WALK) && p.words.y == PAYLOAD_WALKS)
             next = NEXT_WALK;
         // The vertex where a walk leaves runs in its callable from the surface its hit resolved.
@@ -756,7 +768,7 @@ public void lean_updates(PathRoot r)
     Payload first;
     first.words = uint4(0);
     call(CALL_FIRST, first);
-    PathTrail trail = { false, false, 0 };
+    PathTrail trail = { false, false, 0, 0.0 };
     Traced h;
     for (;;)
     {
@@ -771,7 +783,8 @@ public void lean_updates(PathRoot r)
             store_coherent(at, uint4(w0.xyz, w0.w & ~HOT_ARRIVED));
         }
         if ((w0.w & HOT_SHADOW) != 0)
-            trace_shadow(r, slot, at, w0.w);
+            trace_shadow(r, slot, at, w0.w, trail.exterior);
+        trail.exterior = 0.0;
         if ((w0.w & HOT_RAY) == 0)
             break;
         Payload p;
@@ -780,6 +793,8 @@ public void lean_updates(PathRoot r)
         reorder_invoke(h, p);
         if (h.hit() && p.words.x != 0)
             end_path(at);
+        else if (h.hit() && may(MAY_LAYERS) && layer_record(h) && may(MAY_INTERIORS) && may2(MAY2_THIN_DIELECTRICS))
+            trail.exterior = asfloat(p.words.z);
     }
     update.finish(r, asfloat(load_coherent(at + 3).xyz), 0);
 }

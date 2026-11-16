@@ -4,16 +4,16 @@
 //! spheres with dense scattering interiors.
 
 use lighting_suite::bed::{
-    Accumulated, Bed, DenseInterior, EXTENT, FURNACE_RADIANCE, Item, JADE, JADE_SLAB,
-    JADE_SLAB_THICKNESS, JADE_SPHERE, MILK, MILK_SPHERE, Paths, ROUGH_JADE_ROUGHNESS,
-    ROUGH_JADE_SPHERE, Spec, VERY_ROUGH_JADE_ROUGHNESS, VERY_ROUGH_JADE_SPHERE, WALK_FURNACE,
-    WALK_SLABS, WALK_SPHERE, look,
+    Accumulated, Bed, DenseInterior, EXTENT, FURNACE_RADIANCE, GLASS_PANE, Item, JADE, JADE_SLAB,
+    JADE_SLAB_THICKNESS, JADE_SPHERE, MILK, MILK_SPHERE, PANE_IOR, Paths, ROUGH_GLASS_SPHERE,
+    ROUGH_JADE_ROUGHNESS, ROUGH_JADE_SPHERE, Spec, VERY_ROUGH_JADE_ROUGHNESS,
+    VERY_ROUGH_JADE_SPHERE, WALK_FURNACE, WALK_SLABS, WALK_SPHERE, look,
 };
 use lighting_suite::shaders::walk_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
 use openpbr_ref::Inputs;
 use openpbr_ref::walk::{
-    DielectricWalks, Interface, Light as CpuLight, Medium, Shape, Walks, top_exit,
+    DielectricWalks, Interface, Light as CpuLight, Medium, Shape, Walks, fresnel, top_exit,
 };
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
@@ -597,6 +597,64 @@ fn dense_interiors_walk_as_the_cpu_walk_does() {
         interior_matches_the_cpu_walk(&paths, model, interior, 0.0, 1.0, &sun, sunlit);
     }
     a_thin_slab_lit_from_behind_matches_the_cpu_walk(&paths, 0.03);
+    assert_clean();
+}
+
+/// A thin pane 100 m above an interior passes the sun to it by the pane's straight transmission
+/// in the air, 1 - Fresnel at its interface there; so far up, what it reflects of the body's light
+/// back onto the body is too little to see. The sun's shadow jobs leave the interior: where
+/// a very rough jade's walk meets its surface, and where rough glass is lit from inside or its
+/// outer face keeps its job while its ray goes in; their rays lie outside the interior, as the
+/// pane does, and not in the medium the path's ray goes on in. Next-event estimation alone, which
+/// is what the jobs carry.
+#[test]
+fn a_pane_above_an_interior_passes_the_sun_as_in_the_air() {
+    let mut paths = Paths::new(
+        &KernelSet::default(),
+        PathEntry::Compute,
+        real_time(LightingDebugView::NeeOnly),
+    );
+    paths.settings.max_bounces = 2;
+    let (eye, target, fov_y) = (Vec3::new(0.0, 1.2, 4.0), Vec3::ZERO, 0.6);
+    let pixels = sphere_pixels(eye, target, fov_y, 1.0);
+    let sun_cos = f64::from(SUN_DIRECTION.normalize().y);
+    let wanted = 1.0 - fresnel(f64::from(PANE_IOR), sun_cos);
+    let mut failures = Vec::new();
+    for model in [VERY_ROUGH_JADE_SPHERE, ROUGH_GLASS_SPHERE] {
+        let lit = |pane: bool| {
+            let mut copies = vec![Item {
+                model,
+                linear: Mat3::IDENTITY,
+                at: Vec3::ZERO,
+            }];
+            if pane {
+                copies.push(Item {
+                    model: GLASS_PANE,
+                    linear: Mat3::IDENTITY,
+                    at: Vec3::new(0.0, 100.0, 0.0),
+                });
+            }
+            let spec = Spec {
+                copies,
+                lights: vec![Light::Directional(sun())],
+                environment: None,
+                eye,
+                target,
+                fov_y,
+                focus: None,
+            };
+            mean_rgb(&render_spec(&paths, spec, 128), pixels.iter().map(|p| p.0))
+        };
+        let ratio = lit(true) / lit(false);
+        if (ratio / wanted - 1.0).abs().max_element() >= 0.02 {
+            failures.push(format!("{model}: the pane passes {ratio:?} of the sun"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{}; its transmission in the air {wanted:.4}",
+        failures.join("; ")
+    );
     assert_clean();
 }
 
