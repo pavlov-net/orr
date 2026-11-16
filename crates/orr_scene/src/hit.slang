@@ -974,8 +974,9 @@ bool hit_input_by<M : ISectionMaterial, let TRACED : bool, let FLAT : bool>(Scen
     }
     if (FLAT)
     {
+        // Values, not branches, so a stage that never reads it keeps none of the test.
         VertexAttributes a0 = tri.corners.attributes[0];
-        traced.flat = !tri.deformed && all(a0.normal == tri.corners.attributes[1].normal) && all(a0.normal == tri.corners.attributes[2].normal);
+        traced.flat = all(bool3(!tri.deformed, all(a0.normal == tri.corners.attributes[1].normal), all(a0.normal == tri.corners.attributes[2].normal)));
     }
     return true;
 }

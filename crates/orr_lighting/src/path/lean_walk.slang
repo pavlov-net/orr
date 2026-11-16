@@ -44,7 +44,7 @@ void first_vertex(inout Payload p)
 void walk_leaves(inout Payload p)
 {
     ORR_OMM(walk_leaves);
-    lean_walk_exit<Medium>(root, DispatchRaysIndex().x, p.words.x != 0);
+    lean_walk_exit<Medium>(root, DispatchRaysIndex().x, p.words);
 }
 
 [shader("callable")]

@@ -72,10 +72,10 @@ void medium_vertex(inout Payload p)
 }
 
 [shader("callable")]
-void stack_step(inout Payload p)
+void stack_step(inout StackStep c)
 {
     ORR_OMM(stack_step);
-    lean_stack_step<Medium>(root, DispatchRaysIndex().x, p.words);
+    lean_stack_step<Medium>(root, DispatchRaysIndex().x, c);
 }
 
 [shader("callable")]
