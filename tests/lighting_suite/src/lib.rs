@@ -33,6 +33,12 @@ pub mod linked {
     include!(concat!(env!("OUT_DIR"), "/linked/orr_kernels.rs"));
 }
 
+/// orr_lighting's kernels with the stock height fog (`media_types.slang`'s `StockFog`) linked as
+/// the medium.
+pub mod fogged {
+    include!(concat!(env!("OUT_DIR"), "/fogged/orr_kernels.rs"));
+}
+
 /// A kernel set in which each `(module, kernel)` stands in for orr_lighting's module compiled
 /// from `kernel`, as a build linking the types `environment` and `medium` makes it.
 pub fn kernels(

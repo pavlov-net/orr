@@ -13,23 +13,18 @@
 //! the reference march, and sheets past the froxels. The eye under water: a turbid view per channel
 //! against the reference's distance samples, also past the froxels and with shafts, a waterline at
 //! the near plane from either side, a body in the water, a light in the water, flicker, and
-//! particles under water.
+//! particles under water. A dense interior's ways out take the sun through the fog.
 
 use bytemuck::{Pod, Zeroable};
 use lighting_suite::bed::{
-    Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Gate, Item, LEAF, MIRROR, NEAR, PLUME,
-    Particle, ParticleLook, Paths, RT_RANGE, SKY, SUN, Spec, TURBID_WATER, WATER_BOX, WHITE_SPHERE,
-    assert_gate, fresnel, look, pixel_of, plume_volume, water_transmission,
+    Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Gate, Item, LEAF, MILK_SPHERE, MIRROR,
+    NEAR, PLUME, Particle, ParticleLook, Paths, RT_RANGE, SKY, SUN, Spec, TURBID_WATER, WATER_BOX,
+    WHITE_SPHERE, assert_gate, fresnel, look, pixel_of, plume_volume, water_transmission,
 };
-use lighting_suite::shaders::{
-    fog_aerial, fog_apply, fog_directional, fog_froxel, fog_froxel_light, fog_particles,
-    froxel_lookup, froxel_probe, segment_probe,
-};
-use lighting_suite::{
-    assert_clean, device, finish, kernels, pipeline, readback, render, require, upload,
-};
+use lighting_suite::shaders::{froxel_lookup, froxel_probe, segment_probe};
+use lighting_suite::{assert_clean, device, finish, pipeline, readback, render, require, upload};
 use orr_color::luminance;
-use orr_gpu::{Allocation, DEFAULT_ENVIRONMENT, Hazards, KernelSet, Stages};
+use orr_gpu::{Allocation, Hazards, KernelSet, Stages};
 use orr_lighting::path_may::{MAY_FROXELS, MAY_VIEW};
 use orr_lighting::{
     AERIAL_SIZE, DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, MediaSettings,
@@ -45,21 +40,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// Kernels with the stock height fog linked as the medium (`media_types.slang`).
 fn fog_kernels() -> &'static KernelSet {
-    static SET: OnceLock<&'static KernelSet> = OnceLock::new();
-    SET.get_or_init(|| {
-        kernels(
-            DEFAULT_ENVIRONMENT,
-            FogGpu::TYPE,
-            &[
-                (&fog_froxel::MODULE, "media/froxel"),
-                (&fog_froxel_light::MODULE, "media/froxel_light"),
-                (&fog_aerial::MODULE, "media/aerial"),
-                (&fog_apply::MODULE, "media/apply"),
-                (&fog_directional::MODULE, "light_sampling/directional"),
-                (&fog_particles::MODULE, "media/particle_draw"),
-            ],
-        )
-    })
+    &lighting_suite::fogged::KERNELS
 }
 
 /// `media_types`' `FogData`: extinction at `base_height`, 1/m, falling by e every
@@ -1252,6 +1233,52 @@ fn particles_under_water_take_its_color() {
                 "near_range {near_range:?}, channel {c}: {got:?} against {wanted:?}"
             );
         }
+    }
+    assert_clean();
+}
+
+/// A milk sphere in the air 2 m up under a sun 60 degrees high, seen by the light leaving through
+/// its walks alone, which media apply leaves as the paths wrote it: the light a walk's way out
+/// takes from the sun crosses the fog outside every interior, which dims it, per channel, by the
+/// fog's transmittance toward the sun from the sphere, 0.57 here.
+#[test]
+fn a_dense_interiors_way_out_takes_the_sun_through_the_fog() {
+    const THICK: Fog = Fog {
+        density: 5e-3,
+        base_height: 0.0,
+        falloff_height: 100.0,
+    };
+    let center = Vec3::new(0.0, 2.0, 0.0);
+    let elevation = 60.0f32;
+    let walked = |fog: &Fog| {
+        let sun = vec![directional(elevation, 30.0, 1_000.0)];
+        let (eye, target) = (center + Vec3::new(0.0, 0.5, 4.0), center);
+        let (mut bed, _fog) = foggy(fog, vec![at(MILK_SPHERE, center)], sun, None, eye, target);
+        let lighting = ViewLighting {
+            debug_view: LightingDebugView::Subsurface,
+            max_bounces: 2,
+            ..ViewLighting::default()
+        };
+        let a = shown(&mut bed, lighting, 64);
+        let mut sum = [0.0f64; 3];
+        for p in &a.mean {
+            for c in 0..3 {
+                sum[c] += f64::from(p[c]);
+            }
+        }
+        sum
+    };
+    let (fogged, clear) = (walked(&THICK), walked(&CLEAR));
+    let depth = f64::from(THICK.density * THICK.falloff_height)
+        * (-f64::from(center.y - THICK.base_height) / f64::from(THICK.falloff_height)).exp()
+        / f64::from(elevation.to_radians().sin());
+    let want = (-depth).exp();
+    for c in 0..3 {
+        let through = fogged[c] / clear[c];
+        assert!(
+            (through - want).abs() < 0.02 * want,
+            "channel {c}: the fog passes {through:.4} of the walks' light, its transmittance toward the sun {want:.4}"
+        );
     }
     assert_clean();
 }
