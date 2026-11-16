@@ -34,26 +34,23 @@ public static const uint LEAN_FROM_WORD = 18;
 // surface's draw there.
 public static const uint LEAN_INTO_WORD = LEAN_EXIT_WORD;
 [Host] public static const uint LEAN_HOT_BYTES = 16 * LEAN_HOT_WORDS;
-// The words a path keeps where the pipeline may meet a plane stack, apart from its cold ones: the
-// interior list a directional job's walk through a stack works on, which the vertex that left the
-// job gives where the job lies in an interior (`STACK_LIST_WORD`, as the cold list holds one); the
-// walk's leg, from its origin along its direction (`STACK_LEG_WORD`), the point its segment
-// starts from with the stack's normal (`STACK_FROM_WORD`), what the walk let through so far with
-// the ratio of the faces' cosines (`STACK_THROUGH_WORD`), and the light's direction at the vertex
-// and its density there (`STACK_BEND_WORD`); the face a stack ray met, as its hit's shader answers for it
-// (`STACK_FACE_WORD`, two words); what weighs the job's light again where the stack bends it, as
-// the vertex that left the job keeps it (`STACK_BENT_WORD`, four words); and where a path's ray
-// crossed stack faces since its vertex last scattered, that vertex's ray (`STACK_TRACK_WORD`, two
-// words).
-[Host] public static const uint LEAN_STACK_WORDS = 17;
+// The words a path keeps where the pipeline may meet a plane stack, apart from its cold ones, for
+// what passes between its shaders through a directional job's walk through a stack: the interior
+// list the walk works on, which the vertex that left the job gives where the job lies in an
+// interior (`STACK_LIST_WORD`, as the cold list holds one); the point the walk's segment starts
+// from with the stack's normal (`STACK_FROM_WORD`), what the walk let through so far with the
+// ratio of the faces' cosines (`STACK_THROUGH_WORD`), and the light's direction at the vertex and
+// its density there (`STACK_BEND_WORD`); what weighs the job's light again where the stack bends
+// it, as the vertex that left the job keeps it (`STACK_BENT_WORD`, four words); and where a path's
+// ray crossed stack faces since its vertex last scattered, that vertex's ray (`STACK_TRACK_WORD`,
+// two words). The face a stack ray meets and the walk's next leg pass in payloads.
+[Host] public static const uint LEAN_STACK_WORDS = 14;
 public static const uint STACK_LIST_WORD = 0;
-public static const uint STACK_LEG_WORD = 5;
-public static const uint STACK_FROM_WORD = 6;
-public static const uint STACK_THROUGH_WORD = 7;
-public static const uint STACK_BEND_WORD = 8;
-public static const uint STACK_FACE_WORD = 9;
-public static const uint STACK_BENT_WORD = 11;
-public static const uint STACK_TRACK_WORD = 15;
+public static const uint STACK_FROM_WORD = 5;
+public static const uint STACK_THROUGH_WORD = 6;
+public static const uint STACK_BEND_WORD = 7;
+public static const uint STACK_BENT_WORD = 8;
+public static const uint STACK_TRACK_WORD = 12;
 // The last lane of the walk's segment start where the job's list is the path's cold list, which
 // the walk copies, or that list out of the interior a walk of the path's goes through, whose
 // material its walk words keep: a meeting's job lies outside it.

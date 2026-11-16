@@ -194,11 +194,27 @@ void stack_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior, 
     // What the legs' shadow rays let through.
     float3 through = float3(1.0);
     bool lit = false;
+    // The face the stack ray met, and the callable's data, whose leg the walk is on.
+    uint4 face = NO_STACK_FACE;
+    StackStep q;
+    q.leg = uint4(0);
     for (uint k = 0; k < STACK_CROSSINGS + 3; k++)
     {
         if (phase > 0 && !probed)
-            met = stack_ray(r, phase == 1 ? path_ray(origin, dir, met_t) : path_ray(ray.Origin, ray.Direction, positive_infinity()), depth, met_t);
+            met = stack_ray(r, phase == 1 ? path_ray(origin, dir, met_t) : path_ray(ray.Origin, ray.Direction, positive_infinity()), depth, met_t, face);
         probed = false;
+        // The step at the face the stack ray met, before the leg's shadow ray up to it, whose
+        // shadow ray then decides whether the light goes on.
+        uint step = STEP_ON;
+        if (phase > 0)
+        {
+            q.words = uint4((phase == 1 ? STEP_START : STEP_LEG) | (met << 4) | (inside ? STEP_INSIDE : 0) | (crossed << STEP_CROSSED_SHIFT), asuint(met_t), 0, 0);
+            q.face = face;
+            call(CALL_STACK, q);
+            step = q.words.x;
+            if (step == STEP_DARK)
+                return;
+        }
         if (phase != 1)
         {
             if (phase == 2)
@@ -236,27 +252,21 @@ void stack_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior, 
             if (!any(through > 0.0))
                 return;
         }
-        Payload q;
-        q.words = uint4((phase == 1 ? STEP_START : STEP_LEG) | (met << 4) | (inside ? STEP_INSIDE : 0) | (crossed << STEP_CROSSED_SHIFT), asuint(met_t), 0, 0);
-        call(CALL_STACK, q);
-        if (q.words.x == STEP_DARK)
-            return;
-        if (q.words.x == STEP_LIT)
+        if (step == STEP_LIT)
         {
             lit = true;
             break;
         }
         if (phase == 1)
         {
-            bends = (q.words.x & STEP_PROBED) == 0;
+            bends = (step & STEP_PROBED) == 0;
             probed = !bends;
         }
         else
             crossed++;
         phase = 2;
         walls = asfloat(q.words.y);
-        uint4 leg = load_coherent(lean_stack(r, slot) + STACK_LEG_WORD);
-        ray = path_ray(asfloat(leg.xyz), probed ? dir : oct_decode_snorm16(leg.w), positive_infinity());
+        ray = path_ray(asfloat(q.leg.xyz), probed ? dir : oct_decode_snorm16(q.leg.w), positive_infinity());
     }
     if (!lit)
         return;
@@ -274,8 +284,8 @@ void stack_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior, 
 
 // What the stack ray `ray` of `slot`'s path met (MET_*), and in `t` where, at path depth `depth`:
 // the nearest opaque surface or solid glass, as `stack_trace` traces it. A dielectric's hit is
-// asked the stack question, whose answer its shader leaves in the stack words.
-uint stack_ray(PathRoot r, RayDesc ray, uint depth, out float t)
+// asked the stack question, whose answer its shader leaves in the payload, and so in `face`.
+uint stack_ray(PathRoot r, RayDesc ray, uint depth, out float t, inout uint4 face)
 {
     RayCone cone = { 0.0, 0.0 };
     Payload p;
@@ -288,6 +298,7 @@ uint stack_ray(PathRoot r, RayDesc ray, uint depth, out float t)
         return MET_OTHER;
     p.words = uint4(0);
     h.invoke(p);
+    face = p.words;
     return MET_FACE;
 }
 
@@ -342,10 +353,10 @@ bool stack_owned(PathRoot r, uint slot, float3 dir)
     uint4 a = load_coherent(at + STACK_TRACK_WORD);
     uint4 b = load_coherent(at + STACK_TRACK_WORD + 1);
     float t;
-    if (stack_ray(r, path_ray(asfloat(a.xyz), dir, positive_infinity()), (b.w >> 24) + 1, t) != MET_FACE)
+    uint4 face = NO_STACK_FACE;
+    if (stack_ray(r, path_ray(asfloat(a.xyz), dir, positive_infinity()), (b.w >> 24) + 1, t, face) != MET_FACE)
         return false;
-    uint4 face = load_coherent(at + STACK_FACE_WORD);
-    return face.w != MATERIAL_NONE && abs(dot(asfloat(face.xyz), oct_decode_snorm16(b.z))) >= STACK_PARALLEL;
+    return face.z != MATERIAL_NONE && abs(dot(oct_decode_snorm16(face.x), oct_decode_snorm16(b.z))) >= STACK_PARALLEL;
 }
 
 // What the thin walls along `ray`, the shadow ray of `slot`'s path in hot words `at` with flags

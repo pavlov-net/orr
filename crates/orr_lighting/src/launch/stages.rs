@@ -189,9 +189,12 @@ impl Spec {
             Role::Hit => (HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS),
             Role::AnyHit => (ANY_HIT_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS),
         };
-        // A hit of a view's camera ray writes the view's G-buffer too.
-        let primary =
-            self.role == Role::Hit && self.geometry.is_some() && self.may & MAY_TRACED != 0;
+        // A hit of a view's camera ray writes the view's G-buffer too, but for a layer's, which
+        // writes none.
+        let primary = self.role == Role::Hit
+            && self.kernel != Kernel::Layer
+            && self.geometry.is_some()
+            && self.may & MAY_TRACED != 0;
         let traced = if primary { TRACED_HIT_INSTRUCTIONS } else { 0 };
         let coated = self.role == Role::Hit && self.may & may2(SceneFeatures::COATED_EMITTERS) != 0;
         let coated = if coated {
