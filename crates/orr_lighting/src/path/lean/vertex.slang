@@ -75,16 +75,20 @@ public void store_interior(SceneRoot* s, uint4* at, Interior i)
     store_coherent(at, i.entries);
     for (uint k = 0; k < INTERIOR_ENTRIES; k++)
         store_coherent(at + 1 + k, asuint(i.points[k]));
-    InteriorMedium im = InteriorMedium();
+    float3 sigma = float3(0.0);
+    float4 scatter = float4(0.0);
     if (i.count > 0)
     {
         uint m = i.innermost();
-        im = interior_medium(s, m, i.point(m));
+        InteriorMedium im = interior_medium(s, m, i.point(m));
+        sigma = im.sigma_t;
+        if (may(MAY_SCATTERING))
+            scatter = float4(im.sigma_s, im.anisotropy);
     }
     uint4* last = at + 1 + INTERIOR_ENTRIES;
-    store_coherent(last, uint4(load_coherent(last).x, asuint(im.sigma_t)));
+    store_coherent(last, uint4(load_coherent(last).x, asuint(sigma)));
     if (may(MAY_SCATTERING))
-        store_coherent(at + LEAN_SCATTER_WORD, asuint(float4(im.sigma_s, im.anisotropy)));
+        store_coherent(at + LEAN_SCATTER_WORD, asuint(scatter));
 }
 
 // The innermost interior of the list whose entries are `entries`, innermost last.
@@ -746,7 +750,7 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
 // surfaces walk where the scene may.
 bool lean_walks(bool layer)
 {
-    return class_has(CLASS_SUBSURFACE) && may(MAY_WALK) && !layer;
+    return !layer && class_has(CLASS_SUBSURFACE) && may(MAY_WALK);
 }
 
 // Stores in a path's cold words `cold` the subsurface walk vertex `x` starts along `wi`, into its
