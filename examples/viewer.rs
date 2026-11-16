@@ -5,18 +5,19 @@
 //! frames in a scene-referred hook. Windowed runs denoise with DLSS ray reconstruction where
 //! NGX is available.
 //!
-//! `viewer [--still] [--frames N] [--headless] [--out file.png]`. Headless runs keep the
-//! camera still, render 480 x 270 for 120 frames unless told otherwise and write the last
-//! frame as a PNG; windowed runs with `--out` write their last frame as the window shows
-//! it, overlay included.
+//! `viewer [--still] [--reference] [--frames N] [--headless] [--out file.png]`. `--reference`
+//! renders the accumulation reference at 64 bounces and 64 dielectric vertices, without DLSS.
+//! Headless runs keep the camera still, render 480 x 270 for 120 frames unless told otherwise
+//! and write the last frame as a PNG; windowed runs with `--out` write their last frame as the
+//! window shows it, overlay included.
 
 use std::time::{Duration, Instant};
 
 use orr::orr_gpu::{Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, TimelinePoint};
 use orr::{
     Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameTime, HookPass, Lens, LitView,
-    Projection, Renderer, RendererDesc, ResolvedDisplay, ScreenshotRequest, TextureFilter,
-    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Projection, ReferenceSettings, Renderer, RendererDesc, ResolvedDisplay, ScreenshotRequest,
+    TextureFilter, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_examples::average::Average;
 use orr_examples::linked::KERNELS;
@@ -35,6 +36,8 @@ const ORBIT_RATE: f64 = 0.2;
 pub(crate) const STILL_ANGLE: f64 = 1.3;
 /// Frames a still camera renders before it starts averaging, while exposure settles.
 const ACCUMULATE_AFTER: u64 = 30;
+/// The reference's bounces and dielectric vertices.
+const REFERENCE_DEPTH: u32 = 64;
 
 fn main() {
     let options = Options::from_args();
@@ -65,7 +68,8 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .expect("display")
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
-    if !options.headless {
+    let reference = options.has("--reference");
+    if !options.headless && !reference {
         enable_dlss(&mut renderer);
     }
     let _workers = Workers::machine(renderer.loading());
@@ -94,6 +98,16 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     let capture = options.headless || options.out.is_some();
     let still = options.headless || options.has("--still");
     let mut average = Average::new(&mut renderer, gpu, desc.frames_in_flight, ACCUMULATE_AFTER);
+    let lighting = if reference {
+        ViewLighting {
+            max_bounces: REFERENCE_DEPTH,
+            dielectric_depth: REFERENCE_DEPTH,
+            reference: Some(ReferenceSettings::default()),
+            ..ViewLighting::default()
+        }
+    } else {
+        ViewLighting::default()
+    };
     let frames = options
         .frames
         .or_else(|| options.headless.then_some(HEADLESS_FRAMES));
@@ -171,7 +185,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             target,
         };
         let output = ViewOutput::default();
-        let lighting = ViewLighting::default();
         f.prepare_view(&view, &lighting, &output)
             .expect("prepare view");
         f.update_scenes(&mut |c| showcase.sky.record(c, &[]).expect("sky passes"))
