@@ -3156,18 +3156,30 @@ const NOISE_BLOCK: u32 = 8;
 /// micromaps; coverage wrong only in the shadow it casts starts at 2.0.
 const BLOCK_MARGIN: f64 = 1.6;
 
-/// Rms over [`NOISE_BLOCK`] pixel blocks of the difference in mean luminance of `a` and `b`.
-fn block_difference(a: &Accumulated, b: &Accumulated) -> f64 {
+/// The difference in mean luminance of `a` and `b` over each [`NOISE_BLOCK`] pixel block.
+fn block_differences(a: &Accumulated, b: &Accumulated) -> Vec<f64> {
     let half = NOISE_BLOCK / 2;
     let [columns, rows] = EXTENT.map(|e| e / NOISE_BLOCK);
     let block = |image: &Accumulated, at| orr_color::luminance(DVec3::from(image.around(at, half)));
-    let squares = (0..columns * rows)
+    (0..columns * rows)
         .map(|i| {
             let at = (UVec2::new(i % columns, i / columns) * NOISE_BLOCK + half).as_vec2();
-            (block(a, at) - block(b, at)).powi(2)
+            block(a, at) - block(b, at)
         })
-        .sum::<f64>();
-    (squares / f64::from(columns * rows)).sqrt()
+        .collect()
+}
+
+/// Rms over [`NOISE_BLOCK`] pixel blocks of the difference in mean luminance of `a` and `b`.
+fn block_difference(a: &Accumulated, b: &Accumulated) -> f64 {
+    let d = block_differences(a, b);
+    (d.iter().map(|d| d * d).sum::<f64>() / d.len() as f64).sqrt()
+}
+
+/// The largest difference in mean luminance of `a` and `b` over a [`NOISE_BLOCK`] pixel block.
+fn block_max_difference(a: &Accumulated, b: &Accumulated) -> f64 {
+    block_differences(a, b)
+        .iter()
+        .fold(0.0, |m: f64, d| m.max(d.abs()))
 }
 
 /// Asserts `a` shows what `b` shows up to sampling noise, where `a` has `b`'s seed and `noise`
@@ -3423,10 +3435,11 @@ pub struct Gate<'a> {
 
 /// `gate`'s scene renders through the pipelines of `kernels` made for exactly what it and its
 /// settings may meet as through the ones that may meet everything, and the pipeline each of the
-/// gate's sources ran holds the gate's bits. The two sets of shaders are compiled apart, so a
-/// path can round apart by its last bits and, at a draw that falls on a threshold, take another
-/// branch: under a thousandth of the pixels may differ, with the images' means the same. A
-/// feature a mask left out changes every pixel it lights.
+/// gate's sources ran holds the gate's bits. The two sets of shaders are compiled apart and need
+/// not round alike: a draw that falls near a threshold can tip the other way and send its path
+/// elsewhere, so the two images at one seed agree up to sampling noise, not pixel for pixel. A
+/// feature a mask left out changes every pixel it lights, a bias that lifts the images' block
+/// means past the noise between two seeds of the general pipeline.
 pub fn assert_gate(kernels: &KernelSet, gate: &Gate<'_>) {
     let mut beds = [(gate.bed)(), (gate.bed)()];
     let frames = beds.iter().map(Bed::frames_begun).max().unwrap();
@@ -3437,6 +3450,9 @@ pub fn assert_gate(kernels: &KernelSet, gate: &Gate<'_>) {
         paths.specialize = specialize;
         let _kept = (gate.setup)(bed, &mut paths);
         images.push(render_paths(bed, &paths, 4, 1));
+        if !specialize {
+            images.push(render_paths(bed, &paths, 4, 2));
+        }
     }
     let ran = beds[1].view().paths_ran().expect("the paths ran");
     for &held in gate.held {
@@ -3453,26 +3469,21 @@ pub fn assert_gate(kernels: &KernelSet, gate: &Gate<'_>) {
             held & !may
         );
     }
-    let apart = images[0]
-        .mean
-        .iter()
-        .zip(&images[1].mean)
-        .filter(|(a, b)| {
-            a.iter()
-                .zip(*b)
-                .any(|(a, b)| (a - b).abs() > 1e-3 * a.abs().max(b.abs()))
-        })
-        .count();
-    assert!(
-        apart * 1000 <= images[0].mean.len(),
-        "{}: the specialized pipelines changed {apart} pixels",
-        gate.what
+    let [general, noise, specialized] = &images[..] else {
+        unreachable!("three images")
+    };
+    assert_within_noise(gate.what, specialized, general, noise, 1.25);
+    // A feature that lights a few blocks, such as a shadow, moves the blocks' rms too little to
+    // stand out: no block may lie farther from the general image than the farthest does between
+    // its seeds.
+    let (far, floor) = (
+        block_max_difference(specialized, general),
+        block_max_difference(noise, general),
     );
-    assert_close(
-        gate.what,
-        image_mean(&images[1]),
-        image_mean(&images[0]),
-        1e-4,
+    assert!(
+        far <= BLOCK_MARGIN * floor,
+        "{}: a block {far} from the general pipeline's, {floor} at most between seeds",
+        gate.what
     );
 }
 
