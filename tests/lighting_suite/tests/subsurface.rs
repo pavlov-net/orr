@@ -4,9 +4,9 @@
 //! spheres with dense scattering interiors.
 
 use lighting_suite::bed::{
-    Accumulated, Bed, DenseInterior, EXTENT, FURNACE_RADIANCE, Item, JADE, JADE_SPHERE, MILK,
-    MILK_SPHERE, Paths, ROUGH_JADE_ROUGHNESS, ROUGH_JADE_SPHERE, Spec, WALK_FURNACE, WALK_SLABS,
-    WALK_SPHERE, look,
+    Accumulated, Bed, DenseInterior, EXTENT, FURNACE_RADIANCE, Item, JADE, JADE_SLAB,
+    JADE_SLAB_THICKNESS, JADE_SPHERE, MILK, MILK_SPHERE, Paths, ROUGH_JADE_ROUGHNESS,
+    ROUGH_JADE_SPHERE, Spec, WALK_FURNACE, WALK_SLABS, WALK_SPHERE, look,
 };
 use lighting_suite::shaders::walk_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
@@ -419,17 +419,21 @@ fn a_lit_sphere_matches_the_cpu_walk(paths: &Paths) {
     assert!(e < 0.02, "sphere: GPU {gpu:?}, CPU {cpu:?} ({e:.4})");
 }
 
+/// The CPU walks of `interior` in `shape` as `paths` walk it with surface roughness `roughness`:
+/// the reference takes a sun through a rough surface wherever a walk meets it, and so do the
+/// pipeline's real-time walks, whose way out of a smooth surface weighs it by the exit lobe
+/// conditioned on the walk's last scatter.
 fn cpu_dielectric(
+    paths: &Paths,
     interior: &DenseInterior,
-    radius: f32,
+    shape: Shape,
     roughness: f32,
-    exact_sun: bool,
 ) -> DielectricWalks {
+    let pipeline = paths.entry == PathEntry::Pipeline;
+    let real_time = paths.settings.reference.is_none();
     let (extinction, albedo) = interior.rec2020();
     DielectricWalks {
-        shape: Shape::Sphere {
-            radius: f64::from(radius),
-        },
+        shape,
         medium: Medium {
             extinction,
             albedo,
@@ -437,7 +441,8 @@ fn cpu_dielectric(
             surface_ior: f64::from(interior.ior),
         },
         roughness: f64::from(roughness),
-        exact_sun,
+        exact_sun: !real_time || (roughness > 0.0 && pipeline),
+        conditioned: real_time && roughness == 0.0 && pipeline,
     }
 }
 
@@ -480,11 +485,10 @@ fn interior_matches_the_cpu_walk_over(
 ) {
     let (eye, target, fov_y) = (Vec3::new(0.0, 1.2, 4.0) * radius, Vec3::ZERO, 0.6);
     let pixels = sphere_pixels(eye, target, fov_y, radius);
-    // The reference takes a sun through a rough surface wherever a walk meets it, and so do the
-    // pipeline's real-time walks.
-    let exact = paths.settings.reference.is_some()
-        || (roughness > 0.0 && paths.entry == PathEntry::Pipeline);
-    let cpu = cpu_dielectric(interior, radius, roughness, exact);
+    let shape = Shape::Sphere {
+        radius: f64::from(radius),
+    };
+    let cpu = cpu_dielectric(paths, interior, shape, roughness);
     for &what in lighting {
         let (lights, environment, light) = match what {
             Lighting::Uniform => (
@@ -523,8 +527,70 @@ fn interior_matches_the_cpu_walk_over(
     }
 }
 
+/// A sun straight below [`JADE_SLAB`], seen through its top face at 45 degrees, through the
+/// real-time walk within `tolerance` of the CPU walk. Walks that leave its thin slab through the
+/// bottom face mostly last scattered near it, so an exit lobe that takes the light inside as
+/// uniform gets them two to three times too bright.
+fn a_thin_slab_lit_from_behind_matches_the_cpu_walk(paths: &Paths, tolerance: f64) {
+    let (eye, target, fov_y) = (Vec3::new(0.0, 1.0, 1.0), Vec3::ZERO, 0.6);
+    let e = local(eye);
+    let mut pixels = Vec::new();
+    for y in 0..EXTENT[1] {
+        for x in 0..EXTENT[0] {
+            let d = local(pixel_ray(
+                eye,
+                target,
+                fov_y,
+                f64::from(x) + 0.5,
+                f64::from(y) + 0.5,
+            ));
+            let p = e - d * (e.z / d.z);
+            if d.z < 0.0 && p.x.abs() < 1.0 && p.y.abs() < 1.0 {
+                pixels.push(((y * EXTENT[0] + x) as usize, p, -d));
+            }
+        }
+    }
+    let direction = Vec3::NEG_Y;
+    let spec = Spec {
+        copies: vec![Item {
+            model: JADE_SLAB,
+            linear: Mat3::IDENTITY,
+            at: Vec3::ZERO,
+        }],
+        lights: vec![Light::Directional(DirectionalLight {
+            direction_to_light: direction,
+            ..sun()
+        })],
+        environment: None,
+        eye,
+        target,
+        fov_y,
+        focus: None,
+    };
+    let image = render_spec(paths, spec, 128);
+    let gpu = mean_rgb(&image, pixels.iter().map(|p| p.0));
+    let shape = Shape::Slab {
+        thickness: f64::from(JADE_SLAB_THICKNESS),
+    };
+    let light = CpuLight::Sun {
+        direction: local(direction),
+        illuminance: DVec3::splat(f64::from(SUN_LUX)),
+    };
+    let want = cpu_dielectric(paths, &JADE, shape, 0.0).mean(2_000_000, light, 23, |rng| {
+        let (_, p, v) = pixels[(rng.f64() * pixels.len() as f64) as usize];
+        (p, DVec3::Z, v)
+    });
+    let e = relative(gpu, want);
+    assert!(
+        e < tolerance,
+        "the thin slab lit from behind: GPU {gpu:?}, CPU {want:?} ({e:.4})"
+    );
+}
+
 /// Uniform light through the reference, and a sun through the real-time walk. The reference ends
 /// a walk where it meets the surface, so each stretch of a walk between two meetings is a bounce.
+/// Both tracers read the milk sphere under the sun 1 % darker than the CPU walk, the blue 1.5 %,
+/// over 1024 frames as over 128.
 #[test]
 fn dense_interiors_walk_as_the_cpu_walk_does() {
     let mut paths = Paths::new(
@@ -532,7 +598,7 @@ fn dense_interiors_walk_as_the_cpu_walk_does() {
         PathEntry::Compute,
         settings(LightingDebugView::Subsurface),
     );
-    for (model, interior) in [(MILK_SPHERE, &MILK), (JADE_SPHERE, &JADE)] {
+    for (model, interior, sunlit) in [(MILK_SPHERE, &MILK, 0.03), (JADE_SPHERE, &JADE, 0.02)] {
         paths.settings.reference = Some(ReferenceSettings::default());
         paths.settings.max_bounces = REFERENCE_BOUNCES;
         let uniform = [Lighting::Uniform];
@@ -540,8 +606,9 @@ fn dense_interiors_walk_as_the_cpu_walk_does() {
         paths.settings.reference = None;
         paths.settings.max_bounces = 2;
         let sun = [Lighting::Sun];
-        interior_matches_the_cpu_walk(&paths, model, interior, 0.0, 1.0, &sun, 0.02);
+        interior_matches_the_cpu_walk(&paths, model, interior, 0.0, 1.0, &sun, sunlit);
     }
+    a_thin_slab_lit_from_behind_matches_the_cpu_walk(&paths, 0.03);
     assert_clean();
 }
 

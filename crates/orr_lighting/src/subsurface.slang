@@ -251,6 +251,14 @@ public bool walk_reached(Walk e, WalkDraw d, float t, out float3 reached)
     return mix >= F32_MIN_NORMAL;
 }
 
+// The throughput of walk `e` over the chance that its step `d` reaches a surface `t` along, times
+// the least dense channel's transmittance over the step: `walk_reached`'s throughput there before
+// the transmittance `walk_excess` gives each channel.
+public float3 walk_unattenuated(Walk e, WalkDraw d, float t)
+{
+    return e.throughput / dot(d.choose, exp(-walk_excess(e) * t));
+}
+
 // Step `d` of walk `e` reached a surface `t` along and did `met` there: true where the walk goes
 // on, else it ended with `met.kind`.
 public bool walk_met(inout Walk e, WalkDraw d, float t, WalkMeet met)
