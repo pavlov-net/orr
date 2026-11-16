@@ -85,6 +85,12 @@ export __extern_cpp float lighting_interior_rough_transmission(float alpha, floa
     return interior_rough_transmission(alpha, eta, load3(v), load3(l), *pdf);
 }
 
+// `rough_way_in` of GGX `alpha` and IOR `ior` for light along `s`, in its frame.
+export __extern_cpp void lighting_rough_way_in(float alpha, float ior, float* s, float* u, float even, float* r, float* pdf)
+{
+    store3(r, rough_way_in(alpha, ior, load3(s), load3(u), even, *pdf));
+}
+
 export __extern_cpp float lighting_dispersed_ior(float ior, float scale, float abbe, float nm)
 {
     return dispersed_ior(ior, scale, abbe, nm);

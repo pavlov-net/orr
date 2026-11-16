@@ -1481,6 +1481,28 @@ public float interior_rough_transmission(float alpha, float eta, float3 v, float
     return InteriorRoughTransmission(alpha, eta, float3(0.0, 0.0, 1.0), v).value(l, pdf);
 }
 
+// A way in through the surface of a plain transmitting dielectric of GGX `alpha`, whose medium is
+// `ior` times the IOR outside, for light from outside along `s`, in a frame whose z is the
+// surface's normal out of the medium: light refracted in through a normal visible from `s`, or for
+// a share `even` of the draws, evenly over the hemisphere below, where the multiple scattering's
+// transmission reaches too. Its density goes in `pdf`; `u` holds three uniform numbers.
+public float3 rough_way_in(float alpha, float ior, float3 s, float3 u, float even, out float pdf)
+{
+    float2 a = float2(alpha);
+    float3 r = u.z < even ? mirrored(sample_uniform_hemisphere(u.xy)) : refract(-s, openpbr_sample_aniso_ggx_smith_vndf(a, s, u.xy), 1.0 / ior);
+    // The normal that refracts `s` into `r` lies along `s + ior r`, on the side of `s`.
+    float3 h = normalize(s + ior * r);
+    if (h.z < 0.0)
+        h = -h;
+    float sh = dot(s, h);
+    float rh = dot(r, h);
+    float visible = 0.0;
+    if (sh > 0.0 && rh < 0.0)
+        visible = openpbr_eval_aniso_smith_g1(s, a) * sh * openpbr_eval_aniso_ggx(h, a) / s.z * sq(ior) * -rh / sq(sh + ior * rh);
+    pdf = even * INV_TWO_PI + (1.0 - even) * visible;
+    return r;
+}
+
 // A `Bsdf` for a path that has no vertex yet.
 public Bsdf bsdf_unprepared()
 {

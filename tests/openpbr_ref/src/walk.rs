@@ -198,6 +198,29 @@ pub fn walk_channel(
     walk_exit(shape, medium, c, p, w, max_steps, rng).map(|e| (e.normal, e.throughput))
 }
 
+/// GGX's density of normals at `h`, about +z.
+fn ggx_d(alpha: f64, h: DVec3) -> f64 {
+    let a2 = alpha * alpha;
+    let d = h.z * h.z * (a2 - 1.0) + 1.0;
+    a2 / (PI * d * d)
+}
+
+/// Smith's masking of `v` over GGX normals about +z.
+fn ggx_g1(alpha: f64, v: DVec3) -> f64 {
+    let z2 = v.z * v.z;
+    2.0 / (1.0 + (1.0 + alpha * alpha * (1.0 - z2) / z2).sqrt())
+}
+
+/// A visible GGX normal about +z seen from `v` (above the plane), by spherical caps.
+fn sample_vndf(alpha: f64, v: DVec3, u: [f64; 2]) -> DVec3 {
+    let vh = DVec3::new(alpha * v.x, alpha * v.y, v.z).normalize();
+    let phi = TAU * u[0];
+    let z = (1.0 - u[1]) * (1.0 + vh.z) - vh.z;
+    let sin = (1.0 - z * z).max(0.0).sqrt();
+    let c = DVec3::new(sin * phi.cos(), sin * phi.sin(), z) + vh;
+    DVec3::new(alpha * c.x, alpha * c.y, c.z).normalize()
+}
+
 /// Henyey-Greenstein's density of `g` at cosine `c`, per steradian.
 fn hg(g: f64, c: f64) -> f64 {
     (1.0 - g * g) / (4.0 * PI * (1.0 + g * g - 2.0 * g * c).powf(1.5))
@@ -469,12 +492,24 @@ impl DielectricWalks {
     /// The Fresnel transmission from a sun at cosine `cos` over its cosine-weighted mean: the
     /// real-time way out's weight of a sun.
     fn exit_lobe(&self, cos: f64) -> f64 {
+        (1.0 - fresnel(self.medium.surface_ior, cos)) / self.exit_mean()
+    }
+
+    /// The Fresnel transmission from outside's cosine-weighted mean.
+    fn exit_mean(&self) -> f64 {
         let ior = self.medium.surface_ior;
-        let mean = (0..16)
+        (0..16)
             .map(|i| 1.0 - fresnel(ior, ((f64::from(i) + 0.5) / 16.0).sqrt()))
             .sum::<f64>()
-            / 16.0;
-        (1.0 - fresnel(ior, cos)) / mean
+            / 16.0
+    }
+
+    /// The exit lobe of a smooth surface seen from inside, at cosine `cos` to its normal: the
+    /// Fresnel transmission out times the cosine, over its integral over the hemisphere inside,
+    /// which is the outside's over the IOR squared.
+    fn inner_lobe(&self, cos: f64) -> f64 {
+        let ior = self.medium.surface_ior;
+        (1.0 - fresnel(1.0 / ior, cos)) * cos * ior * ior / (PI * self.exit_mean())
     }
 
     /// What the exit lobe of channel `c`'s way out `e` is weighed by toward a sun along `s`,
@@ -605,6 +640,9 @@ impl DielectricWalks {
         let (sigma, albedo) = (self.medium.extinction[c], self.medium.albedo[c]);
         let mut throughput = 1.0;
         let mut out = 0.0;
+        // The scatter the walk's step started from, the direction it reached it along and the
+        // walk's throughput there, where its step started from one.
+        let mut last: Option<(DVec3, DVec3, f64)> = None;
         loop {
             let t = -(1.0 - rng.f64()).ln() / sigma;
             let (tb, nb) = self.shape.exit(p, w);
@@ -618,6 +656,7 @@ impl DielectricWalks {
                     let f = bsdf.eval(to_local(direction, nb).as_vec3().to_array());
                     out += throughput * f64::from(f.total()[c]) * illuminance[c];
                 }
+                let arrived = throughput;
                 let u = [rng.f32(), rng.f32(), rng.f32()];
                 let Some(s) = bsdf.sample(u) else {
                     return out;
@@ -625,6 +664,50 @@ impl DielectricWalks {
                 throughput *= f64::from(s.weight[c]);
                 let wi = to_world(DVec3::from_array(s.wi.map(f64::from)), nb).normalize();
                 if s.wi[2] > 0.0 {
+                    if let Some((direction, illuminance)) = light.sun()
+                        && self.conditioned
+                    {
+                        // Fresh draws from here until one leaves, as many as one over the chance
+                        // that a draw leaves on average.
+                        let mut draws = 1.0;
+                        while !bsdf
+                            .sample([rng.f32(), rng.f32(), rng.f32()])
+                            .is_some_and(|s| s.wi[2] > 0.0)
+                        {
+                            draws += 1.0;
+                        }
+                        let sun = match last {
+                            // The scatter's light through the plane over the density of the step
+                            // to here, the share of it that a smooth surface's exit lobe from
+                            // inside gives: none past the critical angle, where the draws are many
+                            // and the steps rare.
+                            Some((at, into, scattered)) => {
+                                let step = p - at;
+                                let length = step.length();
+                                let way = step / length;
+                                let density = hg(self.medium.anisotropy, into.dot(way))
+                                    * (-sigma * length).exp();
+                                scattered * self.inner_lobe(way.dot(nb)) / density
+                                    * self.through_plane(
+                                        bsdf,
+                                        c,
+                                        into,
+                                        nb,
+                                        step.dot(nb),
+                                        direction,
+                                        rng,
+                                    )
+                            }
+                            None if nb.dot(direction) > 0.0 => {
+                                let f = bsdf.eval(to_local(direction, nb).as_vec3().to_array());
+                                arrived * f64::from(f.total()[c])
+                            }
+                            None => 0.0,
+                        };
+                        return out
+                            + draws * sun * illuminance[c]
+                            + throughput * uniform_radiance(light)[c];
+                    }
                     return out
                         + throughput
                             * match light.sun() {
@@ -641,6 +724,7 @@ impl DielectricWalks {
                             };
                 }
                 w = wi;
+                last = None;
                 continue;
             }
             p += w * t;
@@ -651,8 +735,70 @@ impl DielectricWalks {
                 }
                 throughput = 0.05;
             }
+            last = Some((p, w, throughput));
             w = sample_hg(w, self.medium.anisotropy, rng);
         }
+    }
+
+    /// One estimate of what channel `c`'s walk from a scatter `depth` below the plane of the rough
+    /// surface's outward normal `n`, reached along `into`, carries out through that plane toward a
+    /// sun along `s` on its next step, unit illuminance: a way in from the sun, through a visible
+    /// normal seen from it or, for a share of the draws, evenly over the hemisphere, where the
+    /// multiple scattering's transmission reaches too, and the surface's BSDF from inside along
+    /// that way.
+    #[allow(clippy::too_many_arguments)]
+    fn through_plane(
+        &self,
+        bsdf: &mut Reference,
+        c: usize,
+        into: DVec3,
+        n: DVec3,
+        depth: f64,
+        s: DVec3,
+        rng: &mut Rng,
+    ) -> f64 {
+        const EVEN: f64 = 0.1;
+        let sl = to_local(s, n);
+        if sl.z <= 0.0 {
+            return 0.0;
+        }
+        let ior = self.medium.surface_ior;
+        let alpha = self.roughness * self.roughness;
+        // The density of the way `r` in, below the plane, as the sun refracted through a visible
+        // normal.
+        let visible = |r: DVec3| {
+            let h = -(sl + r * ior);
+            let h = (h * h.z.signum()).normalize();
+            let (sh, rh) = (sl.dot(h), r.dot(h));
+            if sh <= 0.0 || rh >= 0.0 {
+                return 0.0;
+            }
+            ggx_g1(alpha, sl) * sh * ggx_d(alpha, h) / sl.z * ior * ior * -rh
+                / (sh + ior * rh).powi(2)
+        };
+        let r = if rng.f64() < EVEN {
+            let (z, phi) = (rng.f64(), TAU * rng.f64());
+            let sine = (1.0 - z * z).max(0.0).sqrt();
+            DVec3::new(sine * phi.cos(), sine * phi.sin(), -z)
+        } else {
+            let h = sample_vndf(alpha, sl, [rng.f64(), rng.f64()]);
+            let sh = sl.dot(h);
+            let eta = 1.0 / ior;
+            let k = 1.0 - eta * eta * (1.0 - sh * sh);
+            -sl * eta + h * (eta * sh - k.sqrt())
+        };
+        let pdf = EVEN / TAU + (1.0 - EVEN) * visible(r);
+        let toward = -to_world(r, n).normalize();
+        let cosine = toward.dot(n);
+        if cosine <= 0.0 {
+            return 0.0;
+        }
+        bsdf.prepare(&self.surface(), to_local(-toward, n).as_vec3().to_array());
+        let f = f64::from(bsdf.eval(sl.as_vec3().to_array()).total()[c]);
+        hg(self.medium.anisotropy, into.dot(toward))
+            * (-self.medium.extinction[c] * depth / cosine).exp()
+            * f
+            / pdf
     }
 
     /// The mean of [`Self::radiance`] over `count` estimates, each at a boundary point, its
@@ -679,11 +825,52 @@ pub fn cosine_direction(rng: &mut Rng) -> DVec3 {
 }
 
 /// In a furnace, a thick slab behind an index-matched interface returns the subsurface
-/// color, as adobe's volume mapping intends. A smooth dense interior's way out, conditioned on
-/// the walk's last scatter, lets in what the walks' own ways out send into a sun's disc.
+/// color, as adobe's volume mapping intends. A dense interior's way out, conditioned on the walk's
+/// last scatter, lets in what the walks' own ways out send into a sun's disc where its surface is
+/// smooth, and what next-event estimation at every meeting takes where it is rough.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rough jade slab's way out, seen from 45 degrees, weighs a sun by the walk's last scatter
+    /// through the surface's plane: on a half space under a low sun opposite the view, and
+    /// through a slab 0.3 m thick lit from behind, within noise of the light the surface lets in
+    /// wherever a walk meets it, whose second moment is some fifteen times as large.
+    #[test]
+    fn a_rough_way_out_through_the_plane_lets_in_what_every_meeting_does() {
+        let medium = Medium {
+            extinction: DVec3::new(7.5, 4.3, 5.9),
+            albedo: DVec3::new(0.64, 0.93, 0.76),
+            anisotropy: 0.3,
+            surface_ior: 1.6,
+        };
+        let view = DVec3::new(0.0, 1.0, 1.0).normalize();
+        let cases = [
+            (f64::INFINITY, DVec3::new(0.0, -0.87, 0.5).normalize()),
+            (0.3, DVec3::NEG_Z),
+        ];
+        for (i, (thickness, direction)) in cases.into_iter().enumerate() {
+            let walks = |exact_sun, conditioned| DielectricWalks {
+                shape: Shape::Slab { thickness },
+                medium,
+                roughness: 0.35,
+                exact_sun,
+                conditioned,
+            };
+            let sun = Light::Sun {
+                direction,
+                illuminance: DVec3::ONE,
+            };
+            let at = |_: &mut Rng| (DVec3::ZERO, DVec3::Z, view);
+            let exact = walks(true, false).mean(32_000_000, sun, 7 + i as u64, at);
+            let plane = walks(false, true).mean(8_000_000, sun, 9 + i as u64, at);
+            let error = (plane / exact - 1.0).abs().max_element();
+            assert!(
+                error < 0.015,
+                "slab {thickness} m, sun {direction}: through the plane {plane}, exact {exact}"
+            );
+        }
+    }
 
     /// The way out of a smooth jade slab, seen from 45 degrees, under suns the plain exit lobe
     /// gets wrong: on a half space 6 % too bright under a high sun and 10 % too dark under a low
