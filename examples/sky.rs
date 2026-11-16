@@ -4,9 +4,10 @@
 //! as its environment and medium; both suns and the moon go into the sky-view LUT. The suns move
 //! along their arcs and the moon's phase follows.
 //!
-//! `sky [--still] [--fog] [--frames N] [--headless] [--out file.png]`. `--fog` adds a layer of
-//! height fog. Headless runs keep the lights and the camera still, render 480 x 270 for 120
-//! frames unless told otherwise and write the last frame as a PNG.
+//! `sky [--still] [--fog] [--reference] [--frames N] [--headless] [--out file.png]`. `--fog`
+//! adds a layer of height fog. `--reference` renders the accumulation reference at 64 bounces
+//! and 64 dielectric vertices. Headless runs keep the lights and the camera still, render
+//! 480 x 270 for 120 frames unless told otherwise and write the last frame as a PNG.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,9 +20,9 @@ use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     DirectionalLight, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, HookPass,
-    InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource, Projection, Renderer,
-    RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
-    TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource, Projection,
+    ReferenceSettings, Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest,
+    TextureFilter, TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_atmosphere::presets::{LUNAR_ANGULAR_RADIUS, lunar_albedo, lunar_disc, solar_disc};
 use orr_atmosphere::{Atmosphere, AtmosphereState, HeightFog};
@@ -43,6 +44,8 @@ const HEADLESS_FRAMES: u64 = 120;
 const FIRST_FRAME: u64 = 500;
 /// Frames a still camera renders before it starts averaging, while exposure settles.
 const ACCUMULATE_AFTER: u64 = 30;
+/// The reference's bounces and dielectric vertices.
+const REFERENCE_DEPTH: u32 = 64;
 const FOV_Y: f32 = 0.8;
 const EYE: Vec3 = Vec3::new(0.0, 2.0, 12.0);
 const TARGET: Vec3 = Vec3::new(0.0, 5.0, 0.0);
@@ -241,6 +244,16 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     let capture = options.headless || options.out.is_some();
     let still = options.headless || options.has("--still");
     let mut average = Average::new(&mut renderer, gpu, desc.frames_in_flight, ACCUMULATE_AFTER);
+    let lighting = if options.has("--reference") {
+        ViewLighting {
+            max_bounces: REFERENCE_DEPTH,
+            dielectric_depth: REFERENCE_DEPTH,
+            reference: Some(ReferenceSettings::default()),
+            ..ViewLighting::default()
+        }
+    } else {
+        ViewLighting::default()
+    };
     let frames = options
         .frames
         .or_else(|| options.headless.then_some(HEADLESS_FRAMES));
@@ -316,19 +329,17 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             target,
         };
         let output = ViewOutput::default();
-        f.prepare_view(&view, &ViewLighting::default(), &output)
+        f.prepare_view(&view, &lighting, &output)
             .expect("prepare view");
         f.update_scenes(&mut |c| sky.record(c, &[]).expect("sky passes"))
             .expect("update scenes");
-        let lit = f
-            .view_lit(&view, &ViewLighting::default(), false)
-            .expect("path pipelines");
+        let lit = f.view_lit(&view, &lighting, false).expect("path pipelines");
         let mut average = average.hook(&f, extent, lit);
         let mut hooks = ViewHooks {
             scene_referred: still.then_some(&mut average as &mut dyn FnMut(&mut HookPass<'_, '_>)),
             ..ViewHooks::default()
         };
-        f.render_view(&view, &ViewLighting::default(), &output, &mut hooks)
+        f.render_view(&view, &lighting, &output, &mut hooks)
             .expect("render view");
         last = Some((id, f.end().expect("end frame")));
     }
