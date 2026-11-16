@@ -576,6 +576,7 @@ struct GBufferLight : IVertexLight
 struct HitLight : IVertexLight
 {
     EmitterHit emitter;
+    uint4* cold;
 
     float3 light(PathRoot r, uint4* at, Bsdf b, GSurface g, uint2 pixel, uint4 w0, bool first, uint scattered, bool whole)
     {
@@ -586,7 +587,11 @@ struct HitLight : IVertexLight
         if (first || whole || !(pdf > 0.0) || !(emitter.density > 0.0))
             return e;
         uint4 w1 = load_coherent(at + 1);
-        float3 toward = emitter.point - asfloat(w0.xyz);
+        // A ray ideal windows passed on measures the light from where its vertex left.
+        float3 from = asfloat(w0.xyz);
+        if (may2(MAY2_THIN_DIELECTRICS) && (w0.w & HOT_WINDOW) != 0)
+            from = asfloat(load_coherent(cold + LEAN_FROM_WORD).xyz);
+        float3 toward = emitter.point - from;
         float distance = length(toward);
         float cos_to = distance > 0.0 ? dot(emitter.normal, toward / distance) : 0.0;
         // The vertex the ray left drew its candidates with its local sampler where it was the
@@ -620,7 +625,7 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     // Whether light along the ray counts, as the vertex it left had it.
     bool along = (flags & HOT_COUNTED) != 0;
     bool was_diffuse = (flags & HOT_DIFFUSE) != 0;
-    flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM);
+    flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_WINDOW);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
     float3 throughput = hot_throughput(load_coherent(at + 1));
     // A traced camera ray's path runs on the view's share of pixels, as one that starts on the
@@ -831,6 +836,23 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
         cone.y += delta ? 0.0 : diffuse ? 1.0 : 2.0 * roughness * roughness;
         flags |= HOT_RAY;
         flags = diffuse ? flags | HOT_DIFFUSE : flags & ~HOT_DIFFUSE;
+        uint4 w1 = load_coherent(at + 1);
+        uint left_normal = oct_encode_snorm16(g.normal);
+        float ray_run = mode.count_nee ? run : 0.0;
+        float ray_pdf = delta ? 0.0 : s.pdf;
+        // An ideal window passes the ray on as it reached it, weighed against next-event
+        // estimation as the vertex before it left it, which took the lights past the window
+        // through it.
+        if (LAYER && may2(MAY2_THIN_DIELECTRICS) && delta && (s.lobe & LOBE_TRANSMISSION) != 0 && thin_walled(g))
+        {
+            uint kept = HOT_DIFFUSE | HOT_MEDIUM | HOT_COUNTED;
+            flags = (flags & ~kept) | (w0.w & kept) | HOT_WINDOW;
+            left_normal = w1.y;
+            ray_run = halves(w1.w).y;
+            ray_pdf = asfloat(load_coherent(at + 3)).w;
+            if ((w0.w & HOT_WINDOW) == 0)
+                store_coherent(cold + LEAN_FROM_WORD, uint4(w0.xyz, 0));
+        }
         float3 origin = vertex_origin(x, s.wi);
         // A ray inside an interior keeps the stretch from the surface to its origin, which the
         // medium covers too.
@@ -840,9 +862,9 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
             offset = as_halves(float2(dot(o, o), dot(o, s.wi)));
         }
         store_coherent(at, uint4(asuint(origin), hot_flags(flags, rng.dimension)));
-        store_coherent(at + 1, uint4(oct_encode_snorm16(s.wi), oct_encode_snorm16(g.normal), as_halves(throughput.xy), as_halves(float2(throughput.z, mode.count_nee ? run : 0.0))));
+        store_coherent(at + 1, uint4(oct_encode_snorm16(s.wi), left_normal, as_halves(throughput.xy), as_halves(float2(throughput.z, ray_run))));
         float4 gathered = asfloat(load_coherent(at + 3));
-        store_coherent(at + 3, asuint(float4(gathered.xyz, delta ? 0.0 : s.pdf)));
+        store_coherent(at + 3, asuint(float4(gathered.xyz, ray_pdf)));
     }
     else
         store_coherent(at, uint4(0, 0, 0, hot_flags(flags, rng.dimension)));
@@ -1135,7 +1157,7 @@ public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
     uint4 w1 = load_coherent(at + 1);
     uint flags = w0.w;
     bool along = (flags & HOT_COUNTED) != 0;
-    flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE);
+    flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE | HOT_WINDOW);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
     bool meets = kind == MEDIUM_MEETS;
     bool leaves = kind == MEDIUM_LEAVES || kind == MEDIUM_CAPPED || kind == MEDIUM_LEAVES_ROUGH;
@@ -1353,7 +1375,7 @@ float3 surface_ray_origin(PathRoot r, float3 point, float3 n, float3 dir)
 void lean_exit_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathVertex x, float2 cone, bool capped)
 {
     uint4 w0 = load_coherent(at);
-    uint flags = w0.w & ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE);
+    uint flags = w0.w & ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE | HOT_WINDOW);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
     float3 throughput = hot_throughput(load_coherent(at + 1));
     if (capped)
@@ -1500,7 +1522,7 @@ void lean_hit_as<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial, let
         left = PAYLOAD_EXITS;
     else if (EMITTER)
     {
-        HitLight emits = { no_emitter() };
+        HitLight emits = { no_emitter(), lean_cold(r, slot) };
         if (any(sh.surface.bsdf.emission > 0.0))
             emits.emitter = emitter_hit_of(r.set, sh, traced, h.instance_index(), uint(h.cluster_id()));
         if (LAYER)

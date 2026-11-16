@@ -392,7 +392,7 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
         end_path(at);
         return NEXT_RAY;
     }
-    uint flags = w0.w & ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE);
+    uint flags = w0.w & ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE | HOT_WINDOW);
     bool paused = e.kind == WALK_RUNNING;
     // What the ends below store, each word packed at one site.
     uint way = oct_encode_snorm16(e.dir);

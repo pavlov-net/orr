@@ -605,8 +605,10 @@ fn dense_interiors_walk_as_the_cpu_walk_does() {
 /// back onto the body is too little to see. The sun's shadow jobs leave the interior: where
 /// a very rough jade's walk meets its surface, and where rough glass is lit from inside or its
 /// outer face keeps its job while its ray goes in; their rays lie outside the interior, as the
-/// pane does, and not in the medium the path's ray goes on in. Next-event estimation alone, which
-/// is what the jobs carry.
+/// pane does, and not in the medium the path's ray goes on in: next-event estimation alone, which
+/// is what the jobs carry. In the whole view a BSDF ray the pane passes on to the sun is weighed
+/// against the jobs as the vertex before the pane left it, since the jobs took the sun through the
+/// pane.
 #[test]
 fn a_pane_above_an_interior_passes_the_sun_as_in_the_air() {
     let mut paths = Paths::new(
@@ -620,7 +622,11 @@ fn a_pane_above_an_interior_passes_the_sun_as_in_the_air() {
     let sun_cos = f64::from(SUN_DIRECTION.normalize().y);
     let wanted = 1.0 - fresnel(f64::from(PANE_IOR), sun_cos);
     let mut failures = Vec::new();
-    for model in [VERY_ROUGH_JADE_SPHERE, ROUGH_GLASS_SPHERE] {
+    for (view, model) in [LightingDebugView::NeeOnly, LightingDebugView::None]
+        .into_iter()
+        .flat_map(|v| [(v, VERY_ROUGH_JADE_SPHERE), (v, ROUGH_GLASS_SPHERE)])
+    {
+        paths.settings.debug_view = view;
         let lit = |pane: bool| {
             let mut copies = vec![Item {
                 model,
@@ -647,7 +653,9 @@ fn a_pane_above_an_interior_passes_the_sun_as_in_the_air() {
         };
         let ratio = lit(true) / lit(false);
         if (ratio / wanted - 1.0).abs().max_element() >= 0.02 {
-            failures.push(format!("{model}: the pane passes {ratio:?} of the sun"));
+            failures.push(format!(
+                "{model} in {view:?}: the pane passes {ratio:?} of the sun"
+            ));
         }
     }
     assert!(
