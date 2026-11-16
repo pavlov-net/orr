@@ -67,7 +67,7 @@ void eye_interior(inout Payload p)
 void medium_vertex(inout Payload p)
 {
     ORR_OMM(medium_vertex);
-    lean_medium_vertex<Medium>(root, DispatchRaysIndex().x, asfloat(p.words.x), p.words.y, p.words.w != 0);
+    lean_medium_vertex<Medium>(root, DispatchRaysIndex().x, p.words);
 }
 
 [shader("callable")]

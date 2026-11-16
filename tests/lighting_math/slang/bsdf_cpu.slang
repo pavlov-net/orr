@@ -74,6 +74,17 @@ export __extern_cpp float lighting_bsdf_camera_weight(Inputs* m, float* view, fl
     return camera.weight.x / light.weight.x;
 }
 
+// `interior_rough_scatter` of GGX `alpha` and IOR ratio `eta` from `v`, in its frame.
+export __extern_cpp void lighting_interior_rough_scatter(float alpha, float eta, float* v, float* u, float* l, float* weight)
+{
+    store3(l, interior_rough_scatter(alpha, eta, load3(v), float4(u[0], u[1], u[2], u[3]), *weight));
+}
+
+export __extern_cpp float lighting_interior_rough_transmission(float alpha, float eta, float* v, float* l, float* pdf)
+{
+    return interior_rough_transmission(alpha, eta, load3(v), load3(l), *pdf);
+}
+
 export __extern_cpp float lighting_dispersed_ior(float ior, float scale, float abbe, float nm)
 {
     return dispersed_ior(ior, scale, abbe, nm);

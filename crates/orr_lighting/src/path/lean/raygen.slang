@@ -242,17 +242,35 @@ void end_path(uint4* at)
     store_coherent(at, uint4(0, 0, 0, w0.w & ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA)));
 }
 
+// Where an interior's walk last met the surface it walks in: the point, the surface's outward
+// normal there, the direction the walk reached it along, its throughput there and the weight of
+// what the surface did with it, 0 where the surface's draw was lost. `met` where the surface is
+// rough and the walk stopped there.
+struct RoughMeeting
+{
+    bool met;
+    float3 point;
+    float3 normal;
+    float3 arrival;
+    float3 reached;
+    float weight;
+}
+
 // Runs walk `e` of `slot`'s path in hot words `at` to its end, a trace a step, whose hits run no
 // shader: in interior `owner`, a material, where `interior`, else on copy `owner`. `last` is the
-// hit its last
-// step met. A walk stopped at its cap keeps its throughput: outside the reference the vertex
-// where it leaves takes the subsurface table's share of it.
-void walk_traced(PathRoot r, uint slot, uint4* at, inout Walk e, bool interior, uint owner, inout PathTrail trail, out Traced last)
+// hit its last step met. A walk stopped at its cap keeps its throughput: outside the reference the
+// vertex where it leaves takes the subsurface table's share of it. In real time an interior's walk
+// also stops where it meets a rough surface of its own, still running where it reflects back
+// inside and ended where the surface's draw was lost, so its vertex there can take the light
+// through the surface (`meeting`).
+void walk_traced(PathRoot r, uint slot, uint4* at, inout Walk e, bool interior, uint owner, inout PathTrail trail, out Traced last, out RoughMeeting meeting)
 {
     bool share = !lean_reference(r);
     uint mask = interior ? MASK_OPAQUE | MASK_DIELECTRIC : MASK_OPAQUE;
     uint4 cover = scattered_cover(r, slot, at, mask);
     last = traced_nothing();
+    meeting = { false, float3(0.0), float3(0.0), float3(0.0), float3(0.0), 0.0 };
+    bool rough = interior && share && interior_rough(r.scene, owner);
     for (; e.step < r.sss_max_steps; e.step++)
     {
         WalkDraw d;
@@ -270,11 +288,21 @@ void walk_traced(PathRoot r, uint slot, uint4* at, inout Walk e, bool interior, 
         }
         Boundary b = boundary_of(last);
         WalkMeet met = WalkMeet(WALK_BOUNDARY);
+        bool own = interior && b.triangle && b.material == owner;
         if (!interior)
             met = WalkMeet(on_instance(r.scene, b.instance, owner) ? WALK_BOUNDARY : WALK_NONE);
-        else if (b.triangle && b.material == owner)
-            met = interior_meet(r.scene, r.view, owner, e.ior, b.material, boundary_normal(r.scene, last, b, e.dir), e.origin, e.dir, b.t, !share, e.rng);
-        if (walk_met(e, d, b.t, met))
+        else if (own)
+        {
+            float3 normal = boundary_normal(r.scene, last, b, e.dir);
+            met = interior_meet(r.scene, r.view, owner, e.ior, b.material, normal, e.origin, e.dir, b.t, !share, e.rng);
+            meeting = { rough && met.kind != WALK_BOUNDARY, e.origin + e.dir * b.t, normal, e.dir, float3(0.0), met.kind == WALK_NONE ? 0.0 : met.weight };
+        }
+        bool reaches = walk_reached(e, d, b.t, meeting.reached);
+        meeting.met = meeting.met && reaches;
+        bool goes = walk_went(e, met, meeting.reached, reaches);
+        if (goes && meeting.met)
+            e.step++;
+        if (goes && !meeting.met)
             continue;
         return;
     }
@@ -293,11 +321,18 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
     uint4* cold = lean_cold(r, slot);
     uint owner;
     Walk e = load_walk(cold, r.frame, owner);
-    walk_traced(r, slot, at, e, interior, owner, trail, h);
+    // A walk that stopped at a rough meeting goes on with the steps it took, which the walk words'
+    // last lane keeps.
+    e.step = load_coherent(cold + LEAN_WALK_WORD + 3).w;
+    RoughMeeting meeting;
+    walk_traced(r, slot, at, e, interior, owner, trail, h, meeting);
     trail.walked = true;
     uint4 w0 = load_coherent(at);
     uint4 w1 = load_coherent(at + 1);
-    float3 throughput = hot_throughput(w1) * e.throughput;
+    // At a rough meeting the path takes the walk's throughput where it reached the surface, which
+    // the vertex there weighs by what the surface did with it.
+    float3 throughput = hot_throughput(w1) * (meeting.met ? meeting.reached : e.throughput);
+    bool lost = meeting.met && e.kind == WALK_NONE;
     bool capped = e.kind == WALK_CAP;
     bool reference = lean_reference(r);
     if (capped && reference)
@@ -305,18 +340,24 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
     uint entered = load_coherent(cold + LEAN_ENTERED_WORD).x;
     // The reference ends a path whose walk reached its cap, and so does a walk of an interior the
     // path did not enter through a surface.
-    if (e.kind == WALK_NONE || (capped && (reference || (interior && entered == NO_ENTRY))) || !carries(throughput))
+    if ((e.kind == WALK_NONE && !lost) || (capped && (reference || (interior && entered == NO_ENTRY))) || !carries(throughput))
     {
         end_path(at);
         return NEXT_RAY;
     }
     uint flags = w0.w & ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE);
+    bool paused = e.kind == WALK_RUNNING;
+    // What the ends below store, each word packed at one site.
+    uint way = oct_encode_snorm16(e.dir);
+    uint across = oct_encode_snorm16(meeting.normal);
+    uint arrived = oct_encode_snorm16(meeting.arrival);
+    uint2 carried = uint2(as_halves(throughput.xy), as_halves(float2(throughput.z, !interior || paused || lost ? halves(w1.w).y : 0.0)));
     if (!interior)
     {
         // The walk leaves through the face its last step met, whose shader resolves it for the
         // vertex there, or at its cap where it entered, which the vertex that started it left.
         store_coherent(at, uint4(asuint(e.origin), flags));
-        store_coherent(at + 1, uint4(oct_encode_snorm16(e.dir), w1.y, as_halves(throughput.xy), as_halves(float2(throughput.z, halves(w1.w).y))));
+        store_coherent(at + 1, uint4(way, w1.y, carried));
         trail.chain = false;
         if (capped)
             return NEXT_EXIT;
@@ -324,13 +365,28 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
         invokes = true;
         return NEXT_RAY;
     }
+    if (paused || lost)
+    {
+        // The walk reflected back inside at its rough surface, or ended there: the path's
+        // throughput takes the walk's so far, and a walk that goes on does from its cold words, as
+        // `store_walk_words` keeps them with its steps in the last lane, once the raygen traced
+        // the shadow job the vertex at the meeting leaves.
+        store_coherent(cold + LEAN_WALK_WORD, uint4(asuint(e.origin), owner));
+        store_coherent(cold + LEAN_WALK_WORD + 3, uint4(e.rng.seed, way, e.rng.dimension, e.step));
+        store_coherent(at, uint4(asuint(meeting.point), w0.w));
+        store_coherent(at + 1, uint4(arrived, across, carried));
+        Payload meets;
+        meets.words = uint4(asuint(meeting.weight), MEDIUM_MEETS, 0, 1);
+        call(CALL_MEDIUM, meets);
+        return paused ? NEXT_INTERIOR : NEXT_RAY;
+    }
     float2 cone = halves(load_coherent(at + 2).x);
     if (e.kind == WALK_BOUNDARY)
     {
         // The walk met another surface inside: it shades as the hit of a ray from the walk's last
         // point, which the walk weighed to it.
         store_coherent(at, uint4(asuint(e.origin), flags | HOT_RAY | HOT_MEDIUM | HOT_DIFFUSE));
-        store_coherent(at + 1, uint4(oct_encode_snorm16(e.dir), 0, as_halves(throughput.xy), as_halves(float2(throughput.z, 0.0))));
+        store_coherent(at + 1, uint4(way, 0, carried));
         store_coherent(at + 2, uint4(as_halves(cone), 0, 0, NO_LIGHT));
         float4 gathered = asfloat(load_coherent(at + 3));
         store_coherent(at + 3, asuint(float4(gathered.xyz, 0.0)));
@@ -340,9 +396,13 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
     }
     // The way out, which the callable crosses at, or at its cap the point the path entered by.
     store_coherent(at, uint4(asuint(e.origin), flags));
-    store_coherent(at + 1, uint4(oct_encode_snorm16(e.dir), oct_encode_snorm16(e.normal), as_halves(throughput.xy), as_halves(float2(throughput.z, 0.0))));
+    store_coherent(at + 1, uint4(way, across, carried));
+    // Through a rough surface the vertex there weighs light by the surface seen along the walk's
+    // last step.
     Payload leave;
     leave.words = uint4(0, capped ? MEDIUM_CAPPED : MEDIUM_LEAVES, 0, 1);
+    if (meeting.met)
+        leave.words.xyz = uint3(arrived, MEDIUM_LEAVES_ROUGH, asuint(meeting.weight));
     call(CALL_MEDIUM, leave);
     trail.chain = true;
     return NEXT_RAY;

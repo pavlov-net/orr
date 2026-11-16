@@ -1486,6 +1486,12 @@ public struct InteriorWalk<S : ISurfaces> : IWalkTrace
     }
 }
 
+// Whether material `m`'s surface scatters a walk inside it by its rough BSDF, not as a mirror.
+public bool interior_rough(SceneRoot* scene, uint m)
+{
+    return scene.materials[m].specular_roughness >= MIRROR_ROUGHNESS;
+}
+
 // What a step of the walk in interior `material`, its surface `ior` times the outside's, from
 // `origin` along `dir` does at a face of material `m` with geometric normal `normal` `t` along.
 // A face of the interior's own material seen from inside reflects the walk back or lets it out

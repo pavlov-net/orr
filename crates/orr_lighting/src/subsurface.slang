@@ -239,25 +239,37 @@ public bool walk_draw(inout Walk e, out WalkDraw d)
     return true;
 }
 
-// Step `d` of walk `e` reached a surface `t` along and did `met` there: true where the walk goes
-// on, else it ended with `met.kind`.
-public bool walk_met(inout Walk e, WalkDraw d, float t, WalkMeet met)
+// The throughput of walk `e` where its step `d` reaches a surface `t` along, before what it does
+// there: false where the draw's mix of the channels is too small to divide by.
+public bool walk_reached(Walk e, WalkDraw d, float t, out float3 reached)
 {
-    if (met.kind == WALK_NONE)
-    {
-        walk_end(e);
-        return false;
-    }
     float3 a = exp(-walk_excess(e) * t);
     // The mix holds the hero's share times at least exp(-17), so it falls below the smallest
     // normal float only for a hero a sample of 0 drew at a share near none.
     float mix = dot(d.choose, a);
-    if (!(mix >= F32_MIN_NORMAL))
+    reached = e.throughput * a / mix;
+    return mix >= F32_MIN_NORMAL;
+}
+
+// Step `d` of walk `e` reached a surface `t` along and did `met` there: true where the walk goes
+// on, else it ended with `met.kind`.
+public bool walk_met(inout Walk e, WalkDraw d, float t, WalkMeet met)
+{
+    float3 reached;
+    bool reaches = walk_reached(e, d, t, reached);
+    return walk_went(e, met, reached, reaches);
+}
+
+// `walk_met` of a step that reached the surface with throughput `reached`, where `reaches` (as
+// `walk_reached` gives them).
+public bool walk_went(inout Walk e, WalkMeet met, float3 reached, bool reaches)
+{
+    if (met.kind == WALK_NONE || !reaches)
     {
         walk_end(e);
         return false;
     }
-    e.throughput = e.throughput * a / mix * met.weight;
+    e.throughput = reached * met.weight;
     if (met.kind == WALK_REFLECT)
     {
         e.origin = met.origin;
