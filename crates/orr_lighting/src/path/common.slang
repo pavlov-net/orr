@@ -775,7 +775,15 @@ public bool view_pass_end<S : ISurfaces, E : IEnvironment, M : IMedium>(PathRoot
         start = pinhole_start(v, r.gbuffer, pixel, true);
         start.interior = Interior(r.layers[index].near_interior);
         if (isfinite(start.t_max))
+        {
             surface_crossings<S>(r.scene, v, start.origin, start.dir, start.t_max, start.interior);
+            // The path starts on the surface, taking no medium along the camera ray: what lies
+            // before the surface, its layers and their interiors' media, is the layer chain's to
+            // weigh.
+            start.origin += start.dir * start.t_max;
+            start.offset += start.t_max;
+            start.t_max = 0.0;
+        }
     }
     start.dir = camera_ray.dir;
     start.throughput = float3(1.0);
