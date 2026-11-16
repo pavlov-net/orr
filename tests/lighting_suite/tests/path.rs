@@ -240,20 +240,20 @@ fn the_pipeline_renders_coats_fuzz_films_and_thin_walls_as_the_staged_loop_does(
     assert_clean();
 }
 
-/// The pipeline path tracer renders glass as the staged loop does, in eight cases: a solid slab
+/// The pipeline path tracer renders glass as the staged loop does, in seven cases: a solid slab
 /// and a tinted one under the sky, from camera rays that the layer guides trace, and with the
 /// frosted-glass pass over a rough one; two thin-walled panes, one behind the other, whose sunlit
 /// shadow a shadow ray's walk crosses one after the other; a glass sphere that focuses the sun's
-/// caustic photons on the floor; a dispersive sphere that splits paths by wavelength; scattering
-/// interiors, which scatter and walk; an eye inside water, whose interiors start the path; and a
-/// lens in that water over a slab, whose rays start inside the interiors at the lens. Only the
-/// sphere's scene gathers caustic photons. Runs the cases `run`, in that order.
+/// caustic photons on the floor; a dispersive sphere that splits paths by wavelength; an eye
+/// inside water, whose interiors start the path; and a lens in that water over a slab, whose rays
+/// start inside the interiors at the lens. Only the sphere's scene gathers caustic photons. Runs
+/// the cases `run`, in that order.
 fn glass_cases(run: std::ops::Range<usize>) {
     if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
         return;
     }
-    let [slabs, frosted, lens, pane, prism, water, milk] =
-        ["slabs", "frosted", "lens", "pane", "prism", "water", "milk"].map(glass_scene);
+    let [slabs, frosted, lens, pane, prism, water] =
+        ["slabs", "frosted", "lens", "pane", "prism", "water"].map(glass_scene);
     let realtime = ViewLighting::default();
     let thin_lens = ViewLighting {
         reference: Some(ReferenceSettings {
@@ -273,7 +273,6 @@ fn glass_cases(run: std::ops::Range<usize>) {
         ("panes", pane, false, realtime, false, false),
         ("caustic of a sphere", lens, false, realtime, true, false),
         ("dispersive sphere", prism, false, realtime, false, false),
-        ("milky slab and cloud", milk, false, realtime, false, false),
         ("eye in water", water.clone(), true, realtime, false, false),
         ("lens in water", water, true, thin_lens, false, false),
     ]
@@ -319,10 +318,77 @@ fn the_pipeline_renders_caustics_and_dispersion_through_glass_as_the_staged_loop
     glass_cases(3..5);
 }
 
-/// The cases of [`glass_cases`] with scattering interiors and water around the eye.
+/// The cases of [`glass_cases`] with water around the eye.
 #[test]
 fn the_pipeline_renders_interiors_as_the_staged_loop_does() {
-    glass_cases(5..8);
+    glass_cases(5..7);
+}
+
+/// The relative error of `a`'s mean luminance against `truth`'s, and the largest of its 4x4
+/// blocks' in size.
+fn mean_and_worst_block(a: &Accumulated, truth: &Accumulated) -> (f64, f64) {
+    let [w, h] = EXTENT;
+    let (mut sum, mut sum_truth) = (0.0, 0.0);
+    let mut blocks = [[(0.0f64, 0.0f64); 4]; 4];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) as usize;
+            let (l, t) = (luminance(&a.mean[i]), luminance(&truth.mean[i]));
+            sum += l;
+            sum_truth += t;
+            let b = &mut blocks[(y * 4 / h) as usize][(x * 4 / w) as usize];
+            b.0 += l;
+            b.1 += t;
+        }
+    }
+    let worst = blocks
+        .iter()
+        .flatten()
+        .map(|&(l, t)| ((l - t) / t).abs())
+        .fold(0.0, f64::max);
+    ((sum - sum_truth) / sum_truth, worst)
+}
+
+/// A milky slab and a cloud on the floor under the sun and the sky, whose interiors scatter and
+/// walk. The pipeline path tracer's reference converges to the staged loop's, within the spread
+/// between two runs of the staged reference: an unbiased estimate of the same light. In real time
+/// a scatter ends its path in the world cache, whose bias each tracer keeps within a looser bound.
+#[test]
+fn the_pipeline_converges_through_scattering_interiors() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    let mut bed = Bed::with(glass_scene("milk"));
+    bed.set_pre_exposure(1.0 / 64.0);
+    let no_photons = SceneLightingSettings {
+        caustics: CausticSettings {
+            photons: 0,
+            ..bed.lighting.settings().caustics
+        },
+        ..*bed.lighting.settings()
+    };
+    bed.lighting.set_settings(&no_photons).unwrap();
+    let (staged, launched) = both(&KernelSet::default(), reference(3));
+    let truth = render_paths(&mut bed, &staged, 1024, 7);
+    let spread = render_paths(&mut bed, &staged, 256, 9);
+    let piped = render_paths(&mut bed, &launched, 256, 11);
+    assert_within_noise(
+        "milky slab and cloud, reference",
+        &piped,
+        &truth,
+        &spread,
+        1.25,
+    );
+    let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
+    render_paths(&mut bed, &staged, 32, 3);
+    for (what, paths) in [("staged", &staged), ("pipeline", &launched)] {
+        let (mean, worst) = mean_and_worst_block(&render_paths(&mut bed, paths, 256, 13), &truth);
+        assert!(
+            mean.abs() < 0.03 && worst < 0.2,
+            "milky slab and cloud, {what} in real time: mean {mean:+.4}, worst block {worst:.4}"
+        );
+    }
+    assert_clean();
 }
 
 /// The pipeline path tracer bends the sun through a plane stack and passes a coated emitter's
