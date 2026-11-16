@@ -16,9 +16,10 @@ use orr_shaders::surface_declares;
 use crate::mask_sets::Members;
 use crate::shaders::consts::{
     ANY_HIT_INSTRUCTIONS, COATED_EMITTER_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS,
-    EMITTER_VIEW_INSTRUCTIONS, FRONT_INSTRUCTIONS, HIT_INSTRUCTIONS, INTERIOR_HIT_INSTRUCTIONS,
-    LAYER_HIT_INSTRUCTIONS, MEDIUM_VERTEX_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_BACKGROUND,
-    PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
+    EMITTER_VIEW_INSTRUCTIONS, FRONT_ANY_HIT_INSTRUCTIONS, FRONT_INSTRUCTIONS, HIT_INSTRUCTIONS,
+    INTERIOR_HIT_INSTRUCTIONS, LAYER_HIT_INSTRUCTIONS, LIGHT_BOX_INSTRUCTIONS,
+    MEDIUM_VERTEX_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_BACKGROUND, PATH_SOURCE_UPDATE,
+    PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
     PRODUCER_HIT_INSTRUCTIONS, PROXY_ANY_HIT_INSTRUCTIONS, PROXY_INTERSECTION_INSTRUCTIONS,
     PROXY_MARCH_INSTRUCTIONS, RAYGEN_FRONT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS,
     RAYGEN_LAYER_INSTRUCTIONS, RAYGEN_LENS_INSTRUCTIONS, RAYGEN_PROXY_INSTRUCTIONS,
@@ -60,6 +61,10 @@ pub enum Role {
     /// The callable that takes what a path's ray meets in front of its hit: particles and the
     /// proxies of sphere and rect lights.
     Front,
+    /// The any-hit that marks a path ray's payload where it met a particle or a light's proxy,
+    /// and the intersection shader of a light's proxy under a path ray.
+    FrontAnyHit,
+    LightBox,
     /// A medium proxy's intersection shader under a shadow ray, its any-hit there, and the
     /// callable of the marches of those with a volume that the ray passed.
     ProxyBox,
@@ -212,6 +217,8 @@ impl Spec {
             Role::View => return Some(EMITTER_VIEW_INSTRUCTIONS),
             Role::Stack => return Some(STACK_STEP_INSTRUCTIONS),
             Role::Front => return Some(FRONT_INSTRUCTIONS),
+            Role::FrontAnyHit => return Some(FRONT_ANY_HIT_INSTRUCTIONS),
+            Role::LightBox => return Some(LIGHT_BOX_INSTRUCTIONS),
             Role::ProxyBox => return Some(PROXY_INTERSECTION_INSTRUCTIONS),
             Role::ProxyAnyHit => return Some(PROXY_ANY_HIT_INSTRUCTIONS),
             Role::ProxyMarch => return Some(PROXY_MARCH_INSTRUCTIONS),
@@ -679,6 +686,33 @@ impl Table {
                     intersection: None,
                 });
             }
+        }
+        // A path ray whose mask takes particles or lights' proxies marks its payload where it meets
+        // one, and goes on.
+        if may & MAY_PARTICLES != 0 {
+            groups.front = Some(hit_groups.len() as u32);
+            hit_groups.push(HitGroup {
+                closest_hit: None,
+                any_hit: Some(Self::stage(
+                    &mut specs,
+                    folded("front_met_hit", Role::FrontAnyHit),
+                )),
+                intersection: None,
+            });
+        }
+        if may & MAY_LOCAL_LIGHTS != 0 {
+            groups.light_front = Some(hit_groups.len() as u32);
+            hit_groups.push(HitGroup {
+                closest_hit: None,
+                any_hit: Some(Self::stage(
+                    &mut specs,
+                    folded("light_met_hit", Role::FrontAnyHit),
+                )),
+                intersection: Some(Self::stage(
+                    &mut specs,
+                    folded("light_box_hit", Role::LightBox),
+                )),
+            });
         }
         // A medium proxy is a box under shadow rays alone.
         if proxies {

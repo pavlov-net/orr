@@ -118,6 +118,10 @@ public static const uint PAYLOAD_BENT = 1;
 // each particle's look resolved and each one's light weighed against next-event estimation at the
 // vertex the ray left, and inside a scattering medium the free flight that ends the ray.
 [Host] public static const uint FRONT_INSTRUCTIONS = 15500;
+// The any-hit that marks a path ray's payload where it met a particle or a light's proxy, and the
+// intersection shader of a light's proxy under a path ray, which tests the ray against the light.
+[Host] public static const uint FRONT_ANY_HIT_INSTRUCTIONS = 50;
+[Host] public static const uint LIGHT_BOX_INSTRUCTIONS = 700;
 // What a raygen holds more where the view traces its camera rays through a thin lens or draws a
 // background layer: the lens's camera ray, the record of its first hit, and the background
 // layer's texel.

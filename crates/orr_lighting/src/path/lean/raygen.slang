@@ -815,6 +815,12 @@ uint trace_ray<let VIEW : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, inou
     bool traced_camera = camera && traces_primary(r) || lens;
     bool primary = traced_camera || layers;
     uint mask = layers ? MASK_DIELECTRIC : (traced_camera ? MASK_CAMERA : MASK_OPAQUE) | (may(MAY_LAYERS) ? MASK_DIELECTRIC : 0);
+    // What the ray sees in front of its hit it meets in its own trace, whose any-hits mark the
+    // payload where it met one; the callable that takes them runs for those rays alone.
+    uint front = 0;
+    if (may_any(MAY_PARTICLES | MAY_LOCAL_LIGHTS))
+        front = lean_front_mask(r, slot, w0, VIEW, trail.chain);
+    mask |= front;
     float t_max = camera && !traced_camera ? reach : positive_infinity();
     // What the camera sees of an alpha-tested triangle is its coverage itself; a scattered
     // ray, and a layered tile's, which the layer guides trace alike, take the micromap's two
@@ -850,8 +856,9 @@ uint trace_ray<let VIEW : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, inou
     }
     if (may_any(MAY_PARTICLES | MAY_LOCAL_LIGHTS))
     {
-        uint front = lean_front_mask(r, slot, w0, VIEW, trail.chain);
-        if (front != 0)
+        bool met = (p.words.x & FRONT_MET) != 0;
+        p.words.x &= ~FRONT_MET;
+        if (met)
         {
             Payload f;
             f.words = uint4(asuint(h.hit() ? h.t() : positive_infinity()), front, VIEW ? 1 : 0, 0);
