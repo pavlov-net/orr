@@ -2186,6 +2186,109 @@ public void lean_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, bool
     store_hot(at, p);
 }
 
+// Where a ray inside an interior's medium of extinction `sigma_t` scatters, by `rng`: a free flight
+// by one channel's extinction, the channel picked uniformly, along the ray's stretch in the medium.
+// The raygen draws it for the ray's segment, and the callable of what the ray meets in front of its
+// hit draws it again, alike, for where the segment ends.
+[ForceInline]
+public float free_flight(float3 sigma_t, inout Sampler rng)
+{
+    float u_channel = rng.next();
+    float u_distance = rng.next();
+    float sigma = sigma_t[min(uint(u_channel * 3.0), 2u)];
+    return sigma > 0.0 ? -log(1.0 - u_distance) / sigma : positive_infinity();
+}
+
+// What a path's ray sees of a layer in front of its hit (`PathEmission`): the layer's light through
+// the medium up to it, as the hit takes its own. Inside an interior's medium (`inside`) that is the
+// interior's, and where the ray's draw of where it scatters ends it (`drawn`) its light is over the
+// chance the draw reaches the layer, which the channels' mean transmittance gives; the ray's hot
+// words `at` keep where its stretch in the medium starts. Elsewhere it is the linked medium `M`'s.
+struct FrontLayers<M : IMedium> : ITranslucent
+{
+    PathEmission emission;
+    uint64_t medium;
+    bool inside;
+    bool drawn;
+    float3 sigma_t;
+    uint4* at;
+
+    float4 layer(inout Candidate c)
+    {
+        float4 l = emission.layer(c);
+        if (!inside)
+            return float4(l.rgb * medium_transmittance<M>(medium, emission.origin, emission.dir, c.t), l.a);
+        float3 tr = beer(sigma_t, inside_length(at, c.t));
+        return float4(l.rgb * (drawn ? tr / dot(tr, float3(1.0 / 3.0)) : tr), l.a);
+    }
+
+    bool accept(Candidate c)
+    {
+        return false;
+    }
+}
+
+// The callable that takes what `slot`'s path ray meets in front of its hit `t` m along it, under
+// instance mask `mask`: particles, each a layer of its emission at its opacity, and the proxies of
+// sphere and rect lights, layers that only emit, in depth order as the staged loop's trace stage
+// takes them. What the layers emit toward a ray whose light counts adds to the path's radiance, and
+// what they cover leaves its throughput. A view path's ray inside a medium that scatters ends where
+// the raygen's draw for its segment (`free_flight`) says it scatters, if that falls before its
+// hit. Whether the path still carries light.
+public bool lean_front<M : IMedium>(PathRoot r, uint slot, float t, uint mask, bool view)
+{
+    uint4* at = lean_hot(r, slot);
+    uint4 w0 = load_coherent(at);
+    uint4 w1 = load_coherent(at + 1);
+    float4 w3 = asfloat(load_coherent(at + 3));
+    uint flags = w0.w;
+    bool inside = may(MAY_INTERIORS) && (flags & HOT_INTERIOR) != 0;
+    float3 sigma_t = float3(0.0);
+    float end = t;
+    bool drawn = false;
+    if (inside)
+    {
+        uint4* cold = lean_cold(r, slot);
+        sigma_t = interior_sigma(cold);
+        if (may(MAY_SCATTERING) && view && any(asfloat(load_coherent(cold + LEAN_SCATTER_WORD)).xyz > 0.0))
+        {
+            drawn = true;
+            float span = inside_length(at, t);
+            Sampler rng = path_sampler(r, item_pixel(r, r.slice_base + slot));
+            rng.dimension = flags >> HOT_DIMENSION_SHIFT;
+            float sampled = free_flight(sigma_t, rng);
+            if (sampled < span)
+                end = max(sampled - (span - t), 0.0);
+        }
+    }
+    float3 origin = asfloat(w0.xyz);
+    float3 dir = oct_decode_snorm16(w1.x);
+    LeanMode mode = lean_mode(r);
+    // A ray ideal windows passed on measures the light from where its vertex left.
+    float3 from = origin;
+    if (may2(MAY2_THIN_DIELECTRICS) && (flags & HOT_WINDOW) != 0)
+        from = asfloat(load_coherent(lean_cold(r, slot) + LEAN_FROM_WORD).xyz);
+    // The vertex the ray left drew its candidates with its local sampler where it was the path's
+    // first.
+    LocalLights* local = nullptr;
+    if (may(MAY_LOCAL) && ((flags >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK) == 1)
+        local = pixel_local_lights(r, item_pixel(r, r.slice_base + slot));
+    // A ray whose vertex's next-event estimation took the lights meets what light sampling draws
+    // for nothing.
+    bool lit = may(MAY_SCATTERING) && w3.w == PDF_LIT;
+    bool adds = mode.count_bsdf && (flags & HOT_COUNTED) != 0;
+    PathEmission pe = { r.scene, r.set, local, origin, dir, from, left_normal(flags, w1), mode.one_technique ? 0.0 : w3.w, halves(w1.w).y, end, float3(lit ? 0.0 : 1.0), adds };
+    FrontLayers<M> f = { pe, r.scene.medium, inside, drawn, sigma_t, at };
+    float4 layers;
+    trace_resolve_translucent(scene_traced(r.scene), path_ray(origin, dir, end), mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, f, PARTICLE_CANDIDATES, layers);
+    float3 throughput = hot_throughput(w1);
+    w3.xyz += throughput * layers.rgb;
+    throughput *= 1.0 - layers.a;
+    store_coherent(at + 1, uint4(w1.xy, as_halves(throughput.xy), as_halves(float2(throughput.z, halves(w1.w).y))));
+    store_coherent(at + 3, asuint(w3));
+    return carries(throughput);
+}
+
 // What `slot`'s shadow ray that met nothing adds: `added`, its job's light times what the
 // candidates along it let through.
 public void lean_shadow_add(PathRoot r, uint slot, float3 added)
