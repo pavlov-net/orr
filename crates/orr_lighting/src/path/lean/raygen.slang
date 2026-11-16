@@ -273,7 +273,7 @@ void walk_traced(PathRoot r, uint slot, uint4* at, inout Walk e, bool interior, 
         if (!interior)
             met = WalkMeet(on_instance(r.scene, b.instance, owner) ? WALK_BOUNDARY : WALK_NONE);
         else if (b.triangle && b.material == owner)
-            met = interior_meet(r.view, owner, e.ior, b.material, boundary_normal(r.scene, last, b, e.dir), e.origin, e.dir, b.t, e.rng);
+            met = interior_meet(r.scene, r.view, owner, e.ior, b.material, boundary_normal(r.scene, last, b, e.dir), e.origin, e.dir, b.t, !share, e.rng);
         if (walk_met(e, d, b.t, met))
             continue;
         return;

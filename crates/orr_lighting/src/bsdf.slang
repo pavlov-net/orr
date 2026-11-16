@@ -1356,6 +1356,43 @@ public bool bsdf_thin_mirror(BsdfParams p, float exterior_ior)
     return max(alpha.x, alpha.y) < MIRROR_ALPHA;
 }
 
+// Where a walk inside a plain transmitting dielectric of GGX `alpha` goes on from its surface, as
+// the dielectric's BSDF seen from inside scatters it: single scattering by the visible normals,
+// Fresnel and separable Smith masking, and the multiple scattering's lobes. `v` points back along
+// the walk in a frame whose z is the surface's normal into the medium, `eta` is the IOR outside
+// over inside and `u` holds four uniform numbers. The direction, in that frame, lies below z = 0
+// where the walk leaves; `weight` is its BSDF times cosine over the draw's density, without the
+// radiance scale of leaving, and 0 where the draw is lost.
+public float3 interior_rough_scatter(float alpha, float eta, float3 v, float4 u, out float weight)
+{
+    weight = 0.0;
+    float ec = alpha >= MIN_MS_ALPHA ? openpbr_look_up_ideal_dielectric_energy_complement(eta, alpha, v.z) : 0.0;
+    if (u.x < ec)
+    {
+        // Each side of the multiple scattering is drawn by its share and evenly over its
+        // hemisphere, as `Bsdf.draw` draws it.
+        float ratio = openpbr_look_up_ideal_dielectric_reflection_ratio(eta, alpha);
+        bool back = u.w < ratio;
+        float3 l = sample_uniform_hemisphere(u.yz);
+        float side = back ? eta : 1.0 / eta;
+        float share = back ? ratio : 1.0 - ratio;
+        float average = openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_ideal_dielectric_average_energy_complement(side, alpha));
+        float f = min(ec * openpbr_look_up_ideal_dielectric_energy_complement(side, alpha, l.z) / average * share, 1.0 / l.z);
+        weight = 2.0 * f * l.z / (ec * share);
+        return back ? l : mirrored(l);
+    }
+    float2 a = float2(alpha);
+    float3 h = openpbr_sample_aniso_ggx_smith_vndf(a, v, u.yz);
+    float c = dot(v, h);
+    bool back = u.w < openpbr_fresnel(eta, c);
+    float3 l = reflect(-v, h);
+    if (!back && !openpbr_refract(v, h, c, eta, l))
+        return l;
+    if ((l.z > 0.0) == back)
+        weight = openpbr_eval_aniso_smith_g1(l, a) / (1.0 - ec);
+    return l;
+}
+
 // A `Bsdf` for a path that has no vertex yet.
 public Bsdf bsdf_unprepared()
 {

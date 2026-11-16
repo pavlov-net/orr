@@ -532,6 +532,10 @@ pub const MILK: DenseInterior = DenseInterior {
 };
 /// A smooth sphere of radius 1 m holding [`JADE`].
 pub const JADE_SPHERE: &str = "jade sphere";
+/// A sphere of radius 1 m holding [`JADE`] whose surface has GGX roughness
+/// [`ROUGH_JADE_ROUGHNESS`].
+pub const ROUGH_JADE_SPHERE: &str = "rough jade sphere";
+pub const ROUGH_JADE_ROUGHNESS: f32 = 0.35;
 /// Green, absorbing and nearly isotropic, a few mean free paths to the radius.
 pub const JADE: DenseInterior = DenseInterior {
     sigma_t: [8.0, 4.0, 6.0],
@@ -1473,6 +1477,14 @@ fn cook() -> Arc<[u8]> {
                     JADE_SPHERE,
                     mesh(|b| b.sphere(0, 48, 1.0)),
                     vec![JADE.material(glass)],
+                ),
+                model(
+                    ROUGH_JADE_SPHERE,
+                    mesh(|b| b.sphere(0, 48, 1.0)),
+                    vec![Material {
+                        specular_roughness: ROUGH_JADE_ROUGHNESS,
+                        ..JADE.material(glass)
+                    }],
                 ),
                 model(
                     WATER_BOX,

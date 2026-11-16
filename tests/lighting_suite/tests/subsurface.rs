@@ -5,7 +5,8 @@
 
 use lighting_suite::bed::{
     Accumulated, Bed, DenseInterior, EXTENT, FURNACE_RADIANCE, Item, JADE, JADE_SPHERE, MILK,
-    MILK_SPHERE, Paths, Spec, WALK_FURNACE, WALK_SLABS, WALK_SPHERE, look,
+    MILK_SPHERE, Paths, ROUGH_JADE_ROUGHNESS, ROUGH_JADE_SPHERE, Spec, WALK_FURNACE, WALK_SLABS,
+    WALK_SPHERE, look,
 };
 use lighting_suite::shaders::walk_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
@@ -235,11 +236,21 @@ fn real_time(debug_view: LightingDebugView) -> ViewLighting {
     }
 }
 
-/// `spec` through `paths`, accumulated over `frames`. The reference ends a path whose walk
-/// reaches its step cap, so none may.
+/// The renders' pre-exposure, which keeps every frame's pixels under the HDR ceiling: a sun's
+/// light through a rough surface from inside comes as rare, bright samples.
+const PRE_EXPOSURE: f32 = 1.0 / 64.0;
+
+/// `spec` through `paths`, accumulated over `frames`, in radiance before pre-exposure. The
+/// reference ends a path whose walk reaches its step cap, so none may.
 fn render_spec(paths: &Paths, spec: Spec, frames: u32) -> Accumulated {
     let mut bed = Bed::with(spec);
-    let image = bed.accumulate(frames, 5, &mut |list, f| paths.record(list, f));
+    bed.set_pre_exposure(PRE_EXPOSURE);
+    let mut image = bed.accumulate(frames, 5, &mut |list, f| paths.record(list, f));
+    for texel in &mut image.mean {
+        for c in &mut texel[..3] {
+            *c /= PRE_EXPOSURE;
+        }
+    }
     if paths.settings.reference.is_some() {
         let stats = bed.lighting.stats(bed.last_frame()).unwrap();
         assert_eq!(stats.capped_walks, 0, "reference walks reached their cap");
@@ -408,7 +419,12 @@ fn a_lit_sphere_matches_the_cpu_walk(paths: &Paths) {
     assert!(e < 0.02, "sphere: GPU {gpu:?}, CPU {cpu:?} ({e:.4})");
 }
 
-fn cpu_dielectric(interior: &DenseInterior, radius: f32) -> DielectricWalks {
+fn cpu_dielectric(
+    interior: &DenseInterior,
+    radius: f32,
+    roughness: f32,
+    exact_sun: bool,
+) -> DielectricWalks {
     let (extinction, albedo) = interior.rec2020();
     DielectricWalks {
         shape: Shape::Sphere {
@@ -420,6 +436,8 @@ fn cpu_dielectric(interior: &DenseInterior, radius: f32) -> DielectricWalks {
             anisotropy: f64::from(interior.anisotropy),
             surface_ior: f64::from(interior.ior),
         },
+        roughness: f64::from(roughness),
+        exact_sun,
     }
 }
 
@@ -430,20 +448,27 @@ enum Lighting {
     Sun,
 }
 
-/// The light leaving through the walks of `interior`'s sphere `model` scaled to `radius`, under
-/// each of `lighting`, within `tolerance` of the CPU walk. The CPU walk takes a sun through the
-/// way out as the real-time walk does, and uniform light exactly.
+/// The light leaving through the walks of `interior`'s sphere `model` of surface roughness
+/// `roughness` scaled to `radius`, under each of `lighting`, within `tolerance` of the CPU walk.
+/// The CPU walk takes uniform light exactly, and a sun as `paths` do: through the way out as the
+/// real-time walk does, or through the rough surface wherever a walk meets it in the reference.
 fn interior_matches_the_cpu_walk(
     paths: &Paths,
     model: &'static str,
     interior: &DenseInterior,
+    roughness: f32,
     radius: f32,
     lighting: &[Lighting],
     tolerance: f64,
 ) {
     let (eye, target, fov_y) = (Vec3::new(0.0, 1.2, 4.0) * radius, Vec3::ZERO, 0.6);
     let pixels = sphere_pixels(eye, target, fov_y, radius);
-    let cpu = cpu_dielectric(interior, radius);
+    let cpu = cpu_dielectric(
+        interior,
+        radius,
+        roughness,
+        paths.settings.reference.is_some(),
+    );
     for &what in lighting {
         let (lights, environment, light) = match what {
             Lighting::Uniform => (
@@ -482,7 +507,8 @@ fn interior_matches_the_cpu_walk(
     }
 }
 
-/// Uniform light through the reference, and a sun through the real-time walk.
+/// Uniform light through the reference, and a sun through the real-time walk. The reference ends
+/// a walk where it meets the surface, so each stretch of a walk between two meetings is a bounce.
 #[test]
 fn dense_interiors_walk_as_the_cpu_walk_does() {
     let mut paths = Paths::new(
@@ -490,13 +516,42 @@ fn dense_interiors_walk_as_the_cpu_walk_does() {
         PathEntry::Compute,
         settings(LightingDebugView::Subsurface),
     );
-    paths.settings.max_bounces = 2;
     for (model, interior) in [(MILK_SPHERE, &MILK), (JADE_SPHERE, &JADE)] {
         paths.settings.reference = Some(ReferenceSettings::default());
-        interior_matches_the_cpu_walk(&paths, model, interior, 1.0, &[Lighting::Uniform], 0.02);
+        paths.settings.max_bounces = REFERENCE_BOUNCES;
+        let uniform = [Lighting::Uniform];
+        interior_matches_the_cpu_walk(&paths, model, interior, 0.0, 1.0, &uniform, 0.02);
         paths.settings.reference = None;
-        interior_matches_the_cpu_walk(&paths, model, interior, 1.0, &[Lighting::Sun], 0.02);
+        paths.settings.max_bounces = 2;
+        let sun = [Lighting::Sun];
+        interior_matches_the_cpu_walk(&paths, model, interior, 0.0, 1.0, &sun, 0.02);
     }
+    assert_clean();
+}
+
+/// Bounces enough for the reference's walks, which end where they meet the surface.
+const REFERENCE_BOUNCES: u32 = 64;
+
+/// A rough surface scatters the walks by its BSDF seen from inside: the reference takes a sun
+/// through it wherever a walk meets it, and the real-time walk through its way out's exit lobe.
+#[test]
+fn rough_interiors_walk_as_the_cpu_walk_does() {
+    let mut paths = Paths::new(
+        &KernelSet::default(),
+        PathEntry::Compute,
+        settings(LightingDebugView::Subsurface),
+    );
+    paths.settings.max_bounces = REFERENCE_BOUNCES;
+    let (model, roughness) = (ROUGH_JADE_SPHERE, ROUGH_JADE_ROUGHNESS);
+    let (uniform, sun) = ([Lighting::Uniform], [Lighting::Sun]);
+    interior_matches_the_cpu_walk(&paths, model, &JADE, roughness, 1.0, &uniform, 0.02);
+    // The surface's transmission from inside peaks steeply toward the sun for a few ways a walk
+    // reaches it, so both estimates of the reference's sun are a sum of rare, bright samples.
+    interior_matches_the_cpu_walk(&paths, model, &JADE, roughness, 1.0, &sun, 0.1);
+    paths.settings.reference = None;
+    paths.settings.max_bounces = 2;
+    let both = [Lighting::Uniform, Lighting::Sun];
+    interior_matches_the_cpu_walk(&paths, model, &JADE, roughness, 1.0, &both, 0.02);
     assert_clean();
 }
 
@@ -514,8 +569,8 @@ fn capped_interior_walks_keep_the_table_share() {
     paths.settings.max_bounces = 2;
     paths.settings.sss_max_steps = 16;
     let both = [Lighting::Uniform, Lighting::Sun];
-    interior_matches_the_cpu_walk(&paths, MILK_SPHERE, &MILK, 4.0, &both, 0.12);
-    interior_matches_the_cpu_walk(&paths, JADE_SPHERE, &JADE, 4.0, &both, 0.12);
+    interior_matches_the_cpu_walk(&paths, MILK_SPHERE, &MILK, 0.0, 4.0, &both, 0.12);
+    interior_matches_the_cpu_walk(&paths, JADE_SPHERE, &JADE, 0.0, 4.0, &both, 0.12);
     assert_clean();
 }
 
@@ -534,7 +589,16 @@ fn the_ray_entries_walk_as_the_cpu_walk_does() {
     );
     paths.settings.max_bounces = 2;
     a_lit_sphere_matches_the_cpu_walk(&paths);
-    interior_matches_the_cpu_walk(&paths, MILK_SPHERE, &MILK, 1.0, &[Lighting::Uniform], 0.02);
+    paths.settings.max_bounces = REFERENCE_BOUNCES;
+    interior_matches_the_cpu_walk(
+        &paths,
+        MILK_SPHERE,
+        &MILK,
+        0.0,
+        1.0,
+        &[Lighting::Uniform],
+        0.02,
+    );
     assert_clean();
 }
 

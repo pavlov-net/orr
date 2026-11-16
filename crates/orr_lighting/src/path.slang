@@ -1459,8 +1459,9 @@ public float3 interior_ambient(PathRoot r, float3 p, float3 dir, inout Sampler r
 }
 
 // Steps of an interior's walk through the scene: every face of opaque geometry and layers.
-// Faces of its own material seen from behind reflect it back or let it out by Fresnel on their
-// plane, the walk's `ior` times the outside's; any other surface ends the walk there.
+// Faces of its own material seen from behind reflect it back or let it out by its dielectric's
+// BSDF on their plane, the walk's `ior` times the outside's, but end it where `exact`
+// (`interior_meet`); any other surface ends the walk there.
 public struct InteriorWalk<S : ISurfaces> : IWalkTrace
 {
     public SceneRoot* scene;
@@ -1469,6 +1470,7 @@ public struct InteriorWalk<S : ISurfaces> : IWalkTrace
     public uint seed;
     public uint material;
     public float ior;
+    public bool exact;
 
     public Hit trace(float3 origin, float3 dir, float t_max, out float3 positions[3])
     {
@@ -1482,31 +1484,56 @@ public struct InteriorWalk<S : ISurfaces> : IWalkTrace
         uint m;
         if (h.cluster_id < 0 || !hit_geometry(scene, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, normal, m))
             return WalkMeet(WALK_BOUNDARY);
-        return interior_meet(view, material, ior, m, normal, origin, dir, h.t, rng);
+        return interior_meet(scene, view, material, ior, m, normal, origin, dir, h.t, exact, rng);
     }
 }
 
 // What a step of the walk in interior `material`, its surface `ior` times the outside's, from
 // `origin` along `dir` does at a face of material `m` with geometric normal `normal` `t` along.
-public WalkMeet interior_meet(ViewConstants* view, uint material, float ior, uint m, float3 normal, float3 origin, float3 dir, float t, inout Sampler rng)
+// A face of the interior's own material seen from inside reflects the walk back or lets it out
+// by its dielectric's BSDF on the face's plane: by Fresnel where the material's roughness is a
+// mirror's, else by its microfacets. Where `exact`, the walk ends at such a face instead, which
+// shades as the hit of a ray from inside with every input of its surface.
+public WalkMeet interior_meet(SceneRoot* scene, ViewConstants* view, uint material, float ior, uint m, float3 normal, float3 origin, float3 dir, float t, bool exact, inout Sampler rng)
 {
     float c = dot(normal, dir);
-    if (m != material || !(c > 0.0))
+    if (m != material || !(c > 0.0) || exact)
         return WalkMeet(WALK_BOUNDARY);
     float3 p = origin + dir * t;
-    float3 way_out = refract(dir, -normal, ior);
-    if (rng.next() < openpbr_fresnel(1.0 / ior, c) || all(way_out == 0.0))
+    float roughness = scene.materials[m].specular_roughness;
+    float3 way;
+    float weight = 1.0;
+    bool back;
+    if (roughness < MIRROR_ROUGHNESS)
     {
-        WalkMeet back = WalkMeet(WALK_REFLECT);
-        back.dir = reflect(dir, normal);
-        back.origin = ray_origin(p, p, normal, back.dir, ORIGIN_DEFAULT, 0.0, length(p - view.eye_render.xyz));
-        return back;
+        way = refract(dir, -normal, ior);
+        back = rng.next() < openpbr_fresnel(1.0 / ior, c) || all(way == 0.0);
+        if (back)
+            way = reflect(dir, normal);
     }
-    WalkMeet leave = WalkMeet(WALK_LEAVE);
-    leave.dir = normalize(way_out);
-    leave.origin = p;
-    leave.normal = normal;
-    return leave;
+    else
+    {
+        float3 tangent, bitangent;
+        orthonormal_basis(-normal, tangent, bitangent);
+        float3 v = float3(dot(-dir, tangent), dot(-dir, bitangent), c);
+        float3 l = interior_rough_scatter(roughness * roughness, 1.0 / ior, v, rng.next4(), weight);
+        if (!(weight > 0.0))
+            return WalkMeet(WALK_NONE);
+        back = l.z > 0.0;
+        way = normalize(l.x * tangent + l.y * bitangent - l.z * normal);
+    }
+    WalkMeet met = WalkMeet(back ? WALK_REFLECT : WALK_LEAVE);
+    met.dir = way;
+    met.weight = weight;
+    if (back)
+    {
+        met.origin = ray_origin(p, p, normal, way, ORIGIN_DEFAULT, 0.0, length(p - view.eye_render.xyz));
+        return met;
+    }
+    met.dir = normalize(way);
+    met.origin = p;
+    met.normal = normal;
+    return met;
 }
 
 // The walk of interior medium `im` from a scatter at `from` reached along `dir`, its surface
@@ -1527,7 +1554,7 @@ public Walk walk_interior(float3 from, float3 dir, InteriorMedium im, float ior,
 public InteriorWalk<S> interior_tracer<S : ISurfaces>(PathRoot r, uint medium, float ior, uint seed, uint depth, bool feedback)
 {
     RayCone cone = { 0.0, 0.0 };
-    InteriorWalk<S> tracer = { r.scene, r.view, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0, float2(-1.0), feedback), seed, medium, ior };
+    InteriorWalk<S> tracer = { r.scene, r.view, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0, float2(-1.0), feedback), seed, medium, ior, may(MAY_REFERENCE) && (r.dielectric_flags & DIELECTRIC_REFERENCE) != 0 };
     return tracer;
 }
 

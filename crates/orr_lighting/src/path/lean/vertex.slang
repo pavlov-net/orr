@@ -172,6 +172,10 @@ interface IVertexKind
     Bsdf prepare(PathRoot r, PathVertex x, uint4* cold, bool inside);
     // The interiors past a scatter `s` of the vertex, in `cold`: whether the path lies in one.
     bool cross(PathRoot r, BsdfSample s, uint4* cold, bool inside);
+    // Whether light reaching the vertex along `-dir` comes through an interior, whose extinction
+    // goes in `sigma`: the path's own, whose extinction `sigma` holds where `inside`, but past a
+    // surface the light crosses.
+    bool toward_light(PathRoot r, uint4* cold, bool inside, float3 dir, inout float3 sigma);
 }
 
 // An opaque surface: in an interior its BSDF sees the interior's medium outside it.
@@ -186,6 +190,11 @@ struct OnOpaque : IVertexKind
     }
 
     bool cross(PathRoot r, BsdfSample s, uint4* cold, bool inside)
+    {
+        return inside;
+    }
+
+    bool toward_light(PathRoot r, uint4* cold, bool inside, float3 dir, inout float3 sigma)
     {
         return inside;
     }
@@ -215,6 +224,20 @@ struct OnLayer : IVertexKind
             store_coherent(cold + LEAN_ENTERED_WORD, l.front ? uint4(asuint(l.x.surface.position), oct_encode_snorm16(n)) : uint4(NO_ENTRY));
         }
         return interior.count > 0;
+    }
+
+    bool toward_light(PathRoot r, uint4* cold, bool inside, float3 dir, inout float3 sigma)
+    {
+        // Normals keep the material's front side, which `front` says the path is on.
+        if ((dot(dir, l.x.surface.geometric_normal) > 0.0) == l.front || !crosses_interior(r.scene, l.section))
+            return inside;
+        Interior interior = inside ? load_interior(cold) : Interior();
+        interior.cross(l.section, l.front, l.x.surface.medium_point);
+        if (interior.count == 0)
+            return false;
+        uint m = interior.innermost();
+        sigma = interior_medium(r.scene, m, interior.point(m)).sigma_t;
+        return true;
     }
 }
 
@@ -692,11 +715,12 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
         float3 origin = vertex_origin(x, k.dir);
         bool far = !isfinite(k.distance);
         float3 e = throughput * k.f * radiance * (W * mis / run);
-        // The medium's transmittance toward the light: the interior's, which a shadow ray leaves
-        // through no surface of, or the linked medium's, whose transmittance the environment's
-        // map holds of its own.
-        if (inside)
-            e *= beer(sigma, k.distance);
+        // The medium's transmittance toward the light: the interior's on the light's side of the
+        // vertex, which a shadow ray leaves through no surface of, or the linked medium's, whose
+        // transmittance the environment's map holds of its own.
+        float3 toward = sigma;
+        if (on.toward_light(r, cold, inside, k.dir, toward))
+            e *= beer(toward, k.distance);
         else if (k.kind != LIGHT_SAMPLE_ENVIRONMENT)
             e *= medium_transmittance<M>(r.scene.medium, origin, k.dir, k.distance);
         // The point drawn on the light is the candidate's distance along its direction from the
