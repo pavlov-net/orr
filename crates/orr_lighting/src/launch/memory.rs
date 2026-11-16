@@ -6,7 +6,8 @@ use orr_scene::orr_gpu::{Allocation, Device, GpuPtr, MemoryKind};
 
 use crate::Error;
 use crate::shaders::consts::{
-    LEAN_COLD_WORDS, LEAN_HOT_WORDS, LEAN_UPDATE_RECORD_WORDS, LEAN_VIEW_RECORD_WORDS, PART_NONE,
+    LEAN_COLD_WORDS, LEAN_HOT_WORDS, LEAN_STACK_WORDS, LEAN_UPDATE_RECORD_WORDS,
+    LEAN_VIEW_RECORD_WORDS, PART_NONE,
 };
 use crate::shaders::types::LaunchHeader;
 
@@ -48,17 +49,19 @@ pub(crate) struct SourceMemory {
     pub(super) header: Allocation<LaunchHeader>,
     _hot: Allocation<[u32; 4]>,
     cold: Option<Allocation<[u32; 4]>>,
+    stack: Option<Allocation<[u32; 4]>>,
     _records: Allocation<[u32; 4]>,
 }
 
 impl SourceMemory {
     /// The slots of `items` paths, at most [`MAX_SLOTS`], laid out as `layout`, with their cold
-    /// words where `cold` holds.
+    /// words where `cold` holds and their plane stack's where `stack` does.
     fn new(
         device: &Device,
         items: u32,
         layout: SlotLayout,
         cold: bool,
+        stack: bool,
         name: &str,
     ) -> Result<Self, Error> {
         let slots = slots(items);
@@ -74,15 +77,18 @@ impl SourceMemory {
         let cold = cold
             .then(|| words(LEAN_COLD_WORDS, "path interiors"))
             .transpose()?;
+        let stack = stack
+            .then(|| words(LEAN_STACK_WORDS, "path plane stacks"))
+            .transpose()?;
         let records = words(layout.record_words, "path records")?;
         let mut header = device.gpu_malloc::<LaunchHeader>(MemoryKind::Upload, 1, name)?;
         header.as_mut_slice().expect("mapped")[0] = LaunchHeader {
             hot: hot.gpu(),
             cold: cold.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
-            scratch: GpuPtr::NULL,
+            scratch: stack.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
             records: records.gpu(),
             cold_words: if cold.is_some() { LEAN_COLD_WORDS } else { 0 },
-            scratch_words: 0,
+            scratch_words: if stack.is_some() { LEAN_STACK_WORDS } else { 0 },
             walk_at: PART_NONE,
             layer_at: PART_NONE,
             interior_at: PART_NONE,
@@ -96,6 +102,7 @@ impl SourceMemory {
             header,
             _hot: hot,
             cold,
+            stack,
             _records: records,
         })
     }
@@ -113,19 +120,28 @@ pub(crate) struct LaunchMemory {
 
 impl LaunchMemory {
     /// Slots for a slice of a view of `pixels` pixels and one of its `update` update paths, with
-    /// cold words for the interiors where `cold` holds.
+    /// cold words for the interiors where `cold` holds and for a plane stack where `stack` does.
     pub(crate) fn new(
         device: &Device,
         pixels: u32,
         update: u32,
         cold: bool,
+        stack: bool,
     ) -> Result<Self, Error> {
-        let view = SourceMemory::new(device, pixels, SlotLayout::view(), cold, "launched view")?;
+        let view = SourceMemory::new(
+            device,
+            pixels,
+            SlotLayout::view(),
+            cold,
+            stack,
+            "launched view",
+        )?;
         let update = SourceMemory::new(
             device,
             update,
             SlotLayout::update(),
             cold,
+            stack,
             "launched update",
         )?;
         let memory = Self { view, update };
@@ -140,9 +156,10 @@ impl LaunchMemory {
     }
 
     /// Whether it holds the slots [`Self::new`] makes for its arguments.
-    pub(crate) fn fits(&self, pixels: u32, update: u32, cold: bool) -> bool {
+    pub(crate) fn fits(&self, pixels: u32, update: u32, cold: bool, stack: bool) -> bool {
         self.view.slots == slots(pixels)
             && self.update.slots == slots(update)
             && self.view.cold.is_some() == cold
+            && self.view.stack.is_some() == stack
     }
 }

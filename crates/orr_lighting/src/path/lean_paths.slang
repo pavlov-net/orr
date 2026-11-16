@@ -1,9 +1,9 @@
 // The lean path tracer's stages (`path.lean`): the raygens of a view's paths and of its update
 // paths, the callable of a path's first vertex and the one of a debug view of it alone, the ones
 // that start a path in the interiors around the eye and run its vertex in an interior's medium,
-// the hit shader of a plain opaque surface, the
-// any-hit shaders of a path's ray and of its shadow ray at a candidate that is not opaque, and
-// the miss shaders of the two.
+// the one of a step of a directional job's walk through a plane stack, the hit shader of a plain
+// opaque surface, the any-hit shaders of a path's ray and of its shadow ray at a candidate that
+// is not opaque, and the miss shaders of the two.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_shaders.trace;
@@ -16,6 +16,7 @@ import orr_scene.hit;
 import orr_lighting.path;
 import orr_lighting.path.lean.vertex;
 import orr_lighting.path.lean.raygen;
+import orr_lighting.path.lean.stack;
 
 extern struct Surface : ISurfaces = StandardSurface;
 extern struct Medium : IMedium = NoMedium;
@@ -71,6 +72,13 @@ void medium_vertex(inout Payload p)
 }
 
 [shader("callable")]
+void stack_step(inout Payload p)
+{
+    ORR_OMM(stack_step);
+    lean_stack_step<Medium>(root, DispatchRaysIndex().x, p.words);
+}
+
+[shader("callable")]
 void first_view(inout Payload p)
 {
     ORR_OMM(first_view);
@@ -97,7 +105,7 @@ void shadow_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 void miss_scatter(inout Payload p)
 {
     ORR_OMM(miss_scatter);
-    lean_miss<Medium, Environment>(root, DispatchRaysIndex().x);
+    lean_miss<Medium, Environment>(root, DispatchRaysIndex().x, p.words.y != 0);
 }
 
 [shader("miss")]

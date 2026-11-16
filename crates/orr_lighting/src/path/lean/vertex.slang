@@ -15,6 +15,7 @@ import orr_shaders.packing;
 import orr_shaders.random;
 import orr_shaders.sampling;
 import orr_shaders.pipeline;
+import orr_shaders.trace;
 import orr_color.luminance;
 import orr_scene.hit;
 import orr_scene.lights;
@@ -53,6 +54,19 @@ public uint4* lean_cold(PathRoot r, uint slot)
     return r.launch.cold + slot * LEAN_COLD_WORDS;
 }
 
+// The plane stack words of the slice's `slot`th path, where the pipeline may meet a stack.
+public uint4* lean_stack(PathRoot r, uint slot)
+{
+    return r.launch.scratch + slot * LEAN_STACK_WORDS;
+}
+
+// Whether a directional light may reach `r`'s paths through a plane stack: the light set holds a
+// stack entry and a directional light, the one light a stack bends.
+public bool lean_stacks(PathRoot r)
+{
+    return may(MAY_STACK) && r.set.stack_entries != 0 && r.set.directional_count != 0;
+}
+
 // The interior list cold words `at` hold.
 public Interior load_interior(uint4* at)
 {
@@ -72,9 +86,7 @@ public Interior load_interior(uint4* at)
 // the list read of it.
 public void store_interior(SceneRoot* s, uint4* at, Interior i)
 {
-    store_coherent(at, i.entries);
-    for (uint k = 0; k < INTERIOR_ENTRIES; k++)
-        store_coherent(at + 1 + k, asuint(i.points[k]));
+    store_list(at, i);
     float3 sigma = float3(0.0);
     float4 scatter = float4(0.0);
     if (i.count > 0)
@@ -104,14 +116,20 @@ InteriorMedium outside_medium(SceneRoot* s, uint4* at, Interior i, bool stores)
     }
     if (!stores)
         return im;
-    store_coherent(at, i.entries);
-    for (uint k = 0; k < INTERIOR_ENTRIES; k++)
-        store_coherent(at + 1 + k, asuint(i.points[k]));
+    store_list(at, i);
     uint4* last = at + 1 + INTERIOR_ENTRIES;
     store_coherent(last, uint4(load_coherent(last).x, asuint(im.sigma_t)));
     if (may(MAY_SCATTERING))
         store_coherent(at + LEAN_SCATTER_WORD, asuint(float4(im.sigma_s, im.anisotropy)));
     return im;
+}
+
+// Stores interior list `i` in words `at`: its entries, then where each was entered.
+public void store_list(uint4* at, Interior i)
+{
+    store_coherent(at, i.entries);
+    for (uint k = 0; k < INTERIOR_ENTRIES; k++)
+        store_coherent(at + 1 + k, asuint(i.points[k]));
 }
 
 // The innermost interior of the list whose entries are `entries`, innermost last.
@@ -214,9 +232,13 @@ interface IVertexKind
     bool cross(PathRoot r, BsdfSample s, uint4* cold, bool inside);
     // Whether light reaching the vertex along `-dir` comes through an interior, whose extinction
     // goes in `sigma`: the path's own, whose extinction `sigma` holds where `inside`, but past a
-    // surface the light crosses. That interior's medium goes in `medium`: MATERIAL_NONE where the
-    // light comes through none, PATH_MEDIUM where through the path's own.
-    bool toward_light(PathRoot r, uint4* cold, bool inside, float3 dir, inout float3 sigma, out uint medium);
+    // surface the light crosses, whose list goes in `past`. That interior's medium goes in
+    // `medium`: MATERIAL_NONE where the light comes through none, PATH_MEDIUM where through the
+    // path's own.
+    bool toward_light(PathRoot r, uint4* cold, bool inside, float3 dir, inout float3 sigma, out uint medium, out Interior past);
+    // Whether scatter `s` crosses a plane stack face ideally into or out of an interior, and the
+    // face's unit normal.
+    bool crosses_stack(PathRoot r, BsdfSample s, out float3 face);
 }
 
 // An opaque surface: in an interior its BSDF sees the interior's medium outside it.
@@ -235,17 +257,28 @@ struct OnOpaque : IVertexKind
         return inside;
     }
 
-    bool toward_light(PathRoot r, uint4* cold, bool inside, float3 dir, inout float3 sigma, out uint medium)
+    bool toward_light(PathRoot r, uint4* cold, bool inside, float3 dir, inout float3 sigma, out uint medium, out Interior past)
     {
+        past = Interior();
         medium = inside ? PATH_MEDIUM : MATERIAL_NONE;
         return inside;
     }
+
+    bool crosses_stack(PathRoot r, BsdfSample s, out float3 face)
+    {
+        face = float3(0.0);
+        return false;
+    }
 }
 
-// A layer `l`, prepared with the media on its two sides as the path's interiors give them.
+// A layer `l`, prepared with the media on its two sides as the path's interiors give them, on a
+// plane stack face of unit normal `face` where `stack`, which a path's ray that may weigh a
+// directional light against next-event estimation through a stack asks.
 struct OnLayer : IVertexKind
 {
     LayerVertex l;
+    bool stack;
+    float3 face;
 
     Bsdf prepare(PathRoot r, PathVertex x, uint4* cold, bool inside)
     {
@@ -268,20 +301,28 @@ struct OnLayer : IVertexKind
         return interior.count > 0;
     }
 
-    bool toward_light(PathRoot r, uint4* cold, bool inside, float3 dir, inout float3 sigma, out uint medium)
+    bool toward_light(PathRoot r, uint4* cold, bool inside, float3 dir, inout float3 sigma, out uint medium, out Interior past)
     {
+        past = Interior();
         medium = inside ? PATH_MEDIUM : MATERIAL_NONE;
         // Normals keep the material's front side, which `front` says the path is on.
         if ((dot(dir, l.x.surface.geometric_normal) > 0.0) == l.front || !crosses_interior(r.scene, l.section))
             return inside;
-        Interior interior = inside ? load_interior(cold) : Interior();
-        interior.cross(l.section, l.front, l.x.surface.medium_point);
+        past = inside ? load_interior(cold) : Interior();
+        past.cross(l.section, l.front, l.x.surface.medium_point);
         medium = MATERIAL_NONE;
-        if (interior.count == 0)
+        if (past.count == 0)
             return false;
-        medium = interior.innermost();
-        sigma = interior_medium(r.scene, medium, interior.point(medium)).sigma_t;
+        medium = past.innermost();
+        sigma = interior_medium(r.scene, medium, past.point(medium)).sigma_t;
         return true;
+    }
+
+    bool crosses_stack(PathRoot r, BsdfSample s, out float3 face)
+    {
+        face = this.face;
+        uint ideal = LOBE_SPECULAR | LOBE_TRANSMISSION;
+        return stack && (s.lobe & ideal) == ideal && crosses_interior(r.scene, l.section);
     }
 }
 
@@ -613,13 +654,27 @@ struct HitLight : IVertexLight
 // vertex says in `exterior` the IOR of the medium its shadow job's ray lies in, which the walls
 // it crosses take as their outside: past the layer, or on the side the path's ray left; 0 is the
 // path's own.
-uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKind, let LAYER : bool>(PathRoot r, uint slot, uint4* at, PathVertex x, float3 dir, float t, float2 cone, L emits, V on, uint bits, out float exterior)
+uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKind, let LAYER : bool>(PathRoot r, uint slot, uint4* at, PathVertex x, float3 dir, float t, float2 cone, L emits, V on, uint4 input, out float exterior)
 {
     exterior = 0.0;
+    // A re-run (`PAYLOAD_BENT`) weighs the light of the job the vertex left where a plane stack
+    // bent it, from the words the vertex started with: its scatter alone, toward the light's bent
+    // direction.
+    bool bent = false;
+    uint4* stack = at;
+    uint4* start = at;
+    if (may(MAY_STACK))
+    {
+        bent = input.y == PAYLOAD_BENT;
+        stack = lean_stack(r, slot);
+        if (bent)
+            start = stack + STACK_BENT_WORD;
+    }
+    uint bits = input.x;
     // Of the path's words the vertex holds its flags and its throughput. The radiance it adds
     // goes into the path's word at once, and the ray and the shadow job it leaves are written
     // whole, so nothing else of the path is live across the surface's light.
-    uint4 w0 = load_coherent(at);
+    uint4 w0 = load_coherent(start);
     uint flags = w0.w;
     bool first = FIRST == 1 || (FIRST == 2 && may_any(MAY_TRACED | MAY_LAYERS) && (flags & HOT_CAMERA) != 0);
     // Whether light along the ray counts, as the vertex it left had it.
@@ -628,6 +683,11 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_WINDOW);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
     float3 throughput = hot_throughput(load_coherent(at + 1));
+    if (may(MAY_STACK))
+    {
+        if (bent)
+            throughput = float3(1.0);
+    }
     // A traced camera ray's path runs on the view's share of pixels, as one that starts on the
     // G-buffer's surface does. One that looks for layers in front of the G-buffer's surface
     // runs on the share its raygen gave it.
@@ -654,6 +714,16 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     rng.dimension = flags >> HOT_DIMENSION_SHIFT;
     LeanMode mode = lean_mode(r);
     bool update = from_update(r);
+    // A re-run adds no light of the vertex's own, ends in no cache and draws no light.
+    if (may(MAY_STACK))
+    {
+        if (bent)
+        {
+            along = false;
+            mode.cache = false;
+            mode.count_nee = false;
+        }
+    }
     float3 added = float3(0.0);
     // The interiors the path lies in, which its cold words list with the innermost's extinction.
     uint4* cold = lean_cold(r, slot);
@@ -702,7 +772,7 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     float3 u_cell = rng.next4().xyz;
     // Past the root's dielectric depth a path ends at its layer, with the cache's light for the
     // interior there.
-    if (may(MAY_LAYERS) && LAYER && alive)
+    if (may(MAY_LAYERS) && LAYER && alive && !bent)
     {
         uint layers = met_layers(cold) + 1;
         store_met_layers(cold, layers);
@@ -757,12 +827,33 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     // The scatter's direction is drawn first: the light candidates' loop evaluates it with them.
     float4 u = rng.next4();
     float u_roulette = rng.next();
-    BsdfDraw drawn = b.draw(u.xyz);
+    // A re-run evaluates its scatter at the bent direction through the same site.
+    BsdfDraw drawn = BsdfDraw();
+    if (may(MAY_STACK))
+    {
+        if (bent)
+        {
+            drawn.drawn = true;
+            drawn.wi = bent_direction(stack);
+        }
+        else
+            drawn = b.draw(u.xyz);
+    }
+    else
+        drawn = b.draw(u.xyz);
     float3 scatter_f;
     float scatter_pdf;
     float3 scatter_diffuse;
     bool estimates = mode.count_nee && counted && candidates > 0 && u_run < run;
     LightPick k = pick_light<FIRST>(r, b, g.position, g.normal, pixel, candidates, estimates, first, drawn.drawn && !drawn.delta, drawn.wi, scatter_f, scatter_pdf, scatter_diffuse, rng);
+    if (may(MAY_STACK))
+    {
+        if (bent)
+        {
+            bent_add(stack, at, scatter_f, scatter_pdf, sides_agree(g.normal, g.geometric_normal, drawn.wi));
+            return 0;
+        }
+    }
     // The blue of the job's light and its light id share a word with the ray's cone.
     float job_blue = 0.0;
     uint job_light = NO_LIGHT;
@@ -778,11 +869,20 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
         float3 e = throughput * k.f * radiance * (W * mis / run);
         // The medium's transmittance toward the light: the interior's on the light's side of the
         // vertex, which a shadow ray leaves through no surface of, or the linked medium's, whose
-        // transmittance the environment's map holds of its own.
+        // transmittance the environment's map holds of its own. A directional light may come
+        // through a plane stack, whose walk takes the interior's medium along its legs.
+        bool stacked = false;
+        if (may(MAY_STACK))
+            stacked = k.kind == LIGHT_SAMPLE_DIRECTIONAL && r.set.stack_entries != 0;
         float3 toward = sigma;
         uint medium;
-        if (on.toward_light(r, cold, inside, k.dir, toward, medium))
-            e *= beer(toward, k.distance);
+        Interior past;
+        bool through = on.toward_light(r, cold, inside, k.dir, toward, medium, past);
+        if (through)
+        {
+            if (!stacked)
+                e *= beer(toward, k.distance);
+        }
         else if (k.kind != LIGHT_SAMPLE_ENVIRONMENT)
             e *= medium_transmittance<M>(r.scene.medium, origin, k.dir, k.distance);
         // The point drawn on the light is the candidate's distance along its direction from the
@@ -800,6 +900,14 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
             // A layer's job may lie past the layer, or where the path's ray leaves for.
             if (LAYER && may(MAY_INTERIORS) && may2(MAY2_THIN_DIELECTRICS))
                 exterior = interior_ior(r.scene, medium == PATH_MEDIUM ? innermost_of(load_coherent(cold)) : medium);
+            if (may(MAY_STACK))
+            {
+                if (stacked && through)
+                {
+                    job_light = STACK_JOB_LIGHT;
+                    stack_job(stack, !LAYER || medium == PATH_MEDIUM ? STACK_COLD_LIST : 0, past, g.position, w0, load_coherent(at + 1), input, t, FIRST == 1 ? BENT_FIRST : BENT_HIT, throughput * radiance * (W / run), mode.one_technique ? -1.0 : run * k.pdf);
+                }
+            }
         }
     }
 
@@ -822,6 +930,16 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     }
     if (goes)
     {
+        // A ray that crosses a plane stack face ideally past a vertex that scattered it goes on
+        // weighed as that vertex's ray against next-event estimation toward a directional light.
+        float3 face;
+        uint left_normal = oct_encode_snorm16(g.normal);
+        bool stacks = false;
+        if (LAYER && may(MAY_STACK))
+        {
+            if (on.crosses_stack(r, s, face))
+                stacks = stack_track(r, slot, at, w0, face, left_normal, inside ? interior_ior(r.scene, innermost_of(load_coherent(cold))) : AMBIENT_IOR);
+        }
         // The interiors past the vertex.
         if (may(MAY_INTERIORS) && LAYER)
             flags = on.cross(r, s, cold, inside) ? flags | HOT_INTERIOR : flags & ~HOT_INTERIOR;
@@ -837,9 +955,8 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
         flags |= HOT_RAY;
         flags = diffuse ? flags | HOT_DIFFUSE : flags & ~HOT_DIFFUSE;
         uint4 w1 = load_coherent(at + 1);
-        uint left_normal = oct_encode_snorm16(g.normal);
         float ray_run = mode.count_nee ? run : 0.0;
-        float ray_pdf = delta ? 0.0 : s.pdf;
+        float ray_pdf = stacks ? PDF_STACK : delta ? 0.0 : s.pdf;
         // An ideal window passes the ray on as it reached it, weighed against next-event
         // estimation as the vertex before it left it, which took the lights past the window
         // through it.
@@ -870,6 +987,102 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
         store_coherent(at, uint4(0, 0, 0, hot_flags(flags, rng.dimension)));
     store_coherent(at + 2, uint4(as_halves(cone), asuint(job_blue), offset, job_light));
     return left;
+}
+
+// Leaves in stack words `at` what the walk of a directional job through a plane stack takes of the
+// vertex at `point`: the job's ray starts in the interiors of `list`, whose medium its light
+// leaves out, or as `cold` says in those of the path's cold list, which the walk copies
+// (`STACK_COLD_*`). The light
+// may bend at the vertex, and the words keep what weighs it again there: the words the vertex
+// started from, `w0` and `w1`, its `input`, the length `t` of the ray that reached it and its kind
+// (BENT_*), and of the job its light before the vertex's scatter, `light`, and its density against
+// the vertex's own rays, `pdf`, negative where it weighs 1.
+void stack_job(uint4* at, uint cold, Interior list, float3 point, uint4 w0, uint4 w1, uint4 input, float t, uint kind, float3 light, float pdf)
+{
+    if (cold == 0)
+        store_list(at + STACK_LIST_WORD, list);
+    store_coherent(at + STACK_FROM_WORD, uint4(asuint(point), cold));
+    uint4* bent = at + STACK_BENT_WORD;
+    store_coherent(bent, w0);
+    store_coherent(bent + 1, input);
+    store_coherent(bent + 2, uint4(w1.xy, asuint(t), kind));
+    store_coherent(bent + 3, uint4(asuint(light), asuint(pdf)));
+}
+
+// The direction toward the light at the vertex of the bent job whose stack words are `at`, as its
+// walk bent it.
+float3 bent_direction(uint4* at)
+{
+    return asfloat(load_coherent(at + STACK_BEND_WORD).xyz);
+}
+
+// Adds to the path in hot words `hot` the light of its bent job, whose stack words are `at`, which
+// the vertex's scatter gives `f` toward the bent direction, at density `pdf` there, where the
+// light comes from a side it takes light from (`sides`): through the stack's density at the
+// vertex, against the job's own.
+void bent_add(uint4* at, uint4* hot, float3 f, float pdf, bool sides)
+{
+    if (!sides)
+        return;
+    float density = asfloat(load_coherent(at + STACK_BEND_WORD).w);
+    float4 light = asfloat(load_coherent(at + STACK_BENT_WORD + 3));
+    float4 through = asfloat(load_coherent(at + STACK_THROUGH_WORD));
+    float mis = light.w < 0.0 ? 1.0 : mis_balance(light.w, pdf * density);
+    float4 radiance = asfloat(load_coherent(hot + 3));
+    store_coherent(hot + 3, asuint(float4(radiance.xyz + light.xyz * f * through.xyz * (through.w * mis), radiance.w)));
+}
+
+// Whether the ray of `slot`'s path in hot words `at`, whose first word is `w0`, that a layer's
+// vertex passes on across a plane stack face of unit normal `face`, which `code` encodes, from a
+// medium of IOR `ior`, is
+// weighed on as the ray that reached the face toward a directional light: one that a vertex's
+// scatter left, whose ray the stack words then keep, or one that crossed parallel faces past one,
+// fewer than STACK_CROSSINGS. Its density word says so (`PDF_STACK`).
+bool stack_track(PathRoot r, uint slot, uint4* at, uint4 w0, float3 face, uint code, float ior)
+{
+    if (lean_mode(r).one_technique)
+        return false;
+    uint4 w1 = load_coherent(at + 1);
+    float pdf = asfloat(load_coherent(at + 3)).w;
+    uint4* track = lean_stack(r, slot) + STACK_TRACK_WORD;
+    if (pdf == PDF_STACK)
+    {
+        uint4 k = load_coherent(track + 1);
+        uint crossed = (k.w >> 16) & 0x7;
+        if (crossed == STACK_CROSSINGS || !(abs(dot(face, oct_decode_snorm16(k.z))) >= STACK_PARALLEL))
+            return false;
+        store_coherent(track + 1, uint4(k.xyz, (k.w & ~(0x7u << 16)) | ((crossed + 1) << 16)));
+        return true;
+    }
+    if (!(pdf > 0.0))
+        return false;
+    // A ray ideal windows passed on left its vertex from the point the cold words keep.
+    float3 origin = asfloat(w0.xyz);
+    if (may2(MAY2_THIN_DIELECTRICS) && (w0.w & HOT_WINDOW) != 0)
+        origin = asfloat(load_coherent(lean_cold(r, slot) + LEAN_FROM_WORD).xyz);
+    bool medium = may(MAY_SCATTERING) && (w0.w & HOT_MEDIUM) != 0;
+    uint depth = min((w0.w >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK, 0x7fu);
+    // The vertex's density of the ray, over the squared IOR it leaves into, which a directional
+    // light's density at the vertex through the stack divides by.
+    store_coherent(track, uint4(asuint(origin), asuint(pdf / (ior * ior))));
+    store_coherent(track + 1, uint4(w1.x, w1.y, code, (w1.w >> 16) | (1u << 16) | (medium ? 1u << 23 : 0u) | (depth << 24)));
+    return true;
+}
+
+// The density of a directional light's direction `dir` that the ray of `slot`'s path met past
+// plane stack faces (`PDF_STACK`) at the vertex that scattered it, which next-event estimation
+// there reaches the light through the stack with: the vertex's over the squared IOR it left into
+// times the stack's density of `dir` there. That vertex's probability of running next-event
+// estimation goes in `run`, its shading normal in `normal`, zero in a medium.
+float stack_density(PathRoot r, uint slot, float3 dir, out float run, out float3 normal)
+{
+    uint4* track = lean_stack(r, slot) + STACK_TRACK_WORD;
+    uint4 a = load_coherent(track);
+    uint4 b = load_coherent(track + 1);
+    float3 face = oct_decode_snorm16(b.z);
+    normal = (b.w & (1u << 23)) != 0 ? float3(0.0) : oct_decode_snorm16(b.y);
+    run = halves(b.w).x;
+    return asfloat(a.w) * abs(dot(dir, face)) / abs(dot(oct_decode_snorm16(b.x), face));
 }
 
 // Whether a stage's opaque vertices may walk: its BSDF holds the subsurface lobe, which its
@@ -995,13 +1208,15 @@ void store_job(uint4* at, LightPick k, float3 origin, float3 point, float3 e, ui
 
 // The light of pick `k`, which the vertex's scatter weighs by `k.f`, toward a vertex of
 // `throughput` that runs next-event estimation with probability `run`, weighed against its scatter
-// unless `weight_one`, before the medium toward the light.
-float3 picked_light(PathRoot r, LightPick k, float3 throughput, float run, bool weight_one)
+// unless `weight_one`, before the medium toward the light; in `before`, what it is before the
+// vertex's scatter and that weight.
+float3 picked_light(PathRoot r, LightPick k, float3 throughput, float run, bool weight_one, out float3 before)
 {
     float3 radiance = k.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(r.set, k.light, k.dir) : k.radiance;
     float W = k.sum / (float(k.drawn) * k.target);
     float mis = weight_one ? 1.0 : mis_balance(run * k.pdf, k.scatter_pdf);
-    return throughput * k.f * radiance * (W * mis / run);
+    before = throughput * radiance * (W / run);
+    return before * k.f * mis;
 }
 
 // Survival of Russian roulette past the root's roulette depth, at the `opaque`th scatter, by the
@@ -1151,10 +1366,28 @@ struct LeanMediumScatter : ILeanScatter
 public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 words)
 {
     uint word = words.x;
+    // A re-run (`MEDIUM_BENT`) weighs the light of the job the vertex left where a plane stack
+    // bent it, from the words the vertex started with.
     uint kind = words.y;
     uint4* at = lean_hot(r, slot);
-    uint4 w0 = load_coherent(at);
+    bool bent = false;
+    uint4* stack = at;
+    uint4* start = at;
+    if (may(MAY_STACK))
+    {
+        bent = (kind & MEDIUM_BENT) != 0;
+        kind &= ~MEDIUM_BENT;
+        stack = lean_stack(r, slot);
+        if (bent)
+            start = stack + STACK_BENT_WORD;
+    }
+    uint4 w0 = load_coherent(start);
     uint4 w1 = load_coherent(at + 1);
+    if (may(MAY_STACK))
+    {
+        if (bent)
+            w1 = uint4(load_coherent(start + 2).xy, as_halves(float2(1.0)), as_halves(float2(1.0)));
+    }
     uint flags = w0.w;
     bool along = (flags & HOT_COUNTED) != 0;
     flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE | HOT_WINDOW);
@@ -1181,6 +1414,15 @@ public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
     Sampler rng = path_sampler(r, pixel);
     rng.dimension = flags >> HOT_DIMENSION_SHIFT;
     LeanMode mode = lean_mode(r);
+    // A re-run ends in no cache and draws no light.
+    if (may(MAY_STACK))
+    {
+        if (bent)
+        {
+            mode.cache = false;
+            mode.count_nee = false;
+        }
+    }
     bool reference = may(MAY_REFERENCE) && (r.dielectric_flags & DIELECTRIC_REFERENCE) != 0;
     uint scattered = (flags >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK;
     if (kind == MEDIUM_WALKS)
@@ -1295,24 +1537,52 @@ public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
     scatter.u = u.xyz;
     float u_roulette = rng.next();
     float3 wi = leaves ? dir : sample_hg(scatter.anisotropy, dir, u.xy);
+    if (may(MAY_STACK))
+    {
+        if (bent)
+            wi = bent_direction(stack);
+    }
     float3 scatter_f;
     float scatter_pdf;
     float3 scatter_diffuse;
     bool estimates = alive && mode.count_nee && counted && r.bounce_candidates > 0 && !(leaves && reference) && !mirror;
-    LightPick k = pick_light<0>(r, scatter, point, normal, pixel, r.bounce_candidates, estimates, false, !surface || kind == MEDIUM_LEAVES_ROUGH, wi, scatter_f, scatter_pdf, scatter_diffuse, rng);
+    LightPick k = pick_light<0>(r, scatter, point, normal, pixel, r.bounce_candidates, estimates, false, bent || !surface || kind == MEDIUM_LEAVES_ROUGH, wi, scatter_f, scatter_pdf, scatter_diffuse, rng);
+    if (may(MAY_STACK))
+    {
+        if (bent)
+        {
+            bent_add(stack, at, scatter_f, scatter_pdf, true);
+            return;
+        }
+    }
     float job_blue = 0.0;
     uint job_light = NO_LIGHT;
     if (k.sum > 0.0)
     {
         float3 origin = surface ? surface_ray_origin(r, point, normal, k.dir) : point;
-        float3 e = picked_light(r, k, throughput, 1.0, mode.one_technique || lobe);
+        bool weight_one = mode.one_technique || lobe;
+        float3 before;
+        float3 e = picked_light(r, k, throughput, 1.0, weight_one, before);
         // The medium toward the light: the interior's, or past the surface out of every interior
-        // the linked medium's, whose transmittance the environment's map holds of its own.
-        if (inside)
+        // the linked medium's, whose transmittance the environment's map holds of its own. A
+        // directional light may come through a plane stack, whose walk takes the interior's
+        // medium along its legs.
+        bool stacked = false;
+        if (may(MAY_STACK))
+            stacked = k.kind == LIGHT_SAMPLE_DIRECTIONAL && r.set.stack_entries != 0 && inside;
+        if (inside && !stacked)
             e *= beer(sigma, k.distance);
-        else if (k.kind != LIGHT_SAMPLE_ENVIRONMENT)
+        else if (!inside && k.kind != LIGHT_SAMPLE_ENVIRONMENT)
             e *= medium_transmittance<M>(r.scene.medium, origin, k.dir, k.distance);
         store_job(at, k, origin, point, e, beyond, flags, job_blue, job_light);
+        if (may(MAY_STACK))
+        {
+            if (stacked && any(e > 0.0))
+            {
+                job_light = STACK_JOB_LIGHT;
+                stack_job(stack, meets ? STACK_COLD_OUT : STACK_COLD_LIST, Interior(), point, w0, w1, words, 0.0, BENT_MEDIUM, before, weight_one ? -1.0 : k.pdf);
+            }
+        }
     }
     if (meets)
     {
@@ -1372,12 +1642,31 @@ float3 surface_ray_origin(PathRoot r, float3 point, float3 n, float3 dir)
 // agree on, by next-event estimation every time, and draws its next ray by the exit's cosine lobe.
 // The exit is the walk's bounce, which its entry counted. A walk `capped` at its cap takes the
 // subsurface table's share of its throughput here.
-void lean_exit_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathVertex x, float2 cone, bool capped)
+void lean_exit_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathVertex x, float2 cone, uint4 input)
 {
-    uint4 w0 = load_coherent(at);
+    bool capped = input.x != 0;
+    // A re-run weighs the light of the job the vertex left where a plane stack bent it, from the
+    // words the vertex started with.
+    bool bent = false;
+    uint4* stack = at;
+    uint4* start = at;
+    if (may(MAY_STACK))
+    {
+        bent = input.y == PAYLOAD_BENT;
+        stack = lean_stack(r, slot);
+        if (bent)
+            start = stack + STACK_BENT_WORD;
+    }
+    uint4 w0 = load_coherent(start);
+    uint4 w1 = load_coherent(at + 1);
     uint flags = w0.w & ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE | HOT_WINDOW);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
-    float3 throughput = hot_throughput(load_coherent(at + 1));
+    float3 throughput = hot_throughput(w1);
+    if (may(MAY_STACK))
+    {
+        if (bent)
+            throughput = float3(1.0);
+    }
     if (capped)
     {
         uint owner;
@@ -1388,6 +1677,12 @@ void lean_exit_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathVertex 
     Sampler rng = path_sampler(r, pixel);
     rng.dimension = flags >> HOT_DIMENSION_SHIFT;
     LeanMode mode = lean_mode(r);
+    // A re-run draws no light.
+    if (may(MAY_STACK))
+    {
+        if (bent)
+            mode.count_nee = false;
+    }
     uint opaque = (flags >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK;
     bool counted = lean_counted(r, opaque - 1, true);
     flags = counted ? flags | HOT_COUNTED : flags & ~HOT_COUNTED;
@@ -1397,23 +1692,50 @@ void lean_exit_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathVertex 
     float3 tangent, bitangent;
     orthonormal_basis(f.n, tangent, bitangent);
     float3 wi = normalize(from_local(sample_cosine_hemisphere(u.xy), tangent, bitangent, f.n));
+    if (may(MAY_STACK))
+    {
+        if (bent)
+            wi = bent_direction(stack);
+    }
     float3 scatter_f;
     float scatter_pdf;
     float3 scatter_diffuse;
     bool estimates = mode.count_nee && counted && r.bounce_candidates > 0;
     LightPick k = pick_light<0>(r, f, g.position, g.normal, pixel, r.bounce_candidates, estimates, false, true, wi, scatter_f, scatter_pdf, scatter_diffuse, rng);
+    if (may(MAY_STACK))
+    {
+        if (bent)
+        {
+            bent_add(stack, at, scatter_f, scatter_pdf, sides_agree(g.normal, g.geometric_normal, wi));
+            return;
+        }
+    }
     float job_blue = 0.0;
     uint job_light = NO_LIGHT;
     if (k.sum > 0.0 && sides_agree(g.normal, g.geometric_normal, k.dir))
     {
         float3 origin = vertex_origin(x, k.dir);
-        float3 e = picked_light(r, k, throughput, 1.0, mode.one_technique);
+        float3 before;
+        float3 e = picked_light(r, k, throughput, 1.0, mode.one_technique, before);
         bool inside = may(MAY_INTERIORS) && (flags & HOT_INTERIOR) != 0;
-        if (inside)
+        // A directional light may come through a plane stack, whose walk takes the interior's
+        // medium along its legs.
+        bool stacked = false;
+        if (may(MAY_STACK))
+            stacked = k.kind == LIGHT_SAMPLE_DIRECTIONAL && r.set.stack_entries != 0 && inside;
+        if (inside && !stacked)
             e *= beer(interior_sigma(lean_cold(r, slot)), k.distance);
-        else if (k.kind != LIGHT_SAMPLE_ENVIRONMENT)
+        else if (!inside && k.kind != LIGHT_SAMPLE_ENVIRONMENT)
             e *= medium_transmittance<M>(r.scene.medium, origin, k.dir, k.distance);
         store_job(at, k, origin, g.position, e, inside ? PATH_MEDIUM : MATERIAL_NONE, flags, job_blue, job_light);
+        if (may(MAY_STACK))
+        {
+            if (stacked && any(e > 0.0))
+            {
+                job_light = STACK_JOB_LIGHT;
+                stack_job(stack, STACK_COLD_LIST, Interior(), g.position, w0, w1, input, 0.0, BENT_EXIT, before, mode.one_technique ? -1.0 : k.pdf);
+            }
+        }
     }
     bool goes = scatter_pdf > 0.0 && sides_agree(g.normal, g.geometric_normal, wi);
     if (goes)
@@ -1450,7 +1772,9 @@ public void lean_hit<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>
 // `lean_hit` of a hit `h` on a layer of the dielectric class: what the hit shader of such a
 // surface runs, its vertex crossing into or out of the interior its material bounds.
 // A thin wall's hit invoked with a window payload (`window_payload`) runs no vertex: it hands back
-// what the wall lets straight through in the payload's first three words.
+// what the wall lets straight through in the payload's first three words; nor does a stack ray's
+// hit invoked with the stack question (`is_stack_question`), whose answer goes into the path's
+// stack words.
 public void lean_layer_hit<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>(PathRoot r, uint slot, inout uint4 payload, T material, H h)
 {
     if (may(MAY_EMITTER))
@@ -1464,6 +1788,20 @@ void lean_hit_as<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial, let
 {
     uint4* at = lean_hot(r, slot);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
+    // A stack ray's hit asks whether it is on a plane stack face (the stack question), which only a
+    // layer's stage holds and answers from the surface it resolves.
+    bool asks = false;
+    bool bent = false;
+    if (may(MAY_STACK))
+    {
+        asks = is_stack_question(payload);
+        if (!LAYER && asks)
+        {
+            store_coherent(lean_stack(r, slot) + STACK_FACE_WORD, uint4(0, 0, 0, MATERIAL_NONE));
+            return;
+        }
+        bent = payload.y == PAYLOAD_BENT;
+    }
     // The ray's cone rides in its cover, so the surface resolves before the path's state loads.
     PathCover c = path_cover(payload);
     float t = h.t();
@@ -1471,20 +1809,42 @@ void lean_hit_as<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial, let
     RayCone cone = { c.context.cone_width, c.context.cone_spread };
     HitContext context = hit_context(c.context.kind, c.context.depth, cone, t, texture_tap(r.view, pixel, r.frame, r.seed, c.context.depth), c.context.feedback);
     float3 positions[3] = { h.corner(0), h.corner(1), h.corner(2) };
-    // An emitter's light is weighed by its triangle as light sampling reads it.
+    // An emitter's light is weighed by its triangle as light sampling reads it, and a plane stack
+    // face is flat.
     HitTriangle traced;
-    SurfaceHit sh = resolve_hit_traced<FeedbackSurface<S>, T, EMITTER>(r.scene, r.view, dir, h.instance_index(), uint(h.cluster_id()), h.primitive_index(), h.barycentrics(), positions, false, context, material, traced);
+    SurfaceHit sh = resolve_hit_traced<FeedbackSurface<S>, T, EMITTER, LAYER>(r.scene, r.view, dir, h.instance_index(), uint(h.cluster_id()), h.primitive_index(), h.barycentrics(), positions, false, context, material, traced);
+    // A layer's vertex asks whether it lies on a plane stack face where its path's ray may go on
+    // weighed against next-event estimation through a stack, whose face it may cross.
+    // A face's material reads no texture, so its surface is the material's own: the stack's
+    // (`stack_material`).
+    // A window's hit asks whether the wall is an ideal mirror and window too, by one test.
+    bool window = LAYER && may2(MAY2_THIN_DIELECTRICS) && is_window(payload);
+    bool tracks = false;
+    if (LAYER && may(MAY_STACK))
+        tracks = asks || (!bent && !is_question(payload) && lean_stacks(r) && stack_tracked_ray(at));
+    bool mirror = (window || tracks) && sh.valid && bsdf_thin_mirror(sh.surface.bsdf, window ? asfloat(payload.y) : AMBIENT_IOR);
+    bool on_stack = false;
+    if (LAYER && may(MAY_STACK))
+    {
+        SceneRoot* s = r.scene;
+        on_stack = tracks && mirror && traced.flat && s.decal_globals == 0 && s.decal_bin_slots == 0 && (s.materials[sh.section].flags & MATERIAL_STACK_FACE) != 0;
+        if (asks)
+        {
+            answer_stack(r, slot, on_stack, sh);
+            return;
+        }
+    }
     if (!sh.valid)
     {
         uint4 w0 = load_coherent(at);
         store_coherent(at, uint4(w0.xyz, w0.w & ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA)));
         return;
     }
-    if (LAYER && may2(MAY2_THIN_DIELECTRICS) && is_window(payload))
+    if (window)
     {
         BsdfParams p = sh.surface.bsdf;
         float exterior = asfloat(payload.y);
-        float3 through = bsdf_thin_mirror(p, exterior) ? bsdf_straight_transmission(p, sh.surface.geometric_normal, dir, exterior) : float3(0.0);
+        float3 through = mirror ? bsdf_straight_transmission(p, sh.surface.geometric_normal, dir, exterior) : float3(0.0);
         payload.xyz = asuint(through);
         return;
     }
@@ -1493,7 +1853,7 @@ void lean_hit_as<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial, let
         write_primary(r, slot, pixel, sh);
     float2 footprint = float2(cone_width(cone, t), cone.spread);
     PathVertex x;
-    OnLayer on = { LayerVertex() };
+    OnLayer on = { LayerVertex(), on_stack, sh.surface.normal };
     if (LAYER)
     {
         on.l = layer_vertex(r.view, sh, dir);
@@ -1526,14 +1886,14 @@ void lean_hit_as<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial, let
         if (any(sh.surface.bsdf.emission > 0.0))
             emits.emitter = emitter_hit_of(r.set, sh, traced, h.instance_index(), uint(h.cluster_id()));
         if (LAYER)
-            left = lean_vertex<M, 2, HitLight, OnLayer, true>(r, slot, at, x, dir, t, footprint, emits, on, bits, exterior);
+            left = lean_vertex<M, 2, HitLight, OnLayer, true>(r, slot, at, x, dir, t, footprint, emits, on, payload, exterior);
         else
-            left = lean_vertex<M, 2, HitLight, OnOpaque, false>(r, slot, at, x, dir, t, footprint, emits, OnOpaque(), bits, exterior);
+            left = lean_vertex<M, 2, HitLight, OnOpaque, false>(r, slot, at, x, dir, t, footprint, emits, OnOpaque(), payload, exterior);
     }
     else if (LAYER)
-        left = lean_vertex<M, 2, NoLight, OnLayer, true>(r, slot, at, x, dir, t, footprint, NoLight(), on, bits, exterior);
+        left = lean_vertex<M, 2, NoLight, OnLayer, true>(r, slot, at, x, dir, t, footprint, NoLight(), on, payload, exterior);
     else
-        left = lean_vertex<M, 2, NoLight, OnOpaque, false>(r, slot, at, x, dir, t, footprint, NoLight(), OnOpaque(), bits, exterior);
+        left = lean_vertex<M, 2, NoLight, OnOpaque, false>(r, slot, at, x, dir, t, footprint, NoLight(), OnOpaque(), payload, exterior);
     // The surface the vertex where a walk leaves takes: this one, where a walk leaves here, or
     // where one starts here, this one seen from the ray, for where it stops at its cap.
     if (lean_walks(LAYER) && left != 0)
@@ -1562,8 +1922,9 @@ void store_exit(uint4* cold, PathVertex x)
 // runs, on the surface its path's cold words hold (`store_exit`): the one the walk's last step met,
 // or, `capped` where the walk stopped at its cap, the one it entered, which the vertex that started
 // it left there.
-public void lean_walk_exit<M : IMedium>(PathRoot r, uint slot, bool capped)
+public void lean_walk_exit<M : IMedium>(PathRoot r, uint slot, uint4 input)
 {
+    bool capped = input.x != 0;
     uint4* at = lean_hot(r, slot);
     PathVertex x;
     {
@@ -1583,7 +1944,7 @@ public void lean_walk_exit<M : IMedium>(PathRoot r, uint slot, bool capped)
         x.camera_distance = b.w;
         x.view = x.surface.normal;
     }
-    lean_exit_vertex<M>(r, slot, at, x, halves(load_coherent(at + 2).x), capped);
+    lean_exit_vertex<M>(r, slot, at, x, halves(load_coherent(at + 2).x), input);
 }
 
 // Vertex `x` where a subsurface walk leaves, reached along `dir`: its normals face out, along the
@@ -1608,7 +1969,39 @@ public uint4 window_payload(float exterior, float2 cone)
 
 public bool is_window(uint4 payload)
 {
+    return payload.x == 0 && payload.y != 0;
+}
+
+// Whether a hit is invoked with a question its shader answers in place of running a vertex: a
+// window's or the stack question, whose second word is 0.
+public bool is_question(uint4 payload)
+{
     return payload.x == 0;
+}
+
+public bool is_stack_question(uint4 payload)
+{
+    return payload.x == 0 && payload.y == 0;
+}
+
+// Whether the ray of the path in hot words `at` may cross a plane stack face weighed as a
+// vertex's ray toward a directional light: a vertex's scatter drew it, or it crossed faces since.
+bool stack_tracked_ray(uint4* at)
+{
+    float pdf = asfloat(load_coherent(at + 3)).w;
+    return pdf > 0.0 || pdf == PDF_STACK;
+}
+
+// Answers the stack question for `slot`'s stack ray, whose hit resolved to `sh`, on a plane stack
+// face where `face`: in the stack words, the face's unit shading normal, its unit geometric normal
+// on its front side, its material, MATERIAL_NONE off a face, and the error a ray origin there
+// clears. A face's material reads no texture, so its medium reads no point.
+void answer_stack(PathRoot r, uint slot, bool face, SurfaceHit sh)
+{
+    GSurface g = sh.surface;
+    uint4* at = lean_stack(r, slot) + STACK_FACE_WORD;
+    store_coherent(at, uint4(asuint(g.normal), face ? sh.section : MATERIAL_NONE));
+    store_coherent(at + 1, uint4(asuint(g.geometric_normal), asuint(sh.geometric_error)));
 }
 
 // Writes into the record of `slot`'s view path that its first vertex is a layer `distance` m from
@@ -1640,11 +2033,13 @@ public void lean_first<M : IMedium>(PathRoot r, uint slot, inout uint4 payload)
     RayCone cone = camera_cone(r.view);
     float2 footprint = float2(cone_width(cone, x.camera_distance), cone.spread);
     // A path behind layers marks its offset word: the camera ray's media are the layer chain's.
+    // A re-run of the vertex for its bent job's light reads none of them.
     uint4 w2 = load_coherent(at + 2);
     bool behind = w2.z != 0;
-    store_coherent(at + 2, uint4(w2.xy, 0, w2.w));
+    if (!(may(MAY_STACK) && payload.y == PAYLOAD_BENT))
+        store_coherent(at + 2, uint4(w2.xy, 0, w2.w));
     float exterior;
-    payload.y = lean_vertex<M, 1, GBufferLight, OnOpaque, false>(r, slot, at, x, -x.view, behind ? 0.0 : x.camera_distance, footprint, GBufferLight(), OnOpaque(), 0, exterior);
+    payload.y = lean_vertex<M, 1, GBufferLight, OnOpaque, false>(r, slot, at, x, -x.view, behind ? 0.0 : x.camera_distance, footprint, GBufferLight(), OnOpaque(), payload, exterior);
     // Where the walk the vertex starts stops at its cap it leaves here.
     if (lean_walks(false) && payload.y == PAYLOAD_WALKS)
         store_exit(lean_cold(r, slot), exit_vertex_of(x, -x.view, true));
@@ -1671,8 +2066,10 @@ void lean_feedback(PathRoot r, uint slot, uint id, float contribution)
 }
 
 // What `slot`'s path ray that met nothing adds: the environment along it and the directional
-// lights' discs, each weighed against next-event estimation at the vertex the ray left.
-public void lean_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot)
+// lights' discs, each weighed against next-event estimation at the vertex the ray left. A ray past
+// plane stack faces weighs a disc against next-event estimation at the vertex before them where
+// its probe found the stack there, `stack_owned`, as its raygen says.
+public void lean_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, bool stack_owned)
 {
     uint4* at = lean_hot(r, slot);
     PathHot p = load_hot(at);
@@ -1707,8 +2104,22 @@ public void lean_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot)
             {
                 uint id = set.directional_ids[k];
                 float3 d = directional_disc<M>(set, id, p.origin, p.dir);
-                if (any(d > 0.0) && !lit)
-                    e += d * (weigh ? mis_balance(p.pdf, p.run * nee_directional_pdf(set, p.normal, id, p.dir)) : 1.0);
+                if (!any(d > 0.0) || lit)
+                    continue;
+                // Past plane stack faces the disc is weighed as the vertex before them drew it.
+                float pdf = p.pdf;
+                float run = p.run;
+                float3 normal = p.normal;
+                bool weighs = weigh;
+                if (may(MAY_STACK))
+                {
+                    if (stack_owned && p.pdf == PDF_STACK)
+                    {
+                        pdf = stack_density(r, slot, p.dir, run, normal);
+                        weighs = true;
+                    }
+                }
+                e += d * (weighs ? mis_balance(pdf, run * nee_directional_pdf(set, normal, id, p.dir)) : 1.0);
             }
         }
         p.radiance += p.throughput * e;
@@ -1725,6 +2136,6 @@ public void lean_shadow_add(PathRoot r, uint slot, float3 added)
     radiance.xyz += added;
     store_coherent(at + 3, asuint(radiance));
     uint light = load_coherent(at + 2).w;
-    if (light != NO_LIGHT)
+    if (light != NO_LIGHT && light != STACK_JOB_LIGHT)
         lean_feedback(r, slot, light, luminance_rec2020(added));
 }

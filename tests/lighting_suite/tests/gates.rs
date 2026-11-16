@@ -5,7 +5,8 @@ use std::any::Any;
 
 use lighting_suite::bed::{
     Analytic, Bed, EXTENT, FrostGuide, GLOSSY_FLOOR, Gate, Item, NEAR, Paths, SUN, Spec, WATER_BOX,
-    assert_gate, glass_scene, light_bed, particle_bed, plane_stack_spec, plume_bed, reference,
+    assert_gate, glass_scene, light_bed, particle_bed, plane_stack_spec, plume_bed,
+    producer_stack_bed, reference,
 };
 use lighting_suite::{assert_clean, device, require, texture, upload};
 use orr_gpu::KernelSet;
@@ -266,6 +267,13 @@ fn gates() -> Vec<Row> {
             },
             reference(2),
         ),
+        row(
+            "plane stack on a producer entry",
+            &[view | u64::from(MAY_STACK | MAY_LAYERS) | may2(SceneFeatures::PRODUCERS)],
+            producer_stack_bed,
+            dim,
+            real_time,
+        ),
     ]
 }
 
@@ -306,4 +314,10 @@ fn specialized_pipelines_launch_the_paths_the_general_one_does_through_glass() {
 #[test]
 fn specialized_pipelines_launch_the_paths_the_general_one_does_through_layers() {
     gate_rows(16..20);
+}
+
+/// As above, through a producer entry's glass.
+#[test]
+fn specialized_pipelines_launch_the_paths_the_general_one_does_through_producer_glass() {
+    gate_rows(20..21);
 }
