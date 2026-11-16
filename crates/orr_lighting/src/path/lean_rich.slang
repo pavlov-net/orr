@@ -37,7 +37,7 @@ void surface_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 void first_vertex(inout Payload p)
 {
     ORR_OMM(first_vertex);
-    lean_first<Medium>(root, DispatchRaysIndex().x);
+    lean_first<Medium>(root, DispatchRaysIndex().x, p.words);
 }
 
 [shader("callable")]

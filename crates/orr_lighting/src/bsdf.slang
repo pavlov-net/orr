@@ -51,7 +51,7 @@ public static const uint CLASS_EVERY = 0x3f;
 public extern static const uint BSDF_CLASS = CLASS_EVERY;
 
 // Whether the kernel's materials may have lobe set `lobes` (CLASS_*).
-bool class_has(uint lobes)
+public bool class_has(uint lobes)
 {
     return (BSDF_CLASS & lobes) != 0;
 }

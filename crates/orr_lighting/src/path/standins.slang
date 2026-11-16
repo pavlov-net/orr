@@ -52,7 +52,8 @@ void vertex_hit(uint3 id: SV_DispatchThreadID)
     ORR_OMM(vertex_hit);
     uint4* w = lane_words(id.x);
     HitData data = lane_data(id.x);
-    lean_hit<Surface, Medium, StoredHit, SectionGiven>(root, id.x, w[0], section_given(data.material), lane_hit(id.x));
+    uint4 words = w[0];
+    lean_hit<Surface, Medium, StoredHit, SectionGiven>(root, id.x, words, section_given(data.material), lane_hit(id.x));
 }
 
 [shader("compute")]
@@ -60,7 +61,8 @@ void vertex_hit(uint3 id: SV_DispatchThreadID)
 void first_vertex(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(first_vertex);
-    lean_first<Medium>(root, id.x);
+    uint4 none = uint4(0);
+    lean_first<Medium>(root, id.x, none);
 }
 
 [shader("compute")]

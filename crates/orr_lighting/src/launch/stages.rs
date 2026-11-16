@@ -16,14 +16,16 @@ use orr_shaders::surface_declares;
 use crate::mask_sets::Members;
 use crate::shaders::consts::{
     ANY_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS, HIT_INSTRUCTIONS, INTERIOR_HIT_INSTRUCTIONS,
-    LAYER_HIT_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW,
-    PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS,
-    RAYGEN_INSTRUCTIONS, RAYGEN_LAYER_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
+    LAYER_HIT_INSTRUCTIONS, MEDIUM_VERTEX_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_UPDATE,
+    PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS,
+    PRODUCER_HIT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS, RAYGEN_LAYER_INSTRUCTIONS,
+    RAYGEN_WALK_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS,
+    WALK_EXIT_INSTRUCTIONS, WALK_HIT_INSTRUCTIONS,
 };
-use crate::shaders::path::{lean_layer, lean_paths, lean_rich};
+use crate::shaders::path::{lean_layer, lean_paths, lean_rich, lean_walk};
 use crate::staged::{
-    MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_INTERIORS, MAY_LAYERS, MAY_LOBES, MAY_TRACED,
-    MAY_UPDATE, MAY_VIEW,
+    MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_INTERIORS, MAY_LAYERS, MAY_LOBES, MAY_SCATTERING,
+    MAY_TRACED, MAY_UPDATE, MAY_VIEW, MAY_WALK,
 };
 use crate::{Error, KernelSet, module};
 
@@ -41,6 +43,11 @@ pub enum Role {
     Hit,
     /// An any-hit shader of a candidate that is not opaque.
     AnyHit,
+    /// The callable of a path's vertex in an interior's medium: at a scatter, or where a walk
+    /// leaves the interior.
+    Medium,
+    /// The callable of the vertex where a subsurface walk leaves.
+    Exit,
 }
 
 /// The most instructions the stages of a pipeline may hand the driver together.
@@ -78,12 +85,14 @@ impl Geometry {
 }
 
 /// The lean kernel a stage comes from: the one whose BSDF has the plain lobes alone, the one
-/// with a coat, a fuzz, a thin film and a thin wall's transmission too, or the dielectric
-/// class's, whose BSDF transmits and whose vertex crosses interiors.
+/// with a coat, a fuzz, a thin film and a thin wall's transmission too, that one with the
+/// subsurface lobe and its walks, which takes its place where the scene's surfaces may walk, or
+/// the dielectric class's, whose BSDF transmits and whose vertex crosses interiors.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kernel {
     Plain,
     Rich,
+    Walk,
     Layer,
 }
 
@@ -92,6 +101,7 @@ impl Kernel {
         match self {
             Self::Plain => &lean_paths::MODULE,
             Self::Rich => &lean_rich::MODULE,
+            Self::Walk => &lean_walk::MODULE,
             Self::Layer => &lean_layer::MODULE,
         }
     }
@@ -130,6 +140,7 @@ impl Spec {
         let rich = match self.kernel {
             Kernel::Plain => "",
             Kernel::Rich => ".rich",
+            Kernel::Walk => ".walk",
             Kernel::Layer => ".layer",
         };
         CString::new(format!("{}{geometry}{surface}{rich}{emitter}", self.entry))
@@ -152,11 +163,16 @@ impl Spec {
         let (base, producer) = match self.role {
             Role::Raygen => {
                 let layers = self.may & MAY_LAYERS != 0;
+                let walks = self.may & (MAY_SCATTERING | MAY_WALK) != 0;
                 return Some(
-                    RAYGEN_INSTRUCTIONS + if layers { RAYGEN_LAYER_INSTRUCTIONS } else { 0 },
+                    RAYGEN_INSTRUCTIONS
+                        + if layers { RAYGEN_LAYER_INSTRUCTIONS } else { 0 }
+                        + if walks { RAYGEN_WALK_INSTRUCTIONS } else { 0 },
                 );
             }
             Role::Miss => return Some(MISS_INSTRUCTIONS),
+            Role::Medium => return Some(MEDIUM_VERTEX_INSTRUCTIONS),
+            Role::Exit => return Some(WALK_EXIT_INSTRUCTIONS),
             Role::Hit => (HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS),
             Role::AnyHit => (ANY_HIT_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS),
         };
@@ -174,6 +190,7 @@ impl Spec {
         };
         let rich = match (self.role, self.kernel) {
             (Role::Hit, Kernel::Rich) => RICH_HIT_INSTRUCTIONS,
+            (Role::Hit, Kernel::Walk) => RICH_HIT_INSTRUCTIONS + WALK_HIT_INSTRUCTIONS,
             (Role::Hit, Kernel::Layer) => LAYER_HIT_INSTRUCTIONS,
             _ => 0,
         };
@@ -200,6 +217,15 @@ impl Spec {
                     ..lean_rich::Spec::default()
                 };
                 (s.bytes(), lean_rich::Spec::ENTRIES)
+            }
+            Kernel::Walk => {
+                let s = lean_walk::Spec {
+                    path_may: may,
+                    path_may2: may2,
+                    hit_surface: self.hit_surface,
+                    ..lean_walk::Spec::default()
+                };
+                (s.bytes(), lean_walk::Spec::ENTRIES)
             }
             Kernel::Layer => {
                 let s = lean_layer::Spec {
@@ -228,6 +254,10 @@ struct Table {
     /// The callable that starts a path in the interiors around the eye, where the paths may lie
     /// in one.
     eye_interior: Option<u32>,
+    /// The callable of a path's vertex at a scatter in an interior's medium, where one may scatter.
+    medium: Option<u32>,
+    /// The callable of the vertex where a subsurface walk leaves, where surfaces may walk.
+    walk_exit: Option<u32>,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
 }
@@ -260,8 +290,14 @@ impl Table {
         let emits = may & MAY_EMISSIVE != 0;
         // The stage made for a surface that may emit is the only one with `MAY_EMITTER`.
         let may = may & !MAY_EMITTER;
-        // Whether the scene's surfaces may have a coat, a fuzz, a thin film or subsurface.
+        // Whether the scene's surfaces may have a coat, a fuzz, a thin film or subsurface, and the
+        // kernel of those lobes: the one that walks where they may.
         let lobes = may & MAY_LOBES != 0;
+        let rich = if may & MAY_WALK != 0 {
+            Kernel::Walk
+        } else {
+            Kernel::Rich
+        };
         let folded = |entry, role| Spec {
             kernel: Kernel::Plain,
             entry,
@@ -288,7 +324,7 @@ impl Table {
         let first = Self::stage(
             &mut specs,
             Spec {
-                kernel: if lobes { Kernel::Rich } else { Kernel::Plain },
+                kernel: if lobes { rich } else { Kernel::Plain },
                 may: may | if emits { MAY_EMITTER } else { 0 },
                 ..folded("first_vertex", Role::Hit)
             },
@@ -297,13 +333,24 @@ impl Table {
             Self::stage(
                 &mut specs,
                 Spec {
-                    kernel: if lobes { Kernel::Rich } else { Kernel::Plain },
+                    kernel: if lobes { rich } else { Kernel::Plain },
                     ..folded("first_view", Role::Hit)
                 },
             )
         });
         let eye_interior = (may & MAY_INTERIORS != 0)
             .then(|| Self::stage(&mut specs, folded("eye_interior", Role::Hit)));
+        let medium = (may & MAY_SCATTERING != 0)
+            .then(|| Self::stage(&mut specs, folded("medium_vertex", Role::Medium)));
+        let walk_exit = (may & MAY_WALK != 0).then(|| {
+            Self::stage(
+                &mut specs,
+                Spec {
+                    kernel: Kernel::Walk,
+                    ..folded("walk_leaves", Role::Exit)
+                },
+            )
+        });
         // `hit_surface` of the hit shaders of each pin: any id, then each id from 0 on. Where
         // no surface links every material shows id 0.
         let pinned = |entry, role, pin: u32, geometry: Geometry| Spec {
@@ -385,7 +432,7 @@ impl Table {
         // Each kind: its groups, shaders and geometry, whether the table holds it, and whether its
         // materials may emit and may have a rich lobe. A rich material that emits takes the rich
         // kind.
-        for (first, hit, any_hit, geometry, linked, emissive, rich, layer) in [
+        for (first, hit, any_hit, geometry, linked, emissive, lobed_kind, layer) in [
             (
                 &mut groups.path,
                 Some("surface_hit"),
@@ -501,8 +548,8 @@ impl Table {
                         };
                         let kernel = if layer && transmits(pin) {
                             Kernel::Layer
-                        } else if lobed(pin, rich || layer) {
-                            Kernel::Rich
+                        } else if lobed(pin, lobed_kind || layer) {
+                            rich
                         } else {
                             Kernel::Plain
                         };
@@ -530,6 +577,8 @@ impl Table {
             first,
             first_view,
             eye_interior,
+            medium,
+            walk_exit,
             hit_groups,
             groups,
         }
@@ -546,7 +595,7 @@ pub struct StageSize {
     pub geometry: &'static str,
     /// The linked surface id the stage is made for; `u32::MAX` for any.
     pub hit_surface: u32,
-    /// Whether it comes from the lean kernel with the coat, fuzz, thin film and thin wall lobes.
+    /// Whether it comes from a lean kernel with the coat, fuzz, thin film and thin wall lobes.
     pub rich: bool,
     pub instructions: u32,
     /// The most of orr's own code it may hand the driver; none for a stage made for a linked
@@ -610,7 +659,7 @@ pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>,
                 role: spec.role,
                 geometry: spec.geometry.map_or("", Geometry::label),
                 hit_surface: spec.hit_surface,
-                rich: spec.kernel == Kernel::Rich,
+                rich: matches!(spec.kernel, Kernel::Rich | Kernel::Walk),
                 instructions,
                 cap: spec.cap(kernels.surfaces),
                 linked,
@@ -731,6 +780,8 @@ impl PathPipeline {
                 Some(ShaderRecord::new(table.first)),
                 table.first_view.map(ShaderRecord::new),
                 table.eye_interior.map(ShaderRecord::new),
+                table.medium.map(ShaderRecord::new),
+                table.walk_exit.map(ShaderRecord::new),
             ],
             max_recursion: 1,
             flags: RayPipelineFlags::scene(device.caps()),

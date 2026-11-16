@@ -12,8 +12,8 @@ use orr_gpu::KernelSet;
 use orr_lighting::path_may::{
     MAY_BACKGROUND, MAY_CACHE, MAY_CAUSTICS, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL,
     MAY_DISPERSION, MAY_EMISSIVE, MAY_FROST, MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOCAL_LIGHTS,
-    MAY_PARTICLES, MAY_PHOTON, MAY_PROXIES, MAY_REFERENCE, MAY_STACK, MAY_SUBSURFACE, MAY_UPDATE,
-    MAY_VIEW, MAY_WALK,
+    MAY_PARTICLES, MAY_PHOTON, MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING, MAY_STACK,
+    MAY_SUBSURFACE, MAY_UPDATE, MAY_VIEW, MAY_WALK,
 };
 use orr_lighting::{
     DofBackgroundPass, Light, LightingDebugView, ReferenceSettings, ThinLens, ViewLighting,
@@ -152,7 +152,7 @@ fn gates() -> Vec<Row> {
         ),
         row(
             "scattering interiors",
-            &[view | u64::from(MAY_INTERIORS | MAY_LAYERS)],
+            &[view | u64::from(MAY_INTERIORS | MAY_LAYERS | MAY_SCATTERING)],
             || Bed::with(glass_scene("milk")),
             dim,
             real_time,
