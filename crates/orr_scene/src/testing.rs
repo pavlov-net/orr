@@ -2,8 +2,8 @@
 //! and comparison against reference images. `ORR_BLESS=1` rewrites the references instead of
 //! comparing.
 //!
-//! 8-bit images are display-encoded (sRGB) and compare with FLIP; float images compare per
-//! pixel.
+//! 8-bit images are display-encoded (sRGB) and compare with FLIP or by block means; float
+//! images compare per pixel.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -334,6 +334,97 @@ pub enum Tolerance {
     Flip { mean: f32, p99: f32 },
     /// Largest per-channel difference at most this ([`max_difference`]).
     PerPixel(f32),
+    /// 8-bit images: over every `size` x `size` block (smaller at the right and bottom edges),
+    /// the mean linear value of each channel at most `relative` of the reference's plus `floor`
+    /// from it ([`block_excess`]), but in the blocks that meet a `skip` rectangle, `[x0, y0, x1,
+    /// y1)` in pixels. A noisy image passes where its noise averages out over a block and fails
+    /// where it is biased over one.
+    Blocks {
+        size: u32,
+        relative: f32,
+        floor: f32,
+        skip: &'static [[u32; 4]],
+    },
+}
+
+/// The block where `test` strays furthest from `reference` past the bound of
+/// [`Tolerance::Blocks`]: the block's origin, the channel, both means and the difference over
+/// the bound, which is above 1 where the block fails.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockExcess {
+    pub origin: [u32; 2],
+    pub channel: usize,
+    pub reference: f32,
+    pub test: f32,
+    pub ratio: f32,
+}
+
+/// Each `size` x `size` block's mean linear RGB, blocks row by row.
+fn block_means(image: &Image, size: u32) -> Vec<[f64; 3]> {
+    let Pixels::Rgba8(p) = &image.pixels else {
+        panic!("block means compare 8-bit display-encoded images");
+    };
+    let (bw, bh) = (image.width.div_ceil(size), image.height.div_ceil(size));
+    let mut sums = vec![([0.0f64; 3], 0u32); (bw * bh) as usize];
+    for (i, px) in p.as_chunks::<4>().0.iter().enumerate() {
+        let (x, y) = (i as u32 % image.width, i as u32 / image.width);
+        let (sum, n) = &mut sums[((y / size) * bw + x / size) as usize];
+        for c in 0..3 {
+            sum[c] += f64::from(orr_color::srgb8_decode(px[c]));
+        }
+        *n += 1;
+    }
+    sums.into_iter()
+        .map(|(sum, n)| sum.map(|v| v / f64::from(n)))
+        .collect()
+}
+
+/// The furthest block of `test` from `reference` under [`Tolerance::Blocks`].
+pub fn block_excess(
+    reference: &Image,
+    test: &Image,
+    size: u32,
+    relative: f32,
+    floor: f32,
+    skip: &[[u32; 4]],
+) -> BlockExcess {
+    assert_eq!(
+        (reference.width, reference.height),
+        (test.width, test.height),
+        "image sizes differ"
+    );
+    let bw = reference.width.div_ceil(size);
+    let (r, t) = (block_means(reference, size), block_means(test, size));
+    let mut worst = BlockExcess {
+        origin: [0; 2],
+        channel: 0,
+        reference: 0.0,
+        test: 0.0,
+        ratio: 0.0,
+    };
+    for (i, (r, t)) in r.iter().zip(&t).enumerate() {
+        let [x, y] = [i as u32 % bw * size, i as u32 / bw * size];
+        if skip
+            .iter()
+            .any(|s| x < s[2] && s[0] < x + size && y < s[3] && s[1] < y + size)
+        {
+            continue;
+        }
+        for c in 0..3 {
+            let bound = f64::from(relative) * r[c] + f64::from(floor);
+            let ratio = ((t[c] - r[c]).abs() / bound) as f32;
+            if ratio > worst.ratio {
+                worst = BlockExcess {
+                    origin: [x, y],
+                    channel: c,
+                    reference: r[c] as f32,
+                    test: t[c] as f32,
+                    ratio,
+                };
+            }
+        }
+    }
+    worst
 }
 
 /// Compares `image` with the reference at `reference`, whose extension is set from the
@@ -362,6 +453,21 @@ pub fn check(reference: &Path, image: &Image, tolerance: Tolerance) {
             Tolerance::PerPixel(max) => {
                 let d = max_difference(&expected, image);
                 (d > max).then(|| format!("largest difference {d} (allowed {max})"))
+            }
+            Tolerance::Blocks {
+                size,
+                relative,
+                floor,
+                skip,
+            } => {
+                let e = block_excess(&expected, image, size, relative, floor, skip);
+                (e.ratio > 1.0).then(|| {
+                    format!(
+                        "the {size} px block at {:?} has a mean of {} in channel {} against \
+                         the reference's {}: {} times the allowed {relative} of it plus {floor}",
+                        e.origin, e.test, e.channel, e.reference, e.ratio
+                    )
+                })
             }
         }
     };
@@ -474,6 +580,33 @@ mod tests {
         assert!(e.mean > 1e-3 && e.p99 > 0.1, "{e:?}");
         let caught = std::panic::catch_unwind(|| check(&reference, &changed, tight));
         assert!(caught.is_err(), "a changed block passed");
+
+        // Noise that averages out over a block passes the block means; the changed block fails.
+        let blocks = Tolerance::Blocks {
+            size: 8,
+            relative: 0.02,
+            floor: 0.002,
+            skip: &[],
+        };
+        let mut noisy = img.clone();
+        let Pixels::Rgba8(p) = &mut noisy.pixels else {
+            unreachable!()
+        };
+        for (i, px) in p.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let step: i16 = if (i % 64 + i / 64) % 2 == 0 { 3 } else { -3 };
+            px[2] = (i16::from(px[2]) + step) as u8;
+        }
+        assert!(flip(&img, &noisy).mean > 1e-4, "the noise shows per pixel");
+        check(&reference, &noisy, blocks);
+        let caught = std::panic::catch_unwind(|| check(&reference, &changed, blocks));
+        assert!(caught.is_err(), "a changed block passed the block means");
+        let skipped = Tolerance::Blocks {
+            size: 8,
+            relative: 0.02,
+            floor: 0.002,
+            skip: &[[16, 8, 32, 24]],
+        };
+        check(&reference, &changed, skipped);
 
         let float = Image {
             width: 2,
