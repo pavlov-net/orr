@@ -1190,6 +1190,39 @@ fn a_walks_rough_way_out_is_adobes_bsdf_from_inside() {
                     "{label}: {share:.5} of draws leave, the density integrates to {density:.5}"
                 ));
             }
+            // Light outside along the way out `s` = -`v` mirrored, drawn in by `rough_way_in`:
+            // over its draws the value from inside toward `s` sums to its integral over the ways
+            // in, the multiple scattering's among them.
+            let s = [v[0], v[1], v[2]];
+            let inward = |r: [f32; 3]| {
+                if r[2] < 0.0 {
+                    f64::from(
+                        lighting_math::interior_rough_transmission(alpha, eta, way(r), way(s)).0,
+                    )
+                } else {
+                    0.0
+                }
+            };
+            let through: f64 = integrate_cells(&cells, inward).iter().sum();
+            let (mut drawn, mut drawn2) = (0.0f64, 0.0f64);
+            for _ in 0..n {
+                let u = [rng.f32(), rng.f32(), rng.f32()];
+                let (r, pdf) = lighting_math::rough_way_in(alpha, ior, s, u, 0.1);
+                let x = if pdf > 0.0 {
+                    inward(r) / f64::from(pdf)
+                } else {
+                    0.0
+                };
+                drawn += x;
+                drawn2 += x * x;
+            }
+            let mean = drawn / k;
+            let se = ((drawn2 / k - mean * mean) / k).sqrt();
+            if (mean - through).abs() > 0.005 * through + 1e-5 + 3.0 * se {
+                failures.push(format!(
+                    "{label}: the ways in carry {mean:.5}, the value integrates to {through:.5}"
+                ));
+            }
         }
     }
     assert!(

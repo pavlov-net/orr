@@ -439,6 +439,26 @@ pub fn interior_rough_transmission(alpha: f32, eta: f32, v: V3, l: V3) -> (f32, 
     (value, pdf)
 }
 
+/// `rough_way_in`: a way into a plain dielectric of GGX `alpha` and IOR `ior` for light along `s`,
+/// in a frame whose z points out of the medium, with a share `even` of the draws even over the
+/// hemisphere below; the direction and its density.
+pub fn rough_way_in(alpha: f32, ior: f32, s: V3, u: [f32; 3], even: f32) -> (V3, f32) {
+    let (mut r, mut pdf) = ([0.0; 3], 0.0);
+    // SAFETY: `s`, `u` and `r` are 3 floats.
+    unsafe {
+        ffi::lighting_rough_way_in(
+            alpha,
+            ior,
+            s.as_ptr(),
+            u.as_ptr(),
+            even,
+            r.as_mut_ptr(),
+            &raw mut pdf,
+        );
+    }
+    (r, pdf)
+}
+
 /// `dispersed_ior`: OpenPBR's IOR at `nm` for `ior` at 587.6 nm and Abbe number `abbe` over
 /// `scale`.
 pub fn dispersed_ior(ior: f32, scale: f32, abbe: f32, nm: f32) -> f32 {
@@ -527,6 +547,15 @@ mod ffi {
             l: *const f32,
             pdf: *mut f32,
         ) -> f32;
+        pub(crate) fn lighting_rough_way_in(
+            alpha: f32,
+            ior: f32,
+            s: *const f32,
+            u: *const f32,
+            even: f32,
+            r: *mut f32,
+            pdf: *mut f32,
+        );
         pub(crate) fn lighting_spectral_transfer(u: f32, weight: *const f32, out: *mut f32);
         pub(crate) fn lighting_bsdf_albedo(p: *const c_void, out: *mut f32);
         pub(crate) fn lighting_bsdf_emission(p: *const c_void, out: *mut f32);

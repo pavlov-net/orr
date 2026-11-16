@@ -1053,6 +1053,14 @@ public struct InteriorExitScatter : IScatter
         return cosine_hemisphere_pdf(dot(n, wi));
     }
 
+    // The lobe seen from inside, at cosine `c` to the normal of the way out: the Fresnel
+    // transmission out times the cosine, over its integral over the hemisphere inside, which is
+    // the outside's over the IOR squared.
+    public float inside(float c)
+    {
+        return (1.0 - openpbr_fresnel(1.0 / eta, c)) * c * eta * eta * scale * INV_PI;
+    }
+
     public float3 eval_and_pdf(float3 wi, out float density, out float3 diffuse)
     {
         density = pdf(wi);
@@ -1490,6 +1498,19 @@ public struct InteriorWalk<S : ISurfaces> : IWalkTrace
 public bool interior_rough(SceneRoot* scene, uint m)
 {
     return scene.materials[m].specular_roughness >= MIRROR_ROUGHNESS;
+}
+
+// The roughness from which an interior's real-time walk takes the light through its rough
+// surface wherever it meets it, as the reference does; below it, only where it leaves, by the
+// walk's last scatter through the surface's plane, which is quieter where the surface's
+// transmission from inside is narrow and biased on bodies that curve within a few mean free
+// paths.
+public static const float INTERIOR_EXACT_ROUGHNESS = 0.6;
+
+// Whether material `m`'s surface is at least that rough.
+public bool interior_exact(SceneRoot* scene, uint m)
+{
+    return scene.materials[m].specular_roughness >= INTERIOR_EXACT_ROUGHNESS;
 }
 
 // What a step of the walk in interior `material`, its surface `ior` times the outside's, from

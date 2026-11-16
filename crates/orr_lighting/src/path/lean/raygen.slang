@@ -245,7 +245,9 @@ void end_path(uint4* at)
 // Where an interior's walk last met the surface it walks in: the point, the surface's outward
 // normal there, the direction the walk reached it along, its throughput there and the weight of
 // what the surface did with it, 0 where the surface's draw was lost. `met` where the surface is
-// rough and the walk stopped there. Where the walk's step there started at a scatter, its
+// rough and the walk stopped there, and below `INTERIOR_EXACT_ROUGHNESS` where it left there the
+// draws of the surface's BSDF from the same arrival it took until one left, as many as one over
+// the chance that a draw leaves on average. Where the walk's step there started at a scatter, its
 // `length`, the direction the walk reached that scatter along and the walk's throughput there over
 // the chance of the step (`walk_unattenuated`); else a `length` of -1.
 struct RoughMeeting
@@ -256,6 +258,7 @@ struct RoughMeeting
     float3 arrival;
     float3 reached;
     float weight;
+    float draws;
     float length;
     float3 into;
     float3 unattenuated;
@@ -274,8 +277,9 @@ void walk_traced(PathRoot r, uint slot, uint4* at, inout Walk e, bool interior, 
     uint mask = interior ? MASK_OPAQUE | MASK_DIELECTRIC : MASK_OPAQUE;
     uint4 cover = scattered_cover(r, slot, at, mask);
     last = traced_nothing();
-    meeting = { false, float3(0.0), float3(0.0), float3(0.0), float3(0.0), 0.0, -1.0, float3(0.0), float3(0.0) };
+    meeting = { false, float3(0.0), float3(0.0), float3(0.0), float3(0.0), 0.0, 0.0, -1.0, float3(0.0), float3(0.0) };
     bool rough = interior && share && interior_rough(r.scene, owner);
+    bool exact = rough && interior_exact(r.scene, owner);
     // A fresh interior's walk starts at a scatter on the path's ray, whose direction its words
     // keep.
     bool scattered = interior && e.step == 0;
@@ -308,8 +312,22 @@ void walk_traced(PathRoot r, uint slot, uint4* at, inout Walk e, bool interior, 
         else if (own)
         {
             float3 normal = boundary_normal(r.scene, last, b, e.dir);
-            met = interior_meet(r.scene, r.view, owner, e.ior, b.material, normal, e.origin, e.dir, b.t, !share, e.rng);
-            meeting = { rough && met.kind != WALK_BOUNDARY, e.origin + e.dir * b.t, normal, e.dir, float3(0.0), met.kind == WALK_NONE ? 0.0 : met.weight, scattered ? b.t : -1.0, into, walk_unattenuated(e, d, b.t) };
+            // One site of the surface's draw, which the walk's own takes first.
+            uint draws = 0;
+            for (;;)
+            {
+                WalkMeet m = interior_meet(r.scene, r.view, owner, e.ior, b.material, normal, e.origin, e.dir, b.t, !share, e.rng);
+                if (draws == 0)
+                    met = m;
+                draws++;
+                // A step from a scatter that the surface reflects whole, smooth, takes no light
+                // through the plane, and needs no count.
+                float c = dot(e.dir, normal);
+                bool whole = scattered && e.ior * e.ior * (1.0 - c * c) >= 1.0;
+                if (!rough || exact || met.kind != WALK_LEAVE || whole || (draws > 1 && m.kind == WALK_LEAVE))
+                    break;
+            }
+            meeting = { exact && met.kind != WALK_BOUNDARY, e.origin + e.dir * b.t, normal, e.dir, float3(0.0), met.kind == WALK_NONE ? 0.0 : met.weight, float(draws - 1), scattered ? b.t : -1.0, into, walk_unattenuated(e, d, b.t) };
         }
         bool reaches = walk_reached(e, d, b.t, meeting.reached);
         meeting.met = meeting.met && reaches;
@@ -421,7 +439,7 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
     // last step, through a smooth one by that step and the scatter it started at, which the walk's
     // words take with the weight of the surface's draw.
     Payload leave;
-    leave.words = uint4(arrived, capped ? MEDIUM_CAPPED : MEDIUM_LEAVES, asuint(meeting.length), 1);
+    leave.words = uint4(arrived, capped ? MEDIUM_CAPPED : MEDIUM_LEAVES, asuint(meeting.length), asuint(meeting.draws));
     if (meeting.met)
         leave.words.yz = uint2(MEDIUM_LEAVES_ROUGH, asuint(meeting.weight));
     else

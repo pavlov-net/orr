@@ -52,13 +52,13 @@ public static const uint LEAN_INTO_WORD = LEAN_EXIT_WORD;
 [Host] public static const uint RAYGEN_LAYER_INSTRUCTIONS = 1200;
 // What a raygen holds more where an interior's medium may scatter or a surface may walk: the draw
 // of where a ray inside an interior scatters, and the steps of a walk, with the last scatter an
-// interior's way out weighs its light by, 300 of it.
-[Host] public static const uint RAYGEN_WALK_INSTRUCTIONS = 6500;
+// interior's way out weighs its light by and the draws of a rough way out, 500 of it.
+[Host] public static const uint RAYGEN_WALK_INSTRUCTIONS = 6700;
 // The callable of a path's vertex at a scatter in an interior's medium, or where a walk leaves it,
 // and of the light a walk takes through its rough surface where it meets it: that surface's
-// transmission seen from inside holds 1,100 of it, the way out's weight by the walk's last
-// scatter 400.
-[Host] public static const uint MEDIUM_VERTEX_INSTRUCTIONS = 13700;
+// transmission seen from inside holds 1,100 of it, and once more along the way in from a light
+// that a rough way out weighs by the walk's last scatter, with that way's draw, 1,300.
+[Host] public static const uint MEDIUM_VERTEX_INSTRUCTIONS = 15000;
 // The callable of the vertex where a subsurface walk leaves.
 [Host] public static const uint WALK_EXIT_INSTRUCTIONS = 17000;
 // The callable that weighs a coated emitter's light by what its coat and fuzz pass toward a

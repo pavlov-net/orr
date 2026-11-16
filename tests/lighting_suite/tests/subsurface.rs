@@ -6,7 +6,8 @@
 use lighting_suite::bed::{
     Accumulated, Bed, DenseInterior, EXTENT, FURNACE_RADIANCE, Item, JADE, JADE_SLAB,
     JADE_SLAB_THICKNESS, JADE_SPHERE, MILK, MILK_SPHERE, Paths, ROUGH_JADE_ROUGHNESS,
-    ROUGH_JADE_SPHERE, Spec, WALK_FURNACE, WALK_SLABS, WALK_SPHERE, look,
+    ROUGH_JADE_SPHERE, Spec, VERY_ROUGH_JADE_ROUGHNESS, VERY_ROUGH_JADE_SPHERE, WALK_FURNACE,
+    WALK_SLABS, WALK_SPHERE, look,
 };
 use lighting_suite::shaders::walk_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
@@ -419,10 +420,14 @@ fn a_lit_sphere_matches_the_cpu_walk(paths: &Paths) {
     assert!(e < 0.02, "sphere: GPU {gpu:?}, CPU {cpu:?} ({e:.4})");
 }
 
+/// The path shaders' `INTERIOR_EXACT_ROUGHNESS`: from it the pipeline's real-time walks take a sun
+/// through their rough surface wherever they meet it.
+const EXACT_ROUGHNESS: f32 = 0.6;
+
 /// The CPU walks of `interior` in `shape` as `paths` walk it with surface roughness `roughness`:
 /// the reference takes a sun through a rough surface wherever a walk meets it, and so do the
-/// pipeline's real-time walks, whose way out of a smooth surface weighs it by the exit lobe
-/// conditioned on the walk's last scatter.
+/// pipeline's real-time walks from [`EXACT_ROUGHNESS`]; below it their way out weighs it by the
+/// walk's last scatter through the surface's plane.
 fn cpu_dielectric(
     paths: &Paths,
     interior: &DenseInterior,
@@ -441,8 +446,8 @@ fn cpu_dielectric(
             surface_ior: f64::from(interior.ior),
         },
         roughness: f64::from(roughness),
-        exact_sun: !real_time || (roughness > 0.0 && pipeline),
-        conditioned: real_time && roughness == 0.0 && pipeline,
+        exact_sun: !real_time || (roughness >= EXACT_ROUGHNESS && pipeline),
+        conditioned: real_time && roughness < EXACT_ROUGHNESS && pipeline,
     }
 }
 
@@ -465,23 +470,6 @@ fn interior_matches_the_cpu_walk(
     radius: f32,
     lighting: &[Lighting],
     tolerance: f64,
-) {
-    interior_matches_the_cpu_walk_over(
-        paths, model, interior, roughness, radius, lighting, tolerance, 128,
-    );
-}
-
-/// [`interior_matches_the_cpu_walk`] over `frames`.
-#[allow(clippy::too_many_arguments)]
-fn interior_matches_the_cpu_walk_over(
-    paths: &Paths,
-    model: &'static str,
-    interior: &DenseInterior,
-    roughness: f32,
-    radius: f32,
-    lighting: &[Lighting],
-    tolerance: f64,
-    frames: u32,
 ) {
     let (eye, target, fov_y) = (Vec3::new(0.0, 1.2, 4.0) * radius, Vec3::ZERO, 0.6);
     let pixels = sphere_pixels(eye, target, fov_y, radius);
@@ -513,7 +501,7 @@ fn interior_matches_the_cpu_walk_over(
             fov_y,
             focus: None,
         };
-        let image = render_spec(paths, spec, frames);
+        let image = render_spec(paths, spec, 128);
         let gpu = mean_rgb(&image, pixels.iter().map(|p| p.0));
         let want = cpu.mean(2_000_000, light, 19, |rng| {
             let (_, p, n, v) = pixels[(rng.f64() * pixels.len() as f64) as usize];
@@ -615,9 +603,10 @@ fn dense_interiors_walk_as_the_cpu_walk_does() {
 /// Bounces enough for the reference's walks, which end where they meet the surface.
 const REFERENCE_BOUNCES: u32 = 64;
 
-/// A rough surface scatters the walks by its BSDF seen from inside: the reference and the
-/// pipeline's real-time walks take a sun through it wherever a walk meets it, the staged loop's
-/// real-time walks through their way out's exit lobe.
+/// A rough surface scatters the walks by its BSDF seen from inside: the reference takes a sun
+/// through it wherever a walk meets it, and so do the pipeline's real-time walks past
+/// [`EXACT_ROUGHNESS`]; below it they take it where they leave, by their last scatter through the
+/// surface's plane, and the staged loop's real-time walks through their way out's exit lobe.
 #[test]
 fn rough_interiors_walk_as_the_cpu_walk_does() {
     let mut paths = Paths::new(
@@ -634,15 +623,11 @@ fn rough_interiors_walk_as_the_cpu_walk_does() {
     interior_matches_the_cpu_walk(&paths, model, &JADE, roughness, 1.0, &sun, 0.1);
     paths.settings.reference = None;
     paths.settings.max_bounces = 2;
+    let both = [Lighting::Uniform, Lighting::Sun];
+    interior_matches_the_cpu_walk(&paths, model, &JADE, roughness, 1.0, &both, 0.02);
     if paths.entry == PathEntry::Pipeline {
-        // The pipeline's real-time walks take the sun through the surface where they meet it, as
-        // the reference does: their sum too reads 4 % low over 128 frames, and over 2048 within
-        // 1 % of the CPU walk's over 32 million walks.
-        interior_matches_the_cpu_walk(&paths, model, &JADE, roughness, 1.0, &uniform, 0.02);
-        interior_matches_the_cpu_walk_over(&paths, model, &JADE, roughness, 1.0, &sun, 0.04, 2048);
-    } else {
-        let both = [Lighting::Uniform, Lighting::Sun];
-        interior_matches_the_cpu_walk(&paths, model, &JADE, roughness, 1.0, &both, 0.02);
+        let (model, roughness) = (VERY_ROUGH_JADE_SPHERE, VERY_ROUGH_JADE_ROUGHNESS);
+        interior_matches_the_cpu_walk(&paths, model, &JADE, roughness, 1.0, &sun, 0.03);
     }
     assert_clean();
 }

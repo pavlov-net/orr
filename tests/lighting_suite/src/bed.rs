@@ -536,6 +536,10 @@ pub const JADE_SPHERE: &str = "jade sphere";
 /// [`ROUGH_JADE_ROUGHNESS`].
 pub const ROUGH_JADE_SPHERE: &str = "rough jade sphere";
 pub const ROUGH_JADE_ROUGHNESS: f32 = 0.35;
+/// A sphere of radius 1 m holding [`JADE`] whose surface has GGX roughness
+/// [`VERY_ROUGH_JADE_ROUGHNESS`].
+pub const VERY_ROUGH_JADE_SPHERE: &str = "very rough jade sphere";
+pub const VERY_ROUGH_JADE_ROUGHNESS: f32 = 0.75;
 /// A smooth slab of [`JADE`] 20 m square and [`JADE_SLAB_THICKNESS`] thick, its top face at
 /// y = 0: wide enough that the walks in it leave through its faces.
 pub const JADE_SLAB: &str = "jade slab";
@@ -1498,6 +1502,14 @@ fn cook() -> Arc<[u8]> {
                     mesh(|b| b.sphere(0, 48, 1.0)),
                     vec![Material {
                         specular_roughness: ROUGH_JADE_ROUGHNESS,
+                        ..JADE.material(glass)
+                    }],
+                ),
+                model(
+                    VERY_ROUGH_JADE_SPHERE,
+                    mesh(|b| b.sphere(0, 48, 1.0)),
+                    vec![Material {
+                        specular_roughness: VERY_ROUGH_JADE_ROUGHNESS,
                         ..JADE.material(glass)
                     }],
                 ),
