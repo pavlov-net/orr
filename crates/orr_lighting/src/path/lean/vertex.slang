@@ -539,17 +539,18 @@ struct LightPick
     bool view;
     uint position;
     uint triangle;
+    bool local;                 // the candidates came from a mixture with the local sampler's
 }
 
 // Draws the light candidates of the vertex at `position` with shading normal `normal`, weighed by
 // `b`, where the vertex `estimates`: one directional light with the vertex's directional share,
-// else `candidates` from its pixel's tile, and at a path's `first` vertex on the G-buffer's
-// surface (`FIRST` 1) the points this frame drew of its screen tile's local sampler for that
-// sampler's share of them; a hit's stage holds none of that. One sampler dimension and six per
-// candidate, as `nee_draw`. The direction `wi` the vertex's scatter drew, where it `scatters` other
-// than by a delta lobe, is evaluated beside the winner's, into `f`, `pdf` and `diffuse`, so the
-// vertex holds the BSDF's evaluation once. A point in a medium has a zero `normal`.
-LightPick pick_light<let FIRST : uint, B : ILeanScatter>(PathRoot r, B b, float3 position, float3 normal, uint2 pixel, uint candidates, bool estimates, bool first, bool scatters, float3 wi, out float3 f, out float pdf, out float3 diffuse, inout Sampler rng)
+// else `candidates` from its pixel's tile, and where `LOCAL` and `local` hold the points this frame
+// drew of its screen tile's local sampler for that sampler's share of them (`LightPick.local`); a
+// vertex that never draws from it holds none of that. One sampler dimension and six per
+// candidate, as `nee_draw`. The direction `wi` the vertex's scatter drew, where it `scatters`
+// other than by a delta lobe, is evaluated beside the winner's, into `f`, `pdf` and `diffuse`, so
+// the vertex holds the BSDF's evaluation once. A point in a medium has a zero `normal`.
+LightPick pick_light<let LOCAL : bool, B : ILeanScatter>(PathRoot r, B b, float3 position, float3 normal, uint2 pixel, uint candidates, bool estimates, bool local, bool scatters, float3 wi, out float3 f, out float pdf, out float3 diffuse, inout Sampler rng)
 {
     LightSetGpu* set = r.set;
     LightPick k;
@@ -567,14 +568,17 @@ LightPick pick_light<let FIRST : uint, B : ILeanScatter>(PathRoot r, B b, float3
     k.view = false;
     k.position = 0;
     k.triangle = 0;
+    k.local = false;
     f = float3(0.0);
     pdf = 0.0;
     diffuse = float3(0.0);
     uint end = rng.dimension + 1 + 6 * candidates;
     NeeVertex v = nee_vertex(set, position, normal, pixel, nullptr);
-    bool local = FIRST == 1 && first && may(MAY_LOCAL);
-    if (local)
+    if (LOCAL && local)
+    {
         v.local = pixel_local_lights(r, pixel);
+        k.local = v.local != nullptr;
+    }
     bool directional = false;
     if (estimates && !b.specular_only())
     {
@@ -599,7 +603,7 @@ LightPick pick_light<let FIRST : uint, B : ILeanScatter>(PathRoot r, B b, float3
     }
     for (uint i = 0; i < (directional ? 0 : k.drawn); i++)
     {
-        ResolvedLightSample c = nee_tile_candidate<FIRST == 1>(set, v, rng);
+        ResolvedLightSample c = nee_tile_candidate<LOCAL>(set, v, local, rng);
         float u = rng.next();
         if (!(c.pdf > 0.0) || (b.no_environment() && c.kind == LIGHT_SAMPLE_ENVIRONMENT))
             continue;
@@ -697,6 +701,7 @@ struct HitLight : IVertexLight
         if (first || whole || !(pdf > 0.0) || !(emitter.density > 0.0))
             return e;
         uint4 w1 = load_coherent(at + 1);
+        float run = halves(w1.w).y;
         // A ray ideal windows passed on measures the light from where its vertex left.
         float3 from = asfloat(w0.xyz);
         if (may2(MAY2_THIN_DIELECTRICS) && (w0.w & HOT_WINDOW) != 0)
@@ -704,12 +709,10 @@ struct HitLight : IVertexLight
         float3 toward = emitter.point - from;
         float distance = length(toward);
         float cos_to = distance > 0.0 ? dot(emitter.normal, toward / distance) : 0.0;
-        // The vertex the ray left drew its candidates with its local sampler where it was the
-        // path's first.
         LocalLights* local = nullptr;
-        if (may(MAY_LOCAL) && scattered == 1)
+        if (may(MAY_LOCAL) && ran_local(run))
             local = pixel_local_lights(r, pixel);
-        return e * mis_balance(pdf, halves(w1.w).y * nee_emissive_pdf(r.set, local, left_normal(w0.w, w1), emitter, distance, cos_to));
+        return e * mis_balance(pdf, abs(run) * nee_emissive_pdf(r.set, local, left_normal(w0.w, w1), emitter, distance, cos_to));
     }
 }
 
@@ -916,7 +919,10 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     float scatter_pdf;
     float3 scatter_diffuse;
     bool estimates = count_nee && counted && candidates > 0 && u_run < run;
-    LightPick k = pick_light<FIRST>(r, b, g.position, g.normal, pixel, candidates, estimates, first, evaluates, wi, scatter_f, scatter_pdf, scatter_diffuse, rng);
+    // The path's first scattering vertex draws with its pixel's local sampler, as the staged loop's
+    // does: on the G-buffer's surface, or in a hit's stage where a camera ray may reach it.
+    bool local = may(MAY_LOCAL) && scattered == 0 && (FIRST == 1 || may_any(MAY_LAYERS | MAY_TRACED | MAY_LENS | MAY_BACKGROUND));
+    LightPick k = pick_light<true>(r, b, g.position, g.normal, pixel, candidates, estimates, local, evaluates, wi, scatter_f, scatter_pdf, scatter_diffuse, rng);
     if (may(MAY_STACK))
     {
         if (bent)
@@ -1031,7 +1037,7 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
         flags |= HOT_RAY;
         flags = diffuse ? flags | HOT_DIFFUSE : flags & ~HOT_DIFFUSE;
         uint4 w1 = load_coherent(at + 1);
-        float ray_run = count_nee ? run : 0.0;
+        float ray_run = ray_run_word(count_nee ? run : 0.0, k.local);
         float ray_pdf = stacks ? PDF_STACK : delta ? 0.0 : s.pdf;
         // An ideal window passes the ray on as it reached it, weighed against next-event
         // estimation as the vertex before it left it, which took the lights past the window
@@ -1625,7 +1631,7 @@ public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
     float scatter_pdf;
     float3 scatter_diffuse;
     bool estimates = alive && mode.count_nee && counted && r.bounce_candidates > 0 && !(leaves && reference) && !mirror;
-    LightPick k = pick_light<0>(r, scatter, point, normal, pixel, r.bounce_candidates, estimates, false, bent || !surface || kind == MEDIUM_LEAVES_ROUGH, wi, scatter_f, scatter_pdf, scatter_diffuse, rng);
+    LightPick k = pick_light<false>(r, scatter, point, normal, pixel, r.bounce_candidates, estimates, false, bent || !surface || kind == MEDIUM_LEAVES_ROUGH, wi, scatter_f, scatter_pdf, scatter_diffuse, rng);
     if (may(MAY_STACK))
     {
         if (bent)
@@ -1780,7 +1786,7 @@ void lean_exit_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathVertex 
     float scatter_pdf;
     float3 scatter_diffuse;
     bool estimates = mode.count_nee && counted && r.bounce_candidates > 0;
-    LightPick k = pick_light<0>(r, f, g.position, g.normal, pixel, r.bounce_candidates, estimates, false, true, wi, scatter_f, scatter_pdf, scatter_diffuse, rng);
+    LightPick k = pick_light<false>(r, f, g.position, g.normal, pixel, r.bounce_candidates, estimates, false, true, wi, scatter_f, scatter_pdf, scatter_diffuse, rng);
     if (may(MAY_STACK))
     {
         if (bent)
@@ -2167,12 +2173,10 @@ public void lean_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, bool
         bool lit = may(MAY_SCATTERING) && p.pdf == PDF_LIT;
         // The camera sees the environment itself; every other ray the map its light is drawn from.
         float3 env = camera ? E.radiance(set.scene.environment, p.dir, r.view.eye_render.xyz) : environment_map(set.environment, p.dir);
-        // The vertex the ray left drew its candidates with its local sampler where it was the
-        // path's first.
         LocalLights* local = nullptr;
-        if (may(MAY_LOCAL) && p.depth() == 1)
+        if (may(MAY_LOCAL) && ran_local(p.run))
             local = pixel_local_lights(r, item_pixel(r, r.slice_base + slot));
-        float3 e = env * (weigh ? mis_balance(p.pdf, p.run * nee_environment_pdf(set, local, p.normal, p.dir)) : 1.0);
+        float3 e = env * (weigh ? mis_balance(p.pdf, abs(p.run) * nee_environment_pdf(set, local, p.normal, p.dir)) : 1.0);
         lean_feedback(r, slot, feedback_environment(set), luminance_rec2020(p.throughput * e));
         if (may(MAY_DIRECTIONAL))
         {
@@ -2184,7 +2188,7 @@ public void lean_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, bool
                     continue;
                 // Past plane stack faces the disc is weighed as the vertex before them drew it.
                 float pdf = p.pdf;
-                float run = p.run;
+                float run = abs(p.run);
                 float3 normal = p.normal;
                 bool weighs = weigh;
                 if (may(MAY_STACK))
@@ -2309,16 +2313,15 @@ public bool lean_front<M : IMedium>(PathRoot r, uint slot, float t, uint mask, b
     float3 from = origin;
     if (may2(MAY2_THIN_DIELECTRICS) && (flags & HOT_WINDOW) != 0)
         from = asfloat(load_coherent(lean_cold(r, slot) + LEAN_FROM_WORD).xyz);
-    // The vertex the ray left drew its candidates with its local sampler where it was the path's
-    // first.
+    float run = halves(w1.w).y;
     LocalLights* local = nullptr;
-    if (may(MAY_LOCAL) && ((flags >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK) == 1)
+    if (may(MAY_LOCAL) && ran_local(run))
         local = pixel_local_lights(r, item_pixel(r, r.slice_base + slot));
     // A ray whose vertex's next-event estimation took the lights meets what light sampling draws
     // for nothing.
     bool lit = may(MAY_SCATTERING) && w3.w == PDF_LIT;
     bool adds = mode.count_bsdf && (flags & HOT_COUNTED) != 0;
-    PathEmission pe = { r.scene, r.set, local, origin, dir, from, left_normal(flags, w1), mode.one_technique ? 0.0 : w3.w, halves(w1.w).y, end, float3(lit ? 0.0 : 1.0), adds };
+    PathEmission pe = { r.scene, r.set, local, origin, dir, from, left_normal(flags, w1), mode.one_technique ? 0.0 : w3.w, abs(run), end, float3(lit ? 0.0 : 1.0), adds };
     FrontLayers<M> f = { pe, r.scene.medium, inside, drawn, sigma_t, at };
     float4 layers;
     trace_resolve_translucent(scene_traced(r.scene), path_ray(origin, dir, end), mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, f, PARTICLE_CANDIDATES, layers);

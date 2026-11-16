@@ -1357,17 +1357,17 @@ public ResolvedLightSample nee_light_candidate<S : ISurfaces>(LightSetGpu* set, 
 }
 
 // `nee_light_candidate` given that it draws no directional light, its density still the whole
-// mixture's: a sample of the vertex's tile at a random offset, or with `LOCAL` where `v.local` is
-// set, one of the points its local sampler drew this frame for that sampler's share. The sample is
-// resolved at one site, so a kernel holds one copy of it. Five sampler dimensions.
-public ResolvedLightSample nee_tile_candidate<let LOCAL : bool>(LightSetGpu* set, NeeVertex v, inout Sampler rng)
+// mixture's: a sample of the vertex's tile at a random offset, or where `LOCAL` and `local` hold and
+// `v.local` is set, one of the points its local sampler drew this frame for that sampler's share.
+// The sample is resolved at one site, so a kernel holds one copy of it. Five sampler dimensions.
+public ResolvedLightSample nee_tile_candidate<let LOCAL : bool>(LightSetGpu* set, NeeVertex v, bool local_sampler, inout Sampler rng)
 {
     float choice = rng.next();
     uint pick = rng.next_bits();
     rng.dimension += 2;
     float2 u = rng.next4_parts().xy();
     LocalLights* local = nullptr;
-    if (LOCAL)
+    if (LOCAL && local_sampler)
         local = v.local;
     bool drawn = local != nullptr && choice < local.share;
     if (!drawn && !light_tiles(set))
