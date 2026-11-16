@@ -21,12 +21,14 @@ import orr_shaders.pipeline;
 // met beside the extinction of the innermost interior's medium, that medium's scattering
 // coefficient and anisotropy, the point and outward normal of the surface the path last entered
 // an interior through (`LEAN_ENTERED_WORD`), a walk where it starts or goes on (`LEAN_WALK_WORD`),
-// and the surface where a subsurface walk leaves, as its hit resolved it (`LEAN_EXIT_WORD`).
-[Host] public static const uint LEAN_COLD_WORDS = 18;
+// the surface where a subsurface walk leaves, as its hit resolved it (`LEAN_EXIT_WORD`), and where
+// the ray that ideal windows passed on left its vertex (`LEAN_FROM_WORD`).
+[Host] public static const uint LEAN_COLD_WORDS = 19;
 public static const uint LEAN_SCATTER_WORD = 6;
 public static const uint LEAN_ENTERED_WORD = 7;
 public static const uint LEAN_WALK_WORD = 8;
 public static const uint LEAN_EXIT_WORD = 12;
+public static const uint LEAN_FROM_WORD = 18;
 // An interior's walk, which no subsurface walk's way out runs beside, keeps the direction its last
 // scatter was reached along in the first of those words, and where it leaves, the weight of the
 // surface's draw there.
@@ -119,6 +121,9 @@ public static const uint HOT_INTERIOR = 1 << 16;    // the path lies in an inter
 // The path lies in an interior, which its cold words list, but its camera ray takes none of the
 // medium, whose segment the froxels hold: its first vertex takes the interior on.
 public static const uint HOT_INTERIOR_HELD = 1 << 17;
+// Ideal windows passed the ray on as it reached them, from the point its cold words keep
+// (`LEAN_FROM_WORD`): its other words weigh it as the vertex before them left it.
+public static const uint HOT_WINDOW = 1 << 18;
 // Bits of a path ray's first payload word that its cover (`path_payload`) leaves free: traversal's
 // any-hits ignore them, and the shader of the hit reads them.
 public static const uint PAYLOAD_WEIGHED = 1 << 14; // a walk weighed the ray's stretch in its interior: the hit takes no Beer for it
@@ -148,7 +153,7 @@ public static const uint NO_ENTRY = 0xffffffffu;
 public static const uint HOT_DEPTH_SHIFT = 8;
 public static const uint HOT_DEPTH_MASK = 0xff;
 // From HOT_DIMENSION_SHIFT, the sampler dimension the path's next draw takes.
-public static const uint HOT_DIMENSION_SHIFT = 18;
+public static const uint HOT_DIMENSION_SHIFT = 19;
 static const uint HOT_BELOW_DIMENSION = (1u << HOT_DIMENSION_SHIFT) - 1;
 
 // A path's hot state as its shaders hold it.
