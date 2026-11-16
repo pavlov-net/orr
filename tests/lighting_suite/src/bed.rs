@@ -365,6 +365,11 @@ pub const SLAB_THICKNESS: f32 = 0.3;
 pub const ROUGH_SLAB: &str = "rough slab";
 /// A smooth glass sphere of radius 1 m (IOR 1.5), clear.
 pub const GLASS_SPHERE: &str = "glass sphere";
+/// [`GLASS_SPHERE`] with specular roughness 0.3.
+pub const ROUGH_GLASS_SPHERE: &str = "rough glass sphere";
+/// A smooth thin-walled pane 400 m square facing +y at y = 0, of IOR [`PANE_IOR`].
+pub const GLASS_PANE: &str = "glass pane";
+pub const PANE_IOR: f32 = 2.0;
 /// [`GLASS_SPHERE`] of a dispersive glass: IOR [`PRISM_IOR`], Abbe number [`PRISM_ABBE`].
 pub const DISPERSIVE_SPHERE: &str = "dispersive sphere";
 /// An upright prism of the dispersive glass: [`prism_corners`] at y = -1 m to 1 m.
@@ -1464,6 +1469,24 @@ fn cook() -> Arc<[u8]> {
                     vec![rough],
                 ),
                 model(GLASS_SPHERE, mesh(|b| b.sphere(0, 32, 1.0)), vec![glass]),
+                model(
+                    ROUGH_GLASS_SPHERE,
+                    mesh(|b| b.sphere(0, 32, 1.0)),
+                    vec![Material {
+                        specular_roughness: 0.3,
+                        ..glass
+                    }],
+                ),
+                model(
+                    GLASS_PANE,
+                    mesh(|b| b.quad(0, square(200.0, 0.0), Vec3::Y, 1)),
+                    vec![Material {
+                        specular_ior: PANE_IOR,
+                        thin_walled: 1,
+                        double_sided: 1,
+                        ..glass
+                    }],
+                ),
                 model(
                     DISPERSIVE_SPHERE,
                     mesh(|b| b.sphere(0, 32, 1.0)),
