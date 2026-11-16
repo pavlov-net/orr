@@ -9,7 +9,7 @@ use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, DispatchArgs, GpuPtr, Hazards, MemoryKind,
     RayDispatchPipeline, ShaderModule, ShaderStage, SpecData, Stages,
 };
-use orr_scene::{Loading, SceneFeatures};
+use orr_scene::{Loading, SceneFeatures, Urgency};
 use orr_shaders::abi::SpecEntry;
 
 use crate::mask_sets::{MaskSet, MaskSets, Members};
@@ -340,6 +340,7 @@ impl Members for StagedStages {
         _: Option<&Arc<Loading>>,
         member: usize,
         may: u64,
+        _: Urgency,
     ) -> Result<StagePipeline, Error> {
         compile_stage(device, &self.kernels, BY_INDEX[member], may, self.rays)
     }

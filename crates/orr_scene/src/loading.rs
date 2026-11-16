@@ -58,6 +58,9 @@ pub(crate) enum Msg {
 /// The queue a job waits in. A worker takes the front job of the first queue that holds one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Queue {
+    /// Threads that join work another thread already runs and waits on, as a deferred compile's
+    /// helpers do: they add no work, only finish what is under way sooner.
+    Joining,
     /// Reads and decodes of streamed units, user blobs and edits, which frames wait on.
     Stream,
     /// Jobs other crates queue with [`Loading::spawn`]: pipeline compiles and hot reload.
@@ -70,7 +73,7 @@ pub(crate) enum Queue {
     Idle,
 }
 
-const QUEUES: usize = 5;
+const QUEUES: usize = 6;
 
 /// How soon a job from [`Loading::spawn_result_at`] runs, the soonest first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -543,6 +546,16 @@ impl Loading {
     /// Queues `job` for the next worker, behind streamed loads and ahead of mounts.
     pub fn spawn(&self, job: impl FnOnce() + Send + 'static) {
         self.queue(Queue::Spawned, job);
+    }
+
+    /// Queues `job`, a thread that joins work a job of `urgency` runs and waits on: where a frame
+    /// or a caller waits on that job, ahead of everything else queued; else at the job's urgency.
+    pub fn spawn_joining(&self, urgency: Urgency, job: impl FnOnce() + Send + 'static) {
+        let queue = match urgency {
+            Urgency::Needed => Queue::Joining,
+            other => other.queue(),
+        };
+        self.queue(queue, job);
     }
 
     pub(crate) fn queue(&self, queue: Queue, job: impl FnOnce() + Send + 'static) {

@@ -10,7 +10,7 @@ use orr_scene::orr_gpu::{
     CompileThreads, Device, HitGroup, RayPipeline, RayPipelineDesc, RayPipelineFlags, ShaderRecord,
     ShaderStage, SpecData, SpecEntry, handed_instructions,
 };
-use orr_scene::{HitGroups, Loading, SceneFeatures};
+use orr_scene::{HitGroups, Loading, SceneFeatures, Urgency};
 use orr_shaders::surface_declares;
 
 use crate::mask_sets::Members;
@@ -1005,12 +1005,14 @@ impl Members for PathPipelines {
         loading: Option<&Arc<Loading>>,
         _: usize,
         may: u64,
+        urgency: Urgency,
     ) -> Result<PathPipeline, Error> {
-        // The driver compiles the pipeline's shaders on the loading workers that join it.
+        // The driver compiles the pipeline's shaders on the loading workers that join it, ahead
+        // of the queued jobs where a frame waits on it.
         let Some(pool) = loading else {
             return PathPipeline::new(device, &self.kernels, CompileThreads::default(), may);
         };
-        let spawn = |task: Box<dyn FnOnce() + Send>| pool.spawn(task);
+        let spawn = |task: Box<dyn FnOnce() + Send>| pool.spawn_joining(urgency, task);
         let threads = CompileThreads::Pool {
             spawn: &spawn,
             max: std::thread::available_parallelism().map_or(1, |n| n.get() as u32),

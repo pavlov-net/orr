@@ -12,8 +12,8 @@ use orr_scene::{JobResult, Loading, Urgency};
 use crate::Error;
 use crate::staged::MAY_ALL;
 
-/// A compile job and the urgency it is queued at.
-type Queued<T> = Arc<(Mutex<Urgency>, JobResult<Result<T, Error>>)>;
+/// A compile job and the urgency it is queued at, which the job reads as it starts.
+type Queued<T> = Arc<(Arc<Mutex<Urgency>>, JobResult<Result<T, Error>>)>;
 
 /// A pipeline made after the kernels are ready, in a job of its own on the loading side;
 /// whoever asks for it does without until then.
@@ -104,12 +104,12 @@ impl<T: Send + 'static> Late<T> {
 
     /// Starts `compile` unless the pipeline is ready, compiling or failed: as a job on
     /// `loading`, or without one here. A job queued less urgently than this asks moves up to
-    /// where it asks.
+    /// where it asks. `compile` is handed the urgency its job has once it runs.
     pub(crate) fn start(
         &self,
         device: &Device,
         loading: Option<(&Loading, Urgency)>,
-        compile: impl FnOnce(&Device) -> Result<T, Error> + Send + 'static,
+        compile: impl FnOnce(&Device, Urgency) -> Result<T, Error> + Send + 'static,
     ) {
         let mut job = self.job.lock().unwrap();
         if self.ready.get().is_some() || self.failed.get().is_some() {
@@ -127,10 +127,15 @@ impl<T: Send + 'static> Late<T> {
         }
         match loading {
             Some((loading, urgency)) => {
-                let queued = loading.compile_job(device, urgency, compile);
-                *job = Some(Arc::new((Mutex::new(urgency), queued)));
+                let at = Arc::new(Mutex::new(urgency));
+                let live = Arc::clone(&at);
+                let queued = loading.compile_job(device, urgency, move |d| {
+                    let urgency = *live.lock().unwrap();
+                    compile(d, urgency)
+                });
+                *job = Some(Arc::new((at, queued)));
             }
-            None => self.settle(compile(device)),
+            None => self.settle(compile(device, Urgency::Needed)),
         }
     }
 
@@ -163,13 +168,14 @@ pub(crate) trait Members: Send + Sync + 'static {
     fn runs(&self, may: u64, members: &[usize]) -> Vec<usize>;
 
     /// Compiles `member` for paths that may meet `may` on `device`, with the threads of
-    /// `loading` where it is given.
+    /// `loading` where it is given, in a job of `urgency`.
     fn compile(
         &self,
         device: &Device,
         loading: Option<&Arc<Loading>>,
         member: usize,
         may: u64,
+        urgency: Urgency,
     ) -> Result<Self::Pipeline, Error>;
 }
 
@@ -302,9 +308,10 @@ impl<K: Members> MaskSets<K> {
             let kind = Arc::clone(&self.kind);
             let pool = self.compiler.get().map(|(_, l)| Arc::clone(l));
             let loading = self.loading().map(|l| (l, urgency));
-            set.member(member).start(self.device(), loading, move |d| {
-                kind.compile(d, pool.as_ref(), member, may)
-            });
+            set.member(member)
+                .start(self.device(), loading, move |d, urgency| {
+                    kind.compile(d, pool.as_ref(), member, may, urgency)
+                });
         }
         set
     }
