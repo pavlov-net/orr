@@ -116,6 +116,9 @@ public static const uint HOT_COUNTED = 1 << 5;      // light its ray meets count
 public static const uint HOT_MEDIUM = 1 << 6;       // the ray left a point in a medium, which has no normal
 public static const uint HOT_ARRIVED = 1 << 7;      // an update path's hit left its vertex for the raygen to record
 public static const uint HOT_INTERIOR = 1 << 16;    // the path lies in an interior, which its cold words list
+// The path lies in an interior, which its cold words list, but its camera ray takes none of the
+// medium, whose segment the froxels hold: its first vertex takes the interior on.
+public static const uint HOT_INTERIOR_HELD = 1 << 17;
 // Bits of a path ray's first payload word that its cover (`path_payload`) leaves free: traversal's
 // any-hits ignore them, and the shader of the hit reads them.
 public static const uint PAYLOAD_WEIGHED = 1 << 14; // a walk weighed the ray's stretch in its interior: the hit takes no Beer for it
@@ -145,7 +148,7 @@ public static const uint NO_ENTRY = 0xffffffffu;
 public static const uint HOT_DEPTH_SHIFT = 8;
 public static const uint HOT_DEPTH_MASK = 0xff;
 // From HOT_DIMENSION_SHIFT, the sampler dimension the path's next draw takes.
-public static const uint HOT_DIMENSION_SHIFT = 17;
+public static const uint HOT_DIMENSION_SHIFT = 18;
 static const uint HOT_BELOW_DIMENSION = (1u << HOT_DIMENSION_SHIFT) - 1;
 
 // A path's hot state as its shaders hold it.

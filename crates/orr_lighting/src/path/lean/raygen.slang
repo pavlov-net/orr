@@ -64,8 +64,9 @@ bool layer_record(Traced h)
 // `throughput` rides: its first vertex is the G-buffer's surface, and a pixel whose G-buffer holds
 // none sees the sky, which its ray of no length misses into. On a `layers` tile the ray reaches up
 // to the G-buffer's surface, and the path starts in the interiors at the near plane, which its
-// cold words `cold` take: true where those are not empty. A path `behind` the layers starts on the
-// G-buffer's surface inside the interiors there.
+// cold words `cold` take: true where those are not empty and its camera ray takes their medium,
+// which it does where the frame has no froxels to hold the ray's segment. A path `behind` the
+// layers starts on the G-buffer's surface inside the interiors there.
 bool start_path(PathRoot r, uint2 pixel, uint4* at, uint4* cold, float throughput, bool layers, bool behind)
 {
     PathStart s = pinhole_start(r.view, r.gbuffer, pixel, true);
@@ -104,6 +105,7 @@ bool start_path(PathRoot r, uint2 pixel, uint4* at, uint4* cold, float throughpu
         Payload eye;
         eye.words = uint4(behind ? 1 : 0, 0, 0, 0);
         call(CALL_EYE_INTERIOR, eye);
+        carried = eye.words.x != 0;
     }
     // The camera ray's reach, in the lane of the cone's word where a vertex's ray keeps its
     // origin's offset.
