@@ -150,7 +150,10 @@ public struct FroxelRoot
     public EyeInterior* around;                 // per listed froxel, the interiors around its sample point, with MAY_INTERIORS
     public FroxelRays* rays;                    // per listed froxel
     public ShadowTraceRoot* trace;              // the shadow rays' jobs, light j's of listed froxel k at j x `queue.froxels.count` + k and the local winners' after; its lists `queue.jobs` and `queue.flagged`
+    public RayList* froxels;                    // `queue.froxels`
     public RayList* winners;                    // `queue.winners`
+    public uint _pad0;
+    public uint _pad1;
 }
 
 // The view-space ray through point `p` of the view's unjittered image, in render pixels,
@@ -674,10 +677,9 @@ public void froxel_list(FroxelRoot r, uint3 f, bool valid)
             froxel_store(r, f, lights, incident, more, depth);
         }
     }
-    RayList* froxels = &r.queue.froxels;
     uint end;
-    uint at = wave_append(froxels, lit, end);
-    cover(froxels, end);
+    uint at = wave_append(r.froxels, lit, end);
+    cover(r.froxels, end);
     if (lit)
         r.lit[at] = froxel_index(r, f);
 }
