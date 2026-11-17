@@ -61,7 +61,9 @@ pub struct CausticSettings {
     /// caster's share of the photons falls with the square of its distance from the focus over
     /// it.
     pub lod_scale: f32,
-    /// Frames without a deposit before a cell is evicted, at most 255.
+    /// Frames without a deposit before a cell is evicted, at most 255: long enough that a cell's
+    /// running mean has let go of its last deposit by then, which eviction otherwise takes from
+    /// the light the cell gives.
     pub cell_lifetime: u32,
     /// Frames of history a cell keeps; cells whose light is changing keep 8.
     pub max_temporal_samples: f32,
@@ -77,7 +79,7 @@ impl Default for CausticSettings {
             capacity_log2: 20,
             base_cell_log2: -8,
             lod_scale: 2.0,
-            cell_lifetime: 8,
+            cell_lifetime: 32,
             max_temporal_samples: 16.0,
             jitter: 1.0,
         }
@@ -147,6 +149,7 @@ pub(crate) struct CausticPipelines {
     heads: ComputePipeline,
     begin: ComputePipeline,
     resolve: ComputePipeline,
+    sweep: ComputePipeline,
     finish: ComputePipeline,
 }
 
@@ -163,6 +166,7 @@ impl CausticPipelines {
             heads: pipeline(device, kernels, &resolve::MODULE, "heads")?,
             begin: pipeline(device, kernels, &resolve::MODULE, "begin")?,
             resolve: pipeline(device, kernels, &resolve::MODULE, "resolve")?,
+            sweep: pipeline(device, kernels, &resolve::MODULE, "sweep")?,
             finish: pipeline(device, kernels, &resolve::MODULE, "finish")?,
         })
     }
@@ -537,6 +541,7 @@ impl Caustics {
         let root = self.resolve_roots.at(slot);
         list.dispatch(&self.pipelines.resolve, root, resolve_grid(capacity));
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        list.dispatch(&self.pipelines.sweep, root, resolve_grid(capacity));
         list.dispatch(&self.pipelines.finish, root, [1, 1, 1]);
     }
 

@@ -59,6 +59,7 @@ pub(crate) struct WorldCache {
 pub(crate) struct ResolvePipelines {
     begin: ComputePipeline,
     resolve: ComputePipeline,
+    sweep: ComputePipeline,
     finish: ComputePipeline,
 }
 
@@ -67,6 +68,7 @@ impl ResolvePipelines {
         Ok(Self {
             begin: pipeline(device, kernels, &resolve::MODULE, "begin")?,
             resolve: pipeline(device, kernels, &resolve::MODULE, "resolve")?,
+            sweep: pipeline(device, kernels, &resolve::MODULE, "sweep")?,
             finish: pipeline(device, kernels, &resolve::MODULE, "finish")?,
         })
     }
@@ -172,6 +174,7 @@ impl WorldCache {
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         list.dispatch(&pipelines.resolve, root, grid);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        list.dispatch(&pipelines.sweep, root, grid);
         list.dispatch(&pipelines.finish, root, [1, 1, 1]);
     }
 

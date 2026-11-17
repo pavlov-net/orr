@@ -12,7 +12,11 @@
 //
 // A key's slot is found from two hashes of it: its home slot, and a 32-bit check the slot
 // holds (0 marks an empty slot), claimed with a 32-bit compare-exchange. Two keys with the
-// same home and check share a cell; for any lookup that is about one chance in 2^29.
+// same home and check share a cell; for any lookup that is about one chance in 2^29. A key
+// lies past its home slot only where every slot between holds another key or a tombstone,
+// which an evicted cell leaves, so a lookup stops at the first empty slot; the resolve's sweep
+// empties the tombstones no key lies past.
+
 module world_cache;
 
 import orr_shaders.abi;
@@ -24,8 +28,11 @@ import orr_scene.tables;
 import orr_scene.view;
 import orr_lighting.bsdf;
 
-// Slots a key may occupy after its home slot's: lookups scan all of them.
+// Slots a key may occupy from its home slot on.
 public static const uint CACHE_PROBE = 8;
+
+// The check of a slot whose cell was evicted, which no key's check equals.
+public static const uint CACHE_TOMBSTONE = 0xffffffff;
 
 // Key bits: 19 per voxel axis (coordinates wrap at 2^19 voxels), the level, then the
 // normal bucket.
@@ -112,7 +119,7 @@ public struct WorldCacheGpu
 // A cell of the cache: its key, level and voxel edge.
 public struct CacheCell
 {
-    public uint64_t key;
+    public uint2 key;
     public uint level;
     public float size;                  // m
 }
@@ -127,30 +134,33 @@ public uint normal_bucket(float3 n)
 }
 
 // The voxel coordinate along one axis of render-space `p` for a render origin at cell
-// `origin` of edge 2^cell_log2 m and voxels of edge 2^k m: exact while the voxel is no
-// larger than the cell.
-public int64_t voxel_coordinate(int origin, uint cell_log2, float p, int k)
+// `origin` of edge 2^cell_log2 m and voxels of edge 2^k m, modulo 2^32, of which keys keep
+// CACHE_AXIS_BITS: exact while the voxel is no larger than the cell.
+public uint voxel_coordinate(int origin, uint cell_log2, float p, int k)
 {
     int shift = int(cell_log2) - k;
     if (shift >= 0)
-        return (int64_t(origin) << uint(shift)) + int64_t(floor(p * exp2(float(-k))));
+        return (uint(origin) << uint(shift)) + uint(int(floor(p * exp2(float(-k)))));
     uint m = uint(-shift);
     int q = origin >> m;
     int r = origin - (q << m);
-    return int64_t(q) + int64_t(floor((float(r) * exp2(float(cell_log2)) + p) * exp2(float(-k))));
+    return uint(q) + uint(int(floor((float(r) * exp2(float(cell_log2)) + p) * exp2(float(-k)))));
 }
 
 // The key of the voxel of edge 2^k m at level `level` holding render-space `p`, with normal
-// bucket `bucket`, under render origin `origin_cell` (w = cell_log2).
-public uint64_t cache_key(int4 origin_cell, float3 p, int k, uint level, uint bucket)
+// bucket `bucket`, under render origin `origin_cell` (w = cell_log2), as its low and high
+// words.
+public uint2 cache_key(int4 origin_cell, float3 p, int k, uint level, uint bucket)
 {
     uint cell_log2 = uint(origin_cell.w);
-    uint64_t mask = (uint64_t(1) << CACHE_AXIS_BITS) - 1;
-    uint64_t x = uint64_t(voxel_coordinate(origin_cell.x, cell_log2, p.x, k)) & mask;
-    uint64_t y = uint64_t(voxel_coordinate(origin_cell.y, cell_log2, p.y, k)) & mask;
-    uint64_t z = uint64_t(voxel_coordinate(origin_cell.z, cell_log2, p.z, k)) & mask;
-    return x | (y << CACHE_AXIS_BITS) | (z << (2 * CACHE_AXIS_BITS))
-        | (uint64_t(level) << CACHE_LEVEL_SHIFT) | (uint64_t(bucket) << CACHE_BUCKET_SHIFT);
+    uint mask = (1u << CACHE_AXIS_BITS) - 1;
+    uint x = voxel_coordinate(origin_cell.x, cell_log2, p.x, k) & mask;
+    uint y = voxel_coordinate(origin_cell.y, cell_log2, p.y, k) & mask;
+    uint z = voxel_coordinate(origin_cell.z, cell_log2, p.z, k) & mask;
+    uint low = x | (y << CACHE_AXIS_BITS);
+    uint high = (y >> (32 - CACHE_AXIS_BITS)) | (z << (2 * CACHE_AXIS_BITS - 32))
+        | (level << (CACHE_LEVEL_SHIFT - 32)) | (bucket << (CACHE_BUCKET_SHIFT - 32));
+    return uint2(low, high);
 }
 
 // Levels above 0 a scene's cache uses: voxels grow to the cell edge.
@@ -186,35 +196,39 @@ public CacheCell cache_cell(WorldCacheGpu* c, SceneRoot* s, float3 p, float3 n, 
 }
 
 // The first slot `key` may occupy, before masking to the capacity.
-public uint cache_hash(uint64_t key)
+public uint cache_hash(uint2 key)
 {
-    return pcg(uint(key) ^ pcg(uint(key >> 32)));
+    return pcg(key.x ^ pcg(key.y));
 }
 
-// The check a slot holding `key` holds: never 0.
-public uint cache_check(uint64_t key)
+// The check a slot holding `key` holds: neither 0 nor CACHE_TOMBSTONE.
+public uint cache_check(uint2 key)
 {
-    return max(pcg(uint(key >> 32) ^ pcg(uint(key) ^ 0x68E31DA4)), 1u);
+    return clamp(pcg(key.y ^ pcg(key.x ^ 0x68E31DA4)), 1u, CACHE_TOMBSTONE - 1);
 }
 
 // The slot of a table of `mask` + 1 slots whose checks are `checks` that holds `key`.
-public bool slot_find(uint* checks, uint mask, uint64_t key, out uint slot)
+public bool slot_find(uint* checks, uint mask, uint2 key, out uint slot)
 {
     uint home = cache_hash(key) & mask;
     uint check = cache_check(key);
     for (uint i = 0; i < CACHE_PROBE; i++)
     {
         slot = (home + i) & mask;
-        if (checks[slot] == check)
+        uint held = checks[slot];
+        if (held == check)
             return true;
+        if (held == 0)
+            break;
     }
     slot = 0;
     return false;
 }
 
-// The slot holding `key`, claiming the first empty one of its probe when none does; false
-// when every slot of the probe holds another key.
-public bool slot_insert(uint* checks, uint mask, uint64_t key, out uint slot)
+// The slot holding `key`, claiming the first empty or tombstone slot of its probe when none
+// does; false when every slot of the probe holds another key. Inserts of one key claim slots
+// in one order, so they meet in one slot.
+public bool slot_insert(uint* checks, uint mask, uint2 key, out uint slot)
 {
     if (slot_find(checks, mask, key, slot))
         return true;
@@ -223,21 +237,41 @@ public bool slot_insert(uint* checks, uint mask, uint64_t key, out uint slot)
     for (uint i = 0; i < CACHE_PROBE; i++)
     {
         slot = (home + i) & mask;
+        uint held = checks[slot];
+        if (held == check)
+            return true;
+        if (held != 0 && held != CACHE_TOMBSTONE)
+            continue;
         uint previous;
-        InterlockedCompareExchange(checks[slot], 0u, check, previous);
-        if (previous == 0 || previous == check)
+        InterlockedCompareExchange(checks[slot], held, check, previous);
+        if (previous == held || previous == check)
             return true;
     }
     slot = 0;
     return false;
 }
 
-public bool cache_find(WorldCacheGpu* c, uint64_t key, out uint slot)
+// Whether slot `slot`, a tombstone, may be emptied: no key lies past it within a probe, before
+// an empty slot. Tombstones others empty at once only empty it sooner.
+public bool sweeps(uint* checks, uint mask, uint slot)
+{
+    for (uint i = 1; i < CACHE_PROBE; i++)
+    {
+        uint held = checks[(slot + i) & mask];
+        if (held == 0)
+            return true;
+        if (held != CACHE_TOMBSTONE)
+            return false;
+    }
+    return true;
+}
+
+public bool cache_find(WorldCacheGpu* c, uint2 key, out uint slot)
 {
     return slot_find(c.checks, c.capacity_mask, key, slot);
 }
 
-public bool cache_insert(WorldCacheGpu* c, uint64_t key, out uint slot)
+public bool cache_insert(WorldCacheGpu* c, uint2 key, out uint slot)
 {
     return slot_insert(c.checks, c.capacity_mask, key, slot);
 }
@@ -281,7 +315,7 @@ void atomic_add_float(uint* p, float v)
 // Adds one sample of E / pi to cell `key`, claiming the cell when it is new. Samples that are
 // not finite are dropped, negative channels taken as 0, and samples brighter than
 // `CACHE_FIREFLY_RATIO` times a settled cell's luminance scaled down to it.
-public void cache_add(WorldCacheGpu* c, uint64_t key, float3 sample)
+public void cache_add(WorldCacheGpu* c, uint2 key, float3 sample)
 {
     bool valid = all(isfinite(sample));
     sample = max(sample, float3(0.0));
@@ -311,7 +345,7 @@ public void cache_add(WorldCacheGpu* c, uint64_t key, float3 sample)
 }
 
 // The resolved E / pi of `key`'s cell; false when the cell is absent or has no history yet.
-public bool cache_read(WorldCacheGpu* c, uint64_t key, out float3 radiance)
+public bool cache_read(WorldCacheGpu* c, uint2 key, out float3 radiance)
 {
     radiance = float3(0.0);
     uint slot;
@@ -324,7 +358,7 @@ public bool cache_read(WorldCacheGpu* c, uint64_t key, out float3 radiance)
 }
 
 // `cache_read` by a path that may end there, counted as a query.
-public bool cache_lookup(WorldCacheGpu* c, uint64_t key, out float3 radiance)
+public bool cache_lookup(WorldCacheGpu* c, uint2 key, out float3 radiance)
 {
     bool found = cache_read(c, key, radiance);
     count_add(c.counters + COUNT_QUERIES, true);
