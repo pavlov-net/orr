@@ -108,11 +108,15 @@ impl TemporalScaler {
             output: raw(inputs.output).pixelFormat(),
             reactive: inputs.reactive_mask.map(|t| raw(t).pixelFormat()),
         };
+        // An input that comes or goes, such as the reactive mask, needs another effect, which
+        // starts without history.
+        let mut reset = inputs.reset;
+        if self.made.as_ref().is_some_and(|m| m.formats != formats) {
+            self.release();
+            reset = true;
+        }
         let made = match &mut self.made {
-            Some(m) => {
-                m.check(formats)?;
-                m
-            }
+            Some(m) => m,
             None => self
                 .made
                 .insert(Made::new(&self.device, self.render, self.output, formats)?),
@@ -151,7 +155,7 @@ impl TemporalScaler {
             s.setMotionVectorScaleX(mx);
             s.setMotionVectorScaleY(my);
             s.setDepthReversed(true);
-            s.setReset(inputs.reset);
+            s.setReset(reset);
         }
         encode_after_list(list, |buffer| {
             // SAFETY: a Metal 4 effect encoding into a Metal 4 command buffer of its device.
@@ -191,36 +195,24 @@ impl Made {
         })?;
         Ok(Self { raw, formats: f })
     }
-
-    fn check(&self, now: Formats) -> Result<(), Error> {
-        let was = self.formats;
-        let pairs = [
-            ("color", was.color, now.color),
-            ("depth", was.depth, now.depth),
-            ("motion", was.motion, now.motion),
-            ("output", was.output, now.output),
-        ];
-        for (input, was, now) in pairs {
-            if was != now {
-                return Err(Error::Format { input, was, now });
-            }
-        }
-        if was.reactive != now.reactive {
-            return Err(Error::Format {
-                input: "reactive mask",
-                was: was.reactive.unwrap_or(MTLPixelFormat::Invalid),
-                now: now.reactive.unwrap_or(MTLPixelFormat::Invalid),
-            });
-        }
-        Ok(())
-    }
 }
 
-impl Drop for TemporalScaler {
-    fn drop(&mut self) {
+impl TemporalScaler {
+    /// Releases the effect once the GPU is done with it.
+    fn release(&mut self) {
         if let Some(m) = self.made.take() {
             let raw = Keep(m.raw);
             defer_after_submitted(&self.device, move || drop(raw));
         }
     }
 }
+
+impl Drop for TemporalScaler {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+// SAFETY: one thread at a time configures and encodes the effect (`record` takes `&mut self`),
+// and MetalFX effects, like the command buffers they encode into, may move between threads.
+unsafe impl Send for TemporalScaler {}

@@ -27,11 +27,4 @@ pub enum Error {
         have: objc2_metal::MTLTextureUsage,
         need: objc2_metal::MTLTextureUsage,
     },
-    /// An input's format differs from the one the effect was made for.
-    #[error("the {input} texture's format changed from {was:?} to {now:?}")]
-    Format {
-        input: &'static str,
-        was: objc2_metal::MTLPixelFormat,
-        now: objc2_metal::MTLPixelFormat,
-    },
 }

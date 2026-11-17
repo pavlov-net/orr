@@ -2535,6 +2535,7 @@ dependencies = [
  "orr_color",
  "orr_dlss",
  "orr_math",
+ "orr_metalfx",
  "orr_scene",
  "orr_shaders",
  "orr_window",

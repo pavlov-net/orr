@@ -160,9 +160,17 @@ fn diagnostics() -> Diagnostics<'static> {
     }
 }
 
-/// Gives `renderer` DLSS ray reconstruction where NGX offers it; returns whether it does.
+/// Gives `renderer` the platform's ray reconstruction, DLSS where NGX offers it or MetalFX on
+/// Apple; returns whether it does.
 pub fn enable_dlss(renderer: &mut Renderer) -> bool {
     cfg_select! {
+        all(feature = "metalfx", target_vendor = "apple") => {
+            let on = renderer.set_reconstruction(orr::MetalFx::new(device()));
+            if !on {
+                log::warn!("this device runs no MetalFX denoised scaler");
+            }
+            on
+        }
         dlss => match DlssSdk::new(device(), PROJECT_ID) {
             Ok(sdk) => renderer.set_reconstruction(sdk),
             Err(e) => {

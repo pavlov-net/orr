@@ -8,10 +8,12 @@
 #![cfg(target_vendor = "apple")]
 
 pub mod conventions;
+mod denoised;
 mod error;
 mod ext;
 mod temporal;
 
+pub use denoised::{DenoisedInputs, DenoisedScaler};
 pub use error::Error;
 pub use ext::{
     Float4x4, interpolator_has_matrices, set_interpolator_matrices, set_scaler_matrices,

@@ -597,10 +597,11 @@ fn scene_detail_follows_the_render_size_of_its_sharpest_view() {
     assert_clean();
 }
 
-/// `render_view` through DLSS ray reconstruction on one renderer: each request renders at the
+/// `render_view` through the platform's ray reconstruction (DLSS, or MetalFX on Apple) on one
+/// renderer: each request renders at the
 /// size it resolves to, ray reconstruction at half the output size lands close to the converged
 /// image on a still and on a moving camera, the scene-referred hook takes its output, and the
-/// transparency overlay reaches the image through NGX's composite.
+/// transparency overlay reaches the image through the backend's composite.
 #[test]
 fn render_view_runs_ray_reconstruction() {
     let _serial = serial();
@@ -705,14 +706,23 @@ fn render_view_runs_ray_reconstruction() {
         "against the converged image: noisy {noisy:?}, still {denoised_error:?}, \
          moving {moving:?}, averaged in the hook {summed:?}"
     );
-    // Measured mean 0.050 still and 0.053 moving; the jitter sign flipped gives 0.054 and 0.056,
-    // and one path per pixel without ray reconstruction 0.096. The rest of the error is the
-    // fireflies in the converged image.
+    // DLSS: measured mean 0.050 still and 0.053 moving; the jitter sign flipped gives 0.054 and
+    // 0.056, and one path per pixel without ray reconstruction 0.096. MetalFX (Apple M5):
+    // 0.0683 still and 0.0685 moving, against 0.138 for one path per pixel. The rest of the
+    // error is the fireflies in the converged image.
+    let (still_bound, moving_bound) = if cfg!(target_vendor = "apple") {
+        (0.071, 0.071)
+    } else {
+        (0.052, 0.055)
+    };
     assert!(
-        denoised_error.mean < 0.052,
+        denoised_error.mean < still_bound,
         "noisy {noisy:?}, still {denoised_error:?}"
     );
-    assert!(moving.mean < 0.055, "noisy {noisy:?}, moving {moving:?}");
+    assert!(
+        moving.mean < moving_bound,
+        "noisy {noisy:?}, moving {moving:?}"
+    );
     assert!(
         summed.mean < noisy.mean * 0.75,
         "noisy {noisy:?}, averaged {summed:?}"
