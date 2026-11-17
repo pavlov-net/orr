@@ -13,6 +13,13 @@ objc2.workspace = true
 objc2-metal.workspace = true
 objc2-metal-fx.workspace = true
 orr_gpu.workspace = true
+thiserror.workspace = true
+
+
+[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+bytemuck.workspace = true
+half = { workspace = true, features = ["bytemuck"] }
+orr_math.workspace = true
 
 [lints]
 workspace = true
