@@ -7,6 +7,9 @@ use orr_scene::{Projection, SceneId};
 
 use crate::Result;
 
+/// The far plane frame generation backends are told; orr's projections have none.
+pub(crate) const FAR_M: f32 = 100_000.0;
+
 /// How many images frame generation adds per rendered frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FrameGenerationMode {

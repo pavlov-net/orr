@@ -1,16 +1,19 @@
-//! MetalFX as the backend of ray reconstruction and temporal upscaling.
+//! MetalFX as the backend of ray reconstruction, temporal upscaling and frame generation.
 
 use orr_math::jitter::{jitter, jitter_phases, mip_bias};
 use orr_math::{DMat4, DVec3};
 use orr_metalfx::{
-    DenoisedInputs, DenoisedScaler, Float4x4, ScaleRange, TemporalInputs, TemporalScaler,
+    DenoisedInputs, DenoisedScaler, Float4x4, FrameInterpolator, InterpolatorInputs, ScaleRange,
+    TemporalInputs, TemporalScaler,
 };
-use orr_scene::orr_gpu::{CommandList, Device};
+use orr_scene::orr_gpu::{CommandList, Device, Texture};
 
+use crate::frame_generation::FAR_M;
 use crate::{
-    Error, GuideReads, ReconstructionBackend, ReconstructionFeature, ReconstructionInputs,
-    ReconstructionMode, ReconstructionSupport, Result, UpscaleBackend, UpscaleFeature,
-    UpscaleInputs, UpscaleMode, UpscaleQuality,
+    Error, FrameGenerationBackend, FrameGenerationCamera, FrameGenerationFeature,
+    FrameGenerationInputs, GuideReads, InterpolationCheck, ReconstructionBackend,
+    ReconstructionFeature, ReconstructionInputs, ReconstructionMode, ReconstructionSupport, Result,
+    UpscaleBackend, UpscaleFeature, UpscaleInputs, UpscaleMode, UpscaleQuality,
 };
 
 /// MetalFX's effects on one device.
@@ -310,3 +313,86 @@ impl UpscaleFeature for Upscaler {
         Ok(())
     }
 }
+
+/// Column-major `m` as MetalFX takes it.
+fn float4x4(m: DMat4) -> Float4x4 {
+    Float4x4::from_cols_array_2d(&m.as_mat4().to_cols_array_2d())
+}
+
+/// View from world, with world relative to `anchor`.
+fn view_from_world(camera: &FrameGenerationCamera, anchor: DVec3) -> DMat4 {
+    DMat4::from_rotation_translation(camera.rotation.as_dquat(), camera.position - anchor).inverse()
+}
+
+impl FrameGenerationBackend for MetalFx {
+    /// One interpolated image per rendered frame, on a device with Metal 4 frame interpolation
+    /// whose presents can be metered.
+    fn max_generated(&self, gpu: &Device, _low_latency: bool) -> Result<u32> {
+        if !FrameInterpolator::supported(gpu) {
+            Err(Error::FrameGenerationUnavailable(
+                "MetalFX frame interpolation",
+            ))
+        } else if !gpu.caps().present_metering {
+            Err(Error::FrameGenerationUnavailable("metered presents"))
+        } else {
+            Ok(1)
+        }
+    }
+
+    fn feature(
+        &self,
+        _backbuffer: &Texture,
+        _hdr: bool,
+    ) -> Result<Box<dyn FrameGenerationFeature>> {
+        Ok(Box::new(Interpolator(FrameInterpolator::new(
+            &self.device,
+        )?)))
+    }
+
+    fn interpolation_check(&self) -> Option<InterpolationCheck> {
+        None
+    }
+}
+
+struct Interpolator(FrameInterpolator);
+
+impl FrameGenerationFeature for Interpolator {
+    fn record(
+        &mut self,
+        list: &mut CommandList<'_>,
+        inputs: &FrameGenerationInputs<'_>,
+    ) -> Result<()> {
+        let [output] = inputs.outputs else {
+            return Err(Error::FrameGenerationMode(
+                crate::FrameGenerationMode::Fixed(inputs.outputs.len() as u32),
+            ));
+        };
+        let camera = &inputs.camera;
+        let previous = inputs.previous_backbuffer;
+        self.0.record(
+            list,
+            &InterpolatorInputs {
+                color: inputs.backbuffer,
+                previous_color: previous.unwrap_or(inputs.backbuffer),
+                depth: inputs.depth,
+                motion: inputs.motion,
+                distortion: inputs.distortion,
+                output,
+                reset: inputs.reset || previous.is_none(),
+                jitter: inputs.jitter,
+                delta_time: inputs.delta_time,
+                near: camera.projection.near,
+                far: FAR_M,
+                fov_y: camera.projection.fov_y,
+                aspect: camera.output[0] as f32 / camera.output[1].max(1) as f32,
+                world_to_view: float4x4(view_from_world(camera, inputs.anchor)),
+                view_to_clip: float4x4(camera.clip_from_view()),
+            },
+        )?;
+        Ok(())
+    }
+}
+
+// SAFETY: the feature is recorded by one thread at a time (`record` takes `&mut self`), and
+// shared references to it touch nothing.
+unsafe impl Sync for Interpolator {}

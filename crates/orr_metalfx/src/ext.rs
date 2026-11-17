@@ -5,9 +5,12 @@
 use std::arch::aarch64::float32x4_t;
 
 use objc2::encode::{Encode, Encoding};
-use objc2::runtime::{NSObjectProtocol, ProtocolObject};
+use objc2::runtime::{Bool, NSObjectProtocol, ProtocolObject};
 use objc2::{msg_send, sel};
-use objc2_metal_fx::{MTLFXFrameInterpolatorBase, MTLFXTemporalDenoisedScalerBase};
+use objc2_metal::MTLTexture;
+use objc2_metal_fx::{
+    MTLFXFrameInterpolatorBase, MTLFXFrameInterpolatorDescriptor, MTLFXTemporalDenoisedScalerBase,
+};
 
 /// A column-major 4x4 matrix, laid out and passed as C's `simd_float4x4`: four 16-byte vector
 /// columns, which arm64 passes in vector registers. An array of floats of the same size would
@@ -75,6 +78,36 @@ pub fn set_interpolator_matrices(
     unsafe {
         let _: () = msg_send![interpolator, setWorldToViewMatrix: world_to_view];
         let _: () = msg_send![interpolator, setViewToClipMatrix: view_to_clip];
+    }
+}
+
+/// Whether the OS's frame interpolators take a distortion field (macOS 27).
+pub fn interpolators_take_distortion(desc: &MTLFXFrameInterpolatorDescriptor) -> bool {
+    desc.respondsToSelector(sel!(setDistortionTextureEnabled:))
+}
+
+/// Makes interpolators from `desc` take a distortion field. Needs
+/// [`interpolators_take_distortion`].
+pub fn enable_interpolator_distortion(desc: &MTLFXFrameInterpolatorDescriptor) {
+    assert!(
+        interpolators_take_distortion(desc),
+        "a frame interpolator's distortion field needs macOS 27"
+    );
+    // SAFETY: the descriptor implements the selector (checked), which takes a `BOOL`.
+    unsafe {
+        let _: () = msg_send![desc, setDistortionTextureEnabled: Bool::YES];
+    }
+}
+
+/// Sets the distortion field of an interpolator made with distortion enabled.
+pub fn set_interpolator_distortion(
+    interpolator: &ProtocolObject<dyn MTLFXFrameInterpolatorBase>,
+    field: Option<&ProtocolObject<dyn MTLTexture>>,
+) {
+    // SAFETY: the interpolator was made with distortion enabled, so it implements the selector,
+    // which takes an optional texture.
+    unsafe {
+        let _: () = msg_send![interpolator, setDistortionTexture: field];
     }
 }
 

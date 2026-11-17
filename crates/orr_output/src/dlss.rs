@@ -286,9 +286,6 @@ fn hardware_scheduling(gpu: &Device) -> Option<bool> {
     }
 }
 
-/// The far plane frame generation is told; orr's projections have none.
-const FG_FAR_M: f32 = 100_000.0;
-
 /// NGX's camera for `cur`, reprojecting to `prev`, with the position relative to `anchor`.
 fn fg_camera(cur: &FrameGenerationCamera, prev: &FrameGenerationCamera, anchor: DVec3) -> FgCamera {
     let clip = cur.clip_from_view();
@@ -312,7 +309,7 @@ fn fg_camera(cur: &FrameGenerationCamera, prev: &FrameGenerationCamera, anchor: 
         right: dir(Vec3::X),
         forward: dir(Vec3::NEG_Z),
         near: cur.projection.near,
-        far: FG_FAR_M,
+        far: crate::frame_generation::FAR_M,
         fov_y: cur.projection.fov_y,
         aspect: cur.output[0] as f32 / cur.output[1].max(1) as f32,
     }

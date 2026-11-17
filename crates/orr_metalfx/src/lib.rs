@@ -11,13 +11,17 @@ pub mod conventions;
 mod denoised;
 mod error;
 mod ext;
+mod interpolator;
 mod temporal;
 
 pub use denoised::{DenoisedInputs, DenoisedScaler};
 pub use error::Error;
 pub use ext::{
-    Float4x4, interpolator_has_matrices, set_interpolator_matrices, set_scaler_matrices,
+    Float4x4, enable_interpolator_distortion, interpolator_has_matrices,
+    interpolators_take_distortion, set_interpolator_distortion, set_interpolator_matrices,
+    set_scaler_matrices,
 };
+pub use interpolator::{FrameInterpolator, InterpolatorInputs};
 pub use objc2_metal_fx;
 pub use temporal::{TemporalInputs, TemporalScaler};
 

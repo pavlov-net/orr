@@ -1010,11 +1010,12 @@ fn encoded(gpu: &Device, encoding: OutputFormat, extent: [u32; 2], name: &str) -
         OutputFormat::Hdr10Pq => Format::A2b10g10r10Unorm,
         OutputFormat::ScRgb => Format::Rgba16Float,
     };
+    // MetalFX writes generated images as render targets.
     let desc = TextureDesc::d2(
         format,
         extent[0],
         extent[1],
-        TextureUsage::SAMPLED | TextureUsage::STORAGE,
+        TextureUsage::SAMPLED | TextureUsage::STORAGE | TextureUsage::COLOR,
     );
     let texture = gpu.create_texture(&desc, TextureMemory::Dedicated, name)?;
     let view = ViewDesc::default();
