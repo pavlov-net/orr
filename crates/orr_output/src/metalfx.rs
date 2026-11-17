@@ -17,6 +17,7 @@ use crate::{
 };
 
 /// MetalFX's effects on one device.
+#[derive(Clone)]
 pub struct MetalFx {
     device: Device,
     denoised: Option<ScaleRange>,

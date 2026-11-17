@@ -1,18 +1,19 @@
-//! The dlss example's entry point: `dlss.rs`, which a build without DLSS can't compile.
+//! The reconstruction example's entry point: `reconstruction.rs`, which a build without DLSS or
+//! MetalFX can't compile.
 
 cfg_select! {
-    dlss => {
-        #[path = "dlss.rs"]
-        mod dlss;
+    reconstruction => {
+        #[path = "reconstruction.rs"]
+        mod reconstruction;
 
         fn main() {
-            dlss::main();
+            reconstruction::main();
         }
     }
     _ => {
         #[allow(clippy::print_stderr)]
         fn main() {
-            eprintln!("this build has no DLSS");
+            eprintln!("this build has neither DLSS nor MetalFX");
             std::process::exit(1);
         }
     }

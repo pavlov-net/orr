@@ -1627,7 +1627,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
     if settings.dlss {
         assert!(
-            crate::enable_dlss(&mut renderer),
+            crate::enable_reconstruction(&mut renderer),
             "--dlss needs DLSS ray reconstruction"
         );
     }

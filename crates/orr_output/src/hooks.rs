@@ -100,9 +100,10 @@ impl Image {
         )
     }
 
-    /// An image of `desc`, which has `SAMPLED` and `STORAGE` usage. The sampled view covers
-    /// every mip, the storage view mip 0.
-    pub(crate) fn with_desc(gpu: &Device, desc: &TextureDesc, name: &str) -> Result<Self> {
+    /// An image of `desc`, which has `SAMPLED` and `STORAGE` usage and may have more, such as
+    /// `COLOR` for an upscaler that writes it as a render target. The sampled view covers every
+    /// mip, the storage view mip 0.
+    pub fn with_desc(gpu: &Device, desc: &TextureDesc, name: &str) -> Result<Self> {
         let texture = gpu.create_texture(desc, TextureMemory::Dedicated, name)?;
         let sampled = gpu.write_sampled(gpu.alloc_image_slot()?, &texture, &ViewDesc::default());
         let mip0 = ViewDesc {

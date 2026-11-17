@@ -23,7 +23,9 @@ use orr_examples::linked::KERNELS;
 use orr_examples::overlay::Overlay;
 use orr_examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
 use orr_examples::window::Window;
-use orr_examples::{Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time};
+use orr_examples::{
+    Capture, Options, Workers, assert_clean, device, enable_reconstruction, fixed_time,
+};
 use orr_math::Vec3;
 use orr_math::camera::rh::view;
 
@@ -66,7 +68,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
     if !options.headless {
-        enable_dlss(&mut renderer);
+        enable_reconstruction(&mut renderer);
     }
     let _workers = Workers::machine(renderer.loading());
     let mut showcase = Showcase::load(&mut renderer, gpu);

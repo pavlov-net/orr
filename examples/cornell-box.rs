@@ -37,8 +37,8 @@ use orr_examples::average::Average;
 use orr_examples::overlay::Overlay;
 use orr_examples::window::{KeyCode, Window};
 use orr_examples::{
-    Capture, Options, Workers, assert_clean, device, enable_dlss, environment_map, fixed_time,
-    mount_at,
+    Capture, Options, Workers, assert_clean, device, enable_reconstruction, environment_map,
+    fixed_time, mount_at,
 };
 use orr_math::{Affine3, DVec3, Mat3, Mat4, Quat, Vec3};
 use serde_json::Value;
@@ -385,7 +385,7 @@ fn run(options: &Options) -> Option<Capture> {
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
     if !options.headless && !reference {
-        enable_dlss(&mut renderer);
+        enable_reconstruction(&mut renderer);
     }
     let _workers = Workers::machine(renderer.loading());
     let (mount, mut frame) = mount_at(

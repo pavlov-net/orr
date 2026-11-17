@@ -41,8 +41,8 @@ use orr_cook::{
 use orr_examples::overlay::Overlay;
 use orr_examples::window::{KeyCode, Window};
 use orr_examples::{
-    Capture, Options, Workers, assert_clean, device, enable_dlss, entry_head, environment_map,
-    fixed_time, init_logging,
+    Capture, Options, Workers, assert_clean, device, enable_reconstruction, entry_head,
+    environment_map, fixed_time, init_logging,
 };
 use orr_math::{Affine3, Mat3, Quat, Vec3};
 use serde_json::Value;
@@ -875,7 +875,7 @@ fn run(options: &Options) -> Option<Capture> {
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
     if !options.headless {
-        enable_dlss(&mut renderer);
+        enable_reconstruction(&mut renderer);
     }
     let workers = Workers::machine(renderer.loading());
 

@@ -81,6 +81,10 @@ world.
 - Gran Turismo 7's tone mapping, gamut compression for SDR, and lights in physical units
 - DLSS ray reconstruction, super resolution, DLAA and frame generation, with Reflex for low latency,
   behind the default `dlss` feature, which does nothing on Apple targets
+- On Apple, MetalFX ray reconstruction (its denoised scaler), temporal upscaling and antialiasing,
+  and frame interpolation behind the default `metalfx` feature, on Apple silicon with macOS 26 or
+  later; the interpolator's camera matrices and distortion field need macOS 27. The `reconstruction`
+  example shows either backend
 - Auto exposure, white balance, local exposure, depth of field, motion blur and glare
 - A UI layer you can draw into, with `orr_egui` as a simple way to get debug UI on screen for now
 
@@ -95,7 +99,7 @@ world.
 
 You'll need:
 
-- an NVIDIA RTX card with a current driver
+- an NVIDIA RTX card with a current driver, or a Mac with Apple silicon
 - Rust, with the version picked by `rust-toolchain.toml`
 - a C++17 compiler
 - optionally, the NVIDIA DLSS SDK, with `DLSS_SDK` set, and the Vulkan SDK for its headers, with
