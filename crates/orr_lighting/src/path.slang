@@ -163,10 +163,12 @@ public struct LaunchHeader
     public uint light_at;
     public uint spectral_at;
     // The lean tracer's: a word a slot (`path.lean.state`'s `PathChain`) where its paths may gather
-    // caustic photons, and its spectral words (`PathSpectral`) where they may split by wavelength;
-    // null elsewhere.
+    // caustic photons, its spectral words (`PathSpectral`) where they may split by wavelength, and
+    // a word a slot for what a debug view of the path's first vertex shows where its pipeline may
+    // show one; null elsewhere.
     public uint4* chain;
     public uint4* spectral;
+    public uint4* debug;
 }
 
 // A queue of path slots in one round: the workgroups its stage runs over, which whoever

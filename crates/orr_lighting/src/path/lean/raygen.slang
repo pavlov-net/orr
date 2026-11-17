@@ -1055,6 +1055,8 @@ public void lean_paths(PathRoot r)
     bool two = runs && surface && frost_pass(r) && two_passes(r, pixel);
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
     uint index = pixel.y * r.gbuffer.extent.x + pixel.x;
+    if (lean_layer_view(r))
+        store_coherent(lean_debug(r, slot), uint4(0));
     for (uint pass = 0; pass < (two ? 2u : 1u); pass++)
     {
         bool second = pass == 1;
@@ -1092,6 +1094,18 @@ public void lean_paths(PathRoot r)
         float4 texel = float4(apply_hdr_ceiling(pre_exposure * radiance), first_distance > 0.0 ? 1.0 : 0.0);
         if (may(MAY_DEBUG) && path_mode(r) == PATH_RAYS)
             texel.xyz = float3(float(rays), all(isfinite(radiance)) ? 0.0 : 1.0, 0.0);
+        else if (lean_layer_view(r))
+        {
+            // A pixel whose first vertex was a layer shows the layer's shares and the layers the
+            // path met.
+            uint4 d = load_coherent(lean_debug(r, slot));
+            if (d.w != 0)
+            {
+                float2 own = asfloat(d.xy);
+                uint layers = may(MAY_LAYERS) ? met_layers(lean_cold(r, slot)) : 0;
+                texel = float4(own / max(own.x + own.y, 1e-6), float(layers) / float(max(r.dielectric_depth, 1u)), 1.0);
+            }
+        }
         r.radiance.get<RWTexture2D<float4>>()[pixel] = texel;
         r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(lights.feedback, asuint(first_distance));
         if ((r.light_flags & LIGHT_FEEDBACK_COUNT) != 0 && lights.feedback != NO_LIGHT)
