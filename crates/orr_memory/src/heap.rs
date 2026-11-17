@@ -179,7 +179,7 @@ impl HeapPool {
         let slot = &mut self.blocks[a.block];
         let b = slot
             .as_mut()
-            .filter(|b| std::ptr::eq(&*b.heap, &*a.heap))
+            .filter(|b| Retained::as_ptr(&b.heap) == Retained::as_ptr(&a.heap))
             .unwrap_or_else(|| {
                 panic!(
                     "{}: a range freed into a pool that does not hold it",
