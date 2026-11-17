@@ -83,6 +83,8 @@ static const uint path_may = 0xffffffffu;
 [Host] public static const uint MAY_EMITTER = 1 << 27;
 // The medium of an interior may scatter (`SceneFeatures::SCATTERING_INTERIORS`).
 [Host] public static const uint MAY_SCATTERING = 1 << 28;
+// The kernels link a medium, whose in-scatter a path's ray outside every interior may march.
+[Host] public static const uint MAY_MEDIUM = 1 << 29;
 // The scene may hold a medium proxy; a smoke entry.
 [Host] public static const uint MAY_PROXIES = 1u << 30;
 [Host] public static const uint MAY_SMOKE = 1u << 31;

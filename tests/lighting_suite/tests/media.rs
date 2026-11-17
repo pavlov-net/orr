@@ -6,10 +6,11 @@
 //! froxels, and long path segments' march against a fine one. Blended particles: in shade
 //! against in sun inside and beyond the froxel volume, fogged by the single scattering in
 //! front of them and through the aerial-perspective LUT past the froxels, and steady at a
-//! still camera. Medium proxies on the camera ray: a plume against the reference march and, per
-//! pixel, against a fine march of its grid; overlapping boxes, surfaces inside boxes and eyes
-//! inside boxes against Beer's law, inside and past the froxels; sky pixels past the froxels;
-//! and proxies off screen. Smoke: its opacity on the camera ray, a column across a shaft against
+//! still camera. Path rays: the in-scatter in front of a particle on a long way past it, and the
+//! in-scatter behind a glass slab, each against a CPU integral. Medium proxies on the camera ray: a
+//! plume against the reference march and, per pixel, against a fine march of its grid;
+//! overlapping boxes, surfaces inside boxes and eyes inside boxes against Beer's law, inside and
+//! past the froxels; sky pixels past the froxels; and proxies off screen. Smoke: its opacity on the camera ray, a column across a shaft against
 //! the reference march, and sheets past the froxels. The eye under water: a turbid view per channel
 //! against the reference's distance samples, also past the froxels and with shafts, a waterline at
 //! the near plane from either side, a body in the water, a light in the water, flicker, and
@@ -17,15 +18,16 @@
 
 use bytemuck::{Pod, Zeroable};
 use lighting_suite::bed::{
-    Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Gate, Item, LEAF, MILK_SPHERE, MIRROR,
-    NEAR, PLUME, Particle, ParticleLook, Paths, RT_RANGE, SKY, SUN, Spec, TURBID_WATER, WATER_BOX,
-    WHITE_SPHERE, assert_gate, fresnel, look, pixel_of, plume_volume, water_transmission,
+    Accumulated, BLACK_SPHERE, Bed, CANOPY, EXTENT, FLOOR, GLASS_SLAB, GLASS_SPHERE, Gate, Item,
+    LEAF, MILK_SPHERE, MIRROR, NEAR, PLUME, Particle, ParticleLook, Paths, RT_RANGE, SKY, SUN,
+    Spec, TURBID_WATER, WATER_BOX, WHITE_SPHERE, assert_gate, fresnel, look, pixel_of,
+    plume_volume, water_transmission,
 };
 use lighting_suite::shaders::{froxel_lookup, froxel_probe, segment_probe};
 use lighting_suite::{assert_clean, device, finish, pipeline, readback, render, require, upload};
 use orr_color::luminance;
 use orr_gpu::{Allocation, Hazards, KernelSet, Stages};
-use orr_lighting::path_may::{MAY_FROXELS, MAY_VIEW};
+use orr_lighting::path_may::{MAY_FROXELS, MAY_MEDIUM, MAY_VIEW};
 use orr_lighting::{
     AERIAL_SIZE, DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, MediaSettings,
     PathEntry, ReferenceSettings, ViewLighting,
@@ -248,8 +250,8 @@ fn slices_map_distances_and_back() {
 }
 
 /// The pipelines made for exactly what a fogged scene may meet hold what its paths read of the
-/// froxels: a glass sphere on a floor under the sun in haze renders through them as through the
-/// pipelines that may meet everything.
+/// froxels and the march of the haze behind glass: a glass sphere on a floor under the sun in haze
+/// renders through them as through the pipelines that may meet everything.
 #[test]
 fn specialized_pipelines_launch_the_paths_the_general_one_does_through_fog() {
     if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
@@ -260,7 +262,7 @@ fn specialized_pipelines_launch_the_paths_the_general_one_does_through_fog() {
         fog_kernels(),
         &Gate {
             what: "a glass sphere in haze",
-            held: &[u64::from(MAY_VIEW | MAY_FROXELS)],
+            held: &[u64::from(MAY_VIEW | MAY_FROXELS | MAY_MEDIUM)],
             bed: &|| {
                 let (bed, fog) = foggy(
                     &HAZE,
@@ -852,6 +854,123 @@ fn particles_stay_steady_at_a_still_camera() {
         change < 0.01,
         "frame to frame the particle changes by {:.2}% around {mean:.1}",
         100.0 * change
+    );
+    assert_clean();
+}
+
+/// Extinction of `fog` at height `y`, 1/m.
+fn extinction(fog: &Fog, y: f32) -> f64 {
+    f64::from(fog.density) * (-f64::from(y - fog.base_height) / f64::from(fog.falloff_height)).exp()
+}
+
+/// The mean luminance of the 8 x 8 block at the middle of the image over 32 frames, past 16 that
+/// fill the froxels' history.
+fn middle(bed: &mut Bed) -> f64 {
+    let mut paths = fog_paths();
+    paths.settings = ViewLighting::default();
+    bed.accumulate(16, 3, &mut |list, f| paths.record(list, f));
+    let a = bed.accumulate_on(16, 32, 3, &mut |list, f| paths.record(list, f));
+    let [w, h] = EXTENT;
+    luminance(a.around(Vec2::new((w / 2) as f32, (h / 2) as f32), 4))
+}
+
+/// A mirror turned to send the view's middle along +x through haze under a sun to a black sphere
+/// 600 m away, with an opaque black particle across that way 10 m or 300 m from the mirror: the
+/// haze's in-scatter in front of the far particle passes it. The views' differences take the
+/// eye's own segment and the mirror out: the in-scatter in front of the far particle over that of
+/// the whole way, each less that in front of the near one, is the share of the way's in-scatter
+/// a CPU integral gives.
+#[test]
+fn the_in_scatter_in_front_of_a_particle_passes_it() {
+    let eye = Vec3::new(0.0, 2.0, 0.0);
+    let target = Vec3::new(0.0, 2.0, -10.0);
+    let mirror = Vec3::new(0.0, 2.0, -4.0);
+    let (near, far, wall) = (10.0f32, 300.0f32, 600.0f32);
+    let view = |particle: Option<(f32, f32)>| {
+        let copies = vec![
+            Item {
+                model: MIRROR,
+                linear: Mat3::from_rotation_y(std::f32::consts::FRAC_PI_4),
+                at: mirror,
+            },
+            Item {
+                model: BLACK_SPHERE,
+                linear: Mat3::from_diagonal(Vec3::splat(100.0)),
+                at: mirror + Vec3::new(wall + 100.0, 0.0, 0.0),
+            },
+        ];
+        // A sun with no x component: nothing shadows the way.
+        let sun = vec![directional(30.0, 180.0, 1_000.0)];
+        let (mut bed, _fog) = foggy(&HAZE, copies, sun, None, eye, target);
+        if let Some((distance, size)) = particle {
+            let black = ParticleLook {
+                albedo: [0.0; 3],
+                emission: [0.0; 3],
+                opacity: 1.0,
+                anisotropy: 0.0,
+            };
+            let center = mirror + Vec3::new(distance, 0.0, 0.0);
+            bed.set_particles(&[Particle { center, size }], black, Opacity::Particle);
+        }
+        middle(&mut bed)
+    };
+    let open = view(None);
+    let covered_near = view(Some((near, 5.0)));
+    let covered_far = view(Some((far, 50.0)));
+    let sigma = extinction(&HAZE, mirror.y);
+    let through = |d: f32| (-sigma * f64::from(d)).exp();
+    let wanted = (through(near) - through(far)) / (through(near) - through(wall));
+    let got = (covered_far - covered_near) / (open - covered_near);
+    assert!(
+        open > 1.05 * covered_near,
+        "the way's in-scatter {open:.3} hardly shows over {covered_near:.3}"
+    );
+    assert!(
+        (got - wanted).abs() < 0.02 * wanted,
+        "in-scatter in front of the particle over the way's {got:.4}, a CPU integral's {wanted:.4}"
+    );
+    assert_clean();
+}
+
+/// The view's middle through a clear glass slab, faces 1 m apart across the view, in haze under a
+/// sun to a black sphere 2, 20 and 60 m behind it: rays leaving the glass take the haze's
+/// in-scatter on their way, which grows with the way as a CPU integral says, each less that of the
+/// shortest way.
+#[test]
+fn rays_leaving_glass_take_the_in_scatter_behind_it() {
+    let eye = Vec3::new(0.0, 2.0, 0.0);
+    let target = Vec3::new(0.0, 2.0, -10.0);
+    let glass = Vec3::new(0.0, 2.0, -4.0);
+    let ways = [2.0f32, 20.0, 60.0];
+    let [short, mid, long] = ways.map(|way| {
+        let copies = vec![
+            Item {
+                model: GLASS_SLAB,
+                linear: Mat3::from_diagonal(Vec3::new(1.0, 4.0, 1.0)),
+                at: glass,
+            },
+            Item {
+                model: BLACK_SPHERE,
+                linear: Mat3::from_diagonal(Vec3::splat(10.0)),
+                at: glass - Vec3::new(0.0, 0.0, 0.5 + way + 10.0),
+            },
+        ];
+        // A sun with no z component: nothing shadows the ways.
+        let sun = vec![directional(30.0, 90.0, 1_000.0)];
+        let (mut bed, _fog) = foggy(&HAZE, copies, sun, None, eye, target);
+        middle(&mut bed)
+    });
+    let sigma = extinction(&HAZE, glass.y);
+    let through = |d: f32| (-sigma * f64::from(d)).exp();
+    let wanted = (through(ways[0]) - through(ways[2])) / (through(ways[0]) - through(ways[1]));
+    assert!(
+        mid > 1.02 * short,
+        "behind the glass the in-scatter of 20 m {mid:.4} hardly shows over that of 2 m {short:.4}"
+    );
+    let got = (long - short) / (mid - short);
+    assert!(
+        (got - wanted).abs() < 0.02 * wanted,
+        "in-scatter of 60 m over that of 20 m behind the glass {got:.3}, a CPU integral's {wanted:.3}"
     );
     assert_clean();
 }

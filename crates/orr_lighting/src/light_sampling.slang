@@ -12,6 +12,7 @@ import orr_shaders.math;
 import orr_color.luminance;
 import orr_shaders.packing;
 import orr_shaders.random;
+import orr_shaders.trace;
 import orr_pack.mesh;
 import orr_scene.hit;
 import orr_scene.lights;
@@ -1611,15 +1612,23 @@ public float3 multiple_scattered<M : IMedium>(LightSetGpu* set, float3 x)
 // rays.
 public float3 segment_inscatter<M : IMedium>(LightSetGpu* set, float3 origin, float3 dir, float t, uint steps, float jitter, out float3 transmittance)
 {
+    return segment_inscatter<M>(set, origin, dir, t, steps, jitter, uncovered(), transmittance);
+}
+
+// As above, where the layers of `cover` lie across the segment: each step's light takes the share
+// of the layers in front of it that passes them.
+public float3 segment_inscatter<M : IMedium>(LightSetGpu* set, float3 origin, float3 dir, float t, uint steps, float jitter, LayerCover cover, out float3 transmittance)
+{
     uint64_t data = set.scene.medium;
     float dt = t / float(max(steps, 1u));
     float3 inscatter = float3(0.0);
     transmittance = float3(1.0);
     for (uint k = 0; k < max(steps, 1u); k++)
     {
-        float3 x = origin + dir * ((float(k) + jitter) * dt);
+        float s = (float(k) + jitter) * dt;
+        float3 x = origin + dir * s;
         MediumPoint m = M.sample(data, x);
-        float3 source = medium_source<M>(set, m, x, dir);
+        float3 source = medium_source<M>(set, m, x, dir) * cover.passed(s);
         march_step(m.sigma_t, source, dt, inscatter, transmittance);
     }
     transmittance = medium_transmittance<M>(data, origin, dir, t);

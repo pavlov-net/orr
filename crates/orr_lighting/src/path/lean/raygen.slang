@@ -51,8 +51,8 @@ public static const uint CALL_EXIT = 4;
 // The callable of a step of a directional job's walk through a plane stack, which a pipeline
 // whose paths may meet one holds.
 public static const uint CALL_STACK = 6;
-// The callable that takes what a path's ray meets in front of its hit, which a pipeline whose paths
-// may meet particles or sphere and rect lights holds.
+// The callable that takes what a path's ray meets on its way to its hit, which a pipeline whose
+// paths may meet particles, sphere and rect lights or a linked medium holds.
 public static const uint CALL_FRONT = 7;
 // The callable that marches the medium proxies with a volume a shadow ray passed, which a pipeline
 // whose scene may hold medium proxies holds.
@@ -823,8 +823,11 @@ uint lean_front_mask(PathRoot r, uint slot, uint4 w0, bool view, bool chain)
 // transmittance alone and see no particles. Every ray of a view path inside one may scatter: in
 // real time the world cache's light for the medium ends the path there, which costs no more than
 // going on. What the ray meets in front of its hit or its scatter runs in a callable first
-// (`lean_front_mask`). A `PHOTON`'s rays see particles as a view path's do, and report no texture
-// feedback.
+// (`lean_front_mask`), and so does the march of the linked medium's in-scatter along the way to a
+// hit outside every interior, past the camera ray: for a ray that left a layer, a scatter or a
+// walk's way out through the view's froxels, and for any other where it is long. A `PHOTON`'s
+// rays see particles as a view path's do, take the medium's transmittance alone, and report no
+// texture feedback.
 uint trace_ray<let VIEW : bool, let PHOTON : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, inout PathTrail trail, out Traced h, out Payload p, out bool invokes)
 {
     uint4 w1 = load_coherent(at + 1);
@@ -883,14 +886,17 @@ uint trace_ray<let VIEW : bool, let PHOTON : bool>(PathRoot r, uint slot, uint4*
         lights.first_distance = from_background(r) ? -dot(r.view.view_from_world_rotation[2].xyz, from_eye) : length(from_eye);
         store_coherent(record, reinterpret<uint4>(lights));
     }
-    if (may_any(MAY_PARTICLES | MAY_LOCAL_LIGHTS))
+    if (may_any(MAY_PARTICLES | MAY_LOCAL_LIGHTS | MAY_MEDIUM))
     {
-        bool met = (p.words.x & FRONT_MET) != 0;
+        bool met = may_any(MAY_PARTICLES | MAY_LOCAL_LIGHTS) && (p.words.x & FRONT_MET) != 0;
         p.words.x &= ~FRONT_MET;
-        if (met)
+        uint march = MARCH_NONE;
+        if (may(MAY_MEDIUM) && !PHOTON && h.hit() && !camera && !(may(MAY_INTERIORS) && (w0.w & HOT_INTERIOR) != 0))
+            march = trail.chain ? MARCH_FROXELS : h.t() >= INSCATTER_SEGMENT ? MARCH_PLAIN : MARCH_NONE;
+        if (met || march != MARCH_NONE)
         {
             Payload f;
-            f.words = uint4(asuint(h.hit() ? h.t() : positive_infinity()), front, VIEW ? 1 : 0, 0);
+            f.words = uint4(asuint(h.hit() ? h.t() : positive_infinity()), met ? front : 0, VIEW ? 1 : 0, march);
             call(CALL_FRONT, f);
             // What covers the ray in front of its hit may leave the path no light to carry on.
             if (f.words.x == 0)
@@ -898,6 +904,8 @@ uint trace_ray<let VIEW : bool, let PHOTON : bool>(PathRoot r, uint slot, uint4*
                 end_path(at);
                 return NEXT_RAY;
             }
+            if (march != MARCH_NONE)
+                p.words.x |= PAYLOAD_WEIGHED;
         }
     }
     if (VIEW && may(MAY_SCATTERING) && (w0.w & HOT_INTERIOR) != 0)

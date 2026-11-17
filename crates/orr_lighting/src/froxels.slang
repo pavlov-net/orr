@@ -1067,8 +1067,9 @@ public bool froxel_coord(uint3 grid, ViewConstants* v, float near_range, float3 
 // along unit `dir`, marched as `segment_inscatter` does, except that steps inside `volume`
 // (null for none), the froxels of view `v`, take their froxel's medium and light, so the
 // shadowed directional lights carry their visibility, and `transmittance` is the march's, with
-// the froxels' medium in it.
-public float3 froxel_segment_inscatter<M : IMedium>(FroxelVolume* volume, ViewConstants* v, LightSetGpu* set, float3 origin, float3 dir, float t, uint steps, float jitter, out float3 transmittance)
+// the froxels' medium in it. The layers of `cover` lie across the segment: each step's light takes
+// the share of the layers in front of it that passes them.
+public float3 froxel_segment_inscatter<M : IMedium>(FroxelVolume* volume, ViewConstants* v, LightSetGpu* set, float3 origin, float3 dir, float t, uint steps, float jitter, LayerCover cover, out float3 transmittance)
 {
     uint64_t data = set.scene.medium;
     float near_range = set.scene.near_range;
@@ -1084,7 +1085,8 @@ public float3 froxel_segment_inscatter<M : IMedium>(FroxelVolume* volume, ViewCo
     }
     for (uint k = 0; k < max(steps, 1u); k++)
     {
-        float3 x = origin + dir * ((float(k) + jitter) * dt);
+        float s = (float(k) + jitter) * dt;
+        float3 x = origin + dir * s;
         uint3 f;
         MediumPoint m;
         float3 source;
@@ -1102,7 +1104,7 @@ public float3 froxel_segment_inscatter<M : IMedium>(FroxelVolume* volume, ViewCo
             m = M.sample(data, x);
             source = medium_source<M>(set, m, x, dir);
         }
-        march_step(m.sigma_t, source, dt, inscatter, transmittance);
+        march_step(m.sigma_t, source * cover.passed(s), dt, inscatter, transmittance);
     }
     return inscatter;
 }

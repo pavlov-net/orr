@@ -36,10 +36,10 @@ use crate::staged::{
     FEATURE_DISPERSION, FEATURE_INTERIORS, FEATURE_STACK, FEATURE_WALK, MAX_ROUNDS, MAY_ALL,
     MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL, MAY_DISPERSION,
     MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ, MAY_INTERIORS, MAY_LAYERS, MAY_LENS,
-    MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING,
-    MAY_SMOKE, MAY_STACK, MAY_SUBSURFACE, MAY_TRACED, MAY_WALK, PATH_SOURCE_BACKGROUND,
-    PATH_SOURCE_PHOTON, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, Source, SourcePaths, Stage, StageSet,
-    StagedKernels, StagedMemory, StateParts, UPDATE_FEATURES,
+    MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_MEDIUM, MAY_PARTICLES, MAY_PROXIES, MAY_REFERENCE,
+    MAY_SCATTERING, MAY_SMOKE, MAY_STACK, MAY_SUBSURFACE, MAY_TRACED, MAY_WALK,
+    PATH_SOURCE_BACKGROUND, PATH_SOURCE_PHOTON, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, Source,
+    SourcePaths, Stage, StageSet, StagedKernels, StagedMemory, StateParts, UPDATE_FEATURES,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::support::{Masked, MaskedFrame, MaskedSupport, Runs};
@@ -1748,7 +1748,8 @@ fn predict(
     let shared = scene_may(features)
         | bit(gathers_caustics(scene, features, lighting), MAY_CAUSTICS)
         | bit(lens, MAY_LENS)
-        | bit(froxels, MAY_FROXELS);
+        | bit(froxels, MAY_FROXELS)
+        | bit(linked_medium, MAY_MEDIUM);
     let layer = lighting.debug_view == LightingDebugView::DielectricLayer;
     let background = shared
         | features_may(path)
