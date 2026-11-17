@@ -101,6 +101,7 @@ public LayerGuide layer_guides<S : ISurfaces>(PathRoot r, LayerVertex l, Bsdf b,
     Hit rh = trace_closest(s.tlas, path_ray(vertex_origin(l.x, reflected), reflected, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, ra);
     float3 camera = l.x.surface.position - v.eye_render.xyz;
     g.specular_motion = rh.hit ? reprojected_motion(v, dir * (length(camera) + rh.t), 1.0) : reprojected_motion(v, dir, 0.0);
+    g.specular_distance = rh.hit ? rh.t : positive_infinity();
 
     if (h.class_id == CLASS_PRESENCE)
     {

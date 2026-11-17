@@ -59,7 +59,7 @@ pub use passes::{
 };
 pub use present::{Display, DisplayFrame, Presented, UI_PASS};
 pub use reconstruction::{
-    Reconstruction, ReconstructionBackend, ReconstructionFeature, ReconstructionInputs,
+    GuideReads, Reconstruction, ReconstructionBackend, ReconstructionFeature, ReconstructionInputs,
     ReconstructionMode, ReconstructionSupport, UpscaleMode, UpscaleQuality,
 };
 pub use screenshot::{Screenshot, ScreenshotRequest};

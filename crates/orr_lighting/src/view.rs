@@ -494,6 +494,17 @@ const SPECULAR_MOTION: &str = "specular motion";
 const RR_DEPTH: &str = "rr depth";
 const RR_MOTION: &str = "rr motion";
 const DOF_GUIDE: &str = "dof guide";
+const ROUGHNESS: &str = "roughness";
+const SPECULAR_HIT_DISTANCE: &str = "specular hit distance";
+
+/// Guides a ray reconstruction backend reads besides those every view holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExtraGuides {
+    /// Linear roughness on its own, apart from the normal.
+    pub roughness: bool,
+    /// The distance to each pixel's mirror reflection.
+    pub specular_hit_distance: bool,
+}
 
 /// What the passes after ray reconstruction and the consumer read.
 const TO_FRAME_END: Span = Span::new(ViewStep::Lighting, ViewStep::After);
@@ -512,6 +523,9 @@ struct Targets {
     motion: ArenaTexture,
     /// Held only for ray reconstruction.
     dof_guide: Option<ArenaTexture>,
+    /// Held for a reconstruction that reads them ([`ExtraGuides`]).
+    roughness: Option<ArenaTexture>,
+    specular_hit_distance: Option<ArenaTexture>,
 }
 
 impl Targets {
@@ -533,6 +547,8 @@ impl Targets {
             depth: get(RR_DEPTH)?,
             motion: get(RR_MOTION)?,
             dof_guide: arena.texture(DOF_GUIDE).cloned(),
+            roughness: arena.texture(ROUGHNESS).cloned(),
+            specular_hit_distance: arena.texture(SPECULAR_HIT_DISTANCE).cloned(),
         })
     }
 }
@@ -580,8 +596,13 @@ pub struct LightingView {
 impl LightingView {
     /// The targets a view's arena holds for its [`LightingView`] at `extent`. With
     /// `reconstructed`, ray reconstruction's output replaces the radiance after it, later
-    /// passes read lighting's depth and motion, and the view holds a depth-of-field guide.
-    pub fn requests(extent: [u32; 2], reconstructed: bool) -> Vec<ArenaRequest> {
+    /// passes read lighting's depth and motion, and the view holds a depth-of-field guide and
+    /// the `extra` guides.
+    pub fn requests(
+        extent: [u32; 2],
+        reconstructed: bool,
+        extra: ExtraGuides,
+    ) -> Vec<ArenaRequest> {
         let (radiance, surface) = if reconstructed {
             (TO_RECONSTRUCTION, TO_FRAME_END)
         } else {
@@ -601,6 +622,12 @@ impl LightingView {
         ];
         if reconstructed {
             requests.push(guide(DOF_GUIDE, Format::R16Float));
+            if extra.roughness {
+                requests.push(guide(ROUGHNESS, Format::R16Float));
+            }
+            if extra.specular_hit_distance {
+                requests.push(guide(SPECULAR_HIT_DISTANCE, Format::R16Float));
+            }
         }
         requests
     }
@@ -776,6 +803,22 @@ impl LightingView {
     /// term.
     pub fn depth_of_field_guide(&self) -> Option<&Texture> {
         self.targets.dof_guide.as_ref().map(|t| &**t.texture())
+    }
+
+    /// R16F linear roughness, held where [`Self::requests`] asked for it.
+    pub fn roughness(&self) -> Option<&Texture> {
+        self.targets.roughness.as_ref().map(|t| &**t.texture())
+    }
+
+    /// R16F m from each pixel's surface to what its mirror reflection hits, where the guides
+    /// follow the reflection (below the specular motion roughness, or on a dominant layer);
+    /// infinite toward the sky, 0 elsewhere and on sky pixels. Held where [`Self::requests`]
+    /// asked for it.
+    pub fn specular_hit_distance(&self) -> Option<&Texture> {
+        self.targets
+            .specular_hit_distance
+            .as_ref()
+            .map(|t| &**t.texture())
     }
 
     /// The storage view of [`Self::depth_of_field_guide`].
@@ -2439,6 +2482,8 @@ impl LightingKernels {
         };
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         let dof_guide = view.depth_of_field_guide_storage();
+        let storage =
+            |t: &Option<ArenaTexture>| t.as_ref().map_or(StorageImageIndex::NONE, |t| t.storage(0));
         let root = view.guide_roots.write(
             slot,
             GuideRoot {
@@ -2454,10 +2499,14 @@ impl LightingKernels {
                 depth: view.targets.depth.storage(0),
                 motion: view.targets.motion.storage(0),
                 dof_guide: dof_guide.unwrap_or(StorageImageIndex::NONE),
+                roughness: storage(&view.targets.roughness),
+                specular_hit_distance: storage(&view.targets.specular_hit_distance),
                 motion_roughness: lighting.guides.specular_motion_roughness,
                 debug,
                 dielectric_depth: dielectric_depth(lighting),
                 _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
             },
         );
         let [w, h] = view.extent;

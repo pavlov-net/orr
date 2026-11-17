@@ -69,10 +69,25 @@ pub struct ReconstructionSupport {
     pub scale: Option<[f32; 2]>,
 }
 
+/// Guides a backend reads besides those [`ReconstructionInputs`] always holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GuideReads {
+    /// [`ReconstructionInputs::roughness`].
+    pub roughness: bool,
+    /// [`ReconstructionInputs::specular_hit_distance`].
+    pub specular_hit_distance: bool,
+}
+
 /// Makes ray reconstruction features on one device.
 pub trait ReconstructionBackend: Send {
     /// Read once, when the backend is given to the renderer.
     fn support(&self) -> ReconstructionSupport;
+
+    /// The optional guides its features read, which views then hold. Read with
+    /// [`support`](Self::support).
+    fn reads(&self) -> GuideReads {
+        GuideReads::default()
+    }
 
     /// A feature for `output` at the render size of `quality`. May wait for setup on the Render
     /// queue, so call it on that queue's owner thread.
@@ -142,21 +157,19 @@ pub struct ReconstructionInputs<'a> {
     pub specular_albedo: &'a Texture,
     /// World-space normal in RGB, linear roughness in A.
     pub normal_roughness: &'a Texture,
+    /// R16F linear roughness alone, where the backend [`reads`](ReconstructionBackend::reads)
+    /// it.
+    pub roughness: Option<&'a Texture>,
     /// Motion of reflected surfaces, in the same units as `motion`.
     pub specular_motion: &'a Texture,
-    /// World-space distance from each primary surface to its specular hit, an alternative to
-    /// `specular_motion`.
+    /// R16F m from each primary surface to what its mirror reflection hits, where the guides
+    /// follow the reflection; infinite toward the sky, 0 elsewhere, where `specular_motion` is
+    /// the surface's own. An alternative to `specular_motion`, where the backend
+    /// [`reads`](ReconstructionBackend::reads) it.
     pub specular_hit_distance: Option<&'a Texture>,
     /// Premultiplied color with coverage in alpha, composited after denoising.
     pub transparency: Option<&'a Texture>,
     pub depth_of_field_guide: Option<&'a Texture>,
-    /// One channel: how strongly to denoise each pixel.
-    pub denoise_strength_mask: Option<&'a Texture>,
-    /// One channel in [0, 1]: how far to trust the current frame over the history, where motion
-    /// is inaccurate.
-    pub reactive_mask: Option<&'a Texture>,
-    /// 1x1: the exposure that brings the color to the tonemapper's range.
-    pub exposure: Option<&'a Texture>,
     pub output: &'a Texture,
     /// Drops the history.
     pub reset: bool,

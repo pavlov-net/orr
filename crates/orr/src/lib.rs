@@ -48,7 +48,7 @@ pub use orr_output::{
     AutoExposure, AutoWhiteBalance, CalibrationPattern, CompensationCurve, Display, DisplayFeed,
     DisplayHeadroom, DisplayInfo, DisplayRequest, Exposure, ExposureTelemetry,
     FrameGenerationBackend, FrameGenerationCamera, FrameGenerationFeature, FrameGenerationInputs,
-    FrameGenerationMode, GlareMethod, Grade, Gt7Params, HookPass, InterpolationCheck,
+    FrameGenerationMode, GlareMethod, Grade, Gt7Params, GuideReads, HookPass, InterpolationCheck,
     LocalExposure, MeterWeights, OutputDebug, Physiological, PostQuality, Presented, Primaries,
     Reconstruction, ReconstructionBackend, ReconstructionFeature, ReconstructionInputs,
     ReconstructionMode, ReconstructionSupport, ResolvedDisplay, Screenshot, ScreenshotRequest,
@@ -80,7 +80,8 @@ use orr_gpu::{
     StorageImageIndex, TextureDesc, TextureIndex, TextureUsage, TimelinePoint,
 };
 use orr_lighting::{
-    BsdfTables, LightingKernels, LightingView, PathNeeds, SceneLighting, ScenePass, ViewPass,
+    BsdfTables, ExtraGuides, LightingKernels, LightingView, PathNeeds, SceneLighting, ScenePass,
+    ViewPass,
 };
 use orr_math::{DVec3, Quat, UVec2, Vec2};
 use orr_output::{
@@ -1453,7 +1454,16 @@ impl<'a> Frame<'a> {
             scene_referred: hooks.scene_referred.is_some(),
             display_linear: tonemapped && hooks.display_linear.is_some(),
         };
-        let mut requests = LightingView::requests(render, reconstructed);
+        let reads = self
+            .output
+            .reconstruction
+            .as_ref()
+            .map_or_else(GuideReads::default, |(b, _)| b.reads());
+        let extra = ExtraGuides {
+            roughness: reads.roughness,
+            specular_hit_distance: reads.specular_hit_distance,
+        };
+        let mut requests = LightingView::requests(render, reconstructed, extra);
         if reconstructed {
             requests.push(output_image_request(RECONSTRUCTED, extent, ViewStep::Rr));
         }
@@ -1615,13 +1625,11 @@ impl<'a> Frame<'a> {
                         diffuse_albedo: paths.diffuse_albedo(),
                         specular_albedo: paths.specular_albedo(),
                         normal_roughness: paths.normal_roughness(),
+                        roughness: paths.roughness(),
                         specular_motion: paths.specular_motion(),
-                        specular_hit_distance: None,
+                        specular_hit_distance: paths.specular_hit_distance(),
                         transparency: overlay.as_ref().map(|(texture, _)| &**texture),
                         depth_of_field_guide: paths.depth_of_field_guide(),
-                        denoise_strength_mask: None,
-                        reactive_mask: None,
-                        exposure: None,
                         output: target.texture(),
                         reset: std::mem::take(&mut r.fresh) || paths.history_reset() || stepped,
                         view: &desc,

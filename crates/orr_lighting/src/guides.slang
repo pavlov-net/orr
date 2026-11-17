@@ -56,10 +56,20 @@ public struct GuideRoot
     // R16F depth-of-field guide, cleared on every pixel for the frosted-glass term; NONE
     // writes none.
     public StorageImageIndex dof_guide;
+    // R16F linear roughness, for a reconstruction that takes it apart from the normal; NONE
+    // writes none.
+    public StorageImageIndex roughness;
+    // R16F m from each pixel's surface to what its mirror reflection hits, where the guides
+    // follow the reflection (below `motion_roughness`, or a dominant layer's); infinite toward
+    // the sky, 0 elsewhere and on sky pixels, as `specular_motion` there is the surface's own.
+    // NONE writes none.
+    public StorageImageIndex specular_hit_distance;
     public float motion_roughness;              // specular motion below this roughness
     public uint debug;                          // GUIDE_*
     public uint dielectric_depth;               // layers a dielectric's refraction chain crosses
     public uint _pad0;
+    public uint _pad1;
+    public uint _pad2;
 }
 
 // A view's overlay front words, and the targets `guides/overlay_front` resolves them into.
@@ -419,6 +429,7 @@ public void guide_body<S : ISurfaces>(GuideRoot r, uint2 pixel)
     float2 motion = gb.motion.get<Texture2D<float2>>().Load(int3(pixel, 0));
     Guides g = sky_guides();
     float2 specular_motion = motion;
+    float specular_distance = 0.0;
     PathVertex x1;
     bool surface = gbuffer_vertex(s, v, gb, pixel, x1);
     if (surface)
@@ -432,6 +443,7 @@ public void guide_body<S : ISurfaces>(GuideRoot r, uint2 pixel)
             Reflection m = mirror_chain<S>(r, pixel, x1, g, chain);
             g = m.guides;
             specular_motion = reprojected_motion(v, m.virtual_point, m.w);
+            specular_distance = m.w > 0.0 ? length(m.virtual_point) - x1.camera_distance : positive_infinity();
         }
     }
     // Layer guides hold their emission in their diffuse albedo.
@@ -453,6 +465,7 @@ public void guide_body<S : ISurfaces>(GuideRoot r, uint2 pixel)
                 depth = l.depth;
                 motion = l.motion;
                 specular_motion = l.specular_motion;
+                specular_distance = l.specular_distance;
             }
         }
     }
@@ -464,6 +477,10 @@ public void guide_body<S : ISurfaces>(GuideRoot r, uint2 pixel)
     r.motion.get<RWTexture2D<float2>>()[pixel] = motion;
     if (r.dof_guide.index != IMAGE_NONE)
         r.dof_guide.get<RWTexture2D<float>>()[pixel] = 0.0;
+    if (r.roughness.index != IMAGE_NONE)
+        r.roughness.get<RWTexture2D<float>>()[pixel] = g.roughness;
+    if (r.specular_hit_distance.index != IMAGE_NONE)
+        r.specular_hit_distance.get<RWTexture2D<float>>()[pixel] = specular_distance;
 
     float3 shown;
     switch (r.debug)
