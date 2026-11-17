@@ -20,6 +20,10 @@ pub(super) const OPTIONS: &[&str] = &[
     "-restrictive-capability-check",
     "-warnings-as-errors",
     "all",
+    // Slang drops `precise` from MSL and warns, but [`compile_library`] already builds every
+    // expression without contraction or fast math, which is what `precise` asks for.
+    "-warnings-disable",
+    "56005",
     "-target",
     "metal",
     "-matrix-layout-row-major",
