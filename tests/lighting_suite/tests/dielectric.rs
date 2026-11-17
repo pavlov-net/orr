@@ -13,8 +13,9 @@ use lighting_suite::bed::{
     MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, MIXED_SLAB, NEAR, OverlayFrontLayer, PRESENCE_VEIL,
     PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Particle, ParticleLook,
     Paths, ROUGH_SLAB, SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB,
-    TWO_SIDED_SLAB, WATER_BOX, WHITE_SPHERE, assert_close, both, fresnel, image_mean, moved_entry,
-    pixel_of, prism_corners, reference, surface_mean, water_transmission,
+    TWO_SIDED_SLAB, WATER_BOX, WHITE_SPHERE, assert_close, assert_pipeline_within_noise, both,
+    fresnel, image_mean, moved_entry, pixel_of, prism_corners, reference, surface_mean,
+    water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
@@ -1445,5 +1446,47 @@ fn particles_behind_glass_show_through_it() {
     let (f, t) = (fresnel(1.5, 1.0), 0.5);
     let share = (1.0 - f) * (1.0 - f) * t / (1.0 - f * f * t * t);
     assert_close("through the slab", through, open.map(|v| v * share), 0.03);
+    assert_clean();
+}
+
+/// The DielectricLayer view through the pipeline shows what the staged loop's does: on the pixels
+/// whose first vertex is a tinted slab, the share of its albedo it reflects in red and transmits in
+/// green, and the layers the path met over the dielectric depth in blue.
+#[test]
+fn the_pipeline_shows_the_dielectric_layer_view_the_staged_loop_does() {
+    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
+        return;
+    }
+    let mut bed = Bed::with(from_above(
+        vec![
+            at(SMOOTH_FLOOR, Vec3::ZERO),
+            at(TINTED_SLAB, Vec3::new(0.0, 0.5, 0.0)),
+        ],
+        vec![Light::Directional(SUN)],
+        4.0,
+    ));
+    let settings = ViewLighting {
+        debug_view: LightingDebugView::DielectricLayer,
+        ..ViewLighting::default()
+    };
+    let (staged, launched) = both(&KernelSet::default(), settings);
+    // Pixels on a layer: their shares sum to 1.
+    let layered = |a: &Accumulated| {
+        a.mean
+            .iter()
+            .filter(|p| (p[0] + p[1] - 1.0).abs() < 1e-3)
+            .count()
+    };
+    let (of_staged, of_launched) = (
+        layered(&render_paths(&mut bed, &staged, 4)),
+        layered(&render_paths(&mut bed, &launched, 4)),
+    );
+    let [w, h] = EXTENT;
+    let pixels = (w * h) as usize;
+    assert!(
+        of_staged > pixels / 4 && of_staged.abs_diff(of_launched) <= pixels / 100,
+        "{of_launched} layered pixels through the pipeline, {of_staged} through the staged loop"
+    );
+    assert_pipeline_within_noise("the dielectric layer view", &mut bed, &staged, &launched);
     assert_clean();
 }

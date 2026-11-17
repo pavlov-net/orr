@@ -59,14 +59,15 @@ pub(crate) struct SourceMemory {
     stack: Option<Allocation<[u32; 4]>>,
     chain: Option<Allocation<[u32; 4]>>,
     spectral: Option<Allocation<[u32; 4]>>,
+    debug: Option<Allocation<[u32; 4]>>,
     _records: Allocation<[u32; 4]>,
 }
 
 impl SourceMemory {
     /// The slots of `items` paths, at most [`MAX_SLOTS`], laid out as `layout`, with their cold
     /// words where `cold` holds, their plane stack's where `stack` does, their chain word
-    /// (`PathChain`) where `chain` does and their spectral words (`PathSpectral`) where `spectral`
-    /// does.
+    /// (`PathChain`) where `chain` does, their spectral words (`PathSpectral`) where `spectral`
+    /// does and their debug word where `debug` does.
     pub(crate) fn new(
         device: &Device,
         items: u32,
@@ -79,6 +80,7 @@ impl SourceMemory {
             stack,
             chain,
             spectral,
+            debug,
         } = parts;
         let slots = slots(items);
         let n = u64::from(slots);
@@ -100,6 +102,7 @@ impl SourceMemory {
         let spectral = spectral
             .then(|| words(LEAN_SPECTRAL_WORDS, "path wavelengths"))
             .transpose()?;
+        let debug = debug.then(|| words(1, "path debug views")).transpose()?;
         let records = words(layout.record_words, "path records")?;
         let mut header = device.gpu_malloc::<LaunchHeader>(MemoryKind::Upload, 1, name)?;
         header.as_mut_slice().expect("mapped")[0] = LaunchHeader {
@@ -117,6 +120,7 @@ impl SourceMemory {
             spectral_at: PART_NONE,
             chain: chain.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
             spectral: spectral.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
+            debug: debug.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
         };
         Ok(Self {
             slots,
@@ -127,6 +131,7 @@ impl SourceMemory {
             stack,
             chain,
             spectral,
+            debug,
             _records: records,
         })
     }
@@ -143,20 +148,23 @@ impl SourceMemory {
             stack: self.stack.is_some(),
             chain: self.chain.is_some(),
             spectral: self.spectral.is_some(),
+            debug: self.debug.is_some(),
         }
     }
 }
 
 /// The parts a slot holds beside its hot words and its record: its cold words, which paths that
 /// may meet a layer, an interior or a walk keep; the words of a plane stack, which paths that may
-/// meet one keep; the chain word, which paths that may gather caustic photons keep; and the
-/// spectral words, which paths that may split by wavelength keep.
+/// meet one keep; the chain word, which paths that may gather caustic photons keep; the spectral
+/// words, which paths that may split by wavelength keep; and the debug word, which paths whose
+/// pipeline may show a debug view keep.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SlotParts {
     pub(crate) cold: bool,
     pub(crate) stack: bool,
     pub(crate) chain: bool,
     pub(crate) spectral: bool,
+    pub(crate) debug: bool,
 }
 
 fn slots(items: u32) -> u32 {

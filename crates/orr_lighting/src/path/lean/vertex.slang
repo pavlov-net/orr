@@ -76,6 +76,22 @@ public uint4* lean_spectral(PathRoot r, uint slot)
     return r.launch.spectral + slot * LEAN_SPECTRAL_WORDS;
 }
 
+// The debug word of the slice's `slot`th path, where its pipeline may show a debug view: what the
+// DielectricLayer view shows of a first layer, its reflected and transmitted luminance with 1 in w,
+// or 0 where the path's first vertex was none (`lean_layer_view`).
+public uint4* lean_debug(PathRoot r, uint slot)
+{
+    return r.launch.debug + slot;
+}
+
+// Whether `r`'s paths are a view's under the DielectricLayer view: on pixels whose first vertex is
+// a layer, the share of the layer's albedo it reflects and the share it transmits, and the layers
+// the path met over the root's dielectric depth.
+public bool lean_layer_view(PathRoot r)
+{
+    return may(MAY_DEBUG) && from_view(r) && (r.dielectric_flags & DIELECTRIC_DEBUG_LAYER) != 0;
+}
+
 // Whether `r`'s paths split by wavelength at a dispersive layer: a view's, its background layer's
 // and the photons', with the view's dispersion on.
 public bool lean_disperses(PathRoot r)
@@ -961,6 +977,12 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
             spectral = start_spectral(r, slot, at, pixel);
     }
     Bsdf b = on.prepare(r, x, cold, inside, dispersive ? spectral.hero() : 0.0);
+    if (LAYER && first && lean_layer_view(r))
+    {
+        LobeAlbedo albedo = b.albedo();
+        float2 own = float2(luminance_rec2020(albedo.specular + albedo.diffuse), luminance_rec2020(albedo.transmission));
+        store_coherent(lean_debug(r, slot), uint4(asuint(own), 0, 1));
+    }
     // Whether light leaves the surface as a caustic, and what of the light the path finds past
     // chain vertices stays its own: a re-run's as the vertex found it.
     bool chains = may(MAY_CAUSTICS) && surface_chains(r, g);
