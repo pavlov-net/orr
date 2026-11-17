@@ -77,7 +77,7 @@ static const uint SHADE_START = STAGE_QUEUES;
 
 // The features an update path keeps of its view's (`update_root`): it does not walk, nor split by
 // wavelength, and rides in the view's shade stages.
-[Host] public static const uint UPDATE_FEATURES = FEATURE_INTERIORS | FEATURE_STACK | FEATURE_RAY_SHADES | FEATURE_SEGMENTS;
+[Host] public static const uint UPDATE_FEATURES = FEATURE_INTERIORS | FEATURE_STACK | FEATURE_RAY_SHADES;
 
 uint round_now(PathRoot r) { return r.round; }
 uint round_pass(PathRoot r) { return r.round_first; }

@@ -7,7 +7,7 @@ use orr_scene::orr_gpu::{Allocation, Device, GpuPtr, MemoryKind};
 use crate::Error;
 use crate::shaders::consts::{
     LEAN_COLD_WORDS, LEAN_HOT_WORDS, LEAN_PHOTON_RECORD_WORDS, LEAN_SPECTRAL_WORDS,
-    LEAN_STACK_WORDS, LEAN_UPDATE_RECORD_WORDS, LEAN_VIEW_RECORD_WORDS, PART_NONE,
+    LEAN_STACK_WORDS, LEAN_UPDATE_RECORD_WORDS, LEAN_VIEW_RECORD_WORDS,
 };
 use crate::shaders::types::LaunchHeader;
 
@@ -108,16 +108,8 @@ impl SourceMemory {
         header.as_mut_slice().expect("mapped")[0] = LaunchHeader {
             hot: hot.gpu(),
             cold: cold.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
-            scratch: stack.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
+            stack: stack.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
             records: records.gpu(),
-            cold_words: if cold.is_some() { LEAN_COLD_WORDS } else { 0 },
-            scratch_words: if stack.is_some() { LEAN_STACK_WORDS } else { 0 },
-            walk_at: PART_NONE,
-            layer_at: PART_NONE,
-            interior_at: PART_NONE,
-            stack_at: PART_NONE,
-            light_at: PART_NONE,
-            spectral_at: PART_NONE,
             chain: chain.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
             spectral: spectral.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
             debug: debug.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),

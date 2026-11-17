@@ -351,9 +351,6 @@ public uint as_halves(float2 v)
     return f32tof16(v.x) | (f32tof16(v.y) << 16);
 }
 
-// `LaunchHeader`'s offset of a cold part the root does not keep.
-[Host] public static const uint PART_NONE = 0xffffffff;
-
 // The hot words of a path, in order:
 //   0  origin, flags
 //   1  dir as a 2 x 16-bit octahedral code, normal as one, throughput as three halves and run as a half

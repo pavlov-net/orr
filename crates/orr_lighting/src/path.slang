@@ -144,28 +144,20 @@ public struct PathStages
     public uint _pad0;
 }
 
-// Where a pipeline launch's paths keep their state (path/launch/slot.slang): every slot's
-// HOT_WORDS hot words at a fixed stride, its cold words, `cold_words` a slot, with the first word
-// of each cold part a root's source and features keep (PART_NONE for one it does not), its scratch,
-// `scratch_words` a slot, and its record. The host lays them out from the root alone.
+// Where a launch's paths keep their state (`path.lean.state`): every slot's LEAN_HOT_WORDS hot
+// words and its record, of LEAN_VIEW_RECORD_WORDS, LEAN_UPDATE_RECORD_WORDS or
+// LEAN_PHOTON_RECORD_WORDS by its source, at a fixed stride; and where its pipeline's paths may reach
+// them, its cold words (LEAN_COLD_WORDS a slot) where they may meet a layer, an interior or a walk,
+// its plane stack's (LEAN_STACK_WORDS) where they may meet one, a word a slot (`PathChain`) where
+// they may gather caustic photons, its spectral words (`PathSpectral`) where they may split by
+// wavelength, and a word a slot for what a debug view of the path's first vertex shows where its
+// pipeline may show one; null elsewhere.
 public struct LaunchHeader
 {
     public uint4* hot;
     public uint4* cold;
-    public uint4* scratch;
-    public uint4* records;              // RECORD_WORDS a slot, UPDATE_RECORD_WORDS an update path's
-    public uint cold_words;
-    public uint scratch_words;
-    public uint walk_at;
-    public uint layer_at;
-    public uint interior_at;
-    public uint stack_at;
-    public uint light_at;
-    public uint spectral_at;
-    // The lean tracer's: a word a slot (`path.lean.state`'s `PathChain`) where its paths may gather
-    // caustic photons, its spectral words (`PathSpectral`) where they may split by wavelength, and
-    // a word a slot for what a debug view of the path's first vertex shows where its pipeline may
-    // show one; null elsewhere.
+    public uint4* stack;
+    public uint4* records;
     public uint4* chain;
     public uint4* spectral;
     public uint4* debug;
@@ -1340,15 +1332,6 @@ public Bsdf prepare_vertex(SceneRoot* s, LayerVertex l, Interior interior, bool 
         exterior = dispersed_material_ior(s, outside, exterior, nm, interior.point(outside));
     }
     return bsdf_prepare(p, l.x.surface.normal, l.x.view, exterior, adjoint);
-}
-
-// Opaque vertex `l`'s BSDF in a medium of IOR `exterior`, prepared as `prepare_vertex` prepares
-// it up to its fitted coefficients: what its coat and fuzz pass of its emission
-// (`Bsdf.emission_layer`, `Bsdf.emission`), which they do not change.
-public Bsdf opaque_emission_layers(LayerVertex l, float exterior, bool collapse, bool walks, bool adjoint)
-{
-    BsdfLayers layers;
-    return bsdf_prepare_layers(walk_params(vertex_params(l, collapse), walks), l.x.surface.normal, l.x.view, exterior, adjoint, layers);
 }
 
 // A path's wavelengths once it meets a dispersive layer; before that its colors are plain

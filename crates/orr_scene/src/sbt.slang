@@ -17,15 +17,10 @@ import orr_scene.runs;
 import orr_scene.tables;
 
 // The groups the handle table holds one of, in its order (orr_scene::HitGroups).
-[Host] public static const uint KIND_LAYERS = 0;
-[Host] public static const uint KIND_MEDIUM_SHADOW = 1;
-[Host] public static const uint KIND_MEDIUM_LAYERS = 2;
-[Host] public static const uint KIND_LIGHT_LAYERS = 3;
-[Host] public static const uint KIND_WALK_MEET = 4;
-[Host] public static const uint KIND_STACK_MEET = 5;
-[Host] public static const uint KIND_FRONT = 6;         // particles under path rays
-[Host] public static const uint KIND_LIGHT_FRONT = 7;   // light proxies under path rays
-[Host] public static const uint FIXED_KINDS = 8;
+[Host] public static const uint KIND_MEDIUM_SHADOW = 0;
+[Host] public static const uint KIND_FRONT = 1;         // particles under path rays
+[Host] public static const uint KIND_LIGHT_FRONT = 2;   // light proxies under path rays
+[Host] public static const uint FIXED_KINDS = 3;
 // The groups it holds `pins` of after those: one for any surface id, then, where surfaces link,
 // one per pin from id 0 on.
 [Host] public static const uint KIND_PATH = 0;          // a copy's clusters
@@ -90,7 +85,7 @@ uint material_pin(SceneRoot* s, uint material)
 }
 
 // Writes run `run`'s records: per ray type the handle of slot `slots[type]` and `data`.
-void write_run(uint run, uint3 slots, HitData data)
+void write_run(uint run, uint2 slots, HitData data)
 {
     for (uint type = 0; type < RAY_TYPES; type++)
     {
@@ -111,7 +106,7 @@ void write_records(SceneRoot* s, uint run)
 {
     RunGpu g = s.runs[run];
     uint kind = g.word & ROW_KIND_MASK;
-    uint3 none = uint3(SLOT_NONE);
+    uint2 none = uint2(SLOT_NONE);
     if (kind == ROW_NONE)
     {
         write_run(run, none, proxy_data(CLASS_OPAQUE));
@@ -120,11 +115,9 @@ void write_records(SceneRoot* s, uint run)
     if (kind == ROW_FIXED)
     {
         if (run == RUN_MEDIUM)
-            write_run(run, uint3(SLOT_NONE, KIND_MEDIUM_SHADOW, KIND_MEDIUM_LAYERS), proxy_data(CLASS_MEDIUM));
-        else if (run == RUN_LIGHT)
-            write_run(run, uint3(KIND_LIGHT_FRONT, SLOT_NONE, KIND_LIGHT_LAYERS), proxy_data(CLASS_LIGHT));
+            write_run(run, uint2(SLOT_NONE, KIND_MEDIUM_SHADOW), proxy_data(CLASS_MEDIUM));
         else
-            write_run(run, uint3(KIND_WALK_MEET, KIND_STACK_MEET, SLOT_NONE), proxy_data(CLASS_OPAQUE));
+            write_run(run, uint2(KIND_LIGHT_FRONT, SLOT_NONE), proxy_data(CLASS_LIGHT));
         return;
     }
     uint material;
@@ -161,7 +154,7 @@ void write_records(SceneRoot* s, uint run)
             path = producer ? KIND_PRODUCER_EMISSIVE_PATH : KIND_EMISSIVE_PATH;
     }
     // A particle is no path ray's hit: its record keeps it as what lies in front of one.
-    write_run(run, uint3(class_id == CLASS_PARTICLE ? KIND_FRONT : pinned(path, pin), pinned(KIND_SHADOW, pin), KIND_LAYERS), data);
+    write_run(run, uint2(class_id == CLASS_PARTICLE ? KIND_FRONT : pinned(path, pin), pinned(KIND_SHADOW, pin)), data);
 }
 
 // One workgroup per range of runs.

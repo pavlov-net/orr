@@ -1,4 +1,4 @@
-// What the staged loop (`path/stages.slang`) and the pipeline (`path/launch.slang`) share: the
+// What the staged loop (`path/stages.slang`) and the pipeline (`path/lean_paths.slang`) share: the
 // root's sources, features and predicates, a path's loop, record and context, its starts and a
 // view's outputs. The staged loop is the reference the pipeline is tested against; each keeps its
 // own shade bodies over these.
@@ -53,15 +53,6 @@ import orr_lighting.specialize;
 // interior, and may track a plane stack.
 [Host] public static const uint FEATURE_INTERIORS = 1 << 4;
 [Host] public static const uint FEATURE_STACK = 1 << 5;
-// The pipeline path tracer's segments outside interiors march a medium: the build links one, or
-// the view has froxels. Without either a segment changes nothing but its sampler dimension.
-[Host] public static const uint FEATURE_SEGMENTS = 1 << 6;
-// And, read by the pipeline path tracer alone, that its paths may meet dielectric or presence
-// layers: their slots hold a layer vertex's words and a shadow ray's crossings; and that their
-// next-event estimation may draw an emitter with a coat or fuzz, whose sample their slots keep
-// for the shadow ray's end.
-[Host] public static const uint FEATURE_LAYERS = 1 << 7;
-[Host] public static const uint FEATURE_COATED_EMITTERS = 1 << 8;
 
 // Whether paths of `r` track plane stacks: the light set holds a stack entry and a directional
 // light, the one light a stack bends. Without either no stack changes what a path gathers.
@@ -101,12 +92,6 @@ public bool from_view(PathRoot r) { return may(MAY_VIEW) && (sole_source(MAY_VIE
 public bool from_background(PathRoot r) { return may(MAY_BACKGROUND) && (sole_source(MAY_BACKGROUND) || r.source == PATH_SOURCE_BACKGROUND); }
 public bool from_update(PathRoot r) { return may(MAY_UPDATE) && (sole_source(MAY_UPDATE) || r.source == PATH_SOURCE_UPDATE); }
 public bool from_photon(PathRoot r) { return may(MAY_PHOTON) && (sole_source(MAY_PHOTON) || r.source == PATH_SOURCE_PHOTON); }
-
-// Whether a pipeline's paths may run next-event estimation: every source's but a photon's.
-public bool may_estimate()
-{
-    return may_any(MAY_VIEW | MAY_BACKGROUND | MAY_UPDATE);
-}
 
 // Counts a ray of the path, which only the debug view of rays per pixel reads.
 public void count_ray(inout PathLoop p)
@@ -190,10 +175,7 @@ public static const uint SHADOW_COUNTED = 1 << 4;
 public static const uint SHADOW_BEND = 1 << 5;     // a directional light's ray looks for plane stacks
 public static const uint SHADOW_INTO = 1 << 6;     // the ray leaves into the surface the vertex lies on
 public static const uint SHADOW_VIEW = 1 << 7;     // the light is an emitter whose coat and fuzz its light passes (`emitter_view`)
-// Read by the pipeline path tracer alone: the ray is a leg of a plane stack's walk, inside the
-// interiors the walk holds.
-public static const uint SHADOW_LEG = 1 << 8;
-[Host] public static const uint SHADOW_DEPTH_SHIFT = 9;
+[Host] public static const uint SHADOW_DEPTH_SHIFT = 8;
 
 // A record's words: a view's and a photon's, and an update path's, whose slices hold as many
 // fewer paths.
@@ -227,7 +209,6 @@ static const uint RAY_CHAIN = 1 << 1;
 static const uint RAY_SCATTER = 1 << 2;
 static const uint RAY_LOCAL = 1 << 3;
 static const uint RAY_LIT = 1 << 4;
-public static const uint RAY_FLAG_BITS = 5;
 
 // The pixel of the path of item `index` of the root's source: a photon's place in its rows, an
 // update block's pixel, or a view's pixel.
@@ -421,7 +402,7 @@ public StoredLoop pack_loop(PathLoop p)
     return v;
 }
 
-// `ray`'s flags as one word holds them: RAY_*, in the bits below RAY_FLAG_BITS.
+// `ray`'s flags as one word holds them: RAY_*.
 public uint ray_flags(LayerRay ray)
 {
     return (ray.diffuse ? RAY_DIFFUSE : 0) | (ray.chain ? RAY_CHAIN : 0) | (ray.scatter ? RAY_SCATTER : 0) | (ray.local ? RAY_LOCAL : 0) | (ray.lit ? RAY_LIT : 0);

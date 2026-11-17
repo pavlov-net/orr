@@ -60,7 +60,7 @@ public uint4* lean_cold(PathRoot r, uint slot)
 // The plane stack words of the slice's `slot`th path, where the pipeline may meet a stack.
 public uint4* lean_stack(PathRoot r, uint slot)
 {
-    return r.launch.scratch + slot * LEAN_STACK_WORDS;
+    return r.launch.stack + slot * LEAN_STACK_WORDS;
 }
 
 // The chain word of the slice's `slot`th path (`PathChain`), where its paths may gather caustic

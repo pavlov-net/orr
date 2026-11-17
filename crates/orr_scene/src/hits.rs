@@ -10,11 +10,10 @@ use orr_gpu::{
 
 use crate::memory::UploadWindow;
 use crate::shaders::consts::{
-    FIXED_KINDS, HIT_DATA_BYTES, KIND_EMISSIVE_PATH, KIND_FRONT, KIND_LAYER_PATH, KIND_LAYERS,
-    KIND_LIGHT_FRONT, KIND_LIGHT_LAYERS, KIND_MEDIUM_LAYERS, KIND_MEDIUM_SHADOW, KIND_PATH,
-    KIND_PRODUCER_EMISSIVE_PATH, KIND_PRODUCER_LAYER_PATH, KIND_PRODUCER_PATH,
-    KIND_PRODUCER_RICH_PATH, KIND_RICH_PATH, KIND_SHADOW, KIND_STACK_MEET, KIND_STRAND_PATH,
-    KIND_WALK_MEET, PINNED_KINDS, RAY_TYPES, RUNS_PER_GROUP,
+    FIXED_KINDS, HIT_DATA_BYTES, KIND_EMISSIVE_PATH, KIND_FRONT, KIND_LAYER_PATH, KIND_LIGHT_FRONT,
+    KIND_MEDIUM_SHADOW, KIND_PATH, KIND_PRODUCER_EMISSIVE_PATH, KIND_PRODUCER_LAYER_PATH,
+    KIND_PRODUCER_PATH, KIND_PRODUCER_RICH_PATH, KIND_RICH_PATH, KIND_SHADOW, KIND_STRAND_PATH,
+    PINNED_KINDS, RAY_TYPES, RUNS_PER_GROUP,
 };
 use crate::shaders::sbt::HitTableRoot;
 use crate::{Result, SceneRoot};
@@ -60,21 +59,8 @@ pub struct HitGroups {
     pub front: Option<u32>,
     /// Sphere and rect light proxies under path rays.
     pub light_front: Option<u32>,
-    /// Triangles under layer rays: an any-hit that keeps particles and ignores the rest, since a
-    /// record of zeros would commit them.
-    pub layers: Option<u32>,
     /// Medium proxies under shadow rays: a procedural group of `box_medium` and `proxy_shadow`.
     pub medium_shadow: Option<u32>,
-    /// Medium proxies under layer rays.
-    pub medium_layers: Option<u32>,
-    /// Sphere and rect light proxies under layer rays.
-    pub light_layers: Option<u32>,
-    /// The closest-hit a walk's step runs on a triangle it met, in place of the triangle's own,
-    /// to read its geometry.
-    pub walk_meet: Option<u32>,
-    /// The closest-hit a plane stack's trace runs on a dielectric triangle it met, in place of the
-    /// triangle's own, to read its cluster.
-    pub stack_meet: Option<u32>,
 }
 
 impl HitGroups {
@@ -93,12 +79,7 @@ impl HitGroups {
     fn slots(&self) -> Vec<Option<u32>> {
         let mut fixed = [None; FIXED_KINDS as usize];
         for (kind, group) in [
-            (KIND_LAYERS, self.layers),
             (KIND_MEDIUM_SHADOW, self.medium_shadow),
-            (KIND_MEDIUM_LAYERS, self.medium_layers),
-            (KIND_LIGHT_LAYERS, self.light_layers),
-            (KIND_WALK_MEET, self.walk_meet),
-            (KIND_STACK_MEET, self.stack_meet),
             (KIND_FRONT, self.front),
             (KIND_LIGHT_FRONT, self.light_front),
         ] {

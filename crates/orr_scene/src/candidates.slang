@@ -33,10 +33,9 @@ public static const uint PRESENCE_DRAWN = 2;     // where a hashed draw from `se
 [Host] public static const uint COVER_LAYERS = 1;       // presence layers by `presence`, the rest by the alpha test: `LayerAccept`
 [Host] public static const uint COVER_STACK = 2;        // present opaque triangles and cooked solid glass: `StackAccept`
 
-// A path ray's cover word counts in bits 14-16 the candidates in front of its hit that its any-hit
-// shaders met, up to COVER_FRONT_MASK: its trace starts at 0.
+// The bit of a path ray's cover word its any-hit shaders set where they met a candidate in front
+// of its hit: its trace starts with it clear.
 public static const uint COVER_FRONT_SHIFT = 14;
-public static const uint COVER_FRONT_MASK = 7;
 
 // What a path ray's any-hit reads of its trace, 16 bytes of payload (`path_payload`).
 public struct PathCover
@@ -243,13 +242,6 @@ public struct ShadowCover
     public bool has(uint flag)
     {
         return (word & flag) != 0;
-    }
-
-    // Whether the ray passed a medium proxy with a volume that a march takes, where it committed
-    // a hit where `hit`: light is left, and nothing ended it.
-    public bool marches(bool hit)
-    {
-        return has(SHADOW_VOLUME) && any(product > 0.0) && !hit;
     }
 
     // Multiplies a candidate's `transmittance` in, ending the search where the product is 0:

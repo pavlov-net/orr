@@ -18,8 +18,7 @@ import orr_scene.hit;
 // Ray types: a trace's hit record offset, with RAY_TYPES its stride.
 public static const uint RAY_TYPE_PATH = 0;
 public static const uint RAY_TYPE_SHADOW = 1;
-public static const uint RAY_TYPE_LAYERS = 2;
-[Host] public static const uint RAY_TYPES = 3;
+[Host] public static const uint RAY_TYPES = 2;
 
 // The contribution of an instance whose row starts at run `run`. Runs past what 24 bits of
 // contribution reach hold no records, since `Frame::hit_table` refuses such a layout; their
@@ -29,17 +28,14 @@ public uint contribution(uint run)
     return (RAY_TYPES * run) & 0xffffff;
 }
 
-// The runs every medium proxy and every light proxy shows, and the run no instance shows, whose
-// records a raygen sets on a traced hit to run a meet's closest-hit on it: the walk meet's at
-// RAY_TYPE_PATH, the stack meet's at RAY_TYPE_SHADOW. Every scene takes them first.
+// The runs every medium proxy and every light proxy shows. Every scene takes them first.
 public static const uint RUN_MEDIUM = 0;
 public static const uint RUN_LIGHT = 1;
-public static const uint RUN_WALK = 2;
-[Host] public static const uint FIXED_RUNS = 3;
+[Host] public static const uint FIXED_RUNS = 2;
 
 // What a run serves (`RunGpu.word` bits 0-3).
 [Host] public static const uint ROW_NONE = 0;     // nothing: a record of zeros, as free runs hold
-[Host] public static const uint ROW_FIXED = 1;    // RUN_MEDIUM, RUN_LIGHT or RUN_WALK, by its index
+[Host] public static const uint ROW_FIXED = 1;    // RUN_MEDIUM or RUN_LIGHT, by its index
 [Host] public static const uint ROW_MODEL = 2;    // a copy's section of `model_materials[source]`
 [Host] public static const uint ROW_SET = 3;      // a copy's section of `material_sets[source]`
 [Host] public static const uint ROW_PAGE = 4;     // a copy's section of `page_material_sets[source]`
