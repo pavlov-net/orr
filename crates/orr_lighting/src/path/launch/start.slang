@@ -210,8 +210,11 @@ public uint launch_start_photon<S : ISurfaces, M : IMedium>(PathRoot r, uint slo
     Sampler rng = path_sampler(r, pixel);
     PhotonStart p;
     PhotonRay light;
-    if (!photon_emit<S>(r, index, rng, p, light))
+    ResolvedLightSample c;
+    if (!photon_emit<S>(r, index, rng, p, light, c))
         return STEP_DONE;
+    if (c.view)
+        p.flux *= emitter_view_layer<S>(r.set, c, interior_ior(r.scene, p.interior.innermost()));
     LaunchRecord record = launch_record(r, slot);
     store_part<CausticPhoton, RECORD_WORDS>(record.words, CausticPhoton(p.entry));
     begin_launch(r, slot, pixel, photon_path_start(p), rng, 0, record);

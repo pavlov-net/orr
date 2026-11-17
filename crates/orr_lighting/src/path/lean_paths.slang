@@ -1,12 +1,13 @@
 // The lean path tracer's stages (`path.lean`): the raygens of a view's paths, of its background
-// layer's and of its update paths; the callables of a path's first vertex and of a debug view of it
-// alone, the ones that start a path in the interiors around the eye or at a thin lens's point, the
-// one that runs its vertex in an interior's medium, the one of a step of a directional job's walk
-// through a plane stack, the one that takes what a path's ray meets in front of its hit and the one
-// that marches the medium proxies with a volume a shadow ray passed; the hit shaders of a plain
-// opaque surface and of a strand, the any-hit shaders of a path's ray and of its shadow ray at a
-// candidate that is not opaque, a medium proxy's intersection and any-hit shaders under a shadow
-// ray, and the miss shaders of the two.
+// layer's, of its update paths and of the frame's caustic photons; the callables of a path's first
+// vertex and of a debug view of it alone, the ones that start a path in the interiors around the
+// eye or at a thin lens's point, the one that runs its vertex in an interior's medium, the one of a
+// step of a directional job's walk through a plane stack, the one that takes what a path's ray
+// meets in front of its hit, the one that marches the medium proxies with a volume a shadow ray
+// passed, and those of the caustic photons' gathers, a photon's start and its deposit; the hit
+// shaders of a plain opaque surface and of a strand, the any-hit shaders of a path's ray and of its
+// shadow ray at a candidate that is not opaque, a medium proxy's intersection and any-hit shaders
+// under a shadow ray, and the miss shaders of the two.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_shaders.trace;
@@ -68,6 +69,43 @@ void updates()
 {
     ORR_OMM(updates);
     lean_updates(root);
+}
+
+[shader("raygeneration")]
+void photons()
+{
+    ORR_OMM(photons);
+    lean_photons(root);
+}
+
+[shader("callable")]
+void caster_photon(inout Payload p)
+{
+    ORR_OMM(caster_photon);
+    float reach;
+    p.words.x = lean_photon_start<Medium>(root, DispatchRaysIndex().x, reach) ? 1 : 0;
+    p.words.y = asuint(reach);
+}
+
+[shader("callable")]
+void deposit(inout Payload p)
+{
+    ORR_OMM(deposit);
+    lean_deposit(root, DispatchRaysIndex().x);
+}
+
+[shader("callable")]
+void gather(inout GatherCall c)
+{
+    ORR_OMM(gather);
+    lean_gather(root, DispatchRaysIndex().x, c);
+}
+
+[shader("callable")]
+void map_gather(inout MapGatherCall c)
+{
+    ORR_OMM(map_gather);
+    lean_map_gather(root, DispatchRaysIndex().x, c);
 }
 
 [shader("callable")]

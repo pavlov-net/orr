@@ -31,6 +31,7 @@ import orr_lighting.interiors;
 import orr_lighting.subsurface;
 import orr_scene.material;
 import orr_lighting.path.launch.boundary;
+import orr_lighting.caustics;
 
 // The miss shaders: of a path's ray and of its shadow ray.
 public static const uint MISS_SCATTER = 0;
@@ -795,8 +796,9 @@ uint lean_front_mask(PathRoot r, uint slot, uint4 w0, bool view, bool chain)
 // transmittance alone and see no particles. Every ray of a view path inside one may scatter: in
 // real time the world cache's light for the medium ends the path there, which costs no more than
 // going on. What the ray meets in front of its hit or its scatter runs in a callable first
-// (`lean_front_mask`).
-uint trace_ray<let VIEW : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, inout PathTrail trail, out Traced h, out Payload p, out bool invokes)
+// (`lean_front_mask`). A `PHOTON`'s rays see particles as a view path's do, and report no texture
+// feedback.
+uint trace_ray<let VIEW : bool, let PHOTON : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, inout PathTrail trail, out Traced h, out Payload p, out bool invokes)
 {
     uint4 w1 = load_coherent(at + 1);
     uint4 w2 = load_coherent(at + 2);
@@ -819,7 +821,7 @@ uint trace_ray<let VIEW : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, inou
     // payload where it met one; the callable that takes them runs for those rays alone.
     uint front = 0;
     if (may_any(MAY_PARTICLES | MAY_LOCAL_LIGHTS))
-        front = lean_front_mask(r, slot, w0, VIEW, trail.chain);
+        front = lean_front_mask(r, slot, w0, VIEW || PHOTON, trail.chain);
     mask |= front;
     float t_max = camera && !traced_camera ? reach : positive_infinity();
     // What the camera sees of an alpha-tested triangle is its coverage itself; a scattered
@@ -830,7 +832,7 @@ uint trace_ray<let VIEW : bool>(PathRoot r, uint slot, uint4* at, uint4 w0, inou
     RayCone c = { cone.x, cone.y };
     uint seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x;
     PathCover cover = new_path_cover(mask, COVER_ALPHA, PRESENCE_NONE, pcg(seed ^ depth),
-        hit_context(primary ? HIT_PRIMARY : HIT_SECONDARY, depth, c, 0.0, float2(-1.0), texture_feedback_drawn(pixel, r.frame)));
+        hit_context(primary ? HIT_PRIMARY : HIT_SECONDARY, depth, c, 0.0, float2(-1.0), !PHOTON && texture_feedback_drawn(pixel, r.frame)));
     RayDesc ray = path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), t_max);
     // A model that mixes classes holds opaque geometry a layered tile's mask can't turn away: the
     // search goes on past it.
@@ -926,7 +928,7 @@ uint run_path(PathRoot r, uint slot, uint4* at, uint next)
         else if ((w0.w & HOT_RAY) == 0)
             break;
         else
-            next = trace_ray<true>(r, slot, at, w0, trail, h, p, invokes);
+            next = trace_ray<true, false>(r, slot, at, w0, trail, h, p, invokes);
         if (!invokes)
             continue;
         // A hit past a walk takes it as walked, but where a walk leaves.
@@ -1109,6 +1111,115 @@ public void lean_backgrounds<E : IEnvironment, M : IMedium>(PathRoot r)
     r.dof_background.get<RWTexture2D<float4>>()[pixel] = texel;
 }
 
+// Traces the ray of `slot`'s photon toward its light from its hot words `at`, where its start left
+// it in the shadow job's words: it ends at every surface it commits and at every dielectric
+// (SHADOW_PHOTON). What its candidates and the medium proxies with a volume it passed let through
+// becomes the photon's throughput, and the job's flags go. False where none reaches the light.
+bool photon_light_reaches(PathRoot r, uint4* at)
+{
+    uint4 w4 = load_coherent(at + 4);
+    uint4 w5 = load_coherent(at + 5);
+    RayDesc ray = path_ray(asfloat(w4.xyz), asfloat(w5.xyz), asfloat(w4.w));
+    ShadowCover cover = shadow_cover(SHADOW_PHOTON, SHADOW_MASK, 0, false);
+    cover.product = float3(1.0);
+    Payload p;
+    p.words = cover.words();
+    trace(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, ray, p);
+    if ((p.words.w & SHADOW_MISSED) == 0)
+        return false;
+    float3 passed = asfloat(p.words.xyz);
+    if (may(MAY_PROXIES) && ShadowCover.of_words(p.words).has(SHADOW_VOLUME) && any(passed > 0.0))
+        passed *= march_proxies(ray);
+    uint4 w0 = load_coherent(at);
+    uint4 w1 = load_coherent(at + 1);
+    store_coherent(at, uint4(w0.xyz, w0.w & ~(HOT_SHADOW | HOT_SHADOW_FAR)));
+    store_coherent(at + 1, uint4(w1.xy, as_halves(passed.xy), as_halves(float2(passed.z, 0.0))));
+    return carries(passed);
+}
+
+// Whether next-event estimation takes the light of `slot`'s photon in hot words `at` at the vertex
+// it deposits at, through the plane stack it crossed from its directional light (`stack_owns`): the
+// probe from the vertex toward the light, from where its stack words say, meets a face parallel to
+// the first the photon crossed.
+bool photon_stack_owned(PathRoot r, uint slot, uint4* at)
+{
+    uint4* track = lean_stack(r, slot) + STACK_TRACK_WORD;
+    uint4 k = load_coherent(track);
+    if (k.w == 0 || k.z == 0)
+        return false;
+    float t;
+    uint4 face = NO_STACK_FACE;
+    RayDesc probe = path_ray(asfloat(load_coherent(track + 1).xyz), -oct_decode_snorm16(k.x), positive_infinity());
+    if (stack_ray(r, probe, context_depth(r, slot, load_coherent(at).w) + 1, t, face) != MET_FACE)
+        return false;
+    return face.z != MATERIAL_NONE && abs(dot(oct_decode_snorm16(face.x), oct_decode_snorm16(k.y))) >= STACK_PARALLEL;
+}
+
+// The raygen of the frame's caustic photons: `slot`'s photon from its start (`lean_photon_start`),
+// its ray toward its light, then its first vertex, which its first ray reaches on the caster as the
+// light's own ray would, and each vertex past it, whose shader runs it adjoint. Where a vertex
+// leaves a deposit, the deposit's callable takes it, unless next-event estimation takes the
+// photon's light there through the plane stack it crossed. A photon that met nothing is gone. Its
+// caster entry counts the photons that deposited.
+public void lean_photons(PathRoot r)
+{
+    uint slot = DispatchRaysIndex().x;
+    if (slot >= r.slice_count)
+        return;
+    Payload start;
+    start.words = uint4(0);
+    call(CALL_PHOTON_START, start);
+    uint4* at = lean_hot(r, slot);
+    if (start.words.x == 0 || !photon_light_reaches(r, at))
+        return;
+    PathTrail trail = { false, false, 0, 0.0 };
+    Traced h;
+    {
+        uint4 w0 = load_coherent(at);
+        uint4 w1 = load_coherent(at + 1);
+        RayCone cone = { 0.0, 0.0 };
+        uint mask = MASK_OPAQUE | (may(MAY_LAYERS) ? MASK_DIELECTRIC : 0);
+        Payload p;
+        p.words = path_payload(new_path_cover(mask, COVER_ALPHA, PRESENCE_NONE, 0, hit_context(HIT_SECONDARY, 0, cone, 0.0)));
+        // What the light sees of an alpha-tested caster is its coverage itself.
+        h = trace_hit(r.scene.tlas, RAY_FLAG_NONE, mask, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), asfloat(start.words.y)), p);
+        if (!h.hit())
+            return;
+        reorder_invoke(h, p);
+        if (p.words.x != 0)
+            return;
+        trail.chain = may(MAY_LAYERS) && layer_record(h);
+    }
+    for (;;)
+    {
+        uint4 w0 = load_coherent(at);
+        if ((w0.w & HOT_ARRIVED) != 0)
+        {
+            store_coherent(at, uint4(w0.xyz, w0.w & ~HOT_ARRIVED));
+            if (!(may(MAY_STACK) && photon_stack_owned(r, slot, at)))
+            {
+                Payload d;
+                d.words = uint4(0);
+                call(CALL_DEPOSIT, d);
+            }
+        }
+        if ((w0.w & HOT_RAY) == 0)
+            break;
+        Payload p;
+        bool invokes;
+        trace_ray<false, true>(r, slot, at, w0, trail, h, p, invokes);
+        if (!invokes || !h.hit())
+            break;
+        reorder_invoke(h, p);
+        if (p.words.x != 0)
+            break;
+        trail.chain = may(MAY_LAYERS) && layer_record(h);
+    }
+    uint entry = load_coherent(lean_record(r, slot)).w;
+    if ((entry & PHOTON_DEPOSITED) != 0)
+        InterlockedAdd(r.caustics.source.deposited[entry & ~PHOTON_DEPOSITED], 1u);
+}
+
 // The raygen of a view's update paths: the path of a block's pixel, which adds to the world
 // cache's cell of each of its first opaque vertices the light that vertex scattered. On a tile the
 // layer guides traced it starts inside the interiors around its G-buffer surface.
@@ -1149,7 +1260,7 @@ public void lean_updates(PathRoot r)
             break;
         Payload p;
         bool invokes;
-        trace_ray<false>(r, slot, at, w0, trail, h, p, invokes);
+        trace_ray<false, false>(r, slot, at, w0, trail, h, p, invokes);
         if (may(MAY_STACK))
         {
             p.words.y = 0;

@@ -147,6 +147,24 @@ public static const uint PAYLOAD_BENT = 1;
 // The callable that weighs a coated emitter's light by what its coat and fuzz pass toward a
 // vertex.
 [Host] public static const uint EMITTER_VIEW_INSTRUCTIONS = 27200;
+// What a stage that runs a vertex holds more where the scene's paths may gather caustic photons
+// (`MAY_CAUSTICS`): whether its surface is a chain vertex (`surface_chains`, the most of it), the
+// share of the light its rays find past chain vertices that stays the path's, and the call of the
+// grid's gather. Where the pipeline runs photons (`MAY_PHOTON`), a hit holds a photon's vertex
+// beside: its throughput past a chain vertex and the deposit it leaves the raygen. Where it may be
+// the reference's (`MAY_REFERENCE`), the call of the map's gather, whose payload holds the
+// parameters of the vertex's BSDF.
+[Host] public static const uint CAUSTIC_HIT_INSTRUCTIONS = 2600;
+[Host] public static const uint PHOTON_HIT_INSTRUCTIONS = 1100;
+[Host] public static const uint MAP_GATHER_HIT_INSTRUCTIONS = 1600;
+// The callables of the grid's gather and the reference map's, which evaluates the vertex's BSDF per
+// photon; the photons' raygen, the callable that starts a photon from a caster and its light, and
+// the one of its deposit.
+[Host] public static const uint GATHER_INSTRUCTIONS = 2800;
+[Host] public static const uint MAP_GATHER_INSTRUCTIONS = 13500;
+[Host] public static const uint RAYGEN_PHOTON_INSTRUCTIONS = 2500;
+[Host] public static const uint PHOTON_START_INSTRUCTIONS = 14000;
+[Host] public static const uint DEPOSIT_INSTRUCTIONS = 2300;
 // What a hit holds more where the scene's emitters may have a coat or a fuzz: the call of that
 // callable, and the winner's place in its list and cluster through the light candidates' loop.
 [Host] public static const uint COATED_EMITTER_HIT_INSTRUCTIONS = 340;
@@ -155,6 +173,15 @@ public static const uint PAYLOAD_BENT = 1;
 // toward a vertex's shadow ray (`emitter_view_layer`), which a pipeline whose emitters may have
 // one holds. It evaluates the emitter's surface, which no hit stage holds a second copy of.
 public static const uint CALL_EMITTER_VIEW = 5;
+// The callables of the caustic photons: the grid's gather, which a stage that runs a vertex calls
+// where its paths may gather it, the photon's start, which the photons' raygen calls first, and
+// its deposit, which that raygen calls where a vertex leaves one.
+public static const uint CALL_GATHER = 10;
+public static const uint CALL_PHOTON_START = 11;
+public static const uint CALL_DEPOSIT = 12;
+// The callable of the gather of the reference's map of caustic photons, which evaluates the
+// vertex's BSDF per photon.
+public static const uint CALL_MAP_GATHER = 13;
 // What a hit made for surfaces that may walk holds more than one with the rich lobes alone: the
 // subsurface lobe, the start of its walk and what it leaves of the surface where a walk leaves.
 [Host] public static const uint WALK_HIT_INSTRUCTIONS = 5400;
@@ -367,6 +394,56 @@ public void store_shadow(uint4* at, PathHot p)
     store_coherent(at + 4, uint4(asuint(p.shadow_origin), asuint(p.shadow_light.x)));
     store_coherent(at + 5, uint4(asuint(p.shadow_target), asuint(p.shadow_light.y)));
 }
+
+// Where the scene's paths may gather caustic photons, the light the lights other than the
+// environment send through chain vertices (surfaces that chain, met by their lobes that are not
+// diffuse) to a vertex's diffuse lobes is the photons': a path's chain word (`PathChain`) says
+// what of the light its ray finds past such vertices stays its own. It holds the word as its last
+// vertex left it in its first two lanes, and as that vertex found it in the last two, which the
+// vertex's re-run for a bent job reads.
+public struct PathChain
+{
+    // The share of its value outside the diffuse lobes of the last vertex that was no chain
+    // vertex, or 0 past a chain vertex whose diffuse lobes the path went on by.
+    public float3 keep;
+    // The path's ray crossed a chain vertex since that vertex.
+    public bool through;
+
+    // What of an owned light the path's ray meets stays the path's.
+    public float3 owned()
+    {
+        return through ? keep : float3(1.0);
+    }
+}
+
+// The chain of a path whose first vertex is yet to come: every light it finds is its own.
+public PathChain new_chain()
+{
+    PathChain c = { float3(1.0), false };
+    return c;
+}
+
+// The chain word at `at` as its vertex left it, or `before` it.
+public PathChain load_chain(uint4* at, bool before)
+{
+    uint4 w = load_coherent(at);
+    uint2 h = before ? w.zw : w.xy;
+    float2 b = halves(h.y);
+    PathChain c = { float3(halves(h.x), b.x), b.y != 0.0 };
+    return c;
+}
+
+// Stores the chain word at `at` of a vertex that found `before` and leaves `after`.
+public void store_chain(uint4* at, PathChain after, PathChain before)
+{
+    store_coherent(at, uint4(as_halves(after.keep.xy), as_halves(float2(after.keep.z, after.through ? 1.0 : 0.0)),
+        as_halves(before.keep.xy), as_halves(float2(before.keep.z, before.through ? 1.0 : 0.0))));
+}
+
+// A caustic photon's record: its flux in the first three lanes, and its caster entry in the last,
+// with PHOTON_DEPOSITED once it deposited.
+[Host] public static const uint LEAN_PHOTON_RECORD_WORDS = 1;
+public static const uint PHOTON_DEPOSITED = 1u << 31;
 
 // A view path's record, a word in its slot of the launch's records: the light its feedback names,
 // one of those that lit it, kept in proportion to what each added (`view_light`).
