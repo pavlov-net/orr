@@ -25,6 +25,7 @@ orr_lighting = { path = "crates/orr_lighting" }
 orr_math = { path = "crates/orr_math", version = "0.0.1" }
 orr_output = { path = "crates/orr_output", default-features = false }
 orr_memory = { path = "crates/orr_memory", version = "0.0.1" }
+orr_metalfx = { path = "crates/orr_metalfx" }
 orr_pack = { path = "crates/orr_pack" }
 orr_scene = { path = "crates/orr_scene" }
 orr_shaders = { path = "crates/orr_shaders" }
@@ -71,6 +72,7 @@ vulkan-memory-allocator-sys = "0.2.0"
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-metal = "0.3.2"
+objc2-metal-fx = "0.3.2"
 objc2-app-kit = "0.3.2"
 objc2-quartz-core = "0.3.2"
 objc2-core-graphics = "0.3.2"

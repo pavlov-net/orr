@@ -43,12 +43,14 @@ pub use orr_lighting::{
     ReferenceSettings, SceneLightingSettings, ThinLens, ViewLighting, WorldCacheSettings,
 };
 pub use orr_output::DisplayWatch;
+#[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+pub use orr_output::MetalFx;
 pub use orr_output::{self, Error as OutputError};
 pub use orr_output::{
     AutoExposure, AutoWhiteBalance, CalibrationPattern, CompensationCurve, Display, DisplayFeed,
     DisplayHeadroom, DisplayInfo, DisplayRequest, Exposure, ExposureTelemetry,
     FrameGenerationBackend, FrameGenerationCamera, FrameGenerationFeature, FrameGenerationInputs,
-    FrameGenerationMode, GlareMethod, Grade, Gt7Params, HookPass, InterpolationCheck,
+    FrameGenerationMode, GlareMethod, Grade, Gt7Params, GuideReads, HookPass, InterpolationCheck,
     LocalExposure, MeterWeights, OutputDebug, Physiological, PostQuality, Presented, Primaries,
     Reconstruction, ReconstructionBackend, ReconstructionFeature, ReconstructionInputs,
     ReconstructionMode, ReconstructionSupport, ResolvedDisplay, Screenshot, ScreenshotRequest,
@@ -80,7 +82,8 @@ use orr_gpu::{
     StorageImageIndex, TextureDesc, TextureIndex, TextureUsage, TimelinePoint,
 };
 use orr_lighting::{
-    BsdfTables, LightingKernels, LightingView, PathNeeds, SceneLighting, ScenePass, ViewPass,
+    BsdfTables, ExtraGuides, LightingKernels, LightingView, PathNeeds, SceneLighting, ScenePass,
+    ViewPass,
 };
 use orr_math::{DVec3, Quat, UVec2, Vec2};
 use orr_output::{
@@ -589,14 +592,21 @@ const RECONSTRUCTED: &str = "reconstructed radiance";
 /// the display-linear image, from the scene-referred hook on the second image of the chain that
 /// hooks, motion blur and tonemap alternate over. The consumer may read either after the
 /// render.
-fn output_image_request(name: &'static str, extent: [u32; 2], first: ViewStep) -> ArenaRequest {
+/// An RGBA16F image of the view at `extent`, from `first` to the end of the frame, with
+/// sampled and storage usage and `usage` besides.
+fn output_image_request(
+    name: &'static str,
+    extent: [u32; 2],
+    first: ViewStep,
+    usage: TextureUsage,
+) -> ArenaRequest {
     ArenaRequest::texture(
         name,
         TextureDesc::d2(
             Format::Rgba16Float,
             extent[0],
             extent[1],
-            TextureUsage::SAMPLED | TextureUsage::STORAGE,
+            TextureUsage::SAMPLED | TextureUsage::STORAGE | usage,
         ),
         Span::new(first, ViewStep::After),
     )
@@ -1453,14 +1463,30 @@ impl<'a> Frame<'a> {
             scene_referred: hooks.scene_referred.is_some(),
             display_linear: tonemapped && hooks.display_linear.is_some(),
         };
-        let mut requests = LightingView::requests(render, reconstructed);
+        let reads = self
+            .output
+            .reconstruction
+            .as_ref()
+            .map_or_else(GuideReads::default, |(b, _)| b.reads());
+        let extra = ExtraGuides {
+            roughness: reads.roughness,
+            specular_hit_distance: reads.specular_hit_distance,
+        };
+        let mut requests = LightingView::requests(render, reconstructed, extra);
         if reconstructed {
-            requests.push(output_image_request(RECONSTRUCTED, extent, ViewStep::Rr));
+            // MetalFX writes its output as a render target.
+            requests.push(output_image_request(
+                RECONSTRUCTED,
+                extent,
+                ViewStep::Rr,
+                TextureUsage::COLOR,
+            ));
         }
         requests.push(output_image_request(
             VIEW_LINEAR,
             extent,
             ViewStep::SceneReferred,
+            TextureUsage::empty(),
         ));
         if set.any() {
             requests.extend(orr_output::hook_requests(extent));
@@ -1615,13 +1641,11 @@ impl<'a> Frame<'a> {
                         diffuse_albedo: paths.diffuse_albedo(),
                         specular_albedo: paths.specular_albedo(),
                         normal_roughness: paths.normal_roughness(),
+                        roughness: paths.roughness(),
                         specular_motion: paths.specular_motion(),
-                        specular_hit_distance: None,
+                        specular_hit_distance: paths.specular_hit_distance(),
                         transparency: overlay.as_ref().map(|(texture, _)| &**texture),
                         depth_of_field_guide: paths.depth_of_field_guide(),
-                        denoise_strength_mask: None,
-                        reactive_mask: None,
-                        exposure: None,
                         output: target.texture(),
                         reset: std::mem::take(&mut r.fresh) || paths.history_reset() || stepped,
                         view: &desc,
@@ -1851,8 +1875,13 @@ impl<'a> Frame<'a> {
             display_linear: tonemapped && hooks.display_linear.is_some(),
         };
         let mut requests = vec![
-            output_image_request(RECONSTRUCTED, extent, ViewStep::Rr),
-            output_image_request(VIEW_LINEAR, extent, ViewStep::SceneReferred),
+            output_image_request(RECONSTRUCTED, extent, ViewStep::Rr, TextureUsage::COLOR),
+            output_image_request(
+                VIEW_LINEAR,
+                extent,
+                ViewStep::SceneReferred,
+                TextureUsage::empty(),
+            ),
         ];
         if set.any() {
             requests.extend(orr_output::hook_requests(extent));

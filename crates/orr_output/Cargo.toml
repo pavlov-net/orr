@@ -9,10 +9,13 @@ repository.workspace = true
 links = "orr_output"
 
 [features]
-default = ["dlss"]
+default = ["dlss", "metalfx"]
 # Ray reconstruction and frame generation through NVIDIA NGX. On Apple targets, which have no
 # Vulkan, it does nothing.
 dlss = ["dep:orr_dlss"]
+# Ray reconstruction, upscaling and frame interpolation through MetalFX. Off Apple targets it
+# does nothing.
+metalfx = ["dep:orr_metalfx"]
 # Sends every Reflex marker as a PCL Stats event too and marks the PC latency ping that
 # `DisplayWatch` receives, for the NVIDIA overlay and FrameView. Windows only; builds
 # pclstats.h from the Reflex SDK at `REFLEX_SDK`.
@@ -38,6 +41,9 @@ orr_shaders = { workspace = true, features = ["build"] }
 
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
 orr_dlss = { workspace = true, optional = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+orr_metalfx = { workspace = true, optional = true }
 
 [lints]
 workspace = true

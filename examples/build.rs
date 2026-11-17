@@ -1,7 +1,8 @@
 //! Compiles the examples' kernels and the grass example's (`grass/`) against orr's shader roots, with orr's Slang structs mapped
 //! to the Rust types orr publishes, and orr's kernels twice: with the planet's sky and medium
 //! linked, and with the blade field's geometry and surface beside them.
-//! Sets `cfg(dlss)` when orr has DLSS.
+//! Sets `cfg(dlss)` when orr has DLSS, `cfg(metalfx)` when it has MetalFX, and
+//! `cfg(reconstruction)` with either.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -10,8 +11,20 @@ use orr_shaders::build::{Build, Error, LinkPoint, Output, module_file};
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(dlss)");
-    if env::var_os("DEP_ORR_DLSS").is_some() {
+    println!("cargo::rustc-check-cfg=cfg(metalfx)");
+    println!("cargo::rustc-check-cfg=cfg(reconstruction)");
+    let dlss = env::var_os("DEP_ORR_DLSS").is_some();
+    // MetalFX needs no SDK at build time: the feature on an Apple target is enough.
+    let metalfx = env::var_os("CARGO_FEATURE_METALFX").is_some()
+        && env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple");
+    if dlss {
         println!("cargo::rustc-cfg=dlss");
+    }
+    if metalfx {
+        println!("cargo::rustc-cfg=metalfx");
+    }
+    if dlss || metalfx {
+        println!("cargo::rustc-cfg=reconstruction");
     }
     let dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());

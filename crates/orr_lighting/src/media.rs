@@ -671,7 +671,10 @@ impl MediaKernels {
             around: light.map_or(GpuPtr::NULL, |l| l.around.gpu()),
             rays: light.map_or(GpuPtr::NULL, |l| l.rays.gpu()),
             trace,
+            froxels: media.list(offset_of!(FroxelQueue, froxels)),
             winners: media.list(offset_of!(FroxelQueue, winners)),
+            _pad0: 0,
+            _pad1: 0,
         }
     }
 

@@ -60,6 +60,13 @@ pub mod interop {
     };
 }
 
+/// Raw Metal objects, for SDKs that encode into orr's command buffers.
+#[cfg(target_vendor = "apple")]
+pub mod interop {
+    pub use crate::metal::{RawDevice, defer_after_submitted, raw_device, texture_handle};
+    pub use {objc2, objc2_metal};
+}
+
 /// Bytes between kernel roots placed side by side in one allocation. Roots are read as uniform
 /// buffers, whose address must be a multiple of `minUniformBufferOffsetAlignment`, and 256 is
 /// the largest value Vulkan allows; allocations start at a multiple of it.

@@ -221,6 +221,22 @@ impl<'q> CommandList<'q> {
         e
     }
 
+    /// A fresh compute encoder, with the pending barrier, that holds a 4-byte copy: Metal drops
+    /// an encoder without work, and the barriers and timestamps on it with it.
+    pub(super) fn carrier(&mut self) -> Retained<ComputeEncoder> {
+        self.end_encoder();
+        let at = self.inline_bytes(&[0; 8]);
+        // SAFETY: the two halves of inline memory this list keeps.
+        unsafe {
+            self.copy(
+                GpuPtr::from_address(crate::GpuAddress(at + 4)),
+                GpuPtr::from_address(crate::GpuAddress(at)),
+                4,
+            );
+        }
+        self.compute()
+    }
+
     /// The device address of a copy of `bytes`, for an inline root.
     pub(super) fn inline_bytes(&mut self, bytes: &[u8]) -> u64 {
         let len = (bytes.len() as u64).next_multiple_of(16);
@@ -495,17 +511,7 @@ impl<'q> CommandList<'q> {
     /// caller recorded for the next encoder stays pending for it.
     fn write_timestamp(&mut self, seq: u64) {
         let pending = self.pending.replace((MTLStages::All, MTLStages::All));
-        // Metal drops an encoder without work, its barrier and timestamp with it.
-        let at = self.inline_bytes(&[0; 8]);
-        // SAFETY: the two halves of inline memory this list keeps.
-        unsafe {
-            self.copy(
-                GpuPtr::from_address(crate::GpuAddress(at + 4)),
-                GpuPtr::from_address(crate::GpuAddress(at)),
-                4,
-            );
-        }
-        let e = self.compute();
+        let e = self.carrier();
         let ring = &self.queue.shared.timestamps;
         // SAFETY: ring indices are within the heap.
         unsafe {

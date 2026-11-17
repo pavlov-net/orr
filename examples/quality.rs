@@ -21,7 +21,8 @@ use orr_examples::linked::KERNELS;
 use orr_examples::quality::{Bias, Series, TILE, error_map, luminance, welch};
 use orr_examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
 use orr_examples::{
-    Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time, git_rev, report_dir,
+    Capture, Options, Workers, assert_clean, device, enable_reconstruction, fixed_time, git_rev,
+    report_dir,
 };
 use orr_math::camera::rh::view;
 use orr_math::{DVec3, Vec3};
@@ -401,7 +402,7 @@ fn main() {
     std::fs::create_dir_all(&images).expect("image directory");
 
     let mut bench = Bench::new(extent);
-    let dlss = enable_dlss(&mut bench.renderer);
+    let dlss = enable_reconstruction(&mut bench.renderer);
     let reference = bench.reference(reference_frames);
     tone_mapped(&reference.mean(), extent).save_png(&images.join("reference.png"));
 

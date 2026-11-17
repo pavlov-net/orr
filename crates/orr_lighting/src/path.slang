@@ -277,6 +277,8 @@ public struct LayerGuide
     // floats of the blur its lobes give the background, as a radius in pixels (low), and of
     // the transmission's `guide_luminance` (high); 0 elsewhere.
     public uint frost;
+    // m from the dominant layer to what its mirror reflection hits; infinite toward the sky.
+    public float specular_distance;
 }
 
 // A view's layer memory at G-buffer extent `extent`, from `LayerGuide*`: a guide per pixel in

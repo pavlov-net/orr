@@ -242,7 +242,7 @@ impl RayReconstruction {
             mode,
             render,
             output,
-            phases: crate::jitter::jitter_phases(render, output),
+            phases: orr_math::jitter::jitter_phases(render, output),
         })
     }
 
@@ -264,12 +264,12 @@ impl RayReconstruction {
     /// projection places each pixel's sample at the pixel center minus this value on both
     /// axes, with y pointing down.
     pub fn jitter(&self, frame: u64) -> [f32; 2] {
-        crate::jitter::jitter(frame, self.phases)
+        orr_math::jitter::jitter(frame, self.phases)
     }
 
     /// Texture LOD bias for the render resolution: `log2(render / output) - 1`.
     pub fn mip_bias(&self) -> f32 {
-        crate::jitter::mip_bias(self.render, self.output)
+        orr_math::jitter::mip_bias(self.render, self.output)
     }
 
     /// The preset NGX applied to this feature, read from `log`: [`Ngx::take_log`] from
@@ -350,6 +350,35 @@ impl SuperResolution {
         let mode = quality.resolve(output);
         let render = ngx.0.render_size(output, mode, Upscaler::Sr)?;
         // SAFETY: forwarded from the caller.
+        unsafe { Self::create(ngx, cmd, render, output, mode, preset) }
+    }
+
+    /// [`new`](Self::new) at render size `render`, in the mode nearest it.
+    ///
+    /// # Safety
+    ///
+    /// As [`RayReconstruction::new`].
+    pub(crate) unsafe fn with_render_size(
+        ngx: &Ngx,
+        cmd: vk::CommandBuffer,
+        render: [u32; 2],
+        output: [u32; 2],
+        preset: Option<u32>,
+    ) -> Result<Self, DlssError> {
+        let mode = Mode::for_render_size(render, output);
+        // SAFETY: forwarded from the caller.
+        unsafe { Self::create(ngx, cmd, render, output, mode, preset) }
+    }
+
+    unsafe fn create(
+        ngx: &Ngx,
+        cmd: vk::CommandBuffer,
+        render: [u32; 2],
+        output: [u32; 2],
+        mode: Mode,
+        preset: Option<u32>,
+    ) -> Result<Self, DlssError> {
+        // SAFETY: forwarded from the caller.
         let inner =
             unsafe { imp::Upscale::new(&ngx.0, cmd, Upscaler::Sr, render, output, mode, preset)? };
         Ok(Self {
@@ -357,8 +386,13 @@ impl SuperResolution {
             mode,
             render,
             output,
-            phases: crate::jitter::jitter_phases(render, output),
+            phases: orr_math::jitter::jitter_phases(render, output),
         })
+    }
+
+    /// The mode the feature was created with.
+    pub(crate) fn mode(&self) -> Mode {
+        self.mode
     }
 
     /// Render resolution, fixed for the feature's lifetime.
@@ -372,12 +406,12 @@ impl SuperResolution {
 
     /// NGX's jitter offset for `frame`.
     pub(crate) fn jitter(&self, frame: u64) -> [f32; 2] {
-        crate::jitter::jitter(frame, self.phases)
+        orr_math::jitter::jitter(frame, self.phases)
     }
 
     /// Texture LOD bias for the render resolution.
     pub(crate) fn mip_bias(&self) -> f32 {
-        crate::jitter::mip_bias(self.render, self.output)
+        orr_math::jitter::mip_bias(self.render, self.output)
     }
 
     /// The preset NGX applied to this feature, read from `log`: [`Ngx::take_log`] from

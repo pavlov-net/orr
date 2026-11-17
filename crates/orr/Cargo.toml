@@ -9,9 +9,11 @@ repository.workspace = true
 links = "orr"
 
 [features]
-default = ["dlss"]
+default = ["dlss", "metalfx"]
 # orr_output's `dlss`: DLSS ray reconstruction and frame generation where the target has Vulkan.
 dlss = ["orr_output/dlss"]
+# orr_output's `metalfx`: MetalFX ray reconstruction, upscaling and frame interpolation on Apple.
+metalfx = ["orr_output/metalfx"]
 # Recompiles kernels whose sources change and swaps their pipelines at step 1, for dev builds.
 hot-reload = ["orr_scene/hot-reload"]
 # PCL Stats for every display (orr_output's `pcl-stats`; needs the Reflex SDK at `REFLEX_SDK`).

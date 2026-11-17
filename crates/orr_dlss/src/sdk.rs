@@ -419,6 +419,34 @@ impl SuperResolution {
         quality: Quality,
         preset: Option<u32>,
     ) -> Result<Self, DlssError> {
+        Self::create(
+            sdk,
+            // SAFETY: as in `RayReconstruction::new`.
+            |ngx, cmd| unsafe { raw::SuperResolution::new(ngx, cmd, output, quality, preset) },
+        )
+    }
+
+    /// [`new`](Self::new) at render size `render`, in the mode nearest it. NGX may refuse
+    /// render sizes outside its modes' range.
+    pub fn with_render_size(
+        sdk: &DlssSdk,
+        render: [u32; 2],
+        output: [u32; 2],
+        preset: Option<u32>,
+    ) -> Result<Self, DlssError> {
+        Self::create(
+            sdk,
+            // SAFETY: as in `RayReconstruction::new`.
+            |ngx, cmd| unsafe {
+                raw::SuperResolution::with_render_size(ngx, cmd, render, output, preset)
+            },
+        )
+    }
+
+    fn create(
+        sdk: &DlssSdk,
+        make: impl FnOnce(&raw::Ngx, vk::CommandBuffer) -> Result<raw::SuperResolution, DlssError>,
+    ) -> Result<Self, DlssError> {
         let unit_exposure = sdk.gpu.create_texture(
             &TextureDesc::d2(Format::R32Float, 1, 1, TextureUsage::SAMPLED),
             TextureMemory::Dedicated,
@@ -437,16 +465,16 @@ impl SuperResolution {
             );
             list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
         };
-        let feature = Owned::create(
-            sdk,
-            fill,
-            // SAFETY: as in `RayReconstruction::new`.
-            |ngx, cmd| unsafe { raw::SuperResolution::new(ngx, cmd, output, quality, preset) },
-        )?;
+        let feature = Owned::create(sdk, fill, make)?;
         Ok(Self {
             feature,
             unit_exposure,
         })
+    }
+
+    /// The mode the feature was created with.
+    pub fn mode(&self) -> Mode {
+        self.feature.get().mode()
     }
 
     /// Render resolution, fixed for the feature's lifetime.

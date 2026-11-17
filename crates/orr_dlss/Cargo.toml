@@ -19,6 +19,7 @@ debug_overlay = []
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
 ash.workspace = true
 orr_gpu.workspace = true
+orr_math.workspace = true
 log.workspace = true
 thiserror.workspace = true
 uuid = { version = "1", default-features = false }

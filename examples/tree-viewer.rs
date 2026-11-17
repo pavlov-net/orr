@@ -54,8 +54,8 @@ use orr_examples::scene::{FOV_Y, sun};
 use orr_examples::shaders::tree_wind;
 use orr_examples::window::Window;
 use orr_examples::{
-    Capture, LensSwitches, Options, Workers, assert_clean, device, enable_dlss, entry_head,
-    fixed_time, mount_all_at,
+    Capture, LensSwitches, Options, Workers, assert_clean, device, enable_reconstruction,
+    entry_head, fixed_time, mount_all_at,
 };
 use orr_math::camera::rh::view;
 use orr_math::{Affine3, DVec3, Vec2, Vec3};
@@ -438,7 +438,7 @@ fn run(options: &Options) -> Option<Capture> {
         .expect("display")
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
-    enable_dlss(&mut renderer);
+    enable_reconstruction(&mut renderer);
     let _workers = Workers::machine(renderer.loading());
     let surroundings = cook_surroundings((radius * 8.0).max(40.0));
     let (mounts, mut frame) = mount_all_at(

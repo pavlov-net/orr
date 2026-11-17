@@ -160,16 +160,34 @@ fn diagnostics() -> Diagnostics<'static> {
     }
 }
 
-/// Gives `renderer` DLSS ray reconstruction where NGX offers it; returns whether it does.
-pub fn enable_dlss(renderer: &mut Renderer) -> bool {
+/// The platform's ray reconstruction, upscaling and frame generation: DLSS, or MetalFX on Apple.
+#[cfg(dlss)]
+pub type PlatformBackend = DlssSdk;
+/// The platform's ray reconstruction, upscaling and frame generation: DLSS, or MetalFX on Apple.
+#[cfg(metalfx)]
+pub type PlatformBackend = orr::MetalFx;
+
+/// The platform's backend on the examples' device, or `None` with a warning saying why not.
+#[cfg(reconstruction)]
+pub fn platform_backend() -> Option<PlatformBackend> {
     cfg_select! {
-        dlss => match DlssSdk::new(device(), PROJECT_ID) {
-            Ok(sdk) => renderer.set_reconstruction(sdk),
-            Err(e) => {
-                log::warn!("no DLSS: {e}");
-                false
+        dlss => DlssSdk::new(device(), PROJECT_ID)
+            .inspect_err(|e| log::warn!("no DLSS: {e}"))
+            .ok(),
+        _ => Some(orr::MetalFx::new(device())),
+    }
+}
+
+/// Gives `renderer` the platform's ray reconstruction; returns whether it does.
+pub fn enable_reconstruction(renderer: &mut Renderer) -> bool {
+    cfg_select! {
+        reconstruction => {
+            let on = platform_backend().is_some_and(|b| renderer.set_reconstruction(b));
+            if !on {
+                log::warn!("this device runs no ray reconstruction");
             }
-        },
+            on
+        }
         _ => {
             let _ = renderer;
             false

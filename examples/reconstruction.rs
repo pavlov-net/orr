@@ -1,44 +1,50 @@
-//! The showcase scene path traced in a window with DLSS frame generation: the camera orbits
-//! while the display presents generated images between rendered frames, with an egui
-//! overlay naming the mode, the images generated per frame and the encoding, and a dot
-//! crossing the bottom of the window at constant speed. The overlay is composed over every
-//! presented image, so it never moves with the interpolation; with `--ui-per-present` the UI
-//! is drawn once per presented image, so the dot advances on every presented image instead
-//! of every rendered frame.
+//! The showcase scene path traced in a window with the platform's frame generation, DLSS or
+//! MetalFX on Apple: the camera orbits while the display presents generated images between
+//! rendered frames, with an egui overlay naming the mode, the images generated per frame and the
+//! encoding, and a dot crossing the bottom of the window at constant speed. The overlay is
+//! composed over every presented image, so it never moves with the interpolation; with
+//! `--ui-per-present` the UI is drawn once per presented image, so the dot advances on every
+//! presented image instead of every rendered frame.
 //!
-//! `dlss [--frames N] [--off | --2x | --3x | --4x] [--cycle] [--sdr] [--no-glare]
-//! [--no-motion-blur] [--ui-per-present]`. The default is NGX's recommended mode (4x Dynamic on
-//! RTX 50). `--cycle` steps every few seconds through 2x, 4x, Dynamic and off, with SDR, PQ and
-//! scRGB requests, to show frame generation turning on and off at run time. `--sdr` presents SDR
-//! even with Windows HDR on, except under `--cycle`, whose steps name their encodings.
-//! Without frame generation the scene renders without it. DLSS ray reconstruction denoises the
-//! scene at the mode that suits the output size.
+//! `reconstruction [--frames N] [--off | --2x | --3x | --4x] [--cycle] [--sdr] [--no-glare]
+//! [--no-motion-blur] [--ui-per-present]`. The default is the backend's recommended mode (4x
+//! Dynamic with DLSS on RTX 50, 2x Dynamic with MetalFX). `--cycle` steps every few seconds
+//! through 2x, 4x, Dynamic and off, with SDR, PQ and scRGB requests, to show frame generation
+//! turning on and off at run time. `--sdr` presents SDR even with the OS's HDR on, except under
+//! `--cycle`, whose steps name their encodings. Without frame generation the scene renders without
+//! it. The backend's ray reconstruction denoises the scene at the mode that suits the output size.
 //!
-//! With the window focused, for comparing live: `F` steps frame generation through off, 2x, 3x,
-//! 4x and the recommended mode, `R` steps ray reconstruction through off, DLAA and each quality,
-//! `H` switches between SDR and HDR, `G` switches glare and `B` switches motion blur. `F` and `H`
-//! end `--cycle`.
+//! With the window focused, for comparing live: `F` steps frame generation through off, each
+//! multiple the backend runs and the recommended mode, `R` steps ray reconstruction through off,
+//! DLAA and each quality, `H` switches between SDR and HDR, `G` switches glare and `B` switches
+//! motion blur. `F` and `H` end `--cycle`.
 //!
-//! `dlss --sr [--auto | --dlaa | --quality | --balanced | --performance | --ultra-performance]
-//! [--native] [--clusters] [--headless] [--frames N] [--out file.png]` shows DLSS super
-//! resolution instead: the same scene as a raster debug view, its G-buffer shaded by the
-//! sun and sky alone (or colored by cluster with `--clusters`), rendered at the mode's
-//! render size and upscaled to the window; by default the mode suits the window's size.
-//! `--native` renders it at the output size without SR. Headless runs output 960 x 540 for 64
-//! frames unless told otherwise and write the last frame as a PNG.
+//! `reconstruction --sr [--auto | --dlaa | --quality | --balanced | --performance |
+//! --ultra-performance] [--native] [--clusters] [--headless] [--frames N] [--out file.png]` shows
+//! temporal upscaling instead (DLSS super resolution, or MetalFX's temporal scaler): the same scene
+//! as a raster debug view, its G-buffer shaded by the sun and sky alone (or colored by cluster with
+//! `--clusters`), rendered at the mode's render size and upscaled to the window; by default the
+//! mode suits the window's size. `--native` renders it at the output size without upscaling.
+//! Headless runs output 960 x 540 for 64 frames unless told otherwise and write the last frame as a
+//! PNG.
 
 use std::time::{Duration, Instant};
 
 use orr::orr_gpu::{
-    Format, Hazards, MemoryKind, OutputFormat, QueueKind, SpecData, Stages, TimelinePoint,
+    Format, Hazards, MemoryKind, OutputFormat, QueueKind, SpecData, Stages, TextureDesc,
+    TextureUsage, TimelinePoint,
 };
-use orr::orr_output::Image;
+#[cfg(dlss)]
 use orr::orr_output::orr_dlss::raw::Ngx;
-use orr::orr_output::orr_dlss::{Mode, Quality, SrInputs, SuperResolution};
+#[cfg(dlss)]
+use orr::orr_output::orr_dlss::{Mode, Quality, SuperResolution};
+use orr::orr_output::{
+    FrameGenerationBackend, Image, UpscaleBackend, UpscaleFeature, UpscaleInputs,
+};
 use orr::{
-    Display, DisplayRequest, DlssSdk, FrameDesc, FrameGenerationMode, FrameTime, Lens, LitView,
-    Projection, Reconstruction, Renderer, RendererDesc, TextureFilter, UpscaleMode, UpscaleQuality,
-    ViewDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Display, DisplayRequest, FrameDesc, FrameGenerationMode, FrameTime, Lens, LitView, Projection,
+    Reconstruction, Renderer, RendererDesc, TextureFilter, UpscaleMode, UpscaleQuality, ViewDesc,
+    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_examples::linked::KERNELS;
 use orr_examples::overlay::Overlay;
@@ -46,7 +52,8 @@ use orr_examples::scene::{FOV_Y, SUN, Showcase, TARGET, orbit_eye};
 use orr_examples::shaders::{capture, sun_shadow};
 use orr_examples::window::{KeyCode, Window};
 use orr_examples::{
-    Capture, LensSwitches, Options, PROJECT_ID, Workers, assert_clean, device, fixed_time,
+    Capture, LensSwitches, Options, PlatformBackend, Workers, assert_clean, device, fixed_time,
+    platform_backend,
 };
 use orr_math::camera::rh::view;
 use orr_math::{UVec2, Vec2, Vec3};
@@ -66,7 +73,7 @@ pub(crate) fn main() {
             log::info!("SR preset {p}");
         }
         if let Some(c) = run.and_then(|run| run.capture) {
-            let path = options.out_path("dlss-sr");
+            let path = options.out_path("reconstruction-sr");
             c.save_png(&path);
             log::info!("wrote {}", path.display());
         }
@@ -114,7 +121,7 @@ fn cycle(
 
 fn run(options: &Options) {
     let gpu = device();
-    let mut window = Window::new("orr dlss", 1920, 1080);
+    let mut window = Window::new("orr reconstruction", 1920, 1080);
     let desc = RendererDesc {
         kernels: &KERNELS,
         ..RendererDesc::default()
@@ -134,12 +141,14 @@ fn run(options: &Options) {
         desc.frames_in_flight,
     )
     .expect("display");
-    let sdk = DlssSdk::new(gpu, PROJECT_ID)
-        .inspect_err(|e| log::warn!("no DLSS: {e}"))
-        .ok();
-    let support = sdk.as_ref().map_or_default(DlssSdk::support);
-    let recommended = FrameGenerationMode::recommended(support.max_generated);
-    let most = support.max_generated.clamp(1, 3);
+    let sdk = platform_backend();
+    let max_generated = sdk.as_ref().map_or(0, |b| {
+        b.max_generated(gpu, display.latency().is_some())
+            .inspect_err(|e| log::warn!("no frame generation: {e}"))
+            .unwrap_or(0)
+    });
+    let recommended = FrameGenerationMode::recommended(max_generated);
+    let most = max_generated.clamp(1, 3);
     let chosen = if options.has("--off") {
         FrameGenerationMode::Off
     } else if let Some(n) = [("--2x", 1), ("--3x", 2), ("--4x", 3)]
@@ -337,37 +346,76 @@ const SR_SKY: [f32; 3] = [0.18, 0.24, 0.34];
 pub(crate) struct SrRun {
     /// The last frame of a headless run.
     pub capture: Option<Capture>,
-    /// The SR preset NGX applied, from its log; `None` with `--native`.
+    /// The SR preset NGX applied, from its log; `None` with `--native` or off DLSS.
     pub preset: Option<char>,
 }
 
-/// The SR quality the flags name; the default without one.
-fn sr_quality(options: &Options) -> Quality {
-    [
-        ("--dlaa", Mode::Dlaa),
-        ("--quality", Mode::Quality),
-        ("--balanced", Mode::Balanced),
-        ("--performance", Mode::Performance),
-        ("--ultra-performance", Mode::UltraPerformance),
+/// The upscale the flags name: `None` for `--dlaa`, the antialiasing mode; Auto without a flag.
+fn sr_quality(options: &Options) -> Option<UpscaleQuality> {
+    if options.has("--dlaa") {
+        return None;
+    }
+    let fixed = [
+        ("--quality", UpscaleMode::Quality),
+        ("--balanced", UpscaleMode::Balanced),
+        ("--performance", UpscaleMode::Performance),
+        ("--ultra-performance", UpscaleMode::UltraPerformance),
     ]
     .into_iter()
-    .find(|(flag, _)| options.has(flag))
-    .map_or_else(Quality::default, |(_, m)| Quality::Fixed(m))
+    .find(|(flag, _)| options.has(flag));
+    Some(fixed.map_or(UpscaleQuality::Auto, |(_, m)| UpscaleQuality::Fixed(m)))
 }
 
-/// `image`, remade at `extent` when it holds none or one of another size; true when made.
-fn sized(image: &mut Option<Image>, extent: [u32; 2], name: &str) -> bool {
+/// An upscaler for `output` at `quality` (`None`: antialiasing), and the DLSS preset NGX applied
+/// to it.
+fn make_upscaler(
+    backend: &PlatformBackend,
+    output: [u32; 2],
+    quality: Option<UpscaleQuality>,
+) -> (Box<dyn UpscaleFeature>, Option<char>) {
+    cfg_select! {
+        dlss => {
+            let quality = match quality {
+                None => Quality::Fixed(Mode::Dlaa),
+                Some(UpscaleQuality::Auto) => Quality::Auto,
+                Some(UpscaleQuality::Fixed(m)) => Quality::Fixed(match m {
+                    UpscaleMode::Quality => Mode::Quality,
+                    UpscaleMode::Balanced => Mode::Balanced,
+                    UpscaleMode::Performance => Mode::Performance,
+                    UpscaleMode::UltraPerformance => Mode::UltraPerformance,
+                }),
+            };
+            Ngx::take_log();
+            let made = SuperResolution::new(backend, output, quality, None).expect("SR feature");
+            let preset = made.applied_preset(&Ngx::take_log());
+            (Box::new(made), preset)
+        }
+        _ => {
+            let made = match quality {
+                None => backend.antialiaser(output),
+                Some(q) => backend.upscaler(output, q),
+            };
+            (made.expect("upscaler"), None)
+        }
+    }
+}
+
+/// `image`, remade at `extent` when it holds none or one of another size, with sampled, storage
+/// and `usage`; true when made.
+fn sized(image: &mut Option<Image>, extent: [u32; 2], usage: TextureUsage, name: &str) -> bool {
     if image
         .as_ref()
         .is_some_and(|im| im.texture().desc().extent[..2] == extent)
     {
         return false;
     }
-    *image = Some(Image::new(device(), Format::Rgba16Float, extent, name).expect("image"));
+    let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE | usage;
+    let desc = TextureDesc::d2(Format::Rgba16Float, extent[0], extent[1], usage);
+    *image = Some(Image::with_desc(device(), &desc, name).expect("image"));
     true
 }
 
-/// Runs `--sr`. Returns `None` when SR is wanted and NGX does not offer it.
+/// Runs `--sr`. Returns `None` when upscaling is wanted and the platform does not offer it.
 pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
     let gpu = device();
     let native = options.has("--native");
@@ -376,19 +424,16 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
     let sdk = if native {
         None
     } else {
-        match DlssSdk::new(gpu, PROJECT_ID) {
-            Ok(sdk) if sdk.support().sr => Some(sdk),
-            Ok(_) => {
-                log::warn!("NGX offers no super resolution on this device");
+        match platform_backend() {
+            Some(b) if b.upscale_support().available => Some(b),
+            Some(_) => {
+                log::warn!("this device runs no temporal upscaling");
                 return None;
             }
-            Err(e) => {
-                log::warn!("no DLSS: {e}");
-                return None;
-            }
+            None => return None,
         }
     };
-    let mut window = (!options.headless).then(|| Window::new("orr dlss sr", 1920, 1080));
+    let mut window = (!options.headless).then(|| Window::new("orr reconstruction sr", 1920, 1080));
     let desc = RendererDesc {
         kernels: &KERNELS,
         ..RendererDesc::default()
@@ -418,21 +463,21 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
         .expect("capture pipeline");
     let slots = u64::from(desc.frames_in_flight);
     let mut roots = gpu
-        .gpu_malloc::<sun_shadow::Root>(MemoryKind::Upload, slots, "dlss sr roots")
+        .gpu_malloc::<sun_shadow::Root>(MemoryKind::Upload, slots, "reconstruction sr roots")
         .expect("roots");
     let mut capture_root = gpu
-        .gpu_malloc::<capture::Root>(MemoryKind::Upload, 1, "dlss sr capture root")
+        .gpu_malloc::<capture::Root>(MemoryKind::Upload, 1, "reconstruction sr capture root")
         .expect("capture root");
     let pixels = u64::from(SR_HEADLESS_EXTENT[0] * SR_HEADLESS_EXTENT[1]);
     let readback = options.headless.then(|| {
-        gpu.gpu_malloc::<u32>(MemoryKind::Readback, pixels, "dlss sr capture")
+        gpu.gpu_malloc::<u32>(MemoryKind::Readback, pixels, "reconstruction sr capture")
             .expect("readback")
     });
 
     let frames = options
         .frames
         .or_else(|| options.headless.then_some(SR_HEADLESS_FRAMES));
-    let mut sr: Option<SuperResolution> = None;
+    let mut sr: Option<Box<dyn UpscaleFeature>> = None;
     let mut preset = None;
     let mut shaded: Option<Image> = None;
     let mut upscaled: Option<Image> = None;
@@ -484,9 +529,8 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
         if let Some(sdk) = &sdk
             && sr.as_ref().is_none_or(|s| s.output_size() != extent)
         {
-            Ngx::take_log();
-            let made = SuperResolution::new(sdk, extent, quality, None).expect("SR feature");
-            preset = made.applied_preset(&Ngx::take_log());
+            let (made, applied) = make_upscaler(sdk, extent, quality);
+            preset = applied;
             log::info!("SR {quality:?}: {:?} -> {extent:?}", made.render_size());
             sr = Some(made);
             reset = true;
@@ -518,7 +562,12 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
             })
             .expect("raster view");
 
-        let fresh = sized(&mut shaded, render, "dlss sr shaded");
+        let fresh = sized(
+            &mut shaded,
+            render,
+            TextureUsage::empty(),
+            "reconstruction sr shaded",
+        );
         let target = shaded.as_ref().expect("shaded image");
         let slot = f.id() % slots;
         roots.as_mut_slice().expect("roots")[slot as usize] = sun_shadow::Root {
@@ -548,14 +597,19 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         let shown = match sr.as_mut() {
             Some(s) => {
-                let fresh = sized(&mut upscaled, extent, "dlss sr output");
+                let fresh = sized(
+                    &mut upscaled,
+                    extent,
+                    TextureUsage::COLOR,
+                    "reconstruction sr output",
+                );
                 let out = upscaled.as_ref().expect("SR output");
                 if fresh {
                     list.discard(out.texture());
                 }
                 s.record(
                     list,
-                    &SrInputs {
+                    &UpscaleInputs {
                         color: target.texture(),
                         depth: &view.depth,
                         motion: &view.motion,

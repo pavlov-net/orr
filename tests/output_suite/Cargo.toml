@@ -8,9 +8,10 @@ license.workspace = true
 publish = false
 
 [features]
-default = ["dlss"]
+default = ["dlss", "metalfx"]
 # Frame generation's tests.
 dlss = ["orr_output/dlss", "orr/dlss"]
+metalfx = ["orr_output/metalfx", "orr/metalfx"]
 
 [dependencies]
 log.workspace = true

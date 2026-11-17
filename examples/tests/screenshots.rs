@@ -13,15 +13,15 @@ mod dense_vegetation;
 #[path = "../dielectrics.rs"]
 mod dielectrics;
 #[allow(dead_code)]
-#[cfg(dlss)]
-#[path = "../dlss.rs"]
-mod dlss;
-#[allow(dead_code)]
 #[path = "../gpu-basics.rs"]
 mod gpu_basics;
 #[allow(dead_code)]
 #[path = "../producer-field.rs"]
 mod producer_field;
+#[allow(dead_code)]
+#[cfg(reconstruction)]
+#[path = "../reconstruction.rs"]
+mod reconstruction;
 #[allow(dead_code)]
 #[path = "../rigid-parts.rs"]
 mod rigid_parts;
@@ -57,7 +57,7 @@ use orr_examples::linked::KERNELS;
 use orr_examples::mesh::MeshBuilder;
 use orr_examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
 use orr_examples::{
-    Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time, mount_at,
+    Capture, Options, Workers, assert_clean, device, enable_reconstruction, fixed_time, mount_at,
 };
 use orr_math::camera::rh::view;
 use orr_math::{Affine3, DVec3, Quat, Vec3};
@@ -179,27 +179,32 @@ fn dense_vegetation_matches_its_reference() {
     assert_clean();
 }
 
-/// The dlss example's raster debug view upscaled by super resolution at Quality, on an
-/// orbiting camera, matches the view rendered at the output size, and NGX's log names the
-/// preset it applied.
-#[cfg(dlss)]
+/// The reconstruction example's raster debug view upscaled by the platform's temporal upscaling
+/// at Quality, on an orbiting camera, matches the view rendered at the output size, and with
+/// DLSS NGX's log names the preset it applied.
+#[cfg(reconstruction)]
 #[test]
 fn super_resolution_matches_the_native_render() {
     let _serial = serial();
     let frames = 64;
-    let Some(sr) = dlss::run_sr(&Options::headless(frames, &["--sr", "--quality"])) else {
-        log::warn!("skipped: NGX offers no super resolution here");
+    let Some(sr) = reconstruction::run_sr(&Options::headless(frames, &["--sr", "--quality"]))
+    else {
+        log::warn!("skipped: the platform offers no temporal upscaling here");
         return;
     };
-    let native = dlss::run_sr(&Options::headless(frames, &["--sr", "--native"])).expect("native");
-    let preset = sr.preset.expect("NGX's log names the applied SR preset");
+    let native =
+        reconstruction::run_sr(&Options::headless(frames, &["--sr", "--native"])).expect("native");
+    if cfg!(dlss) {
+        let preset = sr.preset.expect("NGX's log names the applied SR preset");
+        log::info!("SR preset {preset}");
+    }
     let error = flip(
         &image(native.capture.expect("native capture")),
         &image(sr.capture.expect("SR capture")),
     );
-    log::info!("SR Quality, preset {preset}: FLIP {error:?} against the native render");
-    // Measured mean 0.0086 and p99 0.141 (preset K); the jitter sign flipped gives 0.0118
-    // and 0.189.
+    log::info!("upscaled at Quality: FLIP {error:?} against the native render");
+    // DLSS: measured mean 0.0086 and p99 0.141 (preset K); the jitter sign flipped gives
+    // 0.0118 and 0.189. MetalFX (Apple M5): 0.0090 and 0.149.
     assert!(
         error.mean <= 0.010 && error.p99 <= 0.16,
         "SR against native: {error:?}"
@@ -584,7 +589,7 @@ fn scene_detail_follows_the_render_size_of_its_sharpest_view() {
     let both = [(small, off), (large, off)];
     assert_eq!(still.detail(&both, true), native);
     assert_eq!(still.detail(&both, false), native);
-    if enable_dlss(&mut still.renderer) {
+    if enable_reconstruction(&mut still.renderer) {
         let upscaled = [(
             [960, 540],
             Reconstruction::Upscale(UpscaleQuality::Fixed(UpscaleMode::Quality)),
@@ -597,10 +602,11 @@ fn scene_detail_follows_the_render_size_of_its_sharpest_view() {
     assert_clean();
 }
 
-/// `render_view` through DLSS ray reconstruction on one renderer: each request renders at the
+/// `render_view` through the platform's ray reconstruction (DLSS, or MetalFX on Apple) on one
+/// renderer: each request renders at the
 /// size it resolves to, ray reconstruction at half the output size lands close to the converged
 /// image on a still and on a moving camera, the scene-referred hook takes its output, and the
-/// transparency overlay reaches the image through NGX's composite.
+/// transparency overlay reaches the image through the backend's composite.
 #[test]
 fn render_view_runs_ray_reconstruction() {
     let _serial = serial();
@@ -615,7 +621,7 @@ fn render_view_runs_ray_reconstruction() {
     let without = still.run(hd, 2, plain);
     assert_eq!((without.render_extent, without.mode), (hd, None));
 
-    if !enable_dlss(&mut still.renderer) {
+    if !enable_reconstruction(&mut still.renderer) {
         log::warn!("skipped: NGX offers no ray reconstruction here");
         return;
     }
@@ -705,14 +711,23 @@ fn render_view_runs_ray_reconstruction() {
         "against the converged image: noisy {noisy:?}, still {denoised_error:?}, \
          moving {moving:?}, averaged in the hook {summed:?}"
     );
-    // Measured mean 0.050 still and 0.053 moving; the jitter sign flipped gives 0.054 and 0.056,
-    // and one path per pixel without ray reconstruction 0.096. The rest of the error is the
-    // fireflies in the converged image.
+    // DLSS: measured mean 0.050 still and 0.053 moving; the jitter sign flipped gives 0.054 and
+    // 0.056, and one path per pixel without ray reconstruction 0.096. MetalFX (Apple M5):
+    // 0.0683 still and 0.0685 moving, against 0.138 for one path per pixel. The rest of the
+    // error is the fireflies in the converged image.
+    let (still_bound, moving_bound) = if cfg!(metalfx) {
+        (0.071, 0.071)
+    } else {
+        (0.052, 0.055)
+    };
     assert!(
-        denoised_error.mean < 0.052,
+        denoised_error.mean < still_bound,
         "noisy {noisy:?}, still {denoised_error:?}"
     );
-    assert!(moving.mean < 0.055, "noisy {noisy:?}, moving {moving:?}");
+    assert!(
+        moving.mean < moving_bound,
+        "noisy {noisy:?}, moving {moving:?}"
+    );
     assert!(
         summed.mean < noisy.mean * 0.75,
         "noisy {noisy:?}, averaged {summed:?}"
@@ -1058,8 +1073,15 @@ impl Lamp {
             (got.variance[1] / sharp.variance[1] - 1.0).abs() < tolerance,
             "{name}: blur across the motion: {got:?}, sharp {sharp:?}"
         );
+        // MetalFX's reconstruction of the moving lamp measured 0.29 px from its streak (Apple
+        // M5), where DLSS and the plain paths stay within 0.1.
+        let off_center = if cfg!(metalfx) && name == "ray reconstruction" {
+            0.35
+        } else {
+            0.1
+        };
         assert!(
-            (got.center[0] - sharp.center[0]).abs() < 0.1,
+            (got.center[0] - sharp.center[0]).abs() < off_center,
             "{name}: the streak is not centered on the frame: {got:?}, sharp {sharp:?}"
         );
         assert!(
@@ -1070,11 +1092,11 @@ impl Lamp {
     }
 }
 
-/// The streak at half the output size under ray reconstruction, where NGX offers it, measured
-/// in output pixels.
+/// The streak at half the output size under ray reconstruction, where the platform offers it,
+/// measured in output pixels.
 fn check_blur_under_ray_reconstruction(lamp: &mut Lamp, moving: LampSettings) {
-    if !enable_dlss(&mut lamp.renderer) {
-        log::warn!("skipped ray reconstruction: NGX offers none here");
+    if !enable_reconstruction(&mut lamp.renderer) {
+        log::warn!("skipped ray reconstruction: the platform offers none here");
         return;
     }
     let extent = [640, 360];

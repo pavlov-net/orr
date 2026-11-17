@@ -2170,6 +2170,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-metal-fx"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2db6f3a9d3b07481d9e5884f592aff6fd3f99e155423d1d1af3977e77a90ea0e"
+dependencies = [
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
+ "objc2-metal 0.3.2",
+]
+
+[[package]]
 name = "objc2-quartz-core"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2388,6 +2399,7 @@ dependencies = [
  "half",
  "log",
  "orr_gpu",
+ "orr_math",
  "thiserror 2.0.21",
  "uuid",
 ]
@@ -2498,6 +2510,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "orr_metalfx"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "half",
+ "objc2 0.6.5",
+ "objc2-metal 0.3.2",
+ "objc2-metal-fx",
+ "orr_gpu",
+ "orr_math",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "orr_output"
 version = "0.0.1"
 dependencies = [
@@ -2509,6 +2535,7 @@ dependencies = [
  "orr_color",
  "orr_dlss",
  "orr_math",
+ "orr_metalfx",
  "orr_scene",
  "orr_shaders",
  "orr_window",

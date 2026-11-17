@@ -19,9 +19,9 @@ use orr_gpu::{
     TextureUsage,
 };
 use orr_lighting::{
-    BsdfTables, DirectionalLight, DiscProfile, DofBackgroundPass, EnvironmentMapGpu, Light,
-    LightId, LightingKernels, LightingView, ParticleDraw, PathEntry, PathNeeds, ReferenceSettings,
-    SceneLighting, SceneLightingSettings, ScenePass, ViewLighting, ViewPass,
+    BsdfTables, DirectionalLight, DiscProfile, DofBackgroundPass, EnvironmentMapGpu, ExtraGuides,
+    Light, LightId, LightingKernels, LightingView, ParticleDraw, PathEntry, PathNeeds,
+    ReferenceSettings, SceneLighting, SceneLightingSettings, ScenePass, ViewLighting, ViewPass,
 };
 use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
@@ -2121,7 +2121,10 @@ impl Bed {
         let mut arena = ViewArena::new(d, false);
         let mut list = render().command_list().unwrap();
         arena
-            .layout(&LightingView::requests(EXTENT, false), &mut list)
+            .layout(
+                &LightingView::requests(EXTENT, false, ExtraGuides::default()),
+                &mut list,
+            )
             .unwrap();
         let point = render().submit(vec![list], &[]).unwrap();
         render()
@@ -3171,7 +3174,10 @@ impl SpareView {
         let mut arena = ViewArena::new(d, false);
         let mut list = render().command_list().unwrap();
         arena
-            .layout(&LightingView::requests(EXTENT, false), &mut list)
+            .layout(
+                &LightingView::requests(EXTENT, false, ExtraGuides::default()),
+                &mut list,
+            )
             .unwrap();
         let point = render().submit(vec![list], &[]).unwrap();
         render()

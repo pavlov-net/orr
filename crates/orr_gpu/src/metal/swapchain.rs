@@ -162,6 +162,29 @@ impl Presented {
     }
 }
 
+/// When the first presents of metered batches reached the display, as their drawables report.
+#[derive(Default)]
+struct Pace {
+    /// The last first present's time, in seconds of `CACurrentMediaTime`.
+    last: Mutex<Option<f64>>,
+    /// The time between the last two.
+    period: Mutex<Option<f64>>,
+}
+
+impl Pace {
+    /// Takes the time a batch's first present showed; 0 for one that never showed, which
+    /// breaks the sequence.
+    fn first_shown(&self, at: f64) {
+        let mut last = lock(&self.last);
+        if at > 0.0
+            && let Some(before) = *last
+        {
+            *lock(&self.period) = Some(at - before);
+        }
+        *last = (at > 0.0).then_some(at);
+    }
+}
+
 /// Registered with the default notification center until dropped.
 struct Observer(Retained<ProtocolObject<dyn NSObjectProtocol>>);
 
@@ -216,6 +239,64 @@ fn observe_occlusion(view: &AnyObject, covered: Arc<AtomicBool>) -> Observer {
     Observer(token)
 }
 
+/// The refresh of the screen `window` is on, on the main thread: `NSScreen`'s shortest
+/// refresh interval, and whether it varies.
+fn screen_refresh(window: &AnyObject) -> Refresh {
+    // SAFETY: an `NSWindow`, on the main thread.
+    let screen: Option<Retained<AnyObject>> = unsafe { msg_send![window, screen] };
+    let Some(screen) = screen else {
+        return Refresh {
+            interval: None,
+            variable: false,
+        };
+    };
+    // SAFETY: `NSScreen` properties of type `NSTimeInterval`, on the main thread.
+    let (min, max): (f64, f64) = unsafe {
+        (
+            msg_send![&screen, minimumRefreshInterval],
+            msg_send![&screen, maximumRefreshInterval],
+        )
+    };
+    Refresh {
+        interval: (min > 0.0).then(|| Duration::from_secs_f64(min)),
+        variable: max > min,
+    }
+}
+
+/// Keeps `refresh` current for the screen of the window `view` is in, from the main thread: the
+/// window may move to another screen, and a screen's mode may change.
+fn observe_screen(view: &AnyObject, refresh: Arc<Mutex<Refresh>>) -> Vec<Observer> {
+    if let Some(w) = view_window(view) {
+        *lock(&refresh) = screen_refresh(&w);
+    }
+    let view = Weak::new(view);
+    let block = RcBlock::new(move |_: NonNull<NSNotification>| {
+        if let Some(window) = view.load().and_then(|v| view_window(&v)) {
+            *lock(&refresh) = screen_refresh(&window);
+        }
+    });
+    [
+        ns_string!("NSWindowDidChangeScreenNotification"),
+        ns_string!("NSApplicationDidChangeScreenParametersNotification"),
+    ]
+    .into_iter()
+    .map(|name| {
+        // SAFETY: the block runs on the main queue only, as `view_window` and `screen_refresh`
+        // need, and what it captures is safe to release on any thread. AppKit's name constants
+        // are its own text.
+        let token = unsafe {
+            NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+                Some(name),
+                None,
+                Some(&NSOperationQueue::mainQueue()),
+                &block,
+            )
+        };
+        Observer(token)
+    })
+    .collect()
+}
+
 /// What the layer was last set to.
 #[derive(Clone, Copy, PartialEq)]
 struct Applied {
@@ -242,6 +323,14 @@ pub struct Swapchain {
     presented: Arc<Presented>,
     extent: WindowExtent,
     _occlusion: Option<Observer>,
+    /// The refresh of the window's screen, which the main thread keeps current.
+    refresh: Arc<Mutex<Refresh>>,
+    _screen: Vec<Observer>,
+    /// The time between the first presents of the last two metered batches.
+    pace: Arc<Pace>,
+    /// Presents left in the current metered batch, and how long each waits after the one
+    /// before it shows.
+    batch: Option<(u32, Option<f64>)>,
 }
 
 impl Swapchain {
@@ -279,13 +368,20 @@ impl Swapchain {
         };
         let added = !made.pre_existing();
         let covered = Arc::new(AtomicBool::new(false));
-        let occlusion = match window {
+        let refresh = Arc::new(Mutex::new(Refresh {
+            interval: None,
+            variable: false,
+        }));
+        let (occlusion, screen) = match window {
             RawWindowHandle::AppKit(h) => {
                 // SAFETY: as above.
                 let view: &AnyObject = unsafe { h.ns_view.cast().as_ref() };
-                Some(observe_occlusion(view, Arc::clone(&covered)))
+                (
+                    Some(observe_occlusion(view, Arc::clone(&covered))),
+                    observe_screen(view, Arc::clone(&refresh)),
+                )
             }
-            _ => None,
+            _ => (None, Vec::new()),
         };
         // SAFETY: `into_raw` hands over its retain of a `CAMetalLayer`.
         let layer: Retained<CAMetalLayer> =
@@ -311,6 +407,10 @@ impl Swapchain {
             next_present_id: 1,
             presented: Arc::default(),
             _occlusion: occlusion,
+            refresh,
+            _screen: screen,
+            pace: Arc::default(),
+            batch: None,
         };
         Ok(s)
     }
@@ -347,12 +447,9 @@ impl Swapchain {
         None
     }
 
-    /// Unknown: Metal reports no refresh timing to swapchains.
+    /// The refresh of the screen the window is on; unknown outside AppKit.
     pub fn refresh(&self) -> Refresh {
-        Refresh {
-            interval: None,
-            variable: false,
-        }
+        *lock(&self.refresh)
     }
 
     /// Waits up to `timeout` for the present `id` (from [`Swapchain::present`]) to reach the
@@ -463,10 +560,24 @@ impl Swapchain {
     }
 
     /// Presents `frame` once its submit has run, and returns its present id: strictly
-    /// increasing across every present of this swapchain. `batch` is ignored: Metal has no
-    /// metered presents.
+    /// increasing across every present of this swapchain. `batch = Some(n)` makes this the
+    /// first present of a metered batch of `n`: the next `n - 1` presents each show once the
+    /// one before has been on screen for `1 / n` of the time between the last two batches'
+    /// first presents.
     pub fn present(&mut self, frame: SwapchainFrame, batch: Option<u32>) -> Result<u64, Error> {
-        let _ = batch;
+        let after = match (batch, self.batch) {
+            (Some(n), _) => {
+                let period = *lock(&self.pace.period);
+                self.batch = (n > 1).then(|| (n - 1, period.map(|p| p / f64::from(n))));
+                None
+            }
+            (None, Some((left, wait))) => {
+                self.batch = (left > 1).then_some((left - 1, wait));
+                wait
+            }
+            (None, None) => None,
+        };
+        let first = batch.is_some();
         let point = frame
             .submitted
             .get()
@@ -474,8 +585,13 @@ impl Swapchain {
         let id = self.next_present_id;
         self.next_present_id += 1;
         let presented = Arc::clone(&self.presented);
-        let handler = RcBlock::new(move |_: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+        let pace = Arc::clone(&self.pace);
+        let handler = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
             presented.record(id);
+            if first {
+                // SAFETY: Metal hands the handler its live drawable.
+                pace.first_shown(unsafe { d.as_ref() }.presentedTime());
+            }
         });
         let drawable = frame.drawable;
         // SAFETY: Metal copies the block, which captures only `Send` values; it is added
@@ -483,7 +599,11 @@ impl Swapchain {
         unsafe { drawable.addPresentedHandler(RcBlock::as_ptr(&handler)) };
         self.queue().in_order(move |_| {
             let drawable: &ProtocolObject<dyn CAMetalDrawable> = &drawable;
-            ProtocolObject::<dyn MTLDrawable>::from_ref(drawable).present();
+            let drawable = ProtocolObject::<dyn MTLDrawable>::from_ref(drawable);
+            match after {
+                Some(wait) => drawable.presentAfterMinimumDuration(wait),
+                None => drawable.present(),
+            }
         });
         self.device.free_image_slot(frame.storage.0, point);
         Ok(id)

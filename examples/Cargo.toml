@@ -8,9 +8,12 @@ license.workspace = true
 publish = false
 
 [features]
-default = ["dlss"]
-# orr's `dlss`. Without it the dlss example only says so, and the others run without DLSS.
+default = ["dlss", "metalfx"]
+# orr's `dlss`. Without it or `metalfx` the reconstruction example only says so, and the others
+# run without reconstruction.
 dlss = ["orr/dlss"]
+# orr's `metalfx`: MetalFX reconstruction on Apple.
+metalfx = ["orr/metalfx"]
 # orr's `pcl-stats`: hdr-calibration reports PC latency to the NVIDIA overlay and FrameView.
 pcl-stats = ["orr/pcl-stats"]
 # orr's `nsight-perf`: bench adds per-pass Nsight Perf SDK counters to its report.
@@ -62,8 +65,8 @@ name = "hdr-calibration"
 path = "hdr-calibration.rs"
 
 [[example]]
-name = "dlss"
-path = "dlss-main.rs"
+name = "reconstruction"
+path = "reconstruction-main.rs"
 
 [[example]]
 name = "rigid-parts"

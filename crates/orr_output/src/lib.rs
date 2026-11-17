@@ -13,6 +13,8 @@ mod glare_tables;
 mod gt7;
 mod hooks;
 mod local_exposure;
+#[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+mod metalfx;
 mod motion_blur;
 mod overlay_front;
 mod passes;
@@ -22,6 +24,7 @@ mod present;
 mod reconstruction;
 mod screenshot;
 mod ui;
+mod upscale;
 mod view;
 mod white_balance;
 
@@ -45,10 +48,14 @@ pub use gt7::{GT7_REFERENCE_NITS, Gt7Curve, Gt7Params};
 pub use hooks::{
     ChainImages, DistortionField, HookInputs, HookPass, HookPoint, Hooks, Image, hook_requests,
 };
+#[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+pub use metalfx::MetalFx;
 pub use motion_blur::{MOTION_BLUR_MAX_RADIUS, MotionBlurPass};
 pub use orr_color::Primaries;
 #[cfg(dlss)]
 pub use orr_dlss::{self, DlssSdk, Support as DlssSupport};
+#[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+pub use orr_metalfx;
 pub use orr_scene::orr_gpu::{LowLatency, OutputFormat};
 pub use orr_window::{self, DisplayFeed, DisplayHeadroom, DisplayInfo, DisplayWatch};
 pub use overlay_front::OverlayFront;
@@ -58,11 +65,12 @@ pub use passes::{
 };
 pub use present::{Display, DisplayFrame, Presented, UI_PASS};
 pub use reconstruction::{
-    Reconstruction, ReconstructionBackend, ReconstructionFeature, ReconstructionInputs,
+    GuideReads, Reconstruction, ReconstructionBackend, ReconstructionFeature, ReconstructionInputs,
     ReconstructionMode, ReconstructionSupport, UpscaleMode, UpscaleQuality,
 };
 pub use screenshot::{Screenshot, ScreenshotRequest};
 pub use ui::{UiLayer, UiPass};
+pub use upscale::{UpscaleBackend, UpscaleFeature, UpscaleInputs};
 pub use view::{GlareMethod, OutputDebug, PostQuality, ViewOutput};
 pub use white_balance::{AutoWhiteBalance, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV};
 
@@ -76,6 +84,9 @@ pub enum Error {
     #[cfg(dlss)]
     #[error(transparent)]
     Dlss(#[from] orr_dlss::DlssError),
+    #[cfg(all(feature = "metalfx", target_vendor = "apple"))]
+    #[error(transparent)]
+    MetalFx(#[from] orr_metalfx::Error),
     /// The device or system lacks something frame generation needs.
     #[error("frame generation needs {0}")]
     FrameGenerationUnavailable(&'static str),
