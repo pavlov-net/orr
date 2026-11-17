@@ -1,7 +1,7 @@
 // The caustic grid's frame: `clear` empties every cell, `begin` starts the frame's counts
 // before its photons, `resolve` blends each cell's photons into its running mean after them and
-// evicts cells that have long had none, and `finish` writes the frame's statistics and sets the
-// next frame's quantum. A reference view's map takes `heads` before its photons, which empties
+// evicts cells that have long had none, leaving tombstones, `sweep` empties the tombstones no key
+// lies past, and `finish` writes the frame's statistics and sets the next frame's quantum. A reference view's map takes `heads` before its photons, which empties
 // its lists.
 #include "orr_root.h"
 import orr_color.luminance;
@@ -80,7 +80,7 @@ void resolve(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
     CausticsGpu* g = root.caustics;
     bool occupied = false;
     bool evicted = false;
-    if (i < root.capacity && g.checks[i] != 0)
+    if (i < root.capacity && g.checks[i] != 0 && g.checks[i] != CACHE_TOMBSTONE)
     {
         uint4 low = g.accumulated[2 * i];
         uint4 high = g.accumulated[2 * i + 1];
@@ -99,7 +99,11 @@ void resolve(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
         float delta = cache_delta(r);
         float3 irradiance = unpack_rgb9e5(r.x) * (1.0 / CAUSTIC_STORE_SCALE);
         float limit = max(root.max_temporal_samples, CACHE_RESPONSIVE_SAMPLES);
-        // A frame without deposits estimates no light: it blends in as 0.
+        // A frame without deposits estimates no light: it blends in as 0. A cell is made only
+        // by a deposit, so its absence says the frames before saw none in it: as many as a cell
+        // outlives its last deposit by, since the grid last changed its finest level or emptied.
+        if (history == 0.0)
+            history = min(float(root.caustics.source.held), float(root.cell_lifetime + 1));
         if (history == 0.0)
         {
             irradiance = frame;
@@ -123,7 +127,7 @@ void resolve(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
         evicted = life > root.cell_lifetime;
         if (evicted)
         {
-            g.checks[i] = 0;
+            g.checks[i] = CACHE_TOMBSTONE;
             g.resolved[i] = uint2(0);
             g.photons[i] = 0.0;
         }
@@ -139,6 +143,17 @@ void resolve(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
     }
     count_add(g.counters + CAUSTIC_OCCUPIED, occupied);
     count_add(g.counters + CAUSTIC_EVICTED, evicted);
+}
+
+// One thread per slot, after the resolve.
+[shader("compute")]
+[numthreads(RESOLVE_GROUP, 1, 1)]
+void sweep(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
+{
+    uint i = dispatch_index(lane, group);
+    CausticsGpu* g = root.caustics;
+    if (i < root.capacity && g.checks[i] == CACHE_TOMBSTONE && sweeps(g.checks, g.capacity_mask, i))
+        g.checks[i] = 0;
 }
 
 [shader("compute")]

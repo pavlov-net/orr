@@ -1747,7 +1747,7 @@ public struct ViewPath : IPathRecord
 public struct CacheUpdate : IPathRecord
 {
     uint count;
-    uint64_t keys[UPDATE_VERTICES];
+    uint2 keys[UPDATE_VERTICES];
     float3 scale[UPDATE_VERTICES];      // 1 / (throughput x albedo) per channel, 0 where the albedo is
     float3 before[UPDATE_VERTICES];     // the path's radiance on arrival
 

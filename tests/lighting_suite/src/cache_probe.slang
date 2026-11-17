@@ -39,11 +39,6 @@ struct Root
 }
 ORR_ROOT(Root);
 
-uint64_t key_of(uint2 k)
-{
-    return uint64_t(k.x) | (uint64_t(k.y) << 32);
-}
-
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void keys(uint3 id: SV_DispatchThreadID)
@@ -51,9 +46,9 @@ void keys(uint3 id: SV_DispatchThreadID)
     if (id.x >= root.count)
         return;
     KeyCase c = root.cases[id.x];
-    uint64_t key = cache_key(c.origin_cell, c.position, c.k, c.level, normal_bucket(c.normal));
+    uint2 key = cache_key(c.origin_cell, c.position, c.k, c.level, normal_bucket(c.normal));
     KeyOut o;
-    o.key = uint2(uint(key), uint(key >> 32));
+    o.key = key;
     o.hash = cache_hash(key);
     o.check = cache_check(key);
     root.keys[id.x] = o;
@@ -64,7 +59,7 @@ void keys(uint3 id: SV_DispatchThreadID)
 void add()
 {
     for (uint i = 0; i < root.count; i++)
-        cache_add(root.cache, key_of(root.samples[i].key), root.samples[i].value.xyz);
+        cache_add(root.cache, root.samples[i].key, root.samples[i].value.xyz);
 }
 
 [shader("compute")]

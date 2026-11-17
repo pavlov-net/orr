@@ -20,6 +20,8 @@ use orr_scene::{SceneDesc, SceneWriter};
 
 /// `world_cache`'s `CACHE_PROBE` and `CACHE_STORE_SCALE`.
 const PROBE: usize = 8;
+/// `world_cache`'s `CACHE_TOMBSTONE`.
+const TOMBSTONE: u32 = !0;
 const STORE_SCALE: f32 = 1.0 / 256.0;
 
 fn rgb9e5(p: u32) -> [f32; 3] {
@@ -264,34 +266,74 @@ fn keys_hold_across_render_origins() {
     assert_clean();
 }
 
+/// A slot of [`Model`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Slot {
+    Empty,
+    /// An evicted cell's.
+    Tombstone,
+    /// Key `keys[.0]`'s, `.1` frames since its last sample.
+    Key(usize, u32),
+}
+
 /// The cache's slots as the CPU expects them: keys by index into `keys`.
 struct Model {
-    slots: Vec<Option<(usize, u32)>>,
+    slots: Vec<Slot>,
     lifetime: u32,
 }
 
 impl Model {
-    /// Adds one sample of key `i` the way `cache_insert` claims slots; false on overflow.
+    /// Adds one sample of key `i` the way `cache_insert` claims slots: its slot where the probe
+    /// meets it before an empty slot, else the probe's first empty or tombstone slot; false on
+    /// overflow.
     fn add(&mut self, keys: &[cache_probe::KeyOut], i: usize, seen: &mut Vec<usize>) -> bool {
         let n = self.slots.len();
         let home = keys[i].hash as usize & (n - 1);
         let window = (0..PROBE).map(|j| (home + j) & (n - 1));
-        let slot = window
+        let held = window
             .clone()
-            .find(|&s| self.slots[s].is_some_and(|(k, _)| keys[k].check == keys[i].check))
-            .or_else(|| window.clone().find(|&s| self.slots[s].is_none()));
+            .take_while(|&s| self.slots[s] != Slot::Empty)
+            .find(|&s| matches!(self.slots[s], Slot::Key(k, _) if keys[k].check == keys[i].check));
+        let slot = held.or_else(|| {
+            window
+                .clone()
+                .find(|&s| matches!(self.slots[s], Slot::Empty | Slot::Tombstone))
+        });
         if let Some(s) = slot {
-            self.slots[s].get_or_insert((i, 0));
+            if held.is_none() {
+                self.slots[s] = Slot::Key(i, 0);
+            }
             seen.push(s);
         }
         slot.is_some()
     }
 
+    /// The resolve, which leaves a tombstone where it evicts, then its sweep, which empties
+    /// every tombstone with no key past it within a probe before an empty slot.
     fn resolve(&mut self, seen: &[usize]) {
         for (s, slot) in self.slots.iter_mut().enumerate() {
-            if let Some((k, life)) = *slot {
+            if let Slot::Key(k, life) = *slot {
                 let life = if seen.contains(&s) { 0 } else { life + 1 };
-                *slot = (life <= self.lifetime).then_some((k, life));
+                *slot = if life <= self.lifetime {
+                    Slot::Key(k, life)
+                } else {
+                    Slot::Tombstone
+                };
+            }
+        }
+        let n = self.slots.len();
+        let swept: Vec<bool> = (0..n)
+            .map(|s| {
+                self.slots[s] == Slot::Tombstone
+                    && (1..PROBE)
+                        .map(|j| self.slots[(s + j) & (n - 1)])
+                        .take_while(|&t| t != Slot::Empty)
+                        .all(|t| t == Slot::Tombstone)
+            })
+            .collect();
+        for (slot, swept) in self.slots.iter_mut().zip(swept) {
+            if swept {
+                *slot = Slot::Empty;
             }
         }
     }
@@ -308,7 +350,7 @@ fn probing_and_eviction_match_a_cpu_model() {
     assert_eq!(checks.len(), keys.len(), "check collision in the test keys");
     let value = |i: usize| [1.0 + i as f32, 2.0, 0.5];
     let mut model = Model {
-        slots: vec![None; 16],
+        slots: vec![Slot::Empty; 16],
         lifetime,
     };
     let mut seen = Vec::new();
@@ -337,15 +379,22 @@ fn probing_and_eviction_match_a_cpu_model() {
                 (added, overflows),
                 "frame {frame}"
             );
-            let occupied = model.slots.iter().filter(|s| s.is_some()).count() as u32;
+            let occupied = model
+                .slots
+                .iter()
+                .filter(|s| matches!(s, Slot::Key(..)))
+                .count() as u32;
             assert_eq!(s.occupied, occupied, "frame {frame}");
             overflowed += s.overflows;
             evicted += s.evicted;
         }
         for (s, (cell, want)) in cells.iter().zip(&model.slots).enumerate() {
             match want {
-                None => assert_eq!(cell.check, 0, "frame {frame} slot {s}: {cell:?}"),
-                Some((k, life)) => {
+                Slot::Empty => assert_eq!(cell.check, 0, "frame {frame} slot {s}: {cell:?}"),
+                Slot::Tombstone => {
+                    assert_eq!(cell.check, TOMBSTONE, "frame {frame} slot {s}: {cell:?}");
+                }
+                Slot::Key(k, life) => {
                     assert_eq!(cell.check, keys[*k].check, "frame {frame} slot {s}");
                     assert_eq!(cell.life, *life, "frame {frame} slot {s}");
                     for c in 0..3 {

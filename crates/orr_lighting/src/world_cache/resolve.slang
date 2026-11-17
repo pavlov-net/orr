@@ -1,6 +1,7 @@
 // The world cache's resolve, once per frame in the scene pass: `begin` settles the global
 // light rescale, `resolve` blends every cell's samples into its resolved value and evicts
-// stale cells, `finish` writes the frame's statistics.
+// stale cells, leaving tombstones, `sweep` empties the tombstones no key lies past, `finish`
+// writes the frame's statistics.
 #include "orr_root.h"
 import orr_color.luminance;
 import orr_shaders.packing;
@@ -68,7 +69,7 @@ void resolve(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
             c.accumulated[i] = uint4(0);
             c.resolved[i] = uint2(0);
         }
-        else if (c.checks[i] != 0)
+        else if (c.checks[i] != 0 && c.checks[i] != CACHE_TOMBSTONE)
         {
             float rescale = asfloat(c.counters[COUNT_RESCALE]);
             uint4 a = c.accumulated[i];
@@ -112,7 +113,7 @@ void resolve(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
             }
             if (evicted)
             {
-                c.checks[i] = 0;
+                c.checks[i] = CACHE_TOMBSTONE;
                 c.resolved[i] = uint2(0);
             }
             else
@@ -131,6 +132,17 @@ void resolve(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
     }
     count_add(c.counters + COUNT_OCCUPIED, occupied);
     count_add(c.counters + COUNT_EVICTED, evicted);
+}
+
+// One thread per slot, after the resolve.
+[shader("compute")]
+[numthreads(RESOLVE_GROUP, 1, 1)]
+void sweep(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
+{
+    uint i = (group.y * RESOLVE_ROW + group.x) * RESOLVE_GROUP + lane;
+    WorldCacheGpu* c = root.cache;
+    if (i < root.capacity && c.checks[i] == CACHE_TOMBSTONE && sweeps(c.checks, c.capacity_mask, i))
+        c.checks[i] = 0;
 }
 
 // Copies the counters into the frame's readback: the resolve's, and the lookups and samples

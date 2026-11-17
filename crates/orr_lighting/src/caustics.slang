@@ -250,7 +250,7 @@ public void grid_deposit(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float
         for (uint l = level > g.source.finest ? level - 1 : level; l <= min(level + 2, top); l++)
         {
             int e = g.base_cell_log2 + int(l);
-            uint64_t key = cache_key(s.origin_cell, plane_point(p, n, axis, exp2(float(e))), e, l, bucket);
+            uint2 key = cache_key(s.origin_cell, plane_point(p, n, axis, exp2(float(e))), e, l, bucket);
             uint slot;
             if (!slot_insert(g.checks, g.capacity_mask, key, slot))
             {
@@ -275,7 +275,7 @@ public void grid_deposit(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float
 
 // The resolved irradiance of a grid cell, and its photons per frame; false for a cell that
 // is absent or has no history yet.
-bool grid_cell(CausticsGpu* g, uint64_t key, out float3 irradiance, out float photons)
+bool grid_cell(CausticsGpu* g, uint2 key, out float3 irradiance, out float photons)
 {
     irradiance = float3(0.0);
     photons = 0.0;
