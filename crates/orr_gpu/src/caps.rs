@@ -106,7 +106,7 @@ pub struct Caps {
     pub present_wait: bool,
     /// Reflex (`VK_NV_low_latency2`): [`crate::Swapchain::latency`] returns a handle.
     pub low_latency: bool,
-    /// Metered present batches (`VK_NV_present_metering`).
+    /// Metered present batches (`VK_NV_present_metering`; on Metal, minimum-duration presents).
     pub present_metering: bool,
     /// Swapchain refresh timing (`VK_EXT_present_timing`): [`crate::Swapchain::refresh`]
     /// can report a variable refresh rate.

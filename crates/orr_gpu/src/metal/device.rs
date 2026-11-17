@@ -375,7 +375,8 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
         // Presented handlers report each drawable's present.
         present_wait: desc.queues.present,
         low_latency: false,
-        present_metering: false,
+        // Batches pace their presents with `presentAfterMinimumDuration`.
+        present_metering: desc.queues.present,
         present_timing: false,
         // `CAEDRMetadata` on the layer.
         hdr_metadata: desc.queues.present,
