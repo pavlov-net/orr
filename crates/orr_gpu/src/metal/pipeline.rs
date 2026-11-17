@@ -34,6 +34,8 @@ pub struct ShaderStage<'a> {
     pub spec: SpecData<'a>,
     /// The name a ray tracing pipeline's tools show the stage by; unused here.
     pub label: &'a CStr,
+    /// `spirv` is already the stage's code as [`Self::fold`] makes it.
+    pub folded: bool,
     pub(super) module: &'a ShaderModule,
 }
 
@@ -53,6 +55,7 @@ impl<'a> ShaderStage<'a> {
             entry,
             spec,
             label: c"",
+            folded: false,
             module,
         })
     }
@@ -60,6 +63,30 @@ impl<'a> ShaderStage<'a> {
     /// The stage named `label`, as the Vulkan backend's.
     pub fn labeled(self, label: &'a CStr) -> Self {
         Self { label, ..self }
+    }
+
+    /// The stage with `code`, what [`Self::fold`] made of it, in place of its module's SPIR-V.
+    pub fn folded(self, code: &'a [u32]) -> Self {
+        Self {
+            spirv: code,
+            folded: true,
+            ..self
+        }
+    }
+
+    /// The SPIR-V the Vulkan backend hands its driver for the stage, as its `fold` makes it;
+    /// `None` where that is `spirv` as it is. This backend compiles the Metal library and hands
+    /// none.
+    pub fn fold(&self) -> Option<Vec<u32>> {
+        if self.folded {
+            return None;
+        }
+        crate::specialize::specialize(
+            self.spirv,
+            self.entry.spirv_name.to_bytes(),
+            self.spec.entries,
+            self.spec.bytes,
+        )
     }
 
     /// The stage's library for pixel entries when `fragment`, else for the others: the

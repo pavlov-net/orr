@@ -16,9 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use std::ffi::CStr;
-
-use orr_shaders::abi::{SpecData, SpecEntry};
+use orr_shaders::abi::SpecEntry;
 
 const HEADER_WORDS: usize = 5;
 const BOUND: usize = 3;
@@ -442,11 +440,9 @@ pub(crate) fn rename_entry(code: &[u32], entry: &[u8], name: &[u8]) -> Option<Ve
     function.map(|_| out)
 }
 
-/// How many instructions the functions of entry point `entry` of `code` hold once `spec` is
-/// folded in, without debug lines: the size of the code a driver is handed for the stage.
-pub fn handed_instructions(code: &[u32], entry: &CStr, spec: SpecData<'_>) -> u32 {
-    let folded = specialize(code, entry.to_bytes(), spec.entries, spec.bytes);
-    let code = folded.as_deref().unwrap_or(code);
+/// How many instructions the functions of `code` hold, without debug lines: of a stage's code as
+/// `ShaderStage::fold` makes it, the size of what the driver is handed.
+pub fn handed_instructions(code: &[u32]) -> u32 {
     let mut inside = false;
     let mut count = 0;
     for (_, inst) in instructions(code, HEADER_WORDS).map_while(|i| i) {

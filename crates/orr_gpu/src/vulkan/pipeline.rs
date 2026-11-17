@@ -35,6 +35,9 @@ pub struct ShaderStage<'a> {
     /// The name the stage's entry point takes in the code the driver is handed, which its tools
     /// show the stage by; empty for the entry's own.
     pub label: &'a CStr,
+    /// `spirv` is already the stage's code as [`Self::fold`] makes it, which the driver is
+    /// handed as it is.
+    pub folded: bool,
 }
 
 impl<'a> ShaderStage<'a> {
@@ -42,6 +45,55 @@ impl<'a> ShaderStage<'a> {
     /// constants are told apart by it.
     pub fn labeled(self, label: &'a CStr) -> Self {
         Self { label, ..self }
+    }
+
+    /// The stage with `code`, what [`Self::fold`] made of it, in place of its module's.
+    pub fn folded(self, code: &'a [u32]) -> Self {
+        Self {
+            spirv: code,
+            folded: true,
+            ..self
+        }
+    }
+
+    /// The code the driver is handed for the stage: its entry point alone, with its constants
+    /// folded in (and a task or mesh entry's payload declared first). `None` where that is
+    /// `spirv` as it is, as for a stage already folded.
+    pub fn fold(&self) -> Option<Vec<u32>> {
+        if self.folded {
+            return None;
+        }
+        let _zone = crate::zone!("specialize");
+        let started = Instant::now();
+        let code = if matches!(self.entry.stage, Stage::Task | Stage::Mesh) {
+            spirv::payload_first(self.spirv, self.entry.spirv_name.to_bytes())
+        } else {
+            Cow::Borrowed(self.spirv)
+        };
+        let folded = specialize::specialize(
+            &code,
+            self.entry.spirv_name.to_bytes(),
+            self.spec.entries,
+            self.spec.bytes,
+        );
+        if let Some(folded) = &folded {
+            let name = if self.label.is_empty() {
+                self.entry.spirv_name
+            } else {
+                self.label
+            };
+            log::debug!(
+                "{}: {} of {} words left by its specialization, in {:.1} ms",
+                name.to_string_lossy(),
+                folded.len(),
+                code.len(),
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        folded.or(match code {
+            Cow::Owned(code) => Some(code),
+            Cow::Borrowed(_) => None,
+        })
     }
 
     /// The entry point `entry` of `module`.
@@ -59,6 +111,7 @@ impl<'a> ShaderStage<'a> {
             entry,
             spec,
             label: c"",
+            folded: false,
         })
     }
 }
@@ -230,32 +283,9 @@ impl<'a> StageParts<'a> {
                 "{name}: the module was built with opacity micromaps, which the device has off; build the shaders with ORR_SHADER_OMM=0, or ORR_SHADER_CAPTURE=1 for a capture session"
             )));
         }
-        let code = if matches!(want, Stage::Task | Stage::Mesh) {
-            spirv::payload_first(s.spirv, s.entry.spirv_name.to_bytes())
-        } else {
-            Cow::Borrowed(s.spirv)
-        };
         // A stage with no constants is still pruned to its entry: the driver and the validation
         // layer otherwise read every other entry point's code once per stage.
-        let code = {
-            let _zone = crate::zone!("specialize");
-            let started = Instant::now();
-            let folded = specialize::specialize(
-                &code,
-                s.entry.spirv_name.to_bytes(),
-                s.spec.entries,
-                s.spec.bytes,
-            );
-            if let Some(folded) = &folded {
-                log::debug!(
-                    "{name}: {} of {} words left by its specialization, in {:.1} ms",
-                    folded.len(),
-                    code.len(),
-                    started.elapsed().as_secs_f64() * 1e3
-                );
-            }
-            folded.map_or(code, Cow::Owned)
-        };
+        let code = s.fold().map_or(Cow::Borrowed(s.spirv), Cow::Owned);
         let (code, entry) = match specialize::rename_entry(
             &code,
             s.entry.spirv_name.to_bytes(),

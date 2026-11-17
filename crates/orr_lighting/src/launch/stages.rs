@@ -794,79 +794,113 @@ pub struct StageSize {
     pub own: Option<i64>,
 }
 
-/// What `spec`'s stage of `module`, the build of its kernel, hands the driver: its entry folded
-/// with its constants.
-fn handed(module: &'static orr_shaders::ShaderModule, spec: &Spec) -> Result<u32, Error> {
-    let (bytes, entries) = spec.constants();
-    let stage = ShaderStage::new(
-        module,
-        spec.entry,
-        SpecData {
-            entries,
-            bytes: &bytes,
-        },
-    )?;
-    Ok(handed_instructions(
-        stage.spirv,
-        stage.entry.spirv_name,
-        stage.spec,
-    ))
+/// The stages of the pipeline of paths that may meet `may`, from `kernels`: each folded with its
+/// constants once, for the sizes and for the driver, and what each hands the driver.
+struct Folded {
+    table: Table,
+    /// Each stage's code as the driver is handed it; none where that is its module's code.
+    code: Vec<Option<Vec<u32>>>,
+    sizes: Vec<StageSize>,
+}
+
+impl Folded {
+    /// Folds every stage the sizes need on `threads`: the table's, and those they are measured
+    /// against.
+    fn new(kernels: &KernelSet, may: u64, threads: CompileThreads<'_>) -> Result<Self, Error> {
+        let table = Table::new(may, kernels);
+        let specs = &table.specs;
+        let lean: Vec<&'static orr_shaders::ShaderModule> = specs
+            .iter()
+            .map(|spec| module(kernels, spec.kernel.own()))
+            .collect::<Result<_, Error>>()?;
+        // The folds, each once: the table's stages, then the stages they are measured against.
+        let mut folds: Vec<_> = lean.iter().copied().zip(specs.iter().copied()).collect();
+        let mut fold = |module: &'static orr_shaders::ShaderModule, spec: Spec| {
+            let at = folds
+                .iter()
+                .position(|&(m, s)| std::ptr::eq(m, module) && s == spec);
+            at.unwrap_or_else(|| {
+                folds.push((module, spec));
+                folds.len() - 1
+            })
+        };
+        // Kernels that link a type compile the lean stages anew, with the types' code in them:
+        // a stage is measured against the same stage of orr's own kernel for the standard surface.
+        let plain: Vec<Option<usize>> = specs
+            .iter()
+            .enumerate()
+            .map(|(at, spec)| {
+                let own = spec.kernel.own();
+                let standard = Spec {
+                    hit_surface: match spec.geometry {
+                        Some(_) => 0,
+                        None => spec.hit_surface,
+                    },
+                    ..*spec
+                };
+                (!std::ptr::eq(lean[at], own)).then(|| fold(own, standard))
+            })
+            .collect();
+        // A stage made for a linked surface is measured against the standard surface's stage of
+        // the same constants, which the table need not hold: the standard surface's materials
+        // may emit by no factor where a linked type emits.
+        let standard: Vec<Option<usize>> = specs
+            .iter()
+            .map(|spec| {
+                spec.linked(kernels.surfaces)
+                    .then(|| {
+                        let standard = Spec {
+                            hit_surface: 0,
+                            ..*spec
+                        };
+                        Ok(fold(module(kernels, standard.kernel.own())?, standard))
+                    })
+                    .transpose()
+            })
+            .collect::<Result<_, Error>>()?;
+        let constants: Vec<_> = folds.iter().map(|(_, spec)| spec.constants()).collect();
+        let stages = folds
+            .iter()
+            .zip(&constants)
+            .map(|(&(module, spec), (bytes, entries))| {
+                ShaderStage::new(module, spec.entry, SpecData { entries, bytes })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut code = threads.map(stages.len(), |i| stages[i].fold());
+        let handed: Vec<u32> = code
+            .iter()
+            .zip(&stages)
+            .map(|(code, stage)| handed_instructions(code.as_deref().unwrap_or(stage.spirv)))
+            .collect();
+        let sizes = specs
+            .iter()
+            .enumerate()
+            .map(|(at, spec)| {
+                let instructions = handed[at];
+                let beyond =
+                    |i: Option<usize>| i.map(|i| i64::from(instructions) - i64::from(handed[i]));
+                StageSize {
+                    entry: spec.entry,
+                    role: spec.role,
+                    geometry: spec.geometry.map_or("", Geometry::label),
+                    hit_surface: spec.hit_surface,
+                    rich: matches!(spec.kernel, Kernel::Rich | Kernel::Walk),
+                    instructions,
+                    cap: spec.cap(kernels.surfaces),
+                    linked: beyond(plain[at]),
+                    own: beyond(standard[at]),
+                }
+            })
+            .collect();
+        code.truncate(specs.len());
+        Ok(Self { table, code, sizes })
+    }
 }
 
 /// What each stage of the pipeline of paths that may meet `may` hands the driver, from
 /// `kernels`, and what of it is orr's own.
 pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>, Error> {
-    let specs = Table::new(may, kernels).specs;
-    let mut sizes = specs
-        .iter()
-        .map(|spec| {
-            let own = spec.kernel.own();
-            let lean = module(kernels, own)?;
-            // Kernels that link a type compile the lean stages anew, with the types' code in them.
-            let plain = (!std::ptr::eq(lean, own)).then_some(own);
-            let instructions = handed(lean, spec)?;
-            let linked = plain
-                .map(|plain| {
-                    let standard = Spec {
-                        hit_surface: match spec.geometry {
-                            Some(_) => 0,
-                            None => spec.hit_surface,
-                        },
-                        ..*spec
-                    };
-                    handed(plain, &standard).map(|own| i64::from(instructions) - i64::from(own))
-                })
-                .transpose()?;
-            Ok(StageSize {
-                entry: spec.entry,
-                role: spec.role,
-                geometry: spec.geometry.map_or("", Geometry::label),
-                hit_surface: spec.hit_surface,
-                rich: matches!(spec.kernel, Kernel::Rich | Kernel::Walk),
-                instructions,
-                cap: spec.cap(kernels.surfaces),
-                linked,
-                own: None,
-            })
-        })
-        .collect::<Result<Vec<StageSize>, Error>>()?;
-    for at in 0..sizes.len() {
-        if !specs[at].linked(kernels.surfaces) {
-            continue;
-        }
-        // The standard surface's stage of the same constants, which the table need not hold:
-        // the standard surface's materials may emit by no factor where a linked type emits.
-        let standard = Spec {
-            hit_surface: 0,
-            ..specs[at]
-        };
-        let instructions = match specs.iter().position(|s| *s == standard) {
-            Some(i) => sizes[i].instructions,
-            None => handed(module(kernels, standard.kernel.own())?, &standard)?,
-        };
-        sizes[at].own = Some(i64::from(sizes[at].instructions) - i64::from(instructions));
-    }
-    Ok(sizes)
+    Folded::new(kernels, may, CompileThreads::default()).map(|f| f.sizes)
 }
 
 /// The first of `sizes` whose own code, without what linked types add to it, is over its cap,
@@ -910,9 +944,10 @@ impl PathPipeline {
         threads: CompileThreads<'_>,
         may: u64,
     ) -> Result<Self, Error> {
-        let table = Table::new(may, kernels);
+        let started = Instant::now();
+        let Folded { table, code, sizes } = Folded::new(kernels, may, threads)?;
+        let folded = started.elapsed().as_secs_f64();
         let name = format!("path pipeline {may:#x}");
-        let sizes = path_stage_sizes(kernels, may)?;
         for s in &sizes {
             let stage = format!("{name}: {}{}", s.entry, s.geometry);
             match (s.own, s.linked) {
@@ -940,9 +975,13 @@ impl PathPipeline {
             .iter()
             .zip(&bytes)
             .zip(&labels)
-            .map(|((spec, (bytes, entries)), label)| {
+            .zip(&code)
+            .map(|(((spec, (bytes, entries)), label), code)| {
                 let lean = module(kernels, spec.kernel.own())?;
-                Ok(ShaderStage::new(lean, spec.entry, SpecData { entries, bytes })?.labeled(label))
+                let stage = ShaderStage::new(lean, spec.entry, SpecData { entries, bytes })?;
+                Ok(stage
+                    .folded(code.as_deref().unwrap_or(lean.spirv))
+                    .labeled(label))
             })
             .collect::<Result<Vec<_>, Error>>()?;
         // A source's record is its place among the raygens the pipeline holds.
@@ -975,10 +1014,10 @@ impl PathPipeline {
             flags: RayPipelineFlags::scene(device.caps()),
             threads,
         };
-        let started = Instant::now();
         let pipeline = device.create_ray_pipeline(&desc, &name)?;
         log::info!(
-            "{name}: {} stages, {} instructions handed over, made in {:.1} s",
+            "{name}: {} stages, {} instructions handed over, made in {:.1} s, {folded:.1} s of \
+             it folding",
             stages.len(),
             sizes.iter().map(|s| s.instructions).sum::<u32>(),
             started.elapsed().as_secs_f64()

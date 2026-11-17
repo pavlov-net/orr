@@ -352,17 +352,22 @@ impl Device {
         if desc.flags.contains(RayPipelineFlags::SWEPT_SPHERES) && !caps.lss {
             return Err(invalid("swept spheres without Caps::lss".into()));
         }
+        if let Some(s) = desc.stages.iter().find(|s| !s.entry.stage.ray_tracing()) {
+            return Err(invalid(format!(
+                "{:?} is a {:?} entry",
+                s.entry.name, s.entry.stage
+            )));
+        }
+        let folded = desc
+            .threads
+            .map(desc.stages.len(), |i| desc.stages[i].fold());
         let parts = desc
             .stages
             .iter()
-            .map(|s| {
-                if !s.entry.stage.ray_tracing() {
-                    return Err(invalid(format!(
-                        "{:?} is a {:?} entry",
-                        s.entry.name, s.entry.stage
-                    )));
-                }
-                StageParts::new(shared, s, s.entry.stage, name)
+            .zip(&folded)
+            .map(|(s, code)| {
+                let s = s.folded(code.as_deref().unwrap_or(s.spirv));
+                StageParts::new(shared, &s, s.entry.stage, name)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut root = 0;
