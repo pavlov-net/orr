@@ -147,7 +147,7 @@ void stack_step(inout StackStep c)
 void front(inout Payload p)
 {
     ORR_OMM(front);
-    p.words.x = lean_front<Medium>(root, DispatchRaysIndex().x, asfloat(p.words.x), p.words.y, p.words.z != 0) ? 1 : 0;
+    p.words.x = lean_front<Medium>(root, DispatchRaysIndex().x, asfloat(p.words.x), p.words.y, p.words.z != 0, p.words.w) ? 1 : 0;
 }
 
 [shader("callable")]

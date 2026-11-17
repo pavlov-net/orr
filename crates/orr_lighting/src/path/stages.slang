@@ -1104,19 +1104,20 @@ public float interior_walk_ior(SceneRoot* s, Interior interior, uint medium)
 // or to infinity, past the camera ray: the linked medium's in-scatter and transmittance, through
 // the froxels for rays leaving a layer or a scatter, marched where the ray is one of those or
 // long; elsewhere transmittance alone. The march's jitter dimension is drawn either way, so later
-// dimensions stay put.
-public void media_segment<M : IMedium>(PathRoot r, inout PathLoop p, inout Sampler rng, LayerRay ray, Spectral spectral, PathContext x, bool hit, float t)
+// dimensions stay put. The layers in front of the hit, `cover`, lie across the segment, and
+// `throughput` is the path's in front of them, which the in-scatter in front of them keeps.
+public void media_segment<M : IMedium>(PathRoot r, inout PathLoop p, inout Sampler rng, LayerRay ray, Spectral spectral, PathContext x, bool hit, float t, LayerCover cover, float3 throughput)
 {
     if (hit && (ray.chain || t >= INSCATTER_SEGMENT))
     {
         float3 through_medium;
         float3 e;
         if (ray.chain)
-            e = froxel_segment_inscatter<M>(r.froxels, r.view, r.set, ray.origin, ray.dir, t, r.segment_steps, rng.next(), through_medium);
+            e = froxel_segment_inscatter<M>(r.froxels, r.view, r.set, ray.origin, ray.dir, t, r.segment_steps, rng.next(), cover, through_medium);
         else
-            e = segment_inscatter<M>(r.set, ray.origin, ray.dir, t, r.segment_steps, rng.next(), through_medium);
+            e = segment_inscatter<M>(r.set, ray.origin, ray.dir, t, r.segment_steps, rng.next(), cover, through_medium);
         if (has(p.flags, LOOP_COUNTED) && !x.photon)
-            p.radiance += spectral.color(p.throughput * e);
+            p.radiance += spectral.color(throughput * e);
         p.throughput *= through_medium;
     }
     else
@@ -1219,6 +1220,9 @@ public void trace_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
     float3 positions[3] = { float3(0.0), float3(0.0), float3(0.0) };
     float t = 0.0;
     float3 own = owned_light(p, ray);
+    // What lies in front of the hit and covers the segment, and the path's throughput in front of it.
+    LayerCover cover = uncovered();
+    float3 before_layers = p.throughput;
     if (camera && camera_ray.given)
     {
         PathPending given = load_pending(r, slot, false);
@@ -1259,7 +1263,7 @@ public void trace_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
             PathEmission pe = { s, set, ray_local, ray.origin, ray.dir, ray.from, ray.normal, x.one_technique ? 0.0 : ray.pdf, ray.run, front.TMax, own, adds };
             // What lies in front of the ray's hit, premultiplied.
             float4 layers;
-            trace_resolve_translucent(scene_traced(s), front, front_layers, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, pe, PARTICLE_CANDIDATES, layers);
+            trace_resolve_translucent(scene_traced(s), front, front_layers, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, pe, PARTICLE_CANDIDATES, layers, cover);
             if (adds)
                 p.radiance += spectral.color(p.throughput * layers.rgb);
             p.throughput *= 1.0 - layers.a;
@@ -1342,7 +1346,7 @@ public void trace_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
         store_ray(r, slot, ray);
     }
     else if (medium == MATERIAL_NONE && !first)
-        media_segment<M>(r, p, rng, ray, spectral, x, h.hit, t);
+        media_segment<M>(r, p, rng, ray, spectral, x, h.hit, t, cover, before_layers);
     p.rng = rng;
     // The camera ray's vertex lies its origin's distance further from the eye.
     pending.t = first ? camera_ray.offset + t : t;

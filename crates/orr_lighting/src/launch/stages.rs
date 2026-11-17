@@ -34,9 +34,9 @@ use crate::shaders::consts::{
 use crate::shaders::path::{lean_layer, lean_paths, lean_rich, lean_walk};
 use crate::staged::{
     MAY_ALL, MAY_BACKGROUND, MAY_CAUSTICS, MAY_DEBUG, MAY_DISPERSION, MAY_EMISSIVE, MAY_EMITTER,
-    MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOBES, MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES,
-    MAY_PHOTON, MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING, MAY_STACK, MAY_TRACED, MAY_UPDATE,
-    MAY_VIEW, MAY_WALK,
+    MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOBES, MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_MEDIUM,
+    MAY_PARTICLES, MAY_PHOTON, MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING, MAY_STACK, MAY_TRACED,
+    MAY_UPDATE, MAY_VIEW, MAY_WALK,
 };
 use crate::{Error, KernelSet, module};
 
@@ -63,8 +63,8 @@ pub enum Role {
     View,
     /// The callable of a step of a directional job's walk through a plane stack.
     Stack,
-    /// The callable that takes what a path's ray meets in front of its hit: particles and the
-    /// proxies of sphere and rect lights.
+    /// The callable that takes what a path's ray meets on its way to its hit: particles, the
+    /// proxies of sphere and rect lights, and the march of the linked medium's in-scatter.
     Front,
     /// The any-hit that marks a path ray's payload where it met a particle or a light's proxy,
     /// and the intersection shader of a light's proxy under a path ray.
@@ -229,7 +229,7 @@ impl Spec {
             Role::Raygen => {
                 let layers = self.may & MAY_LAYERS != 0;
                 let walks = self.may & (MAY_SCATTERING | MAY_WALK) != 0;
-                let front = self.may & (MAY_PARTICLES | MAY_LOCAL_LIGHTS) != 0;
+                let front = self.may & (MAY_PARTICLES | MAY_LOCAL_LIGHTS | MAY_MEDIUM) != 0;
                 let proxies = self.may & MAY_PROXIES != 0;
                 let lens = self.may & (MAY_LENS | MAY_BACKGROUND) != 0;
                 let dispersion = self.may & MAY_DISPERSION != 0;
@@ -408,8 +408,8 @@ struct Table {
     /// The callable of a step of a directional job's walk through a plane stack, where the paths
     /// may meet one.
     stack_step: Option<u32>,
-    /// The callable that takes what a path's ray meets in front of its hit, where the paths may
-    /// meet particles or sphere and rect lights.
+    /// The callable that takes what a path's ray meets on its way to its hit, where the paths may
+    /// meet particles, sphere and rect lights or a linked medium.
     front: Option<u32>,
     /// The callable that marches the medium proxies with a volume a shadow ray passed, where the
     /// scene may hold medium proxies.
@@ -574,7 +574,7 @@ impl Table {
                 },
             )
         });
-        let front = (may & (MAY_PARTICLES | MAY_LOCAL_LIGHTS) != 0)
+        let front = (may & (MAY_PARTICLES | MAY_LOCAL_LIGHTS | MAY_MEDIUM) != 0)
             .then(|| Self::stage(&mut specs, folded("front", Role::Front)));
         let proxies = may & MAY_PROXIES != 0;
         let proxy_march =

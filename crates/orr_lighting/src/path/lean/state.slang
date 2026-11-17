@@ -112,13 +112,16 @@ public static const uint PAYLOAD_BENT = 1;
 // The callable of a step of that walk: the light's bend at the vertex, and per leg the medium,
 // the crossing of the face it ends at and its Fresnel.
 [Host] public static const uint STACK_STEP_INSTRUCTIONS = 5000;
-// What a raygen holds more where its paths may meet particles or sphere and rect lights: whether a
-// ray sees them, and the call that takes what it meets in front of its hit.
-[Host] public static const uint RAYGEN_FRONT_INSTRUCTIONS = 200;
+// What a raygen holds more where its paths may meet particles, sphere and rect lights or a linked
+// medium: whether a ray sees the first two, whether its way to its hit takes the medium's march,
+// and the call that takes what it meets on that way.
+[Host] public static const uint RAYGEN_FRONT_INSTRUCTIONS = 300;
 // That callable: a ray query over particles and light proxies that composites them in depth order,
 // each particle's look resolved and each one's light weighed against next-event estimation at the
-// vertex the ray left, and inside a scattering medium the free flight that ends the ray.
-[Host] public static const uint FRONT_INSTRUCTIONS = 15500;
+// vertex the ray left, and inside a scattering medium the free flight that ends the ray; and the
+// march of the linked medium's in-scatter on the way, through the froxels for a ray that left a
+// layer, a scatter or a walk's way out, so no hit stage holds a march.
+[Host] public static const uint FRONT_INSTRUCTIONS = 17500;
 // The any-hit that marks a path ray's payload where it met a particle or a light's proxy, and the
 // intersection shader of a light's proxy under a path ray, which tests the ray against the light.
 [Host] public static const uint FRONT_ANY_HIT_INSTRUCTIONS = 50;
@@ -248,7 +251,7 @@ public static const uint HOT_INTERIOR_HELD = 1 << 17;
 public static const uint HOT_WINDOW = 1 << 18;
 // Bits of a path ray's first payload word that its cover (`path_payload`) leaves free: traversal's
 // any-hits ignore them, and the shader of the hit reads them.
-public static const uint PAYLOAD_WEIGHED = 1 << 14; // a walk weighed the ray's stretch in its interior: the hit takes no Beer for it
+public static const uint PAYLOAD_WEIGHED = 1 << 14; // a walk weighed the ray's stretch in its interior, or a march the linked medium along it: the hit takes none of it
 public static const uint PAYLOAD_EXIT = 1 << 15;    // the hit is where a subsurface walk leaves
 public static const uint PAYLOAD_WALKED = 1 << 16;  // the path walked
 // What a hit's shader hands back in its payload's second word: the vertex drew a subsurface walk,

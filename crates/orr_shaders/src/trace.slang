@@ -283,6 +283,43 @@ public float3 trace_transmittance<T : ITraced, H : ICandidate>(T traced, RayDesc
 // composite in arrival order behind them.
 public static const uint TRANSLUCENT_BINS = 4;
 
+// What the layers `trace_resolve_translucent` composited cover along its ray, as it composited
+// them: each depth-ordered layer's distance and coverage, and the tail's as one layer at the
+// nearest distance of its own.
+public struct LayerCover
+{
+    public float depth[TRANSLUCENT_BINS];
+    public float coverage[TRANSLUCENT_BINS];
+    public float tail_depth;
+    public float tail_coverage;
+
+    // The share of the light from `s` along the ray that passes the layers in front of it.
+    public float passed(float s)
+    {
+        float passed = s > tail_depth ? 1.0 - tail_coverage : 1.0;
+        for (uint i = 0; i < TRANSLUCENT_BINS; i++)
+        {
+            if (s > depth[i])
+                passed *= 1.0 - coverage[i];
+        }
+        return passed;
+    }
+}
+
+// A cover of no layers.
+public LayerCover uncovered()
+{
+    LayerCover c;
+    for (uint i = 0; i < TRANSLUCENT_BINS; i++)
+    {
+        c.depth[i] = asfloat(0x7f800000u);
+        c.coverage[i] = 0.0;
+    }
+    c.tail_depth = asfloat(0x7f800000u);
+    c.tail_coverage = 0.0;
+    return c;
+}
+
 // The closest hit as `trace_closest`, and the translucent layers in front of it composited
 // into `layers` (premultiplied radiance in rgb, total coverage in a), procedural candidates
 // among them. The nearest `TRANSLUCENT_BINS` layers composite in depth order, later ones in
@@ -293,14 +330,24 @@ public static const uint TRANSLUCENT_BINS = 4;
 public Hit trace_resolve_translucent<T : ITraced, H : ITranslucent>(T traced, RayDesc ray, uint mask, uint flags, H handler, uint max_candidates, out float4 layers)
 {
     float3 positions[3];
-    return translucent(traced, ray, mask, flags, handler, max_candidates, false, positions, layers);
+    LayerCover cover;
+    return translucent(traced, ray, mask, flags, handler, max_candidates, false, positions, layers, cover);
 }
 
-// As above, with the hit's corner positions as in `trace_closest`.
+// As above, and in `cover` what the layers cover along the ray.
+[ForceInline]
+public Hit trace_resolve_translucent<T : ITraced, H : ITranslucent>(T traced, RayDesc ray, uint mask, uint flags, H handler, uint max_candidates, out float4 layers, out LayerCover cover)
+{
+    float3 positions[3];
+    return translucent(traced, ray, mask, flags, handler, max_candidates, false, positions, layers, cover);
+}
+
+// As the first, with the hit's corner positions as in `trace_closest`.
 [ForceInline]
 public Hit trace_resolve_translucent<T : ITraced, H : ITranslucent>(T traced, RayDesc ray, uint mask, uint flags, H handler, uint max_candidates, out float4 layers, out float3 positions[3])
 {
-    return translucent(traced, ray, mask, flags, handler, max_candidates, true, positions, layers);
+    LayerCover cover;
+    return translucent(traced, ray, mask, flags, handler, max_candidates, true, positions, layers, cover);
 }
 
 [ForceInline]
@@ -325,7 +372,7 @@ Hit closest<T : ITraced, A : IAnyHit>(T traced, RayDesc ray, uint mask, uint fla
 }
 
 [ForceInline]
-Hit translucent<T : ITraced, H : ITranslucent>(T traced, RayDesc ray, uint mask, uint flags, H handler, uint max_candidates, bool fetch, out float3 positions[3], out float4 layers)
+Hit translucent<T : ITraced, H : ITranslucent>(T traced, RayDesc ray, uint mask, uint flags, H handler, uint max_candidates, bool fetch, out float3 positions[3], out float4 layers, out LayerCover cover)
 {
     float4 bins[TRANSLUCENT_BINS];
     float depth[TRANSLUCENT_BINS];
@@ -387,13 +434,22 @@ Hit translucent<T : ITraced, H : ITranslucent>(T traced, RayDesc ray, uint mask,
     committed_positions(q, fetch, h, positions);
     float limit = h.hit ? h.t : ray.TMax;
     layers = 0;
+    cover = uncovered();
     for (uint i = 0; i < TRANSLUCENT_BINS; i++)
     {
         if (depth[i] < limit)
+        {
             layers = over(layers, bins[i]);
+            cover.depth[i] = depth[i];
+            cover.coverage[i] = bins[i].a;
+        }
     }
     if (tail_near < limit)
+    {
         layers = over(layers, tail);
+        cover.tail_depth = tail_near;
+        cover.tail_coverage = tail.a;
+    }
     return h;
 }
 

@@ -76,7 +76,7 @@ public void media_segment<M : IMedium>(PathRoot r, inout PathLoop p, inout Sampl
         float3 through_medium;
         float3 e;
         if (ray.chain)
-            e = froxel_segment_inscatter<M>(r.froxels, r.view, r.set, ray.origin, ray.dir, t, r.segment_steps, rng.next(), through_medium);
+            e = froxel_segment_inscatter<M>(r.froxels, r.view, r.set, ray.origin, ray.dir, t, r.segment_steps, rng.next(), uncovered(), through_medium);
         else
             e = segment_inscatter<M>(r.set, ray.origin, ray.dir, t, r.segment_steps, rng.next(), through_medium);
         if (has(p.flags, LOOP_COUNTED) && !x.photon)

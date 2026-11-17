@@ -26,6 +26,7 @@ import orr_scene.visibility;
 import orr_lighting.bsdf;
 import orr_lighting.media;
 import orr_lighting.environment;
+import orr_lighting.froxels;
 import orr_lighting.light_sampling;
 import orr_lighting.shadow;
 import orr_lighting.specialize;
@@ -933,26 +934,16 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     float3 sigma = inside ? interior_sigma(cold) : float3(0.0);
 
     // The medium along the ray: an interior's, or the linked medium's, whose camera segment the
-    // view composes from the froxels.
-    float u_segment = rng.next();
-    // A walk's step weighed the stretch of the ray inside, and a photon's start the way from its
-    // light to its first vertex.
+    // view composes from the froxels. A march of the linked medium's in-scatter along the ray ran
+    // before the hit, from the vertex's first draw (`lean_front`).
+    rng.next();
+    // A walk's step weighed the stretch of the ray inside, a photon's start the way from its light
+    // to its first vertex, and the march the linked medium.
+    bool weighed = may_any(MAY_SCATTERING | MAY_MEDIUM) && (input.x & PAYLOAD_WEIGHED) != 0;
     if (inside && !(photon && first))
-        throughput *= may(MAY_SCATTERING) && (input.x & PAYLOAD_WEIGHED) != 0 ? float3(1.0) : beer(sigma, inside_length(at, t));
-    else if (!first)
-    {
-        float3 origin = asfloat(w0.xyz);
-        if (t >= INSCATTER_SEGMENT)
-        {
-            float3 through;
-            float3 e = segment_inscatter<M>(r.set, origin, dir, t, r.segment_steps, u_segment, through);
-            if (along)
-                added += throughput * e;
-            throughput *= through;
-        }
-        else
-            throughput *= medium_transmittance<M>(r.scene.medium, origin, dir, t);
-    }
+        throughput *= weighed ? float3(1.0) : beer(sigma, inside_length(at, t));
+    else if (!first && !weighed)
+        throughput *= medium_transmittance<M>(r.scene.medium, asfloat(w0.xyz), dir, t);
     // A camera ray whose segment the froxels hold took none of the medium of the interiors around
     // the eye, but its vertex lies in them.
     if (may(MAY_INTERIORS) && may(MAY_FROXELS) && (flags & HOT_INTERIOR_HELD) != 0)
@@ -3006,14 +2997,23 @@ struct FrontLayers<M : IMedium> : ITranslucent
     }
 }
 
-// The callable that takes what `slot`'s path ray meets in front of its hit `t` m along it, under
-// instance mask `mask`: particles, each a layer of its emission at its opacity, and the proxies of
-// sphere and rect lights, layers that only emit, in depth order as the staged loop's trace stage
-// takes them. What the layers emit toward a ray whose light counts adds to the path's radiance, and
-// what they cover leaves its throughput. A view path's ray inside a medium that scatters ends where
-// the raygen's draw for its segment (`free_flight`) says it scatters, if that falls before its
-// hit. Whether the path still carries light.
-public bool lean_front<M : IMedium>(PathRoot r, uint slot, float t, uint mask, bool view)
+// How the callable of what a path's ray meets along its way to its hit takes the linked medium
+// there: it leaves it to the hit's vertex, which takes its transmittance alone; it marches its
+// in-scatter; or it marches that through the view's froxels, as for a ray that left a layer, a
+// scatter or a walk's way out.
+public static const uint MARCH_NONE = 0;
+public static const uint MARCH_PLAIN = 1;
+public static const uint MARCH_FROXELS = 2;
+
+// The callable that takes what `slot`'s path ray meets on its way to its hit `t` m along it: under
+// instance mask `mask`, 0 for none, particles, each a layer of its emission at its opacity, and the
+// proxies of sphere and rect lights, layers that only emit, in depth order as the staged loop's
+// trace stage takes them; and the linked medium as `march` (MARCH_*) says. What the layers emit
+// toward a ray whose light counts adds to the path's radiance, and what they cover leaves its
+// throughput; the medium's in-scatter in front of a layer is not covered by it. A view path's ray
+// inside a medium that scatters ends where the raygen's draw for its segment (`free_flight`) says
+// it scatters, if that falls before its hit. Whether the path still carries light.
+public bool lean_front<M : IMedium>(PathRoot r, uint slot, float t, uint mask, bool view, uint march)
 {
     uint4* at = lean_hot(r, slot);
     uint4 w0 = load_coherent(at);
@@ -3058,12 +3058,37 @@ public bool lean_front<M : IMedium>(PathRoot r, uint slot, float t, uint mask, b
     float3 own = float3(lit ? 0.0 : 1.0);
     if (lean_caustics(r) && adds && !lit)
         own = load_chain(lean_chain(r, slot), false).owned();
-    PathEmission pe = { r.scene, r.set, local, origin, dir, from, left_normal(flags, w1), mode.one_technique ? 0.0 : w3.w, abs(run), end, own, adds };
-    FrontLayers<M> f = { pe, r.scene.medium, inside, drawn, sigma_t, at };
-    float4 layers;
-    trace_resolve_translucent(scene_traced(r.scene), path_ray(origin, dir, end), mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, f, PARTICLE_CANDIDATES, layers);
+    float4 layers = float4(0.0);
+    LayerCover cover = uncovered();
+    if (mask != 0)
+    {
+        PathEmission pe = { r.scene, r.set, local, origin, dir, from, left_normal(flags, w1), mode.one_technique ? 0.0 : w3.w, abs(run), end, own, adds };
+        FrontLayers<M> f = { pe, r.scene.medium, inside, drawn, sigma_t, at };
+        trace_resolve_translucent(scene_traced(r.scene), path_ray(origin, dir, end), mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, f, PARTICLE_CANDIDATES, layers, cover);
+    }
     float3 throughput = hot_throughput(w1);
     w3.xyz += throughput * layers.rgb;
+    if (march != MARCH_NONE)
+    {
+        // The march's jitter is the first draw of the hit's vertex, which takes none of the medium.
+        Sampler rng = path_sampler(r, item_pixel(r, r.slice_base + slot));
+        rng.dimension = flags >> HOT_DIMENSION_SHIFT;
+        float u = rng.next();
+        float3 through;
+        float3 e;
+        if (march == MARCH_FROXELS)
+        {
+            FroxelVolume* froxels = nullptr;
+            if (may(MAY_FROXELS))
+                froxels = r.froxels;
+            e = froxel_segment_inscatter<M>(froxels, r.view, r.set, origin, dir, t, r.segment_steps, u, cover, through);
+        }
+        else
+            e = segment_inscatter<M>(r.set, origin, dir, t, r.segment_steps, u, cover, through);
+        if ((flags & HOT_COUNTED) != 0)
+            w3.xyz += throughput * e;
+        throughput *= through;
+    }
     throughput *= 1.0 - layers.a;
     store_coherent(at + 1, uint4(w1.xy, as_halves(throughput.xy), as_halves(float2(throughput.z, halves(w1.w).y))));
     store_coherent(at + 3, asuint(w3));
