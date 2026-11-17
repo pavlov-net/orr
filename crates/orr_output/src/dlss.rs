@@ -2,7 +2,7 @@
 
 use orr_dlss::{
     DlssSdk, FgCamera, FgInputs, FrameGeneration, MIN_OUTPUT, Mode, Quality, RayReconstruction,
-    RrInputs,
+    RrInputs, SrInputs, SuperResolution,
 };
 use orr_math::{DMat4, DVec3, Vec3};
 use orr_scene::orr_gpu::{CommandList, Device, Texture};
@@ -10,8 +10,8 @@ use orr_scene::orr_gpu::{CommandList, Device, Texture};
 use crate::{
     Error, FrameGenerationBackend, FrameGenerationCamera, FrameGenerationFeature,
     FrameGenerationInputs, InterpolationCheck, ReconstructionBackend, ReconstructionFeature,
-    ReconstructionInputs, ReconstructionMode, ReconstructionSupport, Result, UpscaleMode,
-    UpscaleQuality,
+    ReconstructionInputs, ReconstructionMode, ReconstructionSupport, Result, UpscaleBackend,
+    UpscaleFeature, UpscaleInputs, UpscaleMode, UpscaleQuality,
 };
 
 impl ReconstructionBackend for DlssSdk {
@@ -30,17 +30,11 @@ impl ReconstructionBackend for DlssSdk {
         output: [u32; 2],
         quality: UpscaleQuality,
     ) -> Result<Box<dyn ReconstructionFeature>> {
-        let quality = match quality {
-            UpscaleQuality::Auto => Quality::Auto,
-            UpscaleQuality::Fixed(mode) => Quality::Fixed(match mode {
-                UpscaleMode::Quality => Mode::Quality,
-                UpscaleMode::Balanced => Mode::Balanced,
-                UpscaleMode::Performance => Mode::Performance,
-                UpscaleMode::UltraPerformance => Mode::UltraPerformance,
-            }),
-        };
         Ok(Box::new(RayReconstruction::new(
-            self, output, quality, None,
+            self,
+            output,
+            dlss_quality(quality),
+            None,
         )?))
     }
 
@@ -64,15 +58,31 @@ impl ReconstructionBackend for DlssSdk {
     }
 }
 
+fn dlss_quality(quality: UpscaleQuality) -> Quality {
+    match quality {
+        UpscaleQuality::Auto => Quality::Auto,
+        UpscaleQuality::Fixed(mode) => Quality::Fixed(match mode {
+            UpscaleMode::Quality => Mode::Quality,
+            UpscaleMode::Balanced => Mode::Balanced,
+            UpscaleMode::Performance => Mode::Performance,
+            UpscaleMode::UltraPerformance => Mode::UltraPerformance,
+        }),
+    }
+}
+
+fn reconstruction_mode(mode: Mode) -> ReconstructionMode {
+    match mode {
+        Mode::Dlaa => ReconstructionMode::Dlaa,
+        Mode::Quality => ReconstructionMode::Upscale(UpscaleMode::Quality),
+        Mode::Balanced => ReconstructionMode::Upscale(UpscaleMode::Balanced),
+        Mode::Performance => ReconstructionMode::Upscale(UpscaleMode::Performance),
+        Mode::UltraPerformance => ReconstructionMode::Upscale(UpscaleMode::UltraPerformance),
+    }
+}
+
 impl ReconstructionFeature for RayReconstruction {
     fn mode(&self) -> ReconstructionMode {
-        match RayReconstruction::mode(self) {
-            Mode::Dlaa => ReconstructionMode::Dlaa,
-            Mode::Quality => ReconstructionMode::Upscale(UpscaleMode::Quality),
-            Mode::Balanced => ReconstructionMode::Upscale(UpscaleMode::Balanced),
-            Mode::Performance => ReconstructionMode::Upscale(UpscaleMode::Performance),
-            Mode::UltraPerformance => ReconstructionMode::Upscale(UpscaleMode::UltraPerformance),
-        }
+        reconstruction_mode(RayReconstruction::mode(self))
     }
 
     fn render_size(&self) -> [u32; 2] {
@@ -112,6 +122,82 @@ impl ReconstructionFeature for RayReconstruction {
             jitter: inputs.view.jitter.to_array(),
         };
         Ok(RayReconstruction::record(self, list, &inputs)?)
+    }
+}
+
+impl UpscaleBackend for DlssSdk {
+    fn upscale_support(&self) -> ReconstructionSupport {
+        let sr = DlssSdk::support(self).sr;
+        ReconstructionSupport {
+            available: sr,
+            dlaa: sr,
+            min_output: MIN_OUTPUT,
+            scale: None,
+        }
+    }
+
+    fn upscaler(
+        &self,
+        output: [u32; 2],
+        quality: UpscaleQuality,
+    ) -> Result<Box<dyn UpscaleFeature>> {
+        Ok(Box::new(SuperResolution::new(
+            self,
+            output,
+            dlss_quality(quality),
+            None,
+        )?))
+    }
+
+    fn upscaler_at(&self, render: [u32; 2], output: [u32; 2]) -> Result<Box<dyn UpscaleFeature>> {
+        Ok(Box::new(SuperResolution::with_render_size(
+            self, render, output, None,
+        )?))
+    }
+
+    fn antialiaser(&self, output: [u32; 2]) -> Result<Box<dyn UpscaleFeature>> {
+        Ok(Box::new(SuperResolution::new(
+            self,
+            output,
+            Quality::Fixed(Mode::Dlaa),
+            None,
+        )?))
+    }
+}
+
+impl UpscaleFeature for SuperResolution {
+    fn mode(&self) -> ReconstructionMode {
+        reconstruction_mode(SuperResolution::mode(self))
+    }
+
+    fn render_size(&self) -> [u32; 2] {
+        SuperResolution::render_size(self)
+    }
+
+    fn output_size(&self) -> [u32; 2] {
+        SuperResolution::output_size(self)
+    }
+
+    fn jitter(&self, frame: u64) -> [f32; 2] {
+        SuperResolution::jitter(self, frame)
+    }
+
+    fn mip_bias(&self) -> f32 {
+        SuperResolution::mip_bias(self)
+    }
+
+    fn record(&mut self, list: &mut CommandList<'_>, inputs: &UpscaleInputs<'_>) -> Result<()> {
+        let inputs = SrInputs {
+            color: inputs.color,
+            depth: inputs.depth,
+            motion: inputs.motion,
+            exposure: inputs.exposure,
+            pre_exposure: inputs.pre_exposure,
+            output: inputs.output,
+            reset: inputs.reset,
+            jitter: inputs.jitter,
+        };
+        Ok(SuperResolution::record(self, list, &inputs)?)
     }
 }
 

@@ -22,6 +22,7 @@ mod present;
 mod reconstruction;
 mod screenshot;
 mod ui;
+mod upscale;
 mod view;
 mod white_balance;
 
@@ -63,6 +64,7 @@ pub use reconstruction::{
 };
 pub use screenshot::{Screenshot, ScreenshotRequest};
 pub use ui::{UiLayer, UiPass};
+pub use upscale::{UpscaleBackend, UpscaleFeature, UpscaleInputs};
 pub use view::{GlareMethod, OutputDebug, PostQuality, ViewOutput};
 pub use white_balance::{AutoWhiteBalance, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV};
 

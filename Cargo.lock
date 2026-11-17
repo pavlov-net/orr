@@ -2399,6 +2399,7 @@ dependencies = [
  "half",
  "log",
  "orr_gpu",
+ "orr_math",
  "thiserror 2.0.21",
  "uuid",
 ]

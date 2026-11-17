@@ -21,7 +21,6 @@
 #![cfg(vulkan)]
 
 mod error;
-mod jitter;
 pub mod raw;
 mod sdk;
 
