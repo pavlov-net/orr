@@ -350,8 +350,7 @@ uint stack_ray(PathRoot r, RayDesc ray, uint depth, out float t, inout uint4 fac
         return MET_NONE;
     if (h.record<HitData>().class_id() != CLASS_DIELECTRIC)
         return MET_OTHER;
-    p.words = uint4(0);
-    h.invoke(p);
+    invoke_path<false>(h, INVOKE_STACK, p);
     face = p.words;
     return MET_FACE;
 }
@@ -374,9 +373,9 @@ void bent_rerun(PathRoot r, uint slot)
         ray.TMin = asfloat(asuint(t) - 4);
         uint mask = input.x & 0xff;
         Traced h = trace_hit(r.scene.tlas, (mask & MASK_CAMERA) != 0 ? RAY_FLAG_NONE : RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, mask, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, ray, p);
-        p.words = uint4(input.x, PAYLOAD_BENT, input.zw);
+        p.words.xzw = input.xzw;
         if (h.hit())
-            h.invoke(p);
+            invoke_path<false>(h, INVOKE_RERUN, p);
         return;
     }
     p.words.y = b.w == BENT_MEDIUM ? input.y | MEDIUM_BENT : PAYLOAD_BENT;
@@ -392,9 +391,9 @@ bool stack_miss(PathRoot r, uint slot, uint4* at, inout Payload p)
     if (asfloat(load_coherent(at + 3)).w != PDF_STACK)
         return false;
     float3 dir = oct_decode_snorm16(load_coherent(at + 1).x);
-    p.words.y = stack_owned(r, slot, dir) ? 1 : 0;
+    uint mode = stack_owned(r, slot, dir) ? INVOKE_OWNED : INVOKE_VERTEX;
     Traced m = traced_miss(MISS_SCATTER, path_ray(asfloat(load_coherent(at).xyz), dir, positive_infinity()));
-    m.invoke(p);
+    invoke_path<false>(m, mode, p);
     return true;
 }
 
@@ -499,9 +498,34 @@ uint4 scattered_cover(PathRoot r, uint slot, uint4* at, uint mask)
     float2 cone = halves(load_coherent(at + 2).x);
     uint depth = context_depth(r, slot, load_coherent(at).w);
     RayCone c = { cone.x, cone.y };
-    uint seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x;
-    return path_payload(new_path_cover(mask, COVER_LAYERS, PRESENCE_DRAWN, pcg(seed ^ depth),
+    return path_payload(new_path_cover(mask, COVER_LAYERS, PRESENCE_DRAWN, cover_draw(r, pixel, depth),
         hit_context(HIT_SECONDARY, depth, c, 0.0, float2(-1.0), texture_feedback_drawn(pixel, r.frame))));
+}
+
+// What the shader of a path ray's hit or miss runs for (`invoke_path`): the ray's vertex or miss;
+// the vertex's re-run, which weighs its bent job's light; the stack question, whether the hit lies
+// on a plane stack's face; and the miss of a ray past plane stack faces whose directional light's
+// disc next-event estimation takes.
+static const uint INVOKE_VERTEX = 0;
+static const uint INVOKE_RERUN = 1;
+static const uint INVOKE_STACK = 2;
+static const uint INVOKE_OWNED = 3;
+
+// Runs the shader of `h`, which a path ray's trace with payload `p` found, for `mode`, after a reorder
+// by it where `REORDER`. The payload's second word, where the trace left its cover's draw, says what
+// for, and the stack question's first word is 0 too: so no shader takes a draw for the raygen's word.
+// A thin wall's window question writes its whole payload (`window_payload`). Inline, so the hit
+// object is not copied.
+[ForceInline]
+void invoke_path<let REORDER : bool>(Traced h, uint mode, inout Payload p)
+{
+    p.words.y = mode == INVOKE_RERUN ? PAYLOAD_BENT : mode == INVOKE_OWNED ? 1 : 0;
+    if (mode == INVOKE_STACK)
+        p.words.x = 0;
+    if (REORDER)
+        reorder_invoke(h, p);
+    else
+        h.invoke(p);
 }
 
 // Ends `slot`'s path in hot words `at`: its ray and shadow job gone.
@@ -833,9 +857,8 @@ uint trace_ray<let VIEW : bool, let PHOTON : bool>(PathRoot r, uint slot, uint4*
     uint flags = traced_camera ? RAY_FLAG_NONE : RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE;
     uint depth = context_depth(r, slot, w0.w);
     RayCone c = { cone.x, cone.y };
-    uint seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x;
     // A presence layer is there where the ray's draw falls below its opacity.
-    PathCover cover = new_path_cover(mask, COVER_LAYERS, PRESENCE_DRAWN, pcg(seed ^ depth),
+    PathCover cover = new_path_cover(mask, COVER_LAYERS, PRESENCE_DRAWN, cover_draw(r, pixel, depth),
         hit_context(primary ? HIT_PRIMARY : HIT_SECONDARY, depth, c, 0.0, float2(-1.0), !PHOTON && texture_feedback_drawn(pixel, r.frame)));
     RayDesc ray = path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), t_max);
     // A model that mixes classes holds opaque geometry a layered tile's mask can't turn away: the
@@ -938,12 +961,10 @@ uint run_path(PathRoot r, uint slot, uint4* at, uint next)
         // A hit past a walk takes it as walked, but where a walk leaves.
         if (trail.walked && (p.words.x & PAYLOAD_EXIT) == 0)
             p.words.x |= PAYLOAD_WALKED;
-        // The second word tells a hit's shader its vertex's re-run apart (`PAYLOAD_BENT`), and a
-        // miss whose ray crossed plane stack faces whether its light through them is next-event
-        // estimation's, which a probe from the vertex before them says.
+        // A miss whose ray crossed plane stack faces is told whether its light through them is
+        // next-event estimation's, which a probe from the vertex before them says.
         if (may(MAY_STACK))
         {
-            p.words.y = 0;
             if (!walked && h.miss() && stack_miss(r, slot, at, p))
             {
                 trail.chain = false;
@@ -954,13 +975,13 @@ uint run_path(PathRoot r, uint slot, uint4* at, uint next)
         bool layer;
         if (walked)
         {
-            reorder_invoke(w, p);
+            invoke_path<true>(w, INVOKE_VERTEX, p);
             hit = w.hit();
             layer = hit && may(MAY_LAYERS) && layer_record(w);
         }
         else
         {
-            reorder_invoke(h, p);
+            invoke_path<true>(h, INVOKE_VERTEX, p);
             hit = h.hit();
             layer = hit && may(MAY_LAYERS) && layer_record(h);
         }
@@ -1189,7 +1210,7 @@ public void lean_photons(PathRoot r)
         h = trace_hit(r.scene.tlas, RAY_FLAG_NONE, mask, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), asfloat(start.words.y)), p);
         if (!h.hit())
             return;
-        reorder_invoke(h, p);
+        invoke_path<true>(h, INVOKE_VERTEX, p);
         if (p.words.x != 0)
             return;
         trail.chain = may(MAY_LAYERS) && layer_record(h);
@@ -1214,7 +1235,7 @@ public void lean_photons(PathRoot r)
         trace_ray<false, true>(r, slot, at, w0, trail, h, p, invokes);
         if (!invokes || !h.hit())
             break;
-        reorder_invoke(h, p);
+        invoke_path<true>(h, INVOKE_VERTEX, p);
         if (p.words.x != 0)
             break;
         trail.chain = may(MAY_LAYERS) && layer_record(h);
@@ -1267,11 +1288,10 @@ public void lean_updates(PathRoot r)
         trace_ray<false, false>(r, slot, at, w0, trail, h, p, invokes);
         if (may(MAY_STACK))
         {
-            p.words.y = 0;
             if (h.miss() && stack_miss(r, slot, at, p))
                 continue;
         }
-        reorder_invoke(h, p);
+        invoke_path<true>(h, INVOKE_VERTEX, p);
         if (h.hit() && p.words.x != 0)
             end_path(at);
         else if (h.hit() && may(MAY_LAYERS) && layer_record(h) && may(MAY_INTERIORS) && may2(MAY2_THIN_DIELECTRICS))
