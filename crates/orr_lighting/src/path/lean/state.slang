@@ -161,11 +161,12 @@ public static const uint PAYLOAD_BENT = 1;
 [Host] public static const uint CAUSTIC_HIT_INSTRUCTIONS = 2600;
 [Host] public static const uint PHOTON_HIT_INSTRUCTIONS = 1100;
 [Host] public static const uint MAP_GATHER_HIT_INSTRUCTIONS = 1600;
-// The callables of the grid's gather and the reference map's, which evaluates the vertex's BSDF per
+// The callables of the grid's gather, which takes each level's cell from the receiver's plane
+// moved off the voxel boundaries, and the reference map's, which evaluates the vertex's BSDF per
 // photon; the photons' raygen, the callable that starts a photon from a caster and its light, and
 // the one of its deposit, which where paths split by wavelength carries the flux through their
 // transfer.
-[Host] public static const uint GATHER_INSTRUCTIONS = 2800;
+[Host] public static const uint GATHER_INSTRUCTIONS = 2850;
 [Host] public static const uint MAP_GATHER_INSTRUCTIONS = 13500;
 [Host] public static const uint RAYGEN_PHOTON_INSTRUCTIONS = 2500;
 [Host] public static const uint PHOTON_START_INSTRUCTIONS = 14000;

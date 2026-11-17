@@ -322,6 +322,8 @@ pub const GLASS_SLAB: &str = "glass slab";
 pub const SKIN_SLAB: &str = "skin slab";
 /// An upright 2 m square perfect mirror (metal), facing +z.
 pub const MIRROR: &str = "mirror";
+/// A unit sphere of [`MIRROR`]'s material.
+pub const MIRROR_SPHERE: &str = "mirror sphere";
 /// The floor as a perfectly smooth black dielectric: only its mirror reflection shows.
 pub const SMOOTH_FLOOR: &str = "smooth floor";
 /// The floor with a strong bump normal map.
@@ -1403,6 +1405,7 @@ fn cook() -> Arc<[u8]> {
                     },
                 },
                 model(MIRROR, upright(1.0), vec![mirror]),
+                model(MIRROR_SPHERE, mesh(|b| b.sphere(0, 32, 1.0)), vec![mirror]),
                 model(
                     SMOOTH_FLOOR,
                     mesh(|b| b.quad(0, square(5.0, 0.0), y, 8)),

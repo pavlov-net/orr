@@ -1,13 +1,14 @@
 //! Caustic photons: the grid's irradiance under a slab against Fresnel and Beer's law, under a
 //! ball lens against its 1D map from impact parameter to radius, and the reference's photons
 //! against BSDF rays alone, by Welch's test, through a glass sphere from a light photons own and
-//! from the environment, which they do not.
+//! from the environment, which they do not. A mirror ball's caustic on a floor at a voxel boundary
+//! of every grid level against the reference's map.
 
 use lighting_suite::assert_clean;
 use lighting_suite::bed::{
-    Accumulated, BLACK_SPHERE, Bed, EMITTER, FloorDecal, GLASS_SPHERE, Item, MIRROR, Particle,
-    Paths, SKY, SUN, Spec, TINTED_SLAB, WHITE_FLOOR, WHITE_FLOOR_ALBEDO, fresnel, pixel_of,
-    reference,
+    Accumulated, BLACK_SPHERE, Bed, EMITTER, FloorDecal, GLASS_SPHERE, Item, MIRROR, MIRROR_SPHERE,
+    Particle, Paths, SKY, SUN, Spec, TINTED_SLAB, WHITE_FLOOR, WHITE_FLOOR_ALBEDO, fresnel,
+    pixel_of, reference,
 };
 use lighting_suite::welch::{assert_mean, assert_same_mean};
 use orr_gpu::KernelSet;
@@ -297,6 +298,48 @@ fn patch_means(
     (0..renders)
         .map(|k| render_paths(bed, paths, frames, seed * 1000 + k).around(at, 6)[1])
         .collect()
+}
+
+/// A mirror ball on the white floor, which lies at height 0 on a voxel boundary of every grid
+/// level, under a sun behind it, seen from low over the floor: what the grid gives the floor where
+/// the ball throws the sun onto it, over the view, within 10 % of the reference map's. Photons and
+/// reads round either side of that boundary, and the grid takes a receiver's cell from its plane
+/// moved off it, so both meet in one cell.
+#[test]
+fn a_floor_on_the_grids_voxel_boundaries_takes_its_whole_caustic() {
+    let ball = Vec3::new(0.0, 0.7, 0.0);
+    let spec = Spec {
+        copies: vec![
+            at(WHITE_FLOOR, Vec3::ZERO),
+            Item {
+                model: MIRROR_SPHERE,
+                linear: Mat3::from_diagonal(Vec3::splat(0.7)),
+                at: ball,
+            },
+        ],
+        lights: vec![Light::Directional(DirectionalLight {
+            direction_to_light: Vec3::new(-0.453_413_4, 0.654_930_5, 0.604_551_3),
+            ..SUN
+        })],
+        environment: None,
+        eye: ball + Vec3::new(4.03, 1.3, 0.54),
+        target: Vec3::new(-2.3, 0.9, -1.2),
+        fov_y: 0.8,
+        focus: None,
+    };
+    let mut bed = Bed::with(spec);
+    let total = |a: &Accumulated| a.mean.iter().map(|p| f64::from(p[1])).sum::<f64>();
+    let grid = total(&render_paths(&mut bed, &paths(gathered()), 32, 1));
+    let map = paths(ViewLighting {
+        debug_view: LightingDebugView::Caustics,
+        ..reference(2)
+    });
+    let map = total(&render_paths(&mut bed, &map, 32, 2));
+    assert!(
+        (grid / map - 1.0).abs() < 0.1,
+        "the grid's caustic {grid:.1}, the map's {map:.1}"
+    );
+    assert_clean();
 }
 
 /// The floor under a glass sphere, seen beside it, takes the same light from the reference
