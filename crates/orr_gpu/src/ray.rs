@@ -1,6 +1,9 @@
 //! Descriptions of ray tracing pipelines and their binding tables, alike on every backend.
 //! Only the Vulkan backend creates them (`Caps::ray_dispatch`).
 
+use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, Condvar, Mutex};
+
 use crate::{Caps, GpuAddress, ShaderStage};
 
 bitflags::bitflags! {
@@ -70,10 +73,11 @@ pub struct HitGroup {
     pub intersection: Option<u32>,
 }
 
-/// How many threads compile a [`RayPipelineDesc`]'s shaders: the driver compiles them in
-/// parallel on threads that join the creation, up to the concurrency it reports. NVIDIA's
-/// driver reports no pipeline cache hit for a creation more than one thread joins, so
-/// [`crate::PipelineCacheReport`] counts such a creation from the cache file as a miss.
+/// How many threads compile a [`RayPipelineDesc`]'s shaders: they fold the stages not yet folded
+/// ([`ShaderStage::fold`]), and the driver compiles them in parallel on threads that join the
+/// creation, up to the concurrency it reports. NVIDIA's driver reports no pipeline cache hit for
+/// a creation more than one thread joins, so [`crate::PipelineCacheReport`] counts such a
+/// creation from the cache file as a miss.
 #[derive(Clone, Copy)]
 pub enum CompileThreads<'a> {
     /// The calling thread and up to `n - 1` threads the creation spawns. 1 compiles on the
@@ -92,6 +96,125 @@ impl Default for CompileThreads<'_> {
     /// Every hardware thread.
     fn default() -> Self {
         Self::Spawned(std::thread::available_parallelism().map_or(1, |n| n.get() as u32))
+    }
+}
+
+impl CompileThreads<'_> {
+    /// What `f` returns for each index below `count`, in order. The calls run on these threads,
+    /// the calling one among them, as a pipeline's compile does, and have all returned when this
+    /// does; a call that panics panics this once the others have.
+    pub fn map<T: Send>(&self, count: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        let out: Vec<Mutex<Option<T>>> = std::iter::repeat_with(|| Mutex::new(None))
+            .take(count)
+            .collect();
+        let work = |i: usize| *out[i].lock().unwrap() = Some(f(i));
+        let work: &(dyn Fn(usize) + Sync) = &work;
+        let calls = Arc::new(Calls {
+            // SAFETY: only the lifetime changes; `Calls::work` says when it is valid.
+            work: unsafe {
+                std::mem::transmute::<
+                    *const (dyn Fn(usize) + Sync + '_),
+                    *const (dyn Fn(usize) + Sync + 'static),
+                >(work)
+            },
+            count,
+            state: Mutex::default(),
+            returned: Condvar::new(),
+        });
+        // Every call has returned and none starts once this drops, however `map` returns.
+        let finished = Finished(&calls);
+        let helpers = match *self {
+            Self::Spawned(n) | Self::Pool { max: n, .. } => count.min(n as usize).saturating_sub(1),
+        };
+        match *self {
+            Self::Spawned(_) => std::thread::scope(|s| {
+                for _ in 0..helpers {
+                    s.spawn(|| calls.run());
+                }
+                calls.run();
+            }),
+            Self::Pool { spawn, .. } => {
+                for _ in 0..helpers {
+                    let calls = Arc::clone(&calls);
+                    spawn(Box::new(move || calls.run()));
+                }
+                calls.run();
+            }
+        }
+        drop(finished);
+        if let Some(panic) = calls.state.lock().unwrap().panic.take() {
+            std::panic::resume_unwind(panic);
+        }
+        out.into_iter()
+            .map(|o| o.into_inner().unwrap().expect("every index is called once"))
+            .collect()
+    }
+}
+
+/// The calls of a [`CompileThreads::map`], which its threads start in turn. A pool's helper may
+/// hold it past the map, finding no call left to start.
+struct Calls {
+    /// The map's work, valid while a call it started has not returned.
+    work: *const (dyn Fn(usize) + Sync),
+    count: usize,
+    state: Mutex<CallState>,
+    /// Notified as a call returns.
+    returned: Condvar,
+}
+
+// SAFETY: the work is Sync, and a thread calls it only while the map waits for the call.
+unsafe impl Send for Calls {}
+// SAFETY: as above.
+unsafe impl Sync for Calls {}
+
+#[derive(Default)]
+struct CallState {
+    /// The calls started, which is the next index to call.
+    started: usize,
+    /// The calls started that have not returned.
+    running: usize,
+    /// No more calls start: one panicked, or the map is done.
+    closed: bool,
+    /// The first panic of a call.
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+impl Calls {
+    /// Makes calls until none is left to start.
+    fn run(&self) {
+        loop {
+            let i = {
+                let mut s = self.state.lock().unwrap();
+                if s.closed || s.started == self.count {
+                    return;
+                }
+                s.started += 1;
+                s.running += 1;
+                s.started - 1
+            };
+            // SAFETY: the call is running, so the map waits and its work is live.
+            let work = unsafe { &*self.work };
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| work(i)));
+            let mut s = self.state.lock().unwrap();
+            s.running -= 1;
+            if let Err(panic) = result {
+                s.closed = true;
+                s.panic.get_or_insert(panic);
+            }
+            drop(s);
+            self.returned.notify_all();
+        }
+    }
+}
+
+/// Closes a map's calls and waits for those started to return, as it drops.
+struct Finished<'a>(&'a Calls);
+
+impl Drop for Finished<'_> {
+    fn drop(&mut self) {
+        let mut s = self.0.state.lock().unwrap();
+        s.closed = true;
+        drop(self.0.returned.wait_while(s, |s| s.running > 0).unwrap());
     }
 }
 
