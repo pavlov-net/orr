@@ -1,0 +1,18 @@
+[package]
+name = "orr_metalfx"
+description = "MetalFX denoised and temporal upscaling and frame interpolation on orr's Metal backend."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The crate is empty off Apple targets, where orr_gpu has no Metal backend.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2.workspace = true
+objc2-metal.workspace = true
+objc2-metal-fx.workspace = true
+orr_gpu.workspace = true
+
+[lints]
+workspace = true
