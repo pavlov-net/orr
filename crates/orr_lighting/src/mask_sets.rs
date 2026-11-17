@@ -411,6 +411,14 @@ impl<K: Members> MaskSets<K> {
         Ok(covering.is_some())
     }
 
+    /// The ready set that holds `members` for paths that may meet `may`, as [`Self::wait`] takes
+    /// it, without waiting: none while every set that would is still compiling.
+    pub(crate) fn ready(&self, may: u64, members: &[usize]) -> Option<Arc<MaskSet<K::Pipeline>>> {
+        let now = Instant::now();
+        self.note(may, now);
+        self.covering(may, may, members, now)
+    }
+
     /// How many pipelines a frame or a caller waits for are still compiling: those asked for as
     /// needed of sets no ready set stands in for. A set holding more, with every member the
     /// other was asked for ready and nothing of its own still compiling, runs that one's frames

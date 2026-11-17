@@ -162,6 +162,9 @@ public struct LaunchHeader
     public uint stack_at;
     public uint light_at;
     public uint spectral_at;
+    // The lean tracer's: a word a slot (`path.lean.state`'s `PathChain`) where its paths may gather
+    // caustic photons; null elsewhere.
+    public uint4* chain;
 }
 
 // A queue of path slots in one round: the workgroups its stage runs over, which whoever
@@ -2223,8 +2226,11 @@ public struct PhotonStart
 public bool photon_start<S : ISurfaces, M : IMedium>(PathRoot r, uint index, inout Sampler rng, out PhotonStart p)
 {
     PhotonRay ray;
-    if (!photon_emit<S>(r, index, rng, p, ray))
+    ResolvedLightSample c;
+    if (!photon_emit<S>(r, index, rng, p, ray, c))
         return false;
+    if (c.view)
+        p.flux *= emitter_view_layer<S>(r.set, c, interior_ior(r.scene, p.interior.innermost()));
     p.flux *= visibility<S, M, SHADOW_PHOTON>(r.scene, r.view, ray.origin, ray.dir, ray.t_max, RAY_FLAG_NONE, photon_ray_context(), false, p.interior, r.set.shadow_overflows);
     return any(p.flux > 0.0);
 }
@@ -2244,79 +2250,102 @@ public HitContext photon_ray_context()
     return hit_context(HIT_SECONDARY, 0, cone, 0.0);
 }
 
-// `photon_start` but for its shadow ray, which `ray` holds: `p.flux` is the photon's before what
-// the ray lets through. False for a photon that starts with no flux.
-public bool photon_emit<S : ISurfaces>(PathRoot r, uint index, inout Sampler rng, out PhotonStart p, out PhotonRay ray)
+// Where photon `index` of a frame whose casters have weight starts: a caster entry by its weight,
+// a cluster of its list by its fixed-point step, a triangle uniform by index and a point uniform in
+// it, at a density per m^2 among the frame's photons. Counts the photon started from its entry.
+// False for one that starts nowhere.
+public struct PhotonCaster
 {
-    p = PhotonStart();
-    ray = PhotonRay();
+    public uint entry;
+    public uint instance_index;
+    public uint cluster_id;
+    public uint triangle;
+    public float2 barycentrics;
+    public float3 point;
+    public float3 normal;           // the triangle's geometric normal
+    public float density;
+    public uint material;           // the triangle's section material
+    public float3 positions[3];
+}
+
+public bool photon_caster(PathRoot r, uint index, inout Sampler rng, out PhotonCaster k)
+{
+    k = PhotonCaster();
     SceneRoot* s = r.scene;
     CausticsGpu* g = r.caustics;
     PhotonSourceGpu* source = g.source;
-    LightSetGpu* set = r.set;
     float pick = rng.next();
     uint2 bits = uint2(rng.next_bits(), rng.next_bits());
     float2 u = rng.next2();
     uint entry = upper_bound(source.cdf, source.entry_count, below(pick, source.total));
-    p.entry = entry;
+    k.entry = entry;
     count_started(source, g, entry);
     EmissiveSelection e = source.entries[entry];
     float chosen = source.cdf[entry] - (entry > 0 ? source.cdf[entry - 1] : 0.0);
     if (e.count == 0)
         return false;
     uint pos = upper_bound(e.cdf, e.count, mulhi(bits.x, 0xffffffffu));
-    uint instance_index, cluster_id, triangles, alpha_first;
-    if (!list_cluster(s, e, entry, pos, instance_index, cluster_id, triangles, alpha_first) || triangles == 0)
+    uint triangles, alpha_first;
+    if (!list_cluster(s, e, entry, pos, k.instance_index, k.cluster_id, triangles, alpha_first) || triangles == 0)
         return false;
-    uint triangle = mulhi(bits.y, triangles);
+    k.triangle = mulhi(bits.y, triangles);
     TracedTriangle t;
-    if (!traced_triangle(s, instance_index, cluster_id, triangle, false, t))
+    if (!traced_triangle(s, k.instance_index, k.cluster_id, k.triangle, false, t))
         return false;
-    float3 n;
-    float area = traced_area(t, n);
+    float area = traced_area(t, k.normal);
     if (!(area > 0.0))
         return false;
     float su = sqrt(u.x);
-    float2 bary = float2(u.y * su, su - u.y * su);
-    float3 y = traced_point(t, bary);
-    float density = chosen / source.total * list_step(e, pos) / float(triangles) / area;
+    k.barycentrics = float2(u.y * su, su - u.y * su);
+    k.point = traced_point(t, k.barycentrics);
+    k.density = chosen / source.total * list_step(e, pos) / float(triangles) / area;
+    k.material = t.material;
+    k.positions = t.corners.position;
+    return true;
+}
 
-    ResolvedLightSample c = owned_light_candidate<S>(set, y, rng);
-    float u_hole = rng.next();
-    if (!(c.pdf > 0.0))
+// How the photon from `k` starts where light `c`, a light but the environment, was drawn from its
+// point: its flux, the light's radiance x the point's cosine to it over both densities and the
+// frame's photon count; the interiors that hold the light; its first vertex as a ray from the
+// light reaches it; and the shadow ray toward the light, which `ray` holds. False for one that
+// starts with no flux.
+public bool photon_lit(PathRoot r, PhotonCaster k, ResolvedLightSample c, out PhotonStart p, out PhotonRay ray)
+{
+    p = PhotonStart();
+    ray = PhotonRay();
+    SceneRoot* s = r.scene;
+    LightSetGpu* set = r.set;
+    p.entry = k.entry;
+    if (!(c.pdf > 0.0) || c.kind == LIGHT_SAMPLE_ENVIRONMENT)
         return false;
-    float cos_y = abs(dot(n, c.dir));
+    float cos_y = abs(dot(k.normal, c.dir));
     float3 l = c.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, c.light, c.dir) : c.radiance;
-    float3 flux = l * (cos_y / (c.pdf * density * float(g.photon_count)));
+    float3 flux = l * (cos_y / (c.pdf * k.density * float(r.caustics.photon_count)));
     if (!any(flux > 0.0) || !all(isfinite(flux)))
         return false;
-    p.interior = Interior(source.interiors[c.light]);
+    p.interior = Interior(r.caustics.source.interiors[c.light]);
     p.directional = c.kind == LIGHT_SAMPLE_DIRECTIONAL;
 
     // The first vertex as a ray from the light resolves it.
     p.dir = -c.dir;
-    p.point = y;
+    p.point = k.point;
     Hit h = Hit();
     h.hit = true;
     h.triangle = true;
-    h.instance_index = instance_index;
-    h.cluster_id = int(cluster_id);
-    h.primitive_index = triangle;
-    h.barycentrics = bary;
-    h.front_face = dot(n, p.dir) < 0.0;
+    h.instance_index = k.instance_index;
+    h.cluster_id = int(k.cluster_id);
+    h.primitive_index = k.triangle;
+    h.barycentrics = k.barycentrics;
+    h.front_face = dot(k.normal, p.dir) < 0.0;
     // The class a ray that met the triangle would find.
     uint entry_producer;
-    h.custom_index = hit_producer(s, instance_index, entry_producer) ? s.producers[entry_producer].class_id : 0;
-    h.class_id = class_of(scene_traced(s), h.custom_index, instance_index, h.cluster_id);
+    h.custom_index = hit_producer(s, k.instance_index, entry_producer) ? s.producers[entry_producer].class_id : 0;
+    h.class_id = class_of(scene_traced(s), h.custom_index, k.instance_index, h.cluster_id);
     p.hit = h;
-    p.positions = t.corners.position;
-    HitContext context = photon_ray_context();
-    if (!resolve_alpha<S>(s, r.view, p.dir, instance_index, cluster_id, triangle, bary, context))
-        return false;
-    if ((s.materials[t.material].flags & MATERIAL_PRESENCE) != 0)
-        flux *= saturate(resolve_coverage<S>(s, r.view, p.dir, instance_index, cluster_id, triangle, bary, context));
+    p.positions = k.positions;
 
-    float3 origin = ray_origin(y, y, n, c.dir, ORIGIN_DEFAULT, 0.0, length(y - r.view.eye_render.xyz));
+    float3 y = k.point;
+    float3 origin = ray_origin(y, y, k.normal, c.dir, ORIGIN_DEFAULT, 0.0, length(y - r.view.eye_render.xyz));
     float t_max = c.distance;
     float3 toward = c.dir;
     if (isfinite(t_max))
@@ -2330,8 +2359,34 @@ public bool photon_emit<S : ISurfaces>(PathRoot r, uint index, inout Sampler rng
     ray.origin = origin;
     ray.dir = toward;
     ray.t_max = t_max;
-    if (c.view)
-        flux *= emitter_view_layer<S>(set, c, interior_ior(s, p.interior.innermost()));
     p.flux = flux;
-    return any(flux > 0.0);
+    return true;
+}
+
+// `photon_start` but for its shadow ray, which `ray` holds, and an emitter's coat and fuzz: `p.flux`
+// is the photon's before what the ray lets through and what those pass of the light `light` drew
+// where it is an emitter with them (`ResolvedLightSample.view`). False for a photon that starts with
+// no flux.
+public bool photon_emit<S : ISurfaces>(PathRoot r, uint index, inout Sampler rng, out PhotonStart p, out PhotonRay ray, out ResolvedLightSample light)
+{
+    p = PhotonStart();
+    ray = PhotonRay();
+    PhotonCaster k;
+    light = no_candidate();
+    if (!photon_caster(r, index, rng, k))
+    {
+        p.entry = k.entry;
+        return false;
+    }
+    light = owned_light_candidate<S>(r.set, k.point, rng);
+    float u_hole = rng.next();
+    if (!photon_lit(r, k, light, p, ray))
+        return false;
+    SceneRoot* s = r.scene;
+    HitContext context = photon_ray_context();
+    if (!resolve_alpha<S>(s, r.view, p.dir, k.instance_index, k.cluster_id, k.triangle, k.barycentrics, context))
+        return false;
+    if ((s.materials[k.material].flags & MATERIAL_PRESENCE) != 0)
+        p.flux *= saturate(resolve_coverage<S>(s, r.view, p.dir, k.instance_index, k.cluster_id, k.triangle, k.barycentrics, context));
+    return any(p.flux > 0.0);
 }

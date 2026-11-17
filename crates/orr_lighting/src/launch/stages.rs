@@ -15,24 +15,27 @@ use orr_shaders::surface_declares;
 
 use crate::mask_sets::Members;
 use crate::shaders::consts::{
-    ANY_HIT_INSTRUCTIONS, COATED_EMITTER_HIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS,
-    EMITTER_VIEW_INSTRUCTIONS, FRONT_ANY_HIT_INSTRUCTIONS, FRONT_INSTRUCTIONS, HIT_INSTRUCTIONS,
+    ANY_HIT_INSTRUCTIONS, CAUSTIC_HIT_INSTRUCTIONS, COATED_EMITTER_HIT_INSTRUCTIONS,
+    DEPOSIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS, EMITTER_VIEW_INSTRUCTIONS,
+    FRONT_ANY_HIT_INSTRUCTIONS, FRONT_INSTRUCTIONS, GATHER_INSTRUCTIONS, HIT_INSTRUCTIONS,
     INTERIOR_HIT_INSTRUCTIONS, LAYER_HIT_INSTRUCTIONS, LIGHT_BOX_INSTRUCTIONS,
-    LOCAL_FIRST_HIT_INSTRUCTIONS, MEDIUM_VERTEX_INSTRUCTIONS, MISS_INSTRUCTIONS,
-    PATH_SOURCE_BACKGROUND, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PIPELINE_INSTRUCTIONS,
-    PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS, PROXY_ANY_HIT_INSTRUCTIONS,
-    PROXY_INTERSECTION_INSTRUCTIONS, PROXY_MARCH_INSTRUCTIONS, RAYGEN_FRONT_INSTRUCTIONS,
-    RAYGEN_INSTRUCTIONS, RAYGEN_LAYER_INSTRUCTIONS, RAYGEN_LENS_INSTRUCTIONS,
-    RAYGEN_PROXY_INSTRUCTIONS, RAYGEN_STACK_INSTRUCTIONS, RAYGEN_WALK_INSTRUCTIONS,
-    RICH_HIT_INSTRUCTIONS, STACK_LAYER_INSTRUCTIONS, STACK_STEP_INSTRUCTIONS,
-    STACK_VERTEX_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS, WALK_EXIT_INSTRUCTIONS,
-    WALK_HIT_INSTRUCTIONS,
+    LOCAL_FIRST_HIT_INSTRUCTIONS, MAP_GATHER_HIT_INSTRUCTIONS, MAP_GATHER_INSTRUCTIONS,
+    MEDIUM_VERTEX_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_BACKGROUND, PATH_SOURCE_PHOTON,
+    PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PHOTON_HIT_INSTRUCTIONS, PHOTON_START_INSTRUCTIONS,
+    PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS,
+    PROXY_ANY_HIT_INSTRUCTIONS, PROXY_INTERSECTION_INSTRUCTIONS, PROXY_MARCH_INSTRUCTIONS,
+    RAYGEN_FRONT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS, RAYGEN_LAYER_INSTRUCTIONS,
+    RAYGEN_LENS_INSTRUCTIONS, RAYGEN_PHOTON_INSTRUCTIONS, RAYGEN_PROXY_INSTRUCTIONS,
+    RAYGEN_STACK_INSTRUCTIONS, RAYGEN_WALK_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS,
+    STACK_LAYER_INSTRUCTIONS, STACK_STEP_INSTRUCTIONS, STACK_VERTEX_INSTRUCTIONS,
+    TRACED_HIT_INSTRUCTIONS, WALK_EXIT_INSTRUCTIONS, WALK_HIT_INSTRUCTIONS,
 };
 use crate::shaders::path::{lean_layer, lean_paths, lean_rich, lean_walk};
 use crate::staged::{
-    MAY_ALL, MAY_BACKGROUND, MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_INTERIORS, MAY_LAYERS,
-    MAY_LENS, MAY_LOBES, MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PROXIES, MAY_SCATTERING,
-    MAY_STACK, MAY_TRACED, MAY_UPDATE, MAY_VIEW, MAY_WALK,
+    MAY_ALL, MAY_BACKGROUND, MAY_CAUSTICS, MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_INTERIORS,
+    MAY_LAYERS, MAY_LENS, MAY_LOBES, MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PHOTON,
+    MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING, MAY_STACK, MAY_TRACED, MAY_UPDATE, MAY_VIEW,
+    MAY_WALK,
 };
 use crate::{Error, KernelSet, module};
 
@@ -71,6 +74,15 @@ pub enum Role {
     ProxyBox,
     ProxyAnyHit,
     ProxyMarch,
+    /// The raygen of the frame's caustic photons, the callable that starts one from a caster and
+    /// the one of its deposit.
+    PhotonRaygen,
+    PhotonStart,
+    Deposit,
+    /// The callables of the caustic photons' gather at a path's vertex: the grid's, and the
+    /// reference's map's.
+    Gather,
+    MapGather,
 }
 
 /// The most instructions the stages of a pipeline may hand the driver together.
@@ -191,6 +203,25 @@ impl Spec {
         // a bent job, and a layer's stage the stack question's answer and a crossing's track.
         let stacks = self.may & MAY_STACK != 0;
         let vertex_stack = if stacks { STACK_VERTEX_INSTRUCTIONS } else { 0 };
+        // Where the paths may gather caustic photons, a stage that runs a vertex holds whether it
+        // is a chain vertex, the light its paths find past chain vertices and the gather's call; a
+        // hit, a photon's vertex where the pipeline runs photons and the call of the reference
+        // map's gather where it may be the reference's.
+        let caustics = if self.may & MAY_CAUSTICS != 0 {
+            CAUSTIC_HIT_INSTRUCTIONS
+        } else {
+            0
+        };
+        let photon = if self.may & MAY_PHOTON != 0 {
+            PHOTON_HIT_INSTRUCTIONS
+        } else {
+            0
+        };
+        let map = if self.may & MAY_CAUSTICS != 0 && self.may & MAY_REFERENCE != 0 {
+            MAP_GATHER_HIT_INSTRUCTIONS
+        } else {
+            0
+        };
         let (base, producer) = match self.role {
             Role::Raygen => {
                 let layers = self.may & MAY_LAYERS != 0;
@@ -213,8 +244,13 @@ impl Spec {
                 );
             }
             Role::Miss => return Some(MISS_INSTRUCTIONS),
-            Role::Medium => return Some(MEDIUM_VERTEX_INSTRUCTIONS + vertex_stack),
-            Role::Exit => return Some(WALK_EXIT_INSTRUCTIONS + vertex_stack),
+            Role::Medium => return Some(MEDIUM_VERTEX_INSTRUCTIONS + vertex_stack + caustics),
+            Role::Exit => return Some(WALK_EXIT_INSTRUCTIONS + vertex_stack + caustics),
+            Role::PhotonRaygen => return Some(RAYGEN_PHOTON_INSTRUCTIONS),
+            Role::PhotonStart => return Some(PHOTON_START_INSTRUCTIONS),
+            Role::Deposit => return Some(DEPOSIT_INSTRUCTIONS),
+            Role::Gather => return Some(GATHER_INSTRUCTIONS),
+            Role::MapGather => return Some(MAP_GATHER_INSTRUCTIONS),
             Role::View => return Some(EMITTER_VIEW_INSTRUCTIONS),
             Role::Stack => return Some(STACK_STEP_INSTRUCTIONS),
             Role::Front => return Some(FRONT_INSTRUCTIONS),
@@ -277,7 +313,12 @@ impl Spec {
                 + interiors
                 + rich
                 + coated
-                + stack,
+                + stack
+                + if self.role == Role::Hit {
+                    caustics + photon + map
+                } else {
+                    0
+                },
         )
     }
 
@@ -331,9 +372,9 @@ struct Table {
     /// The raygen stage of each source by its id, where the pipeline runs the source.
     raygens: [Option<u32>; 4],
     misses: [u32; 2],
-    /// The callable of a path's first vertex, and where the pipeline may show a debug view, the
-    /// one of a debug view of the first vertex alone.
-    first: u32,
+    /// The callable of a path's first vertex, where the pipeline runs paths of a view, and where
+    /// it may show a debug view, the one of a debug view of the first vertex alone.
+    first: Option<u32>,
     first_view: Option<u32>,
     /// The callable that starts a path in the interiors around the eye, where the paths may lie
     /// in one.
@@ -357,6 +398,13 @@ struct Table {
     /// The callable that starts a thin lens's path in the interiors at the lens's point, where the
     /// view traces its camera rays through one and the paths may lie in an interior.
     eye_lens: Option<u32>,
+    /// The callable of the caustic photons' gather, where paths of a view may gather them, and
+    /// those of a photon's start and of its deposit, where the pipeline runs photons.
+    gather: Option<u32>,
+    photon_start: Option<u32>,
+    deposit: Option<u32>,
+    /// The callable of the reference map's gather, where paths of a view may gather one.
+    map_gather: Option<u32>,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
 }
@@ -391,6 +439,10 @@ impl Table {
         // serves any id, so the table holds one per kind and not one per linked type. A scene's
         // own mask is never all of it.
         let general = may == MAY_ALL && surfaces != 0;
+        // Whether it runs paths of a view (its own, its background layer's or its update paths),
+        // whose stages a pipeline that runs caustic photons alone holds none of.
+        let viewed = may & (MAY_VIEW | MAY_BACKGROUND | MAY_UPDATE) != 0;
+        let photons = may & MAY_PHOTON != 0;
         let emits = may & MAY_EMISSIVE != 0;
         // The stage made for a surface that may emit is the only one with `MAY_EMITTER`.
         let may = may & !MAY_EMITTER;
@@ -411,14 +463,24 @@ impl Table {
             hit_surface: lean_paths::Spec::default().hit_surface,
         };
         let mut raygens = [None; 4];
-        for (source, bit, entry) in [
-            (PATH_SOURCE_VIEW, MAY_VIEW, "paths"),
-            (PATH_SOURCE_BACKGROUND, MAY_BACKGROUND, "backgrounds"),
-            (PATH_SOURCE_UPDATE, MAY_UPDATE, "updates"),
+        for (source, bit, entry, role) in [
+            (PATH_SOURCE_VIEW, MAY_VIEW, "paths", Role::Raygen),
+            (
+                PATH_SOURCE_BACKGROUND,
+                MAY_BACKGROUND,
+                "backgrounds",
+                Role::Raygen,
+            ),
+            (PATH_SOURCE_UPDATE, MAY_UPDATE, "updates", Role::Raygen),
+            (
+                PATH_SOURCE_PHOTON,
+                MAY_PHOTON,
+                "photons",
+                Role::PhotonRaygen,
+            ),
         ] {
             if may & bit != 0 {
-                raygens[source as usize] =
-                    Some(Self::stage(&mut specs, folded(entry, Role::Raygen)));
+                raygens[source as usize] = Some(Self::stage(&mut specs, folded(entry, role)));
             }
         }
         let misses = [
@@ -426,15 +488,17 @@ impl Table {
             Self::stage(&mut specs, folded("miss_shadow", Role::Miss)),
         ];
         // Any surface of the G-buffer may be a path's first vertex.
-        let first = Self::stage(
-            &mut specs,
-            Spec {
-                kernel: if lobes { rich } else { Kernel::Plain },
-                may: may | if emits { MAY_EMITTER } else { 0 },
-                ..folded("first_vertex", Role::Hit)
-            },
-        );
-        let first_view = (may & MAY_DEBUG != 0).then(|| {
+        let first = viewed.then(|| {
+            Self::stage(
+                &mut specs,
+                Spec {
+                    kernel: if lobes { rich } else { Kernel::Plain },
+                    may: may | if emits { MAY_EMITTER } else { 0 },
+                    ..folded("first_vertex", Role::Hit)
+                },
+            )
+        });
+        let first_view = (viewed && may & MAY_DEBUG != 0).then(|| {
             Self::stage(
                 &mut specs,
                 Spec {
@@ -443,13 +507,14 @@ impl Table {
                 },
             )
         });
-        let eye_interior = (may & MAY_INTERIORS != 0)
+        let eye_interior = (viewed && may & MAY_INTERIORS != 0)
             .then(|| Self::stage(&mut specs, folded("eye_interior", Role::Hit)));
-        let eye_lens = (may & MAY_INTERIORS != 0 && may & MAY_LENS != 0)
+        let eye_lens = (viewed && may & MAY_INTERIORS != 0 && may & MAY_LENS != 0)
             .then(|| Self::stage(&mut specs, folded("eye_lens", Role::Hit)));
-        let medium = (may & MAY_SCATTERING != 0)
+        // A photon scatters in no medium and walks no surface.
+        let medium = (viewed && may & MAY_SCATTERING != 0)
             .then(|| Self::stage(&mut specs, folded("medium_vertex", Role::Medium)));
-        let walk_exit = (may & MAY_WALK != 0).then(|| {
+        let walk_exit = (viewed && may & MAY_WALK != 0).then(|| {
             Self::stage(
                 &mut specs,
                 Spec {
@@ -468,8 +533,16 @@ impl Table {
                 },
             )
         });
-        let stack_step = (may & MAY_STACK != 0)
+        // A photon draws no light, so no job of its walks through a plane stack.
+        let stack_step = (viewed && may & MAY_STACK != 0)
             .then(|| Self::stage(&mut specs, folded("stack_step", Role::Stack)));
+        let gather = (viewed && may & MAY_CAUSTICS != 0)
+            .then(|| Self::stage(&mut specs, folded("gather", Role::Gather)));
+        let photon_start =
+            photons.then(|| Self::stage(&mut specs, folded("caster_photon", Role::PhotonStart)));
+        let deposit = photons.then(|| Self::stage(&mut specs, folded("deposit", Role::Deposit)));
+        let map_gather = (viewed && may & MAY_CAUSTICS != 0 && may & MAY_REFERENCE != 0)
+            .then(|| Self::stage(&mut specs, folded("map_gather", Role::MapGather)));
         let front = (may & (MAY_PARTICLES | MAY_LOCAL_LIGHTS) != 0)
             .then(|| Self::stage(&mut specs, folded("front", Role::Front)));
         let proxies = may & MAY_PROXIES != 0;
@@ -499,8 +572,10 @@ impl Table {
         // hit itself, where no factor of its records shows.
         let factors = may & may2(SceneFeatures::EMISSION_FACTORS) != 0;
         let linked_factors = may & may2(SceneFeatures::LINKED_EMISSION_FACTORS) != 0;
+        // A photon takes no light of what it meets: a pipeline of photons alone shades an emitter as
+        // any other surface.
         let emitter = |pin: u32, emissive: bool| {
-            if !emits {
+            if !emits || !viewed {
                 false
             } else if surfaces == 0 || pin == 1 {
                 emissive && factors
@@ -762,6 +837,10 @@ impl Table {
             front,
             proxy_march,
             eye_lens,
+            gather,
+            photon_start,
+            deposit,
+            map_gather,
             hit_groups,
             groups,
         }
@@ -999,7 +1078,7 @@ impl PathPipeline {
             misses: &table.misses.map(ShaderRecord::new),
             hit_groups: &table.hit_groups,
             callables: &[
-                Some(ShaderRecord::new(table.first)),
+                table.first.map(ShaderRecord::new),
                 table.first_view.map(ShaderRecord::new),
                 table.eye_interior.map(ShaderRecord::new),
                 table.medium.map(ShaderRecord::new),
@@ -1009,6 +1088,10 @@ impl PathPipeline {
                 table.front.map(ShaderRecord::new),
                 table.proxy_march.map(ShaderRecord::new),
                 table.eye_lens.map(ShaderRecord::new),
+                table.gather.map(ShaderRecord::new),
+                table.photon_start.map(ShaderRecord::new),
+                table.deposit.map(ShaderRecord::new),
+                table.map_gather.map(ShaderRecord::new),
             ],
             max_recursion: 1,
             flags: RayPipelineFlags::scene(device.caps()),
