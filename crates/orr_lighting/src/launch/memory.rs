@@ -6,8 +6,8 @@ use orr_scene::orr_gpu::{Allocation, Device, GpuPtr, MemoryKind};
 
 use crate::Error;
 use crate::shaders::consts::{
-    LEAN_COLD_WORDS, LEAN_HOT_WORDS, LEAN_PHOTON_RECORD_WORDS, LEAN_STACK_WORDS,
-    LEAN_UPDATE_RECORD_WORDS, LEAN_VIEW_RECORD_WORDS, PART_NONE,
+    LEAN_COLD_WORDS, LEAN_HOT_WORDS, LEAN_PHOTON_RECORD_WORDS, LEAN_SPECTRAL_WORDS,
+    LEAN_STACK_WORDS, LEAN_UPDATE_RECORD_WORDS, LEAN_VIEW_RECORD_WORDS, PART_NONE,
 };
 use crate::shaders::types::LaunchHeader;
 
@@ -58,13 +58,15 @@ pub(crate) struct SourceMemory {
     cold: Option<Allocation<[u32; 4]>>,
     stack: Option<Allocation<[u32; 4]>>,
     chain: Option<Allocation<[u32; 4]>>,
+    spectral: Option<Allocation<[u32; 4]>>,
     _records: Allocation<[u32; 4]>,
 }
 
 impl SourceMemory {
     /// The slots of `items` paths, at most [`MAX_SLOTS`], laid out as `layout`, with their cold
-    /// words where `cold` holds, their plane stack's where `stack` does and their chain word
-    /// (`PathChain`) where `chain` does.
+    /// words where `cold` holds, their plane stack's where `stack` does, their chain word
+    /// (`PathChain`) where `chain` does and their spectral words (`PathSpectral`) where `spectral`
+    /// does.
     pub(crate) fn new(
         device: &Device,
         items: u32,
@@ -72,7 +74,12 @@ impl SourceMemory {
         parts: SlotParts,
         name: &str,
     ) -> Result<Self, Error> {
-        let SlotParts { cold, stack, chain } = parts;
+        let SlotParts {
+            cold,
+            stack,
+            chain,
+            spectral,
+        } = parts;
         let slots = slots(items);
         let n = u64::from(slots);
         let words = |count: u32, what: &str| {
@@ -90,6 +97,9 @@ impl SourceMemory {
             .then(|| words(LEAN_STACK_WORDS, "path plane stacks"))
             .transpose()?;
         let chain = chain.then(|| words(1, "path chains")).transpose()?;
+        let spectral = spectral
+            .then(|| words(LEAN_SPECTRAL_WORDS, "path wavelengths"))
+            .transpose()?;
         let records = words(layout.record_words, "path records")?;
         let mut header = device.gpu_malloc::<LaunchHeader>(MemoryKind::Upload, 1, name)?;
         header.as_mut_slice().expect("mapped")[0] = LaunchHeader {
@@ -106,6 +116,7 @@ impl SourceMemory {
             light_at: PART_NONE,
             spectral_at: PART_NONE,
             chain: chain.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
+            spectral: spectral.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
         };
         Ok(Self {
             slots,
@@ -115,6 +126,7 @@ impl SourceMemory {
             cold,
             stack,
             chain,
+            spectral,
             _records: records,
         })
     }
@@ -130,18 +142,21 @@ impl SourceMemory {
             cold: self.cold.is_some(),
             stack: self.stack.is_some(),
             chain: self.chain.is_some(),
+            spectral: self.spectral.is_some(),
         }
     }
 }
 
 /// The parts a slot holds beside its hot words and its record: its cold words, which paths that
 /// may meet a layer, an interior or a walk keep; the words of a plane stack, which paths that may
-/// meet one keep; and the chain word, which paths that may gather caustic photons keep.
+/// meet one keep; the chain word, which paths that may gather caustic photons keep; and the
+/// spectral words, which paths that may split by wavelength keep.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SlotParts {
     pub(crate) cold: bool,
     pub(crate) stack: bool,
     pub(crate) chain: bool,
+    pub(crate) spectral: bool,
 }
 
 fn slots(items: u32) -> u32 {

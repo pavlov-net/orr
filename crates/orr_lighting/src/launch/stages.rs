@@ -16,14 +16,15 @@ use orr_shaders::surface_declares;
 use crate::mask_sets::Members;
 use crate::shaders::consts::{
     ANY_HIT_INSTRUCTIONS, CAUSTIC_HIT_INSTRUCTIONS, COATED_EMITTER_HIT_INSTRUCTIONS,
-    DEPOSIT_INSTRUCTIONS, EMITTER_HIT_INSTRUCTIONS, EMITTER_VIEW_INSTRUCTIONS,
-    FRONT_ANY_HIT_INSTRUCTIONS, FRONT_INSTRUCTIONS, GATHER_INSTRUCTIONS, HIT_INSTRUCTIONS,
-    INTERIOR_HIT_INSTRUCTIONS, LAYER_HIT_INSTRUCTIONS, LIGHT_BOX_INSTRUCTIONS,
-    LOCAL_FIRST_HIT_INSTRUCTIONS, MAP_GATHER_HIT_INSTRUCTIONS, MAP_GATHER_INSTRUCTIONS,
-    MEDIUM_VERTEX_INSTRUCTIONS, MISS_INSTRUCTIONS, PATH_SOURCE_BACKGROUND, PATH_SOURCE_PHOTON,
-    PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW, PHOTON_HIT_INSTRUCTIONS, PHOTON_START_INSTRUCTIONS,
-    PIPELINE_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS,
-    PROXY_ANY_HIT_INSTRUCTIONS, PROXY_INTERSECTION_INSTRUCTIONS, PROXY_MARCH_INSTRUCTIONS,
+    DEPOSIT_INSTRUCTIONS, DISPERSE_INSTRUCTIONS, DISPERSION_LAYER_INSTRUCTIONS,
+    EMITTER_HIT_INSTRUCTIONS, EMITTER_VIEW_INSTRUCTIONS, FRONT_ANY_HIT_INSTRUCTIONS,
+    FRONT_INSTRUCTIONS, GATHER_INSTRUCTIONS, HIT_INSTRUCTIONS, INTERIOR_HIT_INSTRUCTIONS,
+    LAYER_HIT_INSTRUCTIONS, LIGHT_BOX_INSTRUCTIONS, LOCAL_FIRST_HIT_INSTRUCTIONS,
+    MAP_GATHER_HIT_INSTRUCTIONS, MAP_GATHER_INSTRUCTIONS, MEDIUM_VERTEX_INSTRUCTIONS,
+    MISS_INSTRUCTIONS, PATH_SOURCE_BACKGROUND, PATH_SOURCE_PHOTON, PATH_SOURCE_UPDATE,
+    PATH_SOURCE_VIEW, PHOTON_HIT_INSTRUCTIONS, PHOTON_START_INSTRUCTIONS, PIPELINE_INSTRUCTIONS,
+    PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS, PROXY_ANY_HIT_INSTRUCTIONS,
+    PROXY_INTERSECTION_INSTRUCTIONS, PROXY_MARCH_INSTRUCTIONS, RAYGEN_DISPERSION_INSTRUCTIONS,
     RAYGEN_FRONT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS, RAYGEN_LAYER_INSTRUCTIONS,
     RAYGEN_LENS_INSTRUCTIONS, RAYGEN_PHOTON_INSTRUCTIONS, RAYGEN_PROXY_INSTRUCTIONS,
     RAYGEN_STACK_INSTRUCTIONS, RAYGEN_WALK_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS,
@@ -32,10 +33,10 @@ use crate::shaders::consts::{
 };
 use crate::shaders::path::{lean_layer, lean_paths, lean_rich, lean_walk};
 use crate::staged::{
-    MAY_ALL, MAY_BACKGROUND, MAY_CAUSTICS, MAY_DEBUG, MAY_EMISSIVE, MAY_EMITTER, MAY_INTERIORS,
-    MAY_LAYERS, MAY_LENS, MAY_LOBES, MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES, MAY_PHOTON,
-    MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING, MAY_STACK, MAY_TRACED, MAY_UPDATE, MAY_VIEW,
-    MAY_WALK,
+    MAY_ALL, MAY_BACKGROUND, MAY_CAUSTICS, MAY_DEBUG, MAY_DISPERSION, MAY_EMISSIVE, MAY_EMITTER,
+    MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOBES, MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_PARTICLES,
+    MAY_PHOTON, MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING, MAY_STACK, MAY_TRACED, MAY_UPDATE,
+    MAY_VIEW, MAY_WALK,
 };
 use crate::{Error, KernelSet, module};
 
@@ -83,6 +84,8 @@ pub enum Role {
     /// reference's map's.
     Gather,
     MapGather,
+    /// The callable that weighs a dispersive layer's companion wavelengths.
+    Disperse,
 }
 
 /// The most instructions the stages of a pipeline may hand the driver together.
@@ -229,6 +232,7 @@ impl Spec {
                 let front = self.may & (MAY_PARTICLES | MAY_LOCAL_LIGHTS) != 0;
                 let proxies = self.may & MAY_PROXIES != 0;
                 let lens = self.may & (MAY_LENS | MAY_BACKGROUND) != 0;
+                let dispersion = self.may & MAY_DISPERSION != 0;
                 return Some(
                     RAYGEN_INSTRUCTIONS
                         + if layers { RAYGEN_LAYER_INSTRUCTIONS } else { 0 }
@@ -240,7 +244,12 @@ impl Spec {
                         } else {
                             0
                         }
-                        + if lens { RAYGEN_LENS_INSTRUCTIONS } else { 0 },
+                        + if lens { RAYGEN_LENS_INSTRUCTIONS } else { 0 }
+                        + if dispersion {
+                            RAYGEN_DISPERSION_INSTRUCTIONS
+                        } else {
+                            0
+                        },
                 );
             }
             Role::Miss => return Some(MISS_INSTRUCTIONS),
@@ -251,6 +260,7 @@ impl Spec {
             Role::Deposit => return Some(DEPOSIT_INSTRUCTIONS),
             Role::Gather => return Some(GATHER_INSTRUCTIONS),
             Role::MapGather => return Some(MAP_GATHER_INSTRUCTIONS),
+            Role::Disperse => return Some(DISPERSE_INSTRUCTIONS),
             Role::View => return Some(EMITTER_VIEW_INSTRUCTIONS),
             Role::Stack => return Some(STACK_STEP_INSTRUCTIONS),
             Role::Front => return Some(FRONT_INSTRUCTIONS),
@@ -305,6 +315,14 @@ impl Spec {
             (Role::Hit, _) => vertex_stack,
             _ => 0,
         };
+        // A layer's stage where its paths may split by wavelength holds the start of the path's
+        // wavelengths, the hero's IOR and the call that weighs the companions.
+        let dispersion = match (self.role, self.kernel) {
+            (Role::Hit, Kernel::Layer) if self.may & MAY_DISPERSION != 0 => {
+                DISPERSION_LAYER_INSTRUCTIONS
+            }
+            _ => 0,
+        };
         Some(
             base + if producers { producer } else { 0 }
                 + traced
@@ -314,6 +332,7 @@ impl Spec {
                 + rich
                 + coated
                 + stack
+                + dispersion
                 + if self.role == Role::Hit {
                     caustics + photon + map
                 } else {
@@ -405,6 +424,9 @@ struct Table {
     deposit: Option<u32>,
     /// The callable of the reference map's gather, where paths of a view may gather one.
     map_gather: Option<u32>,
+    /// The callable that weighs a dispersive layer's companion wavelengths, where the paths may
+    /// meet a layer and split by wavelength.
+    disperse: Option<u32>,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
 }
@@ -543,6 +565,15 @@ impl Table {
         let deposit = photons.then(|| Self::stage(&mut specs, folded("deposit", Role::Deposit)));
         let map_gather = (viewed && may & MAY_CAUSTICS != 0 && may & MAY_REFERENCE != 0)
             .then(|| Self::stage(&mut specs, folded("map_gather", Role::MapGather)));
+        let disperse = (may & MAY_DISPERSION != 0 && may & MAY_LAYERS != 0).then(|| {
+            Self::stage(
+                &mut specs,
+                Spec {
+                    kernel: Kernel::Layer,
+                    ..folded("disperse", Role::Disperse)
+                },
+            )
+        });
         let front = (may & (MAY_PARTICLES | MAY_LOCAL_LIGHTS) != 0)
             .then(|| Self::stage(&mut specs, folded("front", Role::Front)));
         let proxies = may & MAY_PROXIES != 0;
@@ -841,6 +872,7 @@ impl Table {
             photon_start,
             deposit,
             map_gather,
+            disperse,
             hit_groups,
             groups,
         }
@@ -1092,6 +1124,7 @@ impl PathPipeline {
                 table.photon_start.map(ShaderRecord::new),
                 table.deposit.map(ShaderRecord::new),
                 table.map_gather.map(ShaderRecord::new),
+                table.disperse.map(ShaderRecord::new),
             ],
             max_recursion: 1,
             flags: RayPipelineFlags::scene(device.caps()),

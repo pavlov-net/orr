@@ -76,14 +76,14 @@ bool layer_record(Traced h)
     return class_id == CLASS_DIELECTRIC || class_id == CLASS_PRESENCE;
 }
 
-// Starts the path of `pixel` in hot words `at` on its camera ray, which its throughput
-// `throughput` rides: its first vertex is the G-buffer's surface, and a pixel whose G-buffer holds
-// none sees the sky, which its ray of no length misses into. On a `layers` tile the ray reaches up
-// to the G-buffer's surface, and the path starts in the interiors at the near plane, which its
-// cold words `cold` take: true where those are not empty and its camera ray takes their medium,
-// which it does where the frame has no froxels to hold the ray's segment. A path `behind` the
-// layers starts on the G-buffer's surface inside the interiors there.
-bool start_path(PathRoot r, uint2 pixel, uint4* at, uint4* cold, float throughput, bool layers, bool behind)
+// Starts the path of `pixel`, the slice's `slot`th, in hot words `at` on its camera ray, which its
+// throughput `throughput` rides: its first vertex is the G-buffer's surface, and a pixel whose
+// G-buffer holds none sees the sky, which its ray of no length misses into. On a `layers` tile the
+// ray reaches up to the G-buffer's surface, and the path starts in the interiors at the near plane,
+// which its cold words `cold` take: true where those are not empty and its camera ray takes their
+// medium, which it does where the frame has no froxels to hold the ray's segment. A path `behind`
+// the layers starts on the G-buffer's surface inside the interiors there.
+bool start_path(PathRoot r, uint slot, uint2 pixel, uint4* at, uint4* cold, float throughput, bool layers, bool behind)
 {
     PathStart s = pinhole_start(r.view, r.gbuffer, pixel, true);
     RayCone cone = camera_cone(r.view);
@@ -116,6 +116,9 @@ bool start_path(PathRoot r, uint2 pixel, uint4* at, uint4* cold, float throughpu
     p.shadow_target = float3(0.0);
     p.shadow_light = float3(0.0);
     store_hot(at, p);
+    // Its wavelengths are drawn at the first dispersive layer it meets.
+    if (lean_disperses(r))
+        store_coherent(lean_spectral(r, slot) + 3, uint4(0));
     if (carried)
     {
         Payload eye;
@@ -1035,7 +1038,7 @@ public void lean_paths(PathRoot r)
         bool second = pass == 1;
         if (runs)
         {
-            bool starts_inside = start_path(r, pixel, at, lean_cold(r, slot), surface && !second ? 1.0 / r.pixel_fraction : 1.0, layers && !second, second);
+            bool starts_inside = start_path(r, slot, pixel, at, lean_cold(r, slot), surface && !second ? 1.0 / r.pixel_fraction : 1.0, layers && !second, second);
             if (may(MAY_LENS) && lens)
             {
                 Sampler rng = path_sampler(r, pixel);
@@ -1043,7 +1046,7 @@ public void lean_paths(PathRoot r)
                 lens_ray(at, s, rng.dimension, true);
             }
             rays = run_path(r, slot, at, surface && (second || !layers) ? NEXT_FIRST : NEXT_RAY);
-            radiance = asfloat(load_coherent(at + 3).xyz);
+            radiance = lean_radiance(r, slot, at);
             if (!second)
             {
                 carried = starts_inside;
@@ -1095,10 +1098,10 @@ public void lean_backgrounds<E : IEnvironment, M : IMedium>(PathRoot r)
     uint4* record = lean_record(r, slot);
     StoredViewLights lights = { NO_LIGHT, 0.0, pcg3d(uint3(pixel, r.frame ^ path_stream(r))).x, 0.0 };
     store_coherent(record, reinterpret<uint4>(lights));
-    start_path(r, pixel, at, lean_cold(r, slot), 1.0, false, false);
+    start_path(r, slot, pixel, at, lean_cold(r, slot), 1.0, false, false);
     lens_ray(at, s, rng.dimension, false);
     run_path(r, slot, at, NEXT_RAY);
-    float3 radiance = asfloat(load_coherent(at + 3).xyz);
+    float3 radiance = lean_radiance(r, slot, at);
     float depth = reinterpret<StoredViewLights>(load_coherent(record)).first_distance;
     ViewConstants* v = r.view;
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
@@ -1235,7 +1238,7 @@ public void lean_updates(PathRoot r)
     uint4* record = lean_record(r, slot);
     CacheUpdate update = CacheUpdate();
     uint state = pcg3d(uint3(pixel, r.frame ^ path_stream(r))).y;
-    start_path(r, pixel, at, lean_cold(r, slot), 1.0, false, layered(r, pixel));
+    start_path(r, slot, pixel, at, lean_cold(r, slot), 1.0, false, layered(r, pixel));
     Payload first;
     first.words = uint4(0);
     call(CALL_FIRST, first);

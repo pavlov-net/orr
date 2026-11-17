@@ -12,6 +12,7 @@ import orr_shaders.abi;
 import orr_shaders.math;
 import orr_shaders.packing;
 import orr_shaders.pipeline;
+import orr_lighting.spectrum;
 
 // The budget of the common path: what a plain ray pays whatever else its pipeline links.
 // A path's hot state.
@@ -159,12 +160,21 @@ public static const uint PAYLOAD_BENT = 1;
 [Host] public static const uint MAP_GATHER_HIT_INSTRUCTIONS = 1600;
 // The callables of the grid's gather and the reference map's, which evaluates the vertex's BSDF per
 // photon; the photons' raygen, the callable that starts a photon from a caster and its light, and
-// the one of its deposit.
+// the one of its deposit, which where paths split by wavelength carries the flux through their
+// transfer.
 [Host] public static const uint GATHER_INSTRUCTIONS = 2800;
 [Host] public static const uint MAP_GATHER_INSTRUCTIONS = 13500;
 [Host] public static const uint RAYGEN_PHOTON_INSTRUCTIONS = 2500;
 [Host] public static const uint PHOTON_START_INSTRUCTIONS = 14000;
-[Host] public static const uint DEPOSIT_INSTRUCTIONS = 2300;
+[Host] public static const uint DEPOSIT_INSTRUCTIONS = 2400;
+// What a layer's stage holds more where its paths may split by wavelength (`MAY_DISPERSION`): whether
+// the layer disperses, the start of the path's wavelengths, the IORs of both its sides at the
+// hero's wavelength, which read their media (about half of it), and the call of the callable that
+// weighs the companions, which prepares and evaluates their BSDFs; and what a raygen holds more
+// there, the radiance through the wavelengths' transfer at the path's end.
+[Host] public static const uint DISPERSION_LAYER_INSTRUCTIONS = 6600;
+[Host] public static const uint DISPERSE_INSTRUCTIONS = 19000;
+[Host] public static const uint RAYGEN_DISPERSION_INSTRUCTIONS = 200;
 // What a hit holds more where the scene's emitters may have a coat or a fuzz: the call of that
 // callable, and the winner's place in its list and cluster through the light candidates' loop.
 [Host] public static const uint COATED_EMITTER_HIT_INSTRUCTIONS = 340;
@@ -182,6 +192,8 @@ public static const uint CALL_DEPOSIT = 12;
 // The callable of the gather of the reference's map of caustic photons, which evaluates the
 // vertex's BSDF per photon.
 public static const uint CALL_MAP_GATHER = 13;
+// The callable that weighs a dispersive layer's companion wavelengths toward the hero's draw.
+public static const uint CALL_DISPERSE = 14;
 // What a hit made for surfaces that may walk holds more than one with the rich lobes alone: the
 // subsurface lobe, the start of its walk and what it leaves of the surface where a walk leaves.
 [Host] public static const uint WALK_HIT_INSTRUCTIONS = 5400;
@@ -438,6 +450,89 @@ public void store_chain(uint4* at, PathChain after, PathChain before)
 {
     store_coherent(at, uint4(as_halves(after.keep.xy), as_halves(float2(after.keep.z, after.through ? 1.0 : 0.0)),
         as_halves(before.keep.xy), as_halves(float2(before.keep.z, before.through ? 1.0 : 0.0))));
+}
+
+// Where a path may split by wavelength, its spectral words (`PathSpectral`), apart from its hot
+// and cold ones: per wavelength its BSDF values and densities over the hero's, the transfer that
+// takes its light to Rec.2020 through them with the sample that draws them and whether they are
+// drawn, and the light it gathered before the transfer last changed, already through it. The hot
+// words' radiance is what the path gathered since, which goes through the transfer it has now.
+[Host] public static const uint LEAN_SPECTRAL_WORDS = 6;
+
+public struct PathSpectral
+{
+    public bool on;
+    public float sample;
+    public float4 value;
+    public float4 density;
+    public float3x3 transfer;
+    public float3 committed;
+
+    // The hero's wavelength, 0 before the path disperses.
+    public float hero()
+    {
+        return on ? sample_wavelengths(sample).nm.x : 0.0;
+    }
+
+    // Whether a companion still carries an estimate.
+    public bool companions()
+    {
+        return on && any(density.yzw > 0.0);
+    }
+
+    // Light `c` gathered since the transfer last changed, through it.
+    public float3 color(float3 c)
+    {
+        return on ? mul(transfer, c) : c;
+    }
+
+    // The transfer of the values and densities.
+    [mutating]
+    public void update()
+    {
+        float mean = dot(density, float4(1.0 / float(WAVELENGTHS)));
+        transfer = spectral_transfer(sample_wavelengths(sample), mean > 0.0 ? value / mean : float4(0.0));
+    }
+}
+
+// Whether the spectral words at `at` hold drawn wavelengths: a path starts with them undrawn.
+public bool spectral_on(uint4* at)
+{
+    return load_coherent(at + 3).w != 0;
+}
+
+public PathSpectral load_spectral(uint4* at)
+{
+    PathSpectral p;
+    p.value = asfloat(load_coherent(at));
+    p.density = asfloat(load_coherent(at + 1));
+    float4 r0 = asfloat(load_coherent(at + 2));
+    uint4 r1 = load_coherent(at + 3);
+    float4 r2 = asfloat(load_coherent(at + 4));
+    p.sample = r0.w;
+    p.on = r1.w != 0;
+    p.transfer = float3x3(r0.xyz, asfloat(r1.xyz), r2.xyz);
+    p.committed = asfloat(load_coherent(at + 5).xyz);
+    return p;
+}
+
+public void store_spectral(uint4* at, PathSpectral p)
+{
+    store_coherent(at, asuint(p.value));
+    store_coherent(at + 1, asuint(p.density));
+    store_coherent(at + 2, asuint(float4(p.transfer[0], p.sample)));
+    store_coherent(at + 3, uint4(asuint(p.transfer[1]), p.on ? 1 : 0));
+    store_coherent(at + 4, asuint(float4(p.transfer[2], 0.0)));
+    store_coherent(at + 5, uint4(asuint(p.committed), 0));
+}
+
+// What a path whose hot words gathered `pending` since its transfer last changed gathered in all.
+public float3 spectral_radiance(uint4* at, float3 pending)
+{
+    if (!spectral_on(at))
+        return pending;
+    PathSpectral p = load_spectral(at);
+    return p.committed + mul(p.transfer, pending);
 }
 
 // A caustic photon's record: its flux in the first three lanes, and its caster entry in the last,
