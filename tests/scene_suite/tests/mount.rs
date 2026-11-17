@@ -360,6 +360,10 @@ fn snapshot(scenes: &Scenes, gpu: &Gpu<'_>, m: MountId, a: &Archive) -> Vec<Vec<
             texture_streams: scenes.texture_streams(),
             ..MaterialGpu::new(&cooked, &bound)
         };
+        let want = MaterialGpu {
+            lobes: want.standard_lobes(),
+            ..want
+        };
         assert_eq!(
             bytemuck::bytes_of(&got),
             bytemuck::bytes_of(&want),

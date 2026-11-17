@@ -162,6 +162,12 @@ pub(crate) fn rec2020(c: impl Into<orr_math::Vec3>) -> [f32; 3] {
 }
 
 impl MaterialGpu {
+    /// The lobes a scene's material table gives the record where no surface type links
+    /// (`lobes`): those its own weights give it.
+    pub fn standard_lobes(&self) -> u32 {
+        record_lobes(self, &[0])
+    }
+
     /// The record of a cooked material whose slots read `textures`. Colors convert from Rec.709
     /// to Rec.2020, and a color slot's factor multiplies its texels in the texture's primaries;
     /// flags and the cost class follow the parameters.
