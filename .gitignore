@@ -2,3 +2,5 @@ target/
 /.tools
 /.claude/*
 !/.claude/skills/
+/.beads/
+/.beads.gate.lock
