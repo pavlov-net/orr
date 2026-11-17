@@ -1770,12 +1770,14 @@ fn predict(
 /// The parts beside their hot words the slots of the pipeline's paths that may meet `may` hold:
 /// the interiors they lie in, where they may meet a layer or an interior, and the walk a vertex
 /// starts, where they may walk; a shadow job's walk through a plane stack, where they may meet one;
-/// and the light they find past chain vertices, where they may gather caustic photons.
+/// the light they find past chain vertices, where they may gather caustic photons; and their
+/// wavelengths, where they may split by wavelength.
 fn slot_parts(may: u64) -> SlotParts {
     SlotParts {
         cold: may & (MAY_LAYERS | MAY_INTERIORS | MAY_WALK) != 0,
         stack: may & MAY_STACK != 0,
         chain: may & MAY_CAUSTICS != 0,
+        spectral: may & MAY_DISPERSION != 0,
     }
 }
 

@@ -36,6 +36,7 @@ import orr_lighting.path.lean.state;
 import orr_lighting.interiors;
 import orr_lighting.subsurface;
 import orr_lighting.caustics;
+import orr_lighting.spectrum;
 
 // The hot words of the slice's `slot`th path.
 public uint4* lean_hot(PathRoot r, uint slot)
@@ -66,6 +67,30 @@ public uint4* lean_stack(PathRoot r, uint slot)
 public uint4* lean_chain(PathRoot r, uint slot)
 {
     return r.launch.chain + slot;
+}
+
+// The spectral words of the slice's `slot`th path (`PathSpectral`), where its paths may split by
+// wavelength.
+public uint4* lean_spectral(PathRoot r, uint slot)
+{
+    return r.launch.spectral + slot * LEAN_SPECTRAL_WORDS;
+}
+
+// Whether `r`'s paths split by wavelength at a dispersive layer: a view's, its background layer's
+// and the photons', with the view's dispersion on.
+public bool lean_disperses(PathRoot r)
+{
+    return may(MAY_DISPERSION) && (r.dielectric_flags & DIELECTRIC_DISPERSION) != 0 && !from_update(r);
+}
+
+// What `slot`'s path in hot words `at` gathered in all: where it split by wavelength, through its
+// wavelengths' transfer.
+public float3 lean_radiance(PathRoot r, uint slot, uint4* at)
+{
+    float3 pending = asfloat(load_coherent(at + 3).xyz);
+    if (lean_disperses(r))
+        return spectral_radiance(lean_spectral(r, slot), pending);
+    return pending;
 }
 
 // Whether `r`'s paths gather caustic photons, whose light past chain vertices is then the
@@ -278,8 +303,12 @@ struct LayerPast
 interface IVertexKind
 {
     // The vertex `x`'s BSDF, its path inside the interiors its cold words `cold` list where
-    // `inside`.
-    Bsdf prepare(PathRoot r, PathVertex x, uint4* cold, bool inside);
+    // `inside`, a layer's IORs at wavelength `nm` where it is above 0.
+    Bsdf prepare(PathRoot r, PathVertex x, uint4* cold, bool inside, float nm);
+    // Whether it is a layer with a dispersive side, and the section material that bounds its
+    // interior.
+    bool disperses(PathRoot r, uint4* cold, bool inside);
+    uint section();
     // Whether light toward `dir`, where `light`, and scatter `s` cross the surface into the
     // interiors past it, and those interiors' medium.
     LayerPast meet(PathRoot r, uint4* cold, bool inside, float3 dir, bool light, BsdfSample s);
@@ -306,11 +335,21 @@ interface IVertexKind
 // An opaque surface: in an interior its BSDF sees the interior's medium outside it.
 struct OnOpaque : IVertexKind
 {
-    Bsdf prepare(PathRoot r, PathVertex x, uint4* cold, bool inside)
+    Bsdf prepare(PathRoot r, PathVertex x, uint4* cold, bool inside, float nm)
     {
         float exterior;
         BsdfParams p = params(r, x, cold, inside, exterior);
         return bsdf_prepare(p, x.surface.normal, x.view, exterior);
+    }
+
+    bool disperses(PathRoot r, uint4* cold, bool inside)
+    {
+        return false;
+    }
+
+    uint section()
+    {
+        return MATERIAL_NONE;
     }
 
     BsdfParams params(PathRoot r, PathVertex x, uint4* cold, bool inside, out float exterior)
@@ -364,10 +403,20 @@ struct OnLayer : IVertexKind
     bool stack;
     float3 face;
 
-    Bsdf prepare(PathRoot r, PathVertex x, uint4* cold, bool inside)
+    Bsdf prepare(PathRoot r, PathVertex x, uint4* cold, bool inside, float nm)
     {
         // A photon carries flux, which refraction leaves unscaled.
-        return prepare_vertex(r.scene, l, inside ? load_interior(cold) : Interior(), false, false, from_photon(r), 0.0);
+        return prepare_vertex(r.scene, l, inside ? load_interior(cold) : Interior(), false, false, from_photon(r), nm);
+    }
+
+    bool disperses(PathRoot r, uint4* cold, bool inside)
+    {
+        return layer_disperses(r.scene, l, inside ? load_interior(cold) : Interior());
+    }
+
+    uint section()
+    {
+        return l.section;
     }
 
     BsdfParams params(PathRoot r, PathVertex x, uint4* cold, bool inside, out float exterior)
@@ -901,7 +950,17 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     uint opaque = scattered + (LAYER ? 0 : 1);
     flags = (flags & ~(HOT_DEPTH_MASK << HOT_DEPTH_SHIFT)) | (min(opaque, HOT_DEPTH_MASK) << HOT_DEPTH_SHIFT);
     bool alive = (g.flags & GBUFFER_UNLIT) == 0 && (first || path_mode(r) != PATH_DIRECT) && carries(throughput);
-    Bsdf b = on.prepare(r, x, cold, inside);
+    // A dispersive layer draws the path's wavelengths where it has none, and prepares its BSDF at
+    // the hero's; what the path gathered before goes past the transfer that starts here.
+    bool dispersive = false;
+    PathSpectral spectral = {};
+    if (LAYER && may(MAY_DISPERSION) && !bent && lean_disperses(r))
+    {
+        dispersive = on.disperses(r, cold, inside);
+        if (dispersive)
+            spectral = start_spectral(r, slot, at, pixel);
+    }
+    Bsdf b = on.prepare(r, x, cold, inside, dispersive ? spectral.hero() : 0.0);
     // Whether light leaves the surface as a caustic, and what of the light the path finds past
     // chain vertices stays its own: a re-run's as the vertex found it.
     bool chains = may(MAY_CAUSTICS) && surface_chains(r, g);
@@ -1019,7 +1078,10 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     float3 scatter_f;
     float scatter_pdf;
     float3 scatter_diffuse;
-    bool estimates = count_nee && counted && candidates > 0 && u_run < run;
+    // A dispersive layer whose companions live adds no direct light: its BSDF differs by
+    // wavelength, and its rays reach the lights at full weight.
+    bool split = LAYER && may(MAY_DISPERSION) && dispersive && spectral.companions();
+    bool estimates = count_nee && counted && candidates > 0 && u_run < run && !split;
     // The path's first scattering vertex draws with its pixel's local sampler, as the staged loop's
     // does: on the G-buffer's surface, or in a hit's stage where a camera ray may reach it.
     bool local = may(MAY_LOCAL) && scattered == 0 && (FIRST == 1 || may_any(MAY_LAYERS | MAY_TRACED | MAY_LENS | MAY_BACKGROUND));
@@ -1134,6 +1196,10 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     }
     if (goes)
     {
+        // The companions' BSDFs toward the hero's draw weigh them, with the interiors the path
+        // arrived in.
+        if (LAYER && may(MAY_DISPERSION) && split)
+            call_disperse(disperse_call(on, r, x, cold, inside, s));
         // A ray that crosses a plane stack face ideally past a vertex that scattered it goes on
         // weighed as that vertex's ray against next-event estimation toward a directional light.
         uint left_normal = oct_encode_snorm16(g.normal);
@@ -1161,7 +1227,7 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
         flags |= HOT_RAY;
         flags = diffuse ? flags | HOT_DIFFUSE : flags & ~HOT_DIFFUSE;
         uint4 w1 = load_coherent(at + 1);
-        float ray_run = ray_run_word(count_nee ? run : 0.0, k.local);
+        float ray_run = ray_run_word(count_nee && !split ? run : 0.0, k.local);
         float ray_pdf = stacks ? PDF_STACK : delta ? 0.0 : s.pdf;
         // An ideal window passes the ray on as it reached it, weighed against next-event
         // estimation as the vertex before it left it, which took the lights past the window
@@ -1199,6 +1265,134 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     if (gathers)
         call_gather(gather);
     return left;
+}
+
+// The wavelengths of `slot`'s path in hot words `at`, which a dispersive layer at `pixel` meets:
+// those it drew, or drawn now, with every companion live, past which the light the path gathered
+// so far is committed as it is.
+PathSpectral start_spectral(PathRoot r, uint slot, uint4* at, uint2 pixel)
+{
+    uint4* words = lean_spectral(r, slot);
+    PathSpectral p = load_spectral(words);
+    if (p.on)
+        return p;
+    p.on = true;
+    p.sample = wavelength_sample(r, pixel);
+    p.value = float4(1.0);
+    p.density = float4(1.0);
+    p.update();
+    float4 w3 = asfloat(load_coherent(at + 3));
+    p.committed = w3.xyz;
+    store_coherent(at + 3, asuint(float4(0.0, 0.0, 0.0, w3.w)));
+    store_spectral(words, p);
+    return p;
+}
+
+// What a dispersive layer hands the callable that weighs its companions (`lean_disperse`): the
+// parameters its hero's BSDF was prepared from but its IORs, its shading normal, its section, the
+// view, where its section's medium is read, and the hero's draw: its direction, its lobe's
+// component, its value x cos and its density.
+public struct DisperseCall
+{
+    public BsdfParams p;
+    public float3 normal;
+    public uint section;
+    public float3 view;
+    public uint flags;              // DISPERSE_*
+    public float3 wi;
+    public uint component;
+    public float3 hero_f;
+    public float hero_pdf;
+    public float4 medium_point;
+}
+
+static const uint DISPERSE_DELTA = 1 << 0;
+static const uint DISPERSE_ADJOINT = 1 << 1;
+static const uint DISPERSE_INSIDE = 1 << 2;
+
+DisperseCall disperse_call<V : IVertexKind>(V on, PathRoot r, PathVertex x, uint4* cold, bool inside, BsdfSample s)
+{
+    DisperseCall c;
+    float exterior;
+    c.p = on.params(r, x, cold, inside, exterior);
+    c.normal = x.surface.normal;
+    c.section = on.section();
+    c.view = x.view;
+    bool delta = (s.lobe & LOBE_SPECULAR) != 0;
+    c.flags = (delta ? DISPERSE_DELTA : 0) | (from_photon(r) ? DISPERSE_ADJOINT : 0) | (inside ? DISPERSE_INSIDE : 0);
+    c.wi = s.wi;
+    c.component = s.component;
+    c.hero_f = s.weight * s.pdf;
+    c.hero_pdf = s.pdf;
+    c.medium_point = x.surface.medium_point;
+    return c;
+}
+
+void call_disperse(DisperseCall c)
+{
+    __stage_switch
+    {
+    case raygen:
+    case closesthit:
+    case miss:
+    case callable:
+        call(CALL_DISPERSE, c);
+        break;
+    default:
+        break;
+    }
+}
+
+// The callable that weighs `slot`'s companion wavelengths at the dispersive layer `c` names: each
+// live companion's BSDF, prepared as `prepare_vertex` prepares it at the companion's wavelength,
+// toward the hero's draw, against the hero's value and density. What the path gathered under the
+// transfer so far is committed through it before the transfer changes.
+public void lean_disperse(PathRoot r, uint slot, DisperseCall c)
+{
+    SceneRoot* s = r.scene;
+    uint4* words = lean_spectral(r, slot);
+    PathSpectral p = load_spectral(words);
+    Interior interior = (c.flags & DISPERSE_INSIDE) != 0 ? load_interior(lean_cold(r, slot)) : Interior();
+    uint m = c.section;
+    uint outside = interior.outside(m, m);
+    float4 entered = interior.point(m);
+    float4 point = entered.x != NO_MEDIUM_POINT.x ? entered : c.medium_point;
+    float exterior = interior_ior(s, outside);
+    Wavelengths w = sample_wavelengths(p.sample);
+    for (uint k = 1; k < WAVELENGTHS; k++)
+    {
+        if (!(p.density[k] > 0.0))
+            continue;
+        float nm = w.nm[k];
+        BsdfParams q = c.p;
+        q.specular_ior = dispersed_material_ior(s, m, q.specular_ior, nm, point);
+        Bsdf bk = bsdf_prepare(q, c.normal, c.view, dispersed_material_ior(s, outside, exterior, nm, interior.point(outside)), (c.flags & DISPERSE_ADJOINT) != 0);
+        float pk;
+        float3 fk;
+        if ((c.flags & DISPERSE_DELTA) != 0)
+            fk = bk.delta_value(c.component, c.wi, pk);
+        else
+        {
+            float3 unused;
+            fk = bk.eval_and_pdf(c.wi, pk, unused);
+        }
+        float3 basis = spectrum_basis(nm);
+        float own = dot(fk, basis);
+        float theirs = dot(c.hero_f, basis);
+        p.value[k] *= theirs > 0.0 ? own / theirs : 0.0;
+        p.density[k] *= c.hero_pdf > 0.0 ? pk / c.hero_pdf : 0.0;
+        if (!(p.value[k] > 0.0) || !(p.density[k] > 0.0) || !isfinite(p.value[k] * p.density[k]))
+        {
+            p.value[k] = 0.0;
+            p.density[k] = 0.0;
+        }
+    }
+    uint4* at = lean_hot(r, slot);
+    float4 w3 = asfloat(load_coherent(at + 3));
+    p.committed += mul(p.transfer, w3.xyz);
+    store_coherent(at + 3, asuint(float4(0.0, 0.0, 0.0, w3.w)));
+    p.update();
+    store_spectral(words, p);
 }
 
 // The value `f` of a chain vertex's BSDF toward a light, whose diffuse lobes give `diffuse` of it,
@@ -1442,6 +1636,13 @@ public void lean_deposit(PathRoot r, uint slot)
     uint4* record = lean_record(r, slot);
     uint4 photon = load_coherent(record);
     float3 flux = asfloat(photon.xyz) * float3(halves(b.x), halves(b.y).x);
+    // A photon that split by wavelength deposits through its transfer.
+    if (lean_disperses(r))
+    {
+        uint4* words = lean_spectral(r, slot);
+        if (spectral_on(words))
+            flux = mul(load_spectral(words).transfer, flux);
+    }
     if (!any(flux > 0.0) || !all(isfinite(flux)))
         return;
     Sampler rng = path_sampler(r, item_pixel(r, r.slice_base + slot));
@@ -1525,6 +1726,8 @@ public bool lean_photon_start<M : IMedium>(PathRoot r, uint slot, out float reac
     store_coherent(at + 5, uint4(asuint(light.dir), 0));
     if (may(MAY_STACK))
         store_coherent(lean_stack(r, slot) + STACK_TRACK_WORD, uint4(oct_encode_snorm16(p.dir), 0, 0, p.directional && lean_stacks(r) ? 1 : 0));
+    if (lean_disperses(r))
+        store_coherent(lean_spectral(r, slot) + 3, uint4(0));
     return true;
 }
 

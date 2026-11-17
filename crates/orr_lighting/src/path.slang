@@ -163,8 +163,10 @@ public struct LaunchHeader
     public uint light_at;
     public uint spectral_at;
     // The lean tracer's: a word a slot (`path.lean.state`'s `PathChain`) where its paths may gather
-    // caustic photons; null elsewhere.
+    // caustic photons, and its spectral words (`PathSpectral`) where they may split by wavelength;
+    // null elsewhere.
     public uint4* chain;
+    public uint4* spectral;
 }
 
 // A queue of path slots in one round: the workgroups its stage runs over, which whoever
@@ -1326,7 +1328,8 @@ public Bsdf prepare_vertex(SceneRoot* s, LayerVertex l, Interior interior, bool 
     bool layer = l.kind == VERTEX_LAYER;
     uint outside = layer ? interior.outside(m, m) : interior.innermost();
     float exterior = interior_ior(s, outside);
-    if (layer && nm > 0.0)
+    // The specializer folds a branch on the mask, not a wavelength that is 0 without dispersion.
+    if (may(MAY_DISPERSION) && layer && nm > 0.0)
     {
         // A path inside `m` read it where it entered; a path meeting it reads it here.
         float4 entered = interior.point(m);
