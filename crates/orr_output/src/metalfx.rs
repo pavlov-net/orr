@@ -1,26 +1,32 @@
-//! MetalFX as the backend of ray reconstruction.
+//! MetalFX as the backend of ray reconstruction and temporal upscaling.
 
 use orr_math::jitter::{jitter, jitter_phases, mip_bias};
 use orr_math::{DMat4, DVec3};
-use orr_metalfx::{DenoisedInputs, DenoisedScaler, Float4x4, ScaleRange};
+use orr_metalfx::{
+    DenoisedInputs, DenoisedScaler, Float4x4, ScaleRange, TemporalInputs, TemporalScaler,
+};
 use orr_scene::orr_gpu::{CommandList, Device};
 
 use crate::{
     Error, GuideReads, ReconstructionBackend, ReconstructionFeature, ReconstructionInputs,
-    ReconstructionMode, ReconstructionSupport, Result, UpscaleMode, UpscaleQuality,
+    ReconstructionMode, ReconstructionSupport, Result, UpscaleBackend, UpscaleFeature,
+    UpscaleInputs, UpscaleMode, UpscaleQuality,
 };
 
 /// MetalFX's effects on one device.
 pub struct MetalFx {
     device: Device,
     denoised: Option<ScaleRange>,
+    temporal: Option<ScaleRange>,
 }
 
 impl MetalFx {
     pub fn new(device: &Device) -> Self {
+        let support = orr_metalfx::support(device);
         Self {
             device: device.clone(),
-            denoised: orr_metalfx::support(device).denoised,
+            denoised: support.denoised,
+            temporal: support.temporal,
         }
     }
 
@@ -37,6 +43,28 @@ impl MetalFx {
             phases: jitter_phases(render, output),
             anchor: None,
         }))
+    }
+}
+
+/// The render size of `quality` at `output`, and the mode it names.
+fn quality_render(output: [u32; 2], quality: UpscaleQuality) -> ([u32; 2], UpscaleMode) {
+    let mode = match quality {
+        UpscaleQuality::Auto => auto_mode(output),
+        UpscaleQuality::Fixed(m) => m,
+    };
+    let scale = mode_scale(mode);
+    (
+        output.map(|e| ((f64::from(e) / scale).round() as u32).max(1)),
+        mode,
+    )
+}
+
+fn range_support(range: Option<ScaleRange>) -> ReconstructionSupport {
+    ReconstructionSupport {
+        available: range.is_some(),
+        dlaa: range.is_some_and(|r| r.contains(1.0)),
+        min_output: [1, 1],
+        scale: range.map(|r| [r.min, r.max]),
     }
 }
 
@@ -84,12 +112,7 @@ fn auto_mode(output: [u32; 2]) -> UpscaleMode {
 
 impl ReconstructionBackend for MetalFx {
     fn support(&self) -> ReconstructionSupport {
-        ReconstructionSupport {
-            available: self.denoised.is_some(),
-            dlaa: self.denoised.is_some_and(|r| r.contains(1.0)),
-            min_output: [1, 1],
-            scale: self.denoised.map(|r| [r.min, r.max]),
-        }
+        range_support(self.denoised)
     }
 
     fn reads(&self) -> GuideReads {
@@ -104,12 +127,7 @@ impl ReconstructionBackend for MetalFx {
         output: [u32; 2],
         quality: UpscaleQuality,
     ) -> Result<Box<dyn ReconstructionFeature>> {
-        let mode = match quality {
-            UpscaleQuality::Auto => auto_mode(output),
-            UpscaleQuality::Fixed(m) => m,
-        };
-        let scale = mode_scale(mode);
-        let render = output.map(|e| ((f64::from(e) / scale).round() as u32).max(1));
+        let (render, mode) = quality_render(output, quality);
         self.denoiser(render, output, ReconstructionMode::Upscale(mode))
     }
 
@@ -196,6 +214,97 @@ impl ReconstructionFeature for Denoiser {
                 jitter: view.jitter.to_array(),
                 world_to_view: cols(world_from_view.inverse()),
                 view_to_clip: Float4x4::from_cols_array_2d(&clip_from_view.to_cols_array_2d()),
+            },
+        )?;
+        Ok(())
+    }
+}
+
+impl MetalFx {
+    fn temporal(
+        &self,
+        render: [u32; 2],
+        output: [u32; 2],
+        mode: ReconstructionMode,
+    ) -> Result<Box<dyn UpscaleFeature>> {
+        let scaler = TemporalScaler::new(&self.device, render, output)?;
+        Ok(Box::new(Upscaler {
+            scaler,
+            mode,
+            phases: jitter_phases(render, output),
+        }))
+    }
+}
+
+impl UpscaleBackend for MetalFx {
+    fn upscale_support(&self) -> ReconstructionSupport {
+        range_support(self.temporal)
+    }
+
+    fn upscaler(
+        &self,
+        output: [u32; 2],
+        quality: UpscaleQuality,
+    ) -> Result<Box<dyn UpscaleFeature>> {
+        let (render, mode) = quality_render(output, quality);
+        self.temporal(render, output, ReconstructionMode::Upscale(mode))
+    }
+
+    fn upscaler_at(&self, render: [u32; 2], output: [u32; 2]) -> Result<Box<dyn UpscaleFeature>> {
+        self.temporal(
+            render,
+            output,
+            ReconstructionMode::Upscale(nearest_mode(render, output)),
+        )
+    }
+
+    fn antialiaser(&self, output: [u32; 2]) -> Result<Box<dyn UpscaleFeature>> {
+        if !self.upscale_support().dlaa {
+            return Err(Error::DlaaUnavailable);
+        }
+        self.temporal(output, output, ReconstructionMode::Dlaa)
+    }
+}
+
+struct Upscaler {
+    scaler: TemporalScaler,
+    mode: ReconstructionMode,
+    phases: u32,
+}
+
+impl UpscaleFeature for Upscaler {
+    fn mode(&self) -> ReconstructionMode {
+        self.mode
+    }
+
+    fn render_size(&self) -> [u32; 2] {
+        self.scaler.render_size()
+    }
+
+    fn output_size(&self) -> [u32; 2] {
+        self.scaler.output_size()
+    }
+
+    fn jitter(&self, frame: u64) -> [f32; 2] {
+        jitter(frame, self.phases)
+    }
+
+    fn mip_bias(&self) -> f32 {
+        mip_bias(self.scaler.render_size(), self.scaler.output_size())
+    }
+
+    fn record(&mut self, list: &mut CommandList<'_>, inputs: &UpscaleInputs<'_>) -> Result<()> {
+        self.scaler.record(
+            list,
+            &TemporalInputs {
+                color: inputs.color,
+                depth: inputs.depth,
+                motion: inputs.motion,
+                exposure: inputs.exposure,
+                pre_exposure: inputs.pre_exposure,
+                output: inputs.output,
+                reset: inputs.reset,
+                jitter: inputs.jitter,
             },
         )?;
         Ok(())

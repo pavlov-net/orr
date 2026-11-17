@@ -26,8 +26,6 @@ pub struct TemporalInputs<'a> {
     /// for color already exposed.
     pub exposure: Option<&'a Texture>,
     pub pre_exposure: f32,
-    /// One channel in [0, 1]: how far to trust this frame over the history.
-    pub reactive_mask: Option<&'a Texture>,
     pub output: &'a Texture,
     /// Drops the history.
     pub reset: bool,
@@ -56,7 +54,6 @@ struct Formats {
     depth: MTLPixelFormat,
     motion: MTLPixelFormat,
     output: MTLPixelFormat,
-    reactive: Option<MTLPixelFormat>,
 }
 
 impl TemporalScaler {
@@ -106,10 +103,8 @@ impl TemporalScaler {
             depth: raw(inputs.depth).pixelFormat(),
             motion: raw(inputs.motion).pixelFormat(),
             output: raw(inputs.output).pixelFormat(),
-            reactive: inputs.reactive_mask.map(|t| raw(t).pixelFormat()),
         };
-        // An input that comes or goes, such as the reactive mask, needs another effect, which
-        // starts without history.
+        // Inputs of other formats need another effect, which starts without history.
         let mut reset = inputs.reset;
         if self.made.as_ref().is_some_and(|m| m.formats != formats) {
             self.release();
@@ -144,7 +139,6 @@ impl TemporalScaler {
             s.setMotionTexture(Some(raw(inputs.motion)));
             s.setOutputTexture(Some(raw(inputs.output)));
             s.setExposureTexture(inputs.exposure.map(raw));
-            s.setReactiveMaskTexture(inputs.reactive_mask.map(raw));
             s.setPreExposure(inputs.pre_exposure);
             s.setInputContentWidth(self.render[0] as usize);
             s.setInputContentHeight(self.render[1] as usize);
@@ -180,17 +174,13 @@ impl Made {
             d.setOutputWidth(output[0] as usize);
             d.setOutputHeight(output[1] as usize);
             d.setAutoExposureEnabled(false);
-            if let Some(r) = f.reactive {
-                d.setReactiveMaskTextureEnabled(true);
-                d.setReactiveMaskTextureFormat(r);
-            }
             d.newTemporalScalerWithDevice_compiler(rd.device, rd.compiler)
         }
         .ok_or_else(|| Error::Create {
             effect: "temporal scaler",
             formats: format!(
-                "color {:?}, depth {:?}, motion {:?}, output {:?}, reactive {:?}",
-                f.color, f.depth, f.motion, f.output, f.reactive
+                "color {:?}, depth {:?}, motion {:?}, output {:?}",
+                f.color, f.depth, f.motion, f.output
             ),
         })?;
         Ok(Self { raw, formats: f })

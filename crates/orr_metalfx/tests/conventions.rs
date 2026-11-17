@@ -117,7 +117,6 @@ impl Probe {
                         motion: &self.motion,
                         exposure: None,
                         pre_exposure: 1.0,
-                        reactive_mask: None,
                         output: &self.output,
                         reset: frame == 0,
                         jitter: j.map(|c| jitter_sign * c),
