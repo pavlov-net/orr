@@ -28,9 +28,11 @@ macro_rules! patch {
 }
 
 patch! {
-    /// Any [`Material`] field but the texture bindings. glTF has no source for the
-    /// subsurface radius, the scatter and anisotropy fields or the linked surface id, so
-    /// those come only from here. Colors are linear Rec.709, lengths meters.
+    /// Any [`Material`] field but the texture bindings, as the source states it: a glTF or
+    /// UsdPreviewSurface material's in that model, which the cook converts to OpenPBR with the
+    /// rest of the material. glTF has no source for the subsurface radius, the scatter and
+    /// anisotropy fields or the linked surface id, so those come only from here. Colors are
+    /// linear Rec.709, lengths meters.
     MaterialPatch for Material {
         base_color: [f32; 3],
         base_weight: f32,

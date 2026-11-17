@@ -132,6 +132,7 @@ use crate::instances::InstanceMotion;
 use crate::mesh::{MeshData, MeshSettings, MeshSource, PartData, Pivots, SectionData, Skin};
 use crate::patch::{self, MaterialPatch, MeshPatch};
 use crate::shading;
+use crate::shading_model::ShadingModel;
 use crate::skin::{self, Channel, ClipSettings, ClipSource, Rig, RigSpace, Rigging};
 use crate::subd::SubdSettings;
 use crate::texture::material::{ImageData, ImageFile, ImageTile, TextureRules};
@@ -2996,6 +2997,7 @@ impl<'s> Importer<'s> {
                 shading::Mapped {
                     material: Default::default(),
                     textures: Default::default(),
+                    model: ShadingModel::OpenPbr,
                     vertex: Vec::new(),
                     warnings: Vec::new(),
                 },
@@ -3028,6 +3030,7 @@ impl<'s> Importer<'s> {
             suffix,
             material: mapped.material,
             textures: mapped.textures,
+            model: mapped.model,
             back: None,
         });
         self.frames.push(frame);

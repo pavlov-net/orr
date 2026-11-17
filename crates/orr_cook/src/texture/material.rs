@@ -1253,7 +1253,7 @@ impl<'a> Packer<'a> {
 
     /// The lowest and highest value scalar input `r` reads, each tile of a set through its own
     /// channel.
-    fn input_range(&self, r: &TexRef) -> (f32, f32) {
+    pub(crate) fn input_range(&self, r: &TexRef) -> (f32, f32) {
         let each = self.each(r).into_iter();
         widest(each.map(|t| self.range(&t, usize::from(t.channel))))
     }
@@ -1417,6 +1417,52 @@ impl<'a> Packer<'a> {
         let over = self.overridden(&[r.image], |o| o.primaries);
         let color = &self.image(r.image).color;
         r.color.color(color, over, |read| self.reads_below(r, read))
+    }
+
+    /// The highest value color input `r` reads in any channel, linear and in the primaries the
+    /// field multiplies, from its texels' range and what it reads past them: at most what its
+    /// factor times it reaches over the factor. A premultiplied file's colors grow as its alpha
+    /// falls, and an ICC profile need not keep a channel's order, so their texels bound nothing
+    /// and they read as reaching 1.
+    pub(crate) fn color_peak(&self, r: &TexRef) -> f32 {
+        let mut peak = 0.0_f32;
+        for t in self.each(r) {
+            let (read, _, gamut) = self.color_read(&t);
+            let f = self.image(t.image);
+            if read.straight || read.icc.is_some() {
+                peak = peak.max(1.0);
+                continue;
+            }
+            let values = read.values(f.codes);
+            // A remap may turn the range around: its either end can read the most.
+            let end = |high: bool| -> [f32; 3] {
+                let stored: [f32; 4] = std::array::from_fn(|c| match self.read(&t, c) {
+                    Ok(held) if c < 3 => {
+                        let (lo, hi) = f.range[held];
+                        if high { hi } else { lo }
+                    }
+                    Ok(_) => 1.0,
+                    Err(v) => v,
+                });
+                std::array::from_fn(|c| t.read(c, values.value(stored, c)))
+            };
+            let (low, high) = (end(false), end(true));
+            let mut texel: [f32; 3] = std::array::from_fn(|c| low[c].max(high[c]));
+            if let Some(m) = &gamut {
+                // A row of mixed signs reaches its most where its positive weights read their
+                // highest and its negative ones nothing.
+                let top = texel.iter().fold(0.0_f32, |a, &v| a.max(v));
+                texel = std::array::from_fn(|i| {
+                    let row = m.row(i);
+                    (row.x.max(0.0) + row.y.max(0.0) + row.z.max(0.0)) as f32 * top
+                });
+            }
+            peak = texel.into_iter().fold(peak, f32::max);
+            if self.bounded(&t) {
+                peak = (0..3).fold(peak, |p, c| p.max(t.read(c, t.outside[c])));
+            }
+        }
+        peak
     }
 
     /// The primaries a texture of color input `r` holds: a slot has one id, so tiles that read as

@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use crate::instances::InstanceMotion;
 use crate::mesh::{self, MeshSettings, MeshSource};
+use crate::shading_model::ShadingModel;
 use crate::skin::{ClipSettings, ClipSource, Reach, RigSpace, spectral_norm};
 use crate::state::Input;
 use crate::subd::{CageData, SubdSettings};
@@ -408,6 +409,9 @@ pub(crate) struct SceneMaterial {
     pub(crate) suffix: String,
     pub(crate) material: Material,
     pub(crate) textures: MaterialTextures,
+    /// What the source states `material` and `textures` in, which the cook converts to OpenPBR
+    /// once the textures' facts are known.
+    pub(crate) model: ShadingModel,
     /// The index among the scene's materials of its back.
     pub(crate) back: Option<usize>,
 }

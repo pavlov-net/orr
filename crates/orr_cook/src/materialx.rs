@@ -267,6 +267,7 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
             suffix: "back".to_string(),
             material: side.material,
             textures: side.textures,
+            model: side.model,
             back: None,
         });
     }
@@ -276,6 +277,7 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
             suffix: String::new(),
             material: mapped.material,
             textures: mapped.textures,
+            model: mapped.model,
             back: back.is_some().then_some(1),
         })
         .chain(back)

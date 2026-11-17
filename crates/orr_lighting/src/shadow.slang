@@ -543,17 +543,11 @@ public bool stack_material(SceneRoot* s, uint m, bool dispersion, out BsdfParams
     p.base_color = g.base_weight * g.base_color;
     p.metalness = g.metalness;
     p.specular_ior = g.specular_ior;
-    p.specular_color = surface_specular_color(g, g.specular_color, g.specular_ior);
+    p.specular_color = g.specular_color;
     p.specular_weight = g.specular_weight;
     p.specular_roughness = g.specular_roughness;
     p.transmission_weight = g.transmission_weight;
     p.transmission_color = g.transmission_depth == 0.0 ? g.transmission_color : float3(1.0);
-    if ((g.flags & MATERIAL_BASE_TINT) != 0)
-        p.transmission_color *= p.base_color;
-    if ((g.flags & MATERIAL_FRESNEL_MIX) != 0)
-        p.flags |= BSDF_FRESNEL_MIX;
-    if ((g.flags & MATERIAL_METAL_FLAT) != 0)
-        p.flags |= BSDF_METAL_FLAT;
     return bsdf_thin_mirror(p, AMBIENT_IOR);
 }
 

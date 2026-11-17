@@ -194,8 +194,6 @@ const SUBSURFACE: u32 = 8;
 const LAYERS: u32 = 16;
 const BSDF_THIN_WALLED: u32 = 1;
 const BSDF_COAT_FRAME: u32 = 64;
-const BSDF_FRESNEL_MIX: u32 = 128;
-const BSDF_METAL_FLAT: u32 = 256;
 
 // --- Packing ------------------------------------------------------------------------------
 
@@ -281,14 +279,6 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             1e-5 * 1e7f32.powf(rng.next())
         };
         c.flags = ((i as u32 % 3) << 5) | ((i as u32 % 2) * 2);
-        if i % 6 == 5 {
-            c.specular_color = arr(rng.rgb() * rng.next());
-            c.specular_weight = rng.next();
-            c.bsdf_flags |= BSDF_FRESNEL_MIX;
-        }
-        if i % 4 == 3 {
-            c.bsdf_flags |= BSDF_METAL_FLAT;
-        }
         if kind == 1 || kind == 2 {
             c.subsurface_weight = 0.05 + 0.95 * rng.next();
             c.subsurface_color = arr(rng.rgb());
@@ -401,15 +391,9 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             i,
         );
         close(cpu.ior, g.ior, 1e-5 * cpu.ior.max(1.0), "IOR layout", i);
-        let mix = c.bsdf_flags & BSDF_FRESNEL_MIX != 0;
-        assert_eq!(g.bsdf_flags & BSDF_FRESNEL_MIX != 0, mix, "case {i} mix");
-        let flat = c.bsdf_flags & BSDF_METAL_FLAT;
-        assert_eq!(g.bsdf_flags & BSDF_METAL_FLAT, flat, "case {i} flat metal");
         assert_eq!(cpu.flags, g.flags, "case {i} flags layout");
-        let root = byte(w.b[1], 24);
-        let scale = if mix { root * root } else { 1.0 };
         close3(
-            arr(cpu.specular_color * scale),
+            arr(cpu.specular_color),
             g.specular_color,
             1e-6,
             "specular color layout",
@@ -479,28 +463,13 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             ior_step(r(c.ior))
         };
         close(r(g.ior), r(c.ior), step, "IOR", i);
-        if mix {
-            // The size of F0 to a byte of its root, its hue to seven sRGB bits.
-            let peak = Vec3::from(c.specular_color).max_element();
-            let got = Vec3::from(g.specular_color).max_element();
-            close(got.sqrt(), peak.sqrt(), step8, "F0 size", i);
-            let tint = |v: [f32; 3], p: f32| v.map(|x| x / p.max(1e-9));
-            close3(
-                srgb3(tint(g.specular_color, got)),
-                srgb3(tint(c.specular_color, peak)),
-                0.5 / 127.0 + 1e-6,
-                "F0 hue",
-                i,
-            );
-        } else {
-            close3(
-                srgb3(g.specular_color),
-                srgb3(c.specular_color),
-                0.5 / 127.0 + 1e-6,
-                "specular color",
-                i,
-            );
-        }
+        close3(
+            srgb3(g.specular_color),
+            srgb3(c.specular_color),
+            0.5 / 127.0 + 1e-6,
+            "specular color",
+            i,
+        );
         if c.raster_error == 0.0 {
             assert_eq!(g.raster_error, 0.0);
         } else {
@@ -13539,69 +13508,6 @@ fn every_slot_reaches_its_parameter() {
     assert_clean();
 }
 
-/// What each model makes of the same fields, at one point.
-#[test]
-fn models_state_their_specular_and_tint() {
-    use orr_pack::material::{Material, slot};
-    let _guard = serial();
-    let d = device();
-    let specular = Material {
-        specular_color: [2.0, 1.0, 0.5],
-        specular_ior: 1.5,
-        specular_weight: 0.5,
-        base_color: [0.5, 0.25, 0.125],
-        transmission_weight: 1.0,
-        thin_walled: 1,
-        ..Material::default()
-    };
-    let record = |m: &Material| MaterialGpu::new(m, &[BoundTexture::NONE; slot::COUNT]);
-    let models = [
-        Material::MODEL_OPENPBR,
-        Material::MODEL_GLTF,
-        Material::MODEL_PREVIEW_SPECULAR,
-    ];
-    let records: Vec<MaterialGpu> = models
-        .iter()
-        .map(|&model| record(&Material { model, ..specular }))
-        .collect();
-    let out = surface_params(d, &records, |_| {}, [1.0; 4]);
-    let rec2020 = |c: [f32; 3]| {
-        orr_color::rec709_to_rec2020(Vec3::from(c))
-            .as_vec3()
-            .to_array()
-    };
-    let near = |a: [f32; 3], b: [f32; 3], what: &str| {
-        for k in 0..3 {
-            assert!((a[k] - b[k]).abs() < 1e-5, "{what}: {a:?} vs {b:?}");
-        }
-    };
-    near(
-        out[0].specular_color,
-        rec2020(specular.specular_color),
-        "OpenPBR keeps the tint",
-    );
-    near(
-        out[1].specular_color,
-        rec2020(specular.specular_color.map(|c| 0.04 * c)),
-        "glTF scales the IOR's F0",
-    );
-    near(
-        out[2].specular_color,
-        rec2020(specular.specular_color.map(|c| c.min(1.0))),
-        "the specular workflow states F0, a reflectance",
-    );
-    assert_eq!(out[0].flags & BSDF_FRESNEL_MIX, 0);
-    assert_ne!(out[1].flags & BSDF_FRESNEL_MIX, 0);
-    near(out[0].transmission_color, rec2020([1.0; 3]), "no tint");
-    near(
-        out[1].transmission_color,
-        rec2020(specular.base_color),
-        "glTF's base color tints",
-    );
-    near(out[2].transmission_color, rec2020([1.0; 3]), "no tint");
-    assert_clean();
-}
-
 /// A hit's vertex color weighs each corner by its barycentric, and its normals stay on the side
 /// a mirrored placement puts them, at sizes whose determinant is outside a float's range and on
 /// triangles whose area is. A ray from behind meets the whole frame reversed toward it, the
@@ -13907,58 +13813,6 @@ fn a_coat_frame_follows_a_uv_set_of_its_own() {
         assert!(along(rows[4], base), "{:?}", rows[4]);
         assert!(along(rows[5], coat), "{:?}", rows[5]);
     }
-    assert_clean();
-}
-
-/// `Material::MODEL_GLTF`: "The base color tints light through the surface", and a decal's base
-/// color is the surface's base color where it lies.
-#[test]
-fn a_decals_base_color_tints_gltf_transmission() {
-    use orr_pack::material::Material;
-    let _guard = serial();
-    let d = device();
-    let glass = Material {
-        base_color: [0.5; 3],
-        transmission_weight: 1.0,
-        model: Material::MODEL_GLTF,
-        ..Material::default()
-    };
-    let paint = Material {
-        base_color: [1.0, 0.0, 0.0],
-        ..Material::default()
-    };
-    let surface = Material {
-        model: Material::MODEL_OPENPBR,
-        ..glass
-    };
-    let record = |m: &Material| MaterialGpu::new(m, &[BoundTexture::NONE; slot::COUNT]);
-    let decal = DecalGpu {
-        material: 1,
-        channels: DecalChannels::BASE_COLOR.0,
-        axis_x: [1.0, 0.0, 0.0],
-        inv_half_x: 1e-3,
-        axis_y: [0.0, 1.0, 0.0],
-        inv_half_y: 1e-3,
-        axis_z: [0.0, 0.0, 1.0],
-        inv_half_z: 1e-3,
-        opacity: 1.0,
-        cos_full: 0.5,
-        ..bytemuck::Zeroable::zeroed()
-    };
-    let records = [record(&glass), record(&paint), record(&surface)];
-    let out = surface_params_under(d, &records, Some(decal), |_| {}, [1.0; 4]);
-    let want = orr_color::rec709_to_rec2020(Vec3::X).as_vec3();
-    let near = |got: [f32; 3], want: Vec3| (Vec3::from(got) - want).abs().max_element() < 1e-5;
-    assert!(near(out[0].base_color, want), "{:?}", out[0].base_color);
-    assert!(
-        near(out[0].transmission_color, want),
-        "{:?}",
-        out[0].transmission_color
-    );
-    assert_eq!(
-        out[2].transmission_color, [1.0; 3],
-        "OpenPBR's tint is its own"
-    );
     assert_clean();
 }
 
