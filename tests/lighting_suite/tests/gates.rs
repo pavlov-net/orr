@@ -1,4 +1,4 @@
-//! The code of the pipeline path tracer that not every scene runs: the pipelines made for exactly
+//! The code of the path tracer that not every scene runs: the pipelines made for exactly
 //! what a scene and its settings may meet hold it behind each of its `specialize.slang` bits.
 
 use std::any::Any;
@@ -8,7 +8,7 @@ use lighting_suite::bed::{
     assert_gate, glass_scene, light_bed, particle_bed, plane_stack_spec, plume_bed,
     producer_stack_bed, reference,
 };
-use lighting_suite::{assert_clean, device, require, texture, upload};
+use lighting_suite::{assert_clean, texture, upload};
 use orr_gpu::KernelSet;
 use orr_lighting::path_may::{
     MAY_BACKGROUND, MAY_CACHE, MAY_CAUSTICS, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL,
@@ -42,7 +42,7 @@ fn dim(bed: &mut Bed, _: &mut Paths) -> Box<dyn Any> {
     Box::new(())
 }
 
-/// The code of the pipeline path tracer that not every scene runs, by the `path_may` and
+/// The code of the path tracer that not every scene runs, by the `path_may` and
 /// `path_may2` bits it sits behind, each with a scene whose paths run it.
 fn gates() -> Vec<Row> {
     let view = u64::from(MAY_VIEW);
@@ -279,9 +279,6 @@ fn gates() -> Vec<Row> {
 
 /// The gates of [`gates`] in `run`, each by [`assert_gate`].
 fn gate_rows(run: std::ops::Range<usize>) {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
     for row in gates().into_iter().skip(run.start).take(run.len()) {
         assert_gate(
             &KernelSet::default(),

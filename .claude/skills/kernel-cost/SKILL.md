@@ -19,8 +19,8 @@ and the counters, for the GPU, driver, scene and mask in front of you.
   struct kept for a later use, a candidate handler inside a query's loop), whether or not a
   scene runs that code. What the registers cannot hold spills to memory, which each thread
   crossing that point loads and stores.
-- **Per-thread state.** Every stage loads and stores per-path state every round. An array
-  indexed at run time lives in each thread's local memory, and every invocation writes a
+- **Per-thread state.** A path's shaders load and store its state in memory at every vertex. An
+  array indexed at run time lives in each thread's local memory, and every invocation writes a
   `static` array's initializer whether or not anything reads the array.
 - **Call sites.** Slang inlines every call. That is what makes the code fast, and it is not
   the thing to fight. What costs is a heavy body reached from many sites: each is another full
@@ -64,7 +64,7 @@ pipeline's stage caps hold.
   boolean tests and scalar locals; a gate that reads it from a root or record field removes
   nothing.
 - Set the bit from what the scene holds, as narrowly as the scene allows (`SceneFeatures`,
-  `scene_may`, `features_may`). A bit set without need keeps code that holds registers and
+  `scene_may`, `state_may`). A bit set without need keeps code that holds registers and
   compile time; a bit clear where the feature is used gives a wrong image with no error.
 - Add a rendered test that fails with the bit forced clear, like the `specialized_pipelines_*`
   tests in `tests/lighting_suite`. The driver may round two specializations differently, so
@@ -87,8 +87,8 @@ report those with the GPU and driver beside every number.
   over several. The examples read `RUST_LOG`, as do the tests on `gpu_suite`'s device (the
   lighting suite's among them), whose output the test runner writes to `target/test-logs`, a
   passing test's only with `-- --nocapture`.
-- **Call sites.** `python -I ${CLAUDE_SKILL_DIR}/scripts/spv_size.py --lines --stage trace`,
-  on a build with line tables (dev, or the `profiling` profile), lists a path stage's
+- **Call sites.** `python -I ${CLAUDE_SKILL_DIR}/scripts/spv_size.py --lines --kernel lean_paths`,
+  on a build with line tables (dev, or the `profiling` profile), lists a path kernel's
   instructions by source file and the lines with the most copies: a heavy body inlined at many
   sites.
 - **What holds registers or spill.** The driver reports no liveness per line, so find the
@@ -136,8 +136,6 @@ then measures the stand-ins as much as the idea.
 
 ## Facts about the API
 
-- The host records the barriers between a pass's rounds, and nothing in Vulkan lets the GPU
-  skip them, so an empty round still costs its barriers.
 - Lanes that split at a branch are guaranteed back together for subgroup (wave) operations
   only where the whole workgroup entered the branch together, unless the kernel declares
   maximal reconvergence (`[MaximallyReconverges]`, as the software raster does).

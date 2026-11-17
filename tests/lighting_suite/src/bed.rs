@@ -22,8 +22,8 @@ use orr_gpu::{
 use orr_lighting::path_may::{MAY_BACKGROUND, MAY_PHOTON, MAY_UPDATE, MAY_VIEW};
 use orr_lighting::{
     BsdfTables, DirectionalLight, DiscProfile, DofBackgroundPass, EnvironmentMapGpu, ExtraGuides,
-    Light, LightId, LightingKernels, LightingView, ParticleDraw, PathEntry, PathNeeds,
-    ReferenceSettings, SceneLighting, SceneLightingSettings, ScenePass, ViewLighting, ViewPass,
+    Light, LightId, LightingKernels, LightingView, ParticleDraw, PathNeeds, ReferenceSettings,
+    SceneLighting, SceneLightingSettings, ScenePass, ViewLighting, ViewPass,
 };
 use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
@@ -3449,7 +3449,7 @@ pub fn assert_gate(kernels: &KernelSet, gate: &Gate<'_>) {
     let mut images = Vec::new();
     for (bed, specialize) in beds.iter_mut().zip([false, true]) {
         bed.run_to(frames);
-        let mut paths = Paths::exactly(kernels, PathEntry::Pipeline, gate.settings);
+        let mut paths = Paths::new(kernels, gate.settings);
         paths.specialize = specialize;
         let _kept = (gate.setup)(bed, &mut paths);
         images.push(render_paths(bed, &paths, 4, 1));
@@ -3490,42 +3490,29 @@ pub fn assert_gate(kernels: &KernelSet, gate: &Gate<'_>) {
     );
 }
 
-/// The staged loop and the pipeline path tracer of `kernels`, both with `settings`.
-pub fn both(kernels: &KernelSet, settings: ViewLighting) -> (Paths, Paths) {
-    (
-        Paths::exactly(kernels, PathEntry::Compute, settings),
-        Paths::exactly(kernels, PathEntry::Pipeline, settings),
-    )
+/// Real-time frames redraw the light tiles, so runs differ by their noise: `b`'s frames at `a`'s
+/// seed sit as close to `a`'s as `a`'s frames at another seed do. The world cache settles over
+/// `a`'s frames first.
+pub fn assert_renders_within_noise(what: &str, bed: &mut Bed, a: &Paths, b: &Paths) {
+    render_paths(bed, a, 32, 3);
+    let of_b = render_paths(bed, b, 32, 1);
+    let same_seed = render_paths(bed, a, 32, 1);
+    let noise = render_paths(bed, a, 32, 2);
+    assert_within_noise(what, &of_b, &same_seed, &noise, 1.25);
 }
 
-/// Real-time frames redraw the light tiles, so runs differ by their noise: the pipeline's frames
-/// at the staged loop's seed sit as close to the staged loop's as its frames at another seed do.
-/// The world cache settles over the staged loop's frames first.
-pub fn assert_pipeline_within_noise(what: &str, bed: &mut Bed, staged: &Paths, launched: &Paths) {
-    render_paths(bed, staged, 32, 3);
-    let piped = render_paths(bed, launched, 32, 1);
-    let same_seed = render_paths(bed, staged, 32, 1);
-    let noise = render_paths(bed, staged, 32, 2);
-    assert_within_noise(what, &piped, &same_seed, &noise, 1.25);
-}
-
-/// [`assert_pipeline_within_noise`], and the two means agree over frames that alternate, which
+/// [`assert_renders_within_noise`], and the two means agree over frames that alternate, which
 /// see the world cache alike. The cache carries light from frame to frame, so a frame's mean
 /// leans on the last ones': the test takes the means of runs of frames, which lean on each
 /// other little enough to count as independent.
-pub fn assert_pipeline_renders_as_staged(
-    what: &str,
-    bed: &mut Bed,
-    staged: &Paths,
-    launched: &Paths,
-) {
+pub fn assert_renders_alike(what: &str, bed: &mut Bed, a: &Paths, b: &Paths) {
     const RUN: usize = 8;
     const RUNS: usize = 12;
-    assert_pipeline_within_noise(what, bed, staged, launched);
-    let (mut of_staged, mut of_launched) = (Vec::new(), Vec::new());
+    assert_renders_within_noise(what, bed, a, b);
+    let (mut of_a, mut of_b) = (Vec::new(), Vec::new());
     for k in 0..(RUN * RUNS) as u32 {
-        of_staged.push(image_mean(&render_paths(bed, staged, 1, 4 + k))[1]);
-        of_launched.push(image_mean(&render_paths(bed, launched, 1, 4 + k))[1]);
+        of_a.push(image_mean(&render_paths(bed, a, 1, 4 + k))[1]);
+        of_b.push(image_mean(&render_paths(bed, b, 1, 4 + k))[1]);
     }
     let runs = |frames: &[f64]| -> Vec<f64> {
         frames
@@ -3533,15 +3520,83 @@ pub fn assert_pipeline_renders_as_staged(
             .map(|run| run.iter().sum::<f64>() / RUN as f64)
             .collect()
     };
-    crate::welch::assert_same_mean(what, &runs(&of_launched), &runs(&of_staged));
+    crate::welch::assert_same_mean(what, &runs(&of_b), &runs(&of_a));
+}
+
+/// A real-time view's frames against the converged reference of the same scene: the image's
+/// mean luminance and each 16 px block's, past the blocks darker than `floor` of the image mean,
+/// within relative `tolerance`.
+#[derive(Clone, Copy, Debug)]
+pub struct Converges {
+    pub image: f64,
+    pub block: f64,
+    pub floor: f64,
+}
+
+/// How far a real-time view's frames lie from the reference's: the world cache that real-time
+/// paths end in after a diffuse bounce holds each cell's mean light, which leans on the cell's
+/// brighter or darker parts. Measured at most 0.6% of the image and 3.2% of a block, the
+/// alpha-tested quad's, over the scenes that take it: this is about twice that.
+pub const CONVERGES: Converges = Converges {
+    image: 0.015,
+    block: 0.065,
+    floor: 0.1,
+};
+
+/// Pixels a side of the blocks [`assert_converges`] compares.
+const CONVERGE_BLOCK: u32 = 16;
+
+/// The mean luminance of each [`CONVERGE_BLOCK`] pixel block of `a`, by rows.
+fn block_means(a: &Accumulated) -> Vec<f64> {
+    let [columns, rows] = EXTENT.map(|e| e / CONVERGE_BLOCK);
+    let half = CONVERGE_BLOCK / 2;
+    (0..columns * rows)
+        .map(|i| {
+            let at = (UVec2::new(i % columns, i / columns) * CONVERGE_BLOCK + half).as_vec2();
+            orr_color::luminance(DVec3::from(a.around(at, half)))
+        })
+        .collect()
+}
+
+/// `real_time`'s frames on `bed`, after `real_time` has run long enough for the world cache to
+/// settle, against `truth`, the reference's converged render of the same scene: the two estimate
+/// the same light, the real-time one up to the bias of the world cache it ends paths in, which
+/// `tolerance` holds.
+pub fn assert_converges(
+    what: &str,
+    bed: &mut Bed,
+    real_time: &Paths,
+    truth: &Accumulated,
+    tolerance: Converges,
+) {
+    render_paths(bed, real_time, 64, 3);
+    let got = render_paths(bed, real_time, 256, 5);
+    let mean = |a: &Accumulated| a.mean.iter().map(luminance).sum::<f64>() / a.mean.len() as f64;
+    let (image, want) = (mean(&got), mean(truth));
+    let report = format!("{what}: image {image} against the reference's {want}");
+    assert!(want > 0.0, "{report}");
+    assert!(
+        (image / want - 1.0).abs() <= tolerance.image,
+        "{report}, beyond {}",
+        tolerance.image
+    );
+    let worst = block_means(&got)
+        .into_iter()
+        .zip(block_means(truth))
+        .filter(|&(_, t)| t > tolerance.floor * want)
+        .map(|(g, t)| (g / t - 1.0).abs())
+        .fold(0.0, f64::max);
+    assert!(
+        worst <= tolerance.block,
+        "{report}; a block {worst} from the reference's, beyond {}",
+        tolerance.block
+    );
 }
 
 /// orr_lighting's view dispatch and guide resolve recording into bed frames with
 /// `settings`.
 pub struct Paths {
     kernels: &'static LightingKernels,
-    /// The entry the paths run.
-    pub entry: PathEntry,
     /// Where the kernels compile the path pipelines a frame first asks for.
     loading: &'static orr_scene::Loading,
     pub settings: ViewLighting,
@@ -3560,45 +3615,23 @@ pub struct Paths {
     pub every_tile: bool,
 }
 
-/// The entry [`Paths::new`] runs for `entry`: with `ORR_TEST_PIPELINE_PATHS` set, the staged loop's
-/// entries move to the ray tracing pipeline, so every bed's paths run on it.
-pub fn moved_entry(entry: PathEntry) -> PathEntry {
-    match entry {
-        PathEntry::Fastest | PathEntry::Compute | PathEntry::RayDispatch
-            if std::env::var_os("ORR_TEST_PIPELINE_PATHS").is_some() =>
-        {
-            PathEntry::Pipeline
-        }
-        e => e,
-    }
-}
-
 /// Threads that compile a bed's pipelines at once: the machine's.
 fn compile_threads() -> usize {
     std::thread::available_parallelism().map_or(2, std::num::NonZero::get)
 }
 
 impl Paths {
-    /// The paths of [`moved_entry`]`(entry)`.
-    pub fn new(kernels: &KernelSet, entry: PathEntry, settings: ViewLighting) -> Self {
-        Self::exactly(kernels, moved_entry(entry), settings)
-    }
-
-    /// The paths of `entry` whatever `ORR_TEST_PIPELINE_PATHS` says, for tests that compare
-    /// entries. The kernels of a set and entry compile once per process, on threads of their
-    /// own, and stay: under the validation layer each compile takes minutes.
-    pub fn exactly(kernels: &KernelSet, entry: PathEntry, settings: ViewLighting) -> Self {
-        type Key = (Vec<usize>, PathEntry);
+    /// The paths of `kernels` with `settings`. The kernels of a set compile once per process, on
+    /// threads of their own, and stay: under the validation layer each compile takes minutes.
+    pub fn new(kernels: &KernelSet, settings: ViewLighting) -> Self {
+        type Key = Vec<usize>;
         type Compiled = (LightingKernels, Arc<orr_scene::Loading>);
         static COMPILED: Mutex<Vec<(Key, &'static OnceLock<Compiled>)>> = Mutex::new(Vec::new());
-        let key = (
-            kernels
-                .modules
-                .iter()
-                .map(|m| ptr::from_ref(*m).addr())
-                .collect(),
-            entry,
-        );
+        let key: Key = kernels
+            .modules
+            .iter()
+            .map(|m| ptr::from_ref(*m).addr())
+            .collect();
         let mut compiled = COMPILED.lock().unwrap_or_else(PoisonError::into_inner);
         let slot = match compiled.iter().find(|(k, _)| *k == key) {
             Some((_, slot)) => *slot,
@@ -3613,7 +3646,7 @@ impl Paths {
             let tables = BsdfTables::new(device()).unwrap();
             let kernels: &'static KernelSet = Box::leak(Box::new(*kernels));
             let loading = Arc::new(orr_scene::testing::loading());
-            let jobs = LightingKernels::spawn(device(), kernels, &tables, entry, &loading);
+            let jobs = LightingKernels::spawn(device(), kernels, &tables, &loading);
             std::thread::scope(|threads| {
                 for _ in 1..compile_threads() {
                     threads.spawn(|| while loading.run_one() {});
@@ -3633,7 +3666,6 @@ impl Paths {
         });
         Self {
             kernels,
-            entry,
             loading,
             settings,
             specialize: std::env::var_os("ORR_TEST_SPECIALIZED").is_some(),
@@ -3721,7 +3753,7 @@ impl Paths {
             .record_media(list, lighting, target, pass, settings)
             .unwrap();
         self.kernels
-            .record_paths(list, lighting, target, pass, settings, Some(f.scene_hits))
+            .record_paths(list, lighting, target, pass, settings, f.scene_hits)
             .unwrap();
         // A frame that waited for its pipelines runs the ones made for exactly what it asked.
         if let Some(ran) = target.paths_ran().filter(|_| settings.specialize) {

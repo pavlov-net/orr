@@ -2,7 +2,7 @@
 
     python -I spv_size.py MODULE.spv [...]       instructions, ray queries, largest functions
     python -I spv_size.py --lines MODULE.spv     instructions by source file and most-copied lines
-    python -I spv_size.py [--lines] --stage NAME the newest build of path/staged/NAME.spv
+    python -I spv_size.py [--lines] --kernel NAME the newest build of path/NAME.spv
 
 --lines needs a build with line tables (dev, the profiling profile, or
 ORR_SHADER_DEBUG_INFO=lines). A line that shows many copies is a body inlined at many call
@@ -98,7 +98,7 @@ def lines(path):
         print("  %8d  %4d copies  %s:%d" % (count, copies[key], name(key[0]), key[1]))
 
 
-def newest_stage(stage):
+def newest_kernel(kernel):
     # The script lives in <checkout>/.claude/skills/<skill>/scripts, so this finds the build of
     # the checkout the skill came from, worktrees included.
     checkout = pathlib.Path(__file__).resolve().parents[4]
@@ -106,9 +106,9 @@ def newest_stage(stage):
         ["cargo", "metadata", "--format-version", "1", "--no-deps"],
         cwd=checkout, capture_output=True, text=True, check=True)
     build = pathlib.Path(json.loads(metadata.stdout)["build_directory"])
-    found = list(build.glob("*/build/orr_lighting/*/out/path/staged/%s.spv" % stage))
+    found = list(build.glob("*/build/orr_lighting/*/out/path/%s.spv" % kernel))
     if not found:
-        sys.exit("no path/staged/%s.spv under %s: build the lighting crate first" % (stage, build))
+        sys.exit("no path/%s.spv under %s: build the lighting crate first" % (kernel, build))
     module = max(found, key=lambda path: path.stat().st_mtime)
     print(module)
     return str(module)
@@ -119,8 +119,8 @@ if __name__ == "__main__":
     by_lines = args[:1] == ["--lines"]
     if by_lines:
         args = args[1:]
-    if args[:1] == ["--stage"] and len(args) == 2:
-        args = [newest_stage(args[1])]
+    if args[:1] == ["--kernel"] and len(args) == 2:
+        args = [newest_kernel(args[1])]
     if not args or args[0].startswith("--") or (by_lines and len(args) != 1):
         sys.exit(__doc__)
     if by_lines:

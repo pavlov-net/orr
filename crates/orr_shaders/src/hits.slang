@@ -49,36 +49,6 @@ public struct HitInputs
     public uint pad4;
 }
 
-// A hit as a value apart from the trace that found it: an inline trace's `Hit` with its triangle's
-// corners `positions`, reached along `dir`, which no launch thread holds. It holds what the bodies
-// that resolve a hit read, and no geometry index, side or origin.
-public struct ValueHit : IHit
-{
-    public uint instance;
-    public uint custom;
-    public int cluster;
-    public uint primitive;
-    public float2 bary;
-    public float distance;
-    public float3 dir;
-    public float3 positions[3];
-
-    public uint3 launch() { return uint3(0); }
-    public uint instance_index() { return instance; }
-    public uint custom_index() { return custom; }
-    public uint geometry_index() { return 0; }
-    public uint primitive_index() { return primitive; }
-    public int cluster_id() { return cluster; }
-    public float t() { return distance; }
-    public float2 barycentrics() { return bary; }
-    public bool front_face() { return false; }
-    public float3 world_origin() { return float3(0.0); }
-    public float3 world_direction() { return dir; }
-    public float3 object_origin() { return float3(0.0); }
-    public float3 object_direction() { return float3(0.0); }
-    public float3 corner(uint i) { return positions[i]; }
-}
-
 // The hit a compute stand-in reads from `HitInputs` in memory.
 public struct StoredHit : IHit
 {

@@ -4,32 +4,32 @@
 //! as lights.
 
 use lighting_suite::bed::{
-    Accumulated, Analytic, BLACK_SPHERE, BUMPY_FLOOR, Bed, COATED_EMITTER, EMITTER, EMITTER_FIELD,
-    EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal, FrostGuide, GLASS_SPHERE, GLOSSY_FLOOR, Item,
-    LAYERED_SPHERE, MIRROR, NEAR, Particle, ParticleLook, Paths, QUADRANT_EMITTER, SKINNED_EMITTER,
-    SKY, SMOOTH_FLOOR, SUN, Spec, StrandRow, TILED_FLOOR, TINTED_FLOOR, TRANSLUCENT_SHEET, TROUGH,
-    WATER_BOX, WHITE_FLOOR, assert_close, assert_pipeline_renders_as_staged,
-    assert_pipeline_within_noise, assert_within_noise, both, glass_scene, image_mean, light_bed,
-    luminance, mean_where, particle_bed, pixel_of, plane_stack_spec, plume_bed, producer_stack_bed,
-    reference, render_paths, surface_mean,
+    Accumulated, Analytic, BLACK_SPHERE, BUMPY_FLOOR, Bed, COATED_EMITTER, CONVERGES, EMITTER,
+    EMITTER_FIELD, EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal, FrostGuide, GLASS_SPHERE,
+    GLOSSY_FLOOR, Item, LAYERED_SPHERE, MIRROR, NEAR, Particle, ParticleLook, Paths,
+    QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR, SUN, Spec, StrandRow, TILED_FLOOR,
+    TINTED_FLOOR, TRANSLUCENT_SHEET, TROUGH, WATER_BOX, WHITE_FLOOR, assert_close,
+    assert_converges, assert_renders_alike, assert_within_noise, glass_scene, image_mean,
+    light_bed, luminance, mean_where, particle_bed, pixel_of, plane_stack_spec, plume_bed,
+    producer_stack_bed, reference, render_paths, surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
 use lighting_suite::{
-    assert_clean, device, pipeline, read, readback, render, require, run, texture, upload,
+    assert_clean, device, pipeline, read, readback, render, run, texture, upload,
 };
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::types::LocalLights;
 use orr_lighting::{
     CausticSettings, DirectionalLight, DiscProfile, DofBackgroundPass, Light, LightId, LightSetGpu,
-    LightingDebugView, OriginProbes, PathEntry, ReferenceSettings, SceneLightingSettings, ThinLens,
+    LightingDebugView, OriginProbes, ReferenceSettings, SceneLightingSettings, ThinLens,
     ViewLighting,
 };
 use orr_math::{Affine3, DVec3, Mat3, Quat, Vec2, Vec3};
 use orr_scene::{MediumProxy, MediumProxyId, Opacity, Projection, ProxyDensity, RendererDesc};
 
 fn paths(settings: ViewLighting) -> Paths {
-    Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
+    Paths::new(&KernelSet::default(), settings)
 }
 
 fn debug(view: LightingDebugView, max_bounces: u32) -> ViewLighting {
@@ -80,79 +80,17 @@ fn an_albedo_one_sphere_in_a_uniform_environment_returns_the_environment() {
     assert_clean();
 }
 
-/// A first vertex of the pipeline path tracer draws a share of its candidates from its screen
-/// tile's local light sampler, through a callable of its own, with their densities in the mixture
-/// of the two and its shadow ray to the point the sampler drew: next-event estimation alone
-/// lights a glossy floor under a sphere and a rect light, neither in view, around the shadows a
-/// black sphere casts of them, as the staged loop's does.
+/// The paths trace a view's camera rays in place of the raster: their hits, the paths' first
+/// vertices, write the G-buffer the guides and the update paths read, and the view of a sphere on
+/// the ground under a sun and a sky, of an alpha-tested quad over it, and of the Cornell box, whose
+/// emissive quad the camera sees, comes out as the rastered one does.
 #[test]
-fn the_pipeline_draws_from_local_light_samplers_as_the_staged_loop_does() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
-    let nee = ViewLighting {
-        debug_view: LightingDebugView::NeeOnly,
-        ..ViewLighting::default()
-    };
-    assert!(nee.local_light_share > 0.0);
-    let (staged, launched) = both(&KernelSet::default(), nee);
-    let mut bed = Bed::with(Spec {
-        copies: vec![
-            Item {
-                model: GLOSSY_FLOOR,
-                linear: Mat3::IDENTITY,
-                at: Vec3::ZERO,
-            },
-            Item {
-                model: BLACK_SPHERE,
-                linear: Mat3::IDENTITY,
-                at: Vec3::new(0.0, 0.8, 0.2),
-            },
-        ],
-        lights: vec![
-            Light::Sphere {
-                position: DVec3::new(-0.6, 3.0, 0.5),
-                radius: 0.15,
-                intensity: Vec3::splat(40.0),
-                cone: None,
-            },
-            Light::Rect {
-                center: DVec3::new(0.6, 3.0, 0.5),
-                edge_x: Vec3::new(0.4, 0.0, 0.0),
-                edge_y: Vec3::new(0.0, 0.0, 0.3),
-                luminance: Vec3::splat(200.0),
-            },
-        ],
-        environment: None,
-        eye: Vec3::new(0.0, 1.0, 3.0),
-        target: Vec3::ZERO,
-        fov_y: 0.8,
-        focus: None,
-    });
-    assert_pipeline_renders_as_staged("local lights", &mut bed, &staged, &launched);
-    assert_clean();
-}
-
-/// The pipeline's paths trace a view's camera rays in place of the raster: their hits, the
-/// paths' first vertices, write the G-buffer the guides and the update paths read, and the view
-/// of a sphere on the ground under a sun and a sky, of an alpha-tested quad over it, and of the
-/// Cornell box, whose emissive quad the camera sees, comes out as the staged loop renders the
-/// rastered one.
-#[test]
-fn the_pipeline_traces_a_view_s_camera_rays_as_the_raster_draws_it() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
-    let traced = ViewLighting {
+fn traced_camera_rays_render_what_the_raster_draws() {
+    let raster = paths(ViewLighting::default());
+    let traced = paths(ViewLighting {
         traced_primary: true,
         ..ViewLighting::default()
-    };
-    let staged = Paths::exactly(
-        &KernelSet::default(),
-        PathEntry::Compute,
-        ViewLighting::default(),
-    );
-    let launched = Paths::exactly(&KernelSet::default(), PathEntry::Pipeline, traced);
+    });
     for (scene, pre_exposure) in [
         (Analytic::SunAndGround, 1.0 / 64.0),
         (Analytic::AlphaQuad, 1.0 / 64.0),
@@ -160,20 +98,22 @@ fn the_pipeline_traces_a_view_s_camera_rays_as_the_raster_draws_it() {
     ] {
         let mut bed = Bed::new(scene);
         bed.set_pre_exposure(pre_exposure);
-        assert_pipeline_renders_as_staged(&format!("{scene:?}"), &mut bed, &staged, &launched);
+        assert_renders_alike(&format!("{scene:?}"), &mut bed, &raster, &traced);
     }
     assert_clean();
 }
 
-/// The pipeline path tracer renders opaque scenes as the staged loop does: a sphere on the ground
-/// under a sun and a sky, the Cornell box lit by its emissive quad, and an alpha-tested quad; and
-/// the box in the debug view of its first vertex's ray origin bias.
+/// The converged reference of `bed`'s scene: `frames` frames of `reference(bounces)`.
+fn truth(bed: &mut Bed, bounces: u32, frames: u32) -> Accumulated {
+    render_paths(bed, &paths(reference(bounces)), frames, 7)
+}
+
+/// Real-time paths converge to the reference on opaque scenes, up to the world cache's bias: a
+/// sphere on the ground under a sun and a sky, the Cornell box lit by its emissive quad, and an
+/// alpha-tested quad.
 #[test]
-fn the_pipeline_renders_opaque_scenes_as_the_staged_loop_does() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
-    let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
+fn real_time_paths_converge_on_opaque_scenes() {
+    let real_time = paths(ViewLighting::default());
     // At a pre-exposure of 1 the sunlit ground passes the HDR ceiling, which would clip the
     // samples that draw the sun.
     for (scene, pre_exposure) in [
@@ -183,43 +123,47 @@ fn the_pipeline_renders_opaque_scenes_as_the_staged_loop_does() {
     ] {
         let mut bed = Bed::new(scene);
         bed.set_pre_exposure(pre_exposure);
-        assert_pipeline_renders_as_staged(&format!("{scene:?}"), &mut bed, &staged, &launched);
-    }
-    // A debug view of the first vertex alone, which the pipeline starts from a callable of its
-    // own. It draws nothing, so the two show the same image.
-    let origin_bias = ViewLighting {
-        debug_view: LightingDebugView::RayOriginBias,
-        ..ViewLighting::default()
-    };
-    let (staged, launched) = both(&KernelSet::default(), origin_bias);
-    let mut bed = Bed::new(Analytic::CornellBox);
-    let a = render_paths(&mut bed, &staged, 1, 1);
-    let b = render_paths(&mut bed, &launched, 1, 1);
-    assert!(
-        b.mean.iter().any(|p| p[0] > 0.0),
-        "origin bias: an empty image"
-    );
-    for (i, (x, y)) in a.mean.iter().zip(&b.mean).enumerate() {
-        for c in 0..4 {
-            assert!(
-                (x[c] - y[c]).abs() <= 1e-5 * x[c].abs().max(1e-6),
-                "origin bias: pixel {i} staged {x:?}, pipeline {y:?}"
-            );
-        }
+        let truth = truth(&mut bed, 12, 1024);
+        assert_converges(
+            &format!("{scene:?}"),
+            &mut bed,
+            &real_time,
+            &truth,
+            CONVERGES,
+        );
     }
     assert_clean();
 }
 
-/// The pipeline path tracer renders the lobes a plain surface lacks as the staged loop does,
-/// through the stages its table makes for them and its first vertex: a sphere under a coat, a
-/// fuzz and a thin film, and a thin-walled sheet whose subsurface carries the sun's light through
-/// it, seen from its shaded side. Compared as the opaque scenes are.
+/// The ray origin bias view, which a callable of the first vertex alone draws, draws nothing: two
+/// seeds show the same image, the offset of each surface pixel's ray origin, at least the floor of
+/// a millimeter per meter from the eye that a surface's origins take.
 #[test]
-fn the_pipeline_renders_coats_fuzz_films_and_thin_walls_as_the_staged_loop_does() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
-    let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
+fn the_origin_bias_view_draws_the_first_vertex_alone() {
+    let origin_bias = paths(ViewLighting {
+        debug_view: LightingDebugView::RayOriginBias,
+        ..ViewLighting::default()
+    });
+    let mut bed = Bed::new(Analytic::CornellBox);
+    let a = render_paths(&mut bed, &origin_bias, 1, 1);
+    let b = render_paths(&mut bed, &origin_bias, 1, 2);
+    assert!(a.mean == b.mean, "origin bias: the view differs by seed");
+    let surface: Vec<f32> = a.mean.iter().filter(|p| p[3] > 0.5).map(|p| p[0]).collect();
+    assert!(!surface.is_empty(), "origin bias: no surface pixel");
+    let low = surface.iter().copied().fold(f32::INFINITY, f32::min);
+    assert!(
+        low >= 1e-3,
+        "origin bias: a surface pixel's origin {low} m off it"
+    );
+    assert_clean();
+}
+
+/// Real-time paths converge to the reference through the lobes a plain surface lacks, through the
+/// stages the pipeline's table makes for them and its first vertex: a sphere under a coat, a fuzz
+/// and a thin film, and a thin-walled sheet whose subsurface carries the sun's light through it,
+/// seen from its shaded side.
+#[test]
+fn real_time_paths_converge_through_coats_fuzz_films_and_thin_walls() {
     let mut bed = Bed::with(Spec {
         copies: vec![
             at(FLOOR, Mat3::IDENTITY, Vec3::ZERO),
@@ -231,50 +175,37 @@ fn the_pipeline_renders_coats_fuzz_films_and_thin_walls_as_the_staged_loop_does(
         ..Analytic::SunAndGround.spec()
     });
     bed.set_pre_exposure(1.0 / 64.0);
-    assert_pipeline_renders_as_staged(
+    let truth = truth(&mut bed, 12, 1024);
+    let real_time = paths(ViewLighting::default());
+    assert_converges(
         "layered sphere and translucent sheet",
         &mut bed,
-        &staged,
-        &launched,
+        &real_time,
+        &truth,
+        CONVERGES,
     );
     assert_clean();
 }
 
-/// The pipeline path tracer renders glass as the staged loop does, in seven cases: a solid slab
-/// and a tinted one under the sky, from camera rays that the layer guides trace, and with the
+/// Real-time paths converge to the reference through glass, in six cases: a solid slab and a
+/// tinted one under the sky, from camera rays that the layer guides trace, and with the
 /// frosted-glass pass over a rough one; two thin-walled panes, one behind the other, whose sunlit
 /// shadow a shadow ray's walk crosses one after the other; a glass sphere that focuses the sun's
-/// caustic photons on the floor; a dispersive sphere that splits paths by wavelength; an eye
-/// inside water, whose interiors start the path; and a lens in that water over a slab, whose rays
-/// start inside the interiors at the lens. Only the sphere's scene gathers caustic photons. Runs
-/// the cases `run`, in that order.
+/// caustic photons on the floor; a dispersive sphere that splits paths by wavelength; and an eye
+/// inside water, whose interiors start the path. Only the sphere's scene gathers caustic photons.
+/// Runs the cases `run`, in that order.
 fn glass_cases(run: std::ops::Range<usize>) {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
     let [slabs, frosted, lens, pane, prism, water] =
         ["slabs", "frosted", "lens", "pane", "prism", "water"].map(glass_scene);
-    let realtime = ViewLighting::default();
-    let thin_lens = ViewLighting {
-        reference: Some(ReferenceSettings {
-            lens: Some(ThinLens {
-                aperture_radius: 0.02,
-                focus_distance: 2.0,
-            }),
-            ..ReferenceSettings::default()
-        }),
-        ..reference(4)
-    };
-    // Each case's scene, whether its eye lies in the water, its settings, and whether it gathers
-    // caustic photons and runs the frosted-glass pass.
-    for (what, spec, under_water, settings, photons, frost) in [
-        ("slabs", slabs, false, realtime, false, false),
-        ("frosted slab", frosted, false, realtime, false, true),
-        ("panes", pane, false, realtime, false, false),
-        ("caustic of a sphere", lens, false, realtime, true, false),
-        ("dispersive sphere", prism, false, realtime, false, false),
-        ("eye in water", water.clone(), true, realtime, false, false),
-        ("lens in water", water, true, thin_lens, false, false),
+    // Each case's scene, whether its eye lies in the water, and whether it gathers caustic
+    // photons and runs the frosted-glass pass.
+    for (what, spec, under_water, photons, frost) in [
+        ("slabs", slabs, false, false, false),
+        ("frosted slab", frosted, false, false, true),
+        ("panes", pane, false, false, false),
+        ("caustic of a sphere", lens, false, true, false),
+        ("dispersive sphere", prism, false, false, false),
+        ("eye in water", water, true, false, false),
     ]
     .into_iter()
     .skip(run.start)
@@ -292,36 +223,44 @@ fn glass_cases(run: std::ops::Range<usize>) {
             };
             bed.lighting.set_settings(&no_photons).unwrap();
         }
-        let settings = ViewLighting {
-            camera_medium: under_water.then(|| bed.material(WATER_BOX)),
-            ..settings
-        };
-        let (mut staged, mut launched) = both(&KernelSet::default(), settings);
+        let camera_medium = under_water.then(|| bed.material(WATER_BOX));
+        let truth = render_paths(
+            &mut bed,
+            &paths(ViewLighting {
+                camera_medium,
+                ..reference(12)
+            }),
+            1024,
+            7,
+        );
+        let mut real_time = paths(ViewLighting {
+            camera_medium,
+            ..ViewLighting::default()
+        });
         if frost {
-            staged.frost_guide = Some(FrostGuide::new(0.25));
-            launched.frost_guide = Some(FrostGuide::new(0.25));
+            real_time.frost_guide = Some(FrostGuide::new(0.25));
         }
-        assert_pipeline_renders_as_staged(what, &mut bed, &staged, &launched);
+        assert_converges(what, &mut bed, &real_time, &truth, CONVERGES);
     }
     assert_clean();
 }
 
 /// The cases of [`glass_cases`] with glass in the open.
 #[test]
-fn the_pipeline_renders_glass_as_the_staged_loop_does() {
+fn real_time_paths_converge_through_glass() {
     glass_cases(0..3);
 }
 
 /// The cases of [`glass_cases`] whose glass focuses photons and splits wavelengths.
 #[test]
-fn the_pipeline_renders_caustics_and_dispersion_through_glass_as_the_staged_loop_does() {
+fn real_time_paths_converge_through_caustics_and_dispersion() {
     glass_cases(3..5);
 }
 
-/// The cases of [`glass_cases`] with water around the eye.
+/// The case of [`glass_cases`] with water around the eye.
 #[test]
-fn the_pipeline_renders_interiors_as_the_staged_loop_does() {
-    glass_cases(5..7);
+fn real_time_paths_converge_through_an_interior_around_the_eye() {
+    glass_cases(5..6);
 }
 
 /// The relative error of `a`'s mean luminance against `truth`'s, and the largest of its 4x4
@@ -350,14 +289,11 @@ fn mean_and_worst_block(a: &Accumulated, truth: &Accumulated) -> (f64, f64) {
 }
 
 /// A milky slab and a cloud on the floor under the sun and the sky, whose interiors scatter and
-/// walk. The pipeline path tracer's reference converges to the staged loop's, within the spread
-/// between two runs of the staged reference: an unbiased estimate of the same light. In real time
-/// a scatter ends its path in the world cache, whose bias each tracer keeps within a looser bound.
+/// walk. In real time a scatter ends its path in the world cache, whose bias keeps the image
+/// within a looser bound of the reference than the CPU walks' checks of the reference
+/// (`subsurface.rs`) hold it to.
 #[test]
-fn the_pipeline_converges_through_scattering_interiors() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
+fn real_time_paths_converge_through_scattering_interiors() {
     let mut bed = Bed::with(glass_scene("milk"));
     bed.set_pre_exposure(1.0 / 64.0);
     let no_photons = SceneLightingSettings {
@@ -368,43 +304,34 @@ fn the_pipeline_converges_through_scattering_interiors() {
         ..*bed.lighting.settings()
     };
     bed.lighting.set_settings(&no_photons).unwrap();
-    let (staged, launched) = both(&KernelSet::default(), reference(3));
-    let truth = render_paths(&mut bed, &staged, 1024, 7);
-    let spread = render_paths(&mut bed, &staged, 256, 9);
-    let piped = render_paths(&mut bed, &launched, 256, 11);
-    assert_within_noise(
-        "milky slab and cloud, reference",
-        &piped,
-        &truth,
-        &spread,
-        1.25,
+    let truth = render_paths(&mut bed, &paths(reference(3)), 1024, 7);
+    let real_time = paths(ViewLighting::default());
+    render_paths(&mut bed, &real_time, 32, 3);
+    let (mean, worst) = mean_and_worst_block(&render_paths(&mut bed, &real_time, 256, 13), &truth);
+    assert!(
+        mean.abs() < 0.03 && worst < 0.2,
+        "milky slab and cloud in real time: mean {mean:+.4}, worst block {worst:.4}"
     );
-    let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
-    render_paths(&mut bed, &staged, 32, 3);
-    for (what, paths) in [("staged", &staged), ("pipeline", &launched)] {
-        let (mean, worst) = mean_and_worst_block(&render_paths(&mut bed, paths, 256, 13), &truth);
-        assert!(
-            mean.abs() < 0.03 && worst < 0.2,
-            "milky slab and cloud, {what} in real time: mean {mean:+.4}, worst block {worst:.4}"
-        );
-    }
     assert_clean();
 }
 
-/// The pipeline path tracer bends the sun through a plane stack and passes a coated emitter's
-/// light through its coat as the staged loop does: a tinted slab over the floor under the sun and
-/// a sky, whose shadow the sun's light through both faces fills by next-event estimation, by BSDF
-/// rays that the stack leaves to it, and by caustic photons, beside an emitter with a coat and
-/// fuzz. Compared as the opaque scenes are.
+/// Real-time paths converge to the reference where the sun bends through a plane stack and a
+/// coated emitter's light passes its coat: a tinted slab over the floor under the sun and a sky,
+/// whose shadow the sun's light through both faces fills by next-event estimation, by BSDF rays
+/// that the stack leaves to it, and by caustic photons, beside an emitter with a coat and fuzz.
 #[test]
-fn the_pipeline_renders_plane_stacks_and_coated_emitters_as_the_staged_loop_does() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
+fn real_time_paths_converge_through_plane_stacks_and_coated_emitters() {
     let mut bed = Bed::with(plane_stack_spec(true));
     bed.set_pre_exposure(1.0 / 64.0);
-    let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
-    assert_pipeline_renders_as_staged("slab and coated emitter", &mut bed, &staged, &launched);
+    let truth = truth(&mut bed, 12, 1024);
+    let real_time = paths(ViewLighting::default());
+    assert_converges(
+        "slab and coated emitter",
+        &mut bed,
+        &real_time,
+        &truth,
+        CONVERGES,
+    );
     assert_clean();
 }
 
@@ -415,66 +342,29 @@ fn the_pipeline_renders_plane_stacks_and_coated_emitters_as_the_staged_loop_does
 /// estimation and BSDF rays leave it to it.
 #[test]
 fn a_plane_stack_on_a_producer_entry_lights_the_floor_as_one_on_a_copy() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
-    let mut launched = Paths::exactly(
-        &KernelSet::default(),
-        PathEntry::Pipeline,
-        ViewLighting::default(),
-    );
-    launched.specialize = true;
+    let mut specialized = paths(ViewLighting::default());
+    specialized.specialize = true;
     let mut copy = Bed::with(plane_stack_spec(false));
     let mut producer = producer_stack_bed();
     for bed in [&mut copy, &mut producer] {
         bed.set_pre_exposure(1.0 / 64.0);
-        render_paths(bed, &launched, 32, 3);
+        render_paths(bed, &specialized, 32, 3);
     }
-    let shown = render_paths(&mut producer, &launched, 32, 1);
-    let same_seed = render_paths(&mut copy, &launched, 32, 1);
-    let noise = render_paths(&mut copy, &launched, 32, 2);
+    let shown = render_paths(&mut producer, &specialized, 32, 1);
+    let same_seed = render_paths(&mut copy, &specialized, 32, 1);
+    let noise = render_paths(&mut copy, &specialized, 32, 2);
     assert_within_noise("producer slab", &shown, &same_seed, &noise, 1.25);
     assert_clean();
 }
 
-/// The pipeline path tracer walks subsurface materials as the staged loop does: the light that
-/// leaves a skin slab on the ground through its walks, under a sun and a sky, in real time, whose
-/// walks stop at their cap and keep the subsurface table's share, and in the reference, whose walks
-/// run until they leave. Compared as the opaque scenes are, above.
+/// Real-time paths converge to the reference through what lies in front of a hit and along a
+/// ray: a floor under six stacked emissive particles, which rays from the floor meet in more than
+/// one batch of layers; a sphere and a rect light over a glossy floor, which BSDF rays meet
+/// through the lights' proxies; and the sun through a smoke plume's medium proxy, whose volume
+/// shadow rays march.
 #[test]
-fn the_pipeline_walks_subsurface_materials_as_the_staged_loop_does() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
-    let (mut staged, mut launched) = both(&KernelSet::default(), ViewLighting::default());
-    let real_time = ViewLighting {
-        debug_view: LightingDebugView::Subsurface,
-        ..ViewLighting::default()
-    };
-    for (what, settings) in [
-        ("real time", real_time),
-        ("reference", debug(LightingDebugView::Subsurface, 4)),
-    ] {
-        staged.settings = settings;
-        launched.settings = settings;
-        let mut bed = Bed::new(Analytic::SubsurfaceSlab);
-        bed.set_pre_exposure(1.0 / 64.0);
-        assert_pipeline_renders_as_staged(what, &mut bed, &staged, &launched);
-    }
-    assert_clean();
-}
-
-/// The pipeline path tracer renders what lies in front of a hit and along a ray as the staged
-/// loop does: a floor under six stacked emissive particles, which rays from the floor meet in
-/// more than one batch of layers; a sphere and a rect light over a glossy floor, which BSDF rays
-/// meet through the lights' proxies; and the sun through a smoke plume's medium proxy, whose
-/// volume shadow rays march. Compared as the opaque scenes are.
-#[test]
-fn the_pipeline_renders_layers_and_media_as_the_staged_loop_does() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
-    let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
+fn real_time_paths_converge_through_particles_light_proxies_and_media() {
+    let real_time = paths(ViewLighting::default());
     let scenes: [(&str, &dyn Fn() -> Bed, f32); 3] = [
         ("particles", &particle_bed, 1.0),
         ("sphere and rect lights", &light_bed, 1.0),
@@ -483,114 +373,9 @@ fn the_pipeline_renders_layers_and_media_as_the_staged_loop_does() {
     for (what, make, pre_exposure) in scenes {
         let mut bed = make();
         bed.set_pre_exposure(pre_exposure);
-        assert_pipeline_renders_as_staged(what, &mut bed, &staged, &launched);
+        let truth = truth(&mut bed, 12, 1024);
+        assert_converges(what, &mut bed, &real_time, &truth, CONVERGES);
     }
-    assert_clean();
-}
-
-/// The pipeline path tracer renders the other sources as the staged loop does. Caustic photons:
-/// the sun off one mirror, level to a second and down from it lights a patch of the floor, which
-/// the reference's photons give its first vertex alike by Welch's test, and real-time frames show
-/// alike, with the grid's photons and the world cache's update paths, within the noise between
-/// seeds. The background layer: behind a mirror before the eye, its pixels past a mask's depth
-/// show alike within the noise between seeds.
-#[test]
-fn the_pipeline_renders_photons_and_the_background_layer_as_the_staged_loop_does() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
-    let sun = -SUN.direction_to_light.normalize();
-    let mirror = |center: Vec3, normal: Vec3| {
-        let x = Vec3::Y.cross(normal).normalize();
-        at(
-            MIRROR,
-            Mat3::from_cols(x, normal.cross(x), normal) * 0.4,
-            center,
-        )
-    };
-    let first = Vec3::new(-1.5, 1.0, -1.0);
-    let level = Vec3::X;
-    let second = first + 2.0 * level;
-    let patch = Vec3::new(1.5, 0.0, -0.5);
-    let down = (patch - second).normalize();
-    let spec = Spec {
-        copies: vec![
-            at(WHITE_FLOOR, Mat3::IDENTITY, Vec3::ZERO),
-            mirror(first, (level - sun).normalize()),
-            mirror(second, (down - level).normalize()),
-        ],
-        lights: vec![Light::Directional(SUN)],
-        environment: None,
-        eye: Vec3::new(0.0, 3.0, 4.0),
-        target: Vec3::new(0.5, 0.0, -0.5),
-        fov_y: 0.9,
-        focus: None,
-    };
-    let lit = pixel_of(&spec, patch);
-    let mut bed = Bed::with(spec);
-
-    let (staged, launched) = both(
-        &KernelSet::default(),
-        ViewLighting {
-            debug_view: LightingDebugView::Caustics,
-            ..reference(2)
-        },
-    );
-    let patch_means = |bed: &mut Bed, paths: &Paths, seed: u32| {
-        (0..12)
-            .map(|k| render_paths(bed, paths, 4, seed * 1000 + k).around(lit, 4)[1])
-            .collect::<Vec<_>>()
-    };
-    let of_staged = patch_means(&mut bed, &staged, 1);
-    let of_launched = patch_means(&mut bed, &launched, 2);
-    assert!(
-        of_launched.iter().sum::<f64>() > 0.0,
-        "no photon reached the floor by both mirrors"
-    );
-    assert_same_mean("the photons' patch", &of_launched, &of_staged);
-
-    let (staged, launched) = both(&KernelSet::default(), ViewLighting::default());
-    assert_pipeline_within_noise("real-time photons", &mut bed, &staged, &launched);
-    drop(bed);
-
-    let background = Analytic::SunAndGround.spec();
-    let forward = (background.target - background.eye).normalize();
-    let mut spec = background;
-    spec.copies.push(at(
-        MIRROR,
-        Mat3::from_diagonal(Vec3::splat(0.3)),
-        spec.eye + 1.2 * forward + Vec3::new(-0.25, 0.0, 0.0),
-    ));
-    let mut bed = Bed::with(spec);
-    bed.set_pre_exposure(1.0 / 64.0);
-    bed.accumulate_background_layer(true);
-    // Pixels left of `MARKED` start their background rays 2 m along the view axis, past the
-    // mirror and before the ground.
-    const MARKED: u32 = 96;
-    let mask: Vec<[f32; 4]> = (0..EXTENT[0] * EXTENT[1])
-        .map(|i| {
-            let start = if i % EXTENT[0] < MARKED {
-                NEAR / 2.0
-            } else {
-                0.0
-            };
-            [start, 0.0, 0.0, 0.0]
-        })
-        .collect();
-    let mask = texture(EXTENT[0], EXTENT[1], &mask, "dof mask");
-    let focus = upload(&[5.0f32], "focus distance");
-    let (mut staged, mut launched) = both(&KernelSet::default(), reference(2));
-    for p in [&mut staged, &mut launched] {
-        p.dof_background = Some(DofBackgroundPass {
-            mask: mask.index,
-            aperture_radius: 0.05,
-            focus_distance: focus.gpu(),
-        });
-    }
-    let piped = render_paths(&mut bed, &launched, 32, 1);
-    let same_seed = render_paths(&mut bed, &staged, 32, 1);
-    let noise = render_paths(&mut bed, &staged, 32, 2);
-    assert_within_noise("the background layer", &piped, &same_seed, &noise, 1.25);
     assert_clean();
 }
 
@@ -999,30 +784,45 @@ fn noise_on_a_lit_plane_is_uncorrelated_across_pixels_and_frames() {
     assert_clean();
 }
 
+/// A thin lens with next to no aperture shows what the G-buffer's pinhole does: a sphere on the
+/// ground in the air, and with the eye in water over a slab, where the lens's rays start inside
+/// the interiors at the lens.
 #[test]
 fn a_thin_lens_with_no_aperture_matches_the_gbuffer() {
-    let mut bed = Bed::new(Analytic::SunAndGround);
-    bed.set_pre_exposure(1.0 / 64.0);
-    let gbuffer = render_paths(&mut bed, &paths(reference(2)), 64, 1);
-    let lens = ViewLighting {
-        reference: Some(ReferenceSettings {
-            lens: Some(ThinLens {
-                aperture_radius: 1e-5,
-                focus_distance: 5.0,
+    for (what, spec, under_water) in [
+        ("in the air", Analytic::SunAndGround.spec(), false),
+        ("in water", glass_scene("water"), true),
+    ] {
+        let mut bed = Bed::with(spec);
+        bed.set_pre_exposure(1.0 / 64.0);
+        let pinhole = ViewLighting {
+            camera_medium: under_water.then(|| bed.material(WATER_BOX)),
+            ..reference(2)
+        };
+        let gbuffer = render_paths(&mut bed, &paths(pinhole), 64, 1);
+        let lens = ViewLighting {
+            reference: Some(ReferenceSettings {
+                lens: Some(ThinLens {
+                    aperture_radius: 1e-5,
+                    focus_distance: 5.0,
+                }),
+                ..ReferenceSettings::default()
             }),
-            ..ReferenceSettings::default()
-        }),
-        ..reference(2)
-    };
-    let traced = render_paths(&mut bed, &paths(lens), 64, 1);
-    assert_close(
-        "thin lens against the G-buffer",
-        surface_mean(&traced),
-        surface_mean(&gbuffer),
-        0.02,
-    );
-    let e = traced.flip(&gbuffer, 1.0 / 500.0);
-    assert!(e.mean < 0.05, "thin lens against the G-buffer: {e:?}");
+            ..pinhole
+        };
+        let traced = render_paths(&mut bed, &paths(lens), 64, 1);
+        assert_close(
+            &format!("{what}: thin lens against the G-buffer"),
+            surface_mean(&traced),
+            surface_mean(&gbuffer),
+            0.02,
+        );
+        let e = traced.flip(&gbuffer, 1.0 / 500.0);
+        assert!(
+            e.mean < 0.05,
+            "{what}: thin lens against the G-buffer: {e:?}"
+        );
+    }
     assert_clean();
 }
 
@@ -1177,65 +977,42 @@ fn quarter_means(a: &Accumulated) -> Vec<[f64; 3]> {
 }
 
 /// The view's local samplers draw a first vertex's lights by what its tile fed back, and the
-/// direct light they give is the light the scene's selection gives without them, through the
-/// staged loop and through the pipeline, whose first vertices pick among the points each sampler
-/// drew for the frame.
+/// direct light they give is the light the scene's selection gives without them: the first
+/// vertices pick among the points each sampler drew for the frame.
 #[test]
 fn light_feedback_and_local_samplers_keep_direct_light_unbiased() {
-    let rays = device().caps().ray_dispatch;
-    for entry in [PathEntry::Compute, PathEntry::Pipeline] {
-        if entry == PathEntry::Pipeline && !rays {
-            continue;
-        }
-        let paths = |settings| Paths::new(&KernelSet::default(), entry, settings);
-        let mut bed = Bed::with(many_lights());
-        // The pipeline's scatter rays find no light proxy, so the share of direct light they
-        // weigh against next-event estimation is missing from its image: its estimate is
-        // whole with next-event estimation alone.
-        let direct = ViewLighting {
-            debug_view: if entry == PathEntry::Pipeline {
-                LightingDebugView::NeeOnly
-            } else {
-                LightingDebugView::DirectOnly
-            },
-            ..ViewLighting::default()
-        };
-        let by_power = SceneLightingSettings {
-            feedback_share: 0.0,
-            ..*bed.lighting.settings()
-        };
-        bed.lighting.set_settings(&by_power).unwrap();
-        let plain = render_paths(
-            &mut bed,
-            &paths(ViewLighting {
-                local_light_share: 0.0,
-                ..direct
-            }),
-            96,
-            1,
-        );
-        bed.lighting
-            .set_settings(&SceneLightingSettings::default())
-            .unwrap();
-        let guided = render_paths(&mut bed, &paths(direct), 96, 2);
-        let stats = bed.lighting.stats(bed.last_frame()).unwrap();
-        assert!(
-            stats.feedback_pixels > 0,
-            "{entry:?}: no pixel fed back a light"
-        );
-        assert_close(
-            &format!("{entry:?} image"),
-            image_mean(&guided),
-            image_mean(&plain),
-            0.015,
-        );
-        for (q, (g, p)) in quarter_means(&guided)
-            .into_iter()
-            .zip(quarter_means(&plain))
-            .enumerate()
-        {
-            assert_close(&format!("{entry:?} quarter {q}"), g, p, 0.04);
-        }
+    let mut bed = Bed::with(many_lights());
+    let direct = ViewLighting {
+        debug_view: LightingDebugView::DirectOnly,
+        ..ViewLighting::default()
+    };
+    let by_power = SceneLightingSettings {
+        feedback_share: 0.0,
+        ..*bed.lighting.settings()
+    };
+    bed.lighting.set_settings(&by_power).unwrap();
+    let plain = render_paths(
+        &mut bed,
+        &paths(ViewLighting {
+            local_light_share: 0.0,
+            ..direct
+        }),
+        96,
+        1,
+    );
+    bed.lighting
+        .set_settings(&SceneLightingSettings::default())
+        .unwrap();
+    let guided = render_paths(&mut bed, &paths(direct), 96, 2);
+    let stats = bed.lighting.stats(bed.last_frame()).unwrap();
+    assert!(stats.feedback_pixels > 0, "no pixel fed back a light");
+    assert_close("image", image_mean(&guided), image_mean(&plain), 0.015);
+    for (q, (g, p)) in quarter_means(&guided)
+        .into_iter()
+        .zip(quarter_means(&plain))
+        .enumerate()
+    {
+        assert_close(&format!("quarter {q}"), g, p, 0.04);
     }
     assert_clean();
 }

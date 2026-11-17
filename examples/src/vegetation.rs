@@ -979,7 +979,7 @@ fn mount(renderer: &mut Renderer, source: PackSource, mut frame: u64) -> (MountI
 const FIRST_FRAME: u64 = 1000;
 
 /// The renderer's settings for `settings`.
-fn renderer_desc(options: &Options, settings: &Settings) -> RendererDesc {
+fn renderer_desc(settings: &Settings) -> RendererDesc {
     RendererDesc {
         kernels: match settings.grass {
             GrassMode::Drawn | GrassMode::Stored => &crate::linked_blades::KERNELS,
@@ -992,7 +992,7 @@ fn renderer_desc(options: &Options, settings: &Settings) -> RendererDesc {
         } else {
             RendererDesc::default().raster_error_pixels
         },
-        ..options.renderer_desc()
+        ..RendererDesc::default()
     }
 }
 
@@ -1627,7 +1627,7 @@ const WARM_UP: u64 = 20;
 pub fn run(options: &Options, settings: &Settings) -> Run {
     let gpu = device();
     let mut window = (!options.headless).then(|| Window::new("orr dense vegetation", 1920, 1080));
-    let desc = renderer_desc(options, settings);
+    let desc = renderer_desc(settings);
     let mut display = window.as_ref().map(|w| {
         Display::new(
             gpu,

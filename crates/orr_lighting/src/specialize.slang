@@ -1,7 +1,7 @@
 // What the paths of a pipeline may meet, as a specialization constant. A pipeline made with a
 // bit clear runs only paths that never meet that feature, so the driver compiles the feature's
-// code out of it; the renderer (`staged.rs`) sets every bit it cannot rule out for the scene,
-// the view and the paths' source. A pipeline made without a value may meet everything.
+// code out of it; the renderer (`view.rs`) sets every bit it cannot rule out for the scene, the
+// view and the paths' source. A pipeline made without a value may meet everything.
 //
 // A test of the form `may(bit) && condition` keeps the condition's result wherever the bit is
 // set, and is exact with the bit clear only while the condition is false for every path of the
@@ -46,7 +46,7 @@ static const uint path_may = 0xffffffffu;
 [Host] public static const uint MAY_FROST = 1 << 9;
 // a thin lens (`aperture_radius` above 0);
 [Host] public static const uint MAY_LENS = 1 << 10;
-// walks (FEATURE_WALK);
+// subsurface walks that an opaque vertex starts;
 [Host] public static const uint MAY_WALK = 1 << 11;
 // the view's local light samplers (`local` is set);
 [Host] public static const uint MAY_LOCAL = 1 << 12;

@@ -1,8 +1,8 @@
 //! The support kernels made for what a scene may hold: the guide resolve, the layer guides, the
 //! froxels' light pass with the thin shadow tracer, and media apply. Each inlines hit
-//! resolution, surface evaluation or shadow rays, so like the staged path kernels it compiles for
-//! a mask (`specialize.slang`) when a view first needs it, and a view renders lit once the ones
-//! its frame runs are ready.
+//! resolution, surface evaluation or shadow rays, so like the path pipelines it compiles for a
+//! mask (`specialize.slang`) when a view first needs it, and a view renders lit once the ones its
+//! frame runs are ready.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -18,7 +18,7 @@ use crate::shaders::dielectric::layer_guides;
 use crate::shaders::guides::resolve;
 use crate::shaders::media::{apply, froxel_light};
 use crate::shaders::rays::shadow;
-use crate::staged::{MAY_ALL, PATH_MAY_ID};
+use crate::specialize::{MAY_ALL, PATH_MAY_ID};
 use crate::{Error, KernelSet, module};
 
 /// A support kernel made per mask.

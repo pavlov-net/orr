@@ -41,8 +41,6 @@ public static const uint MATERIAL_LOBE_EMISSION = 1 << 5;
 public static const uint MATERIAL_LOBE_ANISOTROPY = 1 << 6;
 // The lobes a path's rich stages hold.
 public static const uint MATERIAL_LOBES_RICH = MATERIAL_LOBE_SUBSURFACE | MATERIAL_LOBE_COAT | MATERIAL_LOBE_FUZZ | MATERIAL_LOBE_THIN_FILM;
-public static const uint MATERIAL_COST_SHIFT = 16;
-public static const uint MATERIAL_COST_MASK = 3 << 16;
 // A slot reads the vertex color stream.
 public static const uint MATERIAL_VERTEX = 1 << 24;
 // The normal map, or the coat's, holds mesh space directions (`object_normal_decode`).

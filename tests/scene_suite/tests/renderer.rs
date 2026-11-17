@@ -19,8 +19,8 @@ use orr::orr_output::{
 use orr::{
     ArenaReport, AutoExposure, DirectionalLight, DiscProfile, Exposure, FrameDesc, FrameTime,
     Glare, GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancePageRef, InstancesDesc, Lens,
-    Light, LightId, LitView, LoadState, MountId, OutputDebug, PackSource, PageId, PathEntry,
-    PipelineId, PostQuality, Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId,
+    Light, LightId, LitView, LoadState, MountId, OutputDebug, PackSource, PageId, PipelineId,
+    PostQuality, Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId,
     TextureFilter, TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks, ViewLighting,
     ViewOutput, ViewTarget,
 };
@@ -40,10 +40,7 @@ use scene_suite::hot::fill;
 
 #[test]
 fn empty_frames_and_scene_frames_submit_in_order() {
-    let desc = RendererDesc {
-        path_entry: PathEntry::Compute,
-        ..RendererDesc::default()
-    };
+    let desc = RendererDesc::default();
     let mut r = Renderer::new(device(), desc).unwrap();
     let mut ids = Vec::new();
     let mut last = None;
@@ -483,7 +480,6 @@ fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
     let d = device();
     let desc = RendererDesc {
         alias_view_targets: alias,
-        path_entry: PathEntry::Compute,
         ..RendererDesc::default()
     };
     let mut r = Renderer::new(d, desc).unwrap();
@@ -575,7 +571,6 @@ fn frames_around_the_compile(
 ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let d = device();
     let desc = RendererDesc {
-        path_entry: PathEntry::Compute,
         try_cached_paths: false,
         ..RendererDesc::default()
     };
@@ -900,10 +895,7 @@ fn a_material_set_over_glass_marks_its_scene_for_thin_dielectrics() {
 fn a_fading_copy_stops_rays_under_the_pipelines_made_for_its_scene() {
     let pack = floor_and_box();
     let d = device();
-    let desc = RendererDesc {
-        path_entry: PathEntry::Compute,
-        ..RendererDesc::default()
-    };
+    let desc = RendererDesc::default();
     let mut r = Renderer::new(d, desc).unwrap();
     let loading = r.loading();
     let workers: Vec<_> = Vec::from_fn(8, |_| {
@@ -1012,21 +1004,18 @@ fn a_fading_copy_stops_rays_under_the_pipelines_made_for_its_scene() {
     assert_clean();
 }
 
-/// A path pipeline that cannot compile: the device has no ray dispatch and the renderer asks for
-/// it. The pipelines compile when a view first asks for them, so the view's render reports it,
-/// and every wait and render after it.
+/// A path pipeline that cannot compile: the device has no ray tracing pipelines. The pipelines
+/// compile when a view first asks for them, so the view's render reports it, and every wait and
+/// render after it.
 #[test]
 fn a_failed_path_compile_comes_back_from_render_view_and_wait_paths() {
     let d = orr_gpu::Device::new(&orr_gpu::DeviceDesc {
-        name: "no ray dispatch",
+        name: "no ray tracing pipelines",
         skip_extensions: &[c"VK_KHR_ray_tracing_pipeline"],
         ..orr_gpu::DeviceDesc::default()
     })
     .unwrap();
-    let desc = RendererDesc {
-        path_entry: PathEntry::RayDispatch,
-        ..RendererDesc::default()
-    };
+    let desc = RendererDesc::default();
     let mut r = Renderer::new(&d, desc).unwrap();
     let scene = r
         .create_scene(&SceneDesc::default(), &Default::default())
@@ -1036,7 +1025,7 @@ fn a_failed_path_compile_comes_back_from_render_view_and_wait_paths() {
         orr::Error::PathKernels(e) => {
             assert_matches!(
                 &*e,
-                orr::LightingError::LateCompile { kernel, .. } if *kernel == "staged opaque shade",
+                orr::LightingError::LateCompile { kernel, .. } if *kernel == "path pipeline",
                 "{e}"
             );
         }
@@ -1138,10 +1127,7 @@ fn place_lamp(f: &orr::Frame<'_>, scene: SceneId, lamp: orr::ModelId) {
 #[test]
 fn a_camera_cut_starts_exposure_over_at_its_reference() {
     let d = device();
-    let desc = RendererDesc {
-        path_entry: PathEntry::Compute,
-        ..RendererDesc::default()
-    };
+    let desc = RendererDesc::default();
     let mut r = Renderer::new(d, desc).unwrap();
     let loading = r.loading();
     let worker = {
@@ -1417,10 +1403,7 @@ fn ray_reconstruction_resets_on_the_frame_pre_exposure_steps() {
     ];
 
     let d = device();
-    let desc = RendererDesc {
-        path_entry: PathEntry::Compute,
-        ..RendererDesc::default()
-    };
+    let desc = RendererDesc::default();
     let mut r = Renderer::new(d, desc).unwrap();
     let resets = Arc::new(Mutex::new(Vec::new()));
     assert!(r.set_reconstruction(Passthrough(Arc::clone(&resets))));
@@ -1563,10 +1546,7 @@ fn ray_reconstruction_resets_on_the_frame_pre_exposure_steps() {
 #[test]
 fn render_view_runs_the_glare_its_lens_asks_for() {
     let d = device();
-    let desc = RendererDesc {
-        path_entry: PathEntry::Compute,
-        ..RendererDesc::default()
-    };
+    let desc = RendererDesc::default();
     let mut r = Renderer::new(d, desc).unwrap();
     let loading = r.loading();
     let worker = {

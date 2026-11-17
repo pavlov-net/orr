@@ -8,12 +8,12 @@ use lighting_suite::bed::{
     TINTED_SLAB, look,
 };
 use orr_gpu::KernelSet;
-use orr_lighting::{GuideKind, Light, LightingDebugView, PathEntry, ViewLighting};
+use orr_lighting::{GuideKind, Light, LightingDebugView, ViewLighting};
 use orr_math::{Mat3, Quat, Vec2, Vec3};
 use orr_scene::ViewDesc;
 
 fn paths(settings: ViewLighting) -> Paths {
-    Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
+    Paths::new(&KernelSet::default(), settings)
 }
 
 /// One frame of `bed` through the view dispatch and the guide resolve; its guides.

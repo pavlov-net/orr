@@ -124,7 +124,7 @@ fn run(options: &Options) {
     let mut window = Window::new("orr reconstruction", 1920, 1080);
     let desc = RendererDesc {
         kernels: &KERNELS,
-        ..options.renderer_desc()
+        ..RendererDesc::default()
     };
     let request = |encoding: Option<OutputFormat>, hdr: bool| DisplayRequest {
         hdr,
@@ -436,7 +436,7 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
     let mut window = (!options.headless).then(|| Window::new("orr reconstruction sr", 1920, 1080));
     let desc = RendererDesc {
         kernels: &KERNELS,
-        ..options.renderer_desc()
+        ..RendererDesc::default()
     };
     let mut display = window.as_ref().map(|w| {
         Display::new(

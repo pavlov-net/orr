@@ -1,5 +1,5 @@
 //! Pipelines made per mask (`path_may` in the low word, `path_may2` in the high one), which the
-//! staged loop and the pipeline path tracer keep alike: what a view's scene and settings may
+//! path tracer and the masked support kernels keep alike: what a view's scene and settings may
 //! meet is asked for urgently, the set that may meet everything compiles behind it, and a frame
 //! runs the ready set that holds the least beyond what its paths may meet.
 
@@ -10,7 +10,7 @@ use orr_scene::orr_gpu::Device;
 use orr_scene::{JobResult, Loading, Urgency};
 
 use crate::Error;
-use crate::staged::MAY_ALL;
+use crate::specialize::MAY_ALL;
 
 /// A compile job and the urgency it is queued at, which the job reads as it starts.
 type Queued<T> = Arc<(Arc<Mutex<Urgency>>, JobResult<Result<T, Error>>)>;

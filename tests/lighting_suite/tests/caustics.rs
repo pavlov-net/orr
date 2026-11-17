@@ -2,7 +2,8 @@
 //! ball lens against its 1D map from impact parameter to radius, and the reference's photons
 //! against BSDF rays alone, by Welch's test, through a glass sphere from a light photons own and
 //! from the environment, which they do not. A mirror ball's caustic on a floor at a voxel boundary
-//! of every grid level against the reference's map.
+//! of every grid level against the reference's map, and the sun off two mirrors against its
+//! illuminance.
 
 use lighting_suite::assert_clean;
 use lighting_suite::bed::{
@@ -13,12 +14,12 @@ use lighting_suite::bed::{
 use lighting_suite::welch::{assert_mean, assert_same_mean};
 use orr_gpu::KernelSet;
 use orr_lighting::{
-    CausticStats, DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry, ViewLighting,
+    CausticStats, DirectionalLight, DiscProfile, Light, LightingDebugView, ViewLighting,
 };
 use orr_math::{Affine3, DVec2, Mat3, Vec2, Vec3};
 
 fn paths(settings: ViewLighting) -> Paths {
-    Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
+    Paths::new(&KernelSet::default(), settings)
 }
 
 fn render_paths(bed: &mut Bed, paths: &Paths, frames: u32, seed: u32) -> Accumulated {
@@ -562,7 +563,10 @@ fn photons_reflect_off_a_producer_set_as_the_producer_table_alone_grows() {
 
 /// A photon's chain goes on at opaque mirrors: the sun off one mirror, level to a second and
 /// down from it lights the floor where nothing else throws it, so a scene with a mirror among
-/// its copies gives its photons the rounds of a chain of opaque vertices.
+/// its copies gives its photons the rounds of a chain of opaque vertices. The mirrors are white
+/// metal, which reflects all of the sun, so the patch takes the sun's illuminance across the beam
+/// slanted onto the floor along its way down, in the grid and in the reference's map: measured 4%
+/// and 5% under it.
 #[test]
 fn photons_chain_through_two_mirrors() {
     let sun = -SUN.direction_to_light.normalize();
@@ -595,10 +599,20 @@ fn photons_chain_through_two_mirrors() {
     };
     let lit = pixel_of(&spec, patch);
     let mut bed = Bed::with(spec);
-    let image = render_paths(&mut bed, &paths(gathered()), 8, 1);
-    assert!(
-        image.around(lit, 4)[1] > 0.0,
-        "no photon reached the floor by both mirrors"
-    );
+    let want = f64::from(WHITE_FLOOR_ALBEDO) / std::f64::consts::PI
+        * f64::from(SUN.illuminance.y)
+        * f64::from(-down.y);
+    let map = paths(ViewLighting {
+        debug_view: LightingDebugView::Caustics,
+        ..reference(2)
+    });
+    for (what, settings, frames) in [("grid", &paths(gathered()), 8), ("map", &map, 32)] {
+        // The beam's footprint on the floor is a few pixels across, so its middle alone.
+        let got = render_paths(&mut bed, settings, frames, 1).around(lit, 1)[1];
+        assert!(
+            (got / want - 1.0).abs() < 0.1,
+            "the {what}'s patch by both mirrors shows {got}, not {want}"
+        );
+    }
     assert_clean();
 }

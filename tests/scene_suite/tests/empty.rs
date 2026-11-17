@@ -6,7 +6,7 @@
 //! this renderer's.
 
 use orr::{
-    FrameDesc, FrameTime, Lens, LitView, PathEntry, Projection, Renderer, RendererDesc, SceneDesc,
+    FrameDesc, FrameTime, Lens, LitView, Projection, Renderer, RendererDesc, SceneDesc,
     TextureFilter, ViewDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_gpu::{Format, MemoryKind, TextureDesc, TextureMemory, TextureUsage};
@@ -42,7 +42,8 @@ impl std::fmt::Display for Follows {
 const WORLD_CACHE: Follows = Setting("SceneLightingSettings::world_cache");
 const MESH_PAGES: Follows = Setting("Budgets::mesh_page_pool");
 
-/// Every label whose allocations are not the device's smallest, and what it follows.
+/// Every label whose allocations are not the device's smallest, and what it follows; a label
+/// ending in `*` names every label that starts with what comes before it.
 const STATED: &[(&str, Follows)] = &[
     ("orr resource heap", Device),
     ("orr raygen records", Device),
@@ -102,11 +103,14 @@ const STATED: &[(&str, Follows)] = &[
     ("hzb", Extent),
     ("depth", Extent),
     ("motion", Extent),
-    ("staged path state", Extent),
-    ("staged path records", Extent),
-    ("staged update path records", Extent),
-    ("staged path lists", Extent),
-    ("staged path queues", Fixed),
+    ("path pipeline *", Fixed),
+    ("hit group handles", Fixed),
+    ("launched view", Fixed),
+    ("launched view paths", Extent),
+    ("launched view path records", Extent),
+    ("launched update", Fixed),
+    ("launched update paths", Extent),
+    ("launched update path records", Extent),
     ("layer guides", Extent),
     ("light feedback", Extent),
     ("local light samplers", Extent),
@@ -186,10 +190,7 @@ fn view(scene: orr::SceneId, history: orr::ViewHistoryId) -> ViewDesc {
 fn an_empty_scene_holds_no_memory_for_content() {
     let kinds = MemoryKind::ALL;
     let granules = kinds.map(smallest);
-    let desc = RendererDesc {
-        path_entry: PathEntry::Compute,
-        ..RendererDesc::default()
-    };
+    let desc = RendererDesc::default();
     let mut r = Renderer::new(device(), desc).unwrap();
     let scene = r
         .create_scene(&SceneDesc::default(), &Default::default())
@@ -264,7 +265,11 @@ fn an_empty_scene_holds_no_memory_for_content() {
         let kind = kinds.iter().position(|&k| k == l.kind);
         let granule = kind.map(|k| granules[k]);
         let empty = granule.is_some_and(|g| l.bytes == l.allocations * g);
-        let stated = STATED.iter().find(|(label, _)| *label == &*l.label);
+        let stated = STATED.iter().find(|(label, _)| {
+            label
+                .strip_suffix('*')
+                .map_or(*label == &*l.label, |prefix| l.label.starts_with(prefix))
+        });
         match stated {
             _ if empty => {}
             Some((label, follows)) => held.push(format!("{:>12} B  {label}: {follows}", l.bytes)),

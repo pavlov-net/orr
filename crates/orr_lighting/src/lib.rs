@@ -63,7 +63,7 @@ pub mod openpbr;
 mod particles;
 mod probe;
 mod scene;
-mod staged;
+mod specialize;
 pub mod standins;
 mod subsurface;
 mod subsurface_table;
@@ -79,7 +79,7 @@ pub use media::{
     AERIAL_SIZE, MAX_FROXEL_SHADOWED_LIGHTS, MAX_PROXY_RAYS, MediaSettings, MediaStats,
 };
 use orr_scene::orr_gpu::KernelSet;
-pub use orr_scene::{DirectionalLight, DiscProfile, Light, LightId, PathEntry};
+pub use orr_scene::{DirectionalLight, DiscProfile, Light, LightId};
 pub use particles::ParticleDraw;
 pub use probe::{OriginProbe, OriginProbes, TracedViews};
 pub use scene::{
@@ -93,9 +93,9 @@ pub use shaders::types::{
 pub use subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 pub use view::{
     CameraJump, CompilingKernels, DofBackgroundPass, ExtraGuides, GuideKind, GuideSettings,
-    LightingDebugView, LightingKernels, LightingView, MAX_LOCAL_LIGHT_SHARE, MIN_PIXEL_FRACTION,
-    PathNeeds, PathsRan, ReferenceSettings, ThinLens, TracedKind, ViewLighting, ViewPass,
-    WaitedPaths,
+    LightingDebugView, LightingKernels, LightingView, MAX_BOUNCES, MAX_LOCAL_LIGHT_SHARE,
+    MIN_PIXEL_FRACTION, PathNeeds, PathsRan, ReferenceSettings, ThinLens, TracedKind, ViewLighting,
+    ViewPass, WaitedPaths,
 };
 pub use world_cache::{MAX_CAPACITY_LOG2, WorldCacheStats};
 

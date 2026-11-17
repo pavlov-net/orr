@@ -1,4 +1,4 @@
-// The pipeline path tracer's shaders by the bodies they run (`path.lean`,
+// The path pipeline's shaders by the bodies they run (`path.lean`,
 // `orr_scene.candidates`), as compute stand-ins compiled for the registers and memory the driver
 // reports of them (`orr_lighting::standins`). A lane's slot is its index; its hit, its payload or
 // its callable's data come from memory, and what its body hands back goes there, so the body is
@@ -24,16 +24,20 @@ export static const uint BSDF_CLASS = 0;
 
 ORR_ROOT_INLINE(PathRoot);
 
-// Lane `lane`'s payload or callable data, and what its body hands back.
+// Lanes per workgroup.
+static const uint LANES = 32;
+
+// Lane `lane`'s payload or callable data, and what its body hands back, in the launch's hot words:
+// a stand-in never runs, so any memory serves.
 uint4* lane_words(uint lane)
 {
-    return (uint4*)root.stages.lists + 2 * lane;
+    return root.launch.hot + 2 * lane;
 }
 
-// Lane `lane`'s hit.
+// Lane `lane`'s hit, in the launch's records.
 StoredHit lane_hit(uint lane)
 {
-    StoredHit h = { (HitInputs*)root.stages.queues + lane };
+    StoredHit h = { (HitInputs*)root.launch.records + lane };
     return h;
 }
 
@@ -46,7 +50,7 @@ HitData lane_data(uint lane)
 }
 
 [shader("compute")]
-[numthreads(STAGE_GROUP, 1, 1)]
+[numthreads(LANES, 1, 1)]
 void vertex_hit(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(vertex_hit);
@@ -57,7 +61,7 @@ void vertex_hit(uint3 id: SV_DispatchThreadID)
 }
 
 [shader("compute")]
-[numthreads(STAGE_GROUP, 1, 1)]
+[numthreads(LANES, 1, 1)]
 void first_vertex(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(first_vertex);
@@ -66,7 +70,7 @@ void first_vertex(uint3 id: SV_DispatchThreadID)
 }
 
 [shader("compute")]
-[numthreads(STAGE_GROUP, 1, 1)]
+[numthreads(LANES, 1, 1)]
 void cover_path_hit(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(cover_path_hit);
@@ -78,7 +82,7 @@ void cover_path_hit(uint3 id: SV_DispatchThreadID)
 }
 
 [shader("compute")]
-[numthreads(STAGE_GROUP, 1, 1)]
+[numthreads(LANES, 1, 1)]
 void cover_shadow_hit(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(cover_shadow_hit);
@@ -90,7 +94,7 @@ void cover_shadow_hit(uint3 id: SV_DispatchThreadID)
 }
 
 [shader("compute")]
-[numthreads(STAGE_GROUP, 1, 1)]
+[numthreads(LANES, 1, 1)]
 void box_medium_hit(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(box_medium_hit);
@@ -99,7 +103,7 @@ void box_medium_hit(uint3 id: SV_DispatchThreadID)
 }
 
 [shader("compute")]
-[numthreads(STAGE_GROUP, 1, 1)]
+[numthreads(LANES, 1, 1)]
 void proxy_shadow_hit(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(proxy_shadow_hit);

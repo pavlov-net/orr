@@ -17,8 +17,8 @@ use orr::orr_pack::Target;
 use orr::orr_pack::material::Material;
 use orr::{
     Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens,
-    LoadState, PackSource, Pose, Projection, Renderer, SceneDesc, SceneLightingSettings,
-    TextureFilter, TransformGroupDesc, ViewDesc,
+    LoadState, PackSource, Pose, Projection, Renderer, RendererDesc, SceneDesc,
+    SceneLightingSettings, TextureFilter, TransformGroupDesc, ViewDesc,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Source};
 use orr_examples::mesh::MeshBuilder;
@@ -72,7 +72,7 @@ fn branch(b: u32) -> (Vec3, f32, f32) {
 pub(crate) fn run(options: &Options) -> Option<Capture> {
     let gpu = device();
     let mut window = (!options.headless).then(|| Window::new("orr rigid-parts", 1920, 1080));
-    let desc = options.renderer_desc();
+    let desc = RendererDesc::default();
     let mut display = window.as_ref().map(|w| {
         Display::new(
             gpu,

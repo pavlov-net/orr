@@ -9,7 +9,7 @@ use lighting_suite::bed::{
 use lighting_suite::shaders::alpha_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, require, upload};
 use orr_gpu::{Allocation, Hazards, KernelSet, Stages};
-use orr_lighting::{Light, LightingDebugView, PathEntry, ReferenceSettings, ViewLighting};
+use orr_lighting::{Light, LightingDebugView, ReferenceSettings, ViewLighting};
 use orr_math::{Mat3, Vec2, Vec3};
 
 /// Rays a side aimed across each quad.
@@ -286,7 +286,6 @@ fn direct(model: &'static str, paths: &Paths, seed: u32) -> Accumulated {
 fn direct_paths() -> Paths {
     Paths::new(
         &KernelSet::default(),
-        PathEntry::Compute,
         ViewLighting {
             max_bounces: 1,
             reference: Some(ReferenceSettings::default()),

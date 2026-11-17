@@ -13,7 +13,8 @@
 // interface of kernels that are made without it.
 module scene_may;
 
-// Whether the kernel's pipelines are made for a mask: the staged path kernels export true.
+// Whether the kernel's pipelines are made for a mask: the path pipelines' kernels and the masked
+// support kernels export true.
 public extern static const bool PATH_SPECIALIZES = false;
 
 #ifdef ORR_UNSPECIALIZED

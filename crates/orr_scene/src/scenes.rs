@@ -15,7 +15,6 @@ use orr_gpu::{
 };
 use orr_math::{DVec3, Vec3};
 use orr_pack::AssetId;
-use orr_shaders::PathEntry;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::accel::{AccelKernels, AccelLimits, AccelShared};
@@ -241,8 +240,6 @@ pub struct RendererDesc {
     pub frames_in_flight: u32,
     /// Consumer-linked kernels.
     pub kernels: &'static KernelSet,
-    /// Which entry of the path tracing kernels views run.
-    pub path_entry: PathEntry,
     /// The first view history looks in the pipeline caches for the lighting kernels that every
     /// view runs, on the calling thread, so a warm start waits only for the path pipelines its
     /// first view asks for, which come from the caches as jobs. Off, the calling thread never
@@ -297,7 +294,6 @@ impl Default for RendererDesc {
             budgets: Budgets::default(),
             frames_in_flight: 2,
             kernels: &KernelSet::NONE,
-            path_entry: PathEntry::Fastest,
             try_cached_paths: true,
             cell_log2: 8,
             positioned_reads: false,

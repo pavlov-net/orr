@@ -1,4 +1,4 @@
-//! The shader bodies of the pipeline path tracer, as it ships them, against their kinds' register
+//! The shader bodies of the path tracer's pipeline, as it ships them, against their kinds' register
 //! budgets, compiled as compute stand-ins for the pipeline that may meet everything and for the
 //! bench walk's view pipeline, with orr_lighting's own kernels and with the suite's linked
 //! surfaces.

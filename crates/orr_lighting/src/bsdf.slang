@@ -1466,14 +1466,6 @@ public float3 rough_way_in(float alpha, float ior, float3 s, float3 u, float eve
     return r;
 }
 
-// A `Bsdf` for a path that has no vertex yet.
-public Bsdf bsdf_unprepared()
-{
-    Bsdf s;
-    s.emitted = float3(0.0);
-    return s;
-}
-
 // Prepares `p` at shading normal `n` (unit) seen along `wo` (unit, toward the viewer), with
 // `exterior_ior` the medium on the side `n` points to. A view within 1e-4 of the surface
 // plane leans up to it. Refraction scales radiance by the squared ratio of the two IORs, so

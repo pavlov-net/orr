@@ -459,8 +459,7 @@ struct PathTrail
 }
 
 // The depth of the context a hit of a ray of `slot`'s path takes, whose first hot word's flags are
-// `flags`: the vertices before it, as the staged loop counts them, its scatters and the layers it
-// met alike.
+// `flags`: the vertices before it, its scatters and the layers it met alike.
 uint context_depth(PathRoot r, uint slot, uint flags)
 {
     uint depth = (flags >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK;
@@ -802,7 +801,7 @@ uint scatter_segment(PathRoot r, uint slot, uint4* at, uint4 w0, float t, inout 
 }
 
 // The instance mask of what the ray of `slot`'s path, whose first hot word is `w0`, sees in front
-// of its hit beside what covers it, as the staged loop's `front_mask` takes it: particles for a
+// of its hit beside what covers it: particles for a
 // view path's rays that leave a layer, a scatter or a walk's way out (`chain`) and for the first
 // vertex's ray, and for every ray whose light counts the proxies of sphere and rect lights, which
 // cover nothing. The camera ray sees neither.

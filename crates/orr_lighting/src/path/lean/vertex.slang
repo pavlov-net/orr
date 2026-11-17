@@ -1101,8 +1101,8 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     // wavelength, and its rays reach the lights at full weight.
     bool split = LAYER && may(MAY_DISPERSION) && dispersive && spectral.companions();
     bool estimates = count_nee && counted && candidates > 0 && u_run < run && !split;
-    // The path's first scattering vertex draws with its pixel's local sampler, as the staged loop's
-    // does: on the G-buffer's surface, or in a hit's stage where a camera ray may reach it.
+    // The path's first scattering vertex draws with its pixel's local sampler: on the G-buffer's
+    // surface, or in a hit's stage where a camera ray may reach it.
     bool local = may(MAY_LOCAL) && scattered == 0 && (FIRST == 1 || may_any(MAY_LAYERS | MAY_TRACED | MAY_LENS | MAY_BACKGROUND));
     float3 unused;
     LightPick k = pick_light<true>(r, b, g.position, g.normal, pixel, candidates, estimates, local, evaluates, wi, scatter_f, scatter_pdf, scatter_diffuse, rng, false, float3(0.0), unused);
@@ -3011,8 +3011,8 @@ public static const uint MARCH_FROXELS = 2;
 
 // The callable that takes what `slot`'s path ray meets on its way to its hit `t` m along it: under
 // instance mask `mask`, 0 for none, particles, each a layer of its emission at its opacity, and the
-// proxies of sphere and rect lights, layers that only emit, in depth order as the staged loop's
-// trace stage takes them; and the linked medium as `march` (MARCH_*) says. What the layers emit
+// proxies of sphere and rect lights, layers that only emit, in depth order; and the linked medium
+// as `march` (MARCH_*) says. What the layers emit
 // toward a ray whose light counts adds to the path's radiance, and what they cover leaves its
 // throughput; the medium's in-scatter in front of a layer is not covered by it. A view path's ray
 // inside a medium that scatters ends where the raygen's draw for its segment (`free_flight`) says

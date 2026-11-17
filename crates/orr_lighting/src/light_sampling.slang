@@ -1349,14 +1349,6 @@ public ResolvedLightSample nee_directional_draw(LightSetGpu* set, NeeVertex v, i
     return directional_draw(set, v.normal, v.total, v.share, pick, u);
 }
 
-// `nee_candidate` given that it draws no directional light, its density still the whole
-// mixture's: with the local sampler's share, a slot it holds and a sample of its range, or
-// else a sample at a random offset in the vertex's tile. Draws five sampler dimensions.
-public ResolvedLightSample nee_light_candidate<S : ISurfaces>(LightSetGpu* set, NeeVertex v, inout Sampler rng)
-{
-    return light_candidate<S>(set, v, rng.next(), rng);
-}
-
 // `nee_light_candidate` given that it draws no directional light, its density still the whole
 // mixture's: a sample of the vertex's tile at a random offset, or where `LOCAL` and `local` hold and
 // `v.local` is set, one of the points its local sampler drew this frame for that sampler's share.
@@ -1416,35 +1408,6 @@ ResolvedLightSample light_candidate<S : ISurfaces>(LightSetGpu* set, NeeVertex v
     else
         r = no_candidate();
     r.pdf *= 1.0 - v.share;
-    return r;
-}
-
-// A light seen from `x`, from the candidate mixture of a vertex with no normal and no local
-// sampler given that the draw is not the environment: a directional light, or a sphere, rect
-// or emissive light drawn from the light set's selection itself rather than a tile. The density
-// is the candidate's in that conditioned mixture; none where the scene has no such light.
-// Draws five sampler dimensions.
-public ResolvedLightSample owned_light_candidate<S : ISurfaces>(LightSetGpu* set, float3 x, inout Sampler rng)
-{
-    float total;
-    float share = directional_share(set, float3(0.0), total);
-    float choice = rng.next();
-    uint pick = rng.next_bits();
-    uint2 bits = uint2(rng.next_bits(), rng.next_bits());
-    OwenSobol4 u4 = rng.next4_parts();
-    float2 u = u4.xy();
-    float tiles = set.candidate_total > 0.0 ? (1.0 - share) * (1.0 - set.environment_probability) : 0.0;
-    float owned = share + tiles;
-    if (!(owned > 0.0))
-        return no_candidate();
-    if (choice * owned < share)
-        return directional_candidate(set, float3(0.0), total, share / owned, pick, u);
-    uint id = upper_bound(set.cdf, set.candidate_count, below(unit_float(pick), set.candidate_total));
-    float selected = (set.cdf[id] - (id > 0 ? set.cdf[id - 1] : 0.0)) / set.candidate_total;
-    uint lights = set.scene.light_capacity;
-    uint count = id >= lights ? set.emissive[id - lights].count : 0;
-    ResolvedLightSample r = resolve_light_sample(set, tile_light_sample<S>(set, id, 0, count, bits, float4(u, u4.zw()), selected), x, u);
-    r.pdf *= tiles / owned;
     return r;
 }
 

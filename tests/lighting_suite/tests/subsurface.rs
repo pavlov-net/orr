@@ -10,15 +10,15 @@ use lighting_suite::bed::{
     VERY_ROUGH_JADE_SPHERE, WALK_FURNACE, WALK_SLABS, WALK_SPHERE, assert_within_noise, look,
 };
 use lighting_suite::shaders::walk_probe;
-use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
+use lighting_suite::{assert_clean, device, pipeline, readback, render, run, upload};
 use openpbr_ref::Inputs;
 use openpbr_ref::walk::{
     DielectricWalks, Interface, Light as CpuLight, Medium, Shape, Walks, fresnel, top_exit,
 };
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
-    DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry, ReferenceSettings,
-    SubsurfaceTable, ViewLighting,
+    DirectionalLight, DiscProfile, Light, LightingDebugView, ReferenceSettings, SubsurfaceTable,
+    ViewLighting,
 };
 use orr_math::{DVec3, Mat3, Vec3};
 
@@ -268,7 +268,6 @@ fn render_spec_at(paths: &Paths, spec: Spec, frames: u32, seed: u32) -> Accumula
 fn the_opaque_path_walks_as_the_cpu_walk_does() {
     let mut paths = Paths::new(
         &KernelSet::default(),
-        PathEntry::Compute,
         settings(LightingDebugView::Subsurface),
     );
     lit_slabs_match_the_cpu_walk(&paths);
@@ -425,21 +424,20 @@ fn a_lit_sphere_matches_the_cpu_walk(paths: &Paths) {
     assert!(e < 0.02, "sphere: GPU {gpu:?}, CPU {cpu:?} ({e:.4})");
 }
 
-/// The path shaders' `INTERIOR_EXACT_ROUGHNESS`: from it the pipeline's real-time walks take a sun
-/// through their rough surface wherever they meet it.
+/// The path shaders' `INTERIOR_EXACT_ROUGHNESS`: from it real-time walks take a sun through their
+/// rough surface wherever they meet it.
 const EXACT_ROUGHNESS: f32 = 0.6;
 
 /// The CPU walks of `interior` in `shape` as `paths` walk it with surface roughness `roughness`:
-/// the reference takes a sun through a rough surface wherever a walk meets it, and so do the
-/// pipeline's real-time walks from [`EXACT_ROUGHNESS`]; below it their way out weighs it by the
-/// walk's last scatter through the surface's plane.
+/// the reference takes a sun through a rough surface wherever a walk meets it, and so do real-time
+/// walks from [`EXACT_ROUGHNESS`]; below it their way out weighs it by the walk's last scatter
+/// through the surface's plane.
 fn cpu_dielectric(
     paths: &Paths,
     interior: &DenseInterior,
     shape: Shape,
     roughness: f32,
 ) -> DielectricWalks {
-    let pipeline = paths.entry == PathEntry::Pipeline;
     let real_time = paths.settings.reference.is_none();
     let (extinction, albedo) = interior.rec2020();
     DielectricWalks {
@@ -451,8 +449,8 @@ fn cpu_dielectric(
             surface_ior: f64::from(interior.ior),
         },
         roughness: f64::from(roughness),
-        exact_sun: !real_time || (roughness >= EXACT_ROUGHNESS && pipeline),
-        conditioned: real_time && roughness < EXACT_ROUGHNESS && pipeline,
+        exact_sun: !real_time || roughness >= EXACT_ROUGHNESS,
+        conditioned: real_time && roughness < EXACT_ROUGHNESS,
     }
 }
 
@@ -589,7 +587,6 @@ fn a_thin_slab_lit_from_behind_matches_the_cpu_walk(paths: &Paths, tolerance: f6
 fn dense_interiors_walk_as_the_cpu_walk_does() {
     let mut paths = Paths::new(
         &KernelSet::default(),
-        PathEntry::Compute,
         settings(LightingDebugView::Subsurface),
     );
     paths.settings.reference = None;
@@ -628,11 +625,7 @@ fn dense_interiors_walk_as_the_cpu_walk_does() {
 /// pane.
 #[test]
 fn a_pane_above_an_interior_passes_the_sun_as_in_the_air() {
-    let mut paths = Paths::new(
-        &KernelSet::default(),
-        PathEntry::Compute,
-        real_time(LightingDebugView::NeeOnly),
-    );
+    let mut paths = Paths::new(&KernelSet::default(), real_time(LightingDebugView::NeeOnly));
     paths.settings.max_bounces = 2;
     let (eye, target, fov_y) = (Vec3::new(0.0, 1.2, 4.0), Vec3::ZERO, 0.6);
     let pixels = sphere_pixels(eye, target, fov_y, 1.0);
@@ -687,14 +680,12 @@ fn a_pane_above_an_interior_passes_the_sun_as_in_the_air() {
 const REFERENCE_BOUNCES: u32 = 64;
 
 /// A rough surface scatters the walks by its BSDF seen from inside: the reference takes a sun
-/// through it wherever a walk meets it, and so do the pipeline's real-time walks past
-/// [`EXACT_ROUGHNESS`]; below it they take it where they leave, by their last scatter through the
-/// surface's plane, and the staged loop's real-time walks through their way out's exit lobe.
+/// through it wherever a walk meets it, and so do real-time walks past [`EXACT_ROUGHNESS`]; below
+/// it they take it where they leave, by their last scatter through the surface's plane.
 #[test]
 fn rough_interiors_walk_as_the_cpu_walk_does() {
     let mut paths = Paths::new(
         &KernelSet::default(),
-        PathEntry::Compute,
         settings(LightingDebugView::Subsurface),
     );
     paths.settings.max_bounces = REFERENCE_BOUNCES;
@@ -708,10 +699,8 @@ fn rough_interiors_walk_as_the_cpu_walk_does() {
     paths.settings.max_bounces = 2;
     let both = [Lighting::Uniform, Lighting::Sun];
     interior_matches_the_cpu_walk(&paths, model, &JADE, roughness, 1.0, &both, 0.02);
-    if paths.entry == PathEntry::Pipeline {
-        let (model, roughness) = (VERY_ROUGH_JADE_SPHERE, VERY_ROUGH_JADE_ROUGHNESS);
-        interior_matches_the_cpu_walk(&paths, model, &JADE, roughness, 1.0, &sun, 0.03);
-    }
+    let (model, roughness) = (VERY_ROUGH_JADE_SPHERE, VERY_ROUGH_JADE_ROUGHNESS);
+    interior_matches_the_cpu_walk(&paths, model, &JADE, roughness, 1.0, &sun, 0.03);
     assert_clean();
 }
 
@@ -723,7 +712,6 @@ fn rough_interiors_walk_as_the_cpu_walk_does() {
 fn capped_interior_walks_keep_the_table_share() {
     let mut paths = Paths::new(
         &KernelSet::default(),
-        PathEntry::Compute,
         real_time(LightingDebugView::Subsurface),
     );
     paths.settings.max_bounces = 2;
@@ -734,34 +722,6 @@ fn capped_interior_walks_keep_the_table_share() {
     assert_clean();
 }
 
-/// The shade stages' ray entries reorder their lanes before a vertex loads: a subsurface sphere
-/// and a dense interior still match the CPU walk under them.
-#[test]
-fn the_ray_entries_walk_as_the_cpu_walk_does() {
-    let caps = device().caps();
-    if !require(caps.ray_dispatch && caps.reorder, "no reordering") {
-        return;
-    }
-    let mut paths = Paths::new(
-        &KernelSet::default(),
-        PathEntry::RayDispatch,
-        settings(LightingDebugView::Subsurface),
-    );
-    paths.settings.max_bounces = 2;
-    a_lit_sphere_matches_the_cpu_walk(&paths);
-    paths.settings.max_bounces = REFERENCE_BOUNCES;
-    interior_matches_the_cpu_walk(
-        &paths,
-        MILK_SPHERE,
-        &MILK,
-        0.0,
-        1.0,
-        &[Lighting::Uniform],
-        0.02,
-    );
-    assert_clean();
-}
-
 /// Pipelines compiled for what a scene and its settings may meet hold the code its paths run:
 /// a subsurface sphere and a dense interior trace the same paths through them as through the
 /// pipelines that hold everything. The images compare BSDF rays alone, as above.
@@ -769,7 +729,6 @@ fn the_ray_entries_walk_as_the_cpu_walk_does() {
 fn specialized_pipelines_trace_the_paths_the_general_ones_do() {
     let mut paths = Paths::new(
         &KernelSet::default(),
-        PathEntry::Compute,
         real_time(LightingDebugView::BsdfOnly),
     );
     paths.settings.max_bounces = 2;

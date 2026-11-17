@@ -259,12 +259,6 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
             "path/lean_paths",
             "path/lean_rich",
             "path/lean_walk",
-            "path/staged/primary",
-            "path/staged/shade_opaque",
-            "path/staged/shade_other",
-            "path/staged/sources",
-            "path/staged/trace",
-            "path/staged/walk",
             "path/standins"
         ]
     );

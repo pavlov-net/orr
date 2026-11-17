@@ -4,16 +4,16 @@
 
 use bytemuck::Zeroable;
 use lighting_suite::bed::{
-    Accumulated, Analytic, Bed, CLOUD_SPHERE, CORNELL, EMITTER, FLOOR, Item, Paths, SKY, Spec,
-    WHITE_SPHERE, assert_within_noise, reference,
+    Accumulated, Analytic, Bed, CLOUD_SPHERE, CONVERGES, CORNELL, Converges, EMITTER, FLOOR, Item,
+    Paths, SKY, Spec, WHITE_SPHERE, assert_converges, reference,
 };
 use lighting_suite::shaders::cache_probe;
 use lighting_suite::{TestScene, assert_clean, finish, pipeline, readback, render, upload};
 use orr_color::luminance;
 use orr_gpu::{ComputePipeline, GpuPtr, Hazards, KernelSet, Stages};
 use orr_lighting::{
-    DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, LightingStats, PathEntry,
-    SceneLighting, SceneLightingSettings, ViewLighting, WorldCacheSettings,
+    DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, LightingStats, SceneLighting,
+    SceneLightingSettings, ViewLighting, WorldCacheSettings,
 };
 use orr_math::{Mat3, Vec3};
 use orr_scene::{SceneDesc, SceneWriter};
@@ -528,7 +528,7 @@ fn realtime() -> ViewLighting {
 }
 
 fn paths(settings: ViewLighting) -> Paths {
-    Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
+    Paths::new(&KernelSet::default(), settings)
 }
 
 fn render_paths(bed: &mut Bed, paths: &Paths, first: u32, frames: u32) -> Accumulated {
@@ -828,19 +828,12 @@ fn cache_terminated_paths_stay_finite_on_every_analytic_scene() {
     assert_clean();
 }
 
-/// The pipeline's update paths fill the cache as the staged loop's do, each tracer warming a cache
-/// of its own under the sky: the floor inside a glass sphere sunk into it holds the light that
-/// crossed the sphere's medium, as its update paths start inside the interiors around their
-/// surface. The pipeline's view of its cache sits as close to the staged loop's as the staged
-/// loop's from other frames does.
+/// The update paths fill the cache where they start inside the interiors around their surface:
+/// under the sky, the floor inside a glass sphere sunk into it holds the light that crossed the
+/// sphere's medium, which real-time view paths that end there read, so they converge to the
+/// reference as on open ground.
 #[test]
-fn the_pipelines_update_paths_fill_the_cache_as_the_staged_loops_do() {
-    if !lighting_suite::require(
-        lighting_suite::device().caps().ray_dispatch,
-        "no ray tracing pipelines",
-    ) {
-        return;
-    }
+fn update_paths_fill_the_cache_inside_an_interior() {
     let spec = Spec {
         copies: vec![
             at(FLOOR, Vec3::ZERO),
@@ -853,30 +846,23 @@ fn the_pipelines_update_paths_fill_the_cache_as_the_staged_loops_do() {
         fov_y: 0.8,
         focus: None,
     };
-    let cache = |entry, first| {
-        let run = Paths::exactly(&KernelSet::default(), entry, realtime());
-        let view = Paths::exactly(
-            &KernelSet::default(),
-            entry,
-            ViewLighting {
-                debug_view: LightingDebugView::WorldCache,
-                ..realtime()
-            },
-        );
-        let mut bed = Bed::with(spec.clone());
-        bed.set_pre_exposure(1.0 / 64.0);
-        render_paths(&mut bed, &run, first, 120);
-        render_paths(&mut bed, &view, first + 120, 1)
+    let mut bed = Bed::with(spec);
+    bed.set_pre_exposure(1.0 / 64.0);
+    let truth_paths = paths(reference(12));
+    let truth = bed.accumulate(1024, 7, &mut |list, f| truth_paths.record(list, f));
+    // Measured 1.7% off on the image and 12% on a block, where the floor in the sphere's medium
+    // reads cells whose light the medium's scatters lean on: this is about twice that.
+    let tolerance = Converges {
+        image: 0.035,
+        block: 0.25,
+        ..CONVERGES
     };
-    let staged = cache(PathEntry::Compute, 0);
-    let other = cache(PathEntry::Compute, 1000);
-    let piped = cache(PathEntry::Pipeline, 0);
-    assert_within_noise(
-        "the cache by a sunken cloud sphere",
-        &piped,
-        &staged,
-        &other,
-        1.25,
+    assert_converges(
+        "a sunken cloud sphere",
+        &mut bed,
+        &paths(realtime()),
+        &truth,
+        tolerance,
     );
     assert_clean();
 }

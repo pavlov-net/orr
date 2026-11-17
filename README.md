@@ -58,10 +58,12 @@ world.
 
 **Lighting and materials**
 
-- Path tracing with shader execution reordering
+- Path tracing in a ray tracing pipeline: a raygen runs each path from its start to its end, the
+  hit's record picks the closest-hit shader that runs a whole vertex, and hit objects are
+  reordered by the shader they run
 - Ray tracing pipelines in `orr_gpu`: raygen, closest-hit, any-hit, intersection, miss and
   callable shaders compiled in parallel, hit records your GPU code can write, hit objects and
-  reordering (Vulkan only, not yet used by the path tracer)
+  reordering (Vulkan only)
 - A real time OpenPBR BSDF, checked against the reference implementation
 - Light selection across many lights, including area lights and emissive meshes, guided by per
   pixel feedback, with light and BSDF samples weighed against each other, plus a world radiance
@@ -118,11 +120,11 @@ read code, start with those examples and the `orr` crate.
 
 ### Profiling
 
-Each kernel's entry point is named after its module, such as `orr_lighting.path.staged.trace`, so
-a GPU profiler tells kernels apart, and passes carry debug labels. Kernels follow the Rust debug
-info of the build: where it has some, they carry line tables and their Slang source, so a
-profiler maps hotspots to source lines; release builds have none. The `profiling` profile is
-release with line tables:
+Each kernel's entry point is named after its module, such as
+`orr_lighting.path.lean_paths.paths`, so a GPU profiler tells kernels apart, and passes carry debug
+labels. Kernels follow the Rust debug info of the build: where it has some, they carry line tables
+and their Slang source, so a profiler maps hotspots to source lines; release builds have none. The
+`profiling` profile is release with line tables:
 
 ```sh
 cargo build --profile profiling -p orr_examples --example viewer

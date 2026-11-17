@@ -292,7 +292,7 @@ public float3 cache_radiance(uint2 r)
 }
 
 // Adds 1 to `*p` where `count`, one atomic per lane: on 621.01 a wave-summed add after a
-// raygen entry's coherence point loses the device.
+// raygen's reorder loses the device.
 public void count_add(uint* p, bool count)
 {
     if (count)

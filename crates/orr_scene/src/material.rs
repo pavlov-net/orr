@@ -48,9 +48,6 @@ pub mod material_flags {
     /// `stack_material`), which only a surface smoother than `CHAIN_ROUGHNESS` is. The material
     /// table sets it on every record it stores, from the record's other fields.
     pub const STACK_FACE: u32 = 1 << 15;
-    /// The cost class, 0-3, in bits 16-17.
-    pub const COST_SHIFT: u32 = 16;
-    pub const COST_MASK: u32 = 3 << COST_SHIFT;
     pub const MORE_TEXTURES: u32 = 1 << 22;
     pub const VERTEX: u32 = 1 << 24;
     pub const OBJECT_NORMAL: u32 = 1 << 25;
@@ -170,7 +167,7 @@ impl MaterialGpu {
 
     /// The record of a cooked material whose slots read `textures`. Colors convert from Rec.709
     /// to Rec.2020, and a color slot's factor multiplies its texels in the texture's primaries;
-    /// flags and the cost class follow the parameters.
+    /// the flags follow the parameters.
     pub fn new(m: &Material, textures: &[BoundTexture; slot::COUNT]) -> Self {
         use material_flags as f;
         let bound = |s: usize| textures[s].index != TextureIndex::NONE;
@@ -185,10 +182,6 @@ impl MaterialGpu {
         let dielectric = class == SurfaceClass::Dielectric;
         let presence = class == SurfaceClass::Presence;
         let subsurface = m.subsurface_weight > 0.0 && !thin && !dielectric;
-        let lobes = m.coat_weight > 0.0
-            || m.fuzz_weight > 0.0
-            || m.thin_film_weight > 0.0
-            || m.specular_anisotropy > 0.0;
         set(m.alpha_mode == Material::MASK, f::ALPHA_TESTED);
         set(m.double_sided != 0, f::DOUBLE_SIDED);
         set(thin, f::THIN_WALLED);
@@ -228,14 +221,6 @@ impl MaterialGpu {
             (slot::MORE..slot::DISPLACEMENT_U).any(bound),
             f::MORE_TEXTURES,
         );
-        let cost: u32 = if subsurface {
-            3
-        } else if dielectric || presence {
-            2
-        } else {
-            u32::from(lobes)
-        };
-        flags |= cost << f::COST_SHIFT;
         Self {
             base_color: rec2020(m.base_color),
             base_weight: m.base_weight,
@@ -720,28 +705,31 @@ mod tests {
     }
 
     #[test]
-    fn cooked_materials_take_their_flags_cost_class_and_slot_bits() {
+    fn cooked_materials_take_their_flags_and_slot_bits() {
         let record = |m: &Material| MaterialGpu::new(m, &[BoundTexture::NONE; slot::COUNT]);
-        let cost = |m: &Material| (record(m).flags & material_flags::COST_MASK) >> 16;
         let base = Material::default();
-        assert_eq!(cost(&base), 0);
         let coat = Material {
             coat_weight: 0.5,
             ..base
         };
-        assert_eq!(cost(&coat), 1);
         assert_ne!(record(&coat).flags & material_flags::COAT, 0);
         let glass = Material {
             transmission_weight: 1.0,
             subsurface_weight: 1.0,
             ..coat
         };
-        assert_eq!(cost(&glass), 2, "transmission wins over subsurface");
+        let flags = record(&glass).flags;
+        assert_ne!(flags & material_flags::DIELECTRIC, 0);
+        assert_eq!(
+            flags & material_flags::SUBSURFACE,
+            0,
+            "transmission wins over subsurface"
+        );
         let skin = Material {
             subsurface_weight: 1.0,
             ..base
         };
-        assert_eq!(cost(&skin), 3);
+        assert_ne!(record(&skin).flags & material_flags::SUBSURFACE, 0);
         let mut veil = Material {
             alpha_mode: Material::BLEND,
             ..base

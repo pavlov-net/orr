@@ -19,7 +19,7 @@ mod module;
 pub use build::{Reload, Watcher};
 pub use module::{
     DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM, EntryPoint, KernelMismatch, KernelSet, Mismatch,
-    PathEntry, ShaderModule, Stage, surface_declares,
+    ShaderModule, Stage, surface_declares,
 };
 
 #[doc(hidden)]

@@ -71,11 +71,11 @@ struct Shot {
 }
 
 impl Bench {
-    fn new(extent: [u32; 2], options: &Options) -> Self {
+    fn new(extent: [u32; 2]) -> Self {
         let gpu = device();
         let desc = RendererDesc {
             kernels: &KERNELS,
-            ..options.renderer_desc()
+            ..RendererDesc::default()
         };
         let mut renderer = Renderer::new(gpu, desc).expect("renderer");
         let workers = Workers::new(renderer.loading(), 2);
@@ -401,7 +401,7 @@ fn main() {
     let images = report_dir().join(format!("quality-{rev}"));
     std::fs::create_dir_all(&images).expect("image directory");
 
-    let mut bench = Bench::new(extent, &options);
+    let mut bench = Bench::new(extent);
     let dlss = enable_reconstruction(&mut bench.renderer);
     let reference = bench.reference(reference_frames);
     tone_mapped(&reference.mean(), extent).save_png(&images.join("reference.png"));

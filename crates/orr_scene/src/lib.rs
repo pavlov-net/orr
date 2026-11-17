@@ -92,7 +92,7 @@ pub use orr_gpu;
 pub use orr_math::DVec3;
 pub use orr_pack;
 pub use orr_pack::volume::{VolumeGpu, VolumeGridGpu};
-pub use orr_shaders::{PathEntry, abi};
+pub use orr_shaders::abi;
 
 pub use arena::{ArenaReport, ArenaRequest, ArenaTarget, ArenaTexture, Span, ViewArena, ViewStep};
 pub use decals::{Decal, DecalChannels, DecalId};

@@ -846,7 +846,7 @@ fn run(options: &Options) -> Option<Capture> {
     let pixels = |name: &str, default: f32| {
         std::env::var(name).map_or(default, |n| n.parse().expect("an error in pixels"))
     };
-    let defaults = options.renderer_desc();
+    let defaults = RendererDesc::default();
     let desc = RendererDesc {
         budgets: budgets(),
         raster_error_pixels: pixels("ZORAH_RASTER_PIXELS", defaults.raster_error_pixels),

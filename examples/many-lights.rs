@@ -19,8 +19,8 @@ use orr::orr_pack::{AssetId, Target};
 use orr::{
     Cone, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime,
     GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource,
-    Projection, Renderer, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
-    TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Projection, Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest,
+    TextureFilter, TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshSettings, Source};
 use orr_examples::mesh::MeshBuilder;
@@ -173,7 +173,7 @@ fn directional_lights() -> [DirectionalLight; 3] {
 pub(crate) fn run(options: &Options) -> Option<Capture> {
     let gpu = device();
     let mut window = (!options.headless).then(|| Window::new("orr many-lights", 1920, 1080));
-    let desc = options.renderer_desc();
+    let desc = RendererDesc::default();
     let mut display = window.as_ref().map(|w| {
         Display::new(
             gpu,

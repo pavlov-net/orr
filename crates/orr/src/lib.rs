@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 pub use orr_lighting::{
     self, CausticSettings, CausticStats, CompilingKernels, Error as LightingError, GuideSettings,
-    LightingDebugView, LightingStats, MediaSettings, ParticleDraw, ParticleLighting, PathEntry,
+    LightingDebugView, LightingStats, MediaSettings, ParticleDraw, ParticleLighting,
     ReferenceSettings, SceneLightingSettings, ThinLens, ViewLighting, WorldCacheSettings,
 };
 pub use orr_output::DisplayWatch;
@@ -351,7 +351,6 @@ impl Paths {
 /// orr_lighting's kernels and tables, and each scene's lighting state.
 struct Lighting {
     kernels: &'static KernelSet,
-    entry: PathEntry,
     try_cached_paths: bool,
     /// Started by the first view history.
     paths: Paths,
@@ -380,9 +379,7 @@ impl Lighting {
         self.started = Some(Instant::now());
         if self.try_cached_paths {
             let cached = gpu.cached_pipelines_only();
-            if let Ok(kernels) =
-                LightingKernels::new(&cached, self.kernels, &self.tables, self.entry)
-            {
+            if let Ok(kernels) = LightingKernels::new(&cached, self.kernels, &self.tables) {
                 kernels.attach(gpu, loading);
                 self.paths = Paths::Ready(Box::new(kernels));
                 return;
@@ -393,7 +390,7 @@ impl Lighting {
              finish, which on a first run takes minutes"
         );
         self.paths = Paths::Compiling {
-            jobs: LightingKernels::spawn(gpu, self.kernels, &self.tables, self.entry, loading),
+            jobs: LightingKernels::spawn(gpu, self.kernels, &self.tables, loading),
             since: Instant::now(),
             warned: false,
         };
@@ -669,7 +666,6 @@ impl Renderer {
             scenes: Scenes::new(gpu, &desc)?,
             lighting: Lighting {
                 kernels: desc.kernels,
-                entry: desc.path_entry,
                 try_cached_paths: desc.try_cached_paths,
                 paths: Paths::NotStarted,
                 waits: false,
@@ -1555,9 +1551,8 @@ impl<'a> Frame<'a> {
                 .restart_exposure(view.history, output.exposure.start())?;
             state.output.exposure_restarted(id);
         }
-        // The pipeline's paths may trace the view's camera rays in place of the raster.
-        let traces_primary = lighting.traced_primary && self.lighting.entry == PathEntry::Pipeline;
-        let raster = if traces_primary {
+        // The paths may trace the view's camera rays in place of the raster.
+        let raster = if lighting.traced_primary {
             if hooks.opaque.is_some() {
                 return Err(orr_lighting::Error::Settings(
                     "a view whose paths trace its camera rays draws no opaque hook",
@@ -1642,7 +1637,7 @@ impl<'a> Frame<'a> {
         let traced = Stages::COMPUTE | Stages::RAY;
         list.barrier(Stages::ALL, traced, Hazards::empty());
         kernels.record_media(list, scene, paths, &pass, lighting)?;
-        kernels.record_paths(list, scene, paths, &pass, lighting, Some(&hits))?;
+        kernels.record_paths(list, scene, paths, &pass, lighting, &hits)?;
         let exact_paths = paths.paths_ran().is_none_or(|ran| ran.exact());
         state.samples = state.samples.wrapping_add(1);
         list.barrier(traced, Stages::COMPUTE, Hazards::empty());
@@ -1664,7 +1659,7 @@ impl<'a> Frame<'a> {
         }
         // The passes from here on test against the depth target, which a traced view draws
         // from what its paths' hits wrote.
-        if traces_primary {
+        if lighting.traced_primary {
             self.scenes.finish_traced_view(&raster)?;
         }
         let mut overlay = None;

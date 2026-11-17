@@ -24,13 +24,13 @@ use lighting_suite::bed::{
     plume_volume, water_transmission,
 };
 use lighting_suite::shaders::{froxel_lookup, froxel_probe, segment_probe};
-use lighting_suite::{assert_clean, device, finish, pipeline, readback, render, require, upload};
+use lighting_suite::{assert_clean, finish, pipeline, readback, render, upload};
 use orr_color::luminance;
 use orr_gpu::{Allocation, Hazards, KernelSet, Stages};
 use orr_lighting::path_may::{MAY_FROXELS, MAY_MEDIUM, MAY_VIEW};
 use orr_lighting::{
     AERIAL_SIZE, DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, MediaSettings,
-    PathEntry, ReferenceSettings, ViewLighting,
+    ReferenceSettings, ViewLighting,
 };
 use orr_math::{DVec3, Mat3, Quat, Vec2, Vec3};
 use orr_pack::volume::GridSampler;
@@ -129,13 +129,7 @@ fn foggy(
 fn fog_paths() -> MutexGuard<'static, Paths> {
     static PATHS: OnceLock<Mutex<Paths>> = OnceLock::new();
     PATHS
-        .get_or_init(|| {
-            Mutex::new(Paths::new(
-                fog_kernels(),
-                PathEntry::Fastest,
-                ViewLighting::default(),
-            ))
-        })
+        .get_or_init(|| Mutex::new(Paths::new(fog_kernels(), ViewLighting::default())))
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
 }
@@ -254,9 +248,6 @@ fn slices_map_distances_and_back() {
 /// renders through them as through the pipelines that may meet everything.
 #[test]
 fn specialized_pipelines_launch_the_paths_the_general_one_does_through_fog() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
     let fogs = RefCell::new(Vec::new());
     assert_gate(
         fog_kernels(),
@@ -701,11 +692,7 @@ fn sun_and_shade() -> (Spec, [Vec3; 2]) {
 /// inside their range and by its own shadow ray and the world cache beyond it.
 #[test]
 fn particles_in_shade_are_darker_than_in_the_sun() {
-    let paths = Paths::new(
-        &KernelSet::default(),
-        PathEntry::Fastest,
-        ViewLighting::default(),
-    );
+    let paths = Paths::new(&KernelSet::default(), ViewLighting::default());
     for near_range in [256.0, 2.0] {
         let (spec, points) = sun_and_shade();
         let mut bed = Bed::with(spec.clone());

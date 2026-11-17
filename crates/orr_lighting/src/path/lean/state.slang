@@ -279,7 +279,7 @@ public static const float PDF_LIT = -1.0;
 public static const uint NO_ENTRY = 0xffffffffu;
 // From HOT_DEPTH_SHIFT, the vertices the path has scattered at, HOT_DEPTH_MASK at most.
 public static const uint HOT_DEPTH_SHIFT = 8;
-public static const uint HOT_DEPTH_MASK = 0xff;
+[Host] public static const uint HOT_DEPTH_MASK = 0xff;
 // From HOT_DIMENSION_SHIFT, the sampler dimension the path's next draw takes.
 public static const uint HOT_DIMENSION_SHIFT = 19;
 static const uint HOT_BELOW_DIMENSION = (1u << HOT_DIMENSION_SHIFT) - 1;
@@ -403,12 +403,6 @@ public void store_hot(uint4* at, PathHot p)
     store_coherent(at + 1, uint4(oct_encode_snorm16(p.dir), oct_encode_snorm16(p.normal), as_halves(p.throughput.xy), as_halves(float2(p.throughput.z, p.run))));
     store_coherent(at + 2, uint4(as_halves(p.cone), asuint(p.shadow_light.z), 0, p.light));
     store_coherent(at + 3, uint4(asuint(p.radiance), asuint(p.pdf)));
-}
-
-public void store_shadow(uint4* at, PathHot p)
-{
-    store_coherent(at + 4, uint4(asuint(p.shadow_origin), asuint(p.shadow_light.x)));
-    store_coherent(at + 5, uint4(asuint(p.shadow_target), asuint(p.shadow_light.y)));
 }
 
 // Where the scene's paths may gather caustic photons, the light the lights other than the

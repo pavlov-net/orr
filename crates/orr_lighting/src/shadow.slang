@@ -638,16 +638,6 @@ public Hit stack_trace<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 ori
     return trace_closest(scene_traced(s), ray, MASK_SHADOW | MASK_DIELECTRIC, flags, a);
 }
 
-// Whether a plane stack's probe from `origin` along unit `dir` toward a directional light meets a
-// stack face first, and its unit shading normal.
-public bool stack_probe<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, uint flags, HitContext context, bool dispersion, out float3 normal)
-{
-    StackFace f;
-    bool face = stack_face(s, stack_trace<S>(s, v, origin, dir, positive_infinity(), flags, context), dispersion, f);
-    normal = f.normal;
-    return face;
-}
-
 // What reaches `origin`, offset from surface point `start` (`origin` itself in a medium), inside
 // the interiors of `inside`, from `t_max` along unit `dir`, by shadow rays in mode SHADOW_PATH
 // traced with ray flags `flags`: their product, with the linked medium's transmittance where

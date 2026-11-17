@@ -1,20 +1,18 @@
 //! Linked kernels through the path kernel, kept in one target because each target compiles
 //! its own linked path pipelines: linked coverage against the equivalent alpha texture, and a
 //! linked surface in a mirror, behind glass and at each bounce. A scene's data against its linked
-//! types. Linked surfaces and coverage, geometry kinds and rich materials through the pipeline
-//! path tracer against the staged loop.
+//! types. Linked surfaces and coverage, geometry kinds and rich materials in real time against
+//! the reference.
 
 use lighting_suite::bed::{
-    Accumulated, BARE_LEAF, Bed, FLOOR, GLASS_SLAB, Item, LAYERED_SPHERE, MIRROR, PANEL, Particle,
-    ParticleLook, Paths, RINGS_LEAF, SKINNED_EMITTER, SKY, SUN, Spec, StrandRow, WHITE_SPHERE,
-    assert_close, assert_pipeline_renders_as_staged, assert_within_noise, both, luminance,
-    mean_where, quad_scene, reference, render_paths, surface_mean,
+    Accumulated, BARE_LEAF, Bed, CONVERGES, FLOOR, GLASS_SLAB, Item, LAYERED_SPHERE, MIRROR, PANEL,
+    Particle, ParticleLook, Paths, RINGS_LEAF, SKINNED_EMITTER, SKY, SUN, Spec, StrandRow,
+    WHITE_SPHERE, assert_close, assert_converges, assert_within_noise, luminance, mean_where,
+    quad_scene, reference, render_paths, surface_mean,
 };
-use lighting_suite::{TestScene, assert_clean, device, linked, require};
+use lighting_suite::{TestScene, assert_clean, linked};
 use orr_gpu::{GpuPtr, KernelSet};
-use orr_lighting::{
-    EnvironmentMapGpu, Light, LightingDebugView, PathEntry, ReferenceSettings, ViewLighting,
-};
+use orr_lighting::{EnvironmentMapGpu, Light, LightingDebugView, ReferenceSettings, ViewLighting};
 use orr_math::{Affine3, Mat3, Vec3};
 use orr_scene::{EnvironmentData, RendererDesc, SceneDesc, SceneWriter};
 
@@ -41,7 +39,7 @@ fn linked_bed(spec: Spec) -> Bed {
 }
 
 fn linked_paths(settings: ViewLighting) -> Paths {
-    Paths::new(&linked::KERNELS, PathEntry::Compute, settings)
+    Paths::new(&linked::KERNELS, settings)
 }
 
 /// `Dome`, a linked environment that reads no record.
@@ -237,20 +235,15 @@ fn linked_coverage_casts_the_shadow_of_the_equivalent_alpha_texture() {
     assert_clean();
 }
 
-/// The pipeline path tracer renders as the staged loop does, under the sun and the sky: a
-/// surface of its own (`Context`, whose resolve the pipeline makes for its id) beside a floor
-/// and a coated, fuzzy, filmed sphere, the rings quad of linked coverage (its id's any-hit
-/// shaders) casting its shadow, a skinned emitter and a row of strands; then a producer entry's
-/// opaque quads with a back of their own. Each scene's frames of the pipeline at the staged loop's
-/// seed sit as close to the staged loop's as its frames at another seed do, and the two means
-/// agree over frames that alternate, as `the_pipeline_renders_opaque_scenes_as_the_staged_loop_does`
-/// compares them.
+/// Real-time paths converge to the reference under the sun and the sky through linked types,
+/// geometry kinds and rich materials: a surface of its own (`Context`, whose resolve the pipeline
+/// makes for its id) beside a floor and a coated, fuzzy, filmed sphere, the rings quad of linked
+/// coverage (its id's any-hit shaders) casting its shadow, a skinned emitter and a row of strands;
+/// then a producer entry's opaque quads with a back of their own.
 #[test]
-fn the_pipeline_renders_linked_types_geometry_kinds_and_rich_materials_as_the_staged_loop_does() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
-    let (staged, launched) = both(&linked::KERNELS, ViewLighting::default());
+fn real_time_paths_converge_through_linked_types_geometry_kinds_and_rich_materials() {
+    let real_time = linked_paths(ViewLighting::default());
+    let truth_paths = linked_paths(reference(12));
     let lit = |copies: Vec<Item>| Spec {
         copies: [vec![at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)], copies].concat(),
         lights: vec![Light::Directional(SUN)],
@@ -316,7 +309,8 @@ fn the_pipeline_renders_linked_types_geometry_kinds_and_rich_materials_as_the_st
         // At a pre-exposure of 1 the sunlit ground passes the HDR ceiling, which would clip the
         // samples that draw the sun.
         bed.set_pre_exposure(1.0 / 64.0);
-        assert_pipeline_renders_as_staged(what, bed, &staged, &launched);
+        let truth = render_paths(bed, &truth_paths, 1024, 7);
+        assert_converges(what, bed, &real_time, &truth, CONVERGES);
     }
     assert_clean();
 }

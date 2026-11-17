@@ -1,4 +1,4 @@
-//! The shader bodies of the ray tracing pipeline path tracer as compute stand-ins
+//! The shader bodies of the path tracer's ray tracing pipeline as compute stand-ins
 //! (`path/standins.slang`). A launch of a ray tracing pipeline runs every thread at the register
 //! count of its largest linked shader, capped at 128, and the driver reports nothing of those
 //! pipelines, so each shader's body, the one the pipeline ships, is compiled as a compute kernel
@@ -10,7 +10,7 @@ use std::time::Instant;
 use orr_scene::orr_gpu::{CodeStatistics, Device, ShaderStage, SpecData};
 
 use crate::shaders::path::standins;
-use crate::staged::SPEC_ENTRIES;
+use crate::specialize::SPEC_ENTRIES;
 use crate::{Error, KernelSet, module};
 
 /// The kind of shader a body runs as, which sets its budget.

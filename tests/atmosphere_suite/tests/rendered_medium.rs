@@ -19,7 +19,7 @@ use orr_atmosphere::reference::{
 };
 use orr_atmosphere::spectrum::SOLAR_ILLUMINANCE;
 use orr_atmosphere::{Atmosphere, AtmosphereState};
-use orr_lighting::{Light, LightId, LightingDebugView, PathEntry, ViewLighting};
+use orr_lighting::{Light, LightId, LightingDebugView, ViewLighting};
 use orr_math::{DVec3, Mat3, Quat, Vec2, Vec3};
 use orr_scene::RendererDesc;
 
@@ -119,8 +119,7 @@ fn check(
     want: &dyn Fn(usize, DVec3, DVec3) -> [f64; 3],
 ) {
     let mut paths = PATHS.lock().unwrap();
-    let paths = paths
-        .get_or_insert_with(|| Paths::new(&KERNELS, PathEntry::Fastest, ViewLighting::default()));
+    let paths = paths.get_or_insert_with(|| Paths::new(&KERNELS, ViewLighting::default()));
     paths.settings = settings;
     for (elevation, azimuth) in LIGHTS {
         let sun = dir(elevation, azimuth);

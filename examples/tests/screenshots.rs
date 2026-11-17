@@ -1,8 +1,8 @@
 //! Runs each example headless and compares its last frame with its reference in
 //! `references/`; `ORR_BLESS=1` rewrites the references. The examples whose own kernels shade
-//! a raster image compare by FLIP, as their images repeat exactly. The path-traced ones,
-//! through either path tracer, compare an average of their frames by block means with the
-//! converged render of their `--reference` mode, which is what `ORR_BLESS=1` writes for them.
+//! a raster image compare by FLIP, as their images repeat exactly. The path-traced ones compare
+//! an average of their frames by block means with the converged render of their `--reference`
+//! mode, which is what `ORR_BLESS=1` writes for them.
 //! hdr-calibration shows what a display does with its patterns and has no headless run. The
 //! dlss example's super resolution is compared with the same view rendered at the output size
 //! instead.
@@ -46,7 +46,7 @@ use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     Exposure, FrameDesc, Glare, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens,
-    LensDistortion, LightingDebugView, LitView, OutputDebug, PackSource, PathEntry, Projection,
+    LensDistortion, LightingDebugView, LitView, OutputDebug, PackSource, Projection,
     Reconstruction, ReconstructionMode, ReferenceSettings, Renderer, RendererDesc, SceneDesc,
     SceneId, Screenshot, ScreenshotRequest, TextureFilter, ThinLens, TransformGroupDesc,
     TransformGroupId, TransparencyPass, UpscaleMode, UpscaleQuality, ViewHistoryId, ViewHooks,
@@ -189,18 +189,6 @@ fn sky_matches_its_converged_reference() {
 }
 
 #[test]
-fn sky_through_the_pipeline_matches_its_converged_reference() {
-    let _serial = serial();
-    compare_converged(
-        "sky",
-        SKY,
-        || sky::run(&headless(&["--pipeline-paths"])),
-        None,
-    );
-    assert_clean();
-}
-
-#[test]
 fn viewer_matches_its_converged_reference() {
     let _serial = serial();
     compare_converged(
@@ -208,18 +196,6 @@ fn viewer_matches_its_converged_reference() {
         VIEWER,
         || viewer::run(&headless(&[])),
         Some(&|| viewer::run(&reference(&[]))),
-    );
-    assert_clean();
-}
-
-#[test]
-fn viewer_through_the_pipeline_matches_its_converged_reference() {
-    let _serial = serial();
-    compare_converged(
-        "viewer",
-        VIEWER,
-        || viewer::run(&headless(&["--pipeline-paths"])),
-        None,
     );
     assert_clean();
 }
@@ -242,19 +218,6 @@ fn dielectrics_matches_its_converged_reference() {
         DIELECTRICS,
         || dielectrics::run(&headless(&[])),
         Some(&|| dielectrics::run(&reference(&[]))),
-    );
-    assert_clean();
-}
-
-/// The ray tracing pipeline's paths render the same water, glass, amber and jade.
-#[test]
-fn dielectrics_through_the_pipeline_matches_its_converged_reference() {
-    let _serial = serial();
-    compare_converged(
-        "dielectrics",
-        DIELECTRICS,
-        || dielectrics::run(&headless(&["--pipeline-paths"])),
-        None,
     );
     assert_clean();
 }
@@ -971,10 +934,7 @@ impl Lamp {
 
     fn with_material(material: Material) -> Self {
         let gpu = device();
-        let desc = RendererDesc {
-            path_entry: PathEntry::Compute,
-            ..RendererDesc::default()
-        };
+        let desc = RendererDesc::default();
         let mut renderer = Renderer::new(gpu, desc).expect("renderer");
         let workers = Workers::new(renderer.loading(), 1);
         let mut mesh = MeshBuilder::default();
@@ -1249,12 +1209,13 @@ fn render_view_blurs_a_see_through_lamp_by_its_coverage() {
         stops: 0.0,
         debug_view: LightingDebugView::None,
     };
-    // Presence is stochastic per pixel, so the images are averaged over runs.
+    // Presence is stochastic per pixel, so the images are averaged over runs: over 8 a blurred
+    // image's energy came out 11% from the sharp one's, over 32 within 5%.
     let mut average = |settings: LampSettings| {
         let mut sum = vec![0.0; 4 * (extent[0] * extent[1]) as usize];
-        for _ in 0..8 {
+        for _ in 0..32 {
             for (s, v) in sum.iter_mut().zip(lamp.run(extent, frames, settings)) {
-                *s += v / 8.0;
+                *s += v / 32.0;
             }
         }
         Spread::of(&sum, extent[0])

@@ -112,10 +112,13 @@ fn upload(device: &Device) -> Result<Vec<Texture>, Error> {
 #[cfg(test)]
 mod tests {
     use super::OPENPBR_LUT_SLOT;
-    use crate::shaders::path::staged::primary;
+    use crate::shaders::path::lean_paths;
 
     #[test]
     fn kernels_default_to_the_reserved_table_slot() {
-        assert_eq!(primary::Spec::default().openpbr_lut_slot, OPENPBR_LUT_SLOT);
+        assert_eq!(
+            lean_paths::Spec::default().openpbr_lut_slot,
+            OPENPBR_LUT_SLOT
+        );
     }
 }

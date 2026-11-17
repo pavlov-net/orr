@@ -17,7 +17,7 @@ use crate::shaders::types::{
     LayerGuide, MediaApplyRoot, ParticleLighting, RayJob, RayList, ShadowFull, ShadowResult,
     ShadowTraceRoot,
 };
-use crate::staged::MAY_INTERIORS;
+use crate::specialize::MAY_INTERIORS;
 use crate::support::{FROXEL_LIGHT, Masked, MaskedFrame};
 use crate::view::{LightingDebugView, LightingView, NO_MATERIAL, ViewLighting, ViewPass};
 use crate::{CompilePipeline, Error, KernelSet, SceneLighting, pipeline};

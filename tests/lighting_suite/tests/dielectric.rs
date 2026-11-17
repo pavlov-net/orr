@@ -3,8 +3,8 @@
 //! medium, presence layers, a camera inside water, layer guides under camera rotation,
 //! the frosted-glass term of rough glass, dispersion: a white line through a prism against a
 //! CPU model, a dispersive furnace, and paths without dispersive hits, the layer tiles
-//! against tracing every tile, the raygen against the compute entry, an emissive particle seen
-//! through glass, and each pixel's front layer.
+//! against tracing every tile, the dielectric layer view, an emissive particle seen through
+//! glass, and each pixel's front layer.
 
 use lighting_suite::bed::{
     Accumulated, Analytic, BLACK_SPHERE, Bed, CLOUD_SPHERE, Capture, DEPTH_SPLIT_SLAB,
@@ -13,17 +13,16 @@ use lighting_suite::bed::{
     MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, MIXED_SLAB, NEAR, OverlayFrontLayer, PRESENCE_VEIL,
     PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Particle, ParticleLook,
     Paths, ROUGH_SLAB, SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB,
-    TWO_SIDED_SLAB, WATER_BOX, WHITE_SPHERE, assert_close, assert_pipeline_within_noise, both,
-    fresnel, image_mean, moved_entry, pixel_of, prism_corners, reference, surface_mean,
-    water_transmission,
+    TWO_SIDED_SLAB, WATER_BOX, WHITE_SPHERE, assert_close, fresnel, pixel_of, prism_corners,
+    reference, surface_mean, water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
-use lighting_suite::welch::{assert_mean, assert_same_mean};
-use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
+use lighting_suite::welch::assert_mean;
+use lighting_suite::{assert_clean, pipeline, readback, render, run, upload};
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
-    DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry, ReferenceSettings,
-    ThinLens, ViewLighting,
+    DirectionalLight, DiscProfile, Light, LightingDebugView, ReferenceSettings, ThinLens,
+    ViewLighting,
 };
 use orr_math::{DMat3, DVec3, Mat3, Vec2, Vec3};
 use orr_scene::Opacity;
@@ -150,7 +149,7 @@ fn the_front_layer_is_the_nearest_overlay_or_see_through_layer() {
 }
 
 fn paths(settings: ViewLighting) -> Paths {
-    Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
+    Paths::new(&KernelSet::default(), settings)
 }
 
 fn render_paths(bed: &mut Bed, paths: &Paths, frames: u32) -> Accumulated {
@@ -775,13 +774,9 @@ fn rough_glass_adds_its_blur_into_the_depth_of_field_guide() {
 
 /// A frosted pixel's background is its surface's light alone, which the layer chain's
 /// transmittance weighs: under rough glass over an emitter's edge in absorbing water, the
-/// frosted-glass term dims by the water's transmittance down to the surface once, on both path
-/// tracers.
+/// frosted-glass term dims by the water's transmittance down to the surface once.
 #[test]
 fn the_frosted_glass_term_takes_the_water_behind_the_glass() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
     const FILL: f32 = 0.25;
     let [w, h] = EXTENT;
     // The water box is 4 m tall, its surface `depth` m above the floor, the glass in air above it.
@@ -796,10 +791,8 @@ fn the_frosted_glass_term_takes_the_water_behind_the_glass() {
         }
         Bed::with(from_above(copies, Vec::new(), 5.0))
     };
-    let (mut staged, mut launched) = both(&KernelSet::default(), ViewLighting::default());
-    for p in [&mut staged, &mut launched] {
-        p.frost_guide = Some(FrostGuide::new(FILL));
-    }
+    let mut p = paths(ViewLighting::default());
+    p.frost_guide = Some(FrostGuide::new(FILL));
     // The term's step across the edge, its mean over 8 columns left of it (dark) less over 8
     // right of it (lit), over seeds.
     let step = |bed: &mut Bed, p: &Paths| {
@@ -826,78 +819,17 @@ fn the_frosted_glass_term_takes_the_water_behind_the_glass() {
     // The background is the surface's light, which the chain's transmittance weighs once: the
     // water's surface 0.49 m over the emitter passes 1 - F of it.
     let surface = 1.0 - fresnel(1.33, 1.0);
-    for (what, p) in [("staged", &staged), ("pipeline", &launched)] {
-        let [dry, shallow, deep] =
-            [None, Some(0.5), Some(1.5)].map(|depth| step(&mut pool(depth), p));
-        let pools = [
-            (shallow / dry, surface * through(0.49), "shallow"),
-            (deep / shallow, through(1.0), "deeper"),
-        ];
-        for (got, want, of) in pools {
-            assert!(
-                (got / want - 1.0).abs() < 0.05,
-                "{what}: the {of} pool scales the term by {got}, not by {want}"
-            );
-        }
+    let [dry, shallow, deep] = [None, Some(0.5), Some(1.5)].map(|depth| step(&mut pool(depth), &p));
+    let pools = [
+        (shallow / dry, surface * through(0.49), "shallow"),
+        (deep / shallow, through(1.0), "deeper"),
+    ];
+    for (got, want, of) in pools {
+        assert!(
+            (got / want - 1.0).abs() < 0.05,
+            "the {of} pool scales the term by {got}, not by {want}"
+        );
     }
-    assert_clean();
-}
-
-/// The pipeline's frosted pixels give the frosted-glass term the background luminance the
-/// staged loop's give it: under rough glass over an emitter's edge, the term's mean on the lit
-/// and on the dark side agrees over seeds.
-#[test]
-fn the_pipeline_blurs_the_background_the_staged_loop_does_under_rough_glass() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
-    const FILL: f32 = 0.25;
-    let [w, h] = EXTENT;
-    let mut bed = Bed::with(from_above(
-        vec![
-            at(SMOOTH_FLOOR, Vec3::ZERO),
-            at(LIGHT_FLOOR, Vec3::new(1.0, 0.01, 0.0)),
-            at(ROUGH_SLAB, Vec3::new(0.0, 0.5, 0.0)),
-        ],
-        Vec::new(),
-        5.0,
-    ));
-    let (mut staged, mut launched) = both(&KernelSet::default(), ViewLighting::default());
-    for p in [&mut staged, &mut launched] {
-        p.frost_guide = Some(FrostGuide::new(FILL));
-    }
-    // The term's mean over 8 columns left of the edge (dark) and right of it (lit).
-    let sides = |bed: &mut Bed, p: &Paths, seed: u32| {
-        bed.accumulate(1, seed, &mut |list, f| p.record(list, f));
-        let guide = p.frost_guide.as_ref().unwrap().read();
-        let band = |x0: u32| {
-            let rows = h / 2 - 8..h / 2 + 8;
-            let sum: f64 = rows
-                .clone()
-                .flat_map(|y| (x0..x0 + 8).map(move |x| (y * w + x) as usize))
-                .map(|i| f64::from(guide[i] - FILL))
-                .sum();
-            sum / (rows.len() * 8) as f64
-        };
-        [band(w / 2 - 8), band(w / 2)]
-    };
-    let (mut of_staged, mut of_launched) = ([Vec::new(), Vec::new()], [Vec::new(), Vec::new()]);
-    for seed in 1..=16 {
-        for (p, out) in [(&staged, &mut of_staged), (&launched, &mut of_launched)] {
-            let [dark, lit] = sides(&mut bed, p, seed);
-            out[0].push(dark);
-            out[1].push(lit);
-        }
-    }
-    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-    assert!(
-        mean(&of_staged[0]) > 0.0 && mean(&of_staged[1]) < 0.0,
-        "the staged term is {} dark and {} lit",
-        mean(&of_staged[0]),
-        mean(&of_staged[1])
-    );
-    assert_same_mean("the dark side's term", &of_launched[0], &of_staged[0]);
-    assert_same_mean("the lit side's term", &of_launched[1], &of_staged[1]);
     assert_clean();
 }
 
@@ -1175,10 +1107,8 @@ fn a_white_line_seen_through_a_prism_splits_by_the_abbe_number() {
     assert_clean();
 }
 
-/// How far apart in half-float steps an entry's builds of the path loop with and without layer
-/// code may round a pixel's radiance. At 2048 x 1040 about 1 pixel in 80,000 lands a step apart
-/// through the raygen entry, fewer through the compute entry, so this extent sees one in some
-/// runs.
+/// How far apart in half-float steps two builds of the path pipeline, with and without layer
+/// code, may round a pixel's radiance: now and then a pixel lands a step apart.
 const BUILD_STEPS: u16 = 1;
 
 /// The layer tile marks one frame of `spec` rasters, the word marking every tile last.
@@ -1276,141 +1206,99 @@ fn layer_tiles_trace_what_every_tile_traces() {
             16.0,
         ),
     ];
-    let mut entries = vec![PathEntry::Compute];
-    if require(
-        device().caps().ray_dispatch,
-        "the raygen entry needs ray dispatch",
-    ) {
-        entries.push(PathEntry::RayDispatch);
-    }
-    // Under `ORR_TEST_PIPELINE_PATHS` both run the pipeline.
-    entries.dedup_by_key(|e| moved_entry(*e));
-    for entry in entries {
-        let paths = |every_tile| {
-            let lighting = ViewLighting {
-                reference: Some(ReferenceSettings {
-                    photons: 0,
-                    ..ReferenceSettings::default()
-                }),
-                ..reference(2)
-            };
-            let mut p = Paths::new(&KernelSet::default(), entry, lighting);
-            p.frost_guide = Some(FrostGuide::new(0.25));
-            p.every_tile = every_tile;
-            // Pipelines that hold more than the scene round differently, and a view takes
-            // them while its own compile: both views wait for the scene's.
-            p.specialize = true;
-            p
+    let paths = |every_tile| {
+        let lighting = ViewLighting {
+            reference: Some(ReferenceSettings {
+                photons: 0,
+                ..ReferenceSettings::default()
+            }),
+            ..reference(2)
         };
-        let (tiled, every) = (paths(false), paths(true));
-        for (s, spec) in scenes.iter().enumerate() {
-            let what = format!("{entry:?} scene {s}");
-            let marks = readback::<u32>(TILES + 1, "layer tiles");
-            let mut bed = Bed::with(spec.clone());
-            let mut spare = SpareView::new();
-            let (a, b) = (Capture::new(bed.view()), Capture::new(&spare.view));
-            let done = Stages::COMPUTE | Stages::RAY | Stages::TRANSFER;
-            bed.accumulate(1, 1, &mut |list, f| {
-                list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
-                list.copy(
-                    marks.gpu().cast(),
-                    f.view.targets.layer_tiles.cast(),
-                    4 * (TILES + 1),
-                );
-                tiled.record(list, f);
-                every.record_on(list, f, &mut spare.view);
-                list.barrier(done, Stages::COMPUTE | Stages::TRANSFER, Hazards::empty());
-                a.record(list, f.target);
-                b.record(list, &spare.view);
-            });
-            let tiles = &marks.as_slice().unwrap()[..TILES as usize];
-            let marked = tiles.iter().filter(|&&m| m != 0).count();
-            assert!(
-                marked > 0 && marked < TILES as usize,
-                "{what}: layers marked {marked} of {TILES} tiles"
+        let mut p = Paths::new(&KernelSet::default(), lighting);
+        p.frost_guide = Some(FrostGuide::new(0.25));
+        p.every_tile = every_tile;
+        // Pipelines that hold more than the scene round differently, and a view takes
+        // them while its own compile: both views wait for the scene's.
+        p.specialize = true;
+        p
+    };
+    let (tiled, every) = (paths(false), paths(true));
+    for (s, spec) in scenes.iter().enumerate() {
+        let what = format!("scene {s}");
+        let marks = readback::<u32>(TILES + 1, "layer tiles");
+        let mut bed = Bed::with(spec.clone());
+        let mut spare = SpareView::new();
+        let (a, b) = (Capture::new(bed.view()), Capture::new(&spare.view));
+        let done = Stages::COMPUTE | Stages::RAY | Stages::TRANSFER;
+        bed.accumulate(1, 1, &mut |list, f| {
+            list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
+            list.copy(
+                marks.gpu().cast(),
+                f.view.targets.layer_tiles.cast(),
+                4 * (TILES + 1),
             );
-            let apart = |(x, y): (&[u16; 4], &[u16; 4])| -> u16 {
-                x.iter().zip(y).map(|(p, q)| p.abs_diff(*q)).max().unwrap()
-            };
-            let [columns, rows] = EXTENT.map(|e| e.div_ceil(8) as i32);
-            let beside = |x: i32, y: i32, dx: i32, dy: i32| {
-                let (u, v) = (x + dx, y + dy);
-                (0..columns).contains(&u)
-                    && (0..rows).contains(&v)
-                    && tiles[(v * columns + u) as usize] != 0
-            };
-            let allowed = |pixel: usize| {
-                let x = (pixel as u32 % EXTENT[0] / 8) as i32;
-                let y = (pixel as u32 / EXTENT[0] / 8) as i32;
-                let traced = (-1..=1).any(|dy| (-1..=1).any(|dx| beside(x, y, dx, dy)));
-                if traced { 0 } else { BUILD_STEPS }
-            };
-            let steps = || a.radiance().iter().zip(b.radiance()).map(apart);
-            let differ = steps()
-                .enumerate()
-                .filter(|&(pixel, s)| s > allowed(pixel))
-                .count();
-            let largest = steps().max().unwrap();
-            assert_eq!(
-                differ, 0,
-                "{what}: radiance differs on {differ} pixels, by up to {largest} half-float steps"
-            );
-            let frost = |p: &Paths| p.frost_guide.as_ref().unwrap().read();
-            let (x, y) = (frost(&tiled), frost(&every));
-            let frost_apart = x
-                .iter()
-                .zip(&y)
-                .map(|(p, q)| (p - q).abs() / (1.0 + p.abs()))
-                .fold(0.0f32, f32::max);
-            assert!(
-                frost_apart <= 1e-2,
-                "{what}: frosted-glass term differs by {frost_apart}"
-            );
-            let (ga, gb) = (a.guides(), b.guides());
-            for (name, x, y) in [
-                ("diffuse albedo", &ga.diffuse_albedo, &gb.diffuse_albedo),
-                ("specular albedo", &ga.specular_albedo, &gb.specular_albedo),
-                ("normal", &ga.normal_roughness, &gb.normal_roughness),
-                ("specular motion", &ga.specular_motion, &gb.specular_motion),
-                ("depth", &ga.depth, &gb.depth),
-                ("motion", &ga.motion, &gb.motion),
-            ] {
-                assert!(x == y, "{what}: {name} guide differs");
-            }
+            tiled.record(list, f);
+            every.record_on(list, f, &mut spare.view);
+            list.barrier(done, Stages::COMPUTE | Stages::TRANSFER, Hazards::empty());
+            a.record(list, f.target);
+            b.record(list, &spare.view);
+        });
+        let tiles = &marks.as_slice().unwrap()[..TILES as usize];
+        let marked = tiles.iter().filter(|&&m| m != 0).count();
+        assert!(
+            marked > 0 && marked < TILES as usize,
+            "{what}: layers marked {marked} of {TILES} tiles"
+        );
+        let apart = |(x, y): (&[u16; 4], &[u16; 4])| -> u16 {
+            x.iter().zip(y).map(|(p, q)| p.abs_diff(*q)).max().unwrap()
+        };
+        let [columns, rows] = EXTENT.map(|e| e.div_ceil(8) as i32);
+        let beside = |x: i32, y: i32, dx: i32, dy: i32| {
+            let (u, v) = (x + dx, y + dy);
+            (0..columns).contains(&u)
+                && (0..rows).contains(&v)
+                && tiles[(v * columns + u) as usize] != 0
+        };
+        let allowed = |pixel: usize| {
+            let x = (pixel as u32 % EXTENT[0] / 8) as i32;
+            let y = (pixel as u32 / EXTENT[0] / 8) as i32;
+            let traced = (-1..=1).any(|dy| (-1..=1).any(|dx| beside(x, y, dx, dy)));
+            if traced { 0 } else { BUILD_STEPS }
+        };
+        let steps = || a.radiance().iter().zip(b.radiance()).map(apart);
+        let differ = steps()
+            .enumerate()
+            .filter(|&(pixel, s)| s > allowed(pixel))
+            .count();
+        let largest = steps().max().unwrap();
+        assert_eq!(
+            differ, 0,
+            "{what}: radiance differs on {differ} pixels, by up to {largest} half-float steps"
+        );
+        let frost = |p: &Paths| p.frost_guide.as_ref().unwrap().read();
+        let (x, y) = (frost(&tiled), frost(&every));
+        let frost_apart = x
+            .iter()
+            .zip(&y)
+            .map(|(p, q)| (p - q).abs() / (1.0 + p.abs()))
+            .fold(0.0f32, f32::max);
+        assert!(
+            frost_apart <= 1e-2,
+            "{what}: frosted-glass term differs by {frost_apart}"
+        );
+        let (ga, gb) = (a.guides(), b.guides());
+        for (name, x, y) in [
+            ("diffuse albedo", &ga.diffuse_albedo, &gb.diffuse_albedo),
+            ("specular albedo", &ga.specular_albedo, &gb.specular_albedo),
+            ("normal", &ga.normal_roughness, &gb.normal_roughness),
+            ("specular motion", &ga.specular_motion, &gb.specular_motion),
+            ("depth", &ga.depth, &gb.depth),
+            ("motion", &ga.motion, &gb.motion),
+        ] {
+            assert!(x == y, "{what}: {name} guide differs");
         }
     }
-    assert_clean();
-}
 
-#[test]
-fn raygen_and_compute_entries_trace_the_same_light() {
-    if !require(device().caps().ray_dispatch, "no ray-dispatch pipelines") {
-        return;
-    }
-    let mut bed = Bed::new(Analytic::SunAndGround);
-    bed.set_pre_exposure(1.0 / 64.0);
-    let settings = ViewLighting::default();
-    let compute = Paths::exactly(&KernelSet::default(), PathEntry::Compute, settings);
-    let rays = Paths::exactly(&KernelSet::default(), PathEntry::RayDispatch, settings);
-    // Every frame redraws the light tiles, so runs differ by their noise; the raygen run must
-    // sit as close to a compute run as another compute run does.
-    let a = render_paths(&mut bed, &compute, 32);
-    let again = render_paths(&mut bed, &compute, 32);
-    let b = render_paths(&mut bed, &rays, 32);
-    // The world cache outlives a camera cut and settles over frames of one seed, so the two
-    // entries' frames alternate and see it alike.
-    let (mut of_compute, mut of_rays) = (Vec::new(), Vec::new());
-    for _ in 0..24 {
-        of_compute.push(image_mean(&render_paths(&mut bed, &compute, 1))[1]);
-        of_rays.push(image_mean(&render_paths(&mut bed, &rays, 1))[1]);
-    }
-    assert_same_mean("raygen against compute", &of_rays, &of_compute);
-    let noise = again.flip(&a, 1.0 / 500.0);
-    let e = b.flip(&a, 1.0 / 500.0);
-    assert!(
-        e.mean < 1.25 * noise.mean,
-        "raygen against compute: {e:?}, compute against itself: {noise:?}"
-    );
     assert_clean();
 }
 
@@ -1449,14 +1337,13 @@ fn particles_behind_glass_show_through_it() {
     assert_clean();
 }
 
-/// The DielectricLayer view through the pipeline shows what the staged loop's does: on the pixels
-/// whose first vertex is a tinted slab, the share of its albedo it reflects in red and transmits in
-/// green, and the layers the path met over the dielectric depth in blue.
+/// The DielectricLayer view shows, on the pixels whose first vertex is a layer, the share of its
+/// albedo the layer reflects in red and transmits in green, and the layers the path met over the
+/// dielectric depth in blue: the tinted slab seen from above fills the view, whose center pixels
+/// see its top face head on, reflecting the share Fresnel's law gives at normal incidence, and
+/// whose paths meet its top face and its bottom one on their way to the floor.
 #[test]
-fn the_pipeline_shows_the_dielectric_layer_view_the_staged_loop_does() {
-    if !require(device().caps().ray_dispatch, "no ray tracing pipelines") {
-        return;
-    }
+fn the_dielectric_layer_view_shows_a_slab_s_shares_and_layers() {
     let mut bed = Bed::with(from_above(
         vec![
             at(SMOOTH_FLOOR, Vec3::ZERO),
@@ -1469,24 +1356,29 @@ fn the_pipeline_shows_the_dielectric_layer_view_the_staged_loop_does() {
         debug_view: LightingDebugView::DielectricLayer,
         ..ViewLighting::default()
     };
-    let (staged, launched) = both(&KernelSet::default(), settings);
+    let image = render_paths(&mut bed, &paths(settings), 4);
+    let depth = f64::from(settings.dielectric_depth);
     // Pixels on a layer: their shares sum to 1.
-    let layered = |a: &Accumulated| {
-        a.mean
-            .iter()
-            .filter(|p| (p[0] + p[1] - 1.0).abs() < 1e-3)
-            .count()
-    };
-    let (of_staged, of_launched) = (
-        layered(&render_paths(&mut bed, &staged, 4)),
-        layered(&render_paths(&mut bed, &launched, 4)),
-    );
-    let [w, h] = EXTENT;
-    let pixels = (w * h) as usize;
+    let layered = image
+        .mean
+        .iter()
+        .filter(|p| (p[0] + p[1] - 1.0).abs() < 1e-3)
+        .count();
     assert!(
-        of_staged > pixels / 4 && of_staged.abs_diff(of_launched) <= pixels / 100,
-        "{of_launched} layered pixels through the pipeline, {of_staged} through the staged loop"
+        layered >= image.mean.len() * 9 / 10,
+        "{layered} of {} pixels on the slab",
+        image.mean.len()
     );
-    assert_pipeline_within_noise("the dielectric layer view", &mut bed, &staged, &launched);
+    let [red, _, blue] = center(&image, 4);
+    let reflected = fresnel(1.5, 1.0);
+    assert!(
+        (red - reflected).abs() < 0.01,
+        "the slab's center reflects {red} of its albedo, not {reflected}"
+    );
+    assert!(
+        blue >= 2.0 / depth,
+        "the center's paths meet {} layers",
+        blue * depth
+    );
     assert_clean();
 }
