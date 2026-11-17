@@ -422,7 +422,7 @@ public struct SkinStateGpu
     public uint first;             // its first skinning work item
     public uint job;               // its BLAS build record
     public uint previous;          // 1: last frame's palette is written, which its motion takes
-    public uint _pad;
+    public uint bucket;            // the distance bucket its skinning was admitted by (`skin.slang`)
 }
 
 // A model made resident from a mounted pack: its mesh, the material of each section and its

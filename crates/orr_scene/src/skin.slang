@@ -1,12 +1,14 @@
 // A scene's skinned copies for one frame, after scene compute. `begin` clears the frame's
-// counters; `select` takes each copy's cut by its distance from the focus (15% hysteresis),
-// lists the clusters of the cut its section mask shows as work items and writes the
-// cluster BLAS record over their CLAS; `args` sizes `skin`, which skins one cluster per
-// workgroup with this frame's and last frame's palettes (positions, previous positions,
-// normals, tangents, the cluster's box and the copy's bounds; an edit's copies take last frame's
-// rest positions for its previous positions) and writes the instantiation
-// of its cluster template; after the builds `finish` keeps each copy's BLAS. A copy
-// skins its clusters whether or not a view shows it; one inside `rt_range` is traced.
+// counters; `select` takes each copy's cut by its distance from the focus (15% hysteresis) and
+// asks for the clusters of the cut its section mask shows, in the copy's distance bucket;
+// `cutoff` finds the nearest bucket whose asks no longer fit the frame's room, and `admit`
+// lists the clusters of every copy nearer than that as work items, and of the cutoff bucket's
+// as they fit, and writes the cluster BLAS record over their CLAS; `args` sizes `skin`, which
+// skins one cluster per workgroup with this frame's and last frame's palettes (positions,
+// previous positions, normals, tangents, the cluster's box and the copy's bounds; an edit's
+// copies take last frame's rest positions for its previous positions) and writes the
+// instantiation of its cluster template; after the builds `finish` keeps each copy's BLAS. A
+// copy skins its clusters whether or not a view shows it; one inside `rt_range` is traced.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.atomic;
@@ -24,7 +26,16 @@ public static const uint SKIN_JOBS = 1;      // BLAS records written
 public static const uint SKIN_REFUSED = 2;   // copies refused: their cut found no room
 public static const uint SKIN_TAKEN = 3;     // the end of the last work items handed out
 public static const uint SKIN_ARGS = 4;      // x, y, z of `skin`
-public static const uint SKIN_COUNTERS = 8;
+public static const uint SKIN_ASKED = 7;     // clusters the copies asked for
+public static const uint SKIN_CUTOFF = 8;    // the nearest distance bucket whose asks do not all fit
+public static const uint SKIN_BELOW = 9;     // clusters the buckets nearer than it asked for
+public static const uint SKIN_EDGE = 10;     // the end of the cutoff bucket's work items handed out
+public static const uint SKIN_COUNTERS = 12;
+
+// Distance buckets admission takes nearest first, a quarter octave of 1 m + the copy's distance
+// from the focus each.
+public static const uint SKIN_BUCKETS = 64;
+static const float SKIN_BUCKETS_PER_OCTAVE = 4.0;
 
 // The frame's skinning memory.
 public struct SkinFrameGpu
@@ -34,6 +45,7 @@ public struct SkinFrameGpu
     public uint64_t* clas;          // per work item: its instantiated CLAS
     public uint64_t* blas;          // per job: the built BLAS
     public uint* counters;          // SKIN_*
+    public uint* buckets;           // SKIN_BUCKETS: clusters the copies of each asked for
     public uint work_capacity;
     public uint traced;             // 1: the device builds cluster acceleration structures
 }
@@ -53,10 +65,12 @@ ORR_ROOT(SkinRoot);
 static const float SKIN_HYSTERESIS = 1.15;
 
 [shader("compute")]
-[numthreads(SKIN_COUNTERS, 1, 1)]
+[numthreads(SKIN_BUCKETS, 1, 1)]
 void begin(uint t: SV_GroupThreadID)
 {
-    root.frame.counters[t] = 0;
+    if (t < SKIN_COUNTERS)
+        root.frame.counters[t] = 0;
+    root.frame.buckets[t] = 0;
 }
 
 // `error` (m, mesh space) at `distance`, in pixels at the focus.
@@ -76,7 +90,16 @@ uint coarsest(SkinMeshGpu* m, float scale, float distance, float limit)
     return 0;
 }
 
-// One thread per skinned copy.
+// Whether a copy of record `inst` and mesh `mesh` skins mesh cluster `c`: its page is resident
+// and its section shown.
+bool shows_cluster(SceneRoot* s, InstanceGpu inst, MeshGpu* mesh, uint c)
+{
+    uint page = cluster_page(mesh, c);
+    uint8_t* data = (uint8_t*)mesh_page(s, mesh, page);
+    return data != nullptr && !section_hidden(inst, load_cluster(data, c - mesh.page_clusters[page]).section);
+}
+
+// One thread per skinned copy: its cut and what it asks for.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void select(uint3 id: SV_DispatchThreadID)
@@ -129,49 +152,97 @@ void select(uint3 id: SV_DispatchThreadID)
         }
     }
 
-    // The clusters of the cut its section mask shows.
-    uint first = sm.cut_first[cut];
-    uint end = sm.cut_first[cut + 1];
     uint n = 0;
-    for (uint i = first; i < end; i++)
-    {
-        uint c = sm.cut_clusters[i];
-        uint page = cluster_page(mesh, c);
-        uint8_t* data = (uint8_t*)mesh_page(s, mesh, page);
-        if (data != nullptr && !section_hidden(inst, load_cluster(data, c - mesh.page_clusters[page]).section))
-            n++;
-    }
+    for (uint i = sm.cut_first[cut]; i < sm.cut_first[cut + 1]; i++)
+        n += shows_cluster(s, inst, mesh, sm.cut_clusters[i]) ? 1 : 0;
     if (n == 0)
         return;
-    uint at;
-    InterlockedAdd(f.counters[SKIN_WORK], n, at);
-    if (at + n > f.work_capacity)
+    uint bucket = min(uint(SKIN_BUCKETS_PER_OCTAVE * log2(1.0 + distance)), SKIN_BUCKETS - 1);
+    InterlockedAdd(f.buckets[bucket], n);
+    InterlockedAdd(f.counters[SKIN_ASKED], n);
+    float range = instance_rt_range(inst) * ((s.slot_state[k.slot].rt_flags & RT_IN_RANGE) != 0 ? SKIN_HYSTERESIS : 1.0);
+    bool traced = f.traced != 0 && (inst.flags & INSTANCE_RAY) != 0 && (!focus || distance <= range);
+    // What `admit` takes: the cut, its clusters, their bucket and whether the copy is traced.
+    st.cut = cut;
+    st.clusters = n;
+    st.bucket = bucket;
+    st.job = traced ? 0 : 0xffffffff;
+}
+
+// The nearest distance bucket whose copies' asks do not all fit the frame's room after the
+// buckets nearer than it, and the clusters those asked for, which they all take.
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void cutoff(uint3 id: SV_DispatchThreadID)
+{
+    SkinFrameGpu* f = root.frame;
+    uint below = 0;
+    uint bucket = SKIN_BUCKETS;
+    for (uint b = 0; b < SKIN_BUCKETS; b++)
     {
+        if (f.buckets[b] > f.work_capacity - below)
+        {
+            bucket = b;
+            break;
+        }
+        below += f.buckets[b];
+    }
+    f.counters[SKIN_CUTOFF] = bucket;
+    f.counters[SKIN_BELOW] = below;
+    f.counters[SKIN_EDGE] = below;
+}
+
+// One thread per skinned copy that asked: the work items of one nearer than the cutoff bucket,
+// which all fit below SKIN_BELOW, and of one in it as they fit past that; a copy farther, or of
+// the cutoff bucket past the room, is refused: neither drawn nor traced.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void admit(uint3 id: SV_DispatchThreadID)
+{
+    uint e = id.x;
+    if (e >= root.entries)
+        return;
+    SceneRoot* s = root.scene;
+    SkinFrameGpu* f = root.frame;
+    SkinStateGpu* st = s.skin_state + e;
+    uint n = st.clusters;
+    if (n == 0)
+        return;
+    uint cutoff = f.counters[SKIN_CUTOFF];
+    uint at = 0;
+    bool fits = st.bucket < cutoff;
+    if (fits)
+        InterlockedAdd(f.counters[SKIN_WORK], n, at);
+    else if (st.bucket == cutoff)
+    {
+        InterlockedAdd(f.counters[SKIN_EDGE], n, at);
+        fits = at + n <= f.work_capacity;
+    }
+    if (!fits)
+    {
+        st.cut = SKIN_NO_CUT;
+        st.clusters = 0;
+        st.job = 0xffffffff;
         InterlockedAdd(f.counters[SKIN_REFUSED], 1);
         return;
     }
-    // Every copy that fits ends before any refused one starts, so items below this are written.
+    // Every copy of the cutoff bucket that fits ends before any refused one starts, so items
+    // below this are written.
     InterlockedMax(f.counters[SKIN_TAKEN], at + n);
+    SkinnedGpu k = s.skinned[e];
+    InstanceGpu inst = s.instances[k.slot];
+    MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
+    SkinMeshGpu* sm = mesh.skin;
     uint w = at;
-    for (uint i = first; i < end; i++)
+    for (uint i = sm.cut_first[st.cut]; i < sm.cut_first[st.cut + 1]; i++)
     {
         uint c = sm.cut_clusters[i];
-        uint page = cluster_page(mesh, c);
-        uint8_t* data = (uint8_t*)mesh_page(s, mesh, page);
-        if (data != nullptr && !section_hidden(inst, load_cluster(data, c - mesh.page_clusters[page]).section))
+        if (shows_cluster(s, inst, mesh, c))
             s.skin_work[w++] = uint2(e, c);
     }
-    st.cut = cut;
-    st.clusters = n;
     st.first = at;
-
-    float range = instance_rt_range(inst) * ((s.slot_state[k.slot].rt_flags & RT_IN_RANGE) != 0 ? SKIN_HYSTERESIS : 1.0);
-    bool traced = f.traced != 0 && (inst.flags & INSTANCE_RAY) != 0 && (!focus || distance <= range);
-    if (!traced)
-    {
-        st.job = 0xffffffff;
+    if (st.job == 0xffffffff)
         return;
-    }
     uint job;
     InterlockedAdd(f.counters[SKIN_JOBS], 1, job);
     ClusterBlas b;
