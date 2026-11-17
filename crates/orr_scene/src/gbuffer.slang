@@ -321,10 +321,7 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
     w.y = uint4(0);
     if ((flags & GBUFFER_EXTENDED) != 0)
     {
-        float3 tint = p.subsurface_weight * p.subsurface_color;
-        if (thin)
-            tint *= (p.subsurface_anisotropy + 1.0) * 0.5;
-        w.x.x = rgb8(tint) | (pack_snorm8(p.subsurface_anisotropy) << 24);
+        w.x.x = rgb8(p.subsurface_color) | (pack_snorm8(p.subsurface_anisotropy) << 24);
         w.x.y = pack_rgb9e5(max(p.subsurface_radius, 0.0));
         w.x.z = pack_unorm8(p.coat_weight) | (roughness_code(p.coat_roughness) << 8) | (ior_code(p.coat_ior) << 16) | (pack_unorm8(p.fuzz_weight) << 24);
         w.x.w = pack_unorm8(p.fuzz_roughness) | (pack_unorm8(p.specular_anisotropy) << 8) | (angle_code(p.tangent_angle) << 16) | (pack_unorm8(p.subsurface_weight) << 24);
@@ -395,10 +392,7 @@ public GSurface decode_gsurface(GBufferWords w)
         p.tangent_angle = angle_from_code(w.x.w >> 16);
         p.subsurface_weight = unpack_unorm8(w.x.w >> 24);
         p.subsurface_anisotropy = unpack_snorm8(w.x.x >> 24);
-        float share = p.subsurface_weight;
-        if (thin)
-            share *= (p.subsurface_anisotropy + 1.0) * 0.5;
-        p.subsurface_color = share > 0.0 ? saturate(from_rgb8(w.x.x) / share) : float3(0.0);
+        p.subsurface_color = p.subsurface_weight > 0.0 ? from_rgb8(w.x.x) : float3(0.0);
         p.subsurface_radius = unpack_rgb9e5(w.x.y);
         if (p.coat_weight > 0.0)
             p.flags |= BSDF_COAT;
