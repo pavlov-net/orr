@@ -1,8 +1,9 @@
 //! Cook keys: a hash of everything that shapes an entry's bytes.
 //!
-//! A key covers the class's cook version, the zstd library, the libraries of the class
-//! (locked versions from `Cargo.lock`, build script), the entry name and the parts the
-//! caller adds: settings, input content hashes and the keys of the entries it depends on.
+//! A key covers the class's cook version, the pack schema `orr_pack` writes the class's entries
+//! in, the zstd library, the libraries of the class (locked versions from `Cargo.lock`, build
+//! script), the entry name and the parts the caller adds: settings, input content hashes and the
+//! keys of the entries it depends on.
 //! The key an archive stores also covers the zstd level, and for GDeflate archives the
 //! encoder's commit and level.
 
@@ -11,7 +12,8 @@ use orr_pack::{Class, Hash32};
 /// GDeflate level of the payload blobs of GDeflate archives.
 pub(crate) const GDEFLATE_LEVEL: i32 = 12;
 
-/// Cook version per class, part of every key: raising one recooks that class.
+/// Cook version per class, part of every key: raising one recooks that class. A schema change
+/// recooks the class by itself (`schema`); the version is for changes in what the cook writes.
 const VERSIONS: &[(Class, u32)] = &[
     (Class::Mesh, 40),
     (Class::Texture, 15),
@@ -37,6 +39,12 @@ pub(crate) fn version(class: u16) -> u32 {
         .map_or(USER_VERSION, |(_, v)| *v)
 }
 
+/// The schema `orr_pack` writes `class`'s entries in, part of every key, so an entry cooked under
+/// another schema is never reused; 0 for a user class, which the cook stores as given.
+fn schema(class: u16) -> u16 {
+    Class::from_u16(class).and_then(Class::schema).unwrap_or(0)
+}
+
 fn libraries(class: u16) -> &'static str {
     match Class::from_u16(class) {
         Some(Class::Mesh | Class::Skeleton | Class::Clip) => env!("ORR_COOK_MESH_LIBS"),
@@ -53,13 +61,14 @@ pub(crate) struct Key(blake3::Hasher);
 impl Key {
     pub(crate) fn new(class: impl Into<u16>, name: &str) -> Self {
         let class = class.into();
-        Self::with_libraries(class, libraries(class), name)
+        Self::with_parts(class, schema(class), libraries(class), name)
     }
 
-    fn with_libraries(class: u16, libraries: &str, name: &str) -> Self {
+    fn with_parts(class: u16, schema: u16, libraries: &str, name: &str) -> Self {
         let mut k = Self(blake3::Hasher::new());
         k.0.update(&class.to_le_bytes());
         k.0.update(&version(class).to_le_bytes());
+        k.0.update(&schema.to_le_bytes());
         k.0.update(&zstd::zstd_safe::version_number().to_le_bytes());
         k.str(env!("ORR_COOK_ZSTD_LIBS")).str(libraries).str(name)
     }
@@ -116,7 +125,11 @@ pub(crate) fn salt() -> Hash32 {
     k = k.str(env!("ORR_COOK_RASTER_LIBS"));
     k = k.str(env!("ORR_COOK_VOLUME_LIBS"));
     for (c, v) in VERSIONS {
-        k = k.bytes(&(*c as u16).to_le_bytes()).bytes(&v.to_le_bytes());
+        let class = *c as u16;
+        k = k
+            .bytes(&class.to_le_bytes())
+            .bytes(&v.to_le_bytes())
+            .bytes(&schema(class).to_le_bytes());
     }
     k.bytes(&USER_VERSION.to_le_bytes()).finish()
 }
@@ -146,10 +159,24 @@ mod tests {
         assert!(libraries(Class::Texture as u16).contains("ctt 0.6.1"));
         assert!(env!("ORR_COOK_ZSTD_LIBS").contains("zstd-sys "));
         let key = |libs| {
-            Key::with_libraries(Class::Mesh as u16, libs, "m")
+            let mesh = Class::Mesh as u16;
+            Key::with_parts(mesh, schema(mesh), libs, "m")
                 .str("settings")
                 .finish()
         };
         assert_ne!(key("meshopt 0.7.0"), key("meshopt 0.7.1"));
+    }
+
+    /// An entry's key follows its class's schema: one cooked before a schema change is another
+    /// entry, whatever its bytes.
+    #[test]
+    fn schemas_enter_keys() {
+        let material = Class::Material as u16;
+        let key = |schema| Key::with_parts(material, schema, "", "m").finish();
+        assert_eq!(
+            Key::new(material, "m").finish(),
+            key(orr_pack::material::SCHEMA)
+        );
+        assert_ne!(key(3), key(4));
     }
 }
