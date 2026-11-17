@@ -1161,7 +1161,12 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
                     Interior list = Interior();
                     if (LAYER)
                         list = medium == PATH_MEDIUM ? load_interior(cold) : on.past(r, cold, inside);
-                    stack_job(lean_stack(r, slot), LAYER ? 0 : STACK_COLD_LIST, list, g.position, w0, load_coherent(at + 1), input, t, FIRST == 1 ? BENT_FIRST : BENT_HIT, throughput * radiance * (W / run), mode.one_technique ? -1.0 : run * k.pdf);
+                    // A hit's re-run traces its ray again with the cover it had, whose draw its
+                    // invoke took out of the payload.
+                    uint4 cover = input;
+                    if (FIRST != 1)
+                        cover.y = cover_draw(r, pixel, path_cover(input).context.depth);
+                    stack_job(lean_stack(r, slot), LAYER ? 0 : STACK_COLD_LIST, list, g.position, w0, load_coherent(at + 1), cover, t, FIRST == 1 ? BENT_FIRST : BENT_HIT, throughput * radiance * (W / run), mode.one_technique ? -1.0 : run * k.pdf);
                 }
             }
         }
@@ -1729,6 +1734,13 @@ public bool lean_photon_start<M : IMedium>(PathRoot r, uint slot, out float reac
     if (lean_disperses(r))
         store_coherent(lean_spectral(r, slot) + 3, uint4(0));
     return true;
+}
+
+// The draw of a presence layer (`PRESENCE_DRAWN`) the cover of a ray of `pixel`'s path takes at
+// context depth `depth`.
+public uint cover_draw(PathRoot r, uint2 pixel, uint depth)
+{
+    return pcg(pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x ^ depth);
 }
 
 // Leaves in stack words `at` what the walk of a directional job through a plane stack takes of the
