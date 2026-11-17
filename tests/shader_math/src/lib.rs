@@ -42,6 +42,8 @@ mod ffi {
         pub(crate) fn orr_unpack_half2x16(p: u32, out: *mut f32);
         pub(crate) fn orr_pack_rgb9e5(c: *const f32) -> u32;
         pub(crate) fn orr_unpack_rgb9e5(p: u32, out: *mut f32);
+        pub(crate) fn orr_pack_signed9e5(v: *const f32) -> u32;
+        pub(crate) fn orr_unpack_signed9e5(p: u32, out: *mut f32);
         pub(crate) fn orr_pack_rgbe(c: *const f32) -> u32;
         pub(crate) fn orr_unpack_rgbe(p: u32, out: *mut f32);
         pub(crate) fn orr_grid_step(k: i32) -> f32;
@@ -226,6 +228,12 @@ pub fn pack_rgb9e5(c: V3) -> u32 {
 }
 pub fn unpack_rgb9e5(p: u32) -> V3 {
     out!(V3, |o| ffi::orr_unpack_rgb9e5(p, o.as_mut_ptr()))
+}
+pub fn pack_signed9e5(v: V3) -> u32 {
+    call!(ffi::orr_pack_signed9e5(v.as_ptr()))
+}
+pub fn unpack_signed9e5(p: u32) -> V3 {
+    out!(V3, |o| ffi::orr_unpack_signed9e5(p, o.as_mut_ptr()))
 }
 pub fn pack_rgbe(c: V3) -> u32 {
     call!(ffi::orr_pack_rgbe(c.as_ptr()))

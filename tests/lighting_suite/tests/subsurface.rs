@@ -582,8 +582,9 @@ fn a_thin_slab_lit_from_behind_matches_the_cpu_walk(paths: &Paths, tolerance: f6
 
 /// Uniform light through the reference, and a sun through the real-time walk. The reference ends
 /// a walk where it meets the surface, so each stretch of a walk between two meetings is a bounce.
-/// Both tracers read the milk sphere under the sun 1 % darker than the CPU walk, the blue 1.5 %,
-/// over 1024 frames as over 128.
+/// A milk sphere ten times as large under the sun is seen from 42 m, where a ray's origin lies
+/// farther off the surface than the milk's mean free path: the walk still reflects and scatters
+/// from the surface itself.
 #[test]
 fn dense_interiors_walk_as_the_cpu_walk_does() {
     let mut paths = Paths::new(
@@ -591,7 +592,18 @@ fn dense_interiors_walk_as_the_cpu_walk_does() {
         PathEntry::Compute,
         settings(LightingDebugView::Subsurface),
     );
-    for (model, interior, sunlit) in [(MILK_SPHERE, &MILK, 0.03), (JADE_SPHERE, &JADE, 0.02)] {
+    paths.settings.reference = None;
+    paths.settings.max_bounces = 2;
+    interior_matches_the_cpu_walk(
+        &paths,
+        MILK_SPHERE,
+        &MILK,
+        0.0,
+        10.0,
+        &[Lighting::Sun],
+        0.02,
+    );
+    for (model, interior) in [(MILK_SPHERE, &MILK), (JADE_SPHERE, &JADE)] {
         paths.settings.reference = Some(ReferenceSettings::default());
         paths.settings.max_bounces = REFERENCE_BOUNCES;
         let uniform = [Lighting::Uniform];
@@ -599,7 +611,7 @@ fn dense_interiors_walk_as_the_cpu_walk_does() {
         paths.settings.reference = None;
         paths.settings.max_bounces = 2;
         let sun = [Lighting::Sun];
-        interior_matches_the_cpu_walk(&paths, model, interior, 0.0, 1.0, &sun, sunlit);
+        interior_matches_the_cpu_walk(&paths, model, interior, 0.0, 1.0, &sun, 0.02);
     }
     a_thin_slab_lit_from_behind_matches_the_cpu_walk(&paths, 0.03);
     assert_clean();

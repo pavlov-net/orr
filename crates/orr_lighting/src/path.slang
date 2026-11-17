@@ -1528,7 +1528,10 @@ public bool interior_exact(SceneRoot* scene, uint m)
 // A face of the interior's own material seen from inside reflects the walk back or lets it out
 // by its dielectric's BSDF on the face's plane: by Fresnel where the material's roughness is a
 // mirror's, else by its microfacets. Where `exact`, the walk ends at such a face instead, which
-// shades as the hit of a ray from inside with every input of its surface.
+// shades as the hit of a ray from inside with every input of its surface. A walk reflected back
+// goes on from the face, off it by the rounding of the point's magnitude and its distance from the
+// eye alone, as `walk_from` starts one: its next step traces the geometry the face came from, and
+// its medium reaches the face.
 public WalkMeet interior_meet(SceneRoot* scene, ViewConstants* view, uint material, float ior, uint m, float3 normal, float3 origin, float3 dir, float t, bool exact, inout Sampler rng)
 {
     float c = dot(normal, dir);
@@ -1562,7 +1565,8 @@ public WalkMeet interior_meet(SceneRoot* scene, ViewConstants* view, uint materi
     met.weight = weight;
     if (back)
     {
-        met.origin = ray_origin(p, p, normal, way, ORIGIN_DEFAULT, 0.0, length(p - view.eye_render.xyz));
+        float magnitude = max(length(p - view.eye_render.xyz), max(abs(p.x), max(abs(p.y), abs(p.z))));
+        met.origin = p - normal * (magnitude * F32_PRECISION);
         return met;
     }
     met.dir = normalize(way);

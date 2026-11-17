@@ -745,8 +745,9 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
 }
 
 // The segment of the ray of `slot`'s path in hot words `at`, whose first word is `w0`, inside
-// the interior the path lies in, `t` m on to its hit: a draw of where it scatters, by one channel's extinction picked uniformly and weighed
-// by the channels' mean density. A ray that reaches its hit takes the share of the draw that the
+// the interior the path lies in, `t` m on to its hit: a draw of where it scatters, by one
+// channel's extinction picked uniformly and weighed by the channels' mean density, along the ray
+// from the surface point its origin lies off. A ray that reaches its hit takes the share of the draw that the
 // hit's transmittance leaves out; one that scatters runs its vertex here, or leaves the walk it
 // starts in its cold words. What the raygen runs next, NEXT_RAY with `on` where the ray goes on to
 // its hit.
@@ -761,7 +762,10 @@ uint scatter_segment(PathRoot r, uint slot, uint4* at, uint4 w0, float t, inout 
     if (!any(sigma_s > 0.0))
         return NEXT_RAY;
     // The ray's stretch in the medium runs from the surface its origin lies off.
-    float span = inside_length(at, t);
+    uint4 w1 = load_coherent(at + 1);
+    float3 dir = oct_decode_snorm16(w1.x);
+    float3 offset = ray_offset(at);
+    float span = length(offset + dir * t);
     uint depth = (w0.w >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK;
     bool walks = trail.chain && (lean_reference(r) || !trail.walked) && depth < r.max_bounces && max_component(sigma_s) * span >= 1.0;
     float3 sigma_t = asfloat(load_coherent(cold + 1 + INTERIOR_ENTRIES).yzw);
@@ -769,7 +773,6 @@ uint scatter_segment(PathRoot r, uint slot, uint4* at, uint4 w0, float t, inout 
     rng.dimension = w0.w >> HOT_DIMENSION_SHIFT;
     float sampled = free_flight(sigma_t, rng);
     bool scattered = sampled < span;
-    uint4 w1 = load_coherent(at + 1);
     float3 throughput = hot_throughput(w1);
     if (scattered)
     {
@@ -783,16 +786,16 @@ uint scatter_segment(PathRoot r, uint slot, uint4* at, uint4 w0, float t, inout 
         throughput *= p > 0.0 ? 1.0 / p : 0.0;
     }
     uint flags = w0.w;
-    float3 dir = oct_decode_snorm16(w1.x);
-    float distance = max(sampled - (span - t), 0.0);
-    store_coherent(at, uint4(w0.xyz, hot_flags(flags, rng.dimension)));
+    // A scatter's vertex lies its distance along the ray from that surface point.
+    float3 from = asfloat(w0.xyz) - (scattered ? offset : float3(0.0));
+    store_coherent(at, uint4(asuint(from), hot_flags(flags, rng.dimension)));
     store_coherent(at + 1, uint4(w1.xy, as_halves(throughput.xy), as_halves(float2(throughput.z, halves(w1.w).y))));
     if (!scattered)
         return NEXT_RAY;
     on = false;
     // The callable runs the scatter's vertex, or leaves the walk the scatter starts.
     Payload p;
-    p.words = uint4(asuint(distance), walks ? MEDIUM_WALKS : MEDIUM_SCATTERS, 0, trail.walked ? 1 : 0);
+    p.words = uint4(asuint(sampled), walks ? MEDIUM_WALKS : MEDIUM_SCATTERS, 0, trail.walked ? 1 : 0);
     call(CALL_MEDIUM, p);
     trail.chain = true;
     return walks ? NEXT_INTERIOR : NEXT_RAY;
