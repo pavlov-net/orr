@@ -623,19 +623,14 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
                 "mean free path",
                 i,
             );
-            // The tint is 8 bits of sss x color (x (g + 1) / 2 thin-walled); dividing by the
-            // 8-bit weight widens its error.
-            let share = if thin {
-                c.subsurface_weight * (c.subsurface_anisotropy + 1.0) * 0.5
-            } else {
-                c.subsurface_weight
-            };
-            let tint = Vec3::from(c.subsurface_color) * share;
-            let got = Vec3::from(g.subsurface_color) * share;
-            for k in 0..3 {
-                let e = (srgb_encode(got[k].min(1.0)) - srgb_encode(tint[k])).abs();
-                assert!(e < 8.0 / 255.0, "case {i} subsurface color {got} vs {tint}");
-            }
+            // 8 bits of sRGB, whatever weight and anisotropy the color goes with.
+            close3(
+                srgb3(g.subsurface_color),
+                srgb3(c.subsurface_color),
+                0.5 / 255.0 + 1e-6,
+                "subsurface color",
+                i,
+            );
         }
     }
     assert_clean();
