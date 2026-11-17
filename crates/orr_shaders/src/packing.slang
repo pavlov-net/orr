@@ -256,6 +256,28 @@ public float3 unpack_rgb9e5(uint p)
     return float3(uint3(p, p >> 9, p >> 18) & 0x1FF) * scale;
 }
 
+// A signed vector in one word: x in bits 0-8, y in 9-17, z in 18-26, each 256 plus a multiple of
+// 2^(e - 7) in -255 to 255, for the shared exponent e in 27-31 (bias 15), the largest component
+// at least 128 of them where e > -15: each to half that step, at most 2^-8 of the largest. A
+// largest component past 255 x 2^9 clamps there; 0 is the zero vector.
+public uint pack_signed9e5(float3 v)
+{
+    float m = max(abs(v.x), max(abs(v.y), abs(v.z)));
+    if (!(m > 0.0))
+        return 0;
+    int e = clamp(int(asuint(m) >> 23) - 127, -15, 16);
+    if (round(m * exp2i(7 - e)) >= 256.0 && e < 16)
+        e += 1;
+    int3 q = int3(clamp(round(v * exp2i(7 - e)), -255.0, 255.0)) + 256;
+    return uint(q.x) | (uint(q.y) << 9) | (uint(q.z) << 18) | (uint(e + 15) << 27);
+}
+
+public float3 unpack_signed9e5(uint p)
+{
+    int3 q = int3(uint3(p, p >> 9, p >> 18) & 0x1FF) - 256;
+    return p == 0 ? float3(0.0) : float3(q) * exp2i(int(p >> 27) - 22);
+}
+
 // R, G and B in bytes 0 to 2 under the shared exponent in byte 3, bias 128 (Ward's RGBE): a
 // color of any magnitude a float holds, each channel to half its largest channel's 8-bit step.
 // Colors below 2^-118 are 0; negative and NaN channels are 0.

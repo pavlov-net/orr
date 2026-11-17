@@ -218,13 +218,19 @@ float3 interior_sigma(uint4* at)
     return asfloat(load_coherent(at + 1 + INTERIOR_ENTRIES).yzw);
 }
 
-// How far a ray `t` m long whose path's hot words are `at` ran through the medium it left its vertex
-// in: from the vertex's surface, which the ray's origin lies off, as the words keep the offset (its
-// squared length and its share along the ray). A camera ray has none.
-public float inside_length(uint4* at, float t)
+// The offset of the origin of the ray whose path's hot words are `at` from the surface point it
+// leaves, which the words keep as `pack_signed9e5` packs it.
+public float3 ray_offset(uint4* at)
 {
-    float2 o = halves(load_coherent(at + 2).z);
-    return sqrt(max(o.x + 2.0 * t * o.y + t * t, 0.0));
+    return unpack_signed9e5(load_coherent(at + 2).z);
+}
+
+// How far a ray along unit `dir`, `t` m long, whose path's hot words are `at` ran through the
+// medium it left its vertex in: from the vertex's surface, which the ray's origin lies off. A
+// camera ray has none.
+public float inside_length(uint4* at, float3 dir, float t)
+{
+    return length(ray_offset(at) + dir * t);
 }
 
 // The shading normal of the vertex a path's ray left, whose flags are `flags` and second hot word
@@ -941,7 +947,7 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     // to its first vertex, and the march the linked medium.
     bool weighed = may_any(MAY_SCATTERING | MAY_MEDIUM) && (input.x & PAYLOAD_WEIGHED) != 0;
     if (inside && !(photon && first))
-        throughput *= weighed ? float3(1.0) : beer(sigma, inside_length(at, t));
+        throughput *= weighed ? float3(1.0) : beer(sigma, inside_length(at, dir, t));
     else if (!first && !weighed)
         throughput *= medium_transmittance<M>(r.scene.medium, asfloat(w0.xyz), dir, t);
     // A camera ray whose segment the froxels hold took none of the medium of the interiors around
@@ -1265,8 +1271,7 @@ uint lean_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
         // medium covers too.
         if (may(MAY_INTERIORS) && (flags & HOT_INTERIOR) != 0)
         {
-            float3 o = origin - g.position;
-            offset = as_halves(float2(dot(o, o), dot(o, s.wi)));
+            offset = pack_signed9e5(origin - g.position);
         }
         store_coherent(at, uint4(asuint(origin), hot_flags(flags, rng.dimension)));
         store_coherent(at + 1, uint4(oct_encode_snorm16(s.wi), left_normal, as_halves(throughput.xy), as_halves(float2(throughput.z, ray_run))));
@@ -2386,8 +2391,7 @@ public void lean_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
     uint offset = 0;
     if (leaves && inside)
     {
-        float3 o = origin - point;
-        offset = as_halves(float2(dot(o, o), dot(o, wi)));
+        offset = pack_signed9e5(origin - point);
     }
     if (goes)
     {
@@ -2987,7 +2991,7 @@ struct FrontLayers<M : IMedium> : ITranslucent
         float4 l = emission.layer(c);
         if (!inside)
             return float4(l.rgb * medium_transmittance<M>(medium, emission.origin, emission.dir, c.t), l.a);
-        float3 tr = beer(sigma_t, inside_length(at, c.t));
+        float3 tr = beer(sigma_t, inside_length(at, emission.dir, c.t));
         return float4(l.rgb * (drawn ? tr / dot(tr, float3(1.0 / 3.0)) : tr), l.a);
     }
 
@@ -3031,7 +3035,7 @@ public bool lean_front<M : IMedium>(PathRoot r, uint slot, float t, uint mask, b
         if (may(MAY_SCATTERING) && view && any(asfloat(load_coherent(cold + LEAN_SCATTER_WORD)).xyz > 0.0))
         {
             drawn = true;
-            float span = inside_length(at, t);
+            float span = inside_length(at, oct_decode_snorm16(w1.x), t);
             Sampler rng = path_sampler(r, item_pixel(r, r.slice_base + slot));
             rng.dimension = flags >> HOT_DIMENSION_SHIFT;
             float sampled = free_flight(sigma_t, rng);

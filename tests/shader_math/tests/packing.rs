@@ -321,6 +321,39 @@ fn packed_float_color_round_trips() {
 }
 
 #[test]
+fn signed_shared_exponent_vectors_round_trip() {
+    let mut rng = Rng::new(7);
+    for _ in 0..200_000 {
+        let v = [
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+            rng.range(-1.0, 1.0),
+        ]
+        .map(|c| c * 2f32.powf(rng.range(-14.0, 15.0)));
+        let d = unpack_signed9e5(pack_signed9e5(v));
+        let max = v.iter().map(|c| c.abs()).fold(0.0f32, f32::max);
+        // The shared step is 2^(floor(log2 max) - 7), no finer than 2^-22, doubled when max
+        // rounds up to 256 steps.
+        let mut step = 2f64.powf(f64::from(max).log2().floor().max(-15.0) - 7.0);
+        if (f64::from(max) / step).round() >= 256.0 {
+            step *= 2.0;
+        }
+        for i in 0..3 {
+            assert!(
+                (f64::from(d[i]) - f64::from(v[i])).abs() <= step / 2.0 * (1.0 + 1e-6),
+                "{v:?} -> {d:?}"
+            );
+        }
+    }
+    assert_eq!(pack_signed9e5([0.0; 3]), 0);
+    assert_eq!(unpack_signed9e5(0), [0.0; 3]);
+    assert_eq!(
+        unpack_signed9e5(pack_signed9e5([1e9, -1e9, 0.0])),
+        [130560.0, -130560.0, 0.0]
+    );
+}
+
+#[test]
 fn rgbe_colors_round_trip_over_every_float_magnitude() {
     let mut rng = Rng::new(6);
     for _ in 0..200_000 {

@@ -1085,7 +1085,7 @@ public uint interior_segment_of<R : IPathRecord>(PathRoot r, inout PathLoop p, i
     float scattered;
     if (!interior_segment(im, span, ray.scatter || walks || scatter, rng, p.throughput, scattered))
         return SEGMENT_ON;
-    at = ray.origin + ray.dir * max(scattered - (span - t), 0.0);
+    at = ray.start + ray.dir * scattered;
     p.cone = cone_after_hit(p.cone, scattered, 0.0);
     p.opaque++;
     if (!walks)
@@ -1320,7 +1320,7 @@ public void trace_stage<S : ISurfaces, M : IMedium>(PathRoot root, uint lane)
         pending.medium = medium;
         pending.value = im.anisotropy;
         ShadeState c = { ray, interior, PathStack(), spectral };
-        alive = reach_scatter(r, p, c, record, x, scatter_at, medium, im.anisotropy, (first ? camera_ray.offset : 0.0) + distance(ray.origin, scatter_at), rng);
+        alive = reach_scatter(r, p, c, record, x, scatter_at, medium, im.anisotropy, (first ? camera_ray.offset : 0.0) + distance(ray.start, scatter_at), rng);
         p.rng = rng;
         if (alive)
             queue_medium_vertex(r, slot, p, pending, false);
