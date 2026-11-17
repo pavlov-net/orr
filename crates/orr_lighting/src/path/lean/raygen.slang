@@ -500,7 +500,7 @@ uint4 scattered_cover(PathRoot r, uint slot, uint4* at, uint mask)
     uint depth = context_depth(r, slot, load_coherent(at).w);
     RayCone c = { cone.x, cone.y };
     uint seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x;
-    return path_payload(new_path_cover(mask, COVER_ALPHA, PRESENCE_NONE, pcg(seed ^ depth),
+    return path_payload(new_path_cover(mask, COVER_LAYERS, PRESENCE_DRAWN, pcg(seed ^ depth),
         hit_context(HIT_SECONDARY, depth, c, 0.0, float2(-1.0), texture_feedback_drawn(pixel, r.frame))));
 }
 
@@ -834,7 +834,8 @@ uint trace_ray<let VIEW : bool, let PHOTON : bool>(PathRoot r, uint slot, uint4*
     uint depth = context_depth(r, slot, w0.w);
     RayCone c = { cone.x, cone.y };
     uint seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x;
-    PathCover cover = new_path_cover(mask, COVER_ALPHA, PRESENCE_NONE, pcg(seed ^ depth),
+    // A presence layer is there where the ray's draw falls below its opacity.
+    PathCover cover = new_path_cover(mask, COVER_LAYERS, PRESENCE_DRAWN, pcg(seed ^ depth),
         hit_context(primary ? HIT_PRIMARY : HIT_SECONDARY, depth, c, 0.0, float2(-1.0), !PHOTON && texture_feedback_drawn(pixel, r.frame)));
     RayDesc ray = path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), t_max);
     // A model that mixes classes holds opaque geometry a layered tile's mask can't turn away: the
