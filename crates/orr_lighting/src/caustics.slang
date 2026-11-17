@@ -7,13 +7,14 @@
 //
 // Real time keeps one grid per scene: cells on the world cache's absolute voxel keys, finer
 // (levels of 2^(base_cell_log2 + j) m by distance to the focus, from a finest level that grows
-// coarser while the grid runs full), each normal bucket its own cell. A bucket's cell is the voxel column across its axis together with the voxel of where
-// the receiver's tangent plane crosses the column's center line, so a flat receiver's whole
-// piece in a column, the column's face area over the cosine of its normal to the axis, is one
-// cell. A cell sums the frame's photon flux in 64-bit fixed point, two words per channel that
-// InterlockedAdd and its carry fill, in quanta of `counters[CAUSTIC_QUANTUM]` times that
-// cosine; the resolve turns the frame's sum into irradiance and blends it into a running mean
-// of the frames' estimates, zero included where a frame deposited none.
+// coarser while the grid runs full), each normal bucket its own cell. A bucket's cell is the
+// voxel column across its axis together with the voxel of where the receiver's tangent plane,
+// moved a third of the voxel along its normal, crosses the column's center line, so a flat
+// receiver's whole piece in a column, the column's face area over the cosine of its normal to
+// the axis, is one cell. A cell sums the frame's photon flux in 64-bit fixed point, two words
+// per channel that InterlockedAdd and its carry fill, in quanta of `counters[CAUSTIC_QUANTUM]`
+// times that cosine; the resolve turns the frame's sum into irradiance and blends it into a
+// running mean of the frames' estimates, zero included where a frame deposited none.
 // A point reads the levels `caustic_level` puts it between, first one by the blend between
 // them and then the other, at most two probes, jittered across a share of the cell; near a
 // boundary between normal buckets it draws one of the two by how close the normal lies to it,
@@ -203,6 +204,16 @@ float3 plane_point(float3 p, float3 n, uint axis, float size)
     return q;
 }
 
+// The point whose voxel is the cell, of edge `size` in the normal bucket of `axis`, of a receiver
+// at render-space `p` with geometric normal `n` on the side its light comes from or is read on:
+// where the plane moved a third of the edge along `n` crosses the column's center line. A plane
+// on a voxel boundary, as a floor at height 0 lies on one at every level, would leave its photons'
+// crossings and its reads' either side of it by rounding; moved off it, both take one voxel.
+float3 crossing_point(float3 p, float3 n, uint axis, float size)
+{
+    return plane_point(p + n * (size / 3.0), n, axis, size);
+}
+
 // Adds `v` quanta, rounded at random by `u`, to the 64-bit sum whose words are `*low` and
 // `*high`.
 void add_wide(uint* low, uint* high, float v, float u)
@@ -250,7 +261,7 @@ public void grid_deposit(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float
         for (uint l = level > g.source.finest ? level - 1 : level; l <= min(level + 2, top); l++)
         {
             int e = g.base_cell_log2 + int(l);
-            uint2 key = cache_key(s.origin_cell, plane_point(p, n, axis, exp2(float(e))), e, l, bucket);
+            uint2 key = cache_key(s.origin_cell, crossing_point(p, n, axis, exp2(float(e))), e, l, bucket);
             uint slot;
             if (!slot_insert(g.checks, g.capacity_mask, key, slot))
             {
@@ -318,7 +329,7 @@ public float3 grid_irradiance(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, 
         float3 q = p + (t * (u.z - 0.5) + b * (u.w - 0.5)) * (size * g.jitter);
         float3 irradiance;
         float photons;
-        if (!grid_cell(g, cache_key(s.origin_cell, plane_point(q, n, axis, size), e, l, bucket), irradiance, photons))
+        if (!grid_cell(g, cache_key(s.origin_cell, crossing_point(q, n, axis, size), e, l, bucket), irradiance, photons))
             continue;
         if (coarse || (photons >= CAUSTIC_MIN_PHOTONS && size >= width) || level >= top)
             return irradiance;
