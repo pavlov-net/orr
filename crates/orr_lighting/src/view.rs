@@ -1804,9 +1804,15 @@ impl PipelinePaths {
         Ok(ready)
     }
 
-    /// Records `items` paths of `root`'s source in slices of `memory`'s slots through the
-    /// pipeline made for what they may meet, `may`, or the ready one that holds the least beyond
-    /// it, after waiting for it where none is ready; its hit table, which `hits` writes, before
+    /// The pipeline the paths that may meet `may` run through: the one made for it, or the ready
+    /// one that holds the least beyond it, after waiting for it where none is ready. Their slots
+    /// hold the parts of what its mask may meet ([`slot_parts`]), which its stages reach.
+    fn set(&self, may: u64) -> Result<Arc<MaskSet<PathPipeline>>, Error> {
+        self.sets.wait(may, may, &PIPELINE)
+    }
+
+    /// Records `items` paths of `root`'s source, which may meet `may`, in slices of `memory`'s
+    /// slots through pipeline `set` ([`Self::set`]); its hit table, which `hits` writes, before
     /// them. The pipeline joins `ran`.
     #[allow(clippy::too_many_arguments)]
     fn record(
@@ -1817,6 +1823,7 @@ impl PipelinePaths {
         features: SceneFeatures,
         root: &PathRoot,
         may: u64,
+        set: &Arc<MaskSet<PathPipeline>>,
         memory: &SourceMemory,
         items: u32,
     ) -> Result<(), Error> {
@@ -1826,12 +1833,11 @@ impl PipelinePaths {
             asks & !may == 0,
             "a path root asks for {asks:#x}, beyond the {may:#x} its pipeline holds"
         );
-        let set = self.sets.wait(may, may, &PIPELINE)?;
         let launch = set.member(0).get().expect("the set's pipeline is ready");
         let (pipeline, groups) = launch.hit_pipeline();
         let table = hits.table(list, pipeline, groups)?;
         launch.record(list, &table, root, memory, items);
-        ran.held.push(Arc::clone(&set));
+        ran.held.push(Arc::clone(set));
         Ok(())
     }
 }
@@ -2582,7 +2588,10 @@ impl LightingKernels {
             let blocks = view.extent.map(|e| e.div_ceil(path.update_block));
             blocks[0] * blocks[1]
         };
-        let parts = slot_parts(may);
+        // A pipeline holding more than the frame asked may run it, and its slots hold what that
+        // one's stages reach.
+        let set = launch.set(may)?;
+        let parts = slot_parts(set.may());
         if !view
             .launched
             .as_ref()
@@ -2602,7 +2611,17 @@ impl LightingKernels {
         );
         let features = pass.scene_features;
         let ran = &mut view.launched_ran;
-        launch.record(list, hits, ran, features, &root, may, &memory.view, pixels)?;
+        launch.record(
+            list,
+            hits,
+            ran,
+            features,
+            &root,
+            may,
+            &set,
+            &memory.view,
+            pixels,
+        )?;
         if update > 0 && lighting.stage_passes {
             list.end_pass();
             list.begin_pass("update paths", false);
@@ -2624,6 +2643,7 @@ impl LightingKernels {
                 features,
                 &update_root,
                 may,
+                &set,
                 &memory.update,
                 update,
             )?;
@@ -2647,6 +2667,7 @@ impl LightingKernels {
                 features,
                 &background_root,
                 may,
+                &set,
                 &memory.view,
                 pixels,
             )?;
