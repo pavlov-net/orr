@@ -38,7 +38,7 @@ fn sectors_fit(f: &File) -> bool {
             c"".as_ptr(),
             libc::AT_EMPTY_PATH,
             libc::STATX_DIOALIGN,
-            &mut stat,
+            &raw mut stat,
         )
     };
     if r != 0 || stat.stx_mask & libc::STATX_DIOALIGN == 0 {
