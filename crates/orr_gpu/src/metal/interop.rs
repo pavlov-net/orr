@@ -1,29 +1,25 @@
 //! Raw Metal access for libraries that encode their own work into orr's command buffers:
-//! the device and its compiler, a texture's raw object, the command buffer and deferred
-//! release.
+//! the device, a texture's raw object, the command buffer and deferred release.
 
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTL4CommandBuffer, MTL4CommandEncoder, MTL4Compiler, MTL4VisibilityOptions, MTLDevice,
-    MTLStages, MTLTexture,
+    MTL4CommandBuffer, MTL4CommandEncoder, MTL4VisibilityOptions, MTLDevice, MTLStages, MTLTexture,
 };
 
 use super::command::CommandList;
 use super::device::Device;
 use super::texture::Texture;
 
-/// The raw Metal objects of a device.
+/// The raw Metal objects of a device. A library that builds pipelines makes a compiler of its
+/// own: orr's records what it builds into orr's pipeline cache.
 pub struct RawDevice<'a> {
     pub device: &'a ProtocolObject<dyn MTLDevice>,
-    /// The compiler orr builds its pipelines with, for libraries that build theirs on it.
-    pub compiler: &'a ProtocolObject<dyn MTL4Compiler>,
 }
 
 /// The raw objects of `device`.
 pub fn raw_device(device: &Device) -> RawDevice<'_> {
     RawDevice {
         device: &device.shared.device,
-        compiler: &device.shared.compiler,
     }
 }
 

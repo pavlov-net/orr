@@ -179,6 +179,7 @@ impl FrameInterpolator {
 impl Made {
     fn new(device: &Device, k: Key) -> Result<Self, Error> {
         let rd = raw_device(device);
+        let compiler = crate::compiler(rd.device)?;
         // SAFETY: descriptor setters and effect creation on a live device and compiler.
         let raw = unsafe {
             let d = MTLFXFrameInterpolatorDescriptor::new();
@@ -198,7 +199,7 @@ impl Made {
                 }
                 enable_interpolator_distortion(&d);
             }
-            d.newFrameInterpolatorWithDevice_compiler(rd.device, rd.compiler)
+            d.newFrameInterpolatorWithDevice_compiler(rd.device, &compiler)
         }
         .ok_or_else(|| Error::Create {
             effect: "frame interpolator",

@@ -155,3 +155,17 @@ pub(crate) struct Keep<T: ?Sized>(pub(crate) Retained<T>);
 // SAFETY: effects are only released through this, after their last encode; releasing an
 // Objective-C object is thread-safe.
 unsafe impl<T: ?Sized> Send for Keep<T> {}
+
+/// A compiler for one effect's pipelines, apart from orr's, which records what it builds into
+/// orr's pipeline cache.
+pub(crate) fn compiler(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+) -> Result<Retained<ProtocolObject<dyn objc2_metal::MTL4Compiler>>, Error> {
+    use objc2_metal::MTLDevice as _;
+    device
+        .newCompilerWithDescriptor_error(&objc2_metal::MTL4CompilerDescriptor::new())
+        .map_err(|e| Error::Create {
+            effect: "compiler",
+            formats: e.localizedDescription().to_string(),
+        })
+}

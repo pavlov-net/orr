@@ -162,6 +162,7 @@ impl TemporalScaler {
 impl Made {
     fn new(device: &Device, render: [u32; 2], output: [u32; 2], f: Formats) -> Result<Self, Error> {
         let rd = raw_device(device);
+        let compiler = crate::compiler(rd.device)?;
         // SAFETY: descriptor setters and effect creation on a live device and compiler.
         let raw = unsafe {
             let d = MTLFXTemporalScalerDescriptor::new();
@@ -174,7 +175,7 @@ impl Made {
             d.setOutputWidth(output[0] as usize);
             d.setOutputHeight(output[1] as usize);
             d.setAutoExposureEnabled(false);
-            d.newTemporalScalerWithDevice_compiler(rd.device, rd.compiler)
+            d.newTemporalScalerWithDevice_compiler(rd.device, &compiler)
         }
         .ok_or_else(|| Error::Create {
             effect: "temporal scaler",
