@@ -1311,6 +1311,9 @@ public void lean_updates(PathRoot r)
         Payload p;
         bool invokes;
         trace_ray<false, false>(r, slot, at, w0, trail, h, p, invokes);
+        // What covered the ray in front of its hit may have ended the path.
+        if (!invokes)
+            continue;
         if (may(MAY_STACK))
         {
             if (h.miss() && stack_miss(r, slot, at, p))
