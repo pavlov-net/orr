@@ -10136,7 +10136,18 @@ fn place_worms(w: &mut World, name: &str, copies: &[(Mat3, Vec3)], gpu: bool) ->
 }
 
 fn place_worms_of(w: &mut World, model: ModelId, copies: &[(Mat3, Vec3)], gpu: bool) -> Worms {
-    let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
+    place_worms_in(w, &SceneDesc::default(), model, copies, gpu)
+}
+
+/// [`place_worms_of`] in a scene of `desc`.
+fn place_worms_in(
+    w: &mut World,
+    desc: &SceneDesc,
+    model: ModelId,
+    copies: &[(Mat3, Vec3)],
+    gpu: bool,
+) -> Worms {
+    let scene = w.scenes.create_scene(desc).unwrap();
     let history = w.scenes.create_view_history().unwrap();
     let joints = worm_rig().0.joint_count() as u32;
     let n = copies.len() as u32;
@@ -10675,6 +10686,55 @@ fn skinned_tables_grow_under_frames_in_flight_and_every_frame_stays_exact() {
         );
     }
     assert_eq!(w.scenes.stats().skin.refused, 0);
+    assert_clean();
+}
+
+/// Worms in a row going away from the eye, in a scene whose skinning starts with room for three
+/// and a half of them: the three nearest the focus take it, whatever order the GPU asks in, and
+/// the rest are refused until the frames read back what they all asked for and the room holds
+/// every one.
+#[test]
+fn the_skinning_room_goes_nearest_first_and_grows_to_what_the_copies_ask() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let model = w.model("worm");
+    // Farthest first, so the skinned entries' order is not the order of their distance.
+    let row: Vec<(Mat3, Vec3)> = (0..8)
+        .rev()
+        .map(|i| (Mat3::IDENTITY, Vec3::new(0.0, 0.0, -1.5 * i as f32)))
+        .collect();
+    let probe = place_worms_in(&mut w, &SceneDesc::default(), model, &row, false);
+    let g = shoot_worms(&mut w, &probe, &worm_shot(1), 0.7, 0.0);
+    let one = skinned_entry(&g.view, 0).1.clusters;
+    assert!(one > 0, "a worm skins no cluster");
+    let desc = SceneDesc {
+        skinned_clusters: 3 * one + one / 2,
+        ..SceneDesc::default()
+    };
+    let worms = place_worms_in(&mut w, &desc, model, &row, false);
+    let admitted = |g: &Frame| -> Vec<bool> {
+        (0..8)
+            .map(|e| skinned_entry(&g.view, e).1.clusters == one)
+            .collect()
+    };
+    let g = shoot_worms(&mut w, &worms, &worm_shot(1), 0.7, 0.0);
+    // Entry 7 stands nearest the eye.
+    let nearest = [false, false, false, false, false, true, true, true];
+    assert_eq!(admitted(&g), nearest, "the first frame's admitted copies");
+    let mut frame = 1;
+    let all = loop {
+        frame += 1;
+        let g = shoot_worms(&mut w, &worms, &worm_shot(frame), 0.7, 0.0);
+        let now = admitted(&g);
+        if now.iter().all(|a| *a) || frame == 8 {
+            break now;
+        }
+        assert_eq!(now, nearest, "frame {frame}'s admitted copies");
+    };
+    assert_eq!(all, [true; 8], "the room never grew");
+    shoot_worms(&mut w, &worms, &worm_shot(frame + 1), 0.7, 0.0);
+    let skin = w.scenes.stats().skin;
+    assert_eq!((skin.asked, skin.refused), (8 * one, 0));
     assert_clean();
 }
 

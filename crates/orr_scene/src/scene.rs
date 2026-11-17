@@ -86,7 +86,9 @@ pub struct SceneDesc {
     /// Instances the PTLAS global partition holds, at most: movers beyond it stay in their
     /// cell partitions.
     pub global_instances: u32,
-    /// Clusters all skinned copies skin and instantiate in one frame, at most.
+    /// Clusters all skinned copies skin and instantiate in one frame until they ask for more:
+    /// the room then grows to what they asked, and in the frames before it has, the copies
+    /// farthest from the focus are refused.
     pub skinned_clusters: u32,
 }
 

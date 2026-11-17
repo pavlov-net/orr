@@ -1392,7 +1392,7 @@ impl Scenes {
                     let rt = &mut f.stats.detail.rt_scale;
                     *rt = rt.max(cuts.rt_scale(slot));
                 }
-                if let Some(skin) = &cpu.skin_frame {
+                if let Some(skin) = &mut cpu.skin_frame {
                     f.stats.skin.add(&skin.figures(slot));
                 }
             }
@@ -2103,6 +2103,7 @@ impl<'a> Frame<'a> {
             }
             if let Some(frame) = &mut cpu.skin_frame {
                 frame.follow_sections(device, cpu.skinned_sections)?;
+                frame.follow_asked(device)?;
             }
             let skin_work = cpu.skin_frame.as_ref().map(|f| f.work);
             records.append(&mut cpu.ptlas.partition_records(device, window, &core.seq)?);

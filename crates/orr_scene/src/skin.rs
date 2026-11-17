@@ -6,9 +6,10 @@
 //! and ray tracing. Its vertex arrays hold every vertex of its mesh, by mesh cluster, so a
 //! cut change needs nothing moved; previous positions come from the palette group's previous
 //! transforms and, on an edit's copies, last frame's rest positions, so motion follows both.
-//! The frame's instantiated CLAS and BLAS land in blocks sized for
-//! `SceneDesc::skinned_clusters`; frames run in order on the render queue, so a frame's builds
-//! never overlap the traces of the frame before.
+//! The frame's instantiated CLAS and BLAS land in blocks sized for the clusters the copies ask
+//! for, from `SceneDesc::skinned_clusters` up: past the room, the copies nearest the focus take
+//! it and the farthest are refused until the room has grown to what they asked. Frames run in
+//! order on the render queue, so a frame's builds never overlap the traces of the frame before.
 
 use orr_gpu::{
     Allocation, BlasLimits, ClusterLimits, ClusterVertexFormat, CommandList, Device, DispatchArgs,
@@ -28,7 +29,9 @@ const SKIN_WORK: u64 = 0;
 const SKIN_JOBS: u64 = 1;
 const SKIN_REFUSED: u64 = 2;
 const SKIN_ARGS: u64 = 4;
-const SKIN_COUNTERS: u64 = 8;
+const SKIN_ASKED: u64 = 7;
+const SKIN_COUNTERS: u64 = 12;
+const SKIN_BUCKETS: u64 = 64;
 
 /// `copies` skinned copies of `model`, one instance slot each. Copy `i` is placed by
 /// transform `first + i` of `transforms` and posed by palette entries
@@ -162,6 +165,8 @@ impl CopyArrays {
 pub(crate) struct SkinKernels {
     begin: PipelineId,
     select: PipelineId,
+    cutoff: PipelineId,
+    admit: PipelineId,
     args: PipelineId,
     skin: PipelineId,
     finish: PipelineId,
@@ -178,6 +183,8 @@ impl SkinKernels {
         Ok(Self {
             begin: c("begin")?,
             select: c("select")?,
+            cutoff: c("cutoff")?,
+            admit: c("admit")?,
             args: c("args")?,
             skin: c("skin")?,
             finish: c("finish")?,
@@ -208,8 +215,10 @@ pub struct SkinStats {
     pub clusters: u32,
     /// Copies traced: cluster BLAS built.
     pub traced: u32,
-    /// Copies whose cut found no room left in `SceneDesc::skinned_clusters`; they are
-    /// neither drawn nor traced that frame.
+    /// Clusters the copies asked for: the room grows to it.
+    pub asked: u32,
+    /// Copies the room had no space left for, the farthest from the focus; they are neither
+    /// drawn nor traced that frame.
     pub refused: u32,
 }
 
@@ -217,6 +226,7 @@ impl SkinStats {
     pub(crate) fn add(&mut self, o: &Self) {
         self.clusters += o.clusters;
         self.traced += o.traced;
+        self.asked += o.asked;
         self.refused += o.refused;
     }
 }
@@ -238,6 +248,8 @@ pub(crate) struct SkinFrame {
     /// The clusters and copies a frame skins at most, the most sections a skinned mesh has, and
     /// the frames in flight.
     clusters: u32,
+    /// The most clusters a frame's copies asked for, as the frames read back said.
+    asked: u32,
     copies: u32,
     sections: u32,
     fif: u32,
@@ -249,23 +261,35 @@ impl SkinFrame {
     /// frames in flight stay where they read them. Fails without device memory, changing
     /// nothing.
     pub(crate) fn follow_copies(&mut self, device: &Device, copies: u32) -> Result<()> {
-        self.follow(device, copies, self.sections)
+        self.follow(device, copies, self.sections, self.clusters)
     }
 
     /// As [`Self::follow_copies`], for skinned meshes of up to `sections` sections: a cluster's
     /// section is its geometry index, which the instantiation bounds.
     pub(crate) fn follow_sections(&mut self, device: &Device, sections: u32) -> Result<()> {
-        self.follow(device, self.copies, sections)
+        self.follow(device, self.copies, sections, self.clusters)
     }
 
-    fn follow(&mut self, device: &Device, copies: u32, sections: u32) -> Result<()> {
-        if copies <= self.copies && sections <= self.sections {
+    /// As [`Self::follow_copies`], for as many clusters as the frames read back asked for.
+    pub(crate) fn follow_asked(&mut self, device: &Device) -> Result<()> {
+        let clusters = if self.asked > self.clusters {
+            self.asked.next_power_of_two()
+        } else {
+            self.clusters
+        };
+        self.follow(device, self.copies, self.sections, clusters)
+    }
+
+    fn follow(&mut self, device: &Device, copies: u32, sections: u32, clusters: u32) -> Result<()> {
+        if copies <= self.copies && sections <= self.sections && clusters <= self.clusters {
             return Ok(());
         }
         let copies = copies.max(self.copies);
         let sections = sections.max(self.sections);
-        let mut next = Self::new(device, self.clusters, copies, sections, self.fif)?;
+        let clusters = clusters.max(self.clusters);
+        let mut next = Self::new(device, clusters, copies, sections, self.fif)?;
         std::mem::swap(&mut next.readback, &mut self.readback);
+        next.asked = self.asked;
         *self = next;
         Ok(())
     }
@@ -290,6 +314,7 @@ impl SkinFrame {
         };
         let work_at = take(8 * n);
         let counters_at = take(4 * SKIN_COUNTERS);
+        let buckets_at = take(4 * SKIN_BUCKETS);
         let instantiate_at = take(stride(RtasOp::InstantiateTemplates) * n);
         let blas_records_at = take(stride(RtasOp::BuildClusterBlas) * jobs);
         let clas_at = take(8 * n);
@@ -303,6 +328,7 @@ impl SkinFrame {
             clas: at(clas_at).cast(),
             blas: at(blas_at).cast(),
             counters: at(counters_at).cast(),
+            buckets: at(buckets_at).cast(),
             work_capacity: clusters,
             traced: u32::from(traced),
         };
@@ -373,6 +399,7 @@ impl SkinFrame {
             scratch,
             _memory: memory,
             clusters,
+            asked: 0,
             copies,
             sections,
             fif,
@@ -413,6 +440,10 @@ impl SkinFrame {
         list.dispatch(p.get(k.begin), root, [1, 1, 1]);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         list.dispatch(p.get(k.select), root, [groups, 1, 1]);
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        list.dispatch(p.get(k.cutoff), root, [1, 1, 1]);
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        list.dispatch(p.get(k.admit), root, [groups, 1, 1]);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         list.dispatch(p.get(k.args), root, [1, 1, 1]);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
@@ -479,16 +510,20 @@ impl SkinFrame {
         Ok(())
     }
 
-    /// The figures of readback slot `slot`.
-    pub(crate) fn figures(&self, slot: usize) -> SkinStats {
+    /// The figures of readback slot `slot`, whose frame is done, and takes what its copies asked
+    /// for, which [`Self::follow_asked`] grows the room to.
+    pub(crate) fn figures(&mut self, slot: usize) -> SkinStats {
         let Some(c) = self.readback.as_slice() else {
             return SkinStats::default();
         };
         let c = &c[slot * SKIN_COUNTERS as usize..];
-        SkinStats {
+        let figures = SkinStats {
             clusters: c[SKIN_WORK as usize],
             traced: c[SKIN_JOBS as usize],
+            asked: c[SKIN_ASKED as usize],
             refused: c[SKIN_REFUSED as usize],
-        }
+        };
+        self.asked = self.asked.max(figures.asked);
+        figures
     }
 }
