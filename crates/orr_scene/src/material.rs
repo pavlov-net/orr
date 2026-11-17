@@ -51,12 +51,7 @@ pub mod material_flags {
     /// The cost class, 0-3, in bits 16-17.
     pub const COST_SHIFT: u32 = 16;
     pub const COST_MASK: u32 = 3 << COST_SHIFT;
-    pub const COAT_ON_BASE: u32 = 1 << 18;
-    pub const FRESNEL_MIX: u32 = 1 << 19;
-    pub const METAL_FLAT: u32 = 1 << 20;
-    pub const F0_STATED: u32 = 1 << 21;
     pub const MORE_TEXTURES: u32 = 1 << 22;
-    pub const BASE_TINT: u32 = 1 << 23;
     pub const VERTEX: u32 = 1 << 24;
     pub const OBJECT_NORMAL: u32 = 1 << 25;
     pub const OBJECT_COAT_NORMAL: u32 = 1 << 26;
@@ -213,13 +208,6 @@ impl MaterialGpu {
         set(m.fuzz_weight > 0.0, f::FUZZ);
         set(m.thin_film_weight > 0.0, f::THIN_FILM);
         set(m.specular_anisotropy > 0.0, f::ANISOTROPY);
-        let preview = matches!(
-            m.model,
-            Material::MODEL_PREVIEW | Material::MODEL_PREVIEW_SPECULAR
-        );
-        set(preview, f::COAT_ON_BASE | f::METAL_FLAT);
-        set(m.model != Material::MODEL_OPENPBR, f::FRESNEL_MIX);
-        set(m.model == Material::MODEL_GLTF, f::BASE_TINT);
         set(m.textures.iter().any(|b| b.vertex != 0), f::VERTEX);
         set(m.displacement_world != 0, f::DISPLACEMENT_WORLD);
         set(
@@ -230,7 +218,6 @@ impl MaterialGpu {
             m.object_normals & Material::OBJECT_COAT_NORMAL != 0,
             f::OBJECT_COAT_NORMAL,
         );
-        set(m.model == Material::MODEL_PREVIEW_SPECULAR, f::F0_STATED);
         set(
             (slot::MORE..slot::DISPLACEMENT_U).any(bound),
             f::MORE_TEXTURES,

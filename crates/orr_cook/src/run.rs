@@ -54,6 +54,7 @@ use crate::raster::{self, RasterReport};
 use crate::report::{
     self, ArchiveReport, AssemblyReport, AssemblyUnitReport, AssetReport, Outcome, TangentReport,
 };
+use crate::shading_model;
 use crate::state::{self, Input, Memo, Record, RecordUnit};
 use crate::subd::{self, CageData, CageInput, SubdSettings};
 use crate::texture::material::{
@@ -2223,7 +2224,8 @@ fn plan_scene(
         .iter()
         .flat_map(|m| m.textures.colors().flat_map(|r| read_as(r.image)))
         .collect();
-    // A height's range is what it stores, and a remap can take a color's below 0.
+    // A height's range is what it stores, a remap can take a color's below 0, and a conversion
+    // to OpenPBR may scale a field by the most a texture reads.
     let whole: HashSet<usize> = src
         .materials
         .iter()
@@ -2232,7 +2234,13 @@ fn plan_scene(
             let across = [slot::DISPLACEMENT_U, slot::DISPLACEMENT_V]
                 .into_iter()
                 .filter_map(|s| m.textures.more.get(&s).and_then(Option::as_ref));
-            m.textures.displacement.iter().chain(remapped).chain(across)
+            let converted = shading_model::ranged(m.model, &m.textures);
+            m.textures
+                .displacement
+                .iter()
+                .chain(remapped)
+                .chain(across)
+                .chain(converted)
         })
         .flat_map(|r| read_as(r.image))
         .collect();
@@ -2304,7 +2312,16 @@ fn plan_scene(
     let mut materials = Vec::new();
     for m in &src.materials {
         let mut cooked = m.material;
-        packer.material(&m.suffix, &mut cooked, &m.textures)?;
+        let mut textures = m.textures.clone();
+        let dropped = shading_model::to_openpbr(
+            m.model,
+            &mut cooked,
+            &mut textures,
+            |r| packer.color_peak(r),
+            |r| packer.input_range(r),
+        );
+        warnings.extend(dropped.map(|d| format!("material {}: {d}", m.suffix)));
+        packer.material(&m.suffix, &mut cooked, &textures)?;
         if let Some(back) = m.back {
             let back = material_name(name, &src.materials[back].suffix);
             cooked.back = AssetId::from_name(&back);

@@ -24,7 +24,17 @@
 //!   `opacity` at it; otherwise `opacityMode` `presence` blends an opacity below 1 or textured,
 //!   and `transparent` makes the rest of it thin-walled transmission, which leaves specular and
 //!   emission at full weight. The specular workflow's `specularColor` is F0, with `ior` left to
-//!   refraction and the coat.
+//!   refraction and the coat. These hold UsdPreviewSurface's model until the cook converts them
+//!   to OpenPBR's (`ShadingModel::Preview` and `PreviewSpecular`), once the textures' facts are
+//!   known:
+//!
+//!   | UsdPreviewSurface | OpenPBR | Given up |
+//!   | --- | --- | --- |
+//!   | Dielectric reflection from F0 to white at grazing, Schlick's curve between | The IOR's Fresnel | |
+//!   | The layer below keeps what the largest channel of the specular reflection leaves | OpenPBR's albedo scaling, per channel | |
+//!   | A metal reflects its base color at every angle | OpenPBR's metal, whose edge whitens | The flat metal |
+//!   | The coat shades on the base's normal, normal map included, and takes nothing from the base's IOR or roughness | The normal map binds the coat's normal too (a second copy of it); OpenPBR's coat moves the base's IOR and widens its roughness | A decal's normal under the coat |
+//!   | `specularColor` is F0 | `specular_weight` is the largest F0 the material reads, its texture's texels included, over the IOR's F0, and `specular_color` what each channel and texel holds of that; an `ior` of 1, whose F0 no weight scales, becomes the largest F0's | A white edge where F0 is below the largest; a textured `ior`'s F0, which the weight scales as if it were the field's |
 //!
 //! An input is a constant, or reads a texture through these nodes: MaterialX `image` and
 //! `tiledimage` (with `texcoord`, `geompropvalue` and `place2d` on their coordinates,
@@ -84,6 +94,7 @@ use std::sync::LazyLock;
 use orr_math::{DAffine2, DVec2};
 use orr_pack::material::{Material, filter, slot};
 
+use crate::shading_model::ShadingModel;
 use crate::texture::Wrap;
 use crate::texture::color::{ImageColor, Space};
 use crate::texture::material::{ImageData, ImageFile, ImageRules, MaterialTextures, TexRef};
@@ -397,6 +408,8 @@ pub(crate) fn category(id: &str) -> &str {
 pub(crate) struct Mapped {
     pub(crate) material: Material,
     pub(crate) textures: MaterialTextures,
+    /// What `material` and `textures` are stated in.
+    pub(crate) model: ShadingModel,
     /// The primvars its vertex color stream holds.
     pub(crate) vertex: Vec<VertexRead>,
     /// What the material asks for that it does not get.
@@ -614,6 +627,7 @@ pub(crate) fn map(
             ..Material::default()
         },
         textures: MaterialTextures::default(),
+        model: ShadingModel::OpenPbr,
         vertex: Vec::new(),
         frames: [None; 2],
         warnings: Vec::new(),
@@ -621,7 +635,10 @@ pub(crate) fn map(
     let node = &net.nodes[surface];
     match node.kind.as_str() {
         "open_pbr_surface" => m.open_pbr(surface)?,
-        "UsdPreviewSurface" => m.preview(surface)?,
+        "UsdPreviewSurface" => {
+            m.model = ShadingModel::Preview;
+            m.preview(surface)?;
+        }
         k => {
             return Err(format!(
                 "{}: surface {k} is not open_pbr_surface or UsdPreviewSurface",
@@ -635,6 +652,7 @@ pub(crate) fn map(
     Ok(Mapped {
         material: m.material,
         textures: m.textures,
+        model: m.model,
         vertex: m.vertex,
         warnings: m.warnings,
     })
@@ -645,6 +663,7 @@ struct Mapper<'a, 'h> {
     host: &'a mut Host<'h>,
     material: Material,
     textures: MaterialTextures,
+    model: ShadingModel,
     vertex: Vec<VertexRead>,
     /// The uv set the [`BASE`] and [`COAT`] frames follow, where a node names one.
     frames: [Option<f32>; 2],
@@ -1857,7 +1876,6 @@ impl Mapper<'_, '_> {
 
     fn preview(&mut self, n: usize) -> Result<(), String> {
         let m = &mut self.material;
-        m.model = Material::MODEL_PREVIEW;
         m.coat_darkening = 0.0;
         m.base_color = [0.18; 3];
         m.metalness = 0.0;
@@ -1889,7 +1907,7 @@ impl Mapper<'_, '_> {
         )?;
         let ior = self.material.specular_ior;
         if specular {
-            self.material.model = Material::MODEL_PREVIEW_SPECULAR;
+            self.model = ShadingModel::PreviewSpecular;
             self.material.specular_color = [0.0; 3];
             self.color(
                 n,

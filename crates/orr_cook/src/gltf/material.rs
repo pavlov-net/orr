@@ -15,7 +15,7 @@
 //! | `KHR_materials_sheen` `sheenColorFactor`, `sheenRoughnessFactor`, `sheenColorTexture`, `sheenRoughnessTexture` (A) | `fuzz_weight` 1 when the factor is not black, `fuzz_color`, `fuzz_roughness` (approximate), their textures |
 //! | `KHR_materials_anisotropy` `anisotropyStrength`, `anisotropyRotation`, `anisotropyTexture` (RG direction, B strength) | `specular_anisotropy`, `specular_rotation` (radians, as glTF), the anisotropy and tangent textures |
 //! | `KHR_materials_iridescence` `iridescenceFactor`, `iridescenceIor`, `iridescenceThicknessMinimum` and `Maximum`, `iridescenceTexture` (R), `iridescenceThicknessTexture` (G) | `thin_film_weight`, `thin_film_ior`, `thin_film_thickness` (nm) and their textures: the thickness texture reads `mix(minimum, maximum, g)` over the larger of the two |
-//! | `KHR_materials_transmission` `transmissionFactor`, `transmissionTexture` (R) | `transmission_weight`, the transmission texture; `Material::MODEL_GLTF` tints it with the base color |
+//! | `KHR_materials_transmission` `transmissionFactor`, `transmissionTexture` (R) | `transmission_weight`, the transmission texture, which the base color tints (below) |
 //! | `KHR_materials_volume` `attenuationColor`, `attenuationDistance` | `transmission_color`, `transmission_depth` above `thicknessFactor` 0; an infinite distance is white at depth 0 |
 //! | transmission without `KHR_materials_volume`, or with `thicknessFactor` 0 | `thin_walled` |
 //! | `KHR_materials_diffuse_transmission` `diffuseTransmissionFactor`, `diffuseTransmissionColorFactor`, `diffuseTransmissionTexture` (A), `diffuseTransmissionColorTexture` | `subsurface_weight`, `subsurface_color`, their textures; thin-walled (approximate: glTF's split of diffuse transmission and volume has no OpenPBR equivalent) |
@@ -26,6 +26,21 @@
 //! thickness texture and use the actual, ray-traced distance instead." Transmission scatter,
 //! scatter anisotropy, the subsurface radius fields and the surface id have no ratified glTF
 //! source and come from `MaterialPatch`.
+//!
+//! The fields above hold glTF's model until the cook converts them to OpenPBR's
+//! (`ShadingModel::Gltf`), once the textures' facts are known. What each choice gives up, beside
+//! what Blender's glTF importer (glTF-Blender-IO) makes of it in a Principled BSDF:
+//!
+//! | glTF | OpenPBR | Given up | Blender |
+//! | --- | --- | --- | --- |
+//! | Dielectric reflection from F0 at normal incidence to `specularFactor` at grazing | The IOR's Fresnel with its F0 scaled by `specular_weight`, 1 at grazing | A grazing reflection below 1 | The same: Specular IOR Level is half `specularFactor` and scales F0 alone |
+//! | `specularColorFactor` and its texture tint F0 | `specular_color` tints the Fresnel at every angle | The white edge of a colored specular | Specular Tint tints normal incidence, white at grazing |
+//! | `specularColorFactor` past 1 raises F0 past the IOR's | Its largest channel moves into `specular_weight`, and the color keeps the rest as a tint | The angle of refraction, which glTF's specular leaves and OpenPBR's weight bends; F0 past 1 | Specular Tint takes the factor as it is |
+//! | The layer below keeps what the largest channel of the specular reflection leaves | OpenPBR's albedo scaling, per channel | | Principled's layering |
+//! | The base color tints light through the surface | With a thin wall or no volume, `transmission_color` times the base color, its texture (a second copy of it) and vertex colors; with a volume, the volume's color alone, with a warning | A decal's tint on transmission; the surface tint of a volume | Base Color tints transmission, and a Volume Absorption node takes the volume |
+//! | The coat takes nothing from the base's IOR or roughness | OpenPBR's coat moves the base's IOR toward its own and widens its roughness | | Principled's coat lies over the base, Coat IOR 1.5 |
+//! | `KHR_materials_specular` doesn't reach a metal, whose edge is white | Its weight darkens a metal and its color tints the edge | A specular-extended metal's edge and brightness | Specular Tint tints metallic reflection too |
+//! | A thin wall's tint is the same at every angle, and its reflection the dielectric's | OpenPBR's thin wall: its tint is at normal incidence and deepens with the path through the wall, and it reflects from both faces | | |
 
 use gltf::material::AlphaMode;
 use gltf::texture::{MagFilter, MinFilter, WrappingMode};
@@ -85,7 +100,6 @@ pub(super) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
         alpha_mode,
         alpha_cutoff: m.alpha_cutoff().unwrap_or(0.5),
         double_sided: m.double_sided().into(),
-        model: Material::MODEL_GLTF,
         coat_darkening: 0.0,
         ..Material::default()
     };

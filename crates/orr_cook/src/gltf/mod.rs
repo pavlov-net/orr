@@ -93,6 +93,7 @@ use crate::mesh::{
     tangents,
 };
 use crate::patch::{self, MaterialPatch, MeshPatch};
+use crate::shading_model::ShadingModel;
 use crate::skin::{self, Graph, Rig, Rigging, Skeleton, influences};
 use crate::state::{Input, Memo};
 use crate::texture::material::{ImageData, ImageFile, Layer};
@@ -1021,6 +1022,7 @@ impl Imported<'_> {
                     },
                     material: m,
                     textures: t,
+                    model: ShadingModel::Gltf,
                 },
             );
         }

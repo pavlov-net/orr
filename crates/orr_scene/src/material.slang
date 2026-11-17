@@ -43,14 +43,6 @@ public static const uint MATERIAL_LOBE_ANISOTROPY = 1 << 6;
 public static const uint MATERIAL_LOBES_RICH = MATERIAL_LOBE_SUBSURFACE | MATERIAL_LOBE_COAT | MATERIAL_LOBE_FUZZ | MATERIAL_LOBE_THIN_FILM;
 public static const uint MATERIAL_COST_SHIFT = 16;
 public static const uint MATERIAL_COST_MASK = 3 << 16;
-// The coat shades on the base's normal, normal map included, not the mesh's.
-public static const uint MATERIAL_COAT_ON_BASE = 1 << 18;
-// orr_pack::material::Material::MODEL_GLTF's dielectric and coat: `specular_color` is F0.
-public static const uint MATERIAL_FRESNEL_MIX = 1 << 19;
-// A metal reflects its base color at every angle.
-public static const uint MATERIAL_METAL_FLAT = 1 << 20;
-// `specular_color` is F0 itself, not a factor on the IOR's.
-public static const uint MATERIAL_F0_STATED = 1 << 21;
 // A slot reads the vertex color stream.
 public static const uint MATERIAL_VERTEX = 1 << 24;
 // The normal map, or the coat's, holds mesh space directions (`object_normal_decode`).
@@ -68,8 +60,6 @@ public static const float CHAIN_ROUGHNESS = 0.1;
 public static const uint MATERIAL_DISPLACED_TANGENT = 1 << 30;
 // `material_medium` reads textures.
 public static const uint MATERIAL_MEDIUM_TEXTURED = 1u << 31;
-// The base color tints what passes through the surface.
-public static const uint MATERIAL_BASE_TINT = 1 << 23;
 // It binds a slot past TEXTURE_TRANSMISSION, which hits on other materials don't look at.
 public static const uint MATERIAL_MORE_TEXTURES = 1 << 22;
 

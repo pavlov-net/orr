@@ -126,6 +126,7 @@ mod raster;
 mod report;
 mod run;
 mod shading;
+mod shading_model;
 mod simd;
 mod skin;
 mod state;

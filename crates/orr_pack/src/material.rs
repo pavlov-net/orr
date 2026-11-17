@@ -5,7 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::mesh::SurfaceClass;
 use crate::{AssetId, Error, Result};
 
-pub const SCHEMA: u16 = 3;
+pub const SCHEMA: u16 = 4;
 
 /// Roughness below which a lobe carries light on as a caustic instead of scattering it.
 pub const CHAIN_ROUGHNESS: f32 = 0.1;
@@ -130,8 +130,6 @@ pub struct Material {
     pub surface: u8,
     /// What the tangent frame follows: [`Self::FRAME_NORMAL_MAP`] by default.
     pub frame_uv: u8,
-    /// Whose model the parameters state: [`Self::MODEL_OPENPBR`] by default.
-    pub model: u8,
     /// Which normal maps hold mesh space directions, through [`Self::object_frame`]:
     /// [`Self::OBJECT_NORMAL`] and [`Self::OBJECT_COAT_NORMAL`]. Such a map stores a direction in
     /// its first three channels as `texture::object_normal` says, and the mesh's tangents have
@@ -143,7 +141,7 @@ pub struct Material {
     /// What the coat's normal map and tangent follow where they part from the tangent frame:
     /// [`Self::FRAME_UV0`] or [`Self::FRAME_UV1`]. [`Self::FRAME_NORMAL_MAP`] shares the frame.
     pub coat_frame_uv: u8,
-    pub _pad: [u8; 3],
+    pub _pad: [u8; 4],
     /// The material of the surface's back, double-sided as this one is; [`AssetId::NONE`] where
     /// both sides read this one.
     pub back: AssetId,
@@ -171,24 +169,6 @@ impl Material {
 
     pub const OBJECT_NORMAL: u8 = 1 << 0;
     pub const OBJECT_COAT_NORMAL: u8 = 1 << 1;
-
-    /// The fields mean what OpenPBR states.
-    pub const MODEL_OPENPBR: u8 = 0;
-    /// As glTF's metallic-roughness: the dielectric Fresnel runs from `F0` at normal incidence to
-    /// [`Self::specular_weight`] at grazing, with `F0` the IOR's times [`Self::specular_color`]
-    /// (at most 1) times the weight, and what it leaves goes to the layer below. Neither field
-    /// reaches a metal, whose edge is white, or the angle of refraction. The coat mixes over all of
-    /// that by its Fresnel term, and takes nothing from the base's IOR or roughness. The base
-    /// color tints light through the surface, on top of any surface tint
-    /// [`Self::transmission_color`] states.
-    pub const MODEL_GLTF: u8 = 1;
-    /// As [`Self::MODEL_GLTF`] under UsdPreviewSurface's metalness workflow, except that a metal
-    /// reflects its base color at every angle, the coat shades on the base's normal, normal map
-    /// included, and the base color tints no transmission.
-    pub const MODEL_PREVIEW: u8 = 2;
-    /// As [`Self::MODEL_PREVIEW`] under its specular workflow: [`Self::specular_color`] is `F0`
-    /// itself.
-    pub const MODEL_PREVIEW_SPECULAR: u8 = 3;
 
     /// Whether [`slot::NORMAL`] or [`slot::COAT_NORMAL`] `s` holds mesh space directions.
     pub fn object_normal(&self, s: usize) -> bool {
@@ -391,8 +371,7 @@ impl Default for Material {
             surface: 0,
             frame_uv: Self::FRAME_NORMAL_MAP,
             coat_frame_uv: Self::FRAME_NORMAL_MAP,
-            _pad: [0; 3],
-            model: Self::MODEL_OPENPBR,
+            _pad: [0; 4],
             object_normals: 0,
             displacement_world: 0,
             back: AssetId::NONE,

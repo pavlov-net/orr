@@ -847,17 +847,6 @@ public void apply_decals(DecalLayer layer, inout BsdfParams p, inout float3 norm
         normal = safe_normalize(normal * (1.0 - layer.normal_cover) + layer.normal, normal);
 }
 
-// `BsdfParams.specular_color` of `m` from its specular color `color` and IOR `ior`: past OpenPBR,
-// F0, a reflectance that holds to 0..1 in the space it was stated in, Rec.709.
-public float3 surface_specular_color(MaterialGpu* m, float3 color, float ior)
-{
-    if ((m.flags & MATERIAL_FRESNEL_MIX) == 0)
-        return color;
-    float r = (ior - 1.0) / (ior + 1.0);
-    float scale = (m.flags & MATERIAL_F0_STATED) != 0 ? 1.0 : r * r;
-    return mul(REC709_TO_REC2020, saturate(scale * mul(REC2020_TO_REC709, color)));
-}
-
 // The direction `rotation` turns from `tangent` about `normal`, measured from
 // orthonormal_basis(normal). A `tangent` zero or parallel to `normal` takes that basis's tangent
 // instead, as OpenPBR allows any unit vector orthogonal to the normal there.
@@ -1153,7 +1142,7 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset, bool report)
     p.base_color = m.base_weight * base_weight * base_color;
     p.metalness = m.metalness * metalness;
     p.specular_ior = m.specular_ior * specular_ior;
-    p.specular_color = surface_specular_color(m, specular_color, p.specular_ior);
+    p.specular_color = specular_color;
     p.specular_weight = m.specular_weight * specular_weight;
     p.specular_roughness = m.specular_roughness * roughness;
     p.diffuse_roughness = m.diffuse_roughness * diffuse_roughness;
@@ -1183,16 +1172,10 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset, bool report)
     GSurface s = GSurface();
     s.normal = material_bound(m, TEXTURE_NORMAL) ? material_texel_normal(i, m, TEXTURE_NORMAL, normal) : i.normal;
     apply_decals(surface_decals(i, report), p, s.normal);
-    if ((m.flags & MATERIAL_BASE_TINT) != 0)
-        p.transmission_color *= p.base_color;
     s.geometric_normal = i.geometric_normal;
     p.specular_anisotropy = 0.0;
     p.tangent_angle = 0.0;
     p.flags = thin ? BSDF_THIN_WALLED : 0;
-    if ((m.flags & MATERIAL_FRESNEL_MIX) != 0)
-        p.flags |= BSDF_FRESNEL_MIX;
-    if ((m.flags & MATERIAL_METAL_FLAT) != 0)
-        p.flags |= BSDF_METAL_FLAT;
     if (anisotropic)
     {
         p.specular_anisotropy = m.specular_anisotropy * specular_anisotropy;
@@ -1200,7 +1183,7 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset, bool report)
         p.tangent_angle = surface_tangent_angle(i.tangent, s.normal, m.specular_rotation + direction);
         p.flags |= BSDF_ANISOTROPY;
     }
-    p.coat_normal = (m.flags & MATERIAL_COAT_ON_BASE) != 0 ? s.normal : i.normal;
+    p.coat_normal = i.normal;
     if (more && material_bound(m, TEXTURE_COAT_NORMAL))
         p.coat_normal = material_texel_normal(i, m, TEXTURE_COAT_NORMAL, coat_normal);
     p.coat_anisotropy = m.coat_anisotropy * coat_anisotropy;
@@ -1246,7 +1229,7 @@ void set_plain_surface(inout GSurface g, PlainSurface s)
 }
 
 // The surface of a hit that a linked type shades, before its plain part and its lobes: every
-// lobe off, with the thin wall and the Fresnel and metal models of the material's record.
+// lobe off, with the thin wall of the material's record.
 GSurface unlobed_surface(SurfaceInput i)
 {
     MaterialGpu* m = i.scene.materials + i.material;
@@ -1257,10 +1240,6 @@ GSurface unlobed_surface(SurfaceInput i)
     g.bsdf.coat_normal = i.normal;
     if ((m.flags & MATERIAL_THIN_WALLED) != 0)
         g.bsdf.flags |= BSDF_THIN_WALLED;
-    if ((m.flags & MATERIAL_FRESNEL_MIX) != 0)
-        g.bsdf.flags |= BSDF_FRESNEL_MIX;
-    if ((m.flags & MATERIAL_METAL_FLAT) != 0)
-        g.bsdf.flags |= BSDF_METAL_FLAT;
     return g;
 }
 

@@ -1083,9 +1083,10 @@ fn the_alpha_test_holds_per_texel() {
 }
 
 /// KHR_materials_specular: "The specular color factor is allowed to be set to values greater than
-/// [1, 1, 1]", and clearcoat's `fresnel_coat` is a mix: the model says so, darkening nothing.
+/// [1, 1, 1]": F0 past the IOR's moves into OpenPBR's weight, which scales it, and the color keeps
+/// the rest as a tint. Clearcoat's `fresnel_coat` darkens nothing.
 #[test]
-fn specular_and_coat_keep_the_gltf_model() {
+fn specular_past_1_moves_into_the_weight_and_the_coat_darkens_nothing() {
     let path = dir("specular-model").join("specular.glb");
     textured_quad(
         &path,
@@ -1095,10 +1096,57 @@ fn specular_and_coat_keep_the_gltf_model() {
         "",
     );
     let m = material_of(&cooked(&path).0);
-    assert_eq!(m.model, Material::MODEL_GLTF);
-    assert_eq!(m.specular_weight, 0.5);
-    assert_eq!(m.specular_color, [4.0, 2.0, 0.5]);
+    assert_eq!(m.specular_weight, 2.0);
+    assert_eq!(m.specular_color, [1.0, 0.5, 0.125]);
     assert_eq!((m.coat_ior, m.coat_darkening), (1.5, 0.0));
+}
+
+/// KHR_materials_transmission: "the base color ... tints the transmitted light". Through a thin
+/// wall, OpenPBR's surface tint takes the base color, factor and texture both; inside a volume,
+/// OpenPBR's transmission color is the volume's alone, which stays, with a warning.
+#[test]
+fn the_base_color_tints_thin_transmission_and_a_volume_keeps_its_own() {
+    let path = dir("base-tint").join("thin.glb");
+    textured_quad(
+        &path,
+        &gradient(),
+        r#"{"pbrMetallicRoughness":{"baseColorFactor":[0.5,0.25,1,1],"baseColorTexture":{"index":0}},
+            "extensions":{"KHR_materials_transmission":{"transmissionFactor":1}}}"#,
+        "",
+    );
+    let (a, report) = cooked(&path);
+    let m = material_of(&a);
+    assert_eq!(m.thin_walled, 1);
+    assert_eq!(m.transmission_color, m.base_color);
+    let tint = m.textures[slot::TRANSMISSION_COLOR];
+    let base = m.textures[slot::BASE_COLOR];
+    assert!(is_bound(&m, slot::TRANSMISSION_COLOR));
+    assert_eq!(
+        (tint.channels, tint.uv_set, tint.wrap),
+        (base.channels, base.uv_set, base.wrap)
+    );
+    assert!(report.assets[0].warnings.is_empty());
+
+    let path = dir("base-tint").join("volume.glb");
+    textured_quad(
+        &path,
+        &gradient(),
+        r#"{"pbrMetallicRoughness":{"baseColorFactor":[0.5,0.25,1,1]},
+            "extensions":{"KHR_materials_transmission":{"transmissionFactor":1},
+            "KHR_materials_volume":{"thicknessFactor":1,"attenuationColor":[0.9,0.8,0.7],"attenuationDistance":2}}}"#,
+        "",
+    );
+    let (a, report) = cooked(&path);
+    let m = material_of(&a);
+    assert_eq!(m.thin_walled, 0);
+    assert_eq!(m.transmission_color, [0.9, 0.8, 0.7]);
+    assert!(!is_bound(&m, slot::TRANSMISSION_COLOR));
+    assert_eq!(
+        report.assets[0].warnings.len(),
+        1,
+        "{:?}",
+        report.assets[0].warnings
+    );
 }
 
 /// Each extension texture reaches a slot of its own, on the channel its extension states.

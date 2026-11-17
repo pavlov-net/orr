@@ -1338,7 +1338,8 @@ fn black_reads_transparent_black_through_the_reader() {
 
 /// PS defaults and parameters: `ior` "including the clearcoat if clearcoat > 0";
 /// `clearcoatRoughness` 0.01; `specularColor` (0, 0, 0): "This is the color at 0 incidence. Edge
-/// color is assumed white."
+/// color is assumed white." OpenPBR's weight scales the IOR's F0 to the stated one, and the IOR
+/// stays for refraction.
 #[test]
 fn preview_parameters_carry_their_spec_values() {
     let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
@@ -1365,8 +1366,7 @@ fn preview_parameters_carry_their_spec_values() {
     let specular = "int inputs:useSpecularWorkflow = 1";
     let a = cook("preview-specular-default", &previewed(specular, "", ""));
     let m = material(&a);
-    assert_eq!(m.model, Material::MODEL_PREVIEW_SPECULAR);
-    assert_eq!(m.specular_color, [0.0; 3]);
+    assert_eq!(m.specular_weight, 0.0, "F0 0 reflects nothing");
     assert_eq!(m.specular_ior, 1.5, "ior stays for refraction");
 
     let a = cook(
@@ -1377,7 +1377,14 @@ fn preview_parameters_carry_their_spec_values() {
             "",
         ),
     );
-    assert_eq!(material(&a).specular_color, [0.5; 3]);
+    let m = material(&a);
+    assert_eq!(m.specular_color, [1.0; 3]);
+    assert!(
+        close(m.specular_weight, 0.5 / 0.04),
+        "{}",
+        m.specular_weight
+    );
+    assert_eq!(m.specular_ior, 1.5);
 }
 
 /// The vertex color stream of the stage's mesh, one entry per vertex.
@@ -1698,7 +1705,8 @@ fn geomcolor_past_the_first_reads_zero() {
 }
 
 /// PS inputs are connectable: `specularColor`, `ior` (for the clearcoat too) and
-/// `clearcoatRoughness` read textures.
+/// `clearcoatRoughness` read textures. A texture of F0 stays one: OpenPBR's tint reaches 1 at its
+/// brightest texel, and with the weight and the IOR's F0 gives back each texel.
 #[test]
 fn preview_inputs_read_textures_with_slots_of_their_own() {
     let inputs = "int inputs:useSpecularWorkflow = 1
@@ -1725,7 +1733,25 @@ fn preview_inputs_read_textures_with_slots_of_their_own() {
     assert!(bound(slot::SPECULAR_COLOR));
     assert!(bound(slot::COAT_ROUGHNESS));
     assert!(bound(slot::SPECULAR_IOR) && bound(slot::COAT_IOR));
-    assert_eq!(m.model, Material::MODEL_PREVIEW_SPECULAR);
+    let peak = 224.0 / 255.0;
+    let tint = m.specular_color[0];
+    assert_eq!(m.specular_color, [tint; 3]);
+    assert!((tint * peak - 1.0).abs() < 1e-3, "{tint}");
+    let inputs = "int inputs:useSpecularWorkflow = 1
+        color3f inputs:specularColor.connect = </M/T.outputs:rgb>";
+    let prims = format!(
+        "{}
+{READER}",
+        texture("T", RAW)
+    );
+    let m = material(&shaded(
+        "preview-f0-texture",
+        &previewed(inputs, &prims, ST),
+        &gradient(),
+    ));
+    let stated = m.specular_weight * 0.04 * m.specular_color[0];
+    assert!((stated - 1.0).abs() < 1e-3, "{stated}");
+    assert_eq!(m.specular_ior, 1.5);
 
     // PS `ior`: "including the clearcoat if clearcoat > 0", as it varies over the mesh too.
     let reader = r#"def Shader "I"
@@ -2366,6 +2392,48 @@ fn a_normal_texture_reads_through_any_scale_and_bias() {
         let n = Vec3::new(want, want, 1.0).normalize();
         assert!((x - n.x).abs() < 0.03, "{name}: {x} {}", n.x);
     }
+}
+
+/// PS's clearcoat lies on the surface's normal, normal map included: OpenPBR's coat reads the
+/// same map as its own normal, cooked alike.
+#[test]
+fn a_preview_coat_shades_on_the_normal_map() {
+    let tilted = png(16, 16, |x, y| {
+        [96 + (x * 4) as u8, 160 - (y * 4) as u8, 255, 255]
+    });
+    let body = previewed(
+        "normal3f inputs:normal.connect = </M/T.outputs:rgb>
+ float inputs:clearcoat = 1",
+        &format!(
+            "{}
+{READER}",
+            texture(
+                "T",
+                "token inputs:sourceColorSpace = \"raw\"
+ float4 inputs:scale = (2, 2, 2, 1)
+ float4 inputs:bias = (-1, -1, -1, 0)"
+            )
+        ),
+        ST,
+    );
+    let a = shaded("preview-coat-normal", &body, &tilted);
+    let m = material(&a);
+    let (base, coat) = (m.textures[slot::NORMAL], m.textures[slot::COAT_NORMAL]);
+    assert_ne!(coat.texture, AssetId::NONE);
+    assert_eq!((coat.uv_set, coat.wrap), (base.uv_set, base.wrap));
+    assert_eq!(
+        m.uv_transforms[slot::COAT_NORMAL],
+        m.uv_transforms[slot::NORMAL]
+    );
+    let blobs = |s: usize| {
+        let e = a.find(m.textures[s].texture).unwrap();
+        a.blobs(e).iter().map(|b| read(&a, b)).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        blobs(slot::COAT_NORMAL),
+        blobs(slot::NORMAL),
+        "the same texels"
+    );
 }
 
 /// The mean x of the first texels of a bound normal map.
