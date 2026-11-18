@@ -29,6 +29,11 @@ pub struct DeviceDesc<'a> {
     /// stay until the caller removes them, as [`trim_pipeline_store`] does; a file's
     /// modification time says when a pipeline last came from it. Vulkan only.
     pub pipeline_store: Option<&'a Path>,
+    /// A file the device adds a [`CompileRecord`](crate::CompileRecord) line to for each
+    /// pipeline it compiles, created if missing, so that processes sharing it each add their
+    /// own. `None`: no file; the compiles are still logged. Vulkan only: Metal compiles in a
+    /// service of its own, whose CPU time no thread here takes.
+    pub compile_records: Option<&'a Path>,
     /// Optional extensions to leave off even when the device offers them; their `Caps`
     /// stay false. Vulkan only.
     pub skip_extensions: &'a [&'a CStr],
@@ -58,6 +63,7 @@ impl Default for DeviceDesc<'_> {
             diagnostics: Diagnostics::Off,
             pipeline_cache: None,
             pipeline_store: None,
+            compile_records: None,
             skip_extensions: &[],
             force_staging: false,
             #[cfg(feature = "nsight-perf")]

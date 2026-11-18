@@ -20,6 +20,11 @@ const TARGETS: &[(&str, &str, Style)] = &[
         Style::Raw,
     ),
     (
+        "orr_gpu",
+        "crates/orr_gpu/src/vulkan/windows_bindings.rs",
+        Style::Raw,
+    ),
+    (
         "orr_io",
         "crates/orr_io/src/windows/bindings.rs",
         Style::Raw,

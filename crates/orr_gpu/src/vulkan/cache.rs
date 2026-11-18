@@ -34,9 +34,10 @@ use std::time::{Duration, Instant};
 use ash::vk;
 
 use super::device::{Device, Shared};
+use super::driver_cpu::DriverCpu;
 use super::pipeline::StageParts;
 use crate::cache_file::{Identity, decode, encode, mark_used, write};
-use crate::{Error, PipelineCacheReport};
+use crate::{CompileCost, CompileRecord, Error, PipelineCacheReport, PipelineKind};
 
 /// The bytes `vkGetPipelineCacheData` would write for `cache`.
 fn data_size(device: &ash::Device, cache: vk::PipelineCache) -> Option<usize> {
@@ -181,10 +182,12 @@ impl Drop for StoredPipeline<'_> {
     }
 }
 
-/// A pipeline, and whether the cache it came through held it.
+/// A pipeline, whether the cache it came through held it, and what its creation took.
 struct Created {
     pipeline: vk::Pipeline,
     hit: bool,
+    wall: Duration,
+    cpu: DriverCpu,
 }
 
 /// Marks a key as compiling until dropped.
@@ -529,20 +532,25 @@ impl Shared {
     /// Creates a pipeline through the cache with `extra` creation flags, compiling it once when
     /// several threads ask for it. `stages` and `state`, whatever else the create info depends on,
     /// tell pipelines apart. `create` builds the create info with `next` as its `p_next` (creation
-    /// flags, then creation feedback) and calls the create function with `cache`. A `ray`
-    /// tracing pipeline takes no executable statistics, which other pipelines capture where the
-    /// device reports them.
+    /// flags, then creation feedback), calls the create function with `cache` and returns the
+    /// driver CPU the call took. A ray tracing pipeline takes no executable statistics, which
+    /// other pipelines capture where the device reports them. Returns the pipeline and, where it
+    /// compiled, what that cost, which is also logged and recorded.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn create_pipeline(
         &self,
         stages: &[&StageParts<'_>],
         state: &[u8],
         extra: vk::PipelineCreateFlags2,
-        ray: bool,
+        kind: PipelineKind,
         name: &str,
         call: &'static str,
-        create: impl Fn(vk::PipelineCache, *const c_void) -> Result<vk::Pipeline, vk::Result>,
-    ) -> Result<vk::Pipeline, Error> {
+        create: impl Fn(
+            vk::PipelineCache,
+            *const c_void,
+        ) -> Result<(vk::Pipeline, DriverCpu), vk::Result>,
+    ) -> Result<(vk::Pipeline, Option<CompileCost>), Error> {
+        let ray = kind == PipelineKind::Ray;
         let cache = &self.pipeline_cache;
         let cached_only = vk::PipelineCreateFlags2::FAIL_ON_PIPELINE_COMPILE_REQUIRED;
         let compiles = !extra.contains(cached_only);
@@ -574,14 +582,21 @@ impl Shared {
             let mut flags = vk::PipelineCreateFlags2CreateInfo::default()
                 .flags(self.pipeline_flags(!ray) | extra);
             flags.p_next = std::ptr::from_mut(&mut feedback_info).cast();
-            let pipeline =
+            let called = Instant::now();
+            let (pipeline, cpu) =
                 create(handle, std::ptr::from_ref(&flags).cast()).map_err(Error::vk(call))?;
+            let wall = called.elapsed();
             // Drivers need not report a hit, and a creation that may not compile compiled nothing.
             let hit = only_cached
                 || feedback
                     .flags
                     .contains(vk::PipelineCreationFeedbackFlags::APPLICATION_PIPELINE_CACHE_HIT);
-            Ok(Created { pipeline, hit })
+            Ok(Created {
+                pipeline,
+                hit,
+                wall,
+                cpu,
+            })
         };
         let created = {
             let _zone = crate::zone!("compile in the driver");
@@ -604,8 +619,32 @@ impl Shared {
             count.fetch_add(1, Ordering::Release);
         }
         drop(guard);
-        self.created(raw, name, start, !ray);
-        Ok(raw)
+        let compiled = (compiles && !created.hit).then(|| CompileCost {
+            wall: created.wall,
+            cpu: created.cpu.serial + created.cpu.joined,
+            serial: created.cpu.serial,
+            longest_join: created.cpu.longest_join,
+            joins: created.cpu.joins,
+            stages: stages.len() as u32,
+            instructions: stages.iter().map(|s| s.instructions()).sum(),
+        });
+        self.created(raw, name, start, compiled.as_ref(), !ray);
+        if let (Some(cost), Some(key), Some(file)) = (compiled, key, &self.compile_records) {
+            let record = CompileRecord {
+                kind,
+                key: key.to_hex().to_string(),
+                name: name.to_owned(),
+                cost,
+            };
+            // One write per line, which a file opened to append adds whole, so the threads and
+            // processes sharing the file need no lock.
+            let mut file = file;
+            let written = file.write_all(format!("{record}\n").as_bytes());
+            if let Err(e) = written {
+                log::warn!("compile records: {e}");
+            }
+        }
+        Ok((raw, compiled))
     }
 }
 

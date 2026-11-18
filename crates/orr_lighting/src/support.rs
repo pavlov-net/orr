@@ -12,7 +12,7 @@ use orr_scene::orr_gpu::{ComputePipeline, Device, ShaderModule, ShaderStage, Spe
 use orr_scene::{Loading, SceneFeatures, Urgency};
 use orr_shaders::abi::SpecEntry;
 
-use crate::mask_sets::Late;
+use crate::mask_sets::{Late, driver_cost};
 use crate::media::links_medium;
 use crate::shaders::dielectric::layer_guides;
 use crate::shaders::guides::resolve;
@@ -136,8 +136,9 @@ fn compile(
     let stage = ShaderStage::new(module(kernels, own)?, entry, spec)?;
     let pipeline = device.create_compute_pipeline(&stage, &format!("{name} {may:#x}"))?;
     log::debug!(
-        "{name} for {may:#x} made in {:.1} s",
-        started.elapsed().as_secs_f64()
+        "{name} for {may:#x} made in {:.1} s{}",
+        started.elapsed().as_secs_f64(),
+        driver_cost(pipeline.compile_cost())
     );
     Ok(pipeline)
 }

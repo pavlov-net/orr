@@ -410,7 +410,7 @@ impl RtasCheck {
             "main",
             SpecData::default(),
         )?;
-        let pipeline =
+        let (pipeline, _) =
             shared.create_compute(&stage, vk::PipelineCreateFlags2::empty(), "orr PTLAS check")?;
         // SAFETY: nothing uses the pipeline until it is returned.
         let pipeline = DropGuard::new(pipeline, |p| unsafe {

@@ -173,6 +173,10 @@ impl RayPipeline {
         match self.never {}
     }
 
+    pub fn compile_cost(&self) -> Option<crate::CompileCost> {
+        match self.never {}
+    }
+
     pub fn hit_record_bytes(&self, group: u32) -> u32 {
         let _ = group;
         match self.never {}

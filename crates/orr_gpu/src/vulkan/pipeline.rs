@@ -11,10 +11,13 @@ use ash::vk::TaggedStructure as _;
 
 use super::debug::name_object;
 use super::device::{Device, Shared};
+use super::driver_cpu::DriverCpu;
 use super::garbage::Item;
 use super::spirv;
 use crate::specialize;
-use crate::{CodeStatistics, EntryPoint, Error, ShaderModule, SpecData, Stage};
+use crate::{
+    CodeStatistics, CompileCost, EntryPoint, Error, PipelineKind, ShaderModule, SpecData, Stage,
+};
 
 /// One shader stage of a pipeline: SPIR-V words, the entry point and specialization data.
 #[derive(Clone, Copy, Debug)]
@@ -139,6 +142,7 @@ pub struct ComputePipeline {
     /// The size of the root the kernel holds in the push data; 0 for a root in GPU memory.
     pub(super) inline_root_bytes: u32,
     workgroup: [u32; 3],
+    compiled: Option<CompileCost>,
     shared: Arc<Shared>,
 }
 
@@ -146,6 +150,12 @@ impl ComputePipeline {
     /// The entry point's workgroup size.
     pub fn workgroup(&self) -> [u32; 3] {
         self.workgroup
+    }
+
+    /// What compiling the pipeline cost the driver; `None` where it came from a cache or the
+    /// pipeline store.
+    pub fn compile_cost(&self) -> Option<CompileCost> {
+        self.compiled
     }
 
     /// What the driver reports of the pipeline's code; `None` where it reports nothing
@@ -337,6 +347,11 @@ impl<'a> StageParts<'a> {
         })
     }
 
+    /// The instructions the stage's functions hand the driver.
+    pub(super) fn instructions(&self) -> u32 {
+        specialize::handed_instructions(&self.code)
+    }
+
     /// Adds the stage's code, entry and specialization to `hasher`.
     pub(super) fn key(&self, hasher: &mut blake3::Hasher) {
         hasher.update(&(self.code.len() as u64).to_le_bytes());
@@ -390,14 +405,34 @@ impl Shared {
         flags
     }
 
-    /// Names a new pipeline and logs its creation, and its statistics when it was created with
-    /// `statistics`.
-    pub(super) fn created(&self, raw: vk::Pipeline, name: &str, start: Instant, statistics: bool) {
+    /// Names a new pipeline and logs its creation, what it cost the driver where it `compiled`,
+    /// and its statistics when it was created with `statistics`.
+    pub(super) fn created(
+        &self,
+        raw: vk::Pipeline,
+        name: &str,
+        start: Instant,
+        compiled: Option<&CompileCost>,
+        statistics: bool,
+    ) {
         name_object(&self.debug_fn, raw, name);
-        log::debug!(
-            "pipeline {name}: created in {:.1} ms",
-            start.elapsed().as_secs_f64() * 1e3
-        );
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        match compiled {
+            Some(c) => log::debug!(
+                "pipeline {name}: created in {:.1} ms, compiled in {:.1} ms with {:.1} ms of \
+                 driver CPU, {:.1} ms of it serial and {:.1} ms the longest of {} joins",
+                ms(start.elapsed()),
+                ms(c.wall),
+                ms(c.cpu),
+                ms(c.serial),
+                ms(c.longest_join),
+                c.joins
+            ),
+            None => log::debug!(
+                "pipeline {name}: created in {:.1} ms from a cache",
+                ms(start.elapsed())
+            ),
+        }
         if statistics {
             self.log_statistics(raw, name);
         }
@@ -409,13 +444,13 @@ impl Shared {
         s: &ShaderStage<'_>,
         extra: vk::PipelineCreateFlags2,
         name: &str,
-    ) -> Result<vk::Pipeline, Error> {
+    ) -> Result<(vk::Pipeline, Option<CompileCost>), Error> {
         let parts = StageParts::new(self, s, Stage::Compute, name)?;
         self.create_pipeline(
             &[&parts],
             &[],
             extra,
-            false,
+            PipelineKind::Compute,
             name,
             "vkCreateComputePipelines",
             |cache, next| {
@@ -423,10 +458,11 @@ impl Shared {
                 let mut info = vk::ComputePipelineCreateInfo::default()
                     .stage(stage.info(vk::ShaderStageFlags::COMPUTE));
                 info.p_next = next;
-                // SAFETY: valid create info; the SPIR-V was validated by the shader build.
-                unsafe { self.device.create_compute_pipelines(cache, &[info], None) }
-                    .map(|p| p[0])
-                    .map_err(|(_, e)| e)
+                let (created, cpu) = DriverCpu::serial(|| {
+                    // SAFETY: valid create info; the SPIR-V was validated by the shader build.
+                    unsafe { self.device.create_compute_pipelines(cache, &[info], None) }
+                });
+                created.map(|p| (p[0], cpu)).map_err(|(_, e)| e)
             },
         )
     }
@@ -441,10 +477,12 @@ impl Device {
         name: &str,
     ) -> Result<ComputePipeline, Error> {
         let _zone = crate::zone!("create pipeline", name);
+        let (raw, compiled) = self.shared.create_compute(s, self.creation_flags, name)?;
         Ok(ComputePipeline {
-            raw: self.shared.create_compute(s, self.creation_flags, name)?,
+            raw,
             inline_root_bytes: s.inline_root_bytes,
             workgroup: s.entry.workgroup,
+            compiled,
             shared: Arc::clone(&self.shared),
         })
     }

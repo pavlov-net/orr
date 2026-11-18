@@ -34,8 +34,10 @@ It is the place for a time limit: the runner sets none. Doc tests run without it
 ORR_TEST_PIPELINE_STORE is the directory where test devices keep compiled pipelines, shared
 by targets, worktrees and commits. It defaults to target/test-pipelines in the main checkout.
 
-Each target's output goes to target/test-logs/<target>.log. Exits 0 when every selected
-target passes, 1 when one fails and 2 when the tests can't be built or run.
+Each target's output goes to target/test-logs/<target>.log, and a line for each pipeline its
+test devices compile, in orr_gpu::CompileRecord's format, to target/test-logs/<target>.compiles,
+which ORR_TEST_COMPILE_RECORDS names to them. Exits 0 when every selected target passes, 1 when
+one fails and 2 when the tests can't be built or run.
 ";
 
 /// More GPU runs at once have coincided with device resets, and gain little: the driver's
@@ -480,6 +482,9 @@ struct Job {
 /// Names the directory of the pipeline store to test devices.
 const STORE_VAR: &str = "ORR_TEST_PIPELINE_STORE";
 
+/// Names to test devices the file they add a line to for each pipeline they compile.
+const RECORDS_VAR: &str = "ORR_TEST_COMPILE_RECORDS";
+
 /// The most the pipeline store keeps. What bounds it is that every test device merges the whole
 /// store when it is created; what fills it is a set of path stages for each scene mask the
 /// tests render, a rest kernel for many of them, and each bed mode's own sets, which a pass
@@ -631,8 +636,12 @@ impl Outcome {
 
 fn run_job(mut job: Job, logs: &Path) -> Outcome {
     let log = logs.join(format!("{}.log", job.name));
+    let records = logs.join(format!("{}.compiles", job.name));
+    job.command.env(RECORDS_VAR, &records);
     let start = Instant::now();
-    let status = File::create(&log)
+    // Test devices add to the records, so this run's start empty.
+    let status = File::create(&records)
+        .and_then(|_| File::create(&log))
         .and_then(|out| Ok((out.try_clone()?, out)))
         .and_then(|(stdout, stderr)| {
             job.command

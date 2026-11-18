@@ -18,6 +18,7 @@ mod accel;
 mod cache_file;
 mod caps;
 mod command;
+mod compile;
 mod coopvec;
 #[cfg(feature = "nsight-perf")]
 mod counters;
@@ -79,6 +80,7 @@ pub use accel::{
 pub use cache_file::PipelineCacheReport;
 pub use caps::{Caps, ComponentType, CooperativeVectorCombination, Limits};
 pub use command::{DecompressRegion, DispatchArgs, MemoryCopy, MeshArgs, TextureCopy};
+pub use compile::{CompileCost, CompileRecord, PipelineKind};
 pub use coopvec::{MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout};
 #[cfg(feature = "nsight-perf")]
 pub use counters::{

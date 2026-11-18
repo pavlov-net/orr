@@ -42,11 +42,14 @@ pub fn device() -> &'static Device {
         if log::set_logger(&StderrLog).is_ok() {
             log::set_max_level(log::LevelFilter::Info);
         }
-        // The test runner sets it, so test executables share compiled pipelines.
+        // The test runner sets them, so test executables share compiled pipelines and it can
+        // report what each one compiled.
         let store = std::env::var_os("ORR_TEST_PIPELINE_STORE").map(PathBuf::from);
+        let records = std::env::var_os("ORR_TEST_COMPILE_RECORDS").map(PathBuf::from);
         let desc = DeviceDesc {
             name: "orr-test",
             pipeline_store: store.as_deref(),
+            compile_records: records.as_deref(),
             queues: QueueRequest {
                 render_compute: true,
                 async_compute: true,

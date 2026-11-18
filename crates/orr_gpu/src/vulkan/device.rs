@@ -74,6 +74,8 @@ pub(crate) struct Shared {
     messages: Box<MessageCount>,
     pub(super) caps: Caps,
     pub(super) pipeline_cache: PipelineCache,
+    /// The file of `DeviceDesc::compile_records`, opened to append.
+    pub(super) compile_records: Option<std::fs::File>,
     pub(super) heap_props: vk::PhysicalDeviceDescriptorHeapPropertiesEXT<'static>,
     pub(super) as_scratch_align: u32,
     pub(super) memory: MemoryTypes,
@@ -609,6 +611,19 @@ impl Device {
         // enabled, and `Shared` drops the pools before the device.
         let pools = unsafe { Pools::new(&allocator, &memory, placement) }?;
 
+        let compile_records = desc
+            .compile_records
+            .map(|path| {
+                std::fs::File::options()
+                    .append(true)
+                    .create(true)
+                    .open(path)
+                    .map_err(|source| Error::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    })
+            })
+            .transpose()?;
         let pipeline_cache = DropGuard::new(
             PipelineCache::open(&device, &props, desc.pipeline_cache, desc.pipeline_store),
             |mut c| c.destroy(&device),
@@ -699,6 +714,7 @@ impl Device {
             messages,
             caps,
             pipeline_cache,
+            compile_records,
             heap_props,
             as_scratch_align: as_props.min_acceleration_structure_scratch_offset_alignment,
             memory,

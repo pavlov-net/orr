@@ -6,11 +6,27 @@
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use orr_scene::orr_gpu::Device;
+use orr_scene::orr_gpu::{CompileCost, Device};
 use orr_scene::{JobResult, Loading, Urgency};
 
 use crate::Error;
 use crate::specialize::MAY_ALL;
+
+/// What a pipeline's "made in" log line adds about the driver's compile, where the backend
+/// measured one: nothing for a pipeline from a cache, nor on a backend that measures none.
+pub(crate) fn driver_cost(compiled: Option<CompileCost>) -> String {
+    compiled.map_or_else(String::new, |c| {
+        format!(
+            ", the driver's compile {:.2} s with {:.2} s of CPU, {:.2} s of it serial and {:.2} s \
+             the longest of {} joins",
+            c.wall.as_secs_f64(),
+            c.cpu.as_secs_f64(),
+            c.serial.as_secs_f64(),
+            c.longest_join.as_secs_f64(),
+            c.joins
+        )
+    })
+}
 
 /// A compile job and the urgency it is queued at, which the job reads as it starts.
 type Queued<T> = Arc<(Arc<Mutex<Urgency>>, JobResult<Result<T, Error>>)>;

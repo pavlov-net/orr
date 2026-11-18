@@ -10,11 +10,12 @@ use std::time::Duration;
 use ash::vk;
 
 use super::device::{Device, Shared};
+use super::driver_cpu::{DriverCpu, timed};
 use super::garbage::{Item, RawBuffer};
 use super::pipeline::StageParts;
 use crate::{
-    CompileThreads, Error, HitGroup, MemoryKind, RayPipelineDesc, RayPipelineFlags, ShaderRecord,
-    Stage,
+    CompileCost, CompileThreads, Error, HitGroup, MemoryKind, PipelineKind, RayPipelineDesc,
+    RayPipelineFlags, ShaderRecord, Stage,
 };
 
 /// A ray tracing pipeline and the raygen, miss and callable regions of its binding table.
@@ -34,6 +35,7 @@ pub struct RayPipeline {
     pub(super) miss: vk::StridedDeviceAddressRegionKHR,
     pub(super) callable: vk::StridedDeviceAddressRegionKHR,
     table: Option<RawBuffer>,
+    compiled: Option<CompileCost>,
     shared: Arc<Shared>,
 }
 
@@ -47,6 +49,12 @@ impl Drop for RayPipeline {
 }
 
 impl RayPipeline {
+    /// What compiling the pipeline cost the driver; `None` where it came from a cache or the
+    /// pipeline store.
+    pub fn compile_cost(&self) -> Option<CompileCost> {
+        self.compiled
+    }
+
     /// The handle of hit group `group`, which starts each of its records.
     pub fn hit_handle(&self, group: u32) -> &[u8] {
         let at = group as usize * self.handle_bytes;
@@ -103,6 +111,8 @@ struct JoinState {
     joined: u32,
     /// The first error a join returned.
     error: Option<vk::Result>,
+    /// The driver CPU of the joins that have ended.
+    cpu: DriverCpu,
 }
 
 /// How a thread's join of a deferred operation ended.
@@ -120,9 +130,12 @@ impl Joined {
     fn join(&self) -> Join {
         let f = &self.shared.deferred_fn;
         self.state.lock().unwrap().joined += 1;
+        let mut cpu = Duration::ZERO;
         let out = loop {
             // SAFETY: the operation is live while `self` is.
-            match unsafe { f.deferred_operation_join(self.op) } {
+            let (joined, took) = timed(|| unsafe { f.deferred_operation_join(self.op) });
+            cpu += took;
+            match joined {
                 Ok(()) => break Join::Complete,
                 Err(vk::Result::THREAD_IDLE_KHR) => {
                     let state = self.state.lock().unwrap();
@@ -140,6 +153,7 @@ impl Joined {
         };
         let mut state = self.state.lock().unwrap();
         state.joined -= 1;
+        state.cpu.join(cpu);
         match out {
             Join::Complete => state.done = true,
             Join::Failed(e) => {
@@ -152,10 +166,10 @@ impl Joined {
         out
     }
 
-    /// The operation's result once it is complete. Joins until then: a thread that runs out of
-    /// work waits while others are joined, and joins again once none is, unless a join failed,
-    /// whose error it returns.
-    fn finish(&self) -> vk::Result {
+    /// The operation's result once it is complete, and the driver CPU its joins took. Joins
+    /// until then: a thread that runs out of work waits while others are joined, and joins again
+    /// once none is, unless a join failed, whose error it returns.
+    fn finish(&self) -> (vk::Result, DriverCpu) {
         let f = &self.shared.deferred_fn;
         loop {
             if matches!(self.join(), Join::Complete) {
@@ -170,14 +184,22 @@ impl Joined {
                 break;
             }
             if let Some(e) = state.error {
-                return e;
+                return (e, state.cpu);
             }
         }
+        // Threads still joined are returning from their last join, whose CPU counts.
+        let state = self.state.lock().unwrap();
+        let cpu = self
+            .changed
+            .wait_while(state, |s| s.joined > 0)
+            .unwrap()
+            .cpu;
         // SAFETY: the operation is live and complete.
-        match unsafe { f.get_deferred_operation_result(self.op) } {
+        let result = match unsafe { f.get_deferred_operation_result(self.op) } {
             Ok(()) => vk::Result::SUCCESS,
             Err(e) => e,
-        }
+        };
+        (result, cpu)
     }
 }
 
@@ -193,24 +215,25 @@ impl Drop for Joined {
 }
 
 /// Runs `create` with a deferred operation that `threads` join, or with none when one thread
-/// compiles, and returns its result once the operation is complete.
+/// compiles, and returns its result once the operation is complete, with the driver CPU the
+/// creation took.
 fn create_deferred(
     shared: &Arc<Shared>,
     threads: CompileThreads<'_>,
     create: impl FnOnce(vk::DeferredOperationKHR) -> vk::Result,
-) -> vk::Result {
+) -> (vk::Result, DriverCpu) {
     let most = match threads {
         CompileThreads::Spawned(n) => n,
         CompileThreads::Pool { max, .. } => max,
     };
     if most <= 1 {
-        return create(vk::DeferredOperationKHR::null());
+        return DriverCpu::serial(|| create(vk::DeferredOperationKHR::null()));
     }
     let f = &shared.deferred_fn;
     // SAFETY: the device is live.
     let op = match unsafe { f.create_deferred_operation(None) } {
         Ok(op) => op,
-        Err(e) => return e,
+        Err(e) => return (e, DriverCpu::default()),
     };
     let joined = Arc::new(Joined {
         shared: Arc::clone(shared),
@@ -218,16 +241,24 @@ fn create_deferred(
         state: Mutex::new(JoinState::default()),
         changed: Condvar::new(),
     });
-    match create(op) {
-        vk::Result::OPERATION_DEFERRED_KHR => {}
-        vk::Result::OPERATION_NOT_DEFERRED_KHR => return vk::Result::SUCCESS,
-        other => return other,
+    let (created, serial) = timed(|| create(op));
+    let result = match created {
+        vk::Result::OPERATION_DEFERRED_KHR => None,
+        vk::Result::OPERATION_NOT_DEFERRED_KHR => Some(vk::Result::SUCCESS),
+        other => Some(other),
+    };
+    if let Some(result) = result {
+        let cpu = DriverCpu {
+            serial,
+            ..DriverCpu::default()
+        };
+        return (result, cpu);
     }
     // SAFETY: the operation is pending.
     let concurrency = unsafe { f.get_deferred_operation_max_concurrency(op) };
     let helpers = concurrency.min(most).saturating_sub(1);
     log::debug!("deferred creation: concurrency {concurrency}, {helpers} helper threads");
-    match threads {
+    let (result, cpu) = match threads {
         CompileThreads::Spawned(_) => std::thread::scope(|s| {
             for _ in 0..helpers {
                 let joined = &joined;
@@ -246,7 +277,8 @@ fn create_deferred(
             }
             joined.finish()
         }
-    }
+    };
+    (result, DriverCpu { serial, ..cpu })
 }
 
 /// The creation flags of `flags`.
@@ -530,11 +562,11 @@ impl Device {
         let extra = self.creation_flags | creation_flags(desc.flags);
         let clusters = desc.flags.contains(RayPipelineFlags::CLUSTERS);
         let started = std::time::Instant::now();
-        let raw = shared.create_pipeline(
+        let (raw, compiled) = shared.create_pipeline(
             &parts.iter().collect::<Vec<_>>(),
             &state,
             extra,
-            true,
+            PipelineKind::Ray,
             name,
             "vkCreateRayTracingPipelinesKHR",
             |cache, next| {
@@ -558,7 +590,7 @@ impl Device {
                     info.p_next = next;
                 }
                 let mut pipeline = vk::Pipeline::null();
-                let result = create_deferred(shared, desc.threads, |op| {
+                let (result, cpu) = create_deferred(shared, desc.threads, |op| {
                     // SAFETY: valid create info that outlives the operation, which
                     // `create_deferred` waits for; the SPIR-V was validated by the shader
                     // build.
@@ -575,7 +607,7 @@ impl Device {
                     }
                 });
                 match result {
-                    vk::Result::SUCCESS => Ok(pipeline),
+                    vk::Result::SUCCESS => Ok((pipeline, cpu)),
                     e => Err(e),
                 }
             },
@@ -708,6 +740,7 @@ impl Device {
             callable: region(&regions[2], starts[2]),
             handles,
             table: Some(DropGuard::dismiss(table)),
+            compiled,
             shared: Arc::clone(shared),
         })
     }

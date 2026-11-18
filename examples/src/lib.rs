@@ -120,12 +120,15 @@ pub fn device() -> &'static Device {
         let mut name = exe.file_stem().expect("the executable's name").to_owned();
         name.push(".cache");
         let cache = store.join(name);
+        // The test runner sets it for the screenshot tests, to report what they compiled.
+        let records = std::env::var_os("ORR_TEST_COMPILE_RECORDS").map(PathBuf::from);
         #[cfg(feature = "nsight-perf")]
         let perf_sdk = std::env::var_os("NVPERF_SDK_PATH").map(PathBuf::from);
         let desc = DeviceDesc {
             name: "orr-examples",
             pipeline_cache: Some(&cache),
             pipeline_store: Some(&store),
+            compile_records: records.as_deref(),
             #[cfg(dlss)]
             hooks: Some(&hooks),
             queues: QueueRequest {

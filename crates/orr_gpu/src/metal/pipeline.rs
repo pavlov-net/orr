@@ -318,6 +318,11 @@ impl ComputePipeline {
     pub fn statistics(&self) -> Option<crate::CodeStatistics> {
         None
     }
+
+    /// `None`: Metal compiles in a service of its own, whose CPU time no thread here takes.
+    pub fn compile_cost(&self) -> Option<crate::CompileCost> {
+        None
+    }
 }
 
 impl Device {

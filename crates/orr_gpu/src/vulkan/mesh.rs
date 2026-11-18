@@ -6,11 +6,13 @@ use ash::vk;
 use ash::vk::TaggedStructure as _;
 
 use super::device::{Device, Shared};
+use super::driver_cpu::DriverCpu;
 use super::garbage::Item;
 use super::pipeline::StageParts;
 use super::texture::{vk_compare, vk_format};
 use crate::{
-    Blend, BlendFactor, BlendOp, ColorTarget, Cull, Error, Fill, FrontFace, MeshPipelineDesc, Stage,
+    Blend, BlendFactor, BlendOp, ColorTarget, Cull, Error, Fill, FrontFace, MeshPipelineDesc,
+    PipelineKind, Stage,
 };
 
 /// A task/mesh/pixel pipeline drawn by [`crate::CommandList::draw_mesh_tasks`] inside
@@ -142,7 +144,7 @@ impl Shared {
             &parts.iter().map(|(_, p)| p).collect::<Vec<_>>(),
             state.as_bytes(),
             extra,
-            false,
+            PipelineKind::Mesh,
             name,
             "vkCreateGraphicsPipelines",
             |cache, next| {
@@ -209,12 +211,14 @@ impl Shared {
                     .color_blend_state(&blend)
                     .dynamic_state(&dynamic);
                 info.p_next = std::ptr::from_ref(&rendering).cast();
-                // SAFETY: valid create info; the SPIR-V was validated by the shader build.
-                unsafe { self.device.create_graphics_pipelines(cache, &[info], None) }
-                    .map(|p| p[0])
-                    .map_err(|(_, e)| e)
+                let (created, cpu) = DriverCpu::serial(|| {
+                    // SAFETY: valid create info; the SPIR-V was validated by the shader build.
+                    unsafe { self.device.create_graphics_pipelines(cache, &[info], None) }
+                });
+                created.map(|p| (p[0], cpu)).map_err(|(_, e)| e)
             },
         )
+        .map(|(raw, _)| raw)
     }
 }
 

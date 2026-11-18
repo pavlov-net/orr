@@ -32,6 +32,12 @@ tracy-client-sys = { workspace = true, optional = true }
 ash.workspace = true
 libloading.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-link.workspace = true
+
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
+libc.workspace = true
+
 # The Metal 4 backend.
 [target.'cfg(target_vendor = "apple")'.dependencies]
 orr_color.workspace = true

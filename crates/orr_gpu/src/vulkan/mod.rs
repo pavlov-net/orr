@@ -9,6 +9,7 @@ mod coopvec;
 mod debug;
 mod device;
 mod diagnostics;
+mod driver_cpu;
 mod features;
 mod garbage;
 mod generated;
@@ -27,6 +28,8 @@ mod sparse;
 mod spirv;
 mod swapchain;
 mod texture;
+#[cfg(windows)]
+mod windows_bindings;
 
 /// libloading's own message names only the call that failed; the OS's reason is its source.
 fn load_reason(e: &libloading::Error) -> String {

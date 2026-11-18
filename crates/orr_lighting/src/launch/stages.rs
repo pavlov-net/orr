@@ -13,7 +13,7 @@ use orr_scene::orr_gpu::{
 use orr_scene::{HitGroups, Loading, SceneFeatures, Urgency};
 use orr_shaders::surface_declares;
 
-use crate::mask_sets::Members;
+use crate::mask_sets::{Members, driver_cost};
 use crate::shaders::consts::{
     ANY_HIT_INSTRUCTIONS, CAUSTIC_HIT_INSTRUCTIONS, COATED_EMITTER_HIT_INSTRUCTIONS,
     DEPOSIT_INSTRUCTIONS, DISPERSE_INSTRUCTIONS, DISPERSION_LAYER_INSTRUCTIONS,
@@ -1161,10 +1161,11 @@ impl PathPipeline {
         let pipeline = device.create_ray_pipeline(&desc, &name)?;
         log::info!(
             "{name}: {} stages, {} instructions handed over, made in {:.1} s, {folded:.1} s of \
-             it folding",
+             it folding{}",
             stages.len(),
             sizes.iter().map(|s| s.instructions).sum::<u32>(),
-            started.elapsed().as_secs_f64()
+            started.elapsed().as_secs_f64(),
+            driver_cost(pipeline.compile_cost())
         );
         Ok(Self {
             pipeline,

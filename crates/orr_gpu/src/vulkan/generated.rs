@@ -279,7 +279,7 @@ impl Device {
             )));
         }
         let pipelines = shared.indirect_pipelines(stages, name, |s, flags, name| {
-            shared.create_compute(s, flags, name)
+            shared.create_compute(s, flags, name).map(|(p, _)| p)
         })?;
         let stages = vk::ShaderStageFlags::COMPUTE;
         shared.create_set(SetKind::Compute, stages, pipelines, name)
