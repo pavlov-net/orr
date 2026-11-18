@@ -1477,7 +1477,8 @@ fn link_modules(
 /// entries (`metal_pipeline`), compiles it to MSL and returns what the MSL check finds, with the
 /// Metal libraries when `settings.metal_sdk` asks for them and nothing was found. Writes the MSL
 /// beside `spv`: `.metal` for the compute, mesh and launch kernels, `.fragment.metal` for the
-/// pixel entries and `.stages.metal` for the other ray tracing stages. A fragment function that
+/// pixel entries and `.stages.metal` for the other ray tracing stages, each defining
+/// `ORR_INTERSECTION_TAGS` (`abi::METAL_INTERSECTION_TAGS`) first. A fragment function that
 /// reads a global gets every global of its program, `groupshared` ones too, which Metal rejects
 /// there; and the stages, which Metal runs as functions without threadgroup memory, are kept
 /// apart from the launch kernels, whose reorders use it.
@@ -1588,6 +1589,10 @@ pub(super) fn metal_issues(
         } else {
             msl
         };
+        let msl = format!(
+            "#define ORR_INTERSECTION_TAGS {}\n{msl}",
+            crate::abi::METAL_INTERSECTION_TAGS
+        );
         write(&spv.with_extension(extension), msl.as_bytes())?;
         issues.extend(metal::msl_issues(&msl));
         declared.extend(metal::entry_names(&msl));
