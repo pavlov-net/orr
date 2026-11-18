@@ -227,11 +227,7 @@ struct Folder<'a> {
     joins: Vec<Join>,
     /// Scratch for [`reaching_definitions`]: a local's place among its function's, by id.
     dense: Vec<u32>,
-    /// Scratch for [`drop_unread_variables`].
-    unread: Vec<bool>,
-    /// Scratch for [`drop_unused_values`].
-    pointer: Vec<bool>,
-    uses: Vec<u32>,
+    ids: Ids,
     /// The id of the GLSL.std.450 instructions' import, `u32::MAX` where the module has none.
     glsl: u32,
     /// The ids a decoration names.
@@ -254,9 +250,10 @@ impl Folder<'_> {
         }
     }
 
-    /// What `inst`, an instruction with a result of a scalar type, computes; `None` for one
-    /// the pass does not read, whose result varies.
-    fn evaluate(&self, inst: &[u32], edges: &HashSet<(u32, u32)>, block: u32) -> Option<Value> {
+    /// What `inst`, an instruction with a result of a scalar type, computes, where the edges
+    /// into its block from the blocks labeled `into`, in order, run; `None` for one the pass does
+    /// not read, whose result varies.
+    fn evaluate(&self, inst: &[u32], into: &[u32]) -> Option<Value> {
         use Value::{Constant, Unreached, Varying};
         if inst.len() < 4 || !self.scalar.get(inst[1] as usize).copied().unwrap_or(false) {
             return None;
@@ -343,10 +340,86 @@ impl Folder<'_> {
                     .as_chunks::<2>()
                     .0
                     .iter()
-                    .filter(|pair| edges.contains(&(pair[1], block)))
+                    .filter(|pair| into.binary_search(&pair[1]).is_ok())
                     .fold(Unreached, |v, pair| v.meet(self.known(pair[0]))),
             ),
             _ => None,
+        }
+    }
+}
+
+const NONE: u32 = u32::MAX;
+
+/// What a pass over one function notes of each id of the module, indexed by id: every entry is
+/// clear between passes, and [`Ids::clear`] clears those `touched` names.
+struct Ids {
+    /// A local variable or a place in one ([`drop_dead`]).
+    pointer: Vec<bool>,
+    /// The places that may name the id ([`drop_dead`]).
+    uses: Vec<u32>,
+    /// The stores through the id ([`drop_dead`]).
+    stores: Vec<u32>,
+    /// The instruction that defines the id, by its place in the function ([`drop_dead`]).
+    defined_at: Vec<u32>,
+    /// The last store through the id, by place, which chains the others ([`drop_dead`]).
+    last_store: Vec<u32>,
+    /// The candidate a variable is ([`forward_single_stores`]).
+    candidate: Vec<u32>,
+    /// The value a forwarded load gives ([`forward_single_stores`]).
+    forward: Vec<u32>,
+    /// A label's block ([`fold_function`] and its [`reaching_definitions`],
+    /// [`forward_single_stores`]).
+    block: Vec<u32>,
+    /// The last item that reads the id, which chains the others ([`fold_function`]).
+    last_reader: Vec<u32>,
+    touched: Vec<u32>,
+}
+
+impl Ids {
+    fn new(bound: usize) -> Self {
+        Self {
+            pointer: vec![false; bound],
+            uses: vec![0; bound],
+            stores: vec![0; bound],
+            defined_at: vec![NONE; bound],
+            last_store: vec![NONE; bound],
+            candidate: vec![NONE; bound],
+            forward: vec![NONE; bound],
+            block: vec![NONE; bound],
+            last_reader: vec![NONE; bound],
+            touched: Vec::new(),
+        }
+    }
+
+    /// Whether the module has id `id`, noting it for [`Self::clear`].
+    fn touch(&mut self, id: u32) -> bool {
+        let has = (id as usize) < self.uses.len();
+        if has {
+            self.touched.push(id);
+        }
+        has
+    }
+
+    /// The block labeled `label`, of those the pass at hand noted.
+    fn block_of(&self, label: u32) -> Option<u32> {
+        self.block
+            .get(label as usize)
+            .copied()
+            .filter(|&k| k != NONE)
+    }
+
+    fn clear(&mut self) {
+        for id in self.touched.drain(..) {
+            let id = id as usize;
+            self.pointer[id] = false;
+            self.uses[id] = 0;
+            self.stores[id] = 0;
+            self.defined_at[id] = NONE;
+            self.last_store[id] = NONE;
+            self.candidate[id] = NONE;
+            self.forward[id] = NONE;
+            self.block[id] = NONE;
+            self.last_reader[id] = NONE;
         }
     }
 }
@@ -562,9 +635,7 @@ pub(crate) fn specialize(
         reaching: vec![Definition::Unknown; bound],
         joins: Vec::new(),
         dense: vec![u32::MAX; bound],
-        unread: vec![false; bound],
-        pointer: vec![false; bound],
-        uses: vec![0; bound],
+        ids: Ids::new(bound),
         glsl,
         decorated,
     };
@@ -713,7 +784,8 @@ fn fold_function(
     let mut blocks: Vec<Block> = Vec::new();
     let mut first_label = end;
     let mut function_end = end;
-    let no_edges = HashSet::new();
+    // Each block's instructions that give a value the pass follows.
+    let mut valued: Vec<Vec<usize>> = Vec::new();
     for item in instructions(&code[..end], at) {
         let (start, inst) = item?;
         match op(inst) {
@@ -730,6 +802,7 @@ fn fold_function(
                     terminator: start,
                     merge: None,
                 });
+                valued.push(Vec::new());
             }
             OP_FUNCTION_END => {
                 function_end = start;
@@ -752,9 +825,10 @@ fn fold_function(
                         .get(inst[1] as usize)
                         .copied()
                         .unwrap_or(false)
-                    && folder.evaluate(inst, &no_edges, 0).is_some()
+                    && folder.evaluate(inst, &[]).is_some()
                 {
                     *folder.value.get_mut(inst[2] as usize)? = Value::Unreached;
+                    valued.last_mut()?.push(start);
                 }
             }
         }
@@ -763,98 +837,223 @@ fn fold_function(
         out.extend_from_slice(&code[at..end]);
         return Some(());
     }
-    let index: HashMap<u32, usize> = blocks.iter().enumerate().map(|(k, b)| (b.id, k)).collect();
+    for (k, b) in blocks.iter().enumerate() {
+        if !folder.ids.touch(b.id) {
+            return None;
+        }
+        folder.ids.block[b.id as usize] = k as u32;
+    }
+    let index = |ids: &Ids, label: u32| ids.block_of(label).map(|k| k as usize);
     let inst_at = |start: usize| {
         let count = (code[start] >> 16) as usize;
         &code[start..start + count]
     };
     let loops = |b: &Block| b.merge.is_some_and(|m| op(inst_at(m)) == OP_LOOP_MERGE);
-    let joins_at = reaching_definitions(folder, &blocks, &index)?;
+    let joins_at = reaching_definitions(folder, &blocks)?;
 
     // Which blocks run and which values are constant, to a fixed point: a block runs once an
-    // edge that runs reaches it, and a branch on a constant runs one edge.
+    // edge that runs reaches it, and a branch on a constant runs one edge. An item is evaluated
+    // again only when something it reads changes: a value, a join, or the edges into its block.
+    #[derive(Clone, Copy)]
+    enum Item {
+        /// The instruction at a start, which gives a value.
+        Value(usize),
+        Join(u32),
+        Branch,
+    }
+    // The items, each with its block, and each block's items: first those the edges into it
+    // change, its joins and phis, which end at `edge_end`.
+    let mut items: Vec<(Item, u32)> = Vec::new();
+    let mut block_items: Vec<std::ops::Range<usize>> = Vec::with_capacity(blocks.len());
+    let mut edge_end: Vec<usize> = Vec::with_capacity(blocks.len());
+    for k in 0..blocks.len() {
+        let first = items.len();
+        for &join in &joins_at[k] {
+            items.push((Item::Join(join), k as u32));
+        }
+        // A block's phis come before its other instructions.
+        let mut phis = items.len();
+        for &start in &valued[k] {
+            items.push((Item::Value(start), k as u32));
+            if op(inst_at(start)) == OP_PHI {
+                phis = items.len();
+            }
+        }
+        items.push((Item::Branch, k as u32));
+        block_items.push(first..items.len());
+        edge_end.push(phis);
+    }
+    // What reads each id and each join, as chains of items through `next_reader`.
+    let mut next_reader: Vec<(u32, u32)> = Vec::new();
+    let mut join_reader = vec![NONE; folder.joins.len()];
+    let read = |ids: &mut Ids, id: u32, item: u32, next: &mut Vec<(u32, u32)>| {
+        if ids.touch(id) {
+            next.push((item, ids.last_reader[id as usize]));
+            ids.last_reader[id as usize] = next.len() as u32 - 1;
+        }
+    };
+    let mut read_join = |join: u32, item: u32, next: &mut Vec<(u32, u32)>| {
+        next.push((item, join_reader[join as usize]));
+        join_reader[join as usize] = next.len() as u32 - 1;
+    };
+    for (i, &(item, k)) in items.iter().enumerate() {
+        let i = i as u32;
+        match item {
+            Item::Value(start) => {
+                let inst = inst_at(start);
+                match op(inst) {
+                    OP_LOAD => match folder.reaching[inst[2] as usize] {
+                        Definition::Stored(id) => read(&mut folder.ids, id, i, &mut next_reader),
+                        Definition::Join(join) => read_join(join, i, &mut next_reader),
+                        Definition::Unknown | Definition::None => {}
+                    },
+                    OP_PHI => {
+                        for pair in inst[3..].as_chunks::<2>().0 {
+                            read(&mut folder.ids, pair[0], i, &mut next_reader);
+                        }
+                    }
+                    _ => {
+                        for &id in &inst[3..inst.len().min(6)] {
+                            read(&mut folder.ids, id, i, &mut next_reader);
+                        }
+                    }
+                }
+            }
+            Item::Join(join) => {
+                for &(_, definition) in &folder.joins[join as usize].sources {
+                    match definition {
+                        Definition::Stored(id) => read(&mut folder.ids, id, i, &mut next_reader),
+                        Definition::Join(other) => read_join(other, i, &mut next_reader),
+                        Definition::Unknown | Definition::None => {}
+                    }
+                }
+            }
+            Item::Branch => {
+                let last = inst_at(blocks[k as usize].terminator);
+                if matches!(op(last), OP_BRANCH_CONDITIONAL | OP_SWITCH) {
+                    read(&mut folder.ids, *last.get(1)?, i, &mut next_reader);
+                }
+            }
+        }
+    }
+
     let mut runs = vec![false; blocks.len()];
+    // The labels of the blocks whose edges into each block run, in order.
+    let mut into: Vec<Vec<u32>> = vec![Vec::new(); blocks.len()];
+    let mut queued = vec![false; items.len()];
+    let mut work: Vec<u32> = Vec::new();
+    let push = |work: &mut Vec<u32>, queued: &mut [bool], range: std::ops::Range<usize>| {
+        for i in range.rev() {
+            if !queued[i] {
+                queued[i] = true;
+                work.push(i as u32);
+            }
+        }
+    };
+    // Queues the chain of readers from `reader` on.
+    let readers = |work: &mut Vec<u32>, queued: &mut [bool], mut reader: u32| {
+        while reader != NONE {
+            let (item, next) = next_reader[reader as usize];
+            if !queued[item as usize] {
+                queued[item as usize] = true;
+                work.push(item);
+            }
+            reader = next;
+        }
+    };
     runs[0] = true;
-    let mut edges: HashSet<(u32, u32)> = HashSet::new();
+    push(&mut work, &mut queued, block_items[0].clone());
     loop {
-        let mut changed = false;
-        for k in 0..blocks.len() {
+        while let Some(i) = work.pop() {
+            queued[i as usize] = false;
+            let (item, k) = items[i as usize];
+            let k = k as usize;
             if !runs[k] {
                 continue;
             }
             let b = &blocks[k];
-            for &join in &joins_at[k] {
-                let Join { sources, value } = &folder.joins[join as usize];
-                let met = sources
-                    .iter()
-                    .filter(|(from, _)| edges.contains(&(*from, b.id)))
-                    .fold(*value, |v, &(_, definition)| {
-                        v.meet(folder.defined(definition))
-                    });
-                if met != *value {
-                    folder.joins[join as usize].value = met;
-                    changed = true;
-                }
-            }
-            for item in instructions(&code[..b.end], b.start) {
-                let (_, inst) = item?;
-                if inst.len() < 4 {
-                    continue;
-                }
-                let Some(v) = folder.evaluate(inst, &edges, b.id) else {
-                    continue;
-                };
-                let slot = folder.value.get_mut(inst[2] as usize)?;
-                let met = slot.meet(v);
-                if met != *slot {
-                    *slot = met;
-                    changed = true;
-                }
-            }
-            let last = inst_at(b.terminator);
-            let mut targets: Vec<u32> = Vec::new();
-            match op(last) {
-                OP_BRANCH => targets.push(*last.get(1)?),
-                OP_BRANCH_CONDITIONAL => match folder.known(*last.get(1)?) {
-                    Value::Constant(c) if !loops(b) => {
-                        targets.push(*last.get(if c != 0 { 2 } else { 3 })?);
+            match item {
+                Item::Value(start) => {
+                    let inst = inst_at(start);
+                    let Some(v) = folder.evaluate(inst, &into[k]) else {
+                        continue;
+                    };
+                    let slot = folder.value.get_mut(inst[2] as usize)?;
+                    let met = slot.meet(v);
+                    if met != *slot {
+                        *slot = met;
+                        let first = folder.ids.last_reader[inst[2] as usize];
+                        readers(&mut work, &mut queued, first);
                     }
-                    Value::Unreached if !loops(b) => {}
-                    _ => targets.extend_from_slice(last.get(2..4)?),
-                },
-                OP_SWITCH => match folder.known(*last.get(1)?) {
-                    Value::Constant(c) if !loops(b) => targets.push(switch_target(last, c)?),
-                    Value::Unreached if !loops(b) => {}
-                    _ => {
-                        targets.push(*last.get(2)?);
-                        targets
-                            .extend(last.get(3..)?.as_chunks::<2>().0.iter().map(|pair| pair[1]));
+                }
+                Item::Join(join) => {
+                    let Join { sources, value } = &folder.joins[join as usize];
+                    let met = sources
+                        .iter()
+                        .filter(|(from, _)| into[k].binary_search(from).is_ok())
+                        .fold(*value, |v, &(_, definition)| {
+                            v.meet(folder.defined(definition))
+                        });
+                    if met != *value {
+                        folder.joins[join as usize].value = met;
+                        readers(&mut work, &mut queued, join_reader[join as usize]);
                     }
-                },
-                _ => {}
-            }
-            for target in targets {
-                if edges.insert((b.id, target)) {
-                    changed = true;
                 }
-                let to = *index.get(&target)?;
-                if !runs[to] {
-                    runs[to] = true;
-                    changed = true;
+                Item::Branch => {
+                    let last = inst_at(b.terminator);
+                    let mut targets: Vec<u32> = Vec::new();
+                    match op(last) {
+                        OP_BRANCH => targets.push(*last.get(1)?),
+                        OP_BRANCH_CONDITIONAL => match folder.known(*last.get(1)?) {
+                            Value::Constant(c) if !loops(b) => {
+                                targets.push(*last.get(if c != 0 { 2 } else { 3 })?);
+                            }
+                            Value::Unreached if !loops(b) => {}
+                            _ => targets.extend_from_slice(last.get(2..4)?),
+                        },
+                        OP_SWITCH => match folder.known(*last.get(1)?) {
+                            Value::Constant(c) if !loops(b) => {
+                                targets.push(switch_target(last, c)?);
+                            }
+                            Value::Unreached if !loops(b) => {}
+                            _ => {
+                                targets.push(*last.get(2)?);
+                                targets.extend(
+                                    last.get(3..)?.as_chunks::<2>().0.iter().map(|pair| pair[1]),
+                                );
+                            }
+                        },
+                        _ => {}
+                    }
+                    for target in targets {
+                        let to = index(&folder.ids, target)?;
+                        let Err(place) = into[to].binary_search(&b.id) else {
+                            continue;
+                        };
+                        into[to].insert(place, b.id);
+                        if runs[to] {
+                            let r = block_items[to].start..edge_end[to];
+                            push(&mut work, &mut queued, r);
+                        } else {
+                            runs[to] = true;
+                            push(&mut work, &mut queued, block_items[to].clone());
+                        }
+                    }
                 }
             }
-        }
-        if changed {
-            continue;
         }
         // A branch on a value nothing reached reads an undefined one: it stays as written.
+        let mut changed = false;
         for (k, b) in blocks.iter().enumerate() {
             let last = inst_at(b.terminator);
             if runs[k] && matches!(op(last), OP_BRANCH_CONDITIONAL | OP_SWITCH) {
-                let slot = folder.value.get_mut(*last.get(1)? as usize)?;
+                let cond = *last.get(1)?;
+                let slot = folder.value.get_mut(cond as usize)?;
                 if *slot == Value::Unreached {
                     *slot = Value::Varying;
                     changed = true;
+                    let first = folder.ids.last_reader[cond as usize];
+                    readers(&mut work, &mut queued, first);
                 }
             }
         }
@@ -880,10 +1079,10 @@ fn fold_function(
             continue;
         };
         let merge = inst_at(m);
-        let to = *index.get(merge.get(1)?)?;
+        let to = index(&folder.ids, *merge.get(1)?)?;
         merge_stub[to] = !runs[to];
         if op(merge) == OP_LOOP_MERGE {
-            let to = *index.get(merge.get(2)?)?;
+            let to = index(&folder.ids, *merge.get(2)?)?;
             if !runs[to] {
                 continue_stub[to] = Some(b.id);
             }
@@ -906,7 +1105,11 @@ fn fold_function(
             .merge
             .map(inst_at)
             .filter(|m| op(m) == OP_LOOP_MERGE)
-            .and_then(|m| index.get(&m[2]).filter(|&&to| !runs[to]).map(|_| m[2]));
+            .and_then(|m| {
+                index(&folder.ids, m[2])
+                    .filter(|&to| !runs[to])
+                    .map(|_| m[2])
+            });
         let folded = folds(b);
         for item in instructions(&code[..b.end], b.start) {
             let (start, inst) = item?;
@@ -915,7 +1118,7 @@ fn fold_function(
                     let first = out.len();
                     out.extend_from_slice(&inst[..3]);
                     for pair in inst[3..].as_chunks::<2>().0 {
-                        if edges.contains(&(pair[1], b.id)) {
+                        if into[k].binary_search(&pair[1]).is_ok() {
                             out.extend_from_slice(pair);
                         }
                     }
@@ -953,21 +1156,20 @@ fn fold_function(
         }
     }
     out.extend_from_slice(&code[function_end..end]);
+    folder.ids.clear();
     // A branch the pass folded leaves the values that fed it, the loads among them, and the
     // variables those loads read are left with stores alone. A variable its folded branches
     // also wrote may be left one store, whose value its loads read.
     loop {
-        let before = out.len();
-        drop_unused_values(
+        drop_dead(out, function_at, folder.glsl, &mut folder.ids)?;
+        let forwarded = forward_single_stores(
             out,
             function_at,
-            folder.glsl,
-            &mut folder.pointer,
-            &mut folder.uses,
+            &written,
+            &folder.decorated,
+            &mut folder.ids,
         )?;
-        drop_unread_variables(out, function_at, &mut folder.unread)?;
-        forward_single_stores(out, function_at, &written, &folder.decorated)?;
-        if out.len() == before {
+        if !forwarded {
             break;
         }
     }
@@ -1142,128 +1344,132 @@ fn pure(inst: &[u32], glsl: u32, pointer: &[bool]) -> bool {
 }
 
 /// Removes from the function in `out[from..]` the values ([`pure`]) nothing uses, of GLSL.std.450
-/// import `glsl`, and then those only they used. `pointer` and `uses` are clear for every id on
-/// entry and on return.
-fn drop_unused_values(
-    out: &mut Vec<u32>,
-    from: usize,
-    glsl: u32,
-    pointer: &mut [bool],
-    uses: &mut [u32],
-) -> Option<()> {
-    let mut touched: Vec<u32> = Vec::new();
+/// import `glsl`, and the local variables only stores name, with those stores, and then what only
+/// those used, until nothing more goes: one pass counts each id's uses, and a removal visits only
+/// the ids it named, so a chain of any length goes in one call.
+fn drop_dead(out: &mut Vec<u32>, from: usize, glsl: u32, ids: &mut Ids) -> Option<()> {
     let mut starts: Vec<usize> = Vec::new();
+    // Each store's place, by place, chains the earlier stores through its pointer.
+    let mut earlier_store: Vec<u32> = Vec::new();
+    // Ids whose definition may have nothing left that reads it.
+    let mut work: Vec<u32> = Vec::new();
     for item in instructions(out, from) {
         let (start, inst) = item?;
+        let k = starts.len() as u32;
         starts.push(start);
+        earlier_store.push(NONE);
         let based = match op(inst) {
             OP_VARIABLE => inst.get(3) == Some(&STORAGE_FUNCTION),
-            OP_ACCESS_CHAIN | OP_IN_BOUNDS_ACCESS_CHAIN | OP_PTR_ACCESS_CHAIN => pointer
+            OP_ACCESS_CHAIN | OP_IN_BOUNDS_ACCESS_CHAIN | OP_PTR_ACCESS_CHAIN => ids
+                .pointer
                 .get(*inst.get(3)? as usize)
                 .copied()
                 .unwrap_or(false),
             _ => false,
         };
         if based {
-            *pointer.get_mut(inst[2] as usize)? = true;
-            touched.push(inst[2]);
-        }
-        // A value names its own result alone.
-        let skip = if pure(inst, glsl, pointer) { 3 } else { 1 };
-        for (place, &word) in inst.iter().enumerate().skip(skip) {
-            if !may_use(inst, place) {
-                continue;
+            if !ids.touch(inst[2]) {
+                return None;
             }
-            if let Some(count) = uses.get_mut(word as usize) {
+            ids.pointer[inst[2] as usize] = true;
+        }
+        let pure = pure(inst, glsl, &ids.pointer);
+        // A value names its own result alone.
+        let skip = if pure { 3 } else { 1 };
+        for (place, &word) in inst.iter().enumerate().skip(skip) {
+            if may_use(inst, place)
+                && let Some(count) = ids.uses.get_mut(word as usize)
+            {
                 if *count == 0 {
-                    touched.push(word);
+                    ids.touched.push(word);
                 }
                 *count += 1;
             }
         }
+        let defines = match op(inst) {
+            OP_VARIABLE => inst.get(3) == Some(&STORAGE_FUNCTION),
+            OP_STORE => {
+                let pointer = *inst.get(1)?;
+                if ids.touch(pointer) {
+                    let p = pointer as usize;
+                    ids.stores[p] += 1;
+                    earlier_store[k as usize] = ids.last_store[p];
+                    ids.last_store[p] = k;
+                }
+                false
+            }
+            _ => pure && inst.len() >= 3,
+        };
+        if defines && ids.touch(inst[2]) {
+            ids.defined_at[inst[2] as usize] = k;
+            work.push(inst[2]);
+        }
     }
-    // Uses follow their values but for phis, so one pass from the end frees chains of values.
-    let mut dropped = vec![false; starts.len()];
-    for (k, &start) in starts.iter().enumerate().rev() {
-        let count = (out[start] >> 16) as usize;
-        let inst = &out[start..start + count];
-        if inst.len() < 3
-            || !pure(inst, glsl, pointer)
-            || uses.get(inst[2] as usize).copied() != Some(0)
-        {
+
+    let inst_at = |out: &[u32], k: usize| {
+        let start = starts[k];
+        start..start + (out[start] >> 16) as usize
+    };
+    let mut removed = vec![false; starts.len()];
+    let mut any = false;
+    // Removes instruction `k`, dropping the uses of the words it names from place `skip` on.
+    let remove =
+        |out: &[u32], k: usize, ids: &mut Ids, work: &mut Vec<u32>, removed: &mut [bool]| {
+            removed[k] = true;
+            let inst = &out[inst_at(out, k)];
+            let skip = if op(inst) == OP_STORE || op(inst) == OP_VARIABLE {
+                1
+            } else {
+                3
+            };
+            for (place, &word) in inst.iter().enumerate().skip(skip) {
+                if !may_use(inst, place) {
+                    continue;
+                }
+                if let Some(count) = ids.uses.get_mut(word as usize) {
+                    *count -= 1;
+                    work.push(word);
+                }
+            }
+        };
+    while let Some(id) = work.pop() {
+        let i = id as usize;
+        let k = ids.defined_at[i];
+        if k == NONE || removed[k as usize] {
             continue;
         }
-        dropped[k] = true;
-        for (place, &word) in inst.iter().enumerate().skip(3) {
-            if !may_use(inst, place) {
+        let k = k as usize;
+        if op(&out[inst_at(out, k)]) == OP_VARIABLE {
+            // Read nowhere but as the pointer of its stores: it goes with them.
+            if ids.uses[i] != ids.stores[i] {
                 continue;
             }
-            if let Some(count) = uses.get_mut(word as usize) {
-                *count = count.saturating_sub(1);
+            remove(out, k, ids, &mut work, &mut removed);
+            let mut store = ids.last_store[i];
+            while store != NONE {
+                remove(out, store as usize, ids, &mut work, &mut removed);
+                store = earlier_store[store as usize];
             }
+        } else if ids.uses[i] == 0 {
+            remove(out, k, ids, &mut work, &mut removed);
+        } else {
+            continue;
         }
+        any = true;
+    }
+    ids.clear();
+    if !any {
+        return Some(());
     }
     let mut to = from;
     for (k, &start) in starts.iter().enumerate() {
         let count = (out[start] >> 16) as usize;
-        if !dropped[k] {
+        if !removed[k] {
             out.copy_within(start..start + count, to);
             to += count;
         }
     }
     out.truncate(to);
-    for id in touched {
-        pointer[id as usize] = false;
-        uses[id as usize] = 0;
-    }
-    Some(())
-}
-
-/// Removes from the function in `out[from..]` its variables that only stores name, with
-/// those stores. `unread` is false for every id on entry and on return.
-fn drop_unread_variables(out: &mut Vec<u32>, from: usize, unread: &mut [bool]) -> Option<()> {
-    let mut variables: Vec<u32> = Vec::new();
-    for item in instructions(out, from) {
-        let (_, inst) = item?;
-        match op(inst) {
-            OP_VARIABLE if inst.get(3) == Some(&STORAGE_FUNCTION) => {
-                *unread.get_mut(inst[2] as usize)? = true;
-                variables.push(inst[2]);
-            }
-            OP_VARIABLE => {}
-            _ => {
-                // A word that names a variable anywhere but as a store's pointer reads it.
-                let skip = if op(inst) == OP_STORE { 2 } else { 1 };
-                for (place, &word) in inst.iter().enumerate().skip(skip) {
-                    if !may_use(inst, place) {
-                        continue;
-                    }
-                    if let Some(slot) = unread.get_mut(word as usize) {
-                        *slot = false;
-                    }
-                }
-            }
-        }
-    }
-    let mut to = from;
-    let mut at = from;
-    while at < out.len() {
-        let count = (out[at] >> 16) as usize;
-        let named = match out[at] & 0xffff {
-            OP_VARIABLE => out[at + 2],
-            OP_STORE => out[at + 1],
-            _ => u32::MAX,
-        };
-        if !unread.get(named as usize).copied().unwrap_or(false) {
-            out.copy_within(at..at + count, to);
-            to += count;
-        }
-        at += count;
-    }
-    out.truncate(to);
-    for variable in variables {
-        unread[variable as usize] = false;
-    }
     Some(())
 }
 
@@ -1285,7 +1491,6 @@ struct Dominance {
 
 impl Dominance {
     fn new(successors: &[Vec<u32>]) -> Self {
-        const NONE: u32 = u32::MAX;
         let n = successors.len();
         let mut order: Vec<u32> = Vec::with_capacity(n);
         let mut number = vec![NONE; n];
@@ -1464,22 +1669,73 @@ fn may_use(inst: &[u32], place: usize) -> bool {
 /// and the variable is left with its store alone. A variable `written` counts one store of, as
 /// the function is written, keeps its loads: the pass takes out what its folded branches leave
 /// behind, and leaves the rest of what a driver is handed as it was written. A load a
-/// decoration names (`decorated`) keeps its variable.
+/// decoration names (`decorated`) keeps its variable. Says whether any load went.
 fn forward_single_stores(
     out: &mut Vec<u32>,
     from: usize,
     written: &HashMap<u32, u32>,
     decorated: &[bool],
-) -> Option<()> {
+    ids: &mut Ids,
+) -> Option<bool> {
+    let forwarded = forward_loads(out, from, written, decorated, ids);
+    ids.clear();
+    forwarded
+}
+
+/// [`forward_single_stores`], leaving the ids it notes for the caller to clear.
+fn forward_loads(
+    out: &mut Vec<u32>,
+    from: usize,
+    written: &HashMap<u32, u32>,
+    decorated: &[bool],
+    ids: &mut Ids,
+) -> Option<bool> {
+    struct Candidate {
+        store: Option<(usize, u32)>,
+        stores: u32,
+        loads: Vec<usize>,
+        kept: bool,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for item in instructions(out, from) {
+        let (_, inst) = item?;
+        if op(inst) == OP_VARIABLE
+            && inst.len() == 4
+            && inst[3] == STORAGE_FUNCTION
+            && written.get(&inst[2]).is_some_and(|&n| n > 1)
+            && ids.touch(inst[2])
+        {
+            ids.candidate[inst[2] as usize] = candidates.len() as u32;
+            candidates.push(Candidate {
+                store: None,
+                stores: 0,
+                loads: Vec::new(),
+                kept: false,
+            });
+        }
+    }
+    if candidates.is_empty() {
+        return Some(false);
+    }
+    let candidate = |ids: &Ids, id: u32| {
+        ids.candidate
+            .get(id as usize)
+            .copied()
+            .filter(|&c| c != NONE)
+    };
+
     // Each instruction's start and block, and each block's label and successors.
     let mut starts: Vec<usize> = Vec::new();
     let mut block_of: Vec<u32> = Vec::new();
-    let mut labels: HashMap<u32, u32> = HashMap::new();
     let mut terminators: Vec<usize> = Vec::new();
     for item in instructions(out, from) {
         let (start, inst) = item?;
         if op(inst) == OP_LABEL {
-            labels.insert(*inst.get(1)?, terminators.len() as u32);
+            let label = *inst.get(1)?;
+            if !ids.touch(label) {
+                return None;
+            }
+            ids.block[label as usize] = terminators.len() as u32;
             terminators.push(start);
         } else if let Some(last) = terminators.last_mut()
             && !matches!(op(inst), OP_LINE | OP_NO_LINE | OP_FUNCTION_END)
@@ -1490,53 +1746,25 @@ fn forward_single_stores(
         block_of.push(terminators.len() as u32 - u32::from(!terminators.is_empty()));
     }
     if terminators.is_empty() {
-        return Some(());
+        return Some(false);
     }
     let inst_at = |start: usize| &out[start..start + (out[start] >> 16) as usize];
 
-    struct Candidate {
-        store: Option<(usize, u32)>,
-        stores: u32,
-        loads: Vec<usize>,
-        kept: bool,
-    }
-    let mut candidates: HashMap<u32, Candidate> = HashMap::new();
-    for &start in &starts {
-        let inst = inst_at(start);
-        if op(inst) == OP_VARIABLE
-            && inst.len() == 4
-            && inst[3] == STORAGE_FUNCTION
-            && written.get(&inst[2]).is_some_and(|&n| n > 1)
-        {
-            candidates.insert(
-                inst[2],
-                Candidate {
-                    store: None,
-                    stores: 0,
-                    loads: Vec::new(),
-                    kept: false,
-                },
-            );
-        }
-    }
-    if candidates.is_empty() {
-        return Some(());
-    }
     for (k, &start) in starts.iter().enumerate() {
         let inst = inst_at(start);
         match op(inst) {
             OP_VARIABLE | OP_LINE | OP_NO_LINE => continue,
-            OP_STORE if inst.len() == 3 && candidates.contains_key(&inst[1]) => {
-                let c = candidates.get_mut(&inst[1])?;
+            OP_STORE if inst.len() == 3 && candidate(ids, inst[1]).is_some() => {
+                let c = &mut candidates[candidate(ids, inst[1])? as usize];
                 c.stores += 1;
                 c.store = Some((k, inst[2]));
-                if let Some(c) = candidates.get_mut(&inst[2]) {
-                    c.kept = true;
+                if let Some(c) = candidate(ids, inst[2]) {
+                    candidates[c as usize].kept = true;
                 }
                 continue;
             }
-            OP_LOAD if inst.len() == 4 && candidates.contains_key(&inst[3]) => {
-                let c = candidates.get_mut(&inst[3])?;
+            OP_LOAD if inst.len() == 4 && candidate(ids, inst[3]).is_some() => {
+                let c = &mut candidates[candidate(ids, inst[3])? as usize];
                 c.loads.push(k);
                 c.kept |= decorated.get(inst[2] as usize).copied().unwrap_or(true);
                 continue;
@@ -1545,11 +1773,10 @@ fn forward_single_stores(
         }
         // A variable named anywhere else keeps its loads.
         for (place, &word) in inst.iter().enumerate().skip(1) {
-            if !may_use(inst, place) {
-                continue;
-            }
-            if let Some(c) = candidates.get_mut(&word) {
-                c.kept = true;
+            if may_use(inst, place)
+                && let Some(c) = candidate(ids, word)
+            {
+                candidates[c as usize].kept = true;
             }
         }
     }
@@ -1560,13 +1787,14 @@ fn forward_single_stores(
     for &t in &terminators {
         successors.push(
             targets(inst_at(t))
-                .map(|label| labels.get(&label).copied())
+                .map(|label| ids.block_of(label))
                 .collect::<Option<Vec<u32>>>()?,
         );
     }
     let tree = Dominance::new(&successors);
-    let mut value: HashMap<u32, u32> = HashMap::new();
-    for c in candidates.values() {
+    // The results of the loads that go.
+    let mut forwarded: Vec<u32> = Vec::new();
+    for c in &candidates {
         let Some((at, stored)) = c.store.filter(|_| !c.kept && c.stores == 1) else {
             continue;
         };
@@ -1581,44 +1809,49 @@ fn forward_single_stores(
         });
         if dominated {
             for &load in &c.loads {
-                value.insert(inst_at(starts[load])[2], stored);
+                let result = inst_at(starts[load])[2];
+                if ids.touch(result) {
+                    ids.forward[result as usize] = stored;
+                    forwarded.push(result);
+                }
             }
         }
     }
-    if value.is_empty() {
-        return Some(());
+    if forwarded.is_empty() {
+        return Some(false);
     }
+    let forwards = |ids: &Ids, id: u32| ids.forward.get(id as usize).is_some_and(|&v| v != NONE);
 
     // A forwarded value read where the pass does not know the operands keeps its variable.
     let mut kept: HashSet<u32> = HashSet::new();
     for &start in &starts {
         let inst = inst_at(start);
-        for (place, word) in inst.iter().enumerate().skip(1) {
-            if value.contains_key(word) && reads_value(inst, place).is_none() {
-                kept.insert(*word);
+        for (place, &word) in inst.iter().enumerate().skip(1) {
+            if forwards(ids, word) && reads_value(inst, place).is_none() {
+                kept.insert(word);
             }
         }
     }
     if !kept.is_empty() {
         // The other loads of a variable one of whose loads stays keep theirs too.
-        let stays: HashSet<u32> = candidates
-            .iter()
-            .filter(|(_, c)| {
-                c.loads
-                    .iter()
-                    .any(|&load| kept.contains(&inst_at(starts[load])[2]))
-            })
-            .map(|(&v, _)| v)
-            .collect();
-        for v in stays {
-            for &load in &candidates[&v].loads {
-                value.remove(&inst_at(starts[load])[2]);
+        for c in &candidates {
+            if c.loads
+                .iter()
+                .any(|&load| kept.contains(&inst_at(starts[load])[2]))
+            {
+                for &load in &c.loads {
+                    ids.forward[inst_at(starts[load])[2] as usize] = NONE;
+                }
             }
+        }
+        forwarded.retain(|&id| ids.forward[id as usize] != NONE);
+        if forwarded.is_empty() {
+            return Some(false);
         }
     }
     // A stored value that is itself a forwarded load's names that load's value.
     let resolve = |mut id: u32| {
-        while let Some(&v) = value.get(&id) {
+        while let Some(&v) = ids.forward.get(id as usize).filter(|&&v| v != NONE) {
             id = v;
         }
         id
@@ -1627,7 +1860,7 @@ fn forward_single_stores(
     let mut rewritten: Vec<u32> = Vec::with_capacity(out.len() - from);
     for &start in &starts {
         let inst = inst_at(start);
-        if op(inst) == OP_LOAD && inst.len() == 4 && value.contains_key(&inst[2]) {
+        if op(inst) == OP_LOAD && inst.len() == 4 && forwards(ids, inst[2]) {
             continue;
         }
         let first = rewritten.len();
@@ -1640,7 +1873,7 @@ fn forward_single_stores(
     }
     out.truncate(from);
     out.extend_from_slice(&rewritten);
-    Some(())
+    Some(true)
 }
 
 /// The labels `last`, a block's last instruction, may branch to.
@@ -1662,12 +1895,7 @@ fn targets(last: &[u32]) -> impl Iterator<Item = u32> + '_ {
 /// A definition is the nearest store or join that dominates the load, as in SSA form, where
 /// a variable's joins lie on the iterated dominance frontier of its stores. Only the joins a
 /// load reads, directly or through another join, are made.
-fn reaching_definitions(
-    folder: &mut Folder<'_>,
-    blocks: &[Block],
-    index: &HashMap<u32, usize>,
-) -> Option<Vec<Vec<u32>>> {
-    const NONE: u32 = u32::MAX;
+fn reaching_definitions(folder: &mut Folder<'_>, blocks: &[Block]) -> Option<Vec<Vec<u32>>> {
     let code = folder.code;
     let n = blocks.len();
     let mut joins_at: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -1679,7 +1907,7 @@ fn reaching_definitions(
         let last = code.get(b.terminator..b.terminator + count)?;
         let mut to = Vec::new();
         for target in targets(last) {
-            to.push(*index.get(&target)? as u32);
+            to.push(folder.ids.block_of(target)?);
         }
         successors.push(to);
     }
