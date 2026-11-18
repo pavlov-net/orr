@@ -212,7 +212,7 @@ fn recompile(
     let settings = Settings {
         tool: "",
         options: &options,
-        metal: metal_options.as_deref(),
+        metal: metal_options.as_deref().filter(|_| entry.metal),
         metal_sdk: manifest.metal_sdk.as_deref(),
         asserts: manifest.asserts,
         separate_debug: false,

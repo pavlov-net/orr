@@ -34,6 +34,7 @@ fn main() {
         b.kernels(&src)
             .include(&openpbr)
             .dep("orr_scene")
+            .vulkan_only("path/standins")
             .publish_types("::orr_lighting::types")
             .compile()
     });

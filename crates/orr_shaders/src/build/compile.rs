@@ -46,6 +46,8 @@ pub struct Build {
     /// module's Metal libraries with.
     metal_sdk: Option<&'static str>,
     allowed: BTreeSet<Lint>,
+    /// Kernels left out of the Metal check and Metal libraries ([`Build::vulkan_only`]).
+    vulkan_only: BTreeSet<String>,
     out_dir: Option<PathBuf>,
     link_points: Vec<PathBuf>,
     links: Vec<Link>,
@@ -140,6 +142,7 @@ impl Build {
                 .map_or_else(|| metal_sdk.is_some(), |v| v == "1"),
             metal_sdk,
             allowed: BTreeSet::new(),
+            vulkan_only: BTreeSet::new(),
             out_dir: None,
             link_points: Vec::new(),
             links: Vec::new(),
@@ -304,6 +307,15 @@ impl Build {
         self
     }
 
+    /// Leaves the kernels in `list` (`;`-separated names, `path/name`) out of the Metal check
+    /// and the Metal libraries, here and in builds that link them: kernels compiled only for what
+    /// the Vulkan driver reports of them. Their entries have no Metal function.
+    pub fn vulkan_only(mut self, list: &str) -> Self {
+        self.vulkan_only
+            .extend(list.split(';').filter(|s| !s.is_empty()).map(str::to_owned));
+        self
+    }
+
     /// Turns a lint off for this build.
     pub fn allow(mut self, lint: Lint) -> Self {
         self.allowed.insert(lint);
@@ -385,6 +397,7 @@ impl Build {
                             dir: root.clone(),
                         },
                         points,
+                        vulkan_only: self.vulkan_only.contains(name),
                     });
                 }
             }
@@ -395,6 +408,7 @@ impl Build {
         let jobs = kernels
             .into_iter()
             .map(|(name, path)| Job {
+                metal: !self.vulkan_only.contains(&name),
                 record: records.join(format!("{name}.json")),
                 spv: out_dir.join(format!("{name}.spv")),
                 module: qualified(prefix.as_deref(), &name),
@@ -645,6 +659,14 @@ impl Build {
                 .map(|(name, r)| (name, r, false))
                 .chain(linked_modules.iter().map(|(name, r)| (name, r, true)))
                 .map(|(name, r, linked)| ManifestModule {
+                    metal: if linked {
+                        !listed
+                            .kernels
+                            .iter()
+                            .any(|k| &k.name == name && k.vulkan_only)
+                    } else {
+                        !self.vulkan_only.contains(name)
+                    },
                     name: name.clone(),
                     module: r.module.clone(),
                     kernel: r.kernel.clone(),
@@ -853,6 +875,7 @@ fn linked_jobs(links: &[Link], listed: &LinkPoints, out_dir: &Path) -> Result<Ve
             });
         }
         jobs.push(Job {
+            metal: !k.vulkan_only,
             name: k.name.clone(),
             module: qualified(k.root.prefix.as_deref(), &k.name),
             path: k.path.clone(),
@@ -916,6 +939,8 @@ pub(super) struct ManifestModule {
     pub(super) inputs: Vec<PathBuf>,
     /// The generated link modules composed with the kernel.
     pub(super) links: Vec<LinkFile>,
+    /// The Metal check covers the kernel when the build runs it.
+    pub(super) metal: bool,
 }
 
 /// A generated link module as the manifest lists it.
@@ -1026,6 +1051,8 @@ struct Job {
     spv: PathBuf,
     /// Generated link modules composed with the kernel.
     links: Vec<LinkModule>,
+    /// The Metal check covers the kernel when the build runs it.
+    metal: bool,
 }
 
 fn print_cargo<'a>(
@@ -1150,6 +1177,7 @@ fn cache_key(settings: &Settings<'_>, job: &Job, inputs: &[PathBuf]) -> Option<S
         h.update(&[0]);
     }
     h.update(job.path.to_string_lossy().as_bytes());
+    h.update(&[u8::from(job.metal)]);
     for l in &job.links {
         h.update(&[0]);
         h.update(l.module.as_bytes());
@@ -1322,7 +1350,7 @@ fn compile_one(
     };
     let bytes: &[u8] = bytemuck::cast_slice(&compiled.words);
     write(&job.spv, bytes)?;
-    let (metal, metallib) = match settings.metal {
+    let (metal, metallib) = match settings.metal.filter(|_| job.metal) {
         Some(metal_options) => {
             let session = global.session(metal_options).map_err(slang_err)?;
             metal_issues(&session, settings, &compiled.model, &unit, &job.spv)?
