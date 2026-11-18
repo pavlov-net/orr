@@ -5,7 +5,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use orr_shaders::build::{Build, DebugInfo, Lint};
+use orr_shaders::build::{Build, Lint};
 
 fn main() {
     let dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -13,7 +13,6 @@ fn main() {
     let built = Build::new().and_then(|b| {
         b.kernels(dir.join("src"))
             .dep("orr_gpu")
-            .debug_info(DebugInfo::Embedded)
             .metal_check(apple)
             .allow(Lint::Metal)
             .compile()
