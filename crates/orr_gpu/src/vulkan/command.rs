@@ -218,7 +218,8 @@ impl<'q> CommandList<'q> {
 
     /// Makes writes in `before` stages visible to `after` stages. [`Stages::RAY`],
     /// [`Stages::DECOMPRESS`] and [`Stages::PREPROCESS`] are ignored without their `Caps`,
-    /// since no such work can run then.
+    /// since no such work can run then. It carries memory accesses even with no hazards:
+    /// `drain` relies on that to make NVIDIA's driver wait before an exact pass's timestamp.
     pub fn barrier(&mut self, before: Stages, after: Stages, hazards: Hazards) {
         let caps = &self.queue.shared.caps;
         let mut src = vk_stages(before, caps);
