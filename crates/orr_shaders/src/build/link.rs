@@ -76,7 +76,7 @@ const SURFACE: Switch = Switch {
             name: "surface",
             args: "i, s, depth_offset",
             optional: true,
-            declares: 0,
+            declares: surface_declares::SURFACE,
             forward: true,
         },
         Method {
@@ -84,7 +84,7 @@ const SURFACE: Switch = Switch {
             name: "adjust",
             args: "i, s, depth_offset",
             optional: true,
-            declares: 0,
+            declares: surface_declares::ADJUST,
             forward: true,
         },
         Method {
@@ -92,7 +92,7 @@ const SURFACE: Switch = Switch {
             name: "coverage",
             args: "i, coverage",
             optional: true,
-            declares: 0,
+            declares: surface_declares::COVERAGE,
             forward: true,
         },
         Method {
@@ -100,7 +100,7 @@ const SURFACE: Switch = Switch {
             name: "feedback",
             args: "i",
             optional: true,
-            declares: 0,
+            declares: surface_declares::FEEDBACK,
             forward: true,
         },
         Method {
@@ -108,7 +108,7 @@ const SURFACE: Switch = Switch {
             name: "coverage_feedback",
             args: "i",
             optional: true,
-            declares: 0,
+            declares: surface_declares::COVERAGE,
             forward: true,
         },
         Method {
@@ -116,7 +116,7 @@ const SURFACE: Switch = Switch {
             name: "coverage_reads",
             args: "i",
             optional: true,
-            declares: 0,
+            declares: surface_declares::COVERAGE,
             forward: true,
         },
         lobe(

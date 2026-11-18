@@ -100,8 +100,9 @@ pub const DEFAULT_ENVIRONMENT: &str = "EnvironmentMap";
 pub const DEFAULT_MEDIUM: &str = "NoMedium";
 
 /// What a linked surface type declares by the optional methods of `ISurface` it has: each lobe
-/// its materials may show beyond the plain surface, and that one may share a triangle with a
-/// material of another surface id.
+/// its materials may show beyond the plain surface, that one may share a triangle with a
+/// material of another surface id, and each part of a hit's shading or coverage it takes over
+/// from the standard surface.
 pub mod surface_declares {
     pub const TRANSMISSION: u32 = 1 << 0;
     pub const SUBSURFACE: u32 = 1 << 1;
@@ -113,6 +114,26 @@ pub mod surface_declares {
     pub const OTHER_SIDE: u32 = 1 << 7;
     /// The type shades every hit itself (`always_shades`).
     pub const ALWAYS_SHADES: u32 = 1 << 8;
+    /// The type shades the hits it is asked for (`surface`).
+    pub const SURFACE: u32 = 1 << 9;
+    /// It changes the standard surface's plain part (`adjust`).
+    pub const ADJUST: u32 = 1 << 10;
+    /// It reports what its shading reads to the texture feedback (`feedback`).
+    pub const FEEDBACK: u32 = 1 << 11;
+    /// It decides its triangles' coverage (`coverage`, `coverage_feedback` or `coverage_reads`).
+    pub const COVERAGE: u32 = 1 << 12;
+    /// Everything a hit's shading calls of the type: one that declares none of it shades its hits
+    /// as the standard surface does.
+    pub const SHADING: u32 = TRANSMISSION
+        | SUBSURFACE
+        | COAT
+        | FUZZ
+        | THIN_FILM
+        | EMISSION
+        | ANISOTROPY
+        | SURFACE
+        | ADJUST
+        | FEEDBACK;
 }
 
 /// Kernels compiled by a consumer's build with its own link-time types: `KERNELS` in the

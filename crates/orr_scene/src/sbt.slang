@@ -5,8 +5,9 @@
 //
 // A run's path and shadow groups are its geometry's (a copy's cooked or skinned clusters, a
 // producer's clusters, strands) for its material's linked surface: the pipeline holds those
-// groups once per pin, a surface id its shaders are made for (`scene_may.slang`'s
-// `hit_surface`), and once for any id, which a material whose back shows another id takes.
+// groups once per pin, a surface id whose materials they serve (`scene_may.slang`'s
+// `hit_surface` says which id their shaders are made for), and once for any id, which a material
+// whose back shows another id takes.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.trace;

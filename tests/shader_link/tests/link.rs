@@ -48,7 +48,10 @@ fn every_surface_method_reaches_the_type_linked_for_its_id() {
     }
     assert_eq!(
         linked::KERNELS.surface_declares,
-        [0, 0, orr_shaders::surface_declares::FUZZ],
+        {
+            use orr_shaders::surface_declares::{ADJUST, COVERAGE, FUZZ, SURFACE};
+            [SURFACE | COVERAGE, SURFACE, ADJUST | FUZZ]
+        },
         "what each type declares, in link order"
     );
 }

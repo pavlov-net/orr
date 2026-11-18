@@ -603,7 +603,13 @@ impl Table {
         let proxy_march =
             proxies.then(|| Self::stage(&mut specs, folded("volume_march", Role::ProxyMarch)));
         // `hit_surface` of the hit shaders of each pin: any id, then each id from 0 on. Where
-        // no surface links every material shows id 0.
+        // no surface links every material shows id 0. A closest-hit reaches a linked type only
+        // through its shading and an any-hit only through its coverage, so the shader of a type
+        // that declares neither is the standard surface's, made for id 0.
+        let reaches = |role| match role {
+            Role::Hit => surface_declares::SHADING,
+            _ => surface_declares::COVERAGE,
+        };
         let pinned = |entry, role, pin: u32, geometry: Geometry| Spec {
             kernel: Kernel::Plain,
             entry,
@@ -614,6 +620,8 @@ impl Table {
                 0
             } else if pin == 0 {
                 u32::MAX
+            } else if pin >= 2 && kernels.surface_declares[pin as usize - 2] & reaches(role) == 0 {
+                0
             } else {
                 pin - 1
             },

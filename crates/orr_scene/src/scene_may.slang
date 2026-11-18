@@ -75,8 +75,9 @@ static const uint hit_surface = ANY_SURFACE;
 // The linked surface id every hit and candidate a pipeline reconstructs shows, where it is made for
 // the hits of one id's materials alone (a ray tracing pipeline's hit shaders, chosen by the
 // material's hit records): what a material of an id nothing links shows is id 0's. A pipeline
-// made with an id runs only on hits whose material's id is that one, so the linked surface switch
-// keeps that id's case alone.
+// made with an id runs only on hits whose material's id is that one, or with id 0 on those of a
+// linked type that declares nothing the shader calls, so the linked surface switch keeps that id's
+// case alone.
 [vk::constant_id(112)] const uint hit_surface = ANY_SURFACE;
 #endif
 
