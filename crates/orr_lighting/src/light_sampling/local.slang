@@ -2,7 +2,9 @@
 // moves each frame (`local_tile_offset`): the lights the view's last frame fed back at the
 // tile's surfaces, found by reprojecting each pixel through the G-buffer's motion. A pixel
 // whose reprojected surface lay at another distance from the camera was hidden then, and adds
-// nothing; the sampler's share falls with the tile's surfaces that found no feedback. `main`
+// nothing; the sampler's share falls with the tile's surfaces that found no feedback. Where the
+// view's paths trace its camera rays, the samplers run before this frame's surfaces are known,
+// and take the surfaces the last frame's camera rays met in their place (`retraced`). `main`
 // also bounds the tile's surfaces when a slot's emissive entry has a cooked set holding a tree,
 // and `refine` splits those slots toward them. `presample` then draws `LOCAL_SAMPLES` points of
 // each sampler, for the vertices that read a sampler's points ready drawn.
@@ -21,6 +23,7 @@ import orr_scene.tables;
 import orr_scene.view;
 import orr_scene.gbuffer;
 import orr_scene.surface;
+import orr_scene.visibility;
 import orr_lighting.environment;
 import orr_lighting.light_sampling;
 
@@ -29,6 +32,9 @@ extern struct Surface : ISurfaces = StandardSurface;
 // A reprojected pixel's last camera distance must lie within this share of the distance a
 // static surface would have had.
 static const float DISTANCE_TOLERANCE = 0.05;
+
+// Points along a pixel's ray `retraced` tries.
+static const uint RETRACED_STEPS = 3;
 
 // Distinct lights a tile gathers before it keeps the `LOCAL_LIGHTS` most named, ties to the
 // lower id, so the samplers do not depend on the order lanes gather in.
@@ -58,14 +64,16 @@ struct Root
     uint frame;
     uint fed_lights;
     uint fed_entries;
-    uint _pad1;
+    // 1: the view's paths trace its camera rays, so the G-buffer holds no surface yet.
+    uint traced;
 }
 ORR_ROOT(Root);
 
 groupshared uint gathered_ids[GATHERED];
 groupshared uint gathered_counts[GATHERED];
-// Surfaces in the tile, and those that found feedback.
-groupshared uint surfaces[2];
+// Surfaces in the tile, those that found feedback, and those whose point is known, which the
+// bounds take.
+groupshared uint surfaces[3];
 // The tile's surface points' box as `ordered` floats, the largest distance from its center,
 // and the smallest cosine of their normals to their mean.
 groupshared uint bounds_lo[3];
@@ -100,18 +108,82 @@ bool reprojected(uint2 pixel, out uint id)
     float expected = length(q + v.eye_motion.xyz);
     if (abs(asfloat(fed.y) - expected) > DISTANCE_TOLERANCE * expected)
         return true;
-    if (fed.x == NO_LIGHT)
-        return true;
+    id = fed_light(fed.x);
+    return true;
+}
+
+// The light the last frame's feedback id `fed` names in this frame's tables, or NO_LIGHT where
+// it names none or the scene's selection leaves it out.
+uint fed_light(uint fed)
+{
+    if (fed == NO_LIGHT)
+        return NO_LIGHT;
     // An emissive entry follows the lights and the environment the entries, whose tables may
     // have grown since.
-    uint now = fed.x;
-    if (fed.x >= root.fed_lights)
+    uint now = fed;
+    if (fed >= root.fed_lights)
     {
-        uint entry = fed.x - root.fed_lights;
+        uint entry = fed - root.fed_lights;
         now = entry < root.fed_entries ? root.set.scene.light_capacity + entry : feedback_environment(root.set);
     }
-    if (global_selection(root.set, now) > 0.0)
-        id = now;
+    return global_selection(root.set, now) > 0.0 ? now : NO_LIGHT;
+}
+
+// `reprojected` where the view's paths trace its camera rays, whose hits write the G-buffer after
+// the samplers have run: the surfaces this frame's rays meet are taken from those the last
+// frame's met. Each step places a point along this frame's ray through `pixel` as far from the
+// last frame's eye as the surface the last frame met at a pixel, starting from `pixel` itself,
+// and moves to the pixel that point lay in then. Where that pixel's surface lies within the
+// tolerance of the point's distance, `reprojected`'s test of a static surface, the point is the
+// surface's, at `located` `position`, and it takes that pixel's feedback. As in `reprojected`, a
+// surface the last frame hid behind another or saw off its screen counts without feedback: the
+// search ends on a surface at another distance or off the screen. The pixel counts as no surface
+// where the last frame saw the sky at `pixel` or where a step lands, or no point along the ray
+// lies as far from the last eye as the surface at `pixel`.
+bool retraced(uint2 pixel, out uint id, out bool located, out float3 position)
+{
+    id = NO_LIGHT;
+    located = false;
+    position = float3(0.0);
+    if (root.reset != 0)
+        return false;
+    ViewConstants* v = root.view;
+    Texture2D<uint2> previous = root.previous.get<Texture2D<uint2>>();
+    float d = asfloat(previous.Load(int3(pixel, 0)).y);
+    if (!(d > 0.0))
+        return false;
+    float2 extent = float2(root.gbuffer.extent);
+    float2 uv = (float2(pixel) + 0.5) / extent;
+    float3 dir = render_from_view(v, view_direction(v, uv)) - v.eye_render.xyz;
+    // The last frame's eye lies `motion` behind this one's.
+    float3 motion = v.eye_motion.xyz;
+    float b = dot(dir, motion);
+    float c = dot(motion, motion);
+    for (uint k = 0; k < RETRACED_STEPS; k++)
+    {
+        // The farther of the ray's two points `d` from the last eye; where it lies behind this
+        // eye, so does the nearer. A later step's surface off the ray lay at another distance.
+        float s = b * b - c + d * d;
+        float t = s >= 0.0 ? sqrt(s) - b : -1.0;
+        if (!(t > 0.0))
+            return k > 0;
+        float3 q = t * dir;
+        float2 previous_uv = uv + still_motion(v, q);
+        if (any(previous_uv < 0.0) || any(previous_uv >= 1.0))
+            return true;
+        uint2 fed = previous.Load(int3(uint2(previous_uv * extent), 0));
+        float met = asfloat(fed.y);
+        if (!(met > 0.0))
+            return false;
+        if (abs(met - d) <= DISTANCE_TOLERANCE * d)
+        {
+            id = fed_light(fed.x);
+            located = true;
+            position = v.eye_render.xyz + q;
+            return true;
+        }
+        d = met;
+    }
     return true;
 }
 
@@ -152,7 +224,7 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint lane: SV
         gathered_ids[lane] = NO_LIGHT;
         gathered_counts[lane] = 0;
     }
-    if (lane < 2)
+    if (lane < 3)
         surfaces[lane] = 0;
     if (lane < 3)
     {
@@ -169,9 +241,22 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint lane: SV
     int2 at = int2(group.xy * LOCAL_TILE + thread.xy) - int2(local_tile_offset(root.frame));
     uint2 pixel = uint2(max(at, int2(0)));
     uint id = NO_LIGHT;
-    bool surface = all(at >= 0) && all(pixel < root.gbuffer.extent) && reprojected(pixel, id);
+    float3 position = float3(0.0);
+    bool traced = root.traced != 0;
+    bool inside = all(at >= 0) && all(pixel < root.gbuffer.extent);
+    bool located = false;
+    bool surface = false;
+    if (inside && traced)
+        surface = retraced(pixel, id, located, position);
+    else if (inside)
+    {
+        surface = reprojected(pixel, id);
+        located = surface;
+    }
     if (surface)
         InterlockedAdd(surfaces[0], 1);
+    if (located)
+        InterlockedAdd(surfaces[2], 1);
     if (id != NO_LIGHT)
     {
         InterlockedAdd(surfaces[1], 1);
@@ -239,7 +324,7 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint lane: SV
         out.receiver = float4(0.0, 0.0, 0.0, -1.0);
         out.normal = float4(0.0, 0.0, 1.0, -1.0);
         built = out;
-        bounded = tree && surfaces[0] > 0;
+        bounded = tree && surfaces[2] > 0;
     }
     GroupMemoryBarrierWithGroupSync();
     // Only `refine` reads the bounds, and only for slots whose entries hold trees.
@@ -250,13 +335,16 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint lane: SV
         return;
     }
 
-    float3 position = float3(0.0);
+    // The last frame's feedback keeps no normals: the tiles of a traced view bound none.
     float3 normal = float3(0.0);
-    if (surface)
+    if (located && !traced)
     {
         GSurface g = load_gsurface(root.view, root.gbuffer, pixel);
         position = g.position;
         normal = g.normal;
+    }
+    if (located)
+    {
         for (uint c = 0; c < 3; c++)
         {
             InterlockedMin(bounds_lo[c], ordered(position[c]));
@@ -276,7 +364,7 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint lane: SV
     float3 center = 0.5 * (lo + hi);
     float3 sum = normal_sums[0];
     float3 axis = dot(sum, sum) > 0.0 ? normalize(sum) : float3(0.0, 0.0, 1.0);
-    if (surface)
+    if (located)
     {
         InterlockedMax(bounds_radius, asuint(length(position - center)));
         InterlockedMin(bounds_cos, ordered(dot(normal, axis)));

@@ -106,8 +106,9 @@ pub struct ViewLighting {
     /// The paths trace the view's camera rays, and their hits, the paths' first vertices, write
     /// the view's G-buffer: the pass's raster state is of a view no raster drew
     /// ([`orr_scene::Frame::traced_view`]). The motion they write is the camera's
-    /// alone, the hits see the scene's ray tracing geometry and not its drawn entries, and the
-    /// local light samplers, which read the G-buffer before the paths, are off.
+    /// alone, and the hits see the scene's ray tracing geometry and not its drawn entries. The
+    /// local light samplers run before the paths, so they take the surfaces the last frame's
+    /// camera rays met, as far as the camera's motion finds them again, and bound no normals.
     pub traced_primary: bool,
 }
 
@@ -1411,10 +1412,9 @@ fn path_mode(lighting: &ViewLighting) -> u32 {
 }
 
 /// The share of a view's first-vertex candidates its local light samplers draw: 0 under the
-/// reference, which has none, and where the paths trace the camera rays, whose samplers would
-/// read a G-buffer the paths have yet to write.
+/// reference, which has none.
 fn local_share(lighting: &ViewLighting) -> f32 {
-    if lighting.reference.is_some() || lighting.traced_primary {
+    if lighting.reference.is_some() {
         0.0
     } else {
         lighting.local_light_share.clamp(0.0, MAX_LOCAL_LIGHT_SHARE)
@@ -2019,7 +2019,7 @@ impl LightingKernels {
                     frame: pass.sample_index,
                     fed_lights: view.feedback[1 - written].tables.lights,
                     fed_entries: view.feedback[1 - written].tables.entries,
-                    _pad1: 0,
+                    traced: u32::from(lighting.traced_primary),
                 },
             );
             let [w, h] = view.local_tiles;

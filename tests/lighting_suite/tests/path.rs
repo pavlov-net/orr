@@ -384,16 +384,8 @@ fn reference_error_halves_with_four_times_the_frames() {
     let mut bed = Bed::new(Analytic::CornellBox);
     let p = paths(reference(4));
     let truth = render_paths(&mut bed, &p, 256, 100);
-    let mut error = |frames, seed| {
-        let a = render_paths(&mut bed, &p, frames, seed);
-        let sum: f64 = a
-            .mean
-            .iter()
-            .zip(&truth.mean)
-            .map(|(a, t)| (luminance(a) - luminance(t)).powi(2))
-            .sum();
-        (sum / a.mean.len() as f64).sqrt()
-    };
+    let mut error =
+        |frames, seed| rms_difference(&render_paths(&mut bed, &p, frames, seed), &truth);
     let e4 = error(4, 1);
     let e16 = error(16, 2);
     assert!(
@@ -1092,6 +1084,129 @@ fn a_views_light_feedback_follows_its_lights_as_the_light_tables_grow() {
     assert!(
         stats.feedback_pixels > 0,
         "no pixel of the frame that grew the table fed back a light"
+    );
+    assert_clean();
+}
+
+/// Each tile's most probable light in the bed view's local samplers, `None` where a sampler
+/// holds no slot.
+fn tile_lights(bed: &Bed) -> Vec<Option<u32>> {
+    let (local, [columns, rows]) = bed.view().local_lights();
+    let tiles: Vec<LocalLights> = read(local, u64::from(columns * rows));
+    tiles
+        .iter()
+        .map(|t| {
+            let mut below = 0;
+            t.lights[..t.count as usize]
+                .iter()
+                .map(|l| {
+                    let p = l.cdf - below;
+                    below = l.cdf;
+                    (p, l.id)
+                })
+                .max()
+                .map(|(_, id)| id)
+        })
+        .collect()
+}
+
+/// Where the paths trace the camera rays, the local samplers run before the frame's surfaces are
+/// known and take the surfaces the last frame's camera rays met, found again along this frame's
+/// rays: past a step of the camera sideways over a floor lit by a lamp on each side, each tile
+/// draws most from the lamp the raster view's tile does, which finds its surfaces in the
+/// G-buffer.
+#[test]
+fn a_traced_views_local_samplers_follow_a_camera_step() {
+    let lamp = |x: f64| Light::Sphere {
+        position: DVec3::new(x, 0.3, 0.0),
+        radius: 0.05,
+        intensity: Vec3::splat(20.0),
+        cone: None,
+    };
+    let spec = Spec {
+        copies: vec![at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
+        lights: vec![lamp(-1.5), lamp(1.5)],
+        environment: None,
+        eye: Vec3::new(0.0, 2.5, 4.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        focus: None,
+    };
+    let step = Vec3::new(1.5, 0.0, 0.0);
+    let [raster, traced] = [false, true].map(|traced| {
+        let mut bed = Bed::with(spec.clone());
+        let p = paths(ViewLighting {
+            debug_view: LightingDebugView::DirectOnly,
+            traced_primary: traced,
+            ..ViewLighting::default()
+        });
+        render_paths(&mut bed, &p, 4, 1);
+        bed.follow(spec.eye + step, spec.target + step, 4, &mut |list, f| {
+            p.record(list, f);
+        });
+        tile_lights(&bed)
+    });
+    let named = raster.iter().filter(|t| t.is_some()).count();
+    let differ = raster.iter().zip(&traced).filter(|(a, b)| a != b).count();
+    assert!(named > 0, "no raster tile names a lamp");
+    assert!(
+        differ <= named / 8,
+        "{differ} of {named} tiles draw most from another lamp than the raster view's"
+    );
+    assert_clean();
+}
+
+/// The root mean square of the luminance difference of `a` and `b`.
+fn rms_difference(a: &Accumulated, b: &Accumulated) -> f64 {
+    let sum: f64 = a
+        .mean
+        .iter()
+        .zip(&b.mean)
+        .map(|(p, q)| (luminance(p) - luminance(q)).powi(2))
+        .sum();
+    (sum / a.mean.len() as f64).sqrt()
+}
+
+/// Where the paths trace the camera rays, the first vertices, which the camera rays' hits run,
+/// draw from the local samplers too: the direct light they give agrees with the reference's, and
+/// the samplers leave less noise than the scene's selection alone.
+#[test]
+fn traced_first_vertices_draw_from_the_local_samplers() {
+    let mut bed = Bed::with(many_lights());
+    let traced = |local_light_share| {
+        paths(ViewLighting {
+            debug_view: LightingDebugView::DirectOnly,
+            traced_primary: true,
+            local_light_share,
+            ..ViewLighting::default()
+        })
+    };
+    let guided = traced(0.5);
+    let truth = render_paths(
+        &mut bed,
+        &paths(debug(LightingDebugView::DirectOnly, 1)),
+        96,
+        1,
+    );
+    let image = render_paths(&mut bed, &guided, 96, 2);
+    assert_close("image", image_mean(&image), image_mean(&truth), 0.015);
+    for (q, (g, t)) in quarter_means(&image)
+        .into_iter()
+        .zip(quarter_means(&truth))
+        .enumerate()
+    {
+        assert_close(&format!("quarter {q}"), g, t, 0.04);
+    }
+    let noise = |bed: &mut Bed, p: &Paths| {
+        let a = render_paths(bed, p, 16, 3);
+        let b = render_paths(bed, p, 16, 4);
+        rms_difference(&a, &b)
+    };
+    let with = noise(&mut bed, &guided);
+    let without = noise(&mut bed, &traced(0.0));
+    assert!(
+        with < 0.6 * without,
+        "noise {with} with the local samplers, {without} without"
     );
     assert_clean();
 }
