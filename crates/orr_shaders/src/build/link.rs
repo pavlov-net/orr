@@ -319,9 +319,6 @@ pub(super) struct KernelPoints {
     pub(crate) path: PathBuf,
     pub(super) root: Root,
     pub(super) points: Vec<Declared>,
-    /// Left out of the Metal check ([`Build::vulkan_only`](super::Build::vulkan_only)).
-    #[serde(default)]
-    pub(super) vulkan_only: bool,
 }
 
 /// `link_points.json`: every kernel file that declares a link point.

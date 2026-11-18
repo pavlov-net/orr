@@ -1,6 +1,6 @@
 // What a path holds between its shaders: PATH_HOT_WORDS words of 16 bytes in its slot, packed,
-// which every shader of the common path loads and stores whole, and the budget the tracer's stages
-// are held to (`tests/lighting_suite/tests/budget.rs`).
+// which every shader of the common path loads and stores whole, and the caps the tracer's stages
+// are held to.
 //
 // A path's ray, its throughput and its pending shadow job are all a hit's shader leaves for the
 // raygen: the raygen holds the slot's address across a trace or an invoke and nothing of the path.
@@ -83,13 +83,6 @@ public static const uint PAYLOAD_BENT = 1;
 // What a raygen keeps across a trace or an invoke, bytes: the driver's stack size of the raygen
 // beyond its hit object.
 [Host] public static const uint RAYGEN_LIVE_BYTES = 32;
-// A ray's payload.
-[Host] public static const uint PAYLOAD_BYTES = 16;
-// Registers of the plain opaque hit shader and of an alpha test's any-hit, as their compute
-// stand-ins report them, with no local or shared memory: a launch runs at the count of its
-// largest shader up to 128, past which that shader spills.
-[Host] public static const uint HIT_REGISTERS = 128;
-[Host] public static const uint ANY_HIT_REGISTERS = 64;
 // The caps on what a stage hands the driver, in instructions after the fold, by what it does: a
 // growth budget on orr's own code per stage role, which a feature's allowance adds to where the
 // pipeline's mask keeps the feature. A cap is raised only as a stated decision with its reason.

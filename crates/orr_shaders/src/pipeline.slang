@@ -21,11 +21,22 @@ import orr_shaders.abi;
 import orr_shaders.trace;
 __exported import orr_shaders.hits;
 
-// What crosses a trace, invoke or call in registers. A launch pays registers in every thread
-// for its widest payload past 16 bytes, so pipelines pass this and keep the rest in memory.
+// The most a ray's payload holds, bytes. A launch pays registers in every thread for its widest
+// payload past this, so pipelines pass `Payload` and keep the rest in memory.
+static const uint PAYLOAD_BYTES = 16;
+
+// What crosses a trace, invoke or call in registers.
 public struct Payload
 {
     public uint4 words;
+}
+
+// Fails the build where a trace or invoke passes a payload past PAYLOAD_BYTES. Slang checks a
+// `static_assert` only in a function body it compiles, not beside a type.
+[ForceInline]
+void payload_fits<P>()
+{
+    static_assert(sizeof(P) <= PAYLOAD_BYTES, "a ray's payload is past PAYLOAD_BYTES");
 }
 
 // The attributes of a triangle hit; an intersection shader reports its own type.
@@ -87,6 +98,7 @@ public void any_hit_decides(uint d)
 [ForceInline]
 public void trace<P>(Tlas tlas, uint flags, uint mask, uint ray_type, uint ray_types, uint miss, RayDesc ray, inout P payload)
 {
+    payload_fits<P>();
     TraceRay(tlas.get(), ray_flags(flags), mask, ray_type, ray_types, miss, ray, payload);
 }
 
@@ -224,6 +236,7 @@ public extension HitObject
     // Runs the closest-hit or miss shader of the record, with `payload`.
     public void invoke<P>(inout P payload)
     {
+        payload_fits<P>();
         HitObject::Invoke(this, payload);
     }
 
@@ -234,6 +247,7 @@ public extension HitObject
 [ForceInline]
 public void reorder_invoke<P>(Traced h, inout P payload)
 {
+    payload_fits<P>();
     [__vulkanRayPayload]
     static P p;
     p = payload;
@@ -250,6 +264,7 @@ public void reorder_invoke<P>(Traced h, inout P payload)
 [ForceInline]
 public void reorder_invoke<P>(Traced h, uint hint, uint bits, inout P payload)
 {
+    payload_fits<P>();
     [__vulkanRayPayload]
     static P p;
     p = payload;
@@ -267,6 +282,7 @@ public void reorder_invoke<P>(Traced h, uint hint, uint bits, inout P payload)
 [ForceInline]
 public Traced trace_hit<P>(Tlas tlas, uint flags, uint mask, uint ray_type, uint ray_types, uint miss, RayDesc ray, inout P payload)
 {
+    payload_fits<P>();
     return HitObject::TraceRay(tlas.get(), ray_flags(flags), mask, ray_type, ray_types, miss, ray, payload);
 }
 

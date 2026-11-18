@@ -1371,17 +1371,7 @@ DisperseCall disperse_call<V : IVertexKind>(V on, PathRoot r, PathVertex x, uint
 
 void call_disperse(DisperseCall c)
 {
-    __stage_switch
-    {
-    case raygen:
-    case closesthit:
-    case miss:
-    case callable:
-        call(CALL_DISPERSE, c);
-        break;
-    default:
-        break;
-    }
+    call(CALL_DISPERSE, c);
 }
 
 // The callable that weighs `slot`'s companion wavelengths at the dispersive layer `c` names: each
@@ -1503,19 +1493,7 @@ GatherCall gather_call(PathVertex x, float3 front, float3 back, float3 throughpu
 // Runs the gather's callable, which adds what it gathers to the path's radiance.
 void call_gather(GatherCall c)
 {
-    // The compute stand-ins (`path.standins`), compiled for their statistics alone, hold no
-    // callables.
-    __stage_switch
-    {
-    case raygen:
-    case closesthit:
-    case miss:
-    case callable:
-        call(CALL_GATHER, c);
-        break;
-    default:
-        break;
-    }
+    call(CALL_GATHER, c);
 }
 
 // The gather's callable for `slot`'s path: the grid's irradiance at the vertex `c` names by its
@@ -1568,17 +1546,7 @@ MapGatherCall map_gather_call(GatherCall c, BsdfParams p, PathVertex x, float ex
 
 void call_map_gather(MapGatherCall c)
 {
-    __stage_switch
-    {
-    case raygen:
-    case closesthit:
-    case miss:
-    case callable:
-        call(CALL_MAP_GATHER, c);
-        break;
-    default:
-        break;
-    }
+    call(CALL_MAP_GATHER, c);
 }
 
 // What the reference's map gives a receiver by its diffuse lobes toward each photon: a surface's
@@ -1938,19 +1906,7 @@ float3 emitter_view(uint4* at, LightPick k, float3 origin, float3 target, uint m
     store_coherent(at + 5, uint4(asuint(target), k.position));
     Payload p;
     p.words = uint4(k.triangle, medium, 0, 0);
-    // The compute stand-ins (`path.standins`), compiled for their statistics alone, hold no
-    // callables.
-    __stage_switch
-    {
-    case raygen:
-    case closesthit:
-    case miss:
-    case callable:
-        call(CALL_EMITTER_VIEW, p);
-        break;
-    default:
-        break;
-    }
+    call(CALL_EMITTER_VIEW, p);
     return asfloat(p.words.xyz);
 }
 
@@ -3025,17 +2981,7 @@ uint2 walk_meets(PathRoot r, uint slot, OnLayer on, PathVertex x, uint4 input, b
     c.next = bent ? 1 : 0;
     c.job_exterior = 0.0;
     c.input = input;
-    __stage_switch
-    {
-    case raygen:
-    case closesthit:
-    case miss:
-    case callable:
-        call(CALL_WALK_MEETS, c);
-        break;
-    default:
-        break;
-    }
+    call(CALL_WALK_MEETS, c);
     return uint2(c.next, asuint(c.job_exterior));
 }
 

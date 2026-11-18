@@ -64,7 +64,6 @@ mod particles;
 mod probe;
 mod scene;
 mod specialize;
-pub mod standins;
 mod subsurface;
 mod subsurface_table;
 mod support;

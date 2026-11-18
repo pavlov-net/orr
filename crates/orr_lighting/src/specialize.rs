@@ -2,27 +2,10 @@
 //! their paths may meet, `path_may` and its bits in the low word and `scene_may.slang`'s
 //! `path_may2`, what a scene's surface evaluations and hits may meet, in the high one.
 
-use orr_scene::SceneFeatures;
-use orr_shaders::abi::SpecEntry;
-
 use crate::shaders::consts;
 
 /// The specialization constant id of `path_may`.
 pub(crate) const PATH_MAY_ID: u32 = 110;
-/// The specialization entries of a mask: its low word is `path_may` and its high word
-/// `path_may2`.
-pub(crate) const SPEC_ENTRIES: [SpecEntry; 2] = [
-    SpecEntry {
-        constant_id: PATH_MAY_ID,
-        offset: 0,
-        size: 4,
-    },
-    SpecEntry {
-        constant_id: SceneFeatures::SURFACE_MAY_ID,
-        offset: 4,
-        size: 4,
-    },
-];
 pub(crate) const MAY_STACK: u64 = consts::MAY_STACK as u64;
 pub(crate) const MAY_DISPERSION: u64 = consts::MAY_DISPERSION as u64;
 pub(crate) const MAY_CAUSTICS: u64 = consts::MAY_CAUSTICS as u64;

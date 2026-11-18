@@ -275,8 +275,7 @@ impl HitTable {
     };
 }
 
-/// What the driver reports of a compute pipeline's code, for checking a shader body's register
-/// budget through a compute stand-in. Ray tracing pipelines report none.
+/// What the driver reports of a compute pipeline's code. Ray tracing pipelines report none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CodeStatistics {
     /// Registers per thread.

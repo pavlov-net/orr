@@ -255,7 +255,6 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
             "path/layer",
             "path/plain",
             "path/rich",
-            "path/standins",
             "path/walk"
         ]
     );

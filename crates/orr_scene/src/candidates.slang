@@ -1,6 +1,6 @@
 // What ray tracing pipelines decide at a candidate of the standard coverage, as functions of the
-// candidate so each compiles as its shader and as a compute stand-in: `cover_path` for path rays,
-// `cover_shadow` for shadow rays, and for a medium proxy `box_medium`'s span and `proxy_shadow`.
+// candidate: `cover_path` for path rays, `cover_shadow` for shadow rays, and for a medium proxy
+// `box_medium`'s span and `proxy_shadow`.
 // They decide as `orr_shaders.trace`'s inline loops and orr_lighting's handlers do (`Alpha`,
 // `LayerAccept`, `StackAccept`, `ShadowCandidates` up to the presence level), from the candidate's
 // hit record (`orr_scene.runs`' `HitData`): its class, the class its geometry traces as, and its

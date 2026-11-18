@@ -1,20 +1,20 @@
 //! Ray tracing pipelines on cluster scenes, checked ray by ray against the CPU reference of
 //! the cluster ray-query tests: the hit each shader reports, the record each one reads, ray
 //! types by offset and stride, hit objects, stores across reorders, invokes and calls,
-//! procedural groups, indirect launches, deferred creation and compute stand-ins.
+//! procedural groups, indirect launches and deferred creation.
 
 use std::time::SystemTime;
 
 use gpu_suite::clusters::*;
-use gpu_suite::shaders::ray_pipeline::{self, Dumped, HitData, Root};
-use gpu_suite::{assert_clean, device, pipeline, readback, require, upload};
+use gpu_suite::shaders::ray_pipeline::{self, Root};
+use gpu_suite::{assert_clean, device, readback, require, upload};
 use orr_gpu::rtas::consts::{GEOMETRY_CULL_DISABLE, GEOMETRY_OPAQUE};
 use orr_gpu::{
     Allocation, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicKind, CompileThreads,
-    DispatchArgs, GpuPtr, Hazards, HitGroup, HitTable, MemoryKind, RayPipeline, RayPipelineDesc,
+    DispatchArgs, Hazards, HitGroup, HitTable, MemoryKind, RayPipeline, RayPipelineDesc,
     RayPipelineFlags, RtasFlags, ShaderRecord, ShaderStage, SpecData, Stages, Tlas,
 };
-use orr_shaders::bytemuck::{self, Zeroable};
+use orr_shaders::bytemuck;
 
 const SEEN: usize = 8;
 const NONE: u32 = u32::MAX;
@@ -62,6 +62,8 @@ const CALL_VIS: u32 = 1;
 type MissData = [u32; 2];
 /// `CallData`: what to add and what to scale by.
 type CallData = [u32; 2];
+/// `HitData`: the custom index and geometry index, then `tag`'s low and high words.
+type HitData = [u32; 4];
 
 fn stages(salt: &[u8; 4]) -> Vec<ShaderStage<'_>> {
     let spec = SpecData {
@@ -165,12 +167,8 @@ fn hit_table(p: &RayPipeline, count: u64, fill: impl Fn(u64) -> Option<(u32, Vec
 }
 
 fn hit_data(custom: u32, geometry: u32, ray_type: u32) -> Vec<u8> {
-    bytemuck::bytes_of(&HitData {
-        custom,
-        geometry,
-        tag: u64::from(ray_type) << 32 | 0x5eed,
-    })
-    .to_vec()
+    let data: HitData = [custom, geometry, 0x5eed, ray_type];
+    bytemuck::bytes_of(&data).to_vec()
 }
 
 /// Records of the triangle groups for instances whose (custom index, contribution, geometry
@@ -208,15 +206,12 @@ fn root(scene: Tlas, launch: &Launch, mode: u32, ray_type: u32, callable: u32) -
         out: launch.out.gpu(),
         seen: launch.seen.gpu(),
         scene,
-        dumped: GpuPtr::NULL,
         width: W,
         height: H,
         mode,
         ray_type,
         ray_types: RAY_TYPES,
         callable,
-        pad0: 0,
-        pad1: 0,
     }
 }
 
@@ -566,15 +561,12 @@ fn stores_reach_the_shaders_that_follow() {
                 out: count.gpu(),
                 seen: words.gpu(),
                 scene: tlas,
-                dumped: GpuPtr::NULL,
                 width: w,
                 height: h,
                 mode,
                 ray_type: MISS_VIS,
                 ray_types: 1,
                 callable: CALL_VIS,
-                pad0: 0,
-                pad1: 0,
             };
             let list = b.list();
             list.barrier(
@@ -719,74 +711,6 @@ fn procedural_groups_and_indirect_launches() {
         }
     }
     assert!(hits > 0);
-    assert_clean();
-}
-
-/// The closest-hit's body compiled as a compute stand-in, over the inputs the closest-hit
-/// dumped, writes what the closest-hit wrote; the stand-in reports its code statistics.
-#[test]
-fn a_stand_in_computes_what_its_shader_does() {
-    if skipped() {
-        return;
-    }
-    let p = create(0, CompileThreads::default(), RayPipelineFlags::empty());
-    let mut b = Builder::new();
-    let hit_groups = [0, 20];
-    let (tlas, clusters) = base_scene(&mut b, hit_groups);
-    let insts = front_back(&clusters);
-    let t = triangle_table(
-        &p,
-        &[
-            (FRONT_CUSTOM, hit_groups[0], geometries(&insts[0])),
-            (BACK_CUSTOM, hit_groups[1], geometries(&insts[1])),
-        ],
-    );
-    let mut dumped = device()
-        .gpu_malloc::<Dumped>(MemoryKind::Readback, u64::from(W * H), "dumped")
-        .unwrap();
-    dumped.as_mut_slice().unwrap().fill(Dumped::zeroed());
-    let shader = trace(&mut b, &p, RAYGEN_CLOSEST, &t.table, |l| Root {
-        dumped: dumped.gpu(),
-        ..root(tlas, l, 0, 0, CALL_SCALE_INDEX)
-    });
-    let standin = launch_buffers();
-    let compute = pipeline(&ray_pipeline::MODULE, "standin");
-    let r = Root {
-        dumped: dumped.gpu(),
-        ..root(tlas, &standin, 0, 0, CALL_SCALE_INDEX)
-    };
-    let list = b.list();
-    list.barrier(Stages::RAY, Stages::COMPUTE, Hazards::empty());
-    list.dispatch_inline(&compute, &r, [(W * H).div_ceil(64), 1, 1]);
-    list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
-    b.flush();
-    let mut compared = 0;
-    for (i, d) in dumped.as_slice().unwrap().iter().enumerate() {
-        if d.shader == 0 {
-            continue;
-        }
-        compared += 1;
-        let words = |a: &Allocation<u32>, n: usize, at: &[usize]| -> Vec<u32> {
-            let s = &a.as_slice().unwrap()[i * n..][..n];
-            at.iter().map(|&k| s[k]).collect()
-        };
-        let rec: Vec<usize> = (0..7).chain(10..19).collect();
-        assert_eq!(
-            words(&standin.out, REC, &rec),
-            words(&shader.out, REC, &rec),
-            "ray {i}: ray record"
-        );
-        assert_eq!(
-            words(&standin.seen, SEEN, &[0, 1, 2]),
-            words(&shader.seen, SEEN, &[0, 1, 2]),
-            "ray {i}: payload"
-        );
-    }
-    assert!(compared > 0);
-    if let Some(stats) = compute.statistics() {
-        log::info!("stand-in of the closest-hit body: {stats:?}");
-        assert!(stats.registers > 0, "{stats:?}");
-    }
     assert_clean();
 }
 

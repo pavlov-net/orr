@@ -8,7 +8,6 @@
 //   record data names, read through the record's address before the invoke. With
 //   MODE_REDIRECT `traced` then runs the hit's record of the other ray type.
 // `visibility` checks that stores reach the shaders after a reorder, an invoke and a call.
-// `standin` runs the closest-hit's body as a compute kernel over the inputs it dumped.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.pipeline;
@@ -32,15 +31,12 @@ struct Root
     uint* out;
     uint* seen;
     Tlas scene;
-    Dumped* dumped;
     uint width;
     uint height;
     uint mode;
     uint ray_type;
     uint ray_types;
     uint callable;
-    uint pad0;
-    uint pad1;
 }
 ORR_ROOT_INLINE(Root);
 
@@ -68,17 +64,6 @@ struct CallData
     uint scale;
 }
 
-// What the closest-hit saw, for its stand-in.
-struct Dumped
-{
-    HitInputs hit;
-    HitData record;
-    uint shader;
-    uint pad0;
-    uint pad1;
-    uint pad2;
-}
-
 struct BoxAttributes
 {
     float entry;
@@ -99,9 +84,11 @@ uint* seen(uint3 launch)
     return root.seen + index(launch) * SEEN;
 }
 
-// The closest-hit's body: the ray record of the hit, and in the payload what the record held.
-void closest_body<H : IHit>(H h, HitData rec, uint shader, inout Payload p, uint* o)
+// The closest-hit's ray record of the hit, and in the payload what the record held.
+void closest_hit(HitData rec, uint shader, inout Payload p, TriangleAttributes a)
 {
+    TriangleHit h = { a };
+    uint* o = ray_record(h.launch());
     o[0] = 1;
     o[1] = h.custom_index();
     o[2] = h.instance_index();
@@ -120,34 +107,6 @@ void closest_body<H : IHit>(H h, HitData rec, uint shader, inout Payload p, uint
     p.words.y = shader;
     p.words.z = uint(rec.tag >> 32);
     p.words.w = SALT;
-}
-
-void closest_hit(HitData rec, uint shader, inout Payload p, TriangleAttributes a)
-{
-    TriangleHit h = { a };
-    uint3 launch = h.launch();
-    closest_body(h, rec, shader, p, ray_record(launch));
-    if (root.dumped != nullptr)
-    {
-        Dumped* d = root.dumped + index(launch);
-        d.hit.launch = launch;
-        d.hit.instance_index = h.instance_index();
-        d.hit.custom_index = h.custom_index();
-        d.hit.geometry_index = h.geometry_index();
-        d.hit.primitive_index = h.primitive_index();
-        d.hit.cluster_id = h.cluster_id();
-        d.hit.barycentrics = h.barycentrics();
-        d.hit.t = h.t();
-        d.hit.front_face = uint(h.front_face());
-        d.hit.world_origin = h.world_origin();
-        d.hit.world_direction = h.world_direction();
-        d.hit.object_origin = h.object_origin();
-        d.hit.object_direction = h.object_direction();
-        for (uint v = 0; v < 3; v++)
-            d.hit.corners[v] = h.corner(v);
-        d.record = rec;
-        d.shader = shader;
-    }
 }
 
 [shader("closesthit")]
@@ -420,25 +379,4 @@ void visibility()
         flags |= VIS_REORDERED;
     w[3] = flags;
     InterlockedAdd(*root.out, 1);
-}
-
-// The closest-hit's body as a compute kernel over the hits `closest_hit` dumped: writes the
-// ray record and payload words where the closest-hit wrote them, in `out` and `seen`.
-[shader("compute")]
-[numthreads(64, 1, 1)]
-void standin(uint3 id: SV_DispatchThreadID)
-{
-    if (id.x >= root.width * root.height)
-        return;
-    Dumped* d = root.dumped + id.x;
-    if (d.shader == 0)
-        return;
-    StoredHit h = { &d.hit };
-    Payload p;
-    p.words = 0;
-    closest_body(h, d.record, d.shader, p, root.out + id.x * REC);
-    uint* s = root.seen + id.x * SEEN;
-    s[0] = p.words.x;
-    s[1] = p.words.y;
-    s[2] = p.words.z;
 }
