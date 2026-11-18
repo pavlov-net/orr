@@ -28,6 +28,7 @@ pub struct ShaderStage<'a> {
     /// backend's.
     pub metallib: &'a [u8],
     pub metallib_fragment: &'a [u8],
+    pub metallib_stages: &'a [u8],
     /// `spirv` declares the opacity-micromap execution mode, which needs `Caps::omm`.
     pub omm: bool,
     /// The size of the root the kernel holds in the push data; 0 for a root in GPU memory.
@@ -109,6 +110,7 @@ impl<'a> ShaderStage<'a> {
             spirv: module.spirv,
             metallib: module.metallib,
             metallib_fragment: module.metallib_fragment,
+            metallib_stages: module.metallib_stages,
             omm: module.omm,
             inline_root_bytes: module.inline_root_bytes,
             debug_info: module.debug_info,

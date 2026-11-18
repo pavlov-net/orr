@@ -203,11 +203,12 @@ fn emit_module(out: &mut String, item: &str, k: &Kernel<'_>, manifest: &Path) {
     };
     let _ = writeln!(
         out,
-        "{item}: ::orr_shaders::ShaderModule = ::orr_shaders::ShaderModule {{\n    name: {name:?},\n    kernel: {name:?},\n    spirv: ::orr_shaders::aligned_spirv!({spv:?}),\n    metallib: {metallib},\n    metallib_fragment: {metallib_fragment},\n    omm: {omm},\n    inline_root_bytes: {inline_root_bytes},\n    debug_info: {debug_info:?},\n    hash: {hash:#018x},\n    manifest: {manifest:?},\n    entry_points: &[",
+        "{item}: ::orr_shaders::ShaderModule = ::orr_shaders::ShaderModule {{\n    name: {name:?},\n    kernel: {name:?},\n    spirv: ::orr_shaders::aligned_spirv!({spv:?}),\n    metallib: {metallib},\n    metallib_fragment: {metallib_fragment},\n    metallib_stages: {metallib_stages},\n    omm: {omm},\n    inline_root_bytes: {inline_root_bytes},\n    debug_info: {debug_info:?},\n    hash: {hash:#018x},\n    manifest: {manifest:?},\n    entry_points: &[",
         name = k.name,
         spv = k.spv.display().to_string(),
         metallib = lib(&k.metallib.lib),
         metallib_fragment = lib(&k.metallib.fragment),
+        metallib_stages = lib(&k.metallib.stages),
         omm = k.model.omm,
         inline_root_bytes = match &k.model.root {
             Some(root) if k.model.inline_root => k.plans[root].size,

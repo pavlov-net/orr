@@ -41,13 +41,14 @@ struct Watched {
 pub enum Reload {
     /// New SPIR-V for `module`, whose entry points and interface are unchanged. Its debug
     /// info is embedded. With the Metal libraries built from it, as
-    /// [`ShaderModule::metallib`] and [`ShaderModule::metallib_fragment`], when the module's
-    /// build made them; empty otherwise.
+    /// [`ShaderModule::metallib`], [`ShaderModule::metallib_fragment`] and
+    /// [`ShaderModule::metallib_stages`], when the module's build made them; empty otherwise.
     Module {
         module: &'static ShaderModule,
         spirv: Arc<[u32]>,
         metallib: Arc<[u8]>,
         metallib_fragment: Arc<[u8]>,
+        metallib_stages: Arc<[u8]>,
         hash: u64,
     },
     /// The module failed to compile, with Slang's file and line, or its entry points or
@@ -272,7 +273,7 @@ fn recompile(
     if hash == w.hash {
         return Ok(None);
     }
-    let (metallib, metallib_fragment) = match settings.metal {
+    let (metallib, metallib_fragment, metallib_stages) = match settings.metal {
         Some(metal_options) => {
             let session = global.session(metal_options)?;
             // Beside the build's own MSL and libraries, which the binary embeds.
@@ -283,7 +284,6 @@ fn recompile(
             if !issues.is_empty() {
                 return Err(format!("{}: {}", module.name, issues.join("\n")));
             }
-            // Ray tracing entries have no Metal function in either.
             let renamed = module.entry_points.iter().find(|e| {
                 let name = e.name.to_str().unwrap_or("");
                 libs.names
@@ -304,9 +304,9 @@ fn recompile(
                     .map_err(|e| format!("{}: {e}", p.display())),
                 None => Ok(Arc::from([])),
             };
-            (lib(&libs.lib)?, lib(&libs.fragment)?)
+            (lib(&libs.lib)?, lib(&libs.fragment)?, lib(&libs.stages)?)
         }
-        None => (Arc::from([]), Arc::from([])),
+        None => (Arc::from([]), Arc::from([]), Arc::from([])),
     };
     w.hash = hash;
     Ok(Some(Reload::Module {
@@ -314,6 +314,7 @@ fn recompile(
         spirv: compiled.words.into(),
         metallib,
         metallib_fragment,
+        metallib_stages,
         hash,
     }))
 }

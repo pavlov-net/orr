@@ -235,6 +235,8 @@ void end(uint3 launch, Payload p, uint* o)
 [shader("raygeneration")]
 void closest()
 {
+    if (!launch_inside())
+        return;
     uint3 launch = launch_index();
     uint* o = begin(launch);
     Payload p;
@@ -246,6 +248,8 @@ void closest()
 [shader("raygeneration")]
 void traced()
 {
+    if (!launch_inside())
+        return;
     uint3 launch = launch_index();
     uint* o = begin(launch);
     Payload p;
@@ -287,18 +291,31 @@ uint* vis(uint3 launch)
     return root.seen + index(launch) * VIS;
 }
 
+// A plain access where the target has no shader call scope.
 uint load_shader_call(uint* p)
 {
-    return spirv_asm {
-        result : $$uint = OpLoad $p Aligned|MakePointerVisible|NonPrivatePointer !4 $(6u);
-    };
+    __target_switch
+    {
+    case spirv:
+        return spirv_asm {
+            result : $$uint = OpLoad $p Aligned|MakePointerVisible|NonPrivatePointer !4 $(6u);
+        };
+    default:
+        return *p;
+    }
 }
 
 void store_shader_call(uint* p, uint v)
 {
-    spirv_asm {
-        OpStore $p $v Aligned|MakePointerAvailable|NonPrivatePointer !4 $(6u);
-    };
+    __target_switch
+    {
+    case spirv:
+        spirv_asm {
+            OpStore $p $v Aligned|MakePointerAvailable|NonPrivatePointer !4 $(6u);
+        };
+    default:
+        *p = v;
+    }
 }
 
 uint vis_load(uint* p)
@@ -355,6 +372,8 @@ void vis_call(inout Payload p)
 [shader("raygeneration")]
 void visibility()
 {
+    if (!launch_inside())
+        return;
     uint3 launch = launch_index();
     uint i = index(launch);
     uint* w = vis(launch);

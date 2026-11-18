@@ -12,7 +12,7 @@ use super::sys;
 
 /// Options of the Metal session; include roots follow. `ORR_METAL` (tested with `#if defined`) lets a kernel work around
 /// what a target's Slang backend gets wrong where `__target_switch` cannot reach, as in entry
-/// signatures.
+/// signatures. `ORR_PIPELINE_COMPUTE` selects `orr_shaders.pipeline`'s compute form.
 pub(super) const OPTIONS: &[&str] = &[
     "-std",
     "2026",
@@ -28,6 +28,7 @@ pub(super) const OPTIONS: &[&str] = &[
     "metal",
     "-matrix-layout-row-major",
     "-DORR_METAL=1",
+    "-DORR_PIPELINE_COMPUTE=1",
 ];
 
 /// Every difference between the Metal layout of the root and its pointees and the SPIR-V
@@ -393,7 +394,7 @@ pub(super) fn compile_library(metal: &Path, out: &Path, sdk: &str) -> Result<(),
             "-sdk",
             sdk,
             "metal",
-            "-std=metal4.0",
+            "-std=metal4.1",
             "-fmetal-math-mode=safe",
             "-ffp-contract=off",
             "-o",

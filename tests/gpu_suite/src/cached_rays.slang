@@ -16,6 +16,8 @@ ORR_ROOT_INLINE(Root);
 [shader("raygeneration")]
 void raygen_main()
 {
+    if (!launch_inside())
+        return;
     root.out[1] = value + 1;
 }
 
@@ -31,6 +33,8 @@ struct Span
 [shader("raygeneration")]
 void pipeline_main()
 {
+    if (!launch_inside())
+        return;
     Payload p;
     p.words = uint4(value, 0, 0, 0);
     call(0, p);

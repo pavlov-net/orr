@@ -26,6 +26,8 @@ pub struct ShaderStage<'a> {
     pub metallib: &'a [u8],
     /// The Metal library of the pixel entries.
     pub metallib_fragment: &'a [u8],
+    /// The Metal library of the ray tracing stages but the raygens.
+    pub metallib_stages: &'a [u8],
     pub omm: bool,
     /// The size of the root the kernel holds inline; 0 for a root in GPU memory.
     pub inline_root_bytes: u32,
@@ -49,6 +51,7 @@ impl<'a> ShaderStage<'a> {
             spirv: module.spirv,
             metallib: module.metallib,
             metallib_fragment: module.metallib_fragment,
+            metallib_stages: module.metallib_stages,
             omm: module.omm,
             inline_root_bytes: module.inline_root_bytes,
             debug_info: module.debug_info,
