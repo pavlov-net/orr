@@ -25,11 +25,14 @@ use orr::{
 
 pub mod average;
 pub mod creature;
+pub mod fetch;
 pub mod field;
+pub mod fly;
 #[path = "../grass/mod.rs"]
 pub mod grass;
 pub mod mesh;
 pub mod overlay;
+pub mod perf;
 pub mod quality;
 pub mod scene;
 pub mod sun_shade;

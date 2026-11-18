@@ -174,6 +174,11 @@ impl Window {
         self.app.held.contains(&key)
     }
 
+    /// 1 while `plus` alone is down, -1 while `minus` alone is, else 0.
+    pub fn axis(&self, plus: KeyCode, minus: KeyCode) -> f32 {
+        f32::from(u8::from(self.held(plus))) - f32::from(u8::from(self.held(minus)))
+    }
+
     /// Pointer motion, in device units, while the right mouse button was down since the last
     /// call.
     pub fn take_look(&mut self) -> [f64; 2] {

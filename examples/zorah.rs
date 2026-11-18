@@ -38,13 +38,15 @@ use orr_cook::{
     ArchiveSpec, AssetSpec, CookOptions, GltfLayout, GltfSettings, InputChannels, LodMode,
     Manifest, MeshSettings, Outcome, Source, TextureOverride, TextureRules, TextureSettings, Usage,
 };
+use orr_examples::fetch::TempDir;
+use orr_examples::fly::{Camera, note_view};
 use orr_examples::overlay::Overlay;
 use orr_examples::window::{KeyCode, Window};
 use orr_examples::{
     Capture, Options, Workers, assert_clean, device, enable_reconstruction, entry_head,
     environment_map, fixed_time, init_logging,
 };
-use orr_math::{Affine3, Mat3, Quat, Vec3};
+use orr_math::{Affine3, Mat3, Vec3};
 use serde_json::Value;
 
 const HEADLESS_EXTENT: [u32; 2] = [960, 540];
@@ -64,9 +66,6 @@ const SUN_THRESHOLD: f32 = 100.0;
 const MAX_BOUNCES: u32 = 4;
 /// The `.cfg`'s `cameraspeed`, in m/s.
 const WALK_SPEED: f32 = 2.0;
-const RUN_SCALE: f32 = 8.0;
-/// Radians per device unit of mouse motion.
-const LOOK_SCALE: f32 = 0.0025;
 /// The `.cfg` camera's near plane; the sidecar view gives none.
 const NEAR: f32 = 0.02;
 /// Seconds each figure of the readout averages over.
@@ -81,103 +80,6 @@ fn main() {
         log::info!("wrote {}", path.display());
     }
     assert_clean();
-}
-
-/// A directory of this run's own, removed when it drops, however the run ends.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-        Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_dir_all(&self.0) {
-            log::warn!("could not remove {}: {e}", self.0.display());
-        }
-    }
-}
-
-/// A camera of the export.
-#[derive(Clone, Copy)]
-struct Camera {
-    name: &'static str,
-    position: Vec3,
-    /// Yaw about +Y and pitch, in radians; yaw 0 looks down -Z.
-    yaw: f32,
-    pitch: f32,
-    fov_y: f32,
-}
-
-impl Camera {
-    fn looking(name: &'static str, eye: Vec3, at: Vec3, fov_y_degrees: f32) -> Self {
-        let d = (at - eye).normalize();
-        Camera {
-            name,
-            position: eye,
-            yaw: (-d.x).atan2(-d.z),
-            pitch: d.y.asin(),
-            fov_y: fov_y_degrees.to_radians(),
-        }
-    }
-
-    fn rotation(&self) -> Quat {
-        Quat::from_rotation_y(self.yaw) * Quat::from_rotation_x(self.pitch)
-    }
-
-    /// `--view`'s value: `x,y,z,yaw,pitch,fov`, the angles in degrees.
-    fn parse(view: &str) -> Self {
-        let v: Vec<f32> = view
-            .split(',')
-            .map(|x| x.trim().parse().expect("a --view number"))
-            .collect();
-        let [x, y, z, yaw, pitch, fov] = v[..] else {
-            panic!("--view takes x,y,z,yaw,pitch,fov");
-        };
-        Camera {
-            name: "view",
-            position: Vec3::new(x, y, z),
-            yaw: yaw.to_radians(),
-            pitch: pitch.to_radians(),
-            fov_y: fov.to_radians(),
-        }
-    }
-
-    /// This view as a `--view` value.
-    fn view(&self) -> String {
-        let p = self.position;
-        format!(
-            "{:.3},{:.3},{:.3},{:.2},{:.2},{:.2}",
-            p.x,
-            p.y,
-            p.z,
-            self.yaw.to_degrees(),
-            self.pitch.to_degrees(),
-            self.fov_y.to_degrees()
-        )
-    }
-}
-
-/// Logs `camera` as a `--view` value and appends it to `zorah-views.txt` beside the executable.
-fn note_view(camera: &Camera) {
-    use std::io::Write as _;
-    let view = camera.view();
-    log::info!("--view {view}");
-    let path = std::env::current_exe()
-        .expect("executable path")
-        .with_file_name("zorah-views.txt");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path);
-    match file.and_then(|mut f| writeln!(f, "{view}")) {
-        Ok(()) => {}
-        Err(e) => log::warn!("{}: {e}", path.display()),
-    }
 }
 
 /// Logs a pixel probe and appends it to `zorah-probes.txt` beside the executable.
@@ -428,27 +330,6 @@ fn sun(pack: &Path, from_world: Mat3) -> Option<DirectionalLight> {
         angular_radius: light.angular_radius,
         disc: DiscProfile::Uniform,
     })
-}
-
-/// Fly-camera motion from the held keys over `dt` seconds.
-fn fly(window: &mut Window, camera: &mut Camera, dt: f32) {
-    let [x, y] = window.take_look();
-    camera.yaw -= x as f32 * LOOK_SCALE;
-    camera.pitch = (camera.pitch - y as f32 * LOOK_SCALE)
-        .clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
-    let axis = |plus: KeyCode, minus: KeyCode| {
-        f32::from(u8::from(window.held(plus))) - f32::from(u8::from(window.held(minus)))
-    };
-    let r = camera.rotation();
-    let walk = r * Vec3::NEG_Z * axis(KeyCode::KeyW, KeyCode::KeyS)
-        + r * Vec3::X * axis(KeyCode::KeyD, KeyCode::KeyA)
-        + Vec3::Y * axis(KeyCode::KeyE, KeyCode::KeyQ);
-    let speed = if window.held(KeyCode::ShiftLeft) || window.held(KeyCode::ShiftRight) {
-        WALK_SPEED * RUN_SCALE
-    } else {
-        WALK_SPEED
-    };
-    camera.position += walk.normalize_or_zero() * speed * dt;
 }
 
 fn mib(bytes: u64) -> f64 {
@@ -1097,13 +978,13 @@ fn run(options: &Options) -> Option<Capture> {
                     w.set_title(&title(&camera));
                 }
                 if key == KeyCode::KeyC {
-                    note_view(&camera);
+                    note_view("zorah", &camera);
                 }
                 if key == KeyCode::KeyP {
                     probe = w.cursor();
                 }
             }
-            fly(w, &mut camera, dt as f32);
+            camera.fly(w, WALK_SPEED, dt as f32);
         }
         let final_frame = frames.is_some_and(|n| i + 1 == n);
         let time = FrameTime {

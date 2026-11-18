@@ -16,7 +16,6 @@
 //! runs render 960 x 540, for 120 frames without `--frames`, and write the last frame as a PNG;
 //! a windowed run needs `--frames` to write one.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,21 +23,22 @@ use std::time::{Duration, Instant};
 use orr::orr_gpu::{Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, TimelinePoint};
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    CausticSettings, Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameStats, FrameTime,
-    GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, LitView, PackSource, Projection,
-    ReferenceSettings, Renderer, RendererDesc, ResolvedDisplay, SceneDesc, SceneLightingSettings,
-    ScreenshotRequest, TextureFilter, TransformGroupDesc, UiPass, ViewHooks, ViewLighting,
-    ViewOutput, ViewTarget,
+    CausticSettings, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, HookPass,
+    InstanceFlags, InstancesDesc, Lens, LitView, PackSource, Projection, ReferenceSettings,
+    Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
+    TransformGroupDesc, UiPass, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, Manifest, MeshSettings, Source, TextureSettings, Usage,
 };
 use orr_examples::average::Average;
+use orr_examples::fetch::{TempDir, download_all};
 use orr_examples::overlay::Overlay;
+use orr_examples::perf::Perf;
 use orr_examples::window::{KeyCode, Window};
 use orr_examples::{
     Capture, Options, Workers, assert_clean, device, enable_reconstruction, environment_map,
-    fixed_time, mount_at,
+    fixed_time, init_logging, mount_at,
 };
 use orr_math::{Affine3, DVec3, Mat3, Mat4, Quat, Vec3};
 use serde_json::Value;
@@ -49,10 +49,6 @@ const HEADLESS_FRAMES: u64 = 120;
 const FIRST_FRAME: u64 = 500;
 /// Frames before averaging starts, while exposure settles.
 const ACCUMULATE_AFTER: u64 = 30;
-/// Seconds each figure of the readout averages over.
-const READOUT_PERIOD: f64 = 0.5;
-/// The costliest GPU passes the readout lists.
-const READOUT_PASSES: usize = 8;
 const DEFAULT_CAMERA: &str = "camera_front";
 /// The keys that pick a camera, in the glTF's node order.
 const CAMERA_KEYS: [KeyCode; 7] = [
@@ -66,11 +62,10 @@ const CAMERA_KEYS: [KeyCode; 7] = [
 ];
 const BOX: &str = "box";
 const STUDIO: &str = "studio";
-/// The scene and its environment as the scene's page links them.
-const BOX_URL: &str =
-    "https://boksajak.github.io/files/cornell_box_2026/Cornell_Box_2026_Slatted_Pendant.gltf";
-const STUDIO_URL: &str =
-    "https://boksajak.github.io/files/cornell_box_2026/Cornell_Striped_Studio_4K.exr";
+/// Where the scene's page links the scene and its environment.
+const FILES_URL: &str = "https://boksajak.github.io/files/cornell_box_2026/";
+const BOX_FILE: &str = "Cornell_Box_2026_Slatted_Pendant.gltf";
+const STUDIO_FILE: &str = "Cornell_Striped_Studio_4K.exr";
 /// The default grid would round the 12 mm emitter and the fins.
 const POSITION_STEP_LOG2: i8 = -14;
 /// The source map is 4096 x 2048, and its stripes show around the box.
@@ -84,6 +79,7 @@ const MAX_BOUNCES: u32 = 8;
 const REFERENCE_DEPTH: u32 = 64;
 
 fn main() {
+    init_logging();
     let options = Options::from_args();
     if let Some(c) = run(&options) {
         let path = options.out_path("cornell-box");
@@ -91,44 +87,6 @@ fn main() {
         log::info!("wrote {}", path.display());
     }
     assert_clean();
-}
-
-/// A directory of this run's own, removed when it drops, however the run ends.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-        Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_dir_all(&self.0) {
-            log::warn!("could not remove {}: {e}", self.0.display());
-        }
-    }
-}
-
-/// Downloads `url` into `dir`, named by its last path segment.
-fn download(url: &str, dir: &Path) -> PathBuf {
-    let path = dir.join(url.rsplit('/').next().expect("a file name"));
-    let started = Instant::now();
-    let mut response = ureq::get(url)
-        .call()
-        .unwrap_or_else(|e| panic!("{url}: {e}"));
-    let mut file =
-        std::fs::File::create(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let bytes = std::io::copy(&mut response.body_mut().as_reader(), &mut file)
-        .unwrap_or_else(|e| panic!("{url}: {e}"));
-    log::info!(
-        "downloaded {url}, {:.1} MB in {:.1} s",
-        bytes as f64 / 1e6,
-        started.elapsed().as_secs_f64()
-    );
-    path
 }
 
 /// The first file in `dir` with extension `ext`.
@@ -159,78 +117,6 @@ fn pose(node: &Value) -> Affine3 {
     let rotation = floats(&node["rotation"]).map_or(Quat::IDENTITY, Quat::from_array);
     let translation = floats(&node["translation"]).map_or(Vec3::ZERO, Vec3::from_array);
     Affine3::from_scale_rotation_translation(scale, rotation, translation)
-}
-
-/// Frame and pass times, averaged over each `READOUT_PERIOD`.
-#[derive(Default)]
-struct Perf {
-    frames: u32,
-    seconds: f64,
-    worst: f64,
-    stats_frame: u64,
-    stats_frames: u32,
-    cpu_ms: f64,
-    passes: BTreeMap<&'static str, f64>,
-    figures: String,
-}
-
-impl Perf {
-    /// Counts a frame that took `delta` seconds, with `stats` the last completed frame's.
-    fn add(&mut self, delta: f64, stats: &FrameStats) {
-        self.frames += 1;
-        self.seconds += delta;
-        self.worst = self.worst.max(delta);
-        if stats.frame != self.stats_frame {
-            self.stats_frame = stats.frame;
-            self.stats_frames += 1;
-            self.cpu_ms += stats
-                .cpu
-                .iter()
-                .map(|(_, d)| d.as_secs_f64() * 1000.0)
-                .sum::<f64>();
-            for p in &stats.gpu {
-                *self.passes.entry(p.name).or_default() += p.gpu_ms;
-            }
-        }
-        if self.seconds < READOUT_PERIOD {
-            return;
-        }
-        let n = f64::from(self.stats_frames.max(1));
-        let mut passes: Vec<(&str, f64)> = self.passes.iter().map(|(k, v)| (*k, v / n)).collect();
-        passes.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let mut figures = format!(
-            "{:.1} fps  {:.2} ms  worst {:.2} ms\nGPU passes {:.2} ms  CPU {:.2} ms",
-            f64::from(self.frames) / self.seconds,
-            self.seconds * 1000.0 / f64::from(self.frames),
-            self.worst * 1000.0,
-            passes.iter().map(|p| p.1).sum::<f64>(),
-            self.cpu_ms / n,
-        );
-        for (name, ms) in passes.iter().take(READOUT_PASSES) {
-            figures += &format!("\n{ms:6.2} ms  {name}");
-        }
-        *self = Self {
-            stats_frame: self.stats_frame,
-            figures,
-            ..Self::default()
-        };
-    }
-
-    /// The overlay's text.
-    fn readout(
-        &self,
-        camera: &str,
-        [w, h]: [u32; 2],
-        resolved: &ResolvedDisplay,
-        telemetry: Option<&ExposureTelemetry>,
-        averaged: u32,
-    ) -> String {
-        let ev = telemetry.map_or_default(|t| format!("  EV100 {:.2}", t.adapted_ev100));
-        format!(
-            "{camera}  {w} x {h}  {:?}\n{averaged} frames averaged{ev}\n{}",
-            resolved.encoding, self.figures,
-        )
-    }
 }
 
 /// A glTF camera.
@@ -346,11 +232,9 @@ fn run(options: &Options) -> Option<Capture> {
         }
         None => {
             let dir = TempDir::new("orr-cornell-box");
-            let (gltf, studio) = std::thread::scope(|s| {
-                let studio = s.spawn(|| download(STUDIO_URL, &dir.0));
-                let gltf = download(BOX_URL, &dir.0);
-                (gltf, studio.join().expect("download"))
-            });
+            let [gltf, studio] = download_all(FILES_URL, &[BOX_FILE, STUDIO_FILE], &dir.0)
+                .try_into()
+                .expect("two files");
             (gltf, studio, Some(dir))
         }
     };
@@ -520,7 +404,7 @@ fn run(options: &Options) -> Option<Capture> {
             log::info!(
                 "last readout of GPU pass times:
 {}",
-                perf.figures
+                perf.figures()
             );
         }
         // Headless runs step a fixed clock, so they repeat exactly.
