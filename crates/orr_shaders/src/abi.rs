@@ -108,6 +108,12 @@ image_slot!(
 /// device with descriptor heaps offers, less the last 8, which GPU-assisted validation uses.
 pub const MAX_INLINE_ROOT_BYTES: usize = 248;
 
+/// The intersection tags of every intersector and intersection function of a Metal ray tracing
+/// pipeline, which must all match. The build defines them as `ORR_INTERSECTION_TAGS` atop the MSL
+/// it writes.
+pub const METAL_INTERSECTION_TAGS: &str =
+    "triangle_data, instancing, world_space_data, max_levels<3>, intersection_function_buffer";
+
 /// A sampler's slot in the sampler heap.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Pod, Zeroable)]

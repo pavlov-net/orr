@@ -26,6 +26,7 @@ use objc2_metal::{
     MTLFunctionHandle, MTLResidencySet, MTLResource, MTLResourceOptions, MTLVisibleFunctionTable,
     MTLVisibleFunctionTableDescriptor,
 };
+use orr_shaders::abi::METAL_INTERSECTION_TAGS;
 
 use super::cache::BinaryFunction;
 use super::command::CommandList;
@@ -49,11 +50,6 @@ pub(super) const MAX_RECORD_STRIDE: u32 = 4096;
 /// Threads of a launch kernel's group, as the build's launch kernels declare.
 const GROUP: u32 = 64;
 
-/// The intersection tags of every intersector and intersection function of a pipeline, as
-/// `orr_shaders.pipeline`'s prelude and the build's wrappers declare them.
-const TAGS: &str =
-    "triangle_data, instancing, world_space_data, max_levels<3>, intersection_function_buffer";
-
 /// The function a triangle group's records name when it has no any-hit, which accepts each
 /// candidate, and the kernel that turns an indirect launch's extent into threadgroups.
 fn source() -> String {
@@ -62,7 +58,7 @@ fn source() -> String {
 #include <metal_stdlib>
 using namespace metal;
 using namespace metal::raytracing;
-[[intersection(triangle, {TAGS})]]
+[[intersection(triangle, {METAL_INTERSECTION_TAGS})]]
 bool orr_accept_triangle() {{ return true; }}
 struct GroupArgs {{ device const uint* extent; device uint* groups; }};
 kernel void launch_groups(constant GroupArgs& a [[buffer(0)]]) {{

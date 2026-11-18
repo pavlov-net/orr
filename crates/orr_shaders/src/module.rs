@@ -55,7 +55,8 @@ pub struct EntryPoint {
     /// launch kernel's, in `metallib`; another ray tracing stage's is its function in
     /// `metallib_stages`: `[[visible]]` for a closest-hit, miss or callable, a triangle
     /// intersection function for an any-hit, and for an intersection a bounding-box one, beside
-    /// which `<metal_name>__<any-hit entry>` runs a procedural any-hit of the module on its report.
+    /// which `<metal_name>__<any-hit entry>` runs an any-hit of the module that takes no triangle
+    /// attributes on its report.
     pub metal_name: &'static CStr,
     pub stage: Stage,
     /// The workgroup size; `[1, 1, 1]` for ray tracing and pixel entries.

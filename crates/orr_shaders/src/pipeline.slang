@@ -1233,6 +1233,12 @@ public uint64_t pipeline_raygen_record()
     return metal_launch.raygen;
 }
 
+// The address of the data of the record at `record`.
+public uint64_t pipeline_record_data(uint64_t record)
+{
+    return record + HANDLE_BYTES;
+}
+
 // What an any-hit body returns: whether its candidate is accepted and whether the search goes on.
 public uint2 any_hit_result()
 {
@@ -1267,16 +1273,16 @@ void table_call<D>(uint stage, inout D data, Traced hit, uint64_t record, uint3 
 
 // The definitions the Metal intrinsics below and the build's wrappers share, once a program: the
 // build's stage program has it through `pipeline_prelude`. Every intersector and intersection
-// function of a pipeline has the tags `triangle_data, instancing, world_space_data, max_levels<3>,
-// intersection_function_buffer`, which the build's wrappers repeat.
+// function of a pipeline has the tags `ORR_INTERSECTION_TAGS`, which the build defines atop each
+// program from `orr_shaders::abi::METAL_INTERSECTION_TAGS`.
 static const String METAL_PRELUDE = R"(
 // A stage function: the caller's data, the hit, the record's address, the launch index, the root,
 // the texture pool base, the samplers and the launch block.
 typedef void orr_stage_fn(thread void*, thread const void*, ulong, uint3, constant void*, constant ulong*, device void*, constant void*);
-// What a trace hands its intersection functions with its payload: what a stage's wrapper needs to
-// run its body, the trace's hit table and the report of a procedural hit it accepted.
-template <typename P>
-struct orr_ray_data
+// What a trace hands its intersection functions ahead of its payload: what a stage's wrapper needs
+// to run its body, the trace's hit table and the report of a procedural hit it accepted. A function
+// that runs no any-hit declares only this, whatever the trace's payload.
+struct orr_ray_head
 {
     constant void* root;
     constant ulong* pool;
@@ -1292,7 +1298,11 @@ struct orr_ray_data
     uint attribute_x;
     uint attribute_y;
     uint pad;
-    // Last, so a function that reads none of it finds the rest where any payload's trace put it.
+};
+template <typename P>
+struct orr_ray_data
+{
+    orr_ray_head head;
     P payload;
 };
 // What an any-hit's and an intersection's functions return.
@@ -1341,7 +1351,7 @@ template <typename P>
 inline bool orr_trace(ulong id, ulong tlas, uint flags, uint mask, uint ray_type, uint ray_types, float3 origin, float3 direction, float t_min, float t_max, thread P* payload, ulong hits, uint hit_stride, uint hit_count, uint3 index, constant void* root, constant ulong* pool, device void* samplers, constant void* launch, thread uint4* w0, thread uint4* w1, thread uint* function_id)
 {
     using namespace metal::raytracing;
-    intersector<triangle_data, instancing, world_space_data, max_levels<3>, intersection_function_buffer> i;
+    intersector<ORR_INTERSECTION_TAGS> i;
     i.set_base_id(ray_type);
     i.set_geometry_multiplier(ray_types);
     if (flags & 0x01) i.force_opacity(forced_opacity::opaque);
@@ -1359,31 +1369,31 @@ inline bool orr_trace(ulong id, ulong tlas, uint flags, uint mask, uint ray_type
     ifb.intersection_function_stride = hit_stride;
     orr_ray_data<P> rd;
     rd.payload = *payload;
-    rd.root = root;
-    rd.pool = pool;
-    rd.samplers = samplers;
-    rd.launch = launch;
-    rd.tlas = tlas;
-    rd.hits = hits;
-    rd.hit_stride = hit_stride;
-    rd.index_x = index.x;
-    rd.index_y = index.y;
-    rd.index_z = index.z;
-    rd.kind = 0;
-    rd.attribute_x = 0;
-    rd.attribute_y = 0;
-    rd.pad = 0;
+    rd.head.root = root;
+    rd.head.pool = pool;
+    rd.head.samplers = samplers;
+    rd.head.launch = launch;
+    rd.head.tlas = tlas;
+    rd.head.hits = hits;
+    rd.head.hit_stride = hit_stride;
+    rd.head.index_x = index.x;
+    rd.head.index_y = index.y;
+    rd.head.index_z = index.z;
+    rd.head.kind = 0;
+    rd.head.attribute_x = 0;
+    rd.head.attribute_y = 0;
+    rd.head.pad = 0;
     acceleration_structure<instancing> as = orr_from_id<acceleration_structure<instancing>>(id);
     auto r = i.intersect(ray(origin, direction, t_min, t_max), mask, as, ifb, rd);
     *payload = rd.payload;
     if (r.type == intersection_type::none)
         return false;
     bool tri = r.type == intersection_type::triangle;
-    uint kind = tri ? (r.triangle_front_facing ? 0xfeu : 0xffu) : rd.kind;
+    uint kind = tri ? (r.triangle_front_facing ? 0xfeu : 0xffu) : rd.head.kind;
     *w0 = uint4(0, as_type<uint>(r.distance), r.instance_id[0], (r.user_instance_id[0] & 0xffffffu) | (kind << 24));
     ulong data = reinterpret_cast<ulong>(r.primitive_data);
     *w1 = tri ? uint4(uint(data), uint(data >> 32), as_type<uint2>(r.triangle_barycentric_coord))
-              : uint4(r.geometry_id, r.primitive_id, rd.attribute_x, rd.attribute_y);
+              : uint4(r.geometry_id, r.primitive_id, rd.head.attribute_x, rd.head.attribute_y);
     *function_id = r.function_id;
     return true;
 }

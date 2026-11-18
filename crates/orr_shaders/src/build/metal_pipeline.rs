@@ -19,11 +19,6 @@ use crate::Stage;
 /// `TriangleAttributes` is the hit itself.
 const TRIANGLE_ATTRIBUTES: &str = "BuiltInTriangleIntersectionAttributes";
 
-/// The intersection tags of every intersector and intersection function, as
-/// `orr_shaders.pipeline`'s prelude has them.
-const TAGS: &str =
-    "triangle_data, instancing, world_space_data, max_levels<3>, intersection_function_buffer";
-
 /// The Slang kernel that keeps the stage bodies.
 pub(super) const KEEP_KERNEL: &str = "orr_keep_stages";
 
@@ -56,7 +51,10 @@ fn arguments(e: &Entry) -> Result<String, String> {
             }
             ParamRole::Attributes => format!("orr_stage_hit.attributes<{}>()", p.ty),
             ParamRole::Record(offset) => {
-                format!("*({}*)(orr_stage_record + 32 + {offset})", p.ty)
+                format!(
+                    "*({}*)(pipeline_record_data(orr_stage_record) + {offset})",
+                    p.ty
+                )
             }
         });
     }
@@ -274,33 +272,48 @@ fn base_name(name: &str) -> &str {
 }
 
 /// Where a wrapper finds what its context's fields take.
-struct Sources<'a> {
-    root: &'a str,
-    pool: &'a str,
-    samplers: &'a str,
-    launch: &'a str,
-    index: &'a str,
-    hit: &'a str,
-    t_min: &'a str,
+struct Sources {
+    root: String,
+    pool: String,
+    samplers: String,
+    launch: String,
+    index: String,
+    hit: String,
+    t_min: String,
+}
+
+impl Sources {
+    /// An intersection function's, which finds them in the `orr_ray_head` `head` of its ray data.
+    fn ray_data(head: &str) -> Self {
+        Self {
+            root: format!("{head}.root"),
+            pool: format!("{head}.pool"),
+            samplers: format!("{head}.samplers"),
+            launch: format!("{head}.launch"),
+            index: format!("uint3({head}.index_x, {head}.index_y, {head}.index_z)"),
+            hit: "hit".into(),
+            t_min: "t_min".into(),
+        }
+    }
 }
 
 /// The statements that build the context `ctx` from `sources`, or the field no wrapper can fill.
-fn context(fields: &[(String, String)], sources: &Sources<'_>) -> Result<String, String> {
+fn context(fields: &[(String, String)], sources: &Sources) -> Result<String, String> {
     let mut s = String::from("    thread KernelContext_0 ctx;\n");
     for (ty, name) in fields {
         let value = match base_name(name) {
             "root" | "metal_root" | "metal_launch" | "metal_samplers" => {
                 let from = match base_name(name) {
-                    "root" | "metal_root" => sources.root,
-                    "metal_launch" => sources.launch,
-                    _ => sources.samplers,
+                    "root" | "metal_root" => &sources.root,
+                    "metal_launch" => &sources.launch,
+                    _ => &sources.samplers,
                 };
                 format!("({ty})({from})")
             }
-            "metal_texture_pool" => sources.pool.to_owned(),
-            "orr_index" => sources.index.to_owned(),
-            "orr_hit" => sources.hit.to_owned(),
-            "orr_t_min" => sources.t_min.to_owned(),
+            "metal_texture_pool" => sources.pool.clone(),
+            "orr_index" => sources.index.clone(),
+            "orr_hit" => sources.hit.clone(),
+            "orr_t_min" => sources.t_min.clone(),
             "orr_decision" => "0".to_owned(),
             "orr_report" => "uint4(0)".to_owned(),
             other => {
@@ -359,8 +372,8 @@ fn emitted_body(msl: &str, e: &Entry, traced: &str) -> Result<Body, String> {
 /// function name: `[[visible]]` closest-hit, miss and callable functions `orr_stage_<symbol>`,
 /// any-hit triangle intersection functions `orr_anyhit_<symbol>`, and intersection bounding-box
 /// functions `orr_isect_<symbol>`, with a function `orr_isect_<symbol>__<any-hit>` for each
-/// procedural any-hit of the module, which runs it on the report. `symbol` names an entry's
-/// functions after its module.
+/// any-hit of the module that takes no triangle attributes, which runs it on a report that is not
+/// opaque. `symbol` names an entry's functions after its module.
 pub(super) fn wrap(
     msl: &str,
     model: &Model,
@@ -391,35 +404,18 @@ pub(super) fn wrap(
         }
     };
     let visible = Sources {
-        root: "root",
-        pool: "pool",
-        samplers: "samplers",
-        launch: "launch",
-        index: "index",
-        hit: &format!("*(thread const {traced}*)hit"),
-        t_min: "0.0f",
+        root: "root".into(),
+        pool: "pool".into(),
+        samplers: "samplers".into(),
+        launch: "launch".into(),
+        index: "index".into(),
+        hit: format!("*(thread const {traced}*)hit"),
+        t_min: "0.0f".into(),
     };
-    let ray_data = Sources {
-        root: "rd.root",
-        pool: "rd.pool",
-        samplers: "rd.samplers",
-        launch: "rd.launch",
-        index: "uint3(rd.index_x, rd.index_y, rd.index_z)",
-        hit: "hit",
-        t_min: "t_min",
-    };
-    // A procedural group without an any-hit declares the payload of the module's other stages.
-    let mut payloads: Vec<&str> = bodies
-        .iter()
-        .filter(|(n, _)| {
-            stages
-                .iter()
-                .any(|e| e.name == **n && matches!(e.stage, Stage::ClosestHit | Stage::AnyHit))
-        })
-        .filter_map(|(_, b)| b.data.as_deref())
-        .collect();
-    payloads.sort_unstable();
-    payloads.dedup();
+    // A function that runs an any-hit declares the payload after the head; an intersection alone
+    // declares only the head, which every trace's ray data starts with, whatever its payload.
+    let with_payload = Sources::ray_data("rd.head");
+    let head_only = Sources::ray_data("rd");
     for e in &stages {
         let b = &bodies[e.name.as_str()];
         match e.stage {
@@ -440,67 +436,57 @@ pub(super) fn wrap(
                 let data = b.data.as_deref().expect("an any-hit takes data");
                 write!(
                     out,
-                    "[[intersection(triangle, {TAGS})]]\norr_any_result {name}(float distance [[distance]], float2 bary [[barycentric_coord]], bool front [[front_facing]], array_ref<uint> instance [[instance_id]], array_ref<uint> user [[user_instance_id]], const device void* data [[primitive_data]], float3 origin [[world_space_origin]], float3 direction [[world_space_direction]], float t_min [[min_distance]], uint function_id [[function_id]], ray_data orr_ray_data<{data}>& rd [[payload]])\n{{\n    ulong at = reinterpret_cast<ulong>(data);\n    {traced} hit = {{uint4(function_id, as_type<uint>(distance), instance[0], (user[0] & 0xffffffu) | ((front ? 0xfeu : 0xffu) << 24)), uint4(uint(at), uint(at >> 32), as_type<uint2>(bary)), uint4(as_type<uint3>(origin), as_type<uint>(direction.x)), uint4(as_type<uint2>(direction.yz), uint(rd.tlas), uint(rd.tlas >> 32))}};\n{}    {data} p = rd.payload;\n    uint2 d = {};\n    rd.payload = p;\n    return {{d.x != 0, d.y != 0}};\n}}\n",
-                    context(&fields, &ray_data)?,
-                    call(b, "&p, &hit, rd.hits + ulong(function_id) * rd.hit_stride")
+                    "[[intersection(triangle, ORR_INTERSECTION_TAGS)]]\norr_any_result {name}(float distance [[distance]], float2 bary [[barycentric_coord]], bool front [[front_facing]], array_ref<uint> instance [[instance_id]], array_ref<uint> user [[user_instance_id]], const device void* data [[primitive_data]], float3 origin [[world_space_origin]], float3 direction [[world_space_direction]], float t_min [[min_distance]], uint function_id [[function_id]], ray_data orr_ray_data<{data}>& rd [[payload]])\n{{\n    ulong at = reinterpret_cast<ulong>(data);\n    {traced} hit = {{uint4(function_id, as_type<uint>(distance), instance[0], (user[0] & 0xffffffu) | ((front ? 0xfeu : 0xffu) << 24)), uint4(uint(at), uint(at >> 32), as_type<uint2>(bary)), uint4(as_type<uint3>(origin), as_type<uint>(direction.x)), uint4(as_type<uint2>(direction.yz), uint(rd.head.tlas), uint(rd.head.tlas >> 32))}};\n{}    {data} p = rd.payload;\n    uint2 d = {};\n    rd.payload = p;\n    return {{d.x != 0, d.y != 0}};\n}}\n",
+                    context(&fields, &with_payload)?,
+                    call(
+                        b,
+                        "&p, &hit, rd.head.hits + ulong(function_id) * rd.head.hit_stride"
+                    )
                 )
                 .unwrap();
                 names.insert(e.name.clone(), name);
             }
             Stage::Intersection => {
                 let name = format!("orr_isect_{}", symbol(&e.name));
-                let procedural: Vec<&&Entry> = stages
-                    .iter()
-                    .filter(|h| {
-                        h.stage == Stage::AnyHit
-                            && h.params.iter().any(|p| {
-                                p.role == ParamRole::Attributes && p.ty != TRIANGLE_ATTRIBUTES
-                            })
-                    })
-                    .collect();
-                let alone = match payloads.as_slice() {
-                    [one] => Some(*one),
-                    _ => None,
-                };
-                for any in std::iter::once(None).chain(procedural.into_iter().map(Some)) {
-                    let (fname, data) = match any {
-                        Some(h) => (
-                            format!("{name}__{}", h.name),
-                            bodies[h.name.as_str()]
-                                .data
-                                .clone()
-                                .expect("an any-hit takes data"),
-                        ),
-                        None => match alone {
-                            Some(d) => (name.clone(), d.to_owned()),
-                            None => {
-                                return Err(format!(
-                                    "intersection {} serves groups without an any-hit, whose payload is the module's other stages': they take {} payload types",
-                                    e.name,
-                                    payloads.len()
-                                ));
-                            }
-                        },
-                    };
-                    let mut any_hit = String::new();
-                    if let Some(h) = any {
-                        let hb = &bodies[h.name.as_str()];
+                // The any-hits a procedural group can hold: those that take no triangle's
+                // attributes, since a hit shader may leave its attributes out.
+                let procedural = stages.iter().filter(|h| {
+                    h.stage == Stage::AnyHit
+                        && !h
+                            .params
+                            .iter()
+                            .any(|p| p.role == ParamRole::Attributes && p.ty == TRIANGLE_ATTRIBUTES)
+                });
+                for any in std::iter::once(None).chain(procedural.map(Some)) {
+                    let (mut fname, mut ray_data, mut sources, mut h) =
+                        (name.clone(), "orr_ray_head".to_owned(), &head_only, "rd");
+                    let (mut opaque, mut any_hit, mut more) = ("", String::new(), "true");
+                    if let Some(a) = any {
+                        let ab = &bodies[a.name.as_str()];
+                        let data = ab.data.as_deref().expect("an any-hit takes data");
+                        write!(fname, "__{}", a.name).unwrap();
+                        ray_data = format!("orr_ray_data<{data}>");
+                        (sources, h) = (&with_payload, "rd.head");
+                        // Metal calls a bounding box's function whatever its opacity, which it
+                        // resolves from the ray's flags, the instance and the geometry as Vulkan
+                        // does; an opaque hit runs no any-hit.
+                        opaque = ", bool opaque [[opaque]]";
                         let field = fields
                             .iter()
                             .find(|(_, n)| base_name(n) == "orr_hit")
-                            .map_or_default(|(_, n)| format!("    ctx.{n} = hit;\n"));
+                            .map_or_default(|(_, n)| format!("        ctx.{n} = hit;\n"));
                         write!(
                             any_hit,
-                            "{field}    {data} p = rd.payload;\n    uint2 d = {};\n    rd.payload = p;\n    if (d.x == 0)\n        return {{false, true, 0.0f}};\n",
-                            call(hb, "&p, &hit, record")
+                            "    uint2 d = uint2(1, 1);\n    if (!opaque)\n    {{\n{field}        {data} p = rd.payload;\n        d = {};\n        rd.payload = p;\n    }}\n    if (d.x == 0)\n        return {{false, true, 0.0f}};\n",
+                            call(ab, "&p, &hit, record")
                         )
                         .unwrap();
+                        more = "d.y != 0";
                     }
-                    let more = if any.is_some() { "d.y != 0" } else { "true" };
                     write!(
                         out,
-                        "[[intersection(bounding_box, {TAGS})]]\norr_box_result {fname}(uint geometry [[geometry_id]], uint primitive [[primitive_id]], array_ref<uint> instance [[instance_id]], array_ref<uint> user [[user_instance_id]], float3 origin [[world_space_origin]], float3 direction [[world_space_direction]], float t_min [[min_distance]], float t_max [[max_distance]], uint function_id [[function_id]], ray_data orr_ray_data<{data}>& rd [[payload]])\n{{\n    ulong record = rd.hits + ulong(function_id) * rd.hit_stride;\n    uint4 w2 = uint4(as_type<uint3>(origin), as_type<uint>(direction.x));\n    uint4 w3 = uint4(as_type<uint2>(direction.yz), uint(rd.tlas), uint(rd.tlas >> 32));\n    {traced} hit = {{uint4(function_id, as_type<uint>(t_max), instance[0], user[0] & 0xffffffu), uint4(geometry, primitive, 0, 0), w2, w3}};\n{}    uint4 r = {};\n    if (r.x == 0)\n        return {{false, true, 0.0f}};\n    float t = as_type<float>(r.y);\n    if (!(t >= t_min && t <= t_max))\n        return {{false, true, 0.0f}};\n    hit = {{uint4(function_id, r.y, instance[0], (user[0] & 0xffffffu) | ((r.x >> 1) << 24)), uint4(geometry, primitive, r.z, r.w), w2, w3}};\n{any_hit}    rd.kind = r.x >> 1;\n    rd.attribute_x = r.z;\n    rd.attribute_y = r.w;\n    return {{true, {more}, t}};\n}}\n",
-                        context(&fields, &ray_data)?,
+                        "[[intersection(bounding_box, ORR_INTERSECTION_TAGS)]]\norr_box_result {fname}(uint geometry [[geometry_id]], uint primitive [[primitive_id]], array_ref<uint> instance [[instance_id]], array_ref<uint> user [[user_instance_id]], float3 origin [[world_space_origin]], float3 direction [[world_space_direction]], float t_min [[min_distance]], float t_max [[max_distance]], uint function_id [[function_id]]{opaque}, ray_data {ray_data}& rd [[payload]])\n{{\n    ulong record = {h}.hits + ulong(function_id) * {h}.hit_stride;\n    uint4 w2 = uint4(as_type<uint3>(origin), as_type<uint>(direction.x));\n    uint4 w3 = uint4(as_type<uint2>(direction.yz), uint({h}.tlas), uint({h}.tlas >> 32));\n    {traced} hit = {{uint4(function_id, as_type<uint>(t_max), instance[0], user[0] & 0xffffffu), uint4(geometry, primitive, 0, 0), w2, w3}};\n{}    uint4 r = {};\n    if (r.x == 0)\n        return {{false, true, 0.0f}};\n    float t = as_type<float>(r.y);\n    if (!(t >= t_min && t <= t_max))\n        return {{false, true, 0.0f}};\n    hit = {{uint4(function_id, r.y, instance[0], (user[0] & 0xffffffu) | ((r.x >> 1) << 24)), uint4(geometry, primitive, r.z, r.w), w2, w3}};\n{any_hit}    {h}.kind = r.x >> 1;\n    {h}.attribute_x = r.z;\n    {h}.attribute_y = r.w;\n    return {{true, {more}, t}};\n}}\n",
+                        context(&fields, sources)?,
                         call(b, "&hit, record")
                     )
                     .unwrap();
