@@ -1040,7 +1040,8 @@ public void reorder_invoke<P>(Traced h, uint hint, uint bits, inout P payload)
     orr_work[lane] = h;
     orr_payloads[lane] = reinterpret<uint4>(payload);
     orr_indices[lane] = orr_index;
-    GroupMemoryBarrierWithGroupSync();
+    // The owner's stores to its path's memory reach the thread that runs its work past this.
+    AllMemoryBarrierWithGroupSync();
     uint place = 0;
     for (uint i = 0; i < GROUP; i++)
     {
