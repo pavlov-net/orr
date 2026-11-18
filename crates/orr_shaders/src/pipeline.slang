@@ -1025,7 +1025,6 @@ groupshared uint3 orr_indices[GROUP];
 // `h.reorder()` then `h.invoke(payload)`, as one step every thread of the group takes together
 // (UNIFORM_REORDER): the group's work is sorted by the stage it runs, and each thread runs the
 // work at its place in that order for the thread whose work it is, which gets its payload back.
-// The payload is at most 16 bytes, as `Payload`.
 public void reorder_invoke<P>(Traced h, inout P payload)
 {
     reorder_invoke(h, 0, 0, payload);
@@ -1034,6 +1033,7 @@ public void reorder_invoke<P>(Traced h, inout P payload)
 // As above, sorted by the stage, then by `hint`'s low `bits` bits.
 public void reorder_invoke<P>(Traced h, uint hint, uint bits, inout P payload)
 {
+    static_assert(sizeof(P) <= sizeof(uint4), "a reordered invoke's payload crosses the group in 16 bytes");
     uint lane = orr_lane;
     uint key = (h.stage() << bits) | (hint & ((1u << bits) - 1));
     orr_keys[lane] = key;
