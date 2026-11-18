@@ -84,7 +84,7 @@ public struct Walk
     public uint kind;                   // WALK_*
     public float3 throughput;           // of the walk alone
     public float3 dir;                  // the next step's direction; at the end the last step's, or the way out
-    public float3 origin;               // where the next step starts; WALK_LEAVE: where it leaves from
+    public float3 origin;               // where the next step starts; WALK_LEAVE: where it leaves from; WALK_BOUNDARY: where the step that met the surface started
     public float3 normal;               // WALK_LEAVE: the surface's outward normal
     public Hit hit;                     // WALK_BOUNDARY: the query that reached the surface
     public float3 positions[3];         // and its triangle's fetched object-space corners
@@ -190,7 +190,7 @@ public Walk walk_start(float3 origin, float3 dir, SubsurfaceVolume volume, float
 }
 
 // Ends walk `e` with nothing.
-void walk_end(inout Walk e)
+public void walk_end(inout Walk e)
 {
     e.kind = WALK_NONE;
     e.throughput = float3(0.0);
@@ -285,6 +285,9 @@ public bool walk_went(inout Walk e, WalkMeet met, float3 reached, bool reaches)
         return true;
     }
     e.kind = met.kind;
+    // A ray from the step's origin reaches the surface it met.
+    if (met.kind == WALK_BOUNDARY)
+        return false;
     if (met.kind == WALK_LEAVE)
         e.dir = met.dir;
     e.origin = met.origin;

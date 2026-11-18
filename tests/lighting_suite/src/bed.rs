@@ -549,6 +549,14 @@ pub const ROUGH_JADE_ROUGHNESS: f32 = 0.35;
 /// [`VERY_ROUGH_JADE_ROUGHNESS`].
 pub const VERY_ROUGH_JADE_SPHERE: &str = "very rough jade sphere";
 pub const VERY_ROUGH_JADE_ROUGHNESS: f32 = 0.75;
+/// [`VERY_ROUGH_JADE_SPHERE`] whose roughness a texture of 128 / 255 multiplies, to
+/// [`TEXTURED_JADE_ROUGHNESS`].
+pub const TEXTURED_JADE_SPHERE: &str = "textured jade sphere";
+pub const TEXTURED_JADE_ROUGHNESS: f32 = VERY_ROUGH_JADE_ROUGHNESS * 128.0 / 255.0;
+/// [`ROUGH_JADE_SPHERE`] whose normal map tilts its normals in round bumps.
+pub const BUMPY_JADE_SPHERE: &str = "bumpy jade sphere";
+/// [`JADE_SPHERE`] under a coat that passes red and holds back blue.
+pub const COATED_JADE_SPHERE: &str = "coated jade sphere";
 /// A smooth slab of [`JADE`] 20 m square and [`JADE_SLAB_THICKNESS`] thick, its top face at
 /// y = 0: wide enough that the walks in it leave through its faces.
 pub const JADE_SLAB: &str = "jade slab";
@@ -1123,6 +1131,16 @@ fn cook() -> Arc<[u8]> {
     depth_textured.textures[slot::TRANSMISSION_DEPTH].texture = AssetId::from_name("gray");
     let mut depth_split = tinted;
     depth_split.textures[slot::TRANSMISSION_DEPTH].texture = AssetId::from_name("split");
+    let mut textured_jade = Material {
+        specular_roughness: VERY_ROUGH_JADE_ROUGHNESS,
+        ..JADE.material(glass)
+    };
+    textured_jade.textures[slot::ROUGHNESS].texture = AssetId::from_name("gray");
+    let mut bumpy_jade = Material {
+        specular_roughness: ROUGH_JADE_ROUGHNESS,
+        ..JADE.material(glass)
+    };
+    bumpy_jade.textures[slot::NORMAL].texture = AssetId::from_name("bumps");
     let depth_textured_sheet = Material {
         transmission_depth: SHEET_DEPTH,
         ..depth_textured
@@ -1538,6 +1556,25 @@ fn cook() -> Arc<[u8]> {
                     mesh(|b| b.sphere(0, 48, 1.0)),
                     vec![Material {
                         specular_roughness: VERY_ROUGH_JADE_ROUGHNESS,
+                        ..JADE.material(glass)
+                    }],
+                ),
+                model(
+                    TEXTURED_JADE_SPHERE,
+                    mesh(|b| b.sphere(0, 48, 1.0)),
+                    vec![textured_jade],
+                ),
+                model(
+                    BUMPY_JADE_SPHERE,
+                    mesh(|b| b.sphere(0, 48, 1.0)),
+                    vec![bumpy_jade],
+                ),
+                model(
+                    COATED_JADE_SPHERE,
+                    mesh(|b| b.sphere(0, 48, 1.0)),
+                    vec![Material {
+                        coat_weight: 1.0,
+                        coat_color: [1.0, 0.5, 0.3],
                         ..JADE.material(glass)
                     }],
                 ),

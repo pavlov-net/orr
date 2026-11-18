@@ -31,9 +31,14 @@ public static const uint COLD_WALK_WORD = 8;
 public static const uint COLD_EXIT_WORD = 12;
 public static const uint COLD_FROM_WORD = 18;
 // An interior's walk, which no subsurface walk's way out runs beside, keeps the direction its last
-// scatter was reached along in the first of those words, and where it leaves, the weight of the
-// surface's draw there.
+// scatter was reached along in the first of those words, and where its real-time walk meets its
+// surface, the length of the step there in the last lane, -1 where no scatter started it, and in
+// the next word the path's throughput over the chance of that step (`walk_unattenuated`) with the
+// step's length.
 public static const uint COLD_INTO_WORD = COLD_EXIT_WORD;
+public static const uint COLD_STEP_WORD = COLD_EXIT_WORD + 1;
+// What its draw there did, for a re-run that weighs the light of the job a plane stack bent.
+public static const uint COLD_DRAW_WORD = COLD_EXIT_WORD + 2;
 [Host] public static const uint PATH_HOT_BYTES = 16 * PATH_HOT_WORDS;
 // The words a path keeps where the pipeline may meet a plane stack, apart from its cold ones, for
 // what passes between its shaders through a directional job's walk through a stack: the interior
@@ -96,14 +101,17 @@ public static const uint PAYLOAD_BENT = 1;
 [Host] public static const uint RAYGEN_LAYER_INSTRUCTIONS = 1300;
 // What a raygen holds more where an interior's medium may scatter or a surface may walk: the draw
 // of where a ray inside an interior scatters, and the steps of a walk, with the last scatter an
-// interior's way out weighs its light by and the draws of a rough way out, 500 of it.
-[Host] public static const uint RAYGEN_WALK_INSTRUCTIONS = 6700;
-// The callable of a path's vertex at a scatter in an interior's medium, or where a walk leaves it,
-// and of the light a walk takes through its rough surface where it meets it: that surface's
-// transmission seen from inside holds 1,100 of it, and once more along the way in from a light
-// that a rough way out weighs by the walk's last scatter, with that way's draw, 1,300; the IOR
-// outside a meeting's shadow job 100.
-[Host] public static const uint MEDIUM_VERTEX_INSTRUCTIONS = 15100;
+// interior's way out weighs its light by, and the invoke of the surface a real-time walk meets.
+[Host] public static const uint RAYGEN_WALK_INSTRUCTIONS = 5800;
+// The callable of a path's vertex at a scatter in an interior's medium, or where a walk stopped at
+// its cap leaves it.
+[Host] public static const uint MEDIUM_VERTEX_INSTRUCTIONS = 11500;
+// The callable of the vertex where an interior's real-time walk meets its surface
+// (`path_walk_meets`): the layer's BSDF from inside, prepared once at the walk's arrival and once
+// per light along a way in that a way out weighs by the walk's last scatter, its draw, and the
+// light through the surface; and what a layer's stage holds more for it, the call.
+[Host] public static const uint WALK_MEETS_INSTRUCTIONS = 38000;
+[Host] public static const uint WALK_LAYER_INSTRUCTIONS = 1400;
 // What a raygen holds more where its paths may meet a plane stack: the shadow job's trace into a
 // hit object, the probe and legs of a directional job's walk through a stack, the re-run of the
 // vertex its bent light is weighed at and the probe that decides whose a ray's light through a
@@ -198,6 +206,9 @@ public static const uint CALL_DEPOSIT = 12;
 public static const uint CALL_MAP_GATHER = 13;
 // The callable that weighs a dispersive layer's companion wavelengths toward the hero's draw.
 public static const uint CALL_DISPERSE = 14;
+// The callable of the vertex where an interior's real-time walk meets its surface, which the
+// surface's layer stage calls with what it resolved there.
+public static const uint CALL_WALK_MEETS = 15;
 // What a hit made for surfaces that may walk holds more than one with the rich lobes alone: the
 // subsurface lobe, the start of its walk and what it leaves of the surface where a walk leaves.
 [Host] public static const uint WALK_HIT_INSTRUCTIONS = 5400;
@@ -253,23 +264,21 @@ public static const uint HOT_WINDOW = 1 << 18;
 // Bits of a path ray's first payload word that its cover (`path_payload`) leaves free: traversal's
 // any-hits ignore them, and the shader of the hit reads them.
 public static const uint PAYLOAD_WEIGHED = 1 << 14; // a walk weighed the ray's stretch in its interior, or a march the linked medium along it: the hit takes none of it
-public static const uint PAYLOAD_EXIT = 1 << 15;    // the hit is where a subsurface walk leaves
+public static const uint PAYLOAD_EXIT = 1 << 15;    // the hit is where a subsurface walk leaves, or on a layer where an interior's real-time walk meets its surface
 public static const uint PAYLOAD_WALKED = 1 << 16;  // the path walked
 // What a hit's shader hands back in its payload's second word: the vertex drew a subsurface walk,
-// which the path's cold words hold (`COLD_WALK_WORD`), or it resolved the surface where one leaves
-// into them (`COLD_EXIT_WORD`) for the callable of that vertex.
+// which the path's cold words hold (`COLD_WALK_WORD`), it resolved the surface where one leaves
+// into them (`COLD_EXIT_WORD`) for the callable of that vertex, or an interior's walk that met its
+// surface goes on inside from its cold words.
 public static const uint PAYLOAD_WALKS = 1;
 public static const uint PAYLOAD_EXITS = 2;
+public static const uint PAYLOAD_GOES_ON = 3;
 // What the callable of a vertex in an interior's medium runs, by its payload's second word: a
-// scatter's vertex, the walk a scatter starts, the vertex where a walk leaves the interior or
-// stops at its cap, the light a walk takes through its rough surface where it meets it and goes
-// on inside, and the vertex where a walk leaves through its rough surface.
+// scatter's vertex, the walk a scatter starts, and the vertex where a walk stopped at its cap
+// leaves the interior.
 public static const uint MEDIUM_SCATTERS = 0;
-public static const uint MEDIUM_LEAVES = 1;
-public static const uint MEDIUM_WALKS = 2;
-public static const uint MEDIUM_CAPPED = 3;
-public static const uint MEDIUM_MEETS = 4;
-public static const uint MEDIUM_LEAVES_ROUGH = 5;
+public static const uint MEDIUM_WALKS = 1;
+public static const uint MEDIUM_CAPPED = 2;
 // With one of those, the vertex's re-run that weighs its bent job's light.
 public static const uint MEDIUM_BENT = 1 << 8;
 // The density word of a ray whose vertex's next-event estimation took the lights it meets, which

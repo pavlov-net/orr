@@ -908,12 +908,6 @@ public float3 interior_ambient(PathRoot r, float3 p, float3 dir, inout Sampler r
     return 0.5 * sum;
 }
 
-// Whether material `m`'s surface scatters a walk inside it by its rough BSDF, not as a mirror.
-public bool interior_rough(SceneRoot* scene, uint m)
-{
-    return scene.materials[m].specular_roughness >= MIRROR_ROUGHNESS;
-}
-
 // The roughness from which an interior's real-time walk takes the light through its rough
 // surface wherever it meets it, as the reference does; below it, only where it leaves, by the
 // walk's last scatter through the surface's plane, which is quieter where the surface's
@@ -921,62 +915,14 @@ public bool interior_rough(SceneRoot* scene, uint m)
 // paths.
 public static const float INTERIOR_EXACT_ROUGHNESS = 0.6;
 
-// Whether material `m`'s surface is at least that rough.
-public bool interior_exact(SceneRoot* scene, uint m)
+// Where a walk that a surface at `p` of outward geometric normal `normal` reflected back inside
+// goes on from: off the surface by the rounding of the point's magnitude and its distance from the
+// eye alone, as `walk_from` starts one, so its next step traces the geometry the surface came
+// from, and its medium reaches the surface.
+public float3 walk_reflected_origin(ViewConstants* view, float3 p, float3 normal)
 {
-    return scene.materials[m].specular_roughness >= INTERIOR_EXACT_ROUGHNESS;
-}
-
-// What a step of the walk in interior `material`, its surface `ior` times the outside's, from
-// `origin` along `dir` does at a face of material `m` with geometric normal `normal` `t` along.
-// A face of the interior's own material seen from inside reflects the walk back or lets it out
-// by its dielectric's BSDF on the face's plane: by Fresnel where the material's roughness is a
-// mirror's, else by its microfacets. Where `exact`, the walk ends at such a face instead, which
-// shades as the hit of a ray from inside with every input of its surface. A walk reflected back
-// goes on from the face, off it by the rounding of the point's magnitude and its distance from the
-// eye alone, as `walk_from` starts one: its next step traces the geometry the face came from, and
-// its medium reaches the face.
-public WalkMeet interior_meet(SceneRoot* scene, ViewConstants* view, uint material, float ior, uint m, float3 normal, float3 origin, float3 dir, float t, bool exact, inout Sampler rng)
-{
-    float c = dot(normal, dir);
-    if (m != material || !(c > 0.0) || exact)
-        return WalkMeet(WALK_BOUNDARY);
-    float3 p = origin + dir * t;
-    float roughness = scene.materials[m].specular_roughness;
-    float3 way;
-    float weight = 1.0;
-    bool back;
-    if (roughness < MIRROR_ROUGHNESS)
-    {
-        way = refract(dir, -normal, ior);
-        back = rng.next() < openpbr_fresnel(1.0 / ior, c) || all(way == 0.0);
-        if (back)
-            way = reflect(dir, normal);
-    }
-    else
-    {
-        float3 tangent, bitangent;
-        orthonormal_basis(-normal, tangent, bitangent);
-        float3 v = float3(dot(-dir, tangent), dot(-dir, bitangent), c);
-        float3 l = interior_rough_scatter(roughness * roughness, 1.0 / ior, v, rng.next4(), weight);
-        if (!(weight > 0.0))
-            return WalkMeet(WALK_NONE);
-        back = l.z > 0.0;
-        way = normalize(l.x * tangent + l.y * bitangent - l.z * normal);
-    }
-    WalkMeet met = WalkMeet(back ? WALK_REFLECT : WALK_LEAVE);
-    met.dir = way;
-    met.weight = weight;
-    if (back)
-    {
-        float magnitude = max(length(p - view.eye_render.xyz), max(abs(p.x), max(abs(p.y), abs(p.z))));
-        met.origin = p - normal * (magnitude * F32_PRECISION);
-        return met;
-    }
-    met.dir = normalize(way);
-    met.origin = p;
-    met.normal = normal;
-    return met;
+    float magnitude = max(length(p - view.eye_render.xyz), max(abs(p.x), max(abs(p.y), abs(p.z))));
+    return p - normal * (magnitude * F32_PRECISION);
 }
 
 // The walk of interior medium `im` from a scatter at `from` reached along `dir`, its surface

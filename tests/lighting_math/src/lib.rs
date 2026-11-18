@@ -410,44 +410,15 @@ pub fn edge_direction(rng: &mut Rng) -> V3 {
     }
 }
 
-/// `interior_rough_scatter`: where a walk inside a plain dielectric of GGX `alpha`, `eta` the IOR
-/// outside over inside, goes on from the surface, seen along `v` in a frame whose z points into
-/// the medium; the direction and its weight.
-pub fn interior_rough_scatter(alpha: f32, eta: f32, v: V3, u: [f32; 4]) -> (V3, f32) {
-    let (mut l, mut weight) = ([0.0; 3], 0.0);
-    // SAFETY: `v` and `l` are 3 floats, `u` 4.
-    unsafe {
-        ffi::lighting_interior_rough_scatter(
-            alpha,
-            eta,
-            v.as_ptr(),
-            u.as_ptr(),
-            l.as_mut_ptr(),
-            &raw mut weight,
-        );
-    }
-    (l, weight)
-}
-
-/// `interior_rough_transmission`: the value toward `l`, leaving, and its density.
-pub fn interior_rough_transmission(alpha: f32, eta: f32, v: V3, l: V3) -> (f32, f32) {
-    let mut pdf = 0.0;
-    // SAFETY: `v` and `l` are 3 floats.
-    let value = unsafe {
-        ffi::lighting_interior_rough_transmission(alpha, eta, v.as_ptr(), l.as_ptr(), &raw mut pdf)
-    };
-    (value, pdf)
-}
-
-/// `rough_way_in`: a way into a plain dielectric of GGX `alpha` and IOR `ior` for light along `s`,
-/// in a frame whose z points out of the medium, with a share `even` of the draws even over the
-/// hemisphere below; the direction and its density.
-pub fn rough_way_in(alpha: f32, ior: f32, s: V3, u: [f32; 3], even: f32) -> (V3, f32) {
+/// `rough_way_in`: a way into a dielectric of GGX `alpha` along the frame's x and y and IOR `ior`
+/// for light along `s`, in a frame whose z points out of the medium, with a share `even` of the
+/// draws even over the hemisphere below; the direction and its density.
+pub fn rough_way_in(alpha: [f32; 2], ior: f32, s: V3, u: [f32; 3], even: f32) -> (V3, f32) {
     let (mut r, mut pdf) = ([0.0; 3], 0.0);
-    // SAFETY: `s`, `u` and `r` are 3 floats.
+    // SAFETY: `alpha` is 2 floats, `s`, `u` and `r` 3.
     unsafe {
         ffi::lighting_rough_way_in(
-            alpha,
+            alpha.as_ptr(),
             ior,
             s.as_ptr(),
             u.as_ptr(),
@@ -532,23 +503,8 @@ mod ffi {
             chance: *mut f32,
         );
         pub(crate) fn lighting_dispersed_ior(ior: f32, scale: f32, abbe: f32, nm: f32) -> f32;
-        pub(crate) fn lighting_interior_rough_scatter(
-            alpha: f32,
-            eta: f32,
-            v: *const f32,
-            u: *const f32,
-            l: *mut f32,
-            weight: *mut f32,
-        );
-        pub(crate) fn lighting_interior_rough_transmission(
-            alpha: f32,
-            eta: f32,
-            v: *const f32,
-            l: *const f32,
-            pdf: *mut f32,
-        ) -> f32;
         pub(crate) fn lighting_rough_way_in(
-            alpha: f32,
+            alpha: *const f32,
             ior: f32,
             s: *const f32,
             u: *const f32,

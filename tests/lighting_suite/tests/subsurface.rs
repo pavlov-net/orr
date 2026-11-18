@@ -4,10 +4,12 @@
 //! spheres with dense scattering interiors.
 
 use lighting_suite::bed::{
-    Accumulated, Bed, DenseInterior, EXTENT, FURNACE_RADIANCE, GLASS_PANE, Item, JADE, JADE_SLAB,
-    JADE_SLAB_THICKNESS, JADE_SPHERE, MILK, MILK_SPHERE, PANE_IOR, Paths, ROUGH_GLASS_SPHERE,
-    ROUGH_JADE_ROUGHNESS, ROUGH_JADE_SPHERE, Spec, VERY_ROUGH_JADE_ROUGHNESS,
-    VERY_ROUGH_JADE_SPHERE, WALK_FURNACE, WALK_SLABS, WALK_SPHERE, assert_within_noise, look,
+    Accumulated, BUMPY_JADE_SPHERE, Bed, COATED_JADE_SPHERE, DenseInterior, EXTENT,
+    FURNACE_RADIANCE, GLASS_PANE, Item, JADE, JADE_SLAB, JADE_SLAB_THICKNESS, JADE_SPHERE, MILK,
+    MILK_SPHERE, PANE_IOR, Paths, ROUGH_GLASS_SPHERE, ROUGH_JADE_ROUGHNESS, ROUGH_JADE_SPHERE,
+    Spec, TEXTURED_JADE_ROUGHNESS, TEXTURED_JADE_SPHERE, VERY_ROUGH_JADE_ROUGHNESS,
+    VERY_ROUGH_JADE_SPHERE, WALK_FURNACE, WALK_SLABS, WALK_SPHERE, WATER_BOX, assert_within_noise,
+    look,
 };
 use lighting_suite::shaders::walk_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, render, run, upload};
@@ -249,7 +251,20 @@ fn render_spec(paths: &Paths, spec: Spec, frames: u32) -> Accumulated {
 
 /// [`render_spec`] from seed `seed`.
 fn render_spec_at(paths: &Paths, spec: Spec, frames: u32, seed: u32) -> Accumulated {
+    accumulate(&mut Bed::with(spec), paths, frames, seed)
+}
+
+/// [`render_spec`] with the eye inside the interior of model `medium`'s material.
+fn render_inside(paths: &mut Paths, spec: Spec, medium: &str, frames: u32) -> Accumulated {
     let mut bed = Bed::with(spec);
+    paths.settings.camera_medium = Some(bed.material(medium));
+    let image = accumulate(&mut bed, paths, frames, 5);
+    paths.settings.camera_medium = None;
+    image
+}
+
+/// `frames` of `paths` on `bed` from seed `seed`, in radiance before pre-exposure.
+fn accumulate(bed: &mut Bed, paths: &Paths, frames: u32, seed: u32) -> Accumulated {
     bed.set_pre_exposure(PRE_EXPOSURE);
     let mut image = bed.accumulate(frames, seed, &mut |list, f| paths.record(list, f));
     for texel in &mut image.mean {
@@ -461,6 +476,36 @@ enum Lighting {
     Sun,
 }
 
+/// Where an interior's sphere is seen from, scaled by its radius, and the view's field of view.
+const SPHERE_EYE: Vec3 = Vec3::new(0.0, 1.2, 4.0);
+const SPHERE_FOV_Y: f32 = 0.6;
+
+/// The mean light leaving interior sphere `model` scaled to `radius` under `what`, over the pixels
+/// that see it, through `paths`.
+fn lit_sphere(paths: &Paths, model: &'static str, radius: f32, what: Lighting) -> DVec3 {
+    let (eye, target) = (SPHERE_EYE * radius, Vec3::ZERO);
+    let pixels = sphere_pixels(eye, target, SPHERE_FOV_Y, radius);
+    let (lights, environment) = match what {
+        Lighting::Uniform => (Vec::new(), Some(FURNACE_RADIANCE)),
+        Lighting::Sun => (vec![Light::Directional(sun())], None),
+    };
+    let spec = Spec {
+        copies: vec![Item {
+            model,
+            linear: Mat3::from_diagonal(Vec3::splat(radius)),
+            at: Vec3::ZERO,
+        }],
+        lights,
+        environment,
+        eye,
+        target,
+        fov_y: SPHERE_FOV_Y,
+        focus: None,
+    };
+    let image = render_spec(paths, spec, 128);
+    mean_rgb(&image, pixels.iter().map(|p| p.0))
+}
+
 /// The light leaving through the walks of `interior`'s sphere `model` of surface roughness
 /// `roughness` scaled to `radius`, under each of `lighting`, within `tolerance` of the CPU walk.
 /// The CPU walk takes uniform light exactly, and a sun as `paths` do: through the way out as the
@@ -474,38 +519,19 @@ fn interior_matches_the_cpu_walk(
     lighting: &[Lighting],
     tolerance: f64,
 ) {
-    let (eye, target, fov_y) = (Vec3::new(0.0, 1.2, 4.0) * radius, Vec3::ZERO, 0.6);
-    let pixels = sphere_pixels(eye, target, fov_y, radius);
+    let pixels = sphere_pixels(SPHERE_EYE * radius, Vec3::ZERO, SPHERE_FOV_Y, radius);
     let shape = Shape::Sphere {
         radius: f64::from(radius),
     };
     let cpu = cpu_dielectric(paths, interior, shape, roughness);
     for &what in lighting {
-        let (lights, environment, light) = match what {
-            Lighting::Uniform => (
-                Vec::new(),
-                Some(FURNACE_RADIANCE),
-                CpuLight::Uniform {
-                    radiance: DVec3::from(FURNACE_RADIANCE.map(f64::from)),
-                },
-            ),
-            Lighting::Sun => (vec![Light::Directional(sun())], None, cpu_sun()),
+        let light = match what {
+            Lighting::Uniform => CpuLight::Uniform {
+                radiance: DVec3::from(FURNACE_RADIANCE.map(f64::from)),
+            },
+            Lighting::Sun => cpu_sun(),
         };
-        let spec = Spec {
-            copies: vec![Item {
-                model,
-                linear: Mat3::from_diagonal(Vec3::splat(radius)),
-                at: Vec3::ZERO,
-            }],
-            lights,
-            environment,
-            eye,
-            target,
-            fov_y,
-            focus: None,
-        };
-        let image = render_spec(paths, spec, 128);
-        let gpu = mean_rgb(&image, pixels.iter().map(|p| p.0));
+        let gpu = lit_sphere(paths, model, radius, what);
         let want = cpu.mean(2_000_000, light, 19, |rng| {
             let (_, p, n, v) = pixels[(rng.f64() * pixels.len() as f64) as usize];
             (p, n, v)
@@ -701,6 +727,103 @@ fn rough_interiors_walk_as_the_cpu_walk_does() {
     interior_matches_the_cpu_walk(&paths, model, &JADE, roughness, 1.0, &both, 0.02);
     let (model, roughness) = (VERY_ROUGH_JADE_SPHERE, VERY_ROUGH_JADE_ROUGHNESS);
     interior_matches_the_cpu_walk(&paths, model, &JADE, roughness, 1.0, &sun, 0.03);
+    assert_clean();
+}
+
+/// A real-time walk meets its surface with the inputs the surface has where the walk meets it, as
+/// the reference's walk does. A texture that halves a jade sphere's roughness takes it from past
+/// [`EXACT_ROUGHNESS`] to below it, and the walks take the light as the CPU walk does at the halved
+/// roughness. Under an even sky, the walks in a rough jade sphere whose normal map tilts its
+/// normals, and in a smooth one under a tinted coat, let out what the reference's let out.
+#[test]
+fn walks_meet_their_surface_with_its_inputs_there() {
+    let mut paths = Paths::new(
+        &KernelSet::default(),
+        settings(LightingDebugView::Subsurface),
+    );
+    paths.settings.reference = None;
+    paths.settings.max_bounces = 2;
+    let both = [Lighting::Uniform, Lighting::Sun];
+    let (model, roughness) = (TEXTURED_JADE_SPHERE, TEXTURED_JADE_ROUGHNESS);
+    interior_matches_the_cpu_walk(&paths, model, &JADE, roughness, 1.0, &both, 0.02);
+    let mut failures = Vec::new();
+    for model in [BUMPY_JADE_SPHERE, COATED_JADE_SPHERE] {
+        paths.settings.reference = None;
+        paths.settings.max_bounces = 2;
+        let real_time = lit_sphere(&paths, model, 1.0, Lighting::Uniform);
+        paths.settings.reference = Some(ReferenceSettings::default());
+        paths.settings.max_bounces = REFERENCE_BOUNCES;
+        let reference = lit_sphere(&paths, model, 1.0, Lighting::Uniform);
+        let e = relative(real_time, reference);
+        if e >= 0.02 {
+            failures.push(format!(
+                "{model}: real time {real_time:?}, the reference {reference:?} ({e:.4})"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+    assert_clean();
+}
+
+/// Next-event estimation reaches the surface of a dense interior's walks through a plane stack,
+/// whose re-runs trace each walk's step to its surface again to weigh the light the stack bent:
+/// a very rough jade sphere in a box of water under a wide sun, seen from in the water, takes as
+/// much light by next-event estimation alone as by its rays alone, in real time, where the walks
+/// meet the surface, and in the reference, where they end at it. Through the stack, next-event
+/// estimation falls a few percent short of the rays for an opaque sphere there too.
+#[test]
+fn walks_take_the_light_a_plane_stack_bends() {
+    let mut paths = Paths::new(&KernelSet::default(), real_time(LightingDebugView::NeeOnly));
+    paths.settings.max_bounces = 4;
+    // The sphere lies 1.5 m under the water's surface, in a box so wide and deep that the light
+    // its walls and floor reflect never reaches it: next-event estimation can't take light past
+    // those mirrors, which the rays meet.
+    let (eye, target, fov_y) = (Vec3::new(0.0, 0.6, 2.6), Vec3::ZERO, 0.6);
+    let radius = 0.8;
+    let pixels = sphere_pixels(eye, target, fov_y, radius);
+    let spec = || Spec {
+        copies: vec![
+            Item {
+                model: WATER_BOX,
+                linear: Mat3::from_diagonal(Vec3::new(10.0, 5.0, 10.0)),
+                at: Vec3::new(0.0, -8.5, 0.0),
+            },
+            Item {
+                model: VERY_ROUGH_JADE_SPHERE,
+                linear: Mat3::from_diagonal(Vec3::splat(radius)),
+                at: Vec3::ZERO,
+            },
+        ],
+        lights: vec![Light::Directional(DirectionalLight {
+            angular_radius: 0.25,
+            ..sun()
+        })],
+        environment: None,
+        eye,
+        target,
+        fov_y,
+        focus: None,
+    };
+    let mut failures = Vec::new();
+    for reference in [false, true] {
+        paths.settings.reference = reference.then(ReferenceSettings::default);
+        paths.settings.max_bounces = if reference { REFERENCE_BOUNCES } else { 4 };
+        let mut light = |view| {
+            paths.settings.debug_view = view;
+            let image = render_inside(&mut paths, spec(), WATER_BOX, 512);
+            mean_rgb(&image, pixels.iter().map(|p| p.0))
+        };
+        let (nee, bsdf) = (
+            light(LightingDebugView::NeeOnly),
+            light(LightingDebugView::BsdfOnly),
+        );
+        if relative(nee, bsdf) >= 0.1 {
+            failures.push(format!(
+                "reference {reference}: next-event estimation {nee:?}, rays {bsdf:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
     assert_clean();
 }
 

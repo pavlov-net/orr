@@ -3,6 +3,7 @@
 //! with eval, the white furnace, collapse, the mirror threshold, the subsurface entry, and
 //! finite results everywhere.
 
+use std::f64::consts::TAU;
 use std::thread;
 
 use lighting_math::{
@@ -1022,134 +1023,44 @@ fn sampled_wavelengths_return_colors_unchanged() {
     }
 }
 
-/// A walk inside a rough dielectric leaves through its surface by `interior_rough_scatter`, and
-/// its next-event estimation weighs light by `interior_rough_transmission`: that value is adobe's
-/// BSDF seen from inside toward each way out, the draws carry its integral, and its density
-/// integrates to the share of draws that leave.
+/// Where a dense interior's rough way out weighs a light by the walk's last scatter, it draws the
+/// light's way in by `rough_way_in`, and divides by the density that gives: through isotropic and
+/// anisotropic surfaces, out of a denser medium and out of a lighter one, a draw over its density
+/// averages to the measure of the hemisphere inside.
 #[test]
-fn a_walks_rough_way_out_is_adobes_bsdf_from_inside() {
-    let mut reference = Reference::new();
-    let cells = SphereGrid { nz: 32, nphi: 64 };
-    let mut rng = Rng::new(41);
+fn ways_in_take_the_density_they_are_drawn_with() {
+    let mut rng = Rng::new(43);
     let mut failures = Vec::new();
-    // Below and above the multiple scattering's least roughness, out of a denser medium and out
-    // of a lighter one.
-    for (roughness, ior) in [
-        (0.03f32, 1.6f32),
-        (0.15, 1.6),
-        (0.35, 1.6),
-        (0.5, 1.33),
-        (0.3, 0.75),
+    for (alpha, ior) in [
+        ([0.0009f32, 0.0009], 1.6f32),
+        ([0.1225, 0.1225], 1.6),
+        ([0.3, 0.05], 1.33),
+        ([0.09, 0.09], 0.75),
     ] {
-        let (alpha, eta) = (roughness * roughness, 1.0 / ior);
-        let inputs = Inputs {
-            specular_roughness: roughness,
-            specular_ior: ior,
-            transmission_weight: 1.0,
-            ..Inputs::default()
-        };
         for mu in [0.2f32, 0.6, 0.95] {
-            // The walk's frame points into the medium; adobe's surface normal points out of it.
-            let v = [(1.0 - mu * mu).sqrt(), 0.0, mu];
-            let way = |d: [f32; 3]| [d[0], d[1], -d[2]];
-            reference.prepare(&inputs, way(v));
-            let label = format!("roughness {roughness}, IOR {ior}, mu {mu}");
-            for _ in 0..256 {
-                let d = rng.unit();
-                let d = [d[0], d[1], d[2].abs()];
-                let (value, _) = lighting_math::interior_rough_transmission(alpha, eta, v, way(d));
-                let theirs = reference.eval(d).total()[0];
-                if (value - theirs).abs() > 1e-3 * theirs.max(1e-2) {
-                    failures.push(format!(
-                        "{label}: value {value} toward {d:?}, adobe's {theirs}"
-                    ));
-                    break;
-                }
-            }
-            let leaving = |d: [f32; 3], pick: fn((f32, f32)) -> f32| {
-                if d[2] > 0.0 {
-                    f64::from(pick(lighting_math::interior_rough_transmission(
-                        alpha,
-                        eta,
-                        v,
-                        way(d),
-                    )))
-                } else {
-                    0.0
-                }
-            };
-            let value: f64 = integrate_cells(&cells, |d| leaving(d, |(f, _)| f))
-                .iter()
-                .sum();
-            let density: f64 = integrate_cells(&cells, |d| leaving(d, |(_, p)| p))
-                .iter()
-                .sum();
+            let s = [(1.0 - mu * mu).sqrt(), 0.0, mu];
             let n = 400_000u32;
-            let (mut carried, mut carried2, mut left) = (0.0f64, 0.0f64, 0u32);
-            for _ in 0..n {
-                let u = [rng.f32(), rng.f32(), rng.f32(), rng.f32()];
-                let (l, weight) = lighting_math::interior_rough_scatter(alpha, eta, v, u);
-                if l[2] < 0.0 && weight > 0.0 {
-                    carried += f64::from(weight);
-                    carried2 += f64::from(weight) * f64::from(weight);
-                    left += 1;
-                }
-            }
-            let k = f64::from(n);
-            let (mean, share) = (carried / k, f64::from(left) / k);
-            let se = ((carried2 / k - mean * mean) / k).sqrt();
-            let share_se = (share * (1.0 - share) / k).sqrt();
-            if (mean - value).abs() > 0.005 * value + 1e-5 + 3.0 * se {
-                failures.push(format!(
-                    "{label}: draws carry {mean:.5}, the value integrates to {value:.5}"
-                ));
-            }
-            if (share - density).abs() > 0.005 * density + 1e-5 + 3.0 * share_se {
-                failures.push(format!(
-                    "{label}: {share:.5} of draws leave, the density integrates to {density:.5}"
-                ));
-            }
-            // Light outside along the way out `s` = -`v` mirrored, drawn in by `rough_way_in`:
-            // over its draws the value from inside toward `s` sums to its integral over the ways
-            // in, the multiple scattering's among them.
-            let s = [v[0], v[1], v[2]];
-            let inward = |r: [f32; 3]| {
-                if r[2] < 0.0 {
-                    f64::from(
-                        lighting_math::interior_rough_transmission(alpha, eta, way(r), way(s)).0,
-                    )
-                } else {
-                    0.0
-                }
-            };
-            let through: f64 = integrate_cells(&cells, inward).iter().sum();
-            let (mut drawn, mut drawn2) = (0.0f64, 0.0f64);
+            let (mut sum, mut sum2) = (0.0f64, 0.0f64);
             for _ in 0..n {
                 let u = [rng.f32(), rng.f32(), rng.f32()];
                 let (r, pdf) = lighting_math::rough_way_in(alpha, ior, s, u, 0.1);
-                let x = if pdf > 0.0 {
-                    inward(r) / f64::from(pdf)
+                let x = if r[2] < 0.0 && pdf > 0.0 {
+                    1.0 / f64::from(pdf)
                 } else {
                     0.0
                 };
-                drawn += x;
-                drawn2 += x * x;
+                sum += x;
+                sum2 += x * x;
             }
-            let mean = drawn / k;
-            let se = ((drawn2 / k - mean * mean) / k).sqrt();
-            if (mean - through).abs() > 0.005 * through + 1e-5 + 3.0 * se {
+            let k = f64::from(n);
+            let mean = sum / k;
+            let se = ((sum2 / k - mean * mean) / k).sqrt();
+            if (mean - TAU).abs() > 0.005 * TAU + 3.0 * se {
                 failures.push(format!(
-                    "{label}: the ways in carry {mean:.5}, the value integrates to {through:.5}"
+                    "alpha {alpha:?}, IOR {ior}, mu {mu}: the draws over their density average {mean:.5}"
                 ));
             }
         }
     }
-    assert!(
-        failures.is_empty(),
-        "{}",
-        failures.join(
-            "
-"
-        )
-    );
+    assert!(failures.is_empty(), "{}", failures.join("; "));
 }

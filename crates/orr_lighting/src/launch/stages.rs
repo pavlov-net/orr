@@ -30,6 +30,7 @@ use crate::shaders::consts::{
     RAYGEN_STACK_INSTRUCTIONS, RAYGEN_WALK_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS,
     STACK_LAYER_INSTRUCTIONS, STACK_STEP_INSTRUCTIONS, STACK_VERTEX_INSTRUCTIONS,
     TRACED_HIT_INSTRUCTIONS, WALK_EXIT_INSTRUCTIONS, WALK_HIT_INSTRUCTIONS,
+    WALK_LAYER_INSTRUCTIONS, WALK_MEETS_INSTRUCTIONS,
 };
 use crate::shaders::path::{layer, plain, rich, walk};
 use crate::specialize::{
@@ -55,8 +56,10 @@ pub enum Role {
     /// An any-hit shader of a candidate that is not opaque.
     AnyHit,
     /// The callable of a path's vertex in an interior's medium: at a scatter, or where a walk
-    /// leaves the interior.
+    /// stopped at its cap leaves the interior.
     Medium,
+    /// The callable of the vertex where an interior's real-time walk meets its surface.
+    Meets,
     /// The callable of the vertex where a subsurface walk leaves.
     Exit,
     /// The callable that weighs a coated emitter's light by what its coat and fuzz pass.
@@ -254,6 +257,7 @@ impl Spec {
             }
             Role::Miss => return Some(MISS_INSTRUCTIONS),
             Role::Medium => return Some(MEDIUM_VERTEX_INSTRUCTIONS + vertex_stack + caustics),
+            Role::Meets => return Some(WALK_MEETS_INSTRUCTIONS + vertex_stack + caustics),
             Role::Exit => return Some(WALK_EXIT_INSTRUCTIONS + vertex_stack + caustics),
             Role::PhotonRaygen => return Some(RAYGEN_PHOTON_INSTRUCTIONS),
             Role::PhotonStart => return Some(PHOTON_START_INSTRUCTIONS),
@@ -315,6 +319,12 @@ impl Spec {
             (Role::Hit, _) => vertex_stack,
             _ => 0,
         };
+        // A layer's stage where an interior's medium may scatter holds the call of the vertex where
+        // a real-time walk meets its surface.
+        let walks = match (self.role, self.kernel) {
+            (Role::Hit, Kernel::Layer) if self.may & MAY_SCATTERING != 0 => WALK_LAYER_INSTRUCTIONS,
+            _ => 0,
+        };
         // A layer's stage where its paths may split by wavelength holds the start of the path's
         // wavelengths, the hero's IOR and the call that weighs the companions.
         let dispersion = match (self.role, self.kernel) {
@@ -332,6 +342,7 @@ impl Spec {
                 + rich
                 + coated
                 + stack
+                + walks
                 + dispersion
                 + if self.role == Role::Hit {
                     caustics + photon + map
@@ -427,6 +438,9 @@ struct Table {
     /// The callable that weighs a dispersive layer's companion wavelengths, where the paths may
     /// meet a layer and split by wavelength.
     disperse: Option<u32>,
+    /// The callable of the vertex where an interior's real-time walk meets its surface, where an
+    /// interior's medium may scatter.
+    walk_meets: Option<u32>,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
 }
@@ -571,6 +585,15 @@ impl Table {
                 Spec {
                     kernel: Kernel::Layer,
                     ..folded("disperse", Role::Disperse)
+                },
+            )
+        });
+        let walk_meets = (viewed && may & MAY_SCATTERING != 0).then(|| {
+            Self::stage(
+                &mut specs,
+                Spec {
+                    kernel: Kernel::Layer,
+                    ..folded("walk_meets", Role::Meets)
                 },
             )
         });
@@ -873,6 +896,7 @@ impl Table {
             deposit,
             map_gather,
             disperse,
+            walk_meets,
             hit_groups,
             groups,
         }
@@ -1125,6 +1149,7 @@ impl PathPipeline {
                 table.deposit.map(ShaderRecord::new),
                 table.map_gather.map(ShaderRecord::new),
                 table.disperse.map(ShaderRecord::new),
+                table.walk_meets.map(ShaderRecord::new),
             ],
             max_recursion: 1,
             flags: RayPipelineFlags::scene(device.caps()),

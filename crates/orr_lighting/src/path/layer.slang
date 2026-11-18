@@ -1,7 +1,8 @@
 // The path tracer's hit shader for layers of the dielectric class (`KIND_LAYER_PATH`): a
 // surface whose BSDF transmits, with a coat, a fuzz or a thin film where it has one, and whose
-// vertex crosses into or out of the interior its material bounds; and the callable that weighs a
-// dispersive layer's companion wavelengths. `path.plain` holds the other stages; a stage of
+// vertex crosses into or out of the interior its material bounds; the callable that weighs a
+// dispersive layer's companion wavelengths; and the callable of the vertex where an interior's
+// real-time walk meets the layer's surface. `path.plain` holds the other stages; a stage of
 // this kernel folds the lobes a scene's mask rules out.
 #include "orr_root.h"
 import orr_shaders.pipeline;
@@ -42,4 +43,11 @@ void disperse(inout DisperseCall c)
 {
     ORR_OMM(disperse);
     path_disperse(root, DispatchRaysIndex().x, c);
+}
+
+[shader("callable")]
+void walk_meets(inout WalkMeetCall c)
+{
+    ORR_OMM(walk_meets);
+    path_walk_meets<Medium>(root, DispatchRaysIndex().x, c);
 }

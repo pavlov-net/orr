@@ -640,9 +640,9 @@ impl DielectricWalks {
         let (sigma, albedo) = (self.medium.extinction[c], self.medium.albedo[c]);
         let mut throughput = 1.0;
         let mut out = 0.0;
-        // The scatter the walk's step started from, the direction it reached it along and the
-        // walk's throughput there, where its step started from one.
-        let mut last: Option<(DVec3, DVec3, f64)> = None;
+        // The direction the walk reached the scatter its step started from along and the walk's
+        // throughput there, where its step started from one.
+        let mut last: Option<(DVec3, f64)> = None;
         loop {
             let t = -(1.0 - rng.f64()).ln() / sigma;
             let (tb, nb) = self.shape.exit(p, w);
@@ -681,19 +681,16 @@ impl DielectricWalks {
                             // to here, the share of it that a smooth surface's exit lobe from
                             // inside gives: none past the critical angle, where the draws are many
                             // and the steps rare.
-                            Some((at, into, scattered)) => {
-                                let step = p - at;
-                                let length = step.length();
-                                let way = step / length;
-                                let density = hg(self.medium.anisotropy, into.dot(way))
-                                    * (-sigma * length).exp();
-                                scattered * self.inner_lobe(way.dot(nb)) / density
+                            Some((into, scattered)) => {
+                                let density =
+                                    hg(self.medium.anisotropy, into.dot(w)) * (-sigma * tb).exp();
+                                scattered * self.inner_lobe(w.dot(nb)) / density
                                     * self.through_plane(
                                         bsdf,
                                         c,
                                         into,
                                         nb,
-                                        step.dot(nb),
+                                        tb * w.dot(nb),
                                         direction,
                                         rng,
                                     )
@@ -735,7 +732,7 @@ impl DielectricWalks {
                 }
                 throughput = 0.05;
             }
-            last = Some((p, w, throughput));
+            last = Some((w, throughput));
             w = sample_hg(w, self.medium.anisotropy, rng);
         }
     }

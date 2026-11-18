@@ -94,7 +94,7 @@ public struct BsdfDraw
     public bool delta;          // of a delta lobe, which no evaluation gives a value
     public float3 wi;           // world space, unit
     float3 l;                   // in the BSDF's frame
-    uint lobe;
+    public uint lobe;           // LOBE_*
     uint component;
     float3 weight;              // a delta direction's coefficient
     float within;               // and its probability within its lobe
@@ -167,18 +167,18 @@ public struct BsdfLayers
 // Prepared at one shading point for one view.
 public struct Bsdf : IDifferentiable
 {
-    no_diff float3 t;
-    no_diff float3 b;
-    no_diff float3 n;                   // toward the view
+    public no_diff float3 t;
+    public no_diff float3 b;
+    public no_diff float3 n;            // toward the view
     no_diff float3 v;                   // the view in (t, b, n)
     no_diff bool inside;
     no_diff float3 layer;               // what the coat and fuzz pass of the view to the base
 
-    no_diff float2 alpha;
-    no_diff float alpha_iso;
-    no_diff bool mirror;
+    public no_diff float2 alpha;
+    public no_diff float alpha_iso;
+    public no_diff bool mirror;
     no_diff bool bounded;               // reflection only: bounded visible-normal sampling
-    no_diff float eta_refraction;
+    public no_diff float eta_refraction;
     no_diff float radiance_scale;       // of refraction: 1 / eta_refraction^2, 1 for an adjoint path or a thin wall
     no_diff float eta_transparent;
     no_diff float eta_opaque;
@@ -689,6 +689,20 @@ public struct Bsdf : IDifferentiable
         return w;
     }
 
+    // A mirror's refraction of the view: its direction into `wi` and what `delta_value` gives
+    // there, 0 where the surface is no mirror or reflects the view whole.
+    public float3 refraction(out float3 wi)
+    {
+        wi = float3(0.0);
+        float3 l;
+        if (!mirror || !openpbr_refract(v, float3(0.0, 0.0, 1.0), v.z, eta_refraction, l))
+            return float3(0.0);
+        float3 rc, tc;
+        coefficients(v.z, rc, tc);
+        wi = normalize(from_local(l, t, b, n));
+        return tc * transmit * layer * leaving(l) * radiance_scale;
+    }
+
     // One direction into the subsurface medium from the walk lobe alone: `weight` is its
     // BSDF x cos over its own density. `pdf` is 0 when the material has no walk lobe.
     public BsdfSample subsurface_entry(float3 u)
@@ -1097,7 +1111,7 @@ public struct Facet
     float3 tc;
 }
 
-BsdfSample no_sample()
+public BsdfSample no_sample()
 {
     BsdfSample r;
     r.wi = float3(0.0);
@@ -1319,139 +1333,14 @@ public bool bsdf_thin_mirror(BsdfParams p, float exterior_ior)
     return max(alpha.x, alpha.y) < MIRROR_ALPHA;
 }
 
-// Where a walk inside a plain transmitting dielectric of GGX `alpha` goes on from its surface, as
-// the dielectric's BSDF seen from inside scatters it: single scattering by the visible normals,
-// Fresnel and separable Smith masking, and the multiple scattering's lobes. `v` points back along
-// the walk in a frame whose z is the surface's normal into the medium, `eta` is the IOR outside
-// over inside and `u` holds four uniform numbers. The direction, in that frame, lies below z = 0
-// where the walk leaves; `weight` is its BSDF times cosine over the draw's density, without the
-// radiance scale of leaving, and 0 where the draw is lost.
-public float3 interior_rough_scatter(float alpha, float eta, float3 v, float4 u, out float weight)
+// A way in through the surface of a transmitting dielectric of GGX `alpha` along its frame's x and
+// y, whose medium is `ior` times the IOR outside, for light from outside along `s`, in that frame,
+// whose z is the surface's normal out of the medium: light refracted in through a normal visible
+// from `s`, or for a share `even` of the draws, evenly over the hemisphere below, where the
+// multiple scattering's transmission reaches too. Its density goes in `pdf`; `u` holds three
+// uniform numbers.
+public float3 rough_way_in(float2 a, float ior, float3 s, float3 u, float even, out float pdf)
 {
-    weight = 0.0;
-    float ec = alpha >= MIN_MS_ALPHA ? openpbr_look_up_ideal_dielectric_energy_complement(eta, alpha, v.z) : 0.0;
-    if (u.x < ec)
-    {
-        // Each side of the multiple scattering is drawn by its share and evenly over its
-        // hemisphere, as `Bsdf.draw` draws it.
-        float ratio = openpbr_look_up_ideal_dielectric_reflection_ratio(eta, alpha);
-        bool back = u.w < ratio;
-        float3 l = sample_uniform_hemisphere(u.yz);
-        float side = back ? eta : 1.0 / eta;
-        float share = back ? ratio : 1.0 - ratio;
-        float average = openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_ideal_dielectric_average_energy_complement(side, alpha));
-        float f = min(ec * openpbr_look_up_ideal_dielectric_energy_complement(side, alpha, l.z) / average * share, 1.0 / l.z);
-        weight = 2.0 * f * l.z / (ec * share);
-        return back ? l : mirrored(l);
-    }
-    float2 a = float2(alpha);
-    float3 h = openpbr_sample_aniso_ggx_smith_vndf(a, v, u.yz);
-    float c = dot(v, h);
-    bool back = u.w < openpbr_fresnel(eta, c);
-    float3 l = reflect(-v, h);
-    if (!back && !openpbr_refract(v, h, c, eta, l))
-        return l;
-    if ((l.z > 0.0) == back)
-        weight = openpbr_eval_aniso_smith_g1(l, a) / (1.0 - ec);
-    return l;
-}
-
-// What `interior_rough_scatter` of GGX `alpha` and `eta` passes out of the medium from `v`, in any
-// frame where `n` is the surface's normal into the medium: what does not depend on the way out
-// is drawn once.
-public struct InteriorRoughTransmission
-{
-    float alpha;
-    float eta;
-    float3 n;
-    float3 v;
-    float vz;
-    float ec;                       // the multiple scattering's share of the draws
-    float share;                    // the multiple scattering's share that leaves
-    float average;
-    float g1;                       // the visible normals' masking of `v`
-
-    public __init(float alpha, float eta, float3 n, float3 v)
-    {
-        this.alpha = alpha;
-        this.eta = eta;
-        this.n = n;
-        this.v = v;
-        vz = dot(v, n);
-        ec = alpha >= MIN_MS_ALPHA ? openpbr_look_up_ideal_dielectric_energy_complement(eta, alpha, vz) : 0.0;
-        share = ec > 0.0 ? 1.0 - openpbr_look_up_ideal_dielectric_reflection_ratio(eta, alpha) : 0.0;
-        average = ec > 0.0 ? openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_ideal_dielectric_average_energy_complement(1.0 / eta, alpha)) : 1.0;
-        g1 = smith_g1(v);
-    }
-
-    // `w` in a frame of normal `n`, which isotropy leaves free about it.
-    float3 local(float3 w)
-    {
-        return float3(length(cross(w, n)), 0.0, dot(w, n));
-    }
-
-    float smith_g1(float3 w)
-    {
-        return openpbr_eval_aniso_smith_g1(local(w), float2(alpha));
-    }
-
-    // The single scattering's density toward `l`, below the surface, before the multiple
-    // scattering's share: the visible normal that refracts `v` into `l` times the Fresnel
-    // transmission and the refraction's Jacobian.
-    float single(float3 l)
-    {
-        // That normal lies along `v + eta l`, on the side of `v`.
-        float3 h = normalize(v + eta * l);
-        if (dot(h, n) < 0.0)
-            h = -h;
-        float vh = dot(v, h);
-        float lh = dot(l, h);
-        if (!(vh > 0.0) || !(lh < 0.0))
-            return 0.0;
-        float d = openpbr_eval_aniso_ggx(local(h), float2(alpha));
-        float jacobian = eta * eta * -lh / sq(vh + eta * lh);
-        return (1.0 - openpbr_fresnel(eta, vh)) * g1 * vh * d / vz * jacobian;
-    }
-
-    // The density the draw takes `l` with.
-    public float pdf(float3 l)
-    {
-        if (!(dot(l, n) < 0.0))
-            return 0.0;
-        return ec * share * INV_TWO_PI + (1.0 - ec) * single(l);
-    }
-
-    // Toward `l`, below the surface: the BSDF times the cosine, without the radiance scale of
-    // leaving, and the density the draw takes `l` with, into `pdf`.
-    public float value(float3 l, out float pdf)
-    {
-        pdf = 0.0;
-        float lz = dot(l, n);
-        if (!(lz < 0.0))
-            return 0.0;
-        float s = single(l);
-        pdf = ec * share * INV_TWO_PI + (1.0 - ec) * s;
-        float value = s * smith_g1(l);
-        if (ec > 0.0)
-            value += min(ec * openpbr_look_up_ideal_dielectric_energy_complement(1.0 / eta, alpha, -lz) / average * share, -1.0 / lz) * -lz * INV_PI;
-        return value;
-    }
-}
-
-// `InteriorRoughTransmission` toward `l`, in `interior_rough_scatter`'s frame.
-public float interior_rough_transmission(float alpha, float eta, float3 v, float3 l, out float pdf)
-{
-    return InteriorRoughTransmission(alpha, eta, float3(0.0, 0.0, 1.0), v).value(l, pdf);
-}
-
-// A way in through the surface of a plain transmitting dielectric of GGX `alpha`, whose medium is
-// `ior` times the IOR outside, for light from outside along `s`, in a frame whose z is the
-// surface's normal out of the medium: light refracted in through a normal visible from `s`, or for
-// a share `even` of the draws, evenly over the hemisphere below, where the multiple scattering's
-// transmission reaches too. Its density goes in `pdf`; `u` holds three uniform numbers.
-public float3 rough_way_in(float alpha, float ior, float3 s, float3 u, float even, out float pdf)
-{
-    float2 a = float2(alpha);
     float3 r = u.z < even ? mirrored(sample_uniform_hemisphere(u.xy)) : refract(-s, openpbr_sample_aniso_ggx_smith_vndf(a, s, u.xy), 1.0 / ior);
     // The normal that refracts `s` into `r` lies along `s + ior r`, on the side of `s`.
     float3 h = normalize(s + ior * r);
