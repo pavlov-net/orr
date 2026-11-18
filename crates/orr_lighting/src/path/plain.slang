@@ -1,13 +1,13 @@
-// The lean path tracer's stages (`path.lean`): the raygens of a view's paths, of its background
-// layer's, of its update paths and of the frame's caustic photons; the callables of a path's first
-// vertex and of a debug view of it alone, the ones that start a path in the interiors around the
-// eye or at a thin lens's point, the one that runs its vertex in an interior's medium, the one of a
-// step of a directional job's walk through a plane stack, the one that takes what a path's ray
-// meets in front of its hit, the one that marches the medium proxies with a volume a shadow ray
-// passed, and those of the caustic photons' gathers, a photon's start and its deposit; the hit
-// shaders of a plain opaque surface and of a strand, the any-hit shaders of a path's ray and of its
-// shadow ray at a candidate that is not opaque, a medium proxy's intersection and any-hit shaders
-// under a shadow ray, and the miss shaders of the two.
+// The path tracer's stages: the raygens of a view's paths, of its background layer's, of its update
+// paths and of the frame's caustic photons; the callables of a path's first vertex and of a debug
+// view of it alone, the ones that start a path in the interiors around the eye or at a thin lens's
+// point, the one that runs its vertex in an interior's medium, the one of a step of a directional
+// job's walk through a plane stack, the one that takes what a path's ray meets in front of its hit,
+// the one that marches the medium proxies with a volume a shadow ray passed, and those of the
+// caustic photons' gathers, a photon's start and its deposit; the hit shaders of a plain opaque
+// surface and of a strand, the any-hit shaders of a path's ray and of its shadow ray at a candidate
+// that is not opaque, a medium proxy's intersection and any-hit shaders under a shadow ray, and the
+// miss shaders of the two.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_shaders.trace;
@@ -18,9 +18,9 @@ import orr_scene.candidates;
 import orr_scene.runs;
 import orr_scene.hit;
 import orr_lighting.path;
-import orr_lighting.path.lean.vertex;
-import orr_lighting.path.lean.raygen;
-import orr_lighting.path.lean.stack;
+import orr_lighting.path.vertex;
+import orr_lighting.path.raygen;
+import orr_lighting.path.stack;
 
 extern struct Surface : ISurfaces = StandardSurface;
 extern struct Medium : IMedium = NoMedium;
@@ -34,7 +34,7 @@ ORR_ROOT_INLINE(PathRoot);
 void paths()
 {
     ORR_OMM(paths);
-    lean_paths(root);
+    view_paths(root);
 }
 
 [shader("closesthit")]
@@ -42,7 +42,7 @@ void surface_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(surface_hit);
     TriangleHit h = { a };
-    lean_hit<Surface, Medium, TriangleHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
+    path_hit<Surface, Medium, TriangleHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
     // Tells the raygen a shader took the hit.
     p.words.x = 0;
 }
@@ -52,7 +52,7 @@ void strand_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(strand_hit);
     BuiltInHit h = { a };
-    lean_hit<Surface, Medium, BuiltInHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
+    path_hit<Surface, Medium, BuiltInHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
     // Tells the raygen a shader took the hit.
     p.words.x = 0;
 }
@@ -61,21 +61,21 @@ void strand_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 void backgrounds()
 {
     ORR_OMM(backgrounds);
-    lean_backgrounds<Environment, Medium>(root);
+    background_paths<Environment, Medium>(root);
 }
 
 [shader("raygeneration")]
 void updates()
 {
     ORR_OMM(updates);
-    lean_updates(root);
+    update_paths(root);
 }
 
 [shader("raygeneration")]
 void photons()
 {
     ORR_OMM(photons);
-    lean_photons(root);
+    photon_paths(root);
 }
 
 [shader("callable")]
@@ -83,7 +83,7 @@ void caster_photon(inout Payload p)
 {
     ORR_OMM(caster_photon);
     float reach;
-    p.words.x = lean_photon_start<Medium>(root, DispatchRaysIndex().x, reach) ? 1 : 0;
+    p.words.x = path_photon_start<Medium>(root, DispatchRaysIndex().x, reach) ? 1 : 0;
     p.words.y = asuint(reach);
 }
 
@@ -91,77 +91,77 @@ void caster_photon(inout Payload p)
 void deposit(inout Payload p)
 {
     ORR_OMM(deposit);
-    lean_deposit(root, DispatchRaysIndex().x);
+    path_deposit(root, DispatchRaysIndex().x);
 }
 
 [shader("callable")]
 void gather(inout GatherCall c)
 {
     ORR_OMM(gather);
-    lean_gather(root, DispatchRaysIndex().x, c);
+    path_gather(root, DispatchRaysIndex().x, c);
 }
 
 [shader("callable")]
 void map_gather(inout MapGatherCall c)
 {
     ORR_OMM(map_gather);
-    lean_map_gather(root, DispatchRaysIndex().x, c);
+    path_map_gather(root, DispatchRaysIndex().x, c);
 }
 
 [shader("callable")]
 void first_vertex(inout Payload p)
 {
     ORR_OMM(first_vertex);
-    lean_first<Medium>(root, DispatchRaysIndex().x, p.words);
+    path_first<Medium>(root, DispatchRaysIndex().x, p.words);
 }
 
 [shader("callable")]
 void eye_interior(inout Payload p)
 {
     ORR_OMM(eye_interior);
-    p.words.x = lean_eye_interior<Surface>(root, DispatchRaysIndex().x, p.words.x != 0) ? 1 : 0;
+    p.words.x = path_eye_interior<Surface>(root, DispatchRaysIndex().x, p.words.x != 0) ? 1 : 0;
 }
 
 [shader("callable")]
 void eye_lens(inout Payload p)
 {
     ORR_OMM(eye_lens);
-    lean_lens_interior<Surface>(root, DispatchRaysIndex().x);
+    path_lens_interior<Surface>(root, DispatchRaysIndex().x);
 }
 
 [shader("callable")]
 void medium_vertex(inout Payload p)
 {
     ORR_OMM(medium_vertex);
-    lean_medium_vertex<Medium>(root, DispatchRaysIndex().x, p.words);
+    path_medium_vertex<Medium>(root, DispatchRaysIndex().x, p.words);
 }
 
 [shader("callable")]
 void stack_step(inout StackStep c)
 {
     ORR_OMM(stack_step);
-    lean_stack_step<Medium>(root, DispatchRaysIndex().x, c);
+    path_stack_step<Medium>(root, DispatchRaysIndex().x, c);
 }
 
 [shader("callable")]
 void front(inout Payload p)
 {
     ORR_OMM(front);
-    p.words.x = lean_front<Medium>(root, DispatchRaysIndex().x, asfloat(p.words.x), p.words.y, p.words.z != 0, p.words.w) ? 1 : 0;
+    p.words.x = path_front<Medium>(root, DispatchRaysIndex().x, asfloat(p.words.x), p.words.y, p.words.z != 0, p.words.w) ? 1 : 0;
 }
 
 [shader("callable")]
 void volume_march(inout ProxyMarch m)
 {
     ORR_OMM(volume_march);
-    lean_proxy_march(root, m);
+    path_proxy_march(root, m);
 }
 
 [shader("callable")]
 void first_view(inout Payload p)
 {
     ORR_OMM(first_view);
-    lean_first_view<Surface>(root, DispatchRaysIndex().x);
+    path_first_view<Surface>(root, DispatchRaysIndex().x);
 }
 
 [shader("anyhit")]
@@ -187,7 +187,7 @@ void shadow_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 void front_met_hit(inout Payload p, TriangleAttributes a)
 {
     ORR_OMM(front_met_hit);
-    lean_front_met(p.words);
+    path_front_met(p.words);
     IgnoreHit();
 }
 
@@ -196,7 +196,7 @@ void light_box_hit()
 {
     ORR_OMM(light_box_hit);
     float t;
-    if (lean_light_box(root, InstanceIndex(), WorldRayOrigin(), WorldRayDirection(), RayTMin(), RayTCurrent(), t))
+    if (path_light_box(root, InstanceIndex(), WorldRayOrigin(), WorldRayDirection(), RayTMin(), RayTCurrent(), t))
     {
         SpanAttributes a = { float2(t, t) };
         ReportHit(t, 0, a);
@@ -207,7 +207,7 @@ void light_box_hit()
 void light_met_hit(inout Payload p, SpanAttributes a)
 {
     ORR_OMM(light_met_hit);
-    lean_front_met(p.words);
+    path_front_met(p.words);
     IgnoreHit();
 }
 
@@ -233,7 +233,7 @@ void proxy_shadow_hit(inout Payload p, SpanAttributes a)
 void miss_scatter(inout Payload p)
 {
     ORR_OMM(miss_scatter);
-    lean_miss<Medium, Environment>(root, DispatchRaysIndex().x, p.words.y != 0);
+    path_miss<Medium, Environment>(root, DispatchRaysIndex().x, p.words.y != 0);
 }
 
 [shader("miss")]

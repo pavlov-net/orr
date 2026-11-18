@@ -8,7 +8,7 @@ import orr_scene.hit;
 import orr_scene.surface;
 import orr_scene.candidates;
 import orr_scene.runs;
-import orr_lighting.path.lean.boundary;
+import orr_lighting.path.boundary;
 import lighting_suite.hit_rays;
 
 typealias Surface = CoverageFeedback<StandardSurface>;

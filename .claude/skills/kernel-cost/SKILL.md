@@ -87,7 +87,7 @@ report those with the GPU and driver beside every number.
   over several. The examples read `RUST_LOG`, as do the tests on `gpu_suite`'s device (the
   lighting suite's among them), whose output the test runner writes to `target/test-logs`, a
   passing test's only with `-- --nocapture`.
-- **Call sites.** `python -I ${CLAUDE_SKILL_DIR}/scripts/spv_size.py --lines --kernel lean_paths`,
+- **Call sites.** `python -I ${CLAUDE_SKILL_DIR}/scripts/spv_size.py --lines --kernel plain`,
   on a build with line tables (dev, or the `profiling` profile), lists a path kernel's
   instructions by source file and the lines with the most copies: a heavy body inlined at many
   sites.

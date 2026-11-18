@@ -1,4 +1,4 @@
-// Plane stacks in the lean tracer: a directional job's ray that ends at solid glass may reach its
+// Plane stacks in the path tracer: a directional job's ray that ends at solid glass may reach its
 // light through a stack past it, as `path_light` walks one. The raygen traces a probe along the
 // light's direction up to past the glass, then the legs face to face along the bent directions,
 // each a stack ray to its face and a shadow ray up to it; a dielectric's hit answers whether it is
@@ -19,8 +19,8 @@ import orr_lighting.specialize;
 import orr_lighting.interiors;
 import orr_lighting.path;
 import orr_lighting.path.common;
-import orr_lighting.path.lean.state;
-import orr_lighting.path.lean.vertex;
+import orr_lighting.path.state;
+import orr_lighting.path.vertex;
 
 // What the stack's callable takes and gives: the step and its answer (`words`), the face the
 // stack ray met as its hit answered the stack question (`face`), and the leg, from its origin
@@ -76,10 +76,10 @@ public float short_of(float3 origin, float3 dir, float t)
 // leg that meets nothing reaches the light where it lies outside every interior. One that ends at
 // a face parallel to the first, of fewer than STACK_CROSSINGS, crosses it into the next medium,
 // whose IOR bends the light anew, by the face's Fresnel on its exterior side.
-public void lean_stack_step<M : IMedium>(PathRoot r, uint slot, inout StackStep c)
+public void path_stack_step<M : IMedium>(PathRoot r, uint slot, inout StackStep c)
 {
-    uint4* at = lean_stack(r, slot);
-    uint4* hot = lean_hot(r, slot);
+    uint4* at = path_stack(r, slot);
+    uint4* hot = path_hot(r, slot);
     uint4 words = c.words;
     uint step = words.x & 0xf;
     uint met = (words.x >> 4) & 0xf;
@@ -104,9 +104,9 @@ public void lean_stack_step<M : IMedium>(PathRoot r, uint slot, inout StackStep 
         if (inside)
         {
             uint cold = load_coherent(at + STACK_FROM_WORD).w;
-            list = load_interior(cold != 0 ? lean_cold(r, slot) : at + STACK_LIST_WORD);
+            list = load_interior(cold != 0 ? path_cold(r, slot) : at + STACK_LIST_WORD);
             if (cold == STACK_COLD_OUT)
-                list.cross(load_coherent(lean_cold(r, slot) + LEAN_WALK_WORD).w, false);
+                list.cross(load_coherent(path_cold(r, slot) + COLD_WALK_WORD).w, false);
         }
         if (dot(ng, light) > 0.0 && !list.holds(m))
             list.nest(m, list, point);

@@ -31,7 +31,7 @@ use crate::shaders::consts::{
     STACK_LAYER_INSTRUCTIONS, STACK_STEP_INSTRUCTIONS, STACK_VERTEX_INSTRUCTIONS,
     TRACED_HIT_INSTRUCTIONS, WALK_EXIT_INSTRUCTIONS, WALK_HIT_INSTRUCTIONS,
 };
-use crate::shaders::path::{lean_layer, lean_paths, lean_rich, lean_walk};
+use crate::shaders::path::{layer, plain, rich, walk};
 use crate::specialize::{
     MAY_ALL, MAY_BACKGROUND, MAY_CAUSTICS, MAY_DEBUG, MAY_DISPERSION, MAY_EMISSIVE, MAY_EMITTER,
     MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOBES, MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_MEDIUM,
@@ -126,7 +126,7 @@ impl Geometry {
     }
 }
 
-/// The lean kernel a stage comes from: the one whose BSDF has the plain lobes alone, the one
+/// The kernel a stage comes from: the one whose BSDF has the plain lobes alone, the one
 /// with a coat, a fuzz, a thin film and a thin wall's transmission too, that one with the
 /// subsurface lobe and its walks, which takes its place where the scene's surfaces may walk, or
 /// the dielectric class's, whose BSDF transmits and whose vertex crosses interiors.
@@ -141,15 +141,15 @@ enum Kernel {
 impl Kernel {
     fn own(self) -> &'static orr_shaders::ShaderModule {
         match self {
-            Self::Plain => &lean_paths::MODULE,
-            Self::Rich => &lean_rich::MODULE,
-            Self::Walk => &lean_walk::MODULE,
-            Self::Layer => &lean_layer::MODULE,
+            Self::Plain => &plain::MODULE,
+            Self::Rich => &rich::MODULE,
+            Self::Walk => &walk::MODULE,
+            Self::Layer => &layer::MODULE,
         }
     }
 }
 
-/// A stage of the table: its entry in its lean kernel, its role, and the constants it is made
+/// A stage of the table: its entry in its kernel, its role, and the constants it is made
 /// with: what it may meet (`path_may` in the low word, `path_may2` in the high one) and the
 /// linked surface id its shader is made for.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -345,40 +345,40 @@ impl Spec {
         let (may, may2) = (self.may as u32, (self.may >> 32) as u32);
         match self.kernel {
             Kernel::Plain => {
-                let s = lean_paths::Spec {
+                let s = plain::Spec {
                     path_may: may,
                     path_may2: may2,
                     hit_surface: self.hit_surface,
-                    ..lean_paths::Spec::default()
+                    ..plain::Spec::default()
                 };
-                (s.bytes(), lean_paths::Spec::ENTRIES)
+                (s.bytes(), plain::Spec::ENTRIES)
             }
             Kernel::Rich => {
-                let s = lean_rich::Spec {
+                let s = rich::Spec {
                     path_may: may,
                     path_may2: may2,
                     hit_surface: self.hit_surface,
-                    ..lean_rich::Spec::default()
+                    ..rich::Spec::default()
                 };
-                (s.bytes(), lean_rich::Spec::ENTRIES)
+                (s.bytes(), rich::Spec::ENTRIES)
             }
             Kernel::Walk => {
-                let s = lean_walk::Spec {
+                let s = walk::Spec {
                     path_may: may,
                     path_may2: may2,
                     hit_surface: self.hit_surface,
-                    ..lean_walk::Spec::default()
+                    ..walk::Spec::default()
                 };
-                (s.bytes(), lean_walk::Spec::ENTRIES)
+                (s.bytes(), walk::Spec::ENTRIES)
             }
             Kernel::Layer => {
-                let s = lean_layer::Spec {
+                let s = layer::Spec {
                     path_may: may,
                     path_may2: may2,
                     hit_surface: self.hit_surface,
-                    ..lean_layer::Spec::default()
+                    ..layer::Spec::default()
                 };
-                (s.bytes(), lean_layer::Spec::ENTRIES)
+                (s.bytes(), layer::Spec::ENTRIES)
             }
         }
     }
@@ -482,7 +482,7 @@ impl Table {
             role,
             geometry: None,
             may,
-            hit_surface: lean_paths::Spec::default().hit_surface,
+            hit_surface: plain::Spec::default().hit_surface,
         };
         let mut raygens = [None; 4];
         for (source, bit, entry, role) in [
@@ -889,7 +889,7 @@ pub struct StageSize {
     pub geometry: &'static str,
     /// The linked surface id the stage is made for; `u32::MAX` for any.
     pub hit_surface: u32,
-    /// Whether it comes from a lean kernel with the coat, fuzz, thin film and thin wall lobes.
+    /// Whether it comes from a kernel with the coat, fuzz, thin film and thin wall lobes.
     pub rich: bool,
     pub instructions: u32,
     /// The most of orr's own code it may hand the driver; none for a stage made for a linked
@@ -920,12 +920,12 @@ impl Folded {
     fn new(kernels: &KernelSet, may: u64, threads: CompileThreads<'_>) -> Result<Self, Error> {
         let table = Table::new(may, kernels);
         let specs = &table.specs;
-        let lean: Vec<&'static orr_shaders::ShaderModule> = specs
+        let modules: Vec<&'static orr_shaders::ShaderModule> = specs
             .iter()
             .map(|spec| module(kernels, spec.kernel.own()))
             .collect::<Result<_, Error>>()?;
         // The folds, each once: the table's stages, then the stages they are measured against.
-        let mut folds: Vec<_> = lean.iter().copied().zip(specs.iter().copied()).collect();
+        let mut folds: Vec<_> = modules.iter().copied().zip(specs.iter().copied()).collect();
         let mut fold = |module: &'static orr_shaders::ShaderModule, spec: Spec| {
             let at = folds
                 .iter()
@@ -935,7 +935,7 @@ impl Folded {
                 folds.len() - 1
             })
         };
-        // Kernels that link a type compile the lean stages anew, with the types' code in them:
+        // Kernels that link a type compile the path stages anew, with the types' code in them:
         // a stage is measured against the same stage of orr's own kernel for the standard surface.
         let plain: Vec<Option<usize>> = specs
             .iter()
@@ -949,7 +949,7 @@ impl Folded {
                     },
                     ..*spec
                 };
-                (!std::ptr::eq(lean[at], own)).then(|| fold(own, standard))
+                (!std::ptr::eq(modules[at], own)).then(|| fold(own, standard))
             })
             .collect();
         // A stage made for a linked surface is measured against the standard surface's stage of
@@ -1088,10 +1088,10 @@ impl PathPipeline {
             .zip(&labels)
             .zip(&code)
             .map(|(((spec, (bytes, entries)), label), code)| {
-                let lean = module(kernels, spec.kernel.own())?;
-                let stage = ShaderStage::new(lean, spec.entry, SpecData { entries, bytes })?;
+                let m = module(kernels, spec.kernel.own())?;
+                let stage = ShaderStage::new(m, spec.entry, SpecData { entries, bytes })?;
                 Ok(stage
-                    .folded(code.as_deref().unwrap_or(lean.spirv))
+                    .folded(code.as_deref().unwrap_or(m.spirv))
                     .labeled(label))
             })
             .collect::<Result<Vec<_>, Error>>()?;

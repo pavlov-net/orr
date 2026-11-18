@@ -1,4 +1,4 @@
-// The lean tracer's raygen: a path from its start to its end. Per vertex it traces the pending
+// The path tracer's raygen: a path from its start to its end. Per vertex it traces the pending
 // shadow job, whose light it adds where the ray met nothing, then the path's ray into a hit object, and runs
 // the shader the hit's record names after a reorder by it. It holds the slot's address and the
 // path's flags across those, and nothing else of the path.
@@ -23,14 +23,14 @@ import orr_lighting.specialize;
 import orr_lighting.world_cache;
 import orr_lighting.path;
 import orr_lighting.path.common;
-import orr_lighting.path.lean.state;
-import orr_lighting.path.lean.vertex;
-import orr_lighting.path.lean.stack;
+import orr_lighting.path.state;
+import orr_lighting.path.vertex;
+import orr_lighting.path.stack;
 import orr_color.luminance;
 import orr_lighting.interiors;
 import orr_lighting.subsurface;
 import orr_scene.material;
-import orr_lighting.path.lean.boundary;
+import orr_lighting.path.boundary;
 import orr_lighting.caustics;
 
 // The miss shaders: of a path's ray and of its shadow ray.
@@ -89,7 +89,7 @@ bool start_path(PathRoot r, uint slot, uint2 pixel, uint4* at, uint4* cold, floa
     RayCone cone = camera_cone(r.view);
     PathHot p;
     p.origin = s.origin;
-    p.flags = HOT_RAY | HOT_CAMERA | (lean_counted(r, 0) ? HOT_COUNTED : 0);
+    p.flags = HOT_RAY | HOT_CAMERA | (path_counted(r, 0) ? HOT_COUNTED : 0);
     bool carried = false;
     if (may_any(MAY_LAYERS | MAY_INTERIORS))
     {
@@ -102,7 +102,7 @@ bool start_path(PathRoot r, uint slot, uint2 pixel, uint4* at, uint4* cold, floa
             store_coherent(cold + 1 + INTERIOR_ENTRIES, uint4(0));
         }
         if (may(MAY_SCATTERING))
-            store_coherent(cold + LEAN_ENTERED_WORD, uint4(NO_ENTRY));
+            store_coherent(cold + COLD_ENTERED_WORD, uint4(NO_ENTRY));
     }
     p.dir = s.dir;
     p.pdf = 0.0;
@@ -117,8 +117,8 @@ bool start_path(PathRoot r, uint slot, uint2 pixel, uint4* at, uint4* cold, floa
     p.shadow_light = float3(0.0);
     store_hot(at, p);
     // Its wavelengths are drawn at the first dispersive layer it meets.
-    if (lean_disperses(r))
-        store_coherent(lean_spectral(r, slot) + 3, uint4(0));
+    if (path_disperses(r))
+        store_coherent(path_spectral(r, slot) + 3, uint4(0));
     if (carried)
     {
         Payload eye;
@@ -198,7 +198,7 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior)
     if (may(MAY_STACK))
     {
         uint light = load_coherent(at + 2).w;
-        stacks = (flags & HOT_SHADOW_FAR) != 0 && (light == NO_LIGHT || light == STACK_JOB_LIGHT) && lean_stacks(r);
+        stacks = (flags & HOT_SHADOW_FAR) != 0 && (light == NO_LIGHT || light == STACK_JOB_LIGHT) && path_stacks(r);
     }
     if (stacks)
     {
@@ -226,7 +226,7 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior)
         passed *= cross_walls(r, slot, at, flags, ray, exterior);
     if (may(MAY_PROXIES) && ShadowCover.of_words(p.words).has(SHADOW_VOLUME) && any(passed > 0.0))
         passed *= march_proxies(ray);
-    lean_shadow_add(r, slot, passed);
+    path_shadow_add(r, slot, passed);
 }
 
 // What the medium proxies with a volume that shadow ray `ray` passed let through, by their marches
@@ -244,7 +244,7 @@ float3 march_proxies(RayDesc ray)
 // `reach`, through a plane stack past it: a probe along the light's direction up to `reach`, a
 // stack ray (`stack_ray`), finds the stack's face, and legs go face to face along the bent
 // directions, each a stack ray to its face and a plain shadow ray up to it, the stack's callable
-// stepping from one to the next (`lean_stack_step`). Where the light bent at the vertex, the
+// stepping from one to the next (`path_stack_step`). Where the light bent at the vertex, the
 // vertex's re-run weighs it again (`bent_rerun`). The legs' shadow rays take the job ray's cover
 // word `word`, and the job's ray lies in a medium of IOR `exterior` where the vertex said, which
 // the first leg's thin walls take.
@@ -324,12 +324,12 @@ void stack_walk(PathRoot r, uint slot, uint4* at, uint word, float exterior, flo
     }
     if (!lit)
         return;
-    uint4* walked = lean_stack(r, slot) + STACK_THROUGH_WORD;
+    uint4* walked = path_stack(r, slot) + STACK_THROUGH_WORD;
     float4 legs = asfloat(load_coherent(walked));
     through *= legs.xyz;
     if (!bends)
     {
-        lean_shadow_add(r, slot, job * through);
+        path_shadow_add(r, slot, job * through);
         return;
     }
     store_coherent(walked, asuint(float4(through, legs.w)));
@@ -361,7 +361,7 @@ uint stack_ray(PathRoot r, RayDesc ray, uint depth, out float t, inout uint4 fac
 // callables, each with the re-run's mark.
 void bent_rerun(PathRoot r, uint slot)
 {
-    uint4* kept = lean_stack(r, slot) + STACK_BENT_WORD;
+    uint4* kept = path_stack(r, slot) + STACK_BENT_WORD;
     uint4 input = load_coherent(kept + 1);
     uint4 b = load_coherent(kept + 2);
     Payload p;
@@ -402,7 +402,7 @@ bool stack_miss(PathRoot r, uint slot, uint4* at, inout Payload p)
 // probe from that vertex's ray along `dir` meets a face parallel to the first the ray crossed.
 bool stack_owned(PathRoot r, uint slot, float3 dir)
 {
-    uint4* at = lean_stack(r, slot);
+    uint4* at = path_stack(r, slot);
     uint4 a = load_coherent(at + STACK_TRACK_WORD);
     uint4 b = load_coherent(at + STACK_TRACK_WORD + 1);
     float t;
@@ -425,7 +425,7 @@ float3 cross_walls(PathRoot r, uint slot, uint4* at, uint flags, RayDesc ray, fl
     {
         exterior = 1.0;
         if (may(MAY_INTERIORS) && (flags & HOT_INTERIOR) != 0)
-            exterior = interior_ior(r.scene, innermost_of(load_coherent(lean_cold(r, slot))));
+            exterior = interior_ior(r.scene, innermost_of(load_coherent(path_cold(r, slot))));
     }
     float2 cone = halves(load_coherent(at + 2).x);
     RayCone c = { cone.x, cone.y };
@@ -464,7 +464,7 @@ uint context_depth(PathRoot r, uint slot, uint flags)
 {
     uint depth = (flags >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK;
     if (may(MAY_LAYERS))
-        depth += met_layers(lean_cold(r, slot));
+        depth += met_layers(path_cold(r, slot));
     return depth;
 }
 
@@ -484,7 +484,7 @@ static const uint NEXT_WALK = 3;       // the subsurface walk its last vertex st
 static const uint NEXT_INTERIOR = 4;   // the walk through an interior's dense medium its ray scattered into
 
 // Whether the root is the accumulation reference.
-bool lean_reference(PathRoot r)
+bool path_reference(PathRoot r)
 {
     return may(MAY_REFERENCE) && (r.dielectric_flags & DIELECTRIC_REFERENCE) != 0;
 }
@@ -565,7 +565,7 @@ struct RoughMeeting
 // through the surface (`meeting`).
 void walk_traced(PathRoot r, uint slot, uint4* at, inout Walk e, bool interior, uint owner, inout PathTrail trail, out Traced last, out RoughMeeting meeting)
 {
-    bool share = !lean_reference(r);
+    bool share = !path_reference(r);
     uint mask = interior ? MASK_OPAQUE | MASK_DIELECTRIC : MASK_OPAQUE;
     uint4 cover = scattered_cover(r, slot, at, mask);
     last = traced_nothing();
@@ -577,7 +577,7 @@ void walk_traced(PathRoot r, uint slot, uint4* at, inout Walk e, bool interior, 
     bool scattered = interior && e.step == 0;
     float3 into = float3(0.0);
     if (scattered)
-        into = asfloat(load_coherent(lean_cold(r, slot) + LEAN_INTO_WORD).xyz);
+        into = asfloat(load_coherent(path_cold(r, slot) + COLD_INTO_WORD).xyz);
     for (; e.step < r.sss_max_steps; e.step++)
     {
         WalkDraw d;
@@ -644,12 +644,12 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
 {
     invokes = false;
     p.words = uint4(0);
-    uint4* cold = lean_cold(r, slot);
+    uint4* cold = path_cold(r, slot);
     uint owner;
     Walk e = load_walk(cold, r.frame, owner);
     // A walk that stopped at a rough meeting goes on with the steps it took, which the walk words'
     // last lane keeps.
-    e.step = load_coherent(cold + LEAN_WALK_WORD + 3).w;
+    e.step = load_coherent(cold + COLD_WALK_WORD + 3).w;
     RoughMeeting meeting;
     walk_traced(r, slot, at, e, interior, owner, trail, h, meeting);
     trail.walked = true;
@@ -664,10 +664,10 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
     float3 throughput = hot_throughput(w1) * (conditioned ? meeting.unattenuated : meeting.met || leaves ? meeting.reached : e.throughput);
     bool lost = meeting.met && e.kind == WALK_NONE;
     bool capped = e.kind == WALK_CAP;
-    bool reference = lean_reference(r);
+    bool reference = path_reference(r);
     if (capped && reference)
         InterlockedAdd(r.set.reference_counts[0], 1u);
-    uint entered = load_coherent(cold + LEAN_ENTERED_WORD).x;
+    uint entered = load_coherent(cold + COLD_ENTERED_WORD).x;
     // The reference ends a path whose walk reached its cap, and so does a walk of an interior the
     // path did not enter through a surface.
     if ((e.kind == WALK_NONE && !lost) || (capped && (reference || (interior && entered == NO_ENTRY))) || !carries(throughput))
@@ -701,8 +701,8 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
         // throughput takes the walk's so far, and a walk that goes on does from its cold words, as
         // `store_walk_words` keeps them with its steps in the last lane, once the raygen traced
         // the shadow job the vertex at the meeting leaves.
-        store_coherent(cold + LEAN_WALK_WORD, uint4(asuint(e.origin), owner));
-        store_coherent(cold + LEAN_WALK_WORD + 3, uint4(e.rng.seed, way, e.rng.dimension, e.step));
+        store_coherent(cold + COLD_WALK_WORD, uint4(asuint(e.origin), owner));
+        store_coherent(cold + COLD_WALK_WORD + 3, uint4(e.rng.seed, way, e.rng.dimension, e.step));
         store_coherent(at, uint4(asuint(meeting.point), w0.w));
         store_coherent(at + 1, uint4(arrived, across, carried));
         Payload meets;
@@ -737,7 +737,7 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
     if (meeting.met)
         leave.words.yz = uint2(MEDIUM_LEAVES_ROUGH, asuint(meeting.weight));
     else
-        store_coherent(cold + LEAN_INTO_WORD, uint4(asuint(meeting.into), asuint(meeting.weight)));
+        store_coherent(cold + COLD_INTO_WORD, uint4(asuint(meeting.into), asuint(meeting.weight)));
     call(CALL_MEDIUM, leave);
     trail.chain = true;
     return NEXT_RAY;
@@ -755,8 +755,8 @@ uint run_walk(PathRoot r, uint slot, uint4* at, bool interior, inout PathTrail t
 uint scatter_segment(PathRoot r, uint slot, uint4* at, uint4 w0, float t, inout PathTrail trail, out bool on)
 {
     on = true;
-    uint4* cold = lean_cold(r, slot);
-    float4 scatter = asfloat(load_coherent(cold + LEAN_SCATTER_WORD));
+    uint4* cold = path_cold(r, slot);
+    float4 scatter = asfloat(load_coherent(cold + COLD_SCATTER_WORD));
     float3 sigma_s = scatter.xyz;
     if (!any(sigma_s > 0.0))
         return NEXT_RAY;
@@ -766,7 +766,7 @@ uint scatter_segment(PathRoot r, uint slot, uint4* at, uint4 w0, float t, inout 
     float3 offset = ray_offset(at);
     float span = length(offset + dir * t);
     uint depth = (w0.w >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK;
-    bool walks = trail.chain && (lean_reference(r) || !trail.walked) && depth < r.max_bounces && max_component(sigma_s) * span >= 1.0;
+    bool walks = trail.chain && (path_reference(r) || !trail.walked) && depth < r.max_bounces && max_component(sigma_s) * span >= 1.0;
     float3 sigma_t = asfloat(load_coherent(cold + 1 + INTERIOR_ENTRIES).yzw);
     Sampler rng = path_sampler(r, item_pixel(r, r.slice_base + slot));
     rng.dimension = w0.w >> HOT_DIMENSION_SHIFT;
@@ -805,7 +805,7 @@ uint scatter_segment(PathRoot r, uint slot, uint4* at, uint4 w0, float t, inout 
 // view path's rays that leave a layer, a scatter or a walk's way out (`chain`) and for the first
 // vertex's ray, and for every ray whose light counts the proxies of sphere and rect lights, which
 // cover nothing. The camera ray sees neither.
-uint lean_front_mask(PathRoot r, uint slot, uint4 w0, bool view, bool chain)
+uint path_front_mask(PathRoot r, uint slot, uint4 w0, bool view, bool chain)
 {
     if ((w0.w & HOT_CAMERA) != 0)
         return 0;
@@ -825,7 +825,7 @@ uint lean_front_mask(PathRoot r, uint slot, uint4 w0, bool view, bool chain)
 // transmittance alone and see no particles. Every ray of a view path inside one may scatter: in
 // real time the world cache's light for the medium ends the path there, which costs no more than
 // going on. What the ray meets in front of its hit or its scatter runs in a callable first
-// (`lean_front_mask`), and so does the march of the linked medium's in-scatter along the way to a
+// (`path_front_mask`), and so does the march of the linked medium's in-scatter along the way to a
 // hit outside every interior, past the camera ray: for a ray that left a layer, a scatter or a
 // walk's way out through the view's froxels, and for any other where it is long. A `PHOTON`'s
 // rays see particles as a view path's do, take the medium's transmittance alone, and report no
@@ -853,7 +853,7 @@ uint trace_ray<let VIEW : bool, let PHOTON : bool>(PathRoot r, uint slot, uint4*
     // payload where it met one; the callable that takes them runs for those rays alone.
     uint front = 0;
     if (may_any(MAY_PARTICLES | MAY_LOCAL_LIGHTS))
-        front = lean_front_mask(r, slot, w0, VIEW || PHOTON, trail.chain);
+        front = path_front_mask(r, slot, w0, VIEW || PHOTON, trail.chain);
     mask |= front;
     float t_max = camera && !traced_camera ? reach : positive_infinity();
     // What the camera sees of an alpha-tested triangle is its coverage itself; a scattered
@@ -882,7 +882,7 @@ uint trace_ray<let VIEW : bool, let PHOTON : bool>(PathRoot r, uint slot, uint4*
     // it lies, and for the background layer, how deep along the view's axis.
     if (lens && h.hit())
     {
-        uint4* record = lean_record(r, slot);
+        uint4* record = path_record(r, slot);
         StoredViewLights lights = reinterpret<StoredViewLights>(load_coherent(record));
         float3 from_eye = ray.Origin + ray.Direction * h.t() - r.view.eye_render.xyz;
         lights.first_distance = from_background(r) ? -dot(r.view.view_from_world_rotation[2].xyz, from_eye) : length(from_eye);
@@ -1025,7 +1025,7 @@ uint run_path(PathRoot r, uint slot, uint4* at, uint next)
 
 // The raygen of a view's paths: a pixel's path, then its outputs, the radiance texel and the
 // light feedback.
-public void lean_paths(PathRoot r)
+public void view_paths(PathRoot r)
 {
     uint slot = DispatchRaysIndex().x;
     if (slot >= r.slice_count)
@@ -1040,8 +1040,8 @@ public void lean_paths(PathRoot r)
         return;
     }
     ViewConstants* v = r.view;
-    uint4* at = lean_hot(r, slot);
-    uint4* record = lean_record(r, slot);
+    uint4* at = path_hot(r, slot);
+    uint4* record = path_record(r, slot);
     StoredViewLights lights = { NO_LIGHT, 0.0, pcg3d(uint3(pixel, r.frame ^ path_stream(r))).x, 0.0 };
     store_coherent(record, reinterpret<uint4>(lights));
     float3 radiance = float3(0.0);
@@ -1065,14 +1065,14 @@ public void lean_paths(PathRoot r)
     bool two = runs && surface && frost_pass(r) && two_passes(r, pixel);
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
     uint index = pixel.y * r.gbuffer.extent.x + pixel.x;
-    if (lean_layer_view(r))
-        store_coherent(lean_debug(r, slot), uint4(0));
+    if (path_layer_view(r))
+        store_coherent(path_debug(r, slot), uint4(0));
     for (uint pass = 0; pass < (two ? 2u : 1u); pass++)
     {
         bool second = pass == 1;
         if (runs)
         {
-            bool starts_inside = start_path(r, slot, pixel, at, lean_cold(r, slot), surface && !second ? 1.0 / r.pixel_fraction : 1.0, layers && !second, second);
+            bool starts_inside = start_path(r, slot, pixel, at, path_cold(r, slot), surface && !second ? 1.0 / r.pixel_fraction : 1.0, layers && !second, second);
             if (may(MAY_LENS) && lens)
             {
                 Sampler rng = path_sampler(r, pixel);
@@ -1080,7 +1080,7 @@ public void lean_paths(PathRoot r)
                 lens_ray(at, s, rng.dimension, true);
             }
             rays = run_path(r, slot, at, surface && (second || !layers) ? NEXT_FIRST : NEXT_RAY);
-            radiance = lean_radiance(r, slot, at);
+            radiance = path_radiance(r, slot, at);
             if (!second)
             {
                 carried = starts_inside;
@@ -1104,15 +1104,15 @@ public void lean_paths(PathRoot r)
         float4 texel = float4(apply_hdr_ceiling(pre_exposure * radiance), first_distance > 0.0 ? 1.0 : 0.0);
         if (may(MAY_DEBUG) && path_mode(r) == PATH_RAYS)
             texel.xyz = float3(float(rays), all(isfinite(radiance)) ? 0.0 : 1.0, 0.0);
-        else if (lean_layer_view(r))
+        else if (path_layer_view(r))
         {
             // A pixel whose first vertex was a layer shows the layer's shares and the layers the
             // path met.
-            uint4 d = load_coherent(lean_debug(r, slot));
+            uint4 d = load_coherent(path_debug(r, slot));
             if (d.w != 0)
             {
                 float2 own = asfloat(d.xy);
-                uint layers = may(MAY_LAYERS) ? met_layers(lean_cold(r, slot)) : 0;
+                uint layers = may(MAY_LAYERS) ? met_layers(path_cold(r, slot)) : 0;
                 texel = float4(own / max(own.x + own.y, 1e-6), float(layers) / float(max(r.dielectric_depth, 1u)), 1.0);
             }
         }
@@ -1129,7 +1129,7 @@ public void lean_paths(PathRoot r)
 // camera ray past the mask's depth, at the view path's settings but its mode and its share of
 // pixels; its texel the pre-exposed radiance and the reverse-Z depth of its first hit, or past
 // a miss the sky the camera sees, at depth 0. A pixel the mask leaves out writes (0, 0, 0, -1).
-public void lean_backgrounds<E : IEnvironment, M : IMedium>(PathRoot r)
+public void background_paths<E : IEnvironment, M : IMedium>(PathRoot r)
 {
     uint slot = DispatchRaysIndex().x;
     uint2 extent = r.gbuffer.extent;
@@ -1140,14 +1140,14 @@ public void lean_backgrounds<E : IEnvironment, M : IMedium>(PathRoot r)
     PathStart s;
     if (!background_path_start(r, pixel, rng, s))
         return;
-    uint4* at = lean_hot(r, slot);
-    uint4* record = lean_record(r, slot);
+    uint4* at = path_hot(r, slot);
+    uint4* record = path_record(r, slot);
     StoredViewLights lights = { NO_LIGHT, 0.0, pcg3d(uint3(pixel, r.frame ^ path_stream(r))).x, 0.0 };
     store_coherent(record, reinterpret<uint4>(lights));
-    start_path(r, slot, pixel, at, lean_cold(r, slot), 1.0, false, false);
+    start_path(r, slot, pixel, at, path_cold(r, slot), 1.0, false, false);
     lens_ray(at, s, rng.dimension, false);
     run_path(r, slot, at, NEXT_RAY);
-    float3 radiance = lean_radiance(r, slot, at);
+    float3 radiance = path_radiance(r, slot, at);
     float depth = reinterpret<StoredViewLights>(load_coherent(record)).first_distance;
     ViewConstants* v = r.view;
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
@@ -1192,7 +1192,7 @@ bool photon_light_reaches(PathRoot r, uint4* at)
 // the first the photon crossed.
 bool photon_stack_owned(PathRoot r, uint slot, uint4* at)
 {
-    uint4* track = lean_stack(r, slot) + STACK_TRACK_WORD;
+    uint4* track = path_stack(r, slot) + STACK_TRACK_WORD;
     uint4 k = load_coherent(track);
     if (k.w == 0 || k.z == 0)
         return false;
@@ -1204,13 +1204,13 @@ bool photon_stack_owned(PathRoot r, uint slot, uint4* at)
     return face.z != MATERIAL_NONE && abs(dot(oct_decode_snorm16(face.x), oct_decode_snorm16(k.y))) >= STACK_PARALLEL;
 }
 
-// The raygen of the frame's caustic photons: `slot`'s photon from its start (`lean_photon_start`),
+// The raygen of the frame's caustic photons: `slot`'s photon from its start (`path_photon_start`),
 // its ray toward its light, then its first vertex, which its first ray reaches on the caster as the
 // light's own ray would, and each vertex past it, whose shader runs it adjoint. Where a vertex
 // leaves a deposit, the deposit's callable takes it, unless next-event estimation takes the
 // photon's light there through the plane stack it crossed. A photon that met nothing is gone. Its
 // caster entry counts the photons that deposited.
-public void lean_photons(PathRoot r)
+public void photon_paths(PathRoot r)
 {
     uint slot = DispatchRaysIndex().x;
     if (slot >= r.slice_count)
@@ -1218,7 +1218,7 @@ public void lean_photons(PathRoot r)
     Payload start;
     start.words = uint4(0);
     call(CALL_PHOTON_START, start);
-    uint4* at = lean_hot(r, slot);
+    uint4* at = path_hot(r, slot);
     if (start.words.x == 0 || !photon_light_reaches(r, at))
         return;
     PathTrail trail = { false, false, 0, 0.0 };
@@ -1264,7 +1264,7 @@ public void lean_photons(PathRoot r)
             break;
         trail.chain = may(MAY_LAYERS) && layer_record(h);
     }
-    uint entry = load_coherent(lean_record(r, slot)).w;
+    uint entry = load_coherent(path_record(r, slot)).w;
     if ((entry & PHOTON_DEPOSITED) != 0)
         InterlockedAdd(r.caustics.source.deposited[entry & ~PHOTON_DEPOSITED], 1u);
 }
@@ -1272,7 +1272,7 @@ public void lean_photons(PathRoot r)
 // The raygen of a view's update paths: the path of a block's pixel, which adds to the world
 // cache's cell of each of its first opaque vertices the light that vertex scattered. On a tile the
 // layer guides traced it starts inside the interiors around its G-buffer surface.
-public void lean_updates(PathRoot r)
+public void update_paths(PathRoot r)
 {
     uint slot = DispatchRaysIndex().x;
     if (slot >= r.slice_count)
@@ -1280,11 +1280,11 @@ public void lean_updates(PathRoot r)
     uint2 pixel = item_pixel(r, r.slice_base + slot);
     if (any(pixel >= r.gbuffer.extent) || r.gbuffer.depth.get<Texture2D<float>>().Load(int3(pixel, 0)) == 0.0)
         return;
-    uint4* at = lean_hot(r, slot);
-    uint4* record = lean_record(r, slot);
+    uint4* at = path_hot(r, slot);
+    uint4* record = path_record(r, slot);
     CacheUpdate update = CacheUpdate();
     uint state = pcg3d(uint3(pixel, r.frame ^ path_stream(r))).y;
-    start_path(r, slot, pixel, at, lean_cold(r, slot), 1.0, false, layered(r, pixel));
+    start_path(r, slot, pixel, at, path_cold(r, slot), 1.0, false, layered(r, pixel));
     Payload first;
     first.words = uint4(0);
     call(CALL_FIRST, first);

@@ -121,7 +121,7 @@ read code, start with those examples and the `orr` crate.
 ### Profiling
 
 Each kernel's entry point is named after its module, such as
-`orr_lighting.path.lean_paths.paths`, so a GPU profiler tells kernels apart, and passes carry debug
+`orr_lighting.path.plain.paths`, so a GPU profiler tells kernels apart, and passes carry debug
 labels. Kernels follow the Rust debug info of the build: where it has some, they carry line tables
 and their Slang source, so a profiler maps hotspots to source lines; release builds have none. The
 `profiling` profile is release with line tables:

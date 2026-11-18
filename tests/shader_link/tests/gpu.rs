@@ -252,11 +252,11 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
             "media/froxel",
             "media/froxel_light",
             "media/particle_draw",
-            "path/lean_layer",
-            "path/lean_paths",
-            "path/lean_rich",
-            "path/lean_walk",
-            "path/standins"
+            "path/layer",
+            "path/plain",
+            "path/rich",
+            "path/standins",
+            "path/walk"
         ]
     );
     if let Some(e) = renderer_error(&orr_linked::KERNELS) {

@@ -1,7 +1,7 @@
-// The lean path tracer's hit shader for layers of the dielectric class (`KIND_LAYER_PATH`): a
+// The path tracer's hit shader for layers of the dielectric class (`KIND_LAYER_PATH`): a
 // surface whose BSDF transmits, with a coat, a fuzz or a thin film where it has one, and whose
 // vertex crosses into or out of the interior its material bounds; and the callable that weighs a
-// dispersive layer's companion wavelengths. `path.lean_paths` holds the other stages; a stage of
+// dispersive layer's companion wavelengths. `path.plain` holds the other stages; a stage of
 // this kernel folds the lobes a scene's mask rules out.
 #include "orr_root.h"
 import orr_shaders.pipeline;
@@ -14,7 +14,7 @@ import orr_scene.candidates;
 import orr_scene.runs;
 import orr_scene.hit;
 import orr_lighting.path;
-import orr_lighting.path.lean.vertex;
+import orr_lighting.path.vertex;
 import orr_lighting.specialize;
 
 extern struct Surface : ISurfaces = StandardSurface;
@@ -31,7 +31,7 @@ void surface_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
     TriangleHit h = { a };
     // A window's or the stack question's answer is the payload.
     bool question = is_question(p.words);
-    lean_layer_hit<Surface, Medium, TriangleHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
+    path_layer_hit<Surface, Medium, TriangleHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
     // Tells the raygen a shader took the hit.
     if (!question)
         p.words.x = 0;
@@ -41,5 +41,5 @@ void surface_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 void disperse(inout DisperseCall c)
 {
     ORR_OMM(disperse);
-    lean_disperse(root, DispatchRaysIndex().x, c);
+    path_disperse(root, DispatchRaysIndex().x, c);
 }

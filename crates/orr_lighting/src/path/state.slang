@@ -1,6 +1,6 @@
-// What a path of the lean tracer holds between its shaders: LEAN_HOT_WORDS words of 16 bytes in its
-// slot, packed, which every shader of the common path loads and stores whole, and the budget the
-// tracer's stages are held to (`tests/lighting_suite/tests/budget.rs`).
+// What a path holds between its shaders: PATH_HOT_WORDS words of 16 bytes in its slot, packed,
+// which every shader of the common path loads and stores whole, and the budget the tracer's stages
+// are held to (`tests/lighting_suite/tests/budget.rs`).
 //
 // A path's ray, its throughput and its pending shadow job are all a hit's shader leaves for the
 // raygen: the raygen holds the slot's address across a trace or an invoke and nothing of the path.
@@ -16,25 +16,25 @@ import orr_lighting.spectrum;
 
 // The budget of the common path: what a plain ray pays whatever else its pipeline links.
 // A path's hot state.
-[Host] public static const uint LEAN_HOT_WORDS = 6;
+[Host] public static const uint PATH_HOT_WORDS = 6;
 // The words a path keeps beside its hot ones where the scene may hold a layer, an interior or a
 // walk: the interior list (`Interior`: its entries, then where each was entered), the layers it
 // met beside the extinction of the innermost interior's medium, that medium's scattering
 // coefficient and anisotropy, the point and outward normal of the surface the path last entered
-// an interior through (`LEAN_ENTERED_WORD`), a walk where it starts or goes on (`LEAN_WALK_WORD`),
-// the surface where a subsurface walk leaves, as its hit resolved it (`LEAN_EXIT_WORD`), and where
-// the ray that ideal windows passed on left its vertex (`LEAN_FROM_WORD`).
-[Host] public static const uint LEAN_COLD_WORDS = 19;
-public static const uint LEAN_SCATTER_WORD = 6;
-public static const uint LEAN_ENTERED_WORD = 7;
-public static const uint LEAN_WALK_WORD = 8;
-public static const uint LEAN_EXIT_WORD = 12;
-public static const uint LEAN_FROM_WORD = 18;
+// an interior through (`COLD_ENTERED_WORD`), a walk where it starts or goes on (`COLD_WALK_WORD`),
+// the surface where a subsurface walk leaves, as its hit resolved it (`COLD_EXIT_WORD`), and where
+// the ray that ideal windows passed on left its vertex (`COLD_FROM_WORD`).
+[Host] public static const uint PATH_COLD_WORDS = 19;
+public static const uint COLD_SCATTER_WORD = 6;
+public static const uint COLD_ENTERED_WORD = 7;
+public static const uint COLD_WALK_WORD = 8;
+public static const uint COLD_EXIT_WORD = 12;
+public static const uint COLD_FROM_WORD = 18;
 // An interior's walk, which no subsurface walk's way out runs beside, keeps the direction its last
 // scatter was reached along in the first of those words, and where it leaves, the weight of the
 // surface's draw there.
-public static const uint LEAN_INTO_WORD = LEAN_EXIT_WORD;
-[Host] public static const uint LEAN_HOT_BYTES = 16 * LEAN_HOT_WORDS;
+public static const uint COLD_INTO_WORD = COLD_EXIT_WORD;
+[Host] public static const uint PATH_HOT_BYTES = 16 * PATH_HOT_WORDS;
 // The words a path keeps where the pipeline may meet a plane stack, apart from its cold ones, for
 // what passes between its shaders through a directional job's walk through a stack: the interior
 // list the walk works on, which the vertex that left the job gives where the job lies in an
@@ -45,7 +45,7 @@ public static const uint LEAN_INTO_WORD = LEAN_EXIT_WORD;
 // it, as the vertex that left the job keeps it (`STACK_BENT_WORD`, four words); and where a path's
 // ray crossed stack faces since its vertex last scattered, that vertex's ray (`STACK_TRACK_WORD`,
 // two words). The face a stack ray meets and the walk's next leg pass in payloads.
-[Host] public static const uint LEAN_STACK_WORDS = 14;
+[Host] public static const uint PATH_STACK_WORDS = 14;
 public static const uint STACK_LIST_WORD = 0;
 public static const uint STACK_FROM_WORD = 5;
 public static const uint STACK_THROUGH_WORD = 6;
@@ -248,7 +248,7 @@ public static const uint HOT_INTERIOR = 1 << 16;    // the path lies in an inter
 // medium, whose segment the froxels hold: its first vertex takes the interior on.
 public static const uint HOT_INTERIOR_HELD = 1 << 17;
 // Ideal windows passed the ray on as it reached them, from the point its cold words keep
-// (`LEAN_FROM_WORD`): its other words weigh it as the vertex before them left it.
+// (`COLD_FROM_WORD`): its other words weigh it as the vertex before them left it.
 public static const uint HOT_WINDOW = 1 << 18;
 // Bits of a path ray's first payload word that its cover (`path_payload`) leaves free: traversal's
 // any-hits ignore them, and the shader of the hit reads them.
@@ -256,8 +256,8 @@ public static const uint PAYLOAD_WEIGHED = 1 << 14; // a walk weighed the ray's 
 public static const uint PAYLOAD_EXIT = 1 << 15;    // the hit is where a subsurface walk leaves
 public static const uint PAYLOAD_WALKED = 1 << 16;  // the path walked
 // What a hit's shader hands back in its payload's second word: the vertex drew a subsurface walk,
-// which the path's cold words hold (`LEAN_WALK_WORD`), or it resolved the surface where one leaves
-// into them (`LEAN_EXIT_WORD`) for the callable of that vertex.
+// which the path's cold words hold (`COLD_WALK_WORD`), or it resolved the surface where one leaves
+// into them (`COLD_EXIT_WORD`) for the callable of that vertex.
 public static const uint PAYLOAD_WALKS = 1;
 public static const uint PAYLOAD_EXITS = 2;
 // What the callable of a vertex in an interior's medium runs, by its payload's second word: a
@@ -455,7 +455,7 @@ public void store_chain(uint4* at, PathChain after, PathChain before)
 // takes its light to Rec.2020 through them with the sample that draws them and whether they are
 // drawn, and the light it gathered before the transfer last changed, already through it. The hot
 // words' radiance is what the path gathered since, which goes through the transfer it has now.
-[Host] public static const uint LEAN_SPECTRAL_WORDS = 6;
+[Host] public static const uint PATH_SPECTRAL_WORDS = 6;
 
 public struct PathSpectral
 {
@@ -535,15 +535,15 @@ public float3 spectral_radiance(uint4* at, float3 pending)
 
 // A caustic photon's record: its flux in the first three lanes, and its caster entry in the last,
 // with PHOTON_DEPOSITED once it deposited.
-[Host] public static const uint LEAN_PHOTON_RECORD_WORDS = 1;
+[Host] public static const uint PATH_PHOTON_RECORD_WORDS = 1;
 public static const uint PHOTON_DEPOSITED = 1u << 31;
 
 // A view path's record, a word in its slot of the launch's records: the light its feedback names,
 // one of those that lit it, kept in proportion to what each added (`view_light`).
-[Host] public static const uint LEAN_VIEW_RECORD_WORDS = 1;
+[Host] public static const uint PATH_VIEW_RECORD_WORDS = 1;
 // An update path's: its `CacheUpdate`, then the vertex its last hit left for the raygen to record,
 // two words (`UpdateVertex`).
-[Host] public static const uint LEAN_UPDATE_RECORD_WORDS = 11;
+[Host] public static const uint PATH_UPDATE_RECORD_WORDS = 11;
 public static const uint UPDATE_VERTEX_AT = 9;
 
 // What an update path's hit leaves of its vertex, which the raygen adds to the path's record.

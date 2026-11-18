@@ -122,11 +122,11 @@ public static const float INSCATTER_SEGMENT = 500.0;
 // `NEE_METAL_ROUGHNESS`; BSDF rays carry the rest.
 public static const float NEE_METAL_ROUGHNESS = 0.3;
 
-// Where a launch's paths keep their state (`path.lean.state`): every slot's LEAN_HOT_WORDS hot
-// words and its record, of LEAN_VIEW_RECORD_WORDS, LEAN_UPDATE_RECORD_WORDS or
-// LEAN_PHOTON_RECORD_WORDS by its source, at a fixed stride; and where its pipeline's paths may reach
-// them, its cold words (LEAN_COLD_WORDS a slot) where they may meet a layer, an interior or a walk,
-// its plane stack's (LEAN_STACK_WORDS) where they may meet one, a word a slot (`PathChain`) where
+// Where a launch's paths keep their state (`path.state`): every slot's PATH_HOT_WORDS hot
+// words and its record, of PATH_VIEW_RECORD_WORDS, PATH_UPDATE_RECORD_WORDS or
+// PATH_PHOTON_RECORD_WORDS by its source, at a fixed stride; and where its pipeline's paths may reach
+// them, its cold words (PATH_COLD_WORDS a slot) where they may meet a layer, an interior or a walk,
+// its plane stack's (PATH_STACK_WORDS) where they may meet one, a word a slot (`PathChain`) where
 // they may gather caustic photons, its spectral words (`PathSpectral`) where they may split by
 // wavelength, and a word a slot for what a debug view of the path's first vertex shows where its
 // pipeline may show one; null elsewhere.

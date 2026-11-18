@@ -1,13 +1,13 @@
-//! The slots of a source's paths in the pipeline and their records, as `path/lean/state.slang`
-//! lays them out: [`LEAN_HOT_WORDS`] words of every slot and a record by the source, which the
+//! The slots of a source's paths in the pipeline and their records, as `path/state.slang`
+//! lays them out: [`PATH_HOT_WORDS`] words of every slot and a record by the source, which the
 //! launch's header (`LaunchHeader`) places.
 
 use orr_scene::orr_gpu::{Allocation, Device, GpuPtr, MemoryKind};
 
 use crate::Error;
 use crate::shaders::consts::{
-    LEAN_COLD_WORDS, LEAN_HOT_WORDS, LEAN_PHOTON_RECORD_WORDS, LEAN_SPECTRAL_WORDS,
-    LEAN_STACK_WORDS, LEAN_UPDATE_RECORD_WORDS, LEAN_VIEW_RECORD_WORDS,
+    PATH_COLD_WORDS, PATH_HOT_WORDS, PATH_PHOTON_RECORD_WORDS, PATH_SPECTRAL_WORDS,
+    PATH_STACK_WORDS, PATH_UPDATE_RECORD_WORDS, PATH_VIEW_RECORD_WORDS,
 };
 use crate::shaders::types::LaunchHeader;
 
@@ -25,27 +25,27 @@ impl SlotLayout {
     /// The slots of a view's paths.
     pub(crate) fn view() -> Self {
         Self {
-            record_words: LEAN_VIEW_RECORD_WORDS,
+            record_words: PATH_VIEW_RECORD_WORDS,
         }
     }
 
     /// The slots of its update paths.
     pub(crate) fn update() -> Self {
         Self {
-            record_words: LEAN_UPDATE_RECORD_WORDS,
+            record_words: PATH_UPDATE_RECORD_WORDS,
         }
     }
 
     /// The slots of a frame's caustic photons.
     pub(crate) fn photon() -> Self {
         Self {
-            record_words: LEAN_PHOTON_RECORD_WORDS,
+            record_words: PATH_PHOTON_RECORD_WORDS,
         }
     }
 
     /// The words of a slot: its hot words and its record.
     fn slot_words(self) -> u64 {
-        u64::from(LEAN_HOT_WORDS) + u64::from(self.record_words)
+        u64::from(PATH_HOT_WORDS) + u64::from(self.record_words)
     }
 }
 
@@ -91,16 +91,16 @@ impl SourceMemory {
                 &format!("{name} {what}"),
             )
         };
-        let hot = words(LEAN_HOT_WORDS, "paths")?;
+        let hot = words(PATH_HOT_WORDS, "paths")?;
         let cold = cold
-            .then(|| words(LEAN_COLD_WORDS, "path interiors"))
+            .then(|| words(PATH_COLD_WORDS, "path interiors"))
             .transpose()?;
         let stack = stack
-            .then(|| words(LEAN_STACK_WORDS, "path plane stacks"))
+            .then(|| words(PATH_STACK_WORDS, "path plane stacks"))
             .transpose()?;
         let chain = chain.then(|| words(1, "path chains")).transpose()?;
         let spectral = spectral
-            .then(|| words(LEAN_SPECTRAL_WORDS, "path wavelengths"))
+            .then(|| words(PATH_SPECTRAL_WORDS, "path wavelengths"))
             .transpose()?;
         let debug = debug.then(|| words(1, "path debug views")).transpose()?;
         let records = words(layout.record_words, "path records")?;
