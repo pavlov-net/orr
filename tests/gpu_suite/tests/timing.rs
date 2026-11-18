@@ -15,11 +15,27 @@ use orr_gpu::{
 /// as many threads as the GPU holds at once, so a pass has a tail of late workgroups.
 const GROUPS: u32 = 4096;
 const SIDE: u32 = 512;
-/// Steps of the chain in a short pass.
-const STEPS: u32 = 50_000;
-/// How far the wall time of a submit may exceed its one pass's time: the time the submit call
-/// and the GPU take to start it and the CPU takes to wake once it completes.
-const WALL_MARGIN_MS: f64 = 0.5;
+/// Steps of the chain in a short pass. A pass's time takes in whatever work of other processes
+/// the GPU runs while it does, so the shorter the pass, the more of its readings miss that work.
+const STEPS: u32 = 4_000;
+/// Submits each comparison takes its least readings from, so that they miss other processes'
+/// work on a shared GPU.
+const SAMPLES: usize = 32;
+/// Steps of the chain in a pass checked against the CPU's clock, in multiples of a short
+/// pass's: tens of milliseconds of work, so an end timestamp written early cuts off
+/// milliseconds.
+const WALL_STEPS: u32 = 500;
+/// Submits of each pass checked against the CPU's clock.
+const WALL_SAMPLES: usize = 8;
+/// The most the wall time of a submit may be over its one exact pass's time. The submit call,
+/// the GPU's start and the CPU's wake take under a millisecond, but other processes' work the
+/// GPU runs ahead of the pass can take tens, so only a pass read short by half fails, as a
+/// wrong unit or timestamp period reads it.
+const WALL_OVER_PASS: f64 = 2.0;
+/// How long after its end timestamp the CPU may wake to the completion of a submit: the time
+/// the GPU takes to signal it and the CPU to wake, a tenth of a millisecond on an idle CPU
+/// and more on a busy one, but well short of the tail an early end timestamp cuts off.
+const WAKE_MARGIN_MS: f64 = 5.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
@@ -124,85 +140,112 @@ impl Bench {
         list.end_pass();
     }
 
-    /// Submits `list` to the idle queue: its passes, and the wall time from the submit to its
-    /// completion.
-    fn run(&mut self, list: CommandList<'_>) -> (Vec<PassResult>, f64) {
+    /// Submits `list` to the idle queue: its passes, and the instants of the submit and of the
+    /// CPU's wake to its completion.
+    fn run(&mut self, list: CommandList<'_>) -> (Vec<PassResult>, Instant, Instant) {
         let queue = render();
         let start = Instant::now();
         let point = queue.submit(vec![list], &[]).unwrap();
         queue.wait(point, Duration::from_secs(10)).unwrap();
-        let wall = start.elapsed().as_secs_f64() * 1e3;
-        (device().pass_results(point).unwrap(), wall)
+        let woke = Instant::now();
+        (device().pass_results(point).unwrap(), start, woke)
     }
 
-    /// The least time of `kind`'s exact pass of `steps` steps alone in a submit, after
-    /// checking each against the submit's wall time.
-    fn alone(&mut self, kind: Kind, steps: u32) -> f64 {
-        let mut least = f64::MAX;
-        let mut gap = f64::MAX;
-        for _ in 0..5 {
+    /// The least time of each of `kind`'s exact passes of `steps` steps, all in every submit,
+    /// after checking that each submit's passes fit its wall time.
+    fn alone<const N: usize>(&mut self, kind: Kind, steps: [u32; N]) -> [f64; N] {
+        let mut least = [f64::MAX; N];
+        for _ in 0..SAMPLES {
+            let mut list = render().command_list().unwrap();
+            list.discard(&self.target);
+            list.set_exact_timing(true);
+            for s in steps {
+                self.pass(&mut list, "timed", kind, s);
+            }
+            let (passes, start, woke) = self.run(list);
+            let wall = ms(woke - start);
+            assert_eq!(passes.len(), N, "{passes:?}");
+            assert!(passes.iter().all(|p| p.exact), "{passes:?}");
+            let sum: f64 = passes.iter().map(|p| p.gpu_ms).sum();
+            assert!(sum <= wall, "{kind:?}: {passes:?} in a {wall} ms submit");
+            for (l, p) in least.iter_mut().zip(&passes) {
+                *l = l.min(p.gpu_ms);
+            }
+        }
+        least
+    }
+
+    /// `kind`'s exact pass of `steps` steps alone in a submit, against the CPU's clock: the
+    /// least ratio of the submit's wall time to the pass's time, and with calibrated
+    /// timestamps the least time from the pass's end to the CPU's wake.
+    fn against_wall(&mut self, kind: Kind, steps: u32) -> (f64, f64) {
+        let (mut over, mut wake) = (f64::MAX, f64::MAX);
+        for _ in 0..WALL_SAMPLES {
             let mut list = render().command_list().unwrap();
             list.discard(&self.target);
             list.set_exact_timing(true);
             self.pass(&mut list, "timed", kind, steps);
-            let (passes, wall) = self.run(list);
+            let (passes, start, woke) = self.run(list);
+            let wall = ms(woke - start);
             let [p] = passes.as_slice() else {
                 panic!("{passes:?}")
             };
-            assert!(p.exact, "{p:?}");
-            assert!(
-                p.gpu_ms <= wall,
-                "{kind:?}: {} ms in a {wall} ms submit",
-                p.gpu_ms
-            );
-            least = least.min(p.gpu_ms);
-            gap = gap.min(wall - p.gpu_ms);
+            assert!(p.exact && p.gpu_ms <= wall, "{p:?} in a {wall} ms submit");
+            over = over.min(wall / p.gpu_ms);
+            if let Some((_, end)) = p.cpu {
+                // The calibration can place the end a little past the wake.
+                wake = wake.min(ms(woke.saturating_duration_since(end)));
+            }
         }
-        assert!(
-            gap < WALL_MARGIN_MS,
-            "{kind:?} of {steps} steps: {least} ms, at least {gap} ms short of its wall time"
-        );
-        least
+        (over, wake)
     }
 
-    /// The least time of `kind`'s exact pass of `steps` steps between a long compute pass
-    /// and another `kind` pass, both unexact.
-    fn between(&mut self, kind: Kind, steps: u32) -> f64 {
-        let mut least = f64::MAX;
-        for _ in 0..3 {
+    /// The least times of `kind`'s exact pass of `steps` steps alone, and between a long compute
+    /// pass and another `kind` pass, both unexact, read in the same submits.
+    fn between(&mut self, kind: Kind, steps: u32) -> (f64, f64) {
+        let (mut alone, mut between) = (f64::MAX, f64::MAX);
+        for _ in 0..SAMPLES {
             let mut list = render().command_list().unwrap();
             list.discard(&self.target);
+            list.set_exact_timing(true);
+            self.pass(&mut list, "alone", kind, steps);
+            list.set_exact_timing(false);
             self.pass(&mut list, "before", Kind::Compute, 4 * STEPS);
             list.set_exact_timing(true);
             self.pass(&mut list, "timed", kind, steps);
             list.set_exact_timing(false);
             self.pass(&mut list, "after", kind, steps);
-            let (passes, _) = self.run(list);
+            let (passes, ..) = self.run(list);
             let exact: Vec<(&str, bool)> = passes.iter().map(|p| (p.name, p.exact)).collect();
             assert_eq!(
                 exact,
-                [("before", false), ("timed", true), ("after", false)]
+                [
+                    ("alone", true),
+                    ("before", false),
+                    ("timed", true),
+                    ("after", false)
+                ]
             );
-            least = least.min(passes[1].gpu_ms);
+            alone = alone.min(passes[0].gpu_ms);
+            between = between.min(passes[2].gpu_ms);
         }
-        least
+        (alone, between)
     }
 }
 
-/// Four times the steps read four times the time, every pass agrees with the wall time of
-/// its submit, and an exact pass reads the same whatever unexact work comes before and after
-/// it.
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e3
+}
+
+/// Every exact pass agrees with the CPU's clock, four times the steps read four times the
+/// time, and an exact pass reads the same whatever unexact work comes before and after it, for
+/// every kind of work.
 #[test]
 fn exact_passes_read_their_own_work() {
     let mut bench = Bench::new();
-    // The GPU's clocks settle under load before the passes compared.
-    bench.alone(Kind::Compute, 4 * STEPS);
-    let short = bench.alone(Kind::Compute, STEPS);
-    let long = bench.alone(Kind::Compute, 4 * STEPS);
-    let ratio = long / short;
-    assert!(
-        (3.2..4.8).contains(&ratio),
-        "{long} ms for 4 times the steps of {short} ms"
+    let calibrated = require(
+        device().caps().calibrated_timestamps,
+        "no calibrated timestamps to place passes' ends",
     );
     let mut kinds = vec![(Kind::Compute, STEPS), (Kind::Raster, STEPS)];
     if require(bench.rays.is_some(), "no ray tracing pipelines") {
@@ -210,8 +253,25 @@ fn exact_passes_read_their_own_work() {
         kinds.push((Kind::Rays, 4 * STEPS));
     }
     for (kind, steps) in kinds {
-        let alone = bench.alone(kind, steps);
-        let between = bench.between(kind, steps);
+        // The long passes also let the GPU's clocks settle under load before the passes
+        // compared.
+        let (over, wake) = bench.against_wall(kind, WALL_STEPS * steps);
+        assert!(
+            over < WALL_OVER_PASS,
+            "{kind:?}: submits took at least {over} times their exact pass's time"
+        );
+        if calibrated {
+            assert!(
+                wake < WAKE_MARGIN_MS,
+                "{kind:?}: the CPU woke at least {wake} ms after an exact pass's end"
+            );
+        }
+        let [short, long] = bench.alone(kind, [steps, 4 * steps]);
+        assert!(
+            (3.2..4.8).contains(&(long / short)),
+            "{kind:?}: {long} ms for 4 times the steps of {short} ms"
+        );
+        let (alone, between) = bench.between(kind, steps);
         assert!(
             (0.8..1.25).contains(&(between / alone)),
             "{kind:?}: {between} ms between unexact passes, {alone} ms alone"

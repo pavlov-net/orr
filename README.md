@@ -148,7 +148,8 @@ its timestamps, so its time is its own work's and its `PassResult::exact` is set
 stop overlapping, so those frames take longer than the frames around them: time a few and leave
 the rest alone. `bench` times three frames of its first script exactly and prints their passes
 beside the others; `--exact-frame N` and `--exact-frames K` choose them. On Metal every pass's
-timestamps wait so already.
+timestamps wait so already. Timestamps read the GPU's clock, so a pass's time, exact or not, also
+holds any work of other processes the GPU runs while it does.
 
 Per-pass hardware counters come from NVIDIA's Nsight Perf SDK, with orr_gpu's `nsight-perf`
 feature, off by default and Vulkan only. The build reads the SDK's headers from

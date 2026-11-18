@@ -158,6 +158,8 @@ pub struct QueueRequest {
 #[derive(Clone, Debug)]
 pub struct PassResult {
     pub name: &'static str,
+    /// From the pass's begin timestamp to its end timestamp on the GPU's clock, which goes on
+    /// while the GPU runs other processes' work: on a shared GPU a pass reads that too.
     pub gpu_ms: f64,
     /// Begin and end on the CPU clock; `None` without `Caps::calibrated_timestamps` and on a
     /// queue without timestamps.
@@ -166,7 +168,7 @@ pub struct PassResult {
     /// counts them (Metal does not).
     pub stats: Option<PipelineStats>,
     /// The pass was timed exactly: its timestamps waited for the work before them on its
-    /// queue, so `gpu_ms` and `cpu` span its own work alone
+    /// queue, so `gpu_ms` and `cpu` span its own work and no other on its queue
     /// ([`CommandList::set_exact_timing`](crate::CommandList::set_exact_timing)). Otherwise
     /// its time can lose its last workgroups to later passes and take in the tail of earlier
     /// ones. Every pass a counter frame counts is exact, as is every pass on Metal, whose
