@@ -42,7 +42,7 @@ void surface_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(surface_hit);
     TriangleHit h = { a };
-    path_hit<Surface, Medium, TriangleHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
+    path_hit<Surface, Medium, TriangleHit, SectionGiven>(root, launch_index().x, p.words, section_given(data.material), h);
     // Tells the raygen a shader took the hit.
     p.words.x = 0;
 }
@@ -52,7 +52,7 @@ void strand_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(strand_hit);
     BuiltInHit h = { a };
-    path_hit<Surface, Medium, BuiltInHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
+    path_hit<Surface, Medium, BuiltInHit, SectionGiven>(root, launch_index().x, p.words, section_given(data.material), h);
     // Tells the raygen a shader took the hit.
     p.words.x = 0;
 }
@@ -83,7 +83,7 @@ void caster_photon(inout Payload p)
 {
     ORR_OMM(caster_photon);
     float reach;
-    p.words.x = path_photon_start<Medium>(root, DispatchRaysIndex().x, reach) ? 1 : 0;
+    p.words.x = path_photon_start<Medium>(root, launch_index().x, reach) ? 1 : 0;
     p.words.y = asuint(reach);
 }
 
@@ -91,63 +91,63 @@ void caster_photon(inout Payload p)
 void deposit(inout Payload p)
 {
     ORR_OMM(deposit);
-    path_deposit(root, DispatchRaysIndex().x);
+    path_deposit(root, launch_index().x);
 }
 
 [shader("callable")]
 void gather(inout GatherCall c)
 {
     ORR_OMM(gather);
-    path_gather(root, DispatchRaysIndex().x, c);
+    path_gather(root, launch_index().x, c);
 }
 
 [shader("callable")]
 void map_gather(inout MapGatherCall c)
 {
     ORR_OMM(map_gather);
-    path_map_gather(root, DispatchRaysIndex().x, c);
+    path_map_gather(root, launch_index().x, c);
 }
 
 [shader("callable")]
 void first_vertex(inout Payload p)
 {
     ORR_OMM(first_vertex);
-    path_first<Medium>(root, DispatchRaysIndex().x, p.words);
+    path_first<Medium>(root, launch_index().x, p.words);
 }
 
 [shader("callable")]
 void eye_interior(inout Payload p)
 {
     ORR_OMM(eye_interior);
-    p.words.x = path_eye_interior<Surface>(root, DispatchRaysIndex().x, p.words.x != 0) ? 1 : 0;
+    p.words.x = path_eye_interior<Surface>(root, launch_index().x, p.words.x != 0) ? 1 : 0;
 }
 
 [shader("callable")]
 void eye_lens(inout Payload p)
 {
     ORR_OMM(eye_lens);
-    path_lens_interior<Surface>(root, DispatchRaysIndex().x);
+    path_lens_interior<Surface>(root, launch_index().x);
 }
 
 [shader("callable")]
 void medium_vertex(inout Payload p)
 {
     ORR_OMM(medium_vertex);
-    path_medium_vertex<Medium>(root, DispatchRaysIndex().x, p.words);
+    path_medium_vertex<Medium>(root, launch_index().x, p.words);
 }
 
 [shader("callable")]
 void stack_step(inout StackStep c)
 {
     ORR_OMM(stack_step);
-    path_stack_step<Medium>(root, DispatchRaysIndex().x, c);
+    path_stack_step<Medium>(root, launch_index().x, c);
 }
 
 [shader("callable")]
 void front(inout Payload p)
 {
     ORR_OMM(front);
-    p.words.x = path_front<Medium>(root, DispatchRaysIndex().x, asfloat(p.words.x), p.words.y, p.words.z != 0, p.words.w) ? 1 : 0;
+    p.words.x = path_front<Medium>(root, launch_index().x, asfloat(p.words.x), p.words.y, p.words.z != 0, p.words.w) ? 1 : 0;
 }
 
 [shader("callable")]
@@ -161,7 +161,7 @@ void volume_march(inout ProxyMarch m)
 void first_view(inout Payload p)
 {
     ORR_OMM(first_view);
-    path_first_view<Surface>(root, DispatchRaysIndex().x);
+    path_first_view<Surface>(root, launch_index().x);
 }
 
 [shader("anyhit")]
@@ -188,18 +188,19 @@ void front_met_hit(inout Payload p, TriangleAttributes a)
 {
     ORR_OMM(front_met_hit);
     path_front_met(p.words);
-    IgnoreHit();
+    ignore_hit();
 }
 
 [shader("intersection")]
 void light_box_hit()
 {
     ORR_OMM(light_box_hit);
+    RayBuiltIns r = ray_builtins();
     float t;
-    if (path_light_box(root, InstanceIndex(), WorldRayOrigin(), WorldRayDirection(), RayTMin(), RayTCurrent(), t))
+    if (path_light_box(root, r.instance_index(), r.world_origin(), r.world_direction(), r.t_min(), r.t(), t))
     {
         SpanAttributes a = { float2(t, t) };
-        ReportHit(t, 0, a);
+        report_hit(t, 0, a);
     }
 }
 
@@ -208,7 +209,7 @@ void light_met_hit(inout Payload p, SpanAttributes a)
 {
     ORR_OMM(light_met_hit);
     path_front_met(p.words);
-    IgnoreHit();
+    ignore_hit();
 }
 
 // A medium proxy under a shadow ray: its box reports the ray's span inside it, at the span's start,
@@ -217,23 +218,24 @@ void light_met_hit(inout Payload p, SpanAttributes a)
 void box_medium_hit()
 {
     ORR_OMM(box_medium_hit);
-    float2 span = box_medium(ObjectRayOrigin(), ObjectRayDirection(), RayTCurrent());
+    RayBuiltIns r = ray_builtins();
+    float2 span = box_medium(r.object_origin(), r.object_direction(), r.t());
     SpanAttributes a = { span };
-    ReportHit(clamp(span.x, RayTMin(), RayTCurrent()), 0, a);
+    report_hit(clamp(span.x, r.t_min(), r.t()), 0, a);
 }
 
 [shader("anyhit")]
 void proxy_shadow_hit(inout Payload p, SpanAttributes a)
 {
     ORR_OMM(proxy_shadow_hit);
-    any_hit_decides(proxy_any_hit(root.scene, p.words, InstanceIndex(), a.span));
+    any_hit_decides(proxy_any_hit(root.scene, p.words, ray_builtins().instance_index(), a.span));
 }
 
 [shader("miss")]
 void miss_scatter(inout Payload p)
 {
     ORR_OMM(miss_scatter);
-    path_miss<Medium, Environment>(root, DispatchRaysIndex().x, p.words.y != 0);
+    path_miss<Medium, Environment>(root, launch_index().x, p.words.y != 0);
 }
 
 [shader("miss")]

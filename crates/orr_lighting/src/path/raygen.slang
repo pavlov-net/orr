@@ -1027,7 +1027,7 @@ uint run_path(PathRoot r, uint slot, uint4* at, uint next)
 // light feedback.
 public void view_paths(PathRoot r)
 {
-    uint slot = DispatchRaysIndex().x;
+    uint slot = launch_index().x;
     if (slot >= r.slice_count)
         return;
     uint2 pixel = item_pixel(r, r.slice_base + slot);
@@ -1131,7 +1131,7 @@ public void view_paths(PathRoot r)
 // a miss the sky the camera sees, at depth 0. A pixel the mask leaves out writes (0, 0, 0, -1).
 public void background_paths<E : IEnvironment, M : IMedium>(PathRoot r)
 {
-    uint slot = DispatchRaysIndex().x;
+    uint slot = launch_index().x;
     uint2 extent = r.gbuffer.extent;
     if (slot >= r.slice_count || r.slice_base + slot >= extent.x * extent.y)
         return;
@@ -1212,7 +1212,7 @@ bool photon_stack_owned(PathRoot r, uint slot, uint4* at)
 // caster entry counts the photons that deposited.
 public void photon_paths(PathRoot r)
 {
-    uint slot = DispatchRaysIndex().x;
+    uint slot = launch_index().x;
     if (slot >= r.slice_count)
         return;
     Payload start;
@@ -1274,7 +1274,7 @@ public void photon_paths(PathRoot r)
 // layer guides traced it starts inside the interiors around its G-buffer surface.
 public void update_paths(PathRoot r)
 {
-    uint slot = DispatchRaysIndex().x;
+    uint slot = launch_index().x;
     if (slot >= r.slice_count)
         return;
     uint2 pixel = item_pixel(r, r.slice_base + slot);

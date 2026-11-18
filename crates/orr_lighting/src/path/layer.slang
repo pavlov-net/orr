@@ -31,7 +31,7 @@ void surface_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
     TriangleHit h = { a };
     // A window's or the stack question's answer is the payload.
     bool question = is_question(p.words);
-    path_layer_hit<Surface, Medium, TriangleHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
+    path_layer_hit<Surface, Medium, TriangleHit, SectionGiven>(root, launch_index().x, p.words, section_given(data.material), h);
     // Tells the raygen a shader took the hit.
     if (!question)
         p.words.x = 0;
@@ -41,5 +41,5 @@ void surface_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 void disperse(inout DisperseCall c)
 {
     ORR_OMM(disperse);
-    path_disperse(root, DispatchRaysIndex().x, c);
+    path_disperse(root, launch_index().x, c);
 }

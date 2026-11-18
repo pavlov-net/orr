@@ -71,8 +71,23 @@ uint ray_flags(uint flags)
 #endif
 }
 
+// The thread's index in the launch, in any shader of the pipeline.
+[ForceInline]
+public uint3 launch_index()
+{
+    return DispatchRaysIndex();
+}
+
+// The launch's extent.
+[ForceInline]
+public uint3 launch_size()
+{
+    return DispatchRaysDimensions();
+}
+
 // Ends an any-hit shader by its decision `d` (ANY_HIT_*): ignores the candidate, accepts it, or
-// accepts it and ends the search.
+// accepts it and ends the search. The shader's last act; its payload writes stay whatever it
+// decides.
 [ForceInline]
 public void any_hit_decides(uint d)
 {
@@ -80,6 +95,22 @@ public void any_hit_decides(uint d)
         AcceptHitAndEndSearch();
     if (d == ANY_HIT_IGNORE)
         IgnoreHit();
+}
+
+// Ends an any-hit shader ignoring its candidate, as `any_hit_decides(ANY_HIT_IGNORE)`.
+[ForceInline]
+public void ignore_hit()
+{
+    IgnoreHit();
+}
+
+// Reports a hit of an intersection shader at `t` with hit kind `kind` (below 128) and attributes
+// `a`, of at most 8 bytes, which its group's any-hit and closest-hit shaders take. The shader's
+// last act: a hit outside the ray's span is not reported, and a shader reports one hit at most.
+[ForceInline]
+public void report_hit<A>(float t, uint kind, A a)
+{
+    ReportHit(t, kind, a);
 }
 
 // Traces `ray` and runs the closest-hit or miss shader it finds, from a raygen, closest-hit or
@@ -377,3 +408,73 @@ public struct BuiltIns<let SWEPT : bool> : IHit
 
 public typealias TriangleHit = BuiltIns<false>;
 public typealias BuiltInHit = BuiltIns<true>;
+
+// What an intersection shader, and the any-hit and closest-hit shaders of a group with one, read of
+// the ray and of the candidate or hit, as built-ins give it. `t` is the candidate's distance in an
+// any-hit shader, the hit's in a closest-hit shader and the nearest hit's so far in an
+// intersection shader.
+public struct RayBuiltIns
+{
+    public uint3 launch()
+    {
+        return DispatchRaysIndex();
+    }
+
+    public uint instance_index()
+    {
+        return InstanceIndex();
+    }
+
+    public uint custom_index()
+    {
+        return InstanceID();
+    }
+
+    public uint geometry_index()
+    {
+        return GeometryIndex();
+    }
+
+    public uint primitive_index()
+    {
+        return PrimitiveIndex();
+    }
+
+    public float t_min()
+    {
+        return RayTMin();
+    }
+
+    public float t()
+    {
+        return RayTCurrent();
+    }
+
+    public float3 world_origin()
+    {
+        return WorldRayOrigin();
+    }
+
+    public float3 world_direction()
+    {
+        return WorldRayDirection();
+    }
+
+    public float3 object_origin()
+    {
+        return ObjectRayOrigin();
+    }
+
+    public float3 object_direction()
+    {
+        return ObjectRayDirection();
+    }
+}
+
+// The built-ins of the shader that calls it.
+[ForceInline]
+public RayBuiltIns ray_builtins()
+{
+    RayBuiltIns r = {};
+    return r;
+}
