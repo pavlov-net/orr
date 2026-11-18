@@ -69,8 +69,16 @@ struct Root
 }
 ORR_ROOT(Root);
 
+// The tile's distinct lights in the order lanes gathered them, in entries `0..gathered`, and the
+// pixels that named each.
 groupshared uint gathered_ids[GATHERED];
 groupshared uint gathered_counts[GATHERED];
+groupshared uint gathered;
+// Gathered lights with points to draw, and the ids of those the sampler keeps, by rank.
+groupshared uint kept;
+groupshared uint chosen[LOCAL_LIGHTS];
+// 1 where a kept light's entry holds a tree.
+groupshared uint tree;
 // Surfaces in the tile, those that found feedback, and those whose point is known, which the
 // bounds take.
 groupshared uint surfaces[3];
@@ -81,9 +89,9 @@ groupshared uint bounds_hi[3];
 groupshared uint bounds_radius;
 groupshared uint bounds_cos;
 groupshared float3 normal_sums[LOCAL_TILE * LOCAL_TILE];
-// The tile's sampler before its bounds, and whether a slot holds a tree, so `refine` needs them.
-groupshared LocalLights built;
-groupshared bool bounded;
+// A sampler's slots in order and each one's probability, which `finished_slot` reads.
+groupshared LocalLight slots[LOCAL_LIGHTS];
+groupshared float slot_p[LOCAL_LIGHTS];
 
 // The feedback id that `pixel`'s surface found in the last frame, or NO_LIGHT; false for
 // sky pixels.
@@ -187,31 +195,49 @@ bool retraced(uint2 pixel, out uint id, out bool located, out float3 position)
     return true;
 }
 
-// Finishes slots `0..count` of `out`, sorted by light and first position, from each one's
-// probability `p`: their fixed-point CDF, 0xffffffff from the last slot with probability on,
-// and their gain, a slot's fixed-point step over its range's.
-void finish_slots(inout LocalLights out, float p[LOCAL_LIGHTS], uint count)
+// Slot `k` of `count` of a sampler whose slots `slots` holds, sorted by light and first position,
+// with each one's probability in `slot_p`, finished: its fixed-point CDF, 0xffffffff from the
+// last slot with probability on, and its gain, the slot's fixed-point step over its range's.
+// Each lane sums the slots up to its own in order, as one lane walking them all would.
+LocalLight finished_slot(uint k, uint count)
 {
     float total = 0.0;
-    for (uint k = 0; k < count; k++)
-        total += p[k];
+    for (uint i = 0; i < count; i++)
+        total += slot_p[i];
     float sum = 0.0;
     uint previous = 0;
-    uint lights = root.set.scene.light_capacity;
-    for (uint k = 0; k < count; k++)
+    uint v = 0;
+    for (uint i = 0; i <= k; i++)
     {
-        sum += p[k];
-        uint v = sum >= total ? 0xffffffffu : fixed_point_share(sum / total);
-        v = max(v, previous);
-        LocalLight l = out.lights[k];
-        l.cdf = v;
-        float step = float(v - previous);
-        uint id = l.id;
-        bool entry = id >= lights && id != feedback_environment(root.set);
-        float mass = entry ? float(range_mass(root.set.emissive[id - lights], l.first, l.count)) : 4294967295.0;
-        l.gain = mass > 0.0 ? step / mass : 0.0;
-        out.lights[k] = l;
         previous = v;
+        sum += slot_p[i];
+        v = max(sum >= total ? 0xffffffffu : fixed_point_share(sum / total), previous);
+    }
+    LocalLight l = slots[k];
+    l.cdf = v;
+    float step = float(v - previous);
+    uint lights = root.set.scene.light_capacity;
+    bool entry = l.id >= lights && l.id != feedback_environment(root.set);
+    float mass = entry ? float(range_mass(root.set.emissive[l.id - lights], l.first, l.count)) : 4294967295.0;
+    l.gain = mass > 0.0 ? step / mass : 0.0;
+    return l;
+}
+
+// Adds `named` pixels that name `light` to the tile's gathered lights: to its entry, or to the
+// first free one while one is.
+void gather(uint light, uint named)
+{
+    for (uint k = 0; k < GATHERED; k++)
+    {
+        uint seen;
+        InterlockedCompareExchange(gathered_ids[k], NO_LIGHT, light, seen);
+        if (seen == NO_LIGHT)
+            InterlockedAdd(gathered, 1);
+        if (seen == NO_LIGHT || seen == light)
+        {
+            InterlockedAdd(gathered_counts[k], named);
+            return;
+        }
     }
 }
 
@@ -225,14 +251,16 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint lane: SV
         gathered_counts[lane] = 0;
     }
     if (lane < 3)
-        surfaces[lane] = 0;
-    if (lane < 3)
     {
+        surfaces[lane] = 0;
         bounds_lo[lane] = 0xffffffffu;
         bounds_hi[lane] = 0u;
     }
     if (lane == 0)
     {
+        gathered = 0;
+        kept = 0;
+        tree = 0;
         bounds_radius = 0;
         bounds_cos = 0xffffffffu;
     }
@@ -253,87 +281,96 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint lane: SV
         surface = reprojected(pixel, id);
         located = surface;
     }
-    if (surface)
-        InterlockedAdd(surfaces[0], 1);
-    if (located)
-        InterlockedAdd(surfaces[2], 1);
-    if (id != NO_LIGHT)
+    uint3 counted = WaveActiveSum(uint3(surface ? 1u : 0u, id != NO_LIGHT ? 1u : 0u, located ? 1u : 0u));
+    if (WaveIsFirstLane())
     {
-        InterlockedAdd(surfaces[1], 1);
-        for (uint k = 0; k < GATHERED; k++)
+        InterlockedAdd(surfaces[0], counted.x);
+        InterlockedAdd(surfaces[1], counted.y);
+        InterlockedAdd(surfaces[2], counted.z);
+    }
+    // The first lane of each wave to name a light gathers the wave's pixels that name it, a
+    // light at a time.
+    bool pending = id != NO_LIGHT;
+    while (pending)
+    {
+        uint light = WaveActiveMin(id);
+        uint same = id == light ? 1u : 0u;
+        uint named = WaveActiveSum(same);
+        uint before = WavePrefixSum(same);
+        if (same != 0 && before == 0)
+            gather(light, named);
+        pending = same == 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // A lane per gathered light. Feedback is the last frame's: an entry this frame's selection
+    // left empty has nothing to draw, and the sampler leaves it out.
+    uint distinct = gathered;
+    uint lights = root.set.scene.light_capacity;
+    LocalLight mine = { NO_LIGHT, 0, 0, 0, 0.0 };
+    uint named = 0;
+    bool holds_tree = false;
+    if (lane < distinct)
+    {
+        mine.id = gathered_ids[lane];
+        bool entry = mine.id >= lights && mine.id != feedback_environment(root.set);
+        mine.count = entry ? root.set.emissive[mine.id - lights].count : 1;
+        named = mine.count > 0 ? gathered_counts[lane] : 0;
+        holds_tree = entry && root.set.emissive[mine.id - lights].node_count > 0;
+        gathered_counts[lane] = named;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // The sampler keeps the `LOCAL_LIGHTS` most named, ties to the lower id: a light's rank
+    // counts those ahead of it.
+    uint rank = LOCAL_LIGHTS;
+    if (named > 0)
+    {
+        rank = 0;
+        for (uint j = 0; j < distinct; j++)
         {
-            uint seen;
-            InterlockedCompareExchange(gathered_ids[k], NO_LIGHT, id, seen);
-            if (seen == NO_LIGHT || seen == id)
-            {
-                InterlockedAdd(gathered_counts[k], 1);
-                break;
-            }
+            uint c = gathered_counts[j];
+            rank += c > named || (c == named && gathered_ids[j] < mine.id) ? 1 : 0;
+        }
+        InterlockedAdd(kept, 1);
+        if (rank < LOCAL_LIGHTS)
+        {
+            chosen[rank] = mine.id;
+            if (holds_tree)
+                InterlockedOr(tree, 1);
         }
     }
     GroupMemoryBarrierWithGroupSync();
+    // Each kept light takes the slot of its place by light among the kept.
+    uint count = min(kept, LOCAL_LIGHTS);
+    if (rank < LOCAL_LIGHTS)
+    {
+        uint slot = 0;
+        for (uint r = 0; r < count; r++)
+            slot += chosen[r] < mine.id ? 1 : 0;
+        slots[slot] = mine;
+        slot_p[slot] = float(named);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    LocalLights* out = root.local + group.y * root.columns + group.x;
+    if (lane < LOCAL_LIGHTS)
+    {
+        LocalLight none = { 0, 0, 0, 0, 0.0 };
+        out.lights[lane] = lane < count ? finished_slot(lane, count) : none;
+    }
+    // Only `refine` reads the bounds, and only for slots whose entries hold trees.
+    bool bounded = tree != 0 && surfaces[2] > 0;
     if (lane == 0)
     {
-        LocalLights out = LocalLights();
-        float p[LOCAL_LIGHTS];
-        for (uint k = 0; k < LOCAL_LIGHTS; k++)
-            p[k] = 0.0;
-        uint lights = root.set.scene.light_capacity;
-        bool tree = false;
-        while (out.count < LOCAL_LIGHTS)
+        out.count = count;
+        out.share = count > 0 ? root.share * float(surfaces[1]) / float(max(surfaces[0], 1u)) : 0.0;
+        if (!bounded)
         {
-            uint k = out.count;
-            uint best = GATHERED;
-            uint most = 0;
-            for (uint j = 0; j < GATHERED; j++)
-            {
-                uint c = gathered_counts[j];
-                if (c > most || (c == most && c > 0 && gathered_ids[j] < gathered_ids[best]))
-                {
-                    most = c;
-                    best = j;
-                }
-            }
-            if (best == GATHERED)
-                break;
-            gathered_counts[best] = 0;
-            uint light = gathered_ids[best];
-            bool entry = light >= lights && light != feedback_environment(root.set);
-            uint positions = entry ? root.set.emissive[light - lights].count : 1;
-            // Feedback is the last frame's: an entry this frame's selection left empty has
-            // nothing to draw.
-            if (positions == 0)
-                continue;
-            tree = tree || (entry && root.set.emissive[light - lights].node_count > 0);
-            out.count = k + 1;
-            LocalLight l = { light, 0, positions, 0, 0.0 };
-            // Ascending by light: insertion keeps the slots sorted.
-            uint at_slot = k;
-            while (at_slot > 0 && out.lights[at_slot - 1].id > light)
-            {
-                out.lights[at_slot] = out.lights[at_slot - 1];
-                p[at_slot] = p[at_slot - 1];
-                at_slot--;
-            }
-            out.lights[at_slot] = l;
-            p[at_slot] = float(most);
+            out.receiver = float4(0.0, 0.0, 0.0, -1.0);
+            out.normal = float4(0.0, 0.0, 1.0, -1.0);
         }
-        finish_slots(out, p, out.count);
-        uint found = surfaces[1];
-        out.share = out.count > 0 ? root.share * float(found) / float(max(surfaces[0], 1u)) : 0.0;
-        out.receiver = float4(0.0, 0.0, 0.0, -1.0);
-        out.normal = float4(0.0, 0.0, 1.0, -1.0);
-        built = out;
-        bounded = tree && surfaces[2] > 0;
     }
-    GroupMemoryBarrierWithGroupSync();
-    // Only `refine` reads the bounds, and only for slots whose entries hold trees.
     if (!bounded)
-    {
-        if (lane == 0)
-            root.local[group.y * root.columns + group.x] = built;
         return;
-    }
 
     // The last frame's feedback keeps no normals: the tiles of a traced view bound none.
     float3 normal = float3(0.0);
@@ -343,12 +380,14 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint lane: SV
         position = g.position;
         normal = g.normal;
     }
-    if (located)
+    for (uint c = 0; c < 3; c++)
     {
-        for (uint c = 0; c < 3; c++)
+        uint lo = WaveActiveMin(located ? ordered(position[c]) : 0xffffffffu);
+        uint hi = WaveActiveMax(located ? ordered(position[c]) : 0u);
+        if (WaveIsFirstLane())
         {
-            InterlockedMin(bounds_lo[c], ordered(position[c]));
-            InterlockedMax(bounds_hi[c], ordered(position[c]));
+            InterlockedMin(bounds_lo[c], lo);
+            InterlockedMax(bounds_hi[c], hi);
         }
     }
     normal_sums[lane] = normal;
@@ -364,18 +403,18 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint lane: SV
     float3 center = 0.5 * (lo + hi);
     float3 sum = normal_sums[0];
     float3 axis = dot(sum, sum) > 0.0 ? normalize(sum) : float3(0.0, 0.0, 1.0);
-    if (located)
+    uint radius = WaveActiveMax(located ? asuint(length(position - center)) : 0u);
+    uint spread = WaveActiveMin(located ? ordered(dot(normal, axis)) : 0xffffffffu);
+    if (WaveIsFirstLane())
     {
-        InterlockedMax(bounds_radius, asuint(length(position - center)));
-        InterlockedMin(bounds_cos, ordered(dot(normal, axis)));
+        InterlockedMax(bounds_radius, radius);
+        InterlockedMin(bounds_cos, spread);
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane != 0)
         return;
-    LocalLights out = built;
     out.receiver = float4(center, asfloat(bounds_radius));
     out.normal = float4(axis, dot(sum, sum) > 0.0 ? unordered(bounds_cos) : -1.0);
-    root.local[group.y * root.columns + group.x] = out;
 }
 
 // The cosine of angle `a` less the angles of `b` and `c`, each given by its cosine, or 1 where
@@ -426,17 +465,14 @@ float importance(SceneRoot* s, uint entry, EmissiveSelection e, SetNode n, float
     return power * max(emitter * receiving, IMPORTANCE_FLOOR) * falloff;
 }
 
-groupshared LocalLights refined;
-groupshared float slot_p[LOCAL_LIGHTS];
 groupshared uint slot_node[LOCAL_LIGHTS];
 groupshared float best_p[LOCAL_LIGHTS];
 groupshared uint best_slot[LOCAL_LIGHTS];
-groupshared uint refined_count;
+groupshared uint slot_count;
 
-// The heap node slot `k` of `refined` covers, or NO_RANK for a slot that never splits.
-uint slot_root(uint k)
+// The heap node slot `l` covers, or NO_RANK for a slot that never splits.
+uint slot_root(LocalLight l)
 {
-    LocalLight l = refined.lights[k];
     uint lights = root.set.scene.light_capacity;
     if (l.id < lights || l.id == feedback_environment(root.set))
         return NO_RANK;
@@ -453,35 +489,34 @@ uint slot_root(uint k)
 void refine(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
 {
     LocalLights* at = root.local + group.y * root.columns + group.x;
-    if (lane == 0)
-    {
-        refined = *at;
-        refined_count = min(refined.count, LOCAL_LIGHTS);
-    }
-    GroupMemoryBarrierWithGroupSync();
-    uint n = refined_count;
-    if (n == 0 || refined.receiver.w < 0.0)
+    uint n = min(at.count, LOCAL_LIGHTS);
+    float4 receiver = at.receiver;
+    float4 normal = at.normal;
+    if (n == 0 || receiver.w < 0.0)
         return;
     slot_p[lane] = 0.0;
     slot_node[lane] = NO_RANK;
     if (lane < n)
     {
-        LocalLight l = refined.lights[lane];
-        uint previous = lane > 0 ? refined.lights[lane - 1].cdf : 0u;
+        LocalLight l = at.lights[lane];
+        uint previous = lane > 0 ? at.lights[lane - 1].cdf : 0u;
+        slots[lane] = l;
         slot_p[lane] = float(l.cdf - previous);
-        slot_node[lane] = slot_root(lane);
+        slot_node[lane] = slot_root(l);
     }
+    if (lane == 0)
+        slot_count = n;
     GroupMemoryBarrierWithGroupSync();
     SceneRoot* s = root.set.scene;
     uint lights = s.light_capacity;
     for (uint round_ = 0; round_ < LOCAL_LIGHTS; round_++)
     {
-        n = refined_count;
+        n = slot_count;
         // The most probable slot whose node has children, by a reduction over the lanes.
         float own = -1.0;
         if (lane < n && slot_node[lane] != NO_RANK)
         {
-            EmissiveSelection e = root.set.emissive[refined.lights[lane].id - lights];
+            EmissiveSelection e = root.set.emissive[slots[lane].id - lights];
             if (2 * slot_node[lane] + 2 < e.node_count)
                 own = slot_p[lane];
         }
@@ -502,15 +537,15 @@ void refine(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
         if (lane == 0)
         {
             uint k = best_slot[0];
-            LocalLight l = refined.lights[k];
+            LocalLight l = slots[k];
             uint entry = l.id - lights;
             EmissiveSelection e = root.set.emissive[entry];
             SetNode* nodes = (SetNode*)e.nodes;
             uint parent = slot_node[k];
             SetNode a = nodes[2 * parent + 1];
             SetNode b = nodes[2 * parent + 2];
-            float ia = importance(s, entry, e, a, refined.receiver, refined.normal);
-            float ib = importance(s, entry, e, b, refined.receiver, refined.normal);
+            float ia = importance(s, entry, e, a, receiver, normal);
+            float ib = importance(s, entry, e, b, receiver, normal);
             if (!(ia + ib > 0.0))
             {
                 ia = float(range_mass(e, a.first, a.count));
@@ -519,42 +554,37 @@ void refine(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
             float pa = ia + ib > 0.0 ? slot_p[k] * ia / (ia + ib) : 0.5 * slot_p[k];
             LocalLight la = { l.id, a.first, a.count, 0, 0.0 };
             LocalLight lb = { l.id, b.first, b.count, 0, 0.0 };
-            refined.lights[k] = la;
-            refined.lights[n] = lb;
+            slots[k] = la;
+            slots[n] = lb;
             slot_node[n] = 2 * parent + 2;
             slot_node[k] = 2 * parent + 1;
             slot_p[n] = slot_p[k] - pa;
             slot_p[k] = pa;
-            refined_count = n + 1;
+            slot_count = n + 1;
         }
         GroupMemoryBarrierWithGroupSync();
     }
     // Sorts the slots by light, then first position: each lane takes its slot's rank.
-    n = refined_count;
-    LocalLight mine = refined.lights[min(lane, n - 1)];
+    n = slot_count;
+    LocalLight mine = slots[min(lane, n - 1)];
     float mine_p = slot_p[min(lane, n - 1)];
     uint rank = 0;
     for (uint j = 0; j < n; j++)
     {
-        LocalLight o = refined.lights[j];
+        LocalLight o = slots[j];
         rank += o.id < mine.id || (o.id == mine.id && o.first < mine.first) ? 1 : 0;
     }
     GroupMemoryBarrierWithGroupSync();
     if (lane < n)
     {
-        refined.lights[rank] = mine;
+        slots[rank] = mine;
         slot_p[rank] = mine_p;
     }
     GroupMemoryBarrierWithGroupSync();
-    if (lane != 0)
-        return;
-    LocalLights out = refined;
-    float p[LOCAL_LIGHTS];
-    for (uint k = 0; k < LOCAL_LIGHTS; k++)
-        p[k] = k < n ? slot_p[k] : 0.0;
-    out.count = n;
-    finish_slots(out, p, n);
-    *at = out;
+    if (lane < n)
+        at.lights[lane] = finished_slot(lane, n);
+    if (lane == 0)
+        at.count = n;
 }
 
 // One group per tile, a thread per point: a slot of the tile's sampler and a point of its light,
