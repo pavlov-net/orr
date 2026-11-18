@@ -50,20 +50,16 @@ struct Root
     ListBlock* blocks;
     // The producer entries' caster lists' CDFs.
     uint* pool;
+    // The caster lists' clusters in blocks (`producer_blocks`).
+    uint* block_layout;
     EyeInterior* interiors;
-    // The grid's counters (`caustics`' CAUSTIC_*), as the last frame's resolve left them.
-    uint* counters;
     // The focus in render space, and in w the m over which an entry's weight falls with the
     // square of its distance from the focus.
     float4 focus;
     uint clear;                     // 1: forget the yields, the last photons' counts and level
-    uint capacity;                  // the grid's cells
     int base_cell_log2;             // the grid's level 0, as for `CausticsGpu`
-    uint cell_lifetime;             // frames without a deposit before a cell is evicted
     uint entries_before;
     uint _pad1;
-    // The caster lists' clusters in blocks (`producer_blocks`).
-    uint* block_layout;
 }
 ORR_ROOT(Root);
 
@@ -346,28 +342,15 @@ void weigh(uint lane: SV_GroupIndex)
     p.entry_count = n;
     p.total = carry;
 
-    // The grid's finest level: one coarser while the last resolve left more than
-    // CAUSTIC_LOAD_HIGH of the grid occupied, one finer below CAUSTIC_LOAD_LOW, so that casters
-    // too wide for the grid give up their finest cells rather than overflow it. A level changes
-    // the load by about 4, which the band spans with room to spare; cells of the level left stay
-    // occupied until they are evicted, so a level holds for longer than a cell lives before it
-    // moves again.
-    uint top = uint(clamp(s.origin_cell.w - root.base_cell_log2, 0, int(CACHE_MAX_LEVEL)));
-    uint finest = 0;
-    uint held = 0;
-    if (root.clear == 0)
+    // The grid's finest level: the one the last resolve's `finish` chose, which starts over with
+    // the grid, within the levels the origin's cell allows.
+    uint top = caustic_max_level(s, root.base_cell_log2);
+    if (root.clear != 0)
     {
-        float load = float(root.counters[CAUSTIC_OCCUPIED]) / float(root.capacity);
-        finest = p.finest;
-        held = p.held + 1;
-        if (held > root.cell_lifetime && ((load > CAUSTIC_LOAD_HIGH && finest < top) || (load < CAUSTIC_LOAD_LOW && finest > 0)))
-        {
-            finest = load > CAUSTIC_LOAD_HIGH ? finest + 1 : finest - 1;
-            held = 0;
-        }
+        p.next_finest = 0;
+        p.held = 0;
     }
-    p.finest = min(finest, top);
-    p.held = held;
+    p.finest = min(p.next_finest, top);
 }
 
 // A point on light `id` (a feedback id) to walk out from, and the way out: a sphere or rect

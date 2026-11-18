@@ -113,9 +113,12 @@ public struct PhotonSourceGpu
     public EyeInterior* interiors;
     public uint entry_count;
     public float total;             // the last value of `cdf`
-    // The grid's finest level this frame, and the frames it has held.
+    // The grid's finest level this frame, the frames resolved at it before this one, and the
+    // level the next frame takes, which the resolve's `finish` sets after this frame's reads.
     public uint finest;
     public uint held;
+    public uint next_finest;
+    public uint _pad0;
 }
 
 // A reference photon: where it deposited, the receiver's geometric normal on its side, its flux
@@ -174,7 +177,12 @@ public uint caustic_level(CausticsGpu* g, SceneRoot* s, float distance, out floa
 
 public uint caustic_max_level(CausticsGpu* g, SceneRoot* s)
 {
-    return uint(clamp(s.origin_cell.w - g.base_cell_log2, 0, int(CACHE_MAX_LEVEL)));
+    return caustic_max_level(s, g.base_cell_log2);
+}
+
+public uint caustic_max_level(SceneRoot* s, int base_cell_log2)
+{
+    return uint(clamp(s.origin_cell.w - base_cell_log2, 0, int(CACHE_MAX_LEVEL)));
 }
 
 // The normal bucket a read of normal `n` takes for draw `u`: its dominant axis's, or near

@@ -1,7 +1,8 @@
 // The caustic grid's frame: `clear` empties every cell, `begin` starts the frame's counts
 // before its photons, `resolve` blends each cell's photons into its running mean after them and
 // evicts cells that have long had none, leaving tombstones, `sweep` empties the tombstones no key
-// lies past, and `finish` writes the frame's statistics and sets the next frame's quantum. A reference view's map takes `heads` before its photons, which empties
+// lies past, and `finish` writes the frame's statistics and sets the next frame's quantum and the
+// grid's finest level. A reference view's map takes `heads` before its photons, which empties
 // its lists.
 #include "orr_root.h"
 import orr_color.luminance;
@@ -14,11 +15,14 @@ import orr_lighting.world_cache;
 struct Root
 {
     CausticsGpu* caustics;
+    SceneRoot* scene;               // null for a map
     CausticStatsGpu* stats;         // the frame slot's readback; null for a map
     uint capacity;                  // grid cells or map heads
     uint cell_lifetime;             // frames without a deposit before eviction
     float max_temporal_samples;
     uint clear;                     // 1: start the quantum over
+    uint _pad0;
+    uint _pad1;
 }
 ORR_ROOT(Root);
 
@@ -170,9 +174,30 @@ void finish()
     s.occupied = n[CAUSTIC_OCCUPIED];
     s.evicted = n[CAUSTIC_EVICTED];
     s.quantum = quantum;
-    s.finest = root.caustics.source.finest;
+    PhotonSourceGpu* p = root.caustics.source;
+    s.finest = p.finest;
     s._pad0 = 0;
     *root.stats = s;
+
+    // The grid's finest level: one coarser while the resolve leaves more than CAUSTIC_LOAD_HIGH
+    // of the grid occupied, one finer below CAUSTIC_LOAD_LOW, so that casters too wide for the
+    // grid give up their finest cells rather than overflow it. A level changes the load by about
+    // 4, which the band spans with room to spare; cells of the level left stay occupied until
+    // they are evicted, so a level holds for longer than a cell lives before it moves again.
+    // Only a resolved frame counts toward the frames a level has held: one whose photons did not
+    // run measured nothing, and the resolve takes each counted frame a cell was absent as 0. The
+    // move waits for the next frame's `weigh`, since this frame's gathers read at this level.
+    float load = float(n[CAUSTIC_OCCUPIED]) / float(root.capacity);
+    uint top = caustic_max_level(root.caustics, root.scene);
+    uint finest = p.finest;
+    uint held = p.held + 1;
+    if (held > root.cell_lifetime && ((load > CAUSTIC_LOAD_HIGH && finest < top) || (load < CAUSTIC_LOAD_LOW && finest > 0)))
+    {
+        finest = load > CAUSTIC_LOAD_HIGH ? finest + 1 : finest - 1;
+        held = 0;
+    }
+    p.next_finest = finest;
+    p.held = held;
     if (deposits > 0)
     {
         float sum = float(n[CAUSTIC_SUM_HIGH]) * 4294967296.0 + float(n[CAUSTIC_SUM_LOW]);

@@ -565,8 +565,10 @@ fn photons_reflect_off_a_producer_set_as_the_producer_table_alone_grows() {
 /// down from it lights the floor where nothing else throws it, so a scene with a mirror among
 /// its copies gives its photons the rounds of a chain of opaque vertices. The mirrors are white
 /// metal, which reflects all of the sun, so the patch takes the sun's illuminance across the beam
-/// slanted onto the floor along its way down, in the grid and in the reference's map: measured 4%
-/// and 5% under it.
+/// slanted onto the floor along its way down, in the grid and in the reference's map: measured
+/// within 1.5%. At a pre-exposure of 1 the patch passes the HDR ceiling, which would clip the
+/// frames that draw it brightest; the frame that sets the pre-exposure runs no photons, which the
+/// grid's frames after it count as no frame at all.
 #[test]
 fn photons_chain_through_two_mirrors() {
     let sun = -SUN.direction_to_light.normalize();
@@ -599,7 +601,9 @@ fn photons_chain_through_two_mirrors() {
     };
     let lit = pixel_of(&spec, patch);
     let mut bed = Bed::with(spec);
-    let want = f64::from(WHITE_FLOOR_ALBEDO) / std::f64::consts::PI
+    let pre_exposure = 1.0 / 64.0;
+    bed.set_pre_exposure(pre_exposure);
+    let want = f64::from(pre_exposure) * f64::from(WHITE_FLOOR_ALBEDO) / std::f64::consts::PI
         * f64::from(SUN.illuminance.y)
         * f64::from(-down.y);
     let map = paths(ViewLighting {
@@ -610,7 +614,7 @@ fn photons_chain_through_two_mirrors() {
         // The beam's footprint on the floor is a few pixels across, so its middle alone.
         let got = render_paths(&mut bed, settings, frames, 1).around(lit, 1)[1];
         assert!(
-            (got / want - 1.0).abs() < 0.1,
+            (got / want - 1.0).abs() < 0.03,
             "the {what}'s patch by both mirrors shows {got}, not {want}"
         );
     }
