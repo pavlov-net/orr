@@ -5,7 +5,8 @@
 //   word 4 triangles, word 5 vertices, word 6 cluster ID, word 7 1 when every triangle is opaque.
 // A CLAS follows it with its vertices (f32x3), its indices (u32x3) and per-triangle data
 // (cluster ID, geometry index and flags, triangle in the cluster, then the three corners for
-// hits to fetch: DATA_WORDS words); a template has no vertices and leaves the corners.
+// hits to fetch: DATA_WORDS words); a template has no vertices and leaves the corners. The
+// triangles are in runs of one geometry index and opacity (`run_key`), each a Metal geometry.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -34,7 +35,8 @@ ulong resolve(ulong a, thread bool& cluster) {
 
 // --- CLAS, templates and instantiations -------------------------------------------------
 
-struct PackJob { ulong dst; ulong id; ulong record; uint kind; uint pad; };
+// `keys`, when not 0, takes each triangle's geometry word in the object's order.
+struct PackJob { ulong dst; ulong id; ulong record; ulong keys; uint kind; uint pad; };
 struct PackArgs { device const PackJob* jobs; };
 
 uint load_index(ulong base, uint i, uint bytes) {
@@ -47,6 +49,12 @@ uint load_index(ulong base, uint i, uint bytes) {
 
 uint geometry_word(uint base, uint t) {
     return (((base & 0xffffff) + (t & 0xffffff)) & 0xffffff) | ((base | t) & 0xe0000000u);
+}
+
+// The order of a triangle's geometry word: by geometry index, then opaque before not, so each
+// (geometry, opacity) run is one Metal geometry with its own function table offset.
+uint run_key(uint w) {
+    return ((w & 0xffffff) << 1) | ((w & GEOMETRY_OPAQUE_BIT) != 0 ? 0u : 1u);
 }
 
 // One threadgroup per job: a ClasBuild or TemplateBuild record (kind 1 or 2) or an
@@ -108,22 +116,35 @@ kernel void pack(constant PackArgs& a [[buffer(0)]], uint g [[threadgroup_positi
             for (uint c = 0; c < 3; c++) v_out[i * 3 + c] = as_type<float>(as_type<uint>(src[c]) & keep);
         }
     }
+    // Each triangle's geometry word, then the triangles sorted by it (stable), each keeping
+    // its index in the cluster: a template's are sorted already, and its triangles carry
+    // their indices to its instantiations.
+    threadgroup uint words[256];
+    device const uint* ti = tmpl != nullptr ? tmpl + HEADER / 4 : nullptr;
+    device const uint* tp = tmpl != nullptr ? tmpl + HEADER / 4 + tris * 3 : nullptr;
     for (uint t = tid; t < tris; t += 64) {
         if (tmpl != nullptr) {
-            device const uint* ti = tmpl + HEADER / 4;
-            device const uint* tp = tmpl + HEADER / 4 + tris * 3;
-            for (uint c = 0; c < 3; c++) i_out[t * 3 + c] = ti[t * 3 + c];
             uint w = tp[t * DATA_WORDS + 1];
-            p_out[t * DATA_WORDS] = cluster;
-            p_out[t * DATA_WORDS + 1] = (((w & 0xffffff) + geometry_offset) & 0xffffff) | (w & 0xe0000000u);
-            p_out[t * DATA_WORDS + 2] = t;
+            words[t] = (((w & 0xffffff) + geometry_offset) & 0xffffff) | (w & 0xe0000000u);
         } else {
-            for (uint c = 0; c < 3; c++) i_out[t * 3 + c] = load_index(indices, t * 3 + c, ibytes);
-            uint w = flags != 0 ? geometry_word(base, at<uint>(flags)[t]) : base;
-            p_out[t * DATA_WORDS] = cluster;
-            p_out[t * DATA_WORDS + 1] = w;
-            p_out[t * DATA_WORDS + 2] = t;
+            words[t] = flags != 0 ? geometry_word(base, at<uint>(flags)[t]) : base;
         }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint t = tid; t < tris; t += 64) {
+        uint w = words[t];
+        uint key = run_key(w);
+        uint r = 0;
+        for (uint u = 0; u < tris; u++) {
+            uint k = run_key(words[u]);
+            r += k < key || (k == key && u < t) ? 1 : 0;
+        }
+        for (uint c = 0; c < 3; c++)
+            i_out[r * 3 + c] = tmpl != nullptr ? ti[t * 3 + c] : load_index(indices, t * 3 + c, ibytes);
+        p_out[r * DATA_WORDS] = cluster;
+        p_out[r * DATA_WORDS + 1] = w;
+        p_out[r * DATA_WORDS + 2] = tmpl != nullptr ? tp[t * DATA_WORDS + 2] : t;
+        if (job.keys != 0) at<uint>(job.keys)[r] = w;
     }
     if (!clas) return;
     // The corners, once every vertex is written.
@@ -160,10 +181,11 @@ kernel void blas_instances(constant BlasArgs& a [[buffer(0)]], uint g [[threadgr
     }
 }
 
-struct GatherJob { ulong clas; ulong vertices; ulong data; };
+struct GatherJob { ulong clas; ulong vertices; ulong data; uint first; uint count; };
 struct GatherArgs { device const GatherJob* jobs; };
 
-// One threadgroup per CLAS of a flat BLAS: its triangles unindexed, and their data.
+// One threadgroup per run of a CLAS of a flat BLAS: its `count` triangles from `first`,
+// unindexed, and their data.
 kernel void blas_gather(constant GatherArgs& a [[buffer(0)]], uint g [[threadgroup_position_in_grid]],
                         uint tid [[thread_position_in_threadgroup]]) {
     GatherJob job = a.jobs[g];
@@ -174,10 +196,11 @@ kernel void blas_gather(constant GatherArgs& a [[buffer(0)]], uint g [[threadgro
     device const uint* data = at<uint>(job.clas + HEADER + verts * 12 + tris * 12);
     device float* vo = at<float>(job.vertices);
     device uint* po = at<uint>(job.data);
-    for (uint t = tid; t < tris; t += 64) {
+    for (uint o = tid; o < job.count; o += 64) {
+        uint t = job.first + o;
         for (uint c = 0; c < 3; c++)
-            for (uint k = 0; k < 3; k++) vo[t * 9 + c * 3 + k] = v[idx[t * 3 + c] * 3 + k];
-        for (uint k = 0; k < DATA_WORDS; k++) po[t * DATA_WORDS + k] = data[t * DATA_WORDS + k];
+            for (uint k = 0; k < 3; k++) vo[o * 9 + c * 3 + k] = v[idx[t * 3 + c] * 3 + k];
+        for (uint k = 0; k < DATA_WORDS; k++) po[o * DATA_WORDS + k] = data[t * DATA_WORDS + k];
     }
 }
 
@@ -306,7 +329,7 @@ kernel void ptlas_descriptors(constant PtlasArgs& a [[buffer(0)]], uint i [[thre
     o.m[3] = packed_float3(m[3] + t.x, m[7] + t.y, m[11] + t.z);
     o.options = r[21] & 0xf;
     o.mask = blas == 0 ? 0 : r[19] & 0xff;
-    o.ift = 0;
+    o.ift = r[20];
     o.user = (r[18] & 0xffffff) | (cluster ? 1u << 31 : 0u) | ((o.options & 8u) != 0 ? 1u << 30 : 0u);
     o.id = id;
     if (blas == 0)

@@ -1,10 +1,13 @@
 //! Classic BLAS and TLAS over caller memory, and opacity micromaps, which Metal lacks.
 //!
-//! A classic acceleration structure lives in a DeviceLocal block's placement heap, and its
-//! address is its resource ID tagged in bit 63 ([`CLASSIC_TAG`]); a cluster BLAS or PTLAS
-//! address is memory whose header holds the ID (`cluster.rs`). `abi.slang`'s `Tlas.get()`
-//! and the instance conversion below take either. TLAS builds first rewrite the instance
-//! records, laid out as the Vulkan backend's, into Metal's indirect instance descriptors.
+//! A classic acceleration structure lives in a DeviceLocal block's placement heap, and a
+//! BLAS's address is its resource ID tagged in bit 63 ([`CLASSIC_TAG`]); a TLAS's, as a cluster
+//! BLAS's or a PTLAS's, is memory whose header holds the ID (`cluster.rs`). `abi.slang`'s
+//! `Tlas.get()` and the instance conversion below take either. TLAS builds first rewrite the
+//! instance records, laid out as the Vulkan backend's, into Metal's indirect instance
+//! descriptors, which the TLAS keeps for ray tracing pipelines: its header holds their address
+//! and stride at bytes 48 and 56 (`orr_shaders.pipeline`'s compute form reads an instance's
+//! transform and hit group contribution from them).
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -59,7 +62,7 @@ kernel void convert(constant Args& a [[buffer(0)]], uint i [[thread_position_in_
     o.m[3] = packed_float3(v.t[3], v.t[7], v.t[11]);
     o.options = (v.sbt_flags >> 24) & 0xf;
     o.mask = v.blas == 0 ? 0 : v.custom_mask >> 24;
-    o.ift_offset = 0;
+    o.ift_offset = v.sbt_flags & 0xffffff;
     bool cluster;
     o.as_id = resolve(v.blas, cluster);
     o.user_id = (v.custom_mask & 0xffffff) | (cluster ? 1u << 31 : 0u) | ((o.options & 8u) != 0 ? 1u << 30 : 0u);
@@ -83,6 +86,12 @@ kernel void classic_data(constant DataArgs& a [[buffer(0)]], uint t [[thread_pos
 
 /// Bytes of a triangle's primitive data, as `cluster.rs` lays it out.
 const TRIANGLE_DATA_BYTES: u64 = 48;
+
+/// Bytes of a classic TLAS's header: the words `cluster.rs`'s headers start with (kind, size,
+/// resource ID), then at byte 48 the address of its instance descriptors and at 56 their stride.
+const TLAS_HEADER: u64 = 64;
+/// A classic TLAS's kind in its header's word 0, past `cluster.rs`'s kinds.
+const TLAS_KIND: u32 = 6;
 
 /// The arguments of `classic_data`.
 #[repr(C)]
@@ -112,8 +121,16 @@ pub struct ClassicAs {
     raw: Obj<ProtocolObject<dyn MTLAccelerationStructure>>,
     /// The resource ID.
     id: u64,
-    kind: ClassicKind,
+    /// A TLAS's own memory.
+    tlas: Option<TlasMemory>,
     shared: Arc<Shared>,
+}
+
+/// A classic TLAS's header, which [`ClassicAs::tlas`] names, and its instance descriptors as
+/// the last build wrote them.
+struct TlasMemory {
+    header: Allocation<u8>,
+    instances: Mutex<Option<Allocation<u8>>>,
 }
 
 /// Bit 63 of a classic acceleration structure's address, which is its resource ID: no
@@ -121,15 +138,15 @@ pub struct ClassicAs {
 pub(super) const CLASSIC_TAG: u64 = 1 << 63;
 
 impl ClassicAs {
-    /// The address instances and traces name it by: its resource ID, tagged.
+    /// The address instances name it by: its resource ID, tagged.
     pub fn address(&self) -> GpuAddress {
         GpuAddress(self.id | CLASSIC_TAG)
     }
 
-    /// The TLAS kernels trace.
+    /// The TLAS kernels trace: the address of its header.
     pub fn tlas(&self) -> Tlas {
-        assert_eq!(self.kind, ClassicKind::Tlas, "tlas() of a BLAS");
-        Tlas(self.id | CLASSIC_TAG)
+        let t = self.tlas.as_ref().expect("tlas() of a BLAS");
+        Tlas(t.header.gpu().address().0)
     }
 }
 
@@ -222,10 +239,26 @@ impl Device {
         })));
         self.shared.structure_ids.note(&raw);
         let id = super::heap::id_bits(raw.gpuResourceID());
+        let tlas = match kind {
+            ClassicKind::Tlas => {
+                let header = malloc::<u8>(
+                    &self.shared,
+                    MemoryKind::DeviceLocal,
+                    TLAS_HEADER,
+                    "tlas header",
+                    false,
+                )?;
+                Some(TlasMemory {
+                    header,
+                    instances: Mutex::new(None),
+                })
+            }
+            ClassicKind::Blas => None,
+        };
         Ok(ClassicAs {
             raw: Obj(raw),
             id,
-            kind,
+            tlas,
             shared: Arc::clone(&self.shared),
         })
     }
@@ -251,7 +284,7 @@ impl CommandList<'_> {
     pub fn build_classic(&mut self, b: &ClassicBuild<'_>) {
         let instances = match b.desc.geometry {
             ClassicGeometry::Instances { records, capacity } => {
-                Some(self.convert_instances(records, capacity))
+                Some(self.convert_instances(b.dst, records, capacity))
             }
             _ => None,
         };
@@ -319,19 +352,48 @@ impl CommandList<'_> {
         address
     }
 
-    /// Rewrites `capacity` instance records at `records` into Metal's descriptors, in
-    /// memory the list keeps; returns their address.
-    fn convert_instances(&mut self, records: GpuAddress, capacity: u32) -> u64 {
+    /// Rewrites `capacity` instance records at `records` into Metal's descriptors in memory
+    /// the TLAS `tlas` keeps, and writes its header; returns their address.
+    fn convert_instances(&mut self, tlas: &ClassicAs, records: GpuAddress, capacity: u32) -> u64 {
         let shared = Arc::clone(&self.queue.shared);
-        let dst = malloc::<u8>(
-            &shared,
-            MemoryKind::DeviceLocal,
-            METAL_INSTANCE_BYTES * u64::from(capacity.max(1)),
-            "metal instances",
-            false,
-        )
-        .expect("instance descriptors");
-        let address = dst.gpu().address().0;
+        let TlasMemory { header, instances } =
+            tlas.tlas.as_ref().expect("an instance build of a TLAS");
+        let bytes = METAL_INSTANCE_BYTES * u64::from(capacity.max(1));
+        let address = {
+            let mut kept = lock(instances);
+            // A larger build replaces the memory; what traced the old descriptors keeps them
+            // until it completes.
+            if kept.as_ref().is_none_or(|d| d.size() < bytes) {
+                let d = malloc::<u8>(
+                    &shared,
+                    MemoryKind::DeviceLocal,
+                    bytes,
+                    "metal instances",
+                    false,
+                )
+                .expect("instance descriptors");
+                *kept = Some(d);
+            }
+            kept.as_ref().unwrap().gpu().address().0
+        };
+        let mut words = [0u32; (TLAS_HEADER / 4) as usize];
+        words[0] = TLAS_KIND;
+        words[1] = TLAS_HEADER as u32;
+        words[2] = tlas.id as u32;
+        words[3] = (tlas.id >> 32) as u32;
+        words[12] = address as u32;
+        words[13] = (address >> 32) as u32;
+        words[14] = METAL_INSTANCE_BYTES as u32;
+        let src = self.inline_bytes(bytemuck::cast_slice(&words));
+        self.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
+        // SAFETY: the header is the TLAS's own; the words are in the list's inline memory.
+        unsafe {
+            self.copy(
+                header.gpu(),
+                GpuPtr::from_address(GpuAddress(src)),
+                TLAS_HEADER,
+            );
+        }
         let state = shared
             .instance_convert()
             .expect("the instance conversion kernel");
@@ -349,7 +411,6 @@ impl CommandList<'_> {
             [64, 1, 1],
         );
         self.barrier(Stages::COMPUTE, Stages::AS_BUILD, Hazards::empty());
-        self.keep.push(Box::new(dst));
         address
     }
 
