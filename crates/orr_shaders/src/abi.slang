@@ -96,26 +96,69 @@ public struct Tlas
         __target_switch
         {
         case metal:
-            // A classic structure's address is its resource ID tagged in bit 63; a cluster
-            // BLAS's or PTLAS's is memory whose header holds the ID at byte 8.
-            uint64_t id = (address >> 63) != 0 ? (address & 0x7fffffffffffffffull) : *(uint64_t*)(address + 8);
-            return metal_resource<RaytracingAccelerationStructure>(id);
+            return metal_resource<RaytracingAccelerationStructure>(metal_id());
         default:
             if (ASSERTS && address == 0)
                 abort("Tlas.get() on address 0");
             return RaytracingAccelerationStructure(address);
         }
     }
+
+    // The Metal resource ID of the structure. A classic BLAS's address is its resource ID tagged
+    // in bit 63; a TLAS's, a cluster BLAS's or a PTLAS's is memory whose header holds the ID at
+    // byte 8, and a TLAS's header the address and stride of its Metal instance descriptors at bytes
+    // 48 and 56.
+    [ForceInline]
+    public uint64_t metal_id()
+    {
+        return (address >> 63) != 0 ? (address & 0x7fffffffffffffffull) : *(uint64_t*)(address + 8);
+    }
 }
 
 // Metal: the root is at argument-table buffer 0, the texture view pool's base resource ID
-// at 1 and the sampler resource IDs at 2. SPIR-V never uses these.
-[[vk::binding(1, 0)]] ConstantBuffer<uint64_t> metal_texture_pool;
-struct MetalSampler
+// at 1 and the sampler resource IDs at 2; a ray tracing pipeline's launch kernel has its launch
+// block at 3 and the root again at 4, which `orr_shaders.pipeline`, blind to a kernel's root,
+// hands its stages. SPIR-V never uses these.
+[[vk::binding(1, 0)]] public ConstantBuffer<uint64_t> metal_texture_pool;
+public struct MetalSampler
 {
     uint64_t id;
 }
-[[vk::binding(2, 0)]] StructuredBuffer<MetalSampler> metal_samplers;
+[[vk::binding(2, 0)]] public StructuredBuffer<MetalSampler> metal_samplers;
+
+// What a launch of a ray tracing pipeline's compute form reads (`orr_shaders.pipeline`): the
+// function table of its closest-hit, miss and callable stages by resource ID, its records'
+// addresses, strides and counts, and its extent, inline or at an address.
+public struct PipelineLaunch
+{
+    public uint64_t table;
+    public uint64_t raygen;
+    public uint64_t hits;
+    public uint64_t misses;
+    public uint64_t callables;
+    // The extent's address, as `trace_rays_indirect` reads it; 0 for `extent`.
+    public uint64_t extent_address;
+    // A word whose bits `ASSERTS` builds set where a check fails; 0 for none.
+    public uint64_t checks;
+    public uint64_t reserved0;
+    public uint hit_stride;
+    public uint hit_count;
+    public uint miss_stride;
+    public uint miss_count;
+    public uint callable_stride;
+    public uint callable_count;
+    // How deep stage calls nest: a raygen's call of a stage is 1.
+    public uint call_depth;
+    public uint reserved1;
+    public uint4 extent;
+}
+[[vk::binding(3, 0)]] public ConstantBuffer<PipelineLaunch> metal_launch : register(b3);
+// A launch kernel's root, as its stages are handed it.
+public struct MetalRoot
+{
+    uint4 words;
+}
+[[vk::binding(4, 0)]] public ConstantBuffer<MetalRoot> metal_root : register(b4);
 
 // The view of type `T` in resource heap slot `index`; `varying` when invocations can read
 // different slots. An undecorated heap access is non-uniform, and Slang emits no decoration

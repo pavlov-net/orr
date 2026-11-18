@@ -16,7 +16,7 @@ use super::lint::{self, Lint, LintError};
 use super::model::{self, HostConst, Model, StructDef, Ty};
 use super::roots::{self, Root};
 use super::slang::{GlobalSession, Library, Session};
-use super::{Error, SLANG_VERSION, SLANGC_OPTIONS, metal, spirv};
+use super::{Error, SLANG_VERSION, SLANGC_OPTIONS, metal, metal_pipeline, spirv};
 
 /// Compiles a crate's Slang kernels and generates Rust for them. Used from `build.rs`.
 ///
@@ -978,7 +978,10 @@ pub(super) struct MetalLibs {
     pub(super) lib: Option<PathBuf>,
     /// The pixel entries'.
     pub(super) fragment: Option<PathBuf>,
-    /// Entry name to Metal function name, for every entry but the ray tracing ones.
+    /// The ray tracing stages' but the raygens', whose launch kernels are in `lib`.
+    pub(super) stages: Option<PathBuf>,
+    /// Entry name to Metal function name: a raygen's launch kernel, and the function of any
+    /// other ray tracing stage (`metal_pipeline::wrap`).
     pub(super) names: BTreeMap<String, String>,
 }
 
@@ -1501,11 +1504,14 @@ fn link_modules(
     Ok(out)
 }
 
-/// Loads `unit` once more into the Metal `session`, compiles its non-ray-tracing entries to MSL
-/// and returns what the MSL check finds, with the Metal libraries when `settings.metal_sdk`
-/// asks for them and nothing was found. Writes the MSL beside `spv` as `.metal`, and the
-/// pixel entries apart as `.fragment.metal`: a fragment function that reads a global gets
-/// every global of its program, `groupshared` ones too, which Metal rejects there.
+/// Loads `unit` once more into the Metal `session`, with the compute form of its ray tracing
+/// entries (`metal_pipeline`), compiles it to MSL and returns what the MSL check finds, with the
+/// Metal libraries when `settings.metal_sdk` asks for them and nothing was found. Writes the MSL
+/// beside `spv`: `.metal` for the compute, mesh and launch kernels, `.fragment.metal` for the
+/// pixel entries and `.stages.metal` for the other ray tracing stages. A fragment function that
+/// reads a global gets every global of its program, `groupshared` ones too, which Metal rejects
+/// there; and the stages, which Metal runs as functions without threadgroup memory, are kept
+/// apart from the launch kernels, whose reorders use it.
 pub(super) fn metal_issues(
     session: &Session,
     settings: &Settings<'_>,
@@ -1513,23 +1519,51 @@ pub(super) fn metal_issues(
     unit: &Unit<'_>,
     spv: &Path,
 ) -> Result<(Vec<String>, MetalLibs), Error> {
-    let entries = |pixel: bool| -> BTreeSet<&str> {
-        model
+    let generated = match metal_pipeline::generate(model) {
+        Ok(g) => g,
+        Err(e) => return Ok((vec![e], MetalLibs::default())),
+    };
+    let entries = |pixel: bool| -> BTreeSet<String> {
+        let mut out: BTreeSet<String> = model
             .entries
             .iter()
             .filter(|e| !e.stage.ray_tracing() && (e.stage == crate::Stage::Pixel) == pixel)
-            .map(|e| e.name.as_str())
-            .collect()
-    };
-    let groups: Vec<(&str, BTreeSet<&str>)> =
-        [("metal", entries(false)), ("fragment.metal", entries(true))]
-            .into_iter()
-            .filter(|(_, e)| !e.is_empty())
+            .map(|e| e.name.clone())
             .collect();
+        if !pixel {
+            out.extend(
+                model
+                    .entries
+                    .iter()
+                    .filter(|e| e.stage == crate::Stage::RayGen)
+                    .map(|e| metal_pipeline::launch_kernel(&e.name)),
+            );
+        }
+        out
+    };
+    let stages = generated.as_ref().is_some_and(|g| g.stages);
+    let groups: Vec<(&str, BTreeSet<String>)> = [
+        ("metal", entries(false)),
+        ("fragment.metal", entries(true)),
+        (
+            "stages.metal",
+            if stages {
+                BTreeSet::from([metal_pipeline::KEEP_KERNEL.to_owned()])
+            } else {
+                BTreeSet::new()
+            },
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, e)| !e.is_empty())
+    .collect();
     if groups.is_empty() {
         return Ok((Vec::new(), MetalLibs::default()));
     }
-    let text = metal::without_ray_tracing(unit.source);
+    let mut text = metal::without_ray_tracing(unit.source);
+    if let Some(g) = &generated {
+        text.push_str(&g.slang);
+    }
     let compiled = (|| {
         let mut sources = vec![(unit.path, text.as_ref())];
         sources.extend(
@@ -1561,6 +1595,7 @@ pub(super) fn metal_issues(
     };
     let mut issues = Vec::new();
     let mut declared = Vec::new();
+    let mut libs = MetalLibs::default();
     for (extension, msl, _) in &programs {
         let msl = match metal::multi_level(msl) {
             Ok(msl) => metal::primitive_culled(&msl),
@@ -1569,25 +1604,50 @@ pub(super) fn metal_issues(
                 continue;
             }
         };
-        let msl = msl.as_str();
+        let msl = if *extension == "stages.metal" {
+            let symbol = |e: &str| metal::symbol(&entry_symbol(unit.module, e));
+            match metal_pipeline::wrap(&msl, model, symbol) {
+                Ok((msl, names)) => {
+                    libs.names.extend(names);
+                    msl
+                }
+                Err(e) => {
+                    issues.push(format!("{}: {e}", unit.name));
+                    continue;
+                }
+            }
+        } else {
+            msl
+        };
         write(&spv.with_extension(extension), msl.as_bytes())?;
-        issues.extend(metal::msl_issues(msl));
-        declared.extend(metal::entry_names(msl));
+        issues.extend(metal::msl_issues(&msl));
+        declared.extend(metal::entry_names(&msl));
     }
     // The root and its pointees are the same in every program.
     match programs[0].2.layout() {
         Ok(layout) => issues.extend(metal::layout_issues(&session.lib.api, layout, model)),
         Err(diagnostics) => issues.push(format!("no Metal layout: {diagnostics}")),
     }
-    let mut libs = MetalLibs::default();
-    for (_, entries) in &groups {
-        for &entry in entries {
-            match metal::metal_name(&metal::symbol(&entry_symbol(unit.module, entry)), &declared) {
-                Some(name) => {
-                    libs.names.insert(entry.to_owned(), name.to_owned());
-                }
-                None => issues.push(format!("entry {entry} has no function in the MSL")),
+    for e in &model.entries {
+        if e.stage.ray_tracing() && e.stage != crate::Stage::RayGen {
+            if !libs.names.contains_key(&e.name) && issues.is_empty() {
+                issues.push(format!("entry {} has no function in the MSL", e.name));
             }
+            continue;
+        }
+        let kernel = if e.stage == crate::Stage::RayGen {
+            metal_pipeline::launch_kernel(&e.name)
+        } else {
+            e.name.clone()
+        };
+        match metal::metal_name(
+            &metal::symbol(&entry_symbol(unit.module, &kernel)),
+            &declared,
+        ) {
+            Some(name) => {
+                libs.names.insert(e.name.clone(), name.to_owned());
+            }
+            None => issues.push(format!("entry {} has no function in the MSL", e.name)),
         }
     }
     let Some(sdk) = settings.metal_sdk.filter(|_| issues.is_empty()) else {
@@ -1598,6 +1658,7 @@ pub(super) fn metal_issues(
         let lib = msl.with_extension("metallib");
         match metal::compile_library(&msl, &lib, sdk) {
             Ok(()) if *extension == "metal" => libs.lib = Some(lib),
+            Ok(()) if *extension == "stages.metal" => libs.stages = Some(lib),
             Ok(()) => libs.fragment = Some(lib),
             Err(e) => issues.push(e),
         }

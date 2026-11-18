@@ -206,6 +206,26 @@ pub(crate) struct Entry {
     /// The bytes of shader record data a ray tracing entry reads: the extent of its `uniform`
     /// parameters, which Slang places in the shader record after the group handle.
     pub(super) record_bytes: u32,
+    /// A ray tracing entry's parameters in order, which the Metal build's generated code passes.
+    pub(super) params: Vec<EntryParam>,
+}
+
+/// A parameter of a ray tracing entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EntryParam {
+    pub(super) role: ParamRole,
+    /// Slang's full name of its type.
+    pub(super) ty: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ParamRole {
+    /// The payload or callable data.
+    Data,
+    /// A hit's attributes.
+    Attributes,
+    /// Record data, at this offset after the group handle.
+    Record(u32),
 }
 
 /// A global parameter other than the root and specialization constants, or an entry-point
@@ -474,6 +494,7 @@ impl Extract<'_> {
                     [1, 1, 1]
                 };
                 let mut record_bytes = 0;
+                let mut params = Vec::new();
                 for p in 0..api.spReflectionEntryPoint_getParameterCount(ep) {
                     let vl = api.spReflectionEntryPoint_getParameterByIndex(ep, p);
                     let tl = api.spReflectionVariableLayout_GetTypeLayout(vl);
@@ -483,6 +504,25 @@ impl Extract<'_> {
                     let record = stage.ray_tracing()
                         && matches!(category, C::SLANG_PARAMETER_CATEGORY_UNIFORM)
                         || matches!(category, C::SLANG_PARAMETER_CATEGORY_SHADER_RECORD);
+                    if stage.ray_tracing() {
+                        let role = match category {
+                            _ if record => Some(ParamRole::Record(
+                                api.spReflectionVariableLayout_GetOffset(vl, uniform) as u32,
+                            )),
+                            C::SLANG_PARAMETER_CATEGORY_RAY_PAYLOAD
+                            | C::SLANG_PARAMETER_CATEGORY_CALLABLE_PAYLOAD => Some(ParamRole::Data),
+                            C::SLANG_PARAMETER_CATEGORY_HIT_ATTRIBUTES => {
+                                Some(ParamRole::Attributes)
+                            }
+                            _ => None,
+                        };
+                        if let Some(role) = role {
+                            params.push(EntryParam {
+                                role,
+                                ty: self.full_name(api.spReflectionTypeLayout_GetType(tl)),
+                            });
+                        }
+                    }
                     if record {
                         let end = api.spReflectionVariableLayout_GetOffset(vl, uniform)
                             + api.spReflectionTypeLayout_GetSize(tl, uniform);
@@ -509,6 +549,7 @@ impl Extract<'_> {
                     stage,
                     workgroup,
                     record_bytes,
+                    params,
                 });
             }
 

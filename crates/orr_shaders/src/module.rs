@@ -13,6 +13,9 @@ pub struct ShaderModule {
     pub metallib: &'static [u8],
     /// The Metal library of the pixel entries, which Metal needs apart from the others.
     pub metallib_fragment: &'static [u8],
+    /// The Metal library of the ray tracing stages but the raygens: their `[[visible]]` and
+    /// intersection functions, apart from the launch kernels in `metallib`.
+    pub metallib_stages: &'static [u8],
     /// Built with opacity micromaps: its entry points declare the micromap execution mode,
     /// so its pipelines need a device with micromaps.
     pub omm: bool,
@@ -48,8 +51,11 @@ pub struct EntryPoint {
     /// `main`, followed by `.<name>` for any other entry.
     pub spirv_name: &'static CStr,
     /// The entry's function in the module's Metal library: `spirv_name` with `_` for `.`, which
-    /// Slang may rename further (with a `_0` suffix); empty without a library and for
-    /// ray tracing entries.
+    /// Slang may rename further (with a `_0` suffix); empty without a library. A raygen's is its
+    /// launch kernel's, in `metallib`; another ray tracing stage's is its function in
+    /// `metallib_stages`: `[[visible]]` for a closest-hit, miss or callable, a triangle
+    /// intersection function for an any-hit, and for an intersection a bounding-box one, beside
+    /// which `<metal_name>__<any-hit entry>` runs a procedural any-hit of the module on its report.
     pub metal_name: &'static CStr,
     pub stage: Stage,
     /// The workgroup size; `[1, 1, 1]` for ray tracing and pixel entries.

@@ -13,6 +13,8 @@ ORR_ROOT_INLINE(Root);
 [shader("raygeneration")]
 void alu_rays()
 {
+    if (!launch_inside())
+        return;
     uint2 id = launch_index().xy;
     float x = float(id.y * 4096 + id.x) * 1e-6;
     for (uint i = 0; i < root.iterations; i++)

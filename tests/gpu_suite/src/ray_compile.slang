@@ -62,6 +62,8 @@ void miss(inout Payload p)
 [shader("raygeneration")]
 void raygen()
 {
+    if (!launch_inside())
+        return;
     Payload p;
     p.words = uint4(launch_index().x, 0, 0, 0);
     call(root.callable, p);

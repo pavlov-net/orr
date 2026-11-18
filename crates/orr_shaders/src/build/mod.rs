@@ -9,6 +9,7 @@ mod link;
 mod lint;
 mod locate;
 mod metal;
+mod metal_pipeline;
 mod model;
 #[cfg(feature = "hot-reload")]
 mod reload;
