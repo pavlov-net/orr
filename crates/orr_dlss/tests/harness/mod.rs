@@ -124,19 +124,11 @@ impl Gpu {
             };
             if validation {
                 inames.push(ash::ext::debug_utils::NAME.to_owned());
-                inames.push(ash::ext::layer_settings::NAME.to_owned());
             }
             let iptrs: Vec<_> = inames.iter().map(|n| n.as_ptr()).collect();
             let app = vk::ApplicationInfo::default()
                 .application_name(c"orr_dlss tests")
                 .api_version(vk::API_VERSION_1_4);
-            let on = [vk::TRUE];
-            let settings = [vk::LayerSettingEXT::default()
-                .layer_name(c"VK_LAYER_KHRONOS_validation")
-                .setting_name(c"validate_sync")
-                .ty(vk::LayerSettingTypeEXT::BOOL32)
-                .values(&on)];
-            let mut layer_settings = vk::LayerSettingsCreateInfoEXT::default().settings(&settings);
             let messenger = vk::DebugUtilsMessengerCreateInfoEXT::default()
                 .message_severity(
                     vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
@@ -148,12 +140,9 @@ impl Gpu {
                         | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
                 )
                 .pfn_user_callback(Some(on_message));
-            let mut info = vk::InstanceCreateInfo::default()
+            let info = vk::InstanceCreateInfo::default()
                 .application_info(&app)
                 .enabled_extension_names(&iptrs);
-            if validation {
-                info = info.push(&mut layer_settings);
-            }
             let instance = entry.create_instance(&info, None).expect("instance");
             let mut messenger_handle = vk::DebugUtilsMessengerEXT::null();
             if validation {

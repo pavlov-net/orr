@@ -43,8 +43,9 @@ setup. It has no users yet.
 
 - If a run faults the GPU, stop and find the cause by reading the code and using the validation
   layer. Never rerun the same program unchanged: repeated faults can hang the machine.
-- Enable validation with `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` for correctness runs. Leave
-  it off for timings.
+- Enable validation with `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` for correctness runs, and
+  add `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true` when a change touches barriers, queues or resource
+  lifetimes. Leave it off for timings.
 - A test that deliberately loses or hangs the device is `#[ignore]` and calls
   `gpu_suite::fault_allowed()` first, so normal runs never fault on purpose.
 - Gate kernel code that not every scene uses with a direct `may()` or `may2()` test, and test

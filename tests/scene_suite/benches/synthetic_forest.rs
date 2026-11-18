@@ -7,7 +7,8 @@
 //! `cargo bench -p scene_suite --bench synthetic_forest -- [--validate] [--trees N]
 //! [--extent WxH] [--frames N] [--ptlas-cap-ms MS]`, through `.tools/gpu-run.ps1`.
 //! `--validate` runs a small forest and fails on any validation message; the layer loads
-//! through `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`.
+//! through `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`, and its synchronization checks
+//! through `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true` as well.
 #![allow(clippy::print_stdout)]
 
 use std::path::PathBuf;

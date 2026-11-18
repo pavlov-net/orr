@@ -33,8 +33,6 @@ use crate::{
 };
 use orr_memory::AllocatorDesc;
 
-const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
-
 /// State every object of one device shares. Objects hold it through an `Arc`, so it is
 /// destroyed after the last of them.
 pub(crate) struct Shared {
@@ -300,8 +298,8 @@ fn c_string(chars: &[c_char]) -> String {
 impl Device {
     /// Creates the device: the first Vulkan 1.4 GPU (discrete first) with every required
     /// feature and extension. Fails naming the first missing item. The validation layer
-    /// loads only when the environment enables it (`VK_INSTANCE_LAYERS`, vkconfig); its
-    /// synchronization checks are then on, and its messages are logged and counted
+    /// loads only when the environment enables it (`VK_INSTANCE_LAYERS`, vkconfig), with the
+    /// settings the environment gives it, and its messages are logged and counted
     /// ([`Device::validation_messages`]).
     pub fn new(desc: &DeviceDesc<'_>) -> Result<Device, Error> {
         let _zone = crate::zone!("create device");
@@ -928,30 +926,6 @@ fn create_instance(
         .application_name(&name)
         .engine_name(c"orr")
         .api_version(vk::API_VERSION_1_4);
-    let on = [vk::TRUE];
-    let settings = [vk::LayerSettingEXT::default()
-        .layer_name(VALIDATION_LAYER)
-        .setting_name(c"validate_sync")
-        .ty(vk::LayerSettingTypeEXT::BOOL32)
-        .values(&on)];
-    let mut layer_settings = vk::LayerSettingsCreateInfoEXT::default().settings(&settings);
-    let mut messenger = messenger_info(messages);
-    // `VK_EXT_layer_settings` exists only while a layer providing it is enabled, which the
-    // environment decides, so creation with it fails without one.
-    let mut with_settings = ext_names.clone();
-    with_settings.push(ash::ext::layer_settings::NAME.as_ptr());
-    let info = vk::InstanceCreateInfo::default()
-        .application_info(&app)
-        .enabled_extension_names(&with_settings)
-        .push(&mut messenger)
-        .push(&mut layer_settings);
-    // SAFETY: valid create info; the messenger's count outlives the instance.
-    match unsafe { entry.create_instance(&info, None) } {
-        Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT) => {
-            log::debug!("no enabled layer offers VK_EXT_layer_settings: no synchronization checks");
-        }
-        r => return r.map_err(Error::vk("vkCreateInstance")),
-    }
     let mut messenger = messenger_info(messages);
     let info = vk::InstanceCreateInfo::default()
         .application_info(&app)

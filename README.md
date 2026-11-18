@@ -228,3 +228,8 @@ Install the pre-commit hook, which runs fmt, clippy and typos:
 cargo install --locked prek typos-cli
 prek install
 ```
+
+Run tests with `cargo run -p xtask -- test [FILTER]`. Set
+`VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` to run them under the validation layer. Its
+synchronization checks are much slower and stay off unless
+`VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true` asks for them too.
