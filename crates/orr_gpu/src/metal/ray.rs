@@ -20,11 +20,11 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4ArgumentTable, MTL4BinaryFunctionDescriptor, MTL4BinaryFunctionOptions,
+    MTL4ArgumentTable, MTL4BinaryFunctionDescriptor, MTL4BinaryFunctionOptions, MTL4CommandEncoder,
     MTL4ComputeCommandEncoder, MTL4FunctionDescriptor, MTL4LibraryFunctionDescriptor,
-    MTL4PipelineStageDynamicLinkingDescriptor, MTLBuffer, MTLComputePipelineState, MTLDevice,
-    MTLFunctionHandle, MTLResidencySet, MTLResource, MTLResourceOptions, MTLVisibleFunctionTable,
-    MTLVisibleFunctionTableDescriptor,
+    MTL4PipelineStageDynamicLinkingDescriptor, MTL4VisibilityOptions, MTLBuffer,
+    MTLComputePipelineState, MTLDevice, MTLFunctionHandle, MTLResidencySet, MTLResource,
+    MTLResourceOptions, MTLStages, MTLVisibleFunctionTable, MTLVisibleFunctionTableDescriptor,
 };
 use orr_shaders::abi::METAL_INTERSECTION_TAGS;
 
@@ -36,8 +36,8 @@ use super::memory::{Allocation, malloc};
 use super::pipeline::ShaderStage;
 use super::{Obj, lock};
 use crate::{
-    DispatchArgs, Error, GpuPtr, Hazards, HitGroup, HitTable, MemoryKind, RayPipelineDesc,
-    RayPipelineFlags, ShaderRecord, Stage, Stages,
+    DispatchArgs, Error, GpuPtr, HitGroup, HitTable, MemoryKind, RayPipelineDesc, RayPipelineFlags,
+    ShaderRecord, Stage,
 };
 
 /// Bytes of a record's handle, which its data follows.
@@ -136,20 +136,20 @@ impl RayShared {
         checks.setLabel(Some(&NSString::from_str("orr ray pipeline checks")));
         // SAFETY: shared storage is mapped; nothing else uses it yet.
         unsafe { checks.contents().cast::<u32>().as_ptr().write(0) };
-        {
-            let mut r = lock(&shared.residency);
-            r.set.addAllocation(ProtocolObject::from_ref(&*checks));
-            r.dirty = true;
-        }
-        let r = RayShared {
+        let made = RayShared {
             library: Obj(library),
             groups,
             checks: Obj(checks),
             reported: Default::default(),
         };
-        // Another thread may have made one meanwhile; either serves.
-        let _ = shared.ray.set(r);
-        Ok(shared.ray.get().expect("set above"))
+        // Of threads that race here, one's joins the residency set and serves; the others' are
+        // dropped unused.
+        Ok(shared.ray.get_or_init(|| {
+            let mut r = lock(&shared.residency);
+            r.set.addAllocation(ProtocolObject::from_ref(&*made.checks));
+            r.dirty = true;
+            made
+        }))
     }
 
     /// The checks `ASSERTS` builds' launches found failing (`orr_shaders.pipeline`'s
@@ -208,6 +208,10 @@ pub struct RayPipeline {
     misses: Region,
     callables: Region,
     call_depth: u32,
+    /// The kernel that turns an indirect launch's extent into threadgroups.
+    launch_groups: Obj<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// The address of the word `ASSERTS` builds' checks set.
+    checks: u64,
     records: Arc<Allocation<u8>>,
     /// The binary functions, which the kernels link and the hit records name.
     functions: Arc<Vec<Obj<BinaryFunction>>>,
@@ -272,9 +276,8 @@ impl RayPipeline {
 /// What a binary function is compiled from: a stage, and the function of its library when it
 /// is not the entry's own (a procedural group's intersection with its any-hit), or one of the
 /// default functions.
-#[derive(Clone, Copy)]
 enum Source<'a> {
-    Stage(&'a ShaderStage<'a>, Option<&'a str>),
+    Stage(&'a ShaderStage<'a>, Option<String>),
     Default(&'static str),
 }
 
@@ -389,12 +392,16 @@ impl Device {
                 sources.push(Source::Stage(s, None));
             }
         }
-        // Each stage's own intersection function, a procedural pair's by stage indices, and
-        // each default, by the index of its binary function.
-        let mut own = std::collections::HashMap::new();
-        let mut pairs = std::collections::HashMap::new();
-        let mut defaults = std::collections::HashMap::new();
-        let mut pair_names = Vec::new();
+        // Each hit group's intersection function, by its index among the binary functions: a
+        // stage's own, a procedural pair's or the default, each compiled once.
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum Isect {
+            Own(u32),
+            Pair(u32, u32),
+            Accept,
+        }
+        let mut made = std::collections::HashMap::new();
+        let mut groups = Vec::with_capacity(desc.hit_groups.len());
         for g in desc.hit_groups {
             if let Some(i) = g.closest_hit {
                 stage(i, Stage::ClosestHit)?;
@@ -405,69 +412,44 @@ impl Device {
             if let Some(i) = g.intersection {
                 stage(i, Stage::Intersection)?;
             }
-            if let (Some(isect), Some(any)) = (g.intersection, g.any_hit) {
-                let (is, a) = (&desc.stages[isect as usize], &desc.stages[any as usize]);
-                // The pair's function is the intersection's library's, which runs the any-hit
-                // under the intersection's constants.
-                if !std::ptr::eq(is.module, a.module)
-                    || is.spec.bytes != a.spec.bytes
-                    || is.spec.entries != a.spec.entries
-                {
-                    return Err(invalid(format!(
-                        "intersection {:?} and any-hit {:?} of one group come from different \
-                         modules or constants: Metal runs them as one function of the \
-                         intersection's module",
-                        is.entry.name, a.entry.name
-                    )));
-                }
-                pair_names.push((
-                    (isect, any),
-                    format!(
-                        "{}__{}",
-                        is.metal_name()?,
-                        a.entry.name.to_str().unwrap_or("")
-                    ),
-                ));
-            }
-        }
-        for g in desc.hit_groups {
-            match (g.intersection, g.any_hit) {
-                (Some(isect), Some(any)) => {
-                    if let std::collections::hash_map::Entry::Vacant(e) = pairs.entry((isect, any))
-                    {
-                        let n = &pair_names
-                            .iter()
-                            .find(|(k, _)| *k == (isect, any))
-                            .unwrap()
-                            .1;
-                        e.insert(sources.len());
-                        sources.push(Source::Stage(&desc.stages[isect as usize], Some(n)));
-                    }
-                }
-                (Some(i), None) | (None, Some(i)) => {
-                    own.entry(i).or_insert_with(|| {
-                        sources.push(Source::Stage(&desc.stages[i as usize], None));
-                        sources.len() - 1
+            let key = match (g.intersection, g.any_hit) {
+                (Some(isect), Some(any)) => Isect::Pair(isect, any),
+                (Some(i), None) | (None, Some(i)) => Isect::Own(i),
+                (None, None) => Isect::Accept,
+            };
+            let f = match made.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    sources.push(match key {
+                        Isect::Pair(isect, any) => {
+                            let (is, a) =
+                                (&desc.stages[isect as usize], &desc.stages[any as usize]);
+                            // The pair's function is the intersection's library's, which runs
+                            // the any-hit under the intersection's constants.
+                            if !std::ptr::eq(is.module, a.module)
+                                || is.spec.bytes != a.spec.bytes
+                                || is.spec.entries != a.spec.entries
+                            {
+                                return Err(invalid(format!(
+                                    "intersection {:?} and any-hit {:?} of one group come from \
+                                     different modules or constants: Metal runs them as one \
+                                     function of the intersection's module",
+                                    is.entry.name, a.entry.name
+                                )));
+                            }
+                            let any_name = a.entry.name.to_str().map_err(|_| {
+                                invalid(format!("any-hit {:?} is not named in UTF-8", a.entry.name))
+                            })?;
+                            Source::Stage(is, Some(format!("{}__{any_name}", is.metal_name()?)))
+                        }
+                        Isect::Own(i) => Source::Stage(&desc.stages[i as usize], None),
+                        Isect::Accept => Source::Default("orr_accept_triangle"),
                     });
+                    *e.insert(sources.len() - 1)
                 }
-                (None, None) => {
-                    defaults.entry("orr_accept_triangle").or_insert_with(|| {
-                        sources.push(Source::Default("orr_accept_triangle"));
-                        sources.len() - 1
-                    });
-                }
-            }
+            };
+            groups.push(f);
         }
-        // Each group's intersection function, by its index among the binary functions.
-        let groups: Vec<usize> = desc
-            .hit_groups
-            .iter()
-            .map(|g| match (g.intersection, g.any_hit) {
-                (Some(isect), Some(any)) => pairs[&(isect, any)],
-                (Some(i), None) | (None, Some(i)) => own[&i],
-                (None, None) => defaults["orr_accept_triangle"],
-            })
-            .collect();
         let started = std::time::Instant::now();
         let ray = RayShared::get(shared)?;
         let compiled = desc.threads.map(sources.len(), |i| {
@@ -643,6 +625,8 @@ impl Device {
             misses: region(starts[1], miss_stride, desc.misses.len()),
             callables: region(callable_start, callable_stride, desc.callables.len()),
             call_depth: desc.call_depth,
+            launch_groups: ray.groups.clone(),
+            checks: ray.checks.gpuAddress(),
             records: Arc::new(records),
             functions: Arc::new(functions.into_iter().map(|(f, _)| f).collect()),
             shared: Arc::clone(shared),
@@ -659,17 +643,16 @@ impl Device {
         let shared = &self.shared;
         let mut key = blake3::Hasher::new();
         key.update(b"binary");
-        let (function, label): (Retained<MTL4FunctionDescriptor>, String) = match *source {
+        let (function, label): (Retained<MTL4FunctionDescriptor>, &str) = match source {
             Source::Stage(s, function) => {
                 s.key(&mut key);
-                let f = match function {
+                match function {
                     Some(f) => {
                         key.update(f.as_bytes());
-                        s.function_named(shared, f)?
+                        (s.function_named(shared, f)?, f)
                     }
-                    None => s.function(shared)?,
-                };
-                (f, function.unwrap_or(s.metal_name()?).to_owned())
+                    None => (s.function(shared)?, s.metal_name()?),
+                }
             }
             Source::Default(f) => {
                 key.update(f.as_bytes());
@@ -677,7 +660,7 @@ impl Device {
                 let d = MTL4LibraryFunctionDescriptor::new();
                 d.setName(Some(&NSString::from_str(f)));
                 d.setLibrary(Some(&ray.library));
-                (Retained::into_super(d), f.to_owned())
+                (Retained::into_super(d), f)
             }
         };
         let key = key.finalize();
@@ -728,22 +711,27 @@ impl CommandList<'_> {
         root: &R,
         args: GpuPtr<DispatchArgs>,
     ) {
-        let shared = Arc::clone(&self.queue.shared);
-        let ray = RayShared::get(&shared).expect("a ray tracing pipeline exists");
-        let groups = malloc::<u32>(&shared, MemoryKind::DeviceLocal, 4, "launch groups", false)
-            .expect("launch groups");
-        let at = groups.gpu().address().0;
-        let state = ray.groups.clone();
+        // The threadgroup counts, in the list's inline memory; the caller's barrier on `args`
+        // holds for this dispatch too, which runs in the launch's stage.
+        let at = self.inline_bytes(&[0; size_of::<DispatchArgs>()]);
         let a = GroupArgs {
             extent: args.address().0,
             groups: at,
         };
-        self.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-        self.dispatch_state(&state, bytemuck::bytes_of(&a), [1, 1, 1], [1, 1, 1]);
-        self.barrier(Stages::COMPUTE, Stages::RAY, Hazards::DRAW_ARGUMENTS);
-        self.keep.push(Box::new(groups));
+        self.dispatch_state(
+            &p.launch_groups,
+            bytemuck::bytes_of(&a),
+            [1, 1, 1],
+            [1, 1, 1],
+        );
+        self.compute()
+            .barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+                MTLStages::Dispatch,
+                MTLStages::Dispatch,
+                MTL4VisibilityOptions::Device,
+            );
         let e = self.bind_rays(p, raygen, hits, root, [0; 3], args.address().0);
-        // SAFETY: the counts are in memory this list keeps, written above.
+        // SAFETY: the counts are in the list's inline memory, written above.
         unsafe {
             e.dispatchThreadgroupsWithIndirectBuffer_threadsPerThreadgroup(
                 at,
@@ -780,10 +768,6 @@ impl CommandList<'_> {
             );
         }
         let r = &p.raygens[raygen as usize];
-        let checks = RayShared::get(&self.queue.shared)
-            .expect("a ray tracing pipeline exists")
-            .checks
-            .gpuAddress();
         let launch = PipelineLaunch {
             table: id_bits(r.table.gpuResourceID()),
             raygen: r.record,
@@ -791,7 +775,7 @@ impl CommandList<'_> {
             misses: p.misses.address,
             callables: p.callables.address,
             extent_address,
-            checks,
+            checks: p.checks,
             reserved0: 0,
             hit_stride: hits.stride as u32,
             hit_count: hits.count as u32,
