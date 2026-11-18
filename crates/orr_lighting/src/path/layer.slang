@@ -36,7 +36,7 @@ void surface_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
     TriangleHit h = { a };
     // A window's answer is the payload.
     bool question = is_question(p.words);
-    path_layer_hit<Surface, Medium, TriangleHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
+    path_layer_hit<Surface, Medium, TriangleHit, SectionGiven>(root, launch_index().x, p.words, section_given(data.material), h);
     // Tells the raygen a shader took the hit.
     if (!question)
         p.words.x = 0;
@@ -47,26 +47,26 @@ void face_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(face_hit);
     TriangleHit h = { a };
-    path_face_hit<Surface, TriangleHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
+    path_face_hit<Surface, TriangleHit, SectionGiven>(root, launch_index().x, p.words, section_given(data.material), h);
 }
 
 [shader("callable")]
 void disperse(inout DisperseCall c)
 {
     ORR_OMM(disperse);
-    path_disperse(root, DispatchRaysIndex().x, c);
+    path_disperse(root, launch_index().x, c);
 }
 
 [shader("callable")]
 void walk_meets(inout WalkMeetCall c)
 {
     ORR_OMM(walk_meets);
-    path_walk_meets<Medium>(root, DispatchRaysIndex().x, c);
+    path_walk_meets<Medium>(root, launch_index().x, c);
 }
 
 [shader("callable")]
 void manifold_face(inout FaceCall c)
 {
     ORR_OMM(manifold_face);
-    path_manifold_face<Medium>(root, DispatchRaysIndex().x, c);
+    path_manifold_face<Medium>(root, launch_index().x, c);
 }

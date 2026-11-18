@@ -63,7 +63,7 @@ void miss(inout Payload p)
 void raygen()
 {
     Payload p;
-    p.words = uint4(DispatchRaysIndex().x, 0, 0, 0);
+    p.words = uint4(launch_index().x, 0, 0, 0);
     call(root.callable, p);
-    root.out[DispatchRaysIndex().x] = p.words.x;
+    root.out[launch_index().x] = p.words.x;
 }

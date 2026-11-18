@@ -28,7 +28,7 @@ void surface_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(surface_hit);
     TriangleHit h = { a };
-    path_hit<Surface, Medium, TriangleHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
+    path_hit<Surface, Medium, TriangleHit, SectionGiven>(root, launch_index().x, p.words, section_given(data.material), h);
     // Tells the raygen a shader took the hit.
     p.words.x = 0;
 }
@@ -38,7 +38,7 @@ void strand_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 {
     ORR_OMM(strand_hit);
     BuiltInHit h = { a };
-    path_hit<Surface, Medium, BuiltInHit, SectionGiven>(root, DispatchRaysIndex().x, p.words, section_given(data.material), h);
+    path_hit<Surface, Medium, BuiltInHit, SectionGiven>(root, launch_index().x, p.words, section_given(data.material), h);
     // Tells the raygen a shader took the hit.
     p.words.x = 0;
 }
@@ -47,26 +47,26 @@ void strand_hit(inout Payload p, TriangleAttributes a, uniform HitData data)
 void first_vertex(inout Payload p)
 {
     ORR_OMM(first_vertex);
-    path_first<Medium>(root, DispatchRaysIndex().x, p.words);
+    path_first<Medium>(root, launch_index().x, p.words);
 }
 
 [shader("callable")]
 void walk_leaves(inout Payload p)
 {
     ORR_OMM(walk_leaves);
-    path_walk_exit<Medium>(root, DispatchRaysIndex().x, p.words);
+    path_walk_exit<Medium>(root, launch_index().x, p.words);
 }
 
 [shader("callable")]
 void emitter_view(inout Payload p)
 {
     ORR_OMM(emitter_view);
-    path_emitter_view<Surface>(root, DispatchRaysIndex().x, p.words);
+    path_emitter_view<Surface>(root, launch_index().x, p.words);
 }
 
 [shader("callable")]
 void first_view(inout Payload p)
 {
     ORR_OMM(first_view);
-    path_first_view<Surface>(root, DispatchRaysIndex().x);
+    path_first_view<Surface>(root, launch_index().x);
 }

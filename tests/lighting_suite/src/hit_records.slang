@@ -20,7 +20,7 @@ ORR_ROOT_INLINE(HitRaysRoot);
 [shader("raygeneration")]
 void pipeline_paths()
 {
-    uint i = DispatchRaysIndex().x;
+    uint i = launch_index().x;
     if (i >= root.count)
         return;
     RayIn r = root.rays[i];
@@ -52,7 +52,7 @@ void pipeline_paths()
 [shader("raygeneration")]
 void pipeline_shadows()
 {
-    uint i = DispatchRaysIndex().x;
+    uint i = launch_index().x;
     if (i >= root.count)
         return;
     RayIn r = root.rays[i];
@@ -100,13 +100,14 @@ void cover_shadow_hit(inout Payload p, TriangleAttributes a, uniform HitData dat
 [shader("intersection")]
 void box_medium_hit()
 {
-    float2 span = box_medium(ObjectRayOrigin(), ObjectRayDirection(), RayTCurrent());
+    RayBuiltIns r = ray_builtins();
+    float2 span = box_medium(r.object_origin(), r.object_direction(), r.t());
     SpanAttributes a = { span };
-    ReportHit(clamp(span.x, RayTMin(), RayTCurrent()), 0, a);
+    report_hit(clamp(span.x, r.t_min(), r.t()), 0, a);
 }
 
 [shader("anyhit")]
 void proxy_shadow_hit(inout Payload p, SpanAttributes a)
 {
-    any_hit_decides(proxy_any_hit(root.scene, p.words, InstanceIndex(), a.span));
+    any_hit_decides(proxy_any_hit(root.scene, p.words, ray_builtins().instance_index(), a.span));
 }

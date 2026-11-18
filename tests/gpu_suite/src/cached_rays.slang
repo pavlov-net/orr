@@ -65,7 +65,7 @@ void hit_main(inout Payload p, TriangleAttributes a)
 void any_main(inout Payload p, TriangleAttributes a)
 {
     if (p.words.x == value)
-        IgnoreHit();
+        ignore_hit();
 }
 
 [shader("intersection")]
@@ -73,7 +73,7 @@ void span_main()
 {
     Span s;
     s.far = float(value);
-    ReportHit(1.0, 0, s);
+    report_hit(1.0, 0, s);
 }
 
 [shader("closesthit")]

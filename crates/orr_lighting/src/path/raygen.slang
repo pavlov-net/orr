@@ -1856,7 +1856,7 @@ uint run_path(PathRoot r, uint slot, uint4* at, uint next)
 // light feedback.
 public void view_paths(PathRoot r)
 {
-    uint slot = DispatchRaysIndex().x;
+    uint slot = launch_index().x;
     if (slot >= r.slice_count)
         return;
     uint2 pixel = item_pixel(r, r.slice_base + slot);
@@ -1960,7 +1960,7 @@ public void view_paths(PathRoot r)
 // a miss the sky the camera sees, at depth 0. A pixel the mask leaves out writes (0, 0, 0, -1).
 public void background_paths<E : IEnvironment, M : IMedium>(PathRoot r)
 {
-    uint slot = DispatchRaysIndex().x;
+    uint slot = launch_index().x;
     uint2 extent = r.gbuffer.extent;
     if (slot >= r.slice_count || r.slice_base + slot >= extent.x * extent.y)
         return;
@@ -2047,10 +2047,10 @@ uint start_photon_check(PathRoot r, uint slot, uint4* at)
 // and a winner's takes in; and the direction it leaves along. A job no walk reaches is dark.
 public void path_froxel_walks(PathRoot r)
 {
-    uint slot = DispatchRaysIndex().x;
+    uint slot = launch_index().x;
     FroxelRoot* f = r.froxel;
     uint count = f.walks.list.count;
-    for (uint n = slot; n < count; n += DispatchRaysDimensions().x)
+    for (uint n = slot; n < count; n += launch_size().x)
         froxel_walk_job(r, slot, f, f.walks.jobs[n]);
 }
 
@@ -2128,7 +2128,7 @@ void froxel_walk_job(PathRoot r, uint slot, FroxelRoot* f, uint i)
 // that deposited where the view read counts toward its caster cluster's aim cell.
 public void photon_paths(PathRoot r)
 {
-    uint slot = DispatchRaysIndex().x;
+    uint slot = launch_index().x;
     if (slot >= r.slice_count)
         return;
     Payload start;
@@ -2198,7 +2198,7 @@ public void photon_paths(PathRoot r)
 // layer guides traced it starts inside the interiors around its G-buffer surface.
 public void update_paths(PathRoot r)
 {
-    uint slot = DispatchRaysIndex().x;
+    uint slot = launch_index().x;
     if (slot >= r.slice_count)
         return;
     uint2 pixel = item_pixel(r, r.slice_base + slot);

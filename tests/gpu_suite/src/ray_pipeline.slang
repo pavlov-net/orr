@@ -126,27 +126,28 @@ void hit_b(uniform HitData rec, inout Payload p, TriangleAttributes a)
 [shader("anyhit")]
 void cover(uniform HitData rec, inout Payload p, TriangleAttributes a)
 {
-    uint3 launch = DispatchRaysIndex();
+    TriangleHit h = { a };
+    uint3 launch = h.launch();
     uint* o = ray_record(launch);
     o[7] += 1;
-    float t = RayTCurrent();
-    int cluster = GetClusterID();
+    float t = h.t();
+    int cluster = h.cluster_id();
     if (t < asfloat(o[19]))
     {
         o[19] = asuint(t);
         o[8] = uint(cluster);
-        o[9] = PrimitiveIndex();
+        o[9] = h.primitive_index();
     }
-    if (rec.custom != InstanceID() || rec.geometry != GeometryIndex() || uint(rec.tag >> 32) != root.ray_type)
+    if (rec.custom != h.custom_index() || rec.geometry != h.geometry_index() || uint(rec.tag >> 32) != root.ray_type)
         seen(launch)[4] += 1;
-    if ((root.mode & MODE_ALPHA) != 0 && (uint(cluster) + PrimitiveIndex()) % 3 == 0)
-        IgnoreHit();
+    if ((root.mode & MODE_ALPHA) != 0 && (uint(cluster) + h.primitive_index()) % 3 == 0)
+        ignore_hit();
 }
 
 [shader("miss")]
 void miss(uniform MissData rec, inout Payload p)
 {
-    uint* o = ray_record(DispatchRaysIndex());
+    uint* o = ray_record(launch_index());
     o[0] = 0;
     for (uint i = 1; i < 7; i++)
         o[i] = NONE;
@@ -168,20 +169,21 @@ void box(uniform MissData rec)
 {
     BoxAttributes a;
     a.entry = asfloat(rec.value);
-    ReportHit(a.entry - ObjectRayOrigin().z, 0, a);
+    report_hit(a.entry - ray_builtins().object_origin().z, 0, a);
 }
 
 [shader("closesthit")]
 void box_hit(inout Payload p, BoxAttributes a)
 {
-    uint* o = ray_record(DispatchRaysIndex());
+    RayBuiltIns r = ray_builtins();
+    uint* o = ray_record(r.launch());
     o[0] = 1;
-    o[1] = InstanceID();
-    o[2] = InstanceIndex();
+    o[1] = r.custom_index();
+    o[2] = r.instance_index();
     o[3] = NONE;
-    o[4] = PrimitiveIndex();
-    o[5] = GeometryIndex();
-    o[6] = asuint(RayTCurrent());
+    o[4] = r.primitive_index();
+    o[5] = r.geometry_index();
+    o[6] = asuint(r.t());
     p.words.x = asuint(a.entry);
     p.words.y = SHADER_BOX;
 }
@@ -233,7 +235,7 @@ void end(uint3 launch, Payload p, uint* o)
 [shader("raygeneration")]
 void closest()
 {
-    uint3 launch = DispatchRaysIndex();
+    uint3 launch = launch_index();
     uint* o = begin(launch);
     Payload p;
     p.words = 0;
@@ -244,7 +246,7 @@ void closest()
 [shader("raygeneration")]
 void traced()
 {
-    uint3 launch = DispatchRaysIndex();
+    uint3 launch = launch_index();
     uint* o = begin(launch);
     Payload p;
     p.words = 0;
@@ -319,7 +321,7 @@ void vis_store(uint* p, uint v)
 // The hit or miss shader of `visibility`: reads the raygen's store, stores its own.
 void vis_shade(inout Payload p)
 {
-    uint3 launch = DispatchRaysIndex();
+    uint3 launch = launch_index();
     uint i = index(launch);
     uint* w = vis(launch);
     p.words.y = vis_load(w) == vis_value(i, 0) ? VIS_INVOKED : 0;
@@ -341,7 +343,7 @@ void vis_miss(inout Payload p)
 [shader("callable")]
 void vis_call(inout Payload p)
 {
-    uint3 launch = DispatchRaysIndex();
+    uint3 launch = launch_index();
     uint i = index(launch);
     uint* w = vis(launch);
     p.words.z = vis_load(w + 1) == vis_value(i, 1) ? VIS_CALLED : 0;
@@ -353,7 +355,7 @@ void vis_call(inout Payload p)
 [shader("raygeneration")]
 void visibility()
 {
-    uint3 launch = DispatchRaysIndex();
+    uint3 launch = launch_index();
     uint i = index(launch);
     uint* w = vis(launch);
     vis_store(w, vis_value(i, 0));

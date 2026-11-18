@@ -34,8 +34,10 @@ pub enum Lint {
     HeapTokens,
     /// `RayQuery` appears only in `orr_shaders.trace`.
     RayQuery,
-    /// `TraceRay`, `CallShader`, `HitObject` and `ReorderThread` appear only in
-    /// `orr_shaders.pipeline`.
+    /// The ray tracing pipeline's intrinsics (`TraceRay`, `CallShader`, `HitObject`,
+    /// `ReorderThread`, `ReportHit`, `IgnoreHit`, `DispatchRaysIndex` and the other system values
+    /// of its stages) appear only in `orr_shaders.pipeline`, whose compute form stands in for
+    /// them where a target has no such pipeline.
     Pipeline,
     /// Cooperative-vector names appear only in `orr_shaders.coopvec`.
     CoopVec,
@@ -115,9 +117,41 @@ const TOKEN_RULES: &[TokenRule] = &[
     },
     TokenRule {
         lint: Lint::Pipeline,
-        exact: &["ReorderThread", "HitObject"],
+        exact: &[
+            "ReorderThread",
+            "HitObject",
+            "BuiltInTriangleIntersectionAttributes",
+        ],
         prefixes: &[],
-        calls: &["TraceRay", "CallShader"],
+        calls: &[
+            "TraceRay",
+            "CallShader",
+            "ReportHit",
+            "IgnoreHit",
+            "AcceptHitAndEndSearch",
+            "DispatchRaysIndex",
+            "DispatchRaysDimensions",
+            "RayTCurrent",
+            "RayTMin",
+            "RayFlags",
+            "HitKind",
+            "InstanceIndex",
+            "InstanceID",
+            "GeometryIndex",
+            "PrimitiveIndex",
+            "WorldRayOrigin",
+            "WorldRayDirection",
+            "ObjectRayOrigin",
+            "ObjectRayDirection",
+            "ObjectToWorld",
+            "ObjectToWorld3x4",
+            "ObjectToWorld4x3",
+            "WorldToObject",
+            "WorldToObject3x4",
+            "WorldToObject4x3",
+            "HitTriangleVertexPosition",
+            "GetClusterID",
+        ],
         home: Some("pipeline"),
     },
     TokenRule {
