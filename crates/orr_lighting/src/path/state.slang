@@ -212,9 +212,10 @@ public static const uint CALL_WALK_MEETS = 15;
 // A hit's cap is the standard surface's hit on a copy's clusters, with every scene flag set; the
 // standard alpha test's any-hit likewise. A stage made for producer entries, or for both kinds of
 // geometry, adds what resolves a producer's triangle where the scene may hold producer entries.
-// The caps hold orr's own code: what an application's linked types add to a stage (a medium, an
-// environment, a surface's own code in the stage made for it) is the application's, so the host
-// reports each part and holds it to the pipeline's cap alone.
+// The caps hold orr's own code in orr's tests. The driver compiles a stage whole, so a stage of a
+// scene's pipeline from kernels that link types (a medium, an environment, a surface, in the stage
+// made for it too) is held to its role's cap whole, the linked code among it: the host warns where
+// one is over, and an application asserts it in its own tests.
 [Host] public static const uint HIT_INSTRUCTIONS = 46000;
 [Host] public static const uint ANY_HIT_INSTRUCTIONS = 4800;
 [Host] public static const uint PRODUCER_HIT_INSTRUCTIONS = 2000;

@@ -523,7 +523,7 @@ const SURFACE: &str = "module surface;\n\
         static GSurface surface(SurfaceInput i, out float d, bool report);\n\
         static float coverage(SurfaceInput i, bool presence, bool report);\n\
     }\n\
-    public struct Surfaces<L : ISurface> : ISurfaces {\n\
+    public struct Surfaces<L : ISurface, E : ISurface> : ISurfaces {\n\
         public static GSurface surface(SurfaceInput i, out float d, bool report) {\n\
             PlainSurface s;\n\
             if (!L.surface(i, s, d)) { d = 0; s = { float4(0) }; L.adjust(i, s, d); }\n\
@@ -536,7 +536,7 @@ const SURFACE: &str = "module surface;\n\
             return c;\n\
         }\n\
     }\n\
-    public typealias StandardSurface = Surfaces<NoSurface>;\n";
+    public typealias StandardSurface = Surfaces<NoSurface, NoSurface>;\n";
 
 /// A consumer surface returning `value`.
 fn consumer_surface(ty: &str, value: &str) -> String {

@@ -109,7 +109,7 @@ public interface ISurfaces
     static float coverage(SurfaceInput i, bool presence, bool report);
 }
 
-public struct Surfaces<L : ISurface> : ISurfaces
+public struct Surfaces<L : ISurface, E : ISurface> : ISurfaces
 {
     public static GSurface surface(SurfaceInput i, out float depth_offset, bool report)
     {
@@ -135,4 +135,4 @@ public struct Surfaces<L : ISurface> : ISurfaces
     }
 }
 
-public typealias StandardSurface = Surfaces<NoSurface>;
+public typealias StandardSurface = Surfaces<NoSurface, NoSurface>;

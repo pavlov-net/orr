@@ -7,5 +7,5 @@ mod record;
 mod stages;
 
 pub(crate) use memory::{LaunchMemory, SlotLayout, SlotParts, SourceMemory};
-pub use stages::{PIPELINE_CAP, Role, StageSize, over_cap, path_stage_sizes};
 pub(crate) use stages::{PathPipeline, PathPipelines};
+pub use stages::{PathStageSizes, PipelineSize, Role, StageSize, path_stage_sizes};

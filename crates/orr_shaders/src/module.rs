@@ -145,6 +145,8 @@ pub struct KernelSet {
     pub surfaces: u32,
     /// What each linked surface type declares ([`surface_declares`]), by id from 1.
     pub surface_declares: &'static [u32],
+    /// The Slang type linked as each surface, by id from 1.
+    pub surface_types: &'static [&'static str],
     /// The Slang type linked as the environment; [`DEFAULT_ENVIRONMENT`] when none is.
     pub environment: &'static str,
     /// The Slang type linked as the medium; [`DEFAULT_MEDIUM`] when none is.
@@ -163,6 +165,7 @@ impl KernelSet {
         modules: &[],
         surfaces: 0,
         surface_declares: &[],
+        surface_types: &[],
         environment: DEFAULT_ENVIRONMENT,
         medium: DEFAULT_MEDIUM,
     };

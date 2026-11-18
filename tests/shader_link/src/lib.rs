@@ -3,7 +3,7 @@
 //! standard one, one of them with its own `coverage`, and one adjusting it), a displacement,
 //! an environment and a medium into them, and
 //! `cpu/calls.slang` calls the same linked types on the CPU. The same environment and medium
-//! also link into orr's own kernels.
+//! also link into orr's own kernels, and so does a large surface on its own.
 
 // The build script reads `DEP_ORR_*`, which Cargo sets only while orr is a normal dependency.
 use orr as _;
@@ -31,6 +31,12 @@ pub mod edited {
 /// The environment and medium linked into orr's kernels.
 pub mod orr_linked {
     include!(concat!(env!("OUT_DIR"), "/orr/orr_kernels.rs"));
+}
+
+/// `consumer/strata.slang`'s large layered ground linked into orr's kernels as their one
+/// surface, which their path pipelines' stage caps are checked on and no GPU test compiles.
+pub mod orr_strata {
+    include!(concat!(env!("OUT_DIR"), "/orr-strata/orr_kernels.rs"));
 }
 
 /// The environment linked into a copy of orr's environment bake whose root has one more

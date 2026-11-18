@@ -278,6 +278,11 @@ public interface ISurfaces
     // it reads to the frame's texture feedback.
     static GSurface surface(SurfaceInput i, out float depth_offset, bool report);
 
+    // `surface` of an emitter's point whose material may show a coat or fuzz over its emission
+    // (`MaterialGpu.lobes`), with no feedback: it holds only the linked types whose materials
+    // may, where `surface` holds them all.
+    static GSurface emitter_surface(SurfaceInput i);
+
     // How much of the triangle at the hit is present, 0 to 1: with `presence`, for a presence
     // layer, its material's opacity (`material_opacity`), which no linked surface changes;
     // else the surface's coverage. With `report`, reports what it reads to the frame's texture
@@ -290,7 +295,9 @@ public interface ISurfaces
 
 // The kernel's surfaces over linked surface `L`, the build's switch over the linked types by
 // id: one call to each part of the standard surface serves every type that leaves a hit to it.
-public struct Surfaces<L : ISurface> : ISurfaces
+// `E` is the switch over the linked types whose materials may show a coat or fuzz over their
+// emission alone, with `L`'s cases for those.
+public struct Surfaces<L : ISurface, E : ISurface> : ISurfaces
 {
     public static GSurface surface(SurfaceInput i, out float depth_offset, bool report)
     {
@@ -362,6 +369,12 @@ public struct Surfaces<L : ISurface> : ISurfaces
         return g;
     }
 
+    public static GSurface emitter_surface(SurfaceInput i)
+    {
+        float depth_offset;
+        return Surfaces<E, E>.surface(i, depth_offset, false);
+    }
+
     public static float coverage(SurfaceInput i, bool presence, bool report)
     {
         if (!presence)
@@ -390,7 +403,7 @@ public struct Surfaces<L : ISurface> : ISurfaces
 
 // The surfaces with no linked type: OpenPBR from the hit's `MaterialGpu` and its textures,
 // with the decals over the hit written over the material's parameters.
-public typealias StandardSurface = Surfaces<NoSurface>;
+public typealias StandardSurface = Surfaces<NoSurface, NoSurface>;
 
 // Footprint `f` with no extent, read bilinearly from mip 0.
 UvFootprint finest_footprint(UvFootprint f)
@@ -948,6 +961,11 @@ public struct FeedbackSurface<S : ISurfaces> : ISurfaces
         return S.surface(i, depth_offset, report || (may2(MAY2_STREAMS) && i.context.feedback));
     }
 
+    public static GSurface emitter_surface(SurfaceInput i)
+    {
+        return S.emitter_surface(i);
+    }
+
     public static float coverage(SurfaceInput i, bool presence, bool report)
     {
         return S.coverage(i, presence, report);
@@ -967,6 +985,11 @@ public struct CoverageFeedback<S : ISurfaces> : ISurfaces
     public static GSurface surface(SurfaceInput i, out float depth_offset, bool report)
     {
         return S.surface(i, depth_offset, report);
+    }
+
+    public static GSurface emitter_surface(SurfaceInput i)
+    {
+        return S.emitter_surface(i);
     }
 
     public static float coverage(SurfaceInput i, bool presence, bool report)

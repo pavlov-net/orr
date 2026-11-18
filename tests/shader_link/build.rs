@@ -3,8 +3,9 @@
 //! whose resolve root has an extra field. The CPU library calls the same linked types. Two
 //! more consumer builds link into orr's own kernels: one against orr as it is, one against a
 //! copy of orr_lighting's environment bake and library files whose bake root has an extra
-//! field. The renderer is linked once more with copies of the consumer modules in
-//! `OUT_DIR`, which the hot reload tests edit.
+//! field. A large layered ground surface links into orr's kernels alone, for their stage caps.
+//! The renderer is linked once more with copies of the consumer modules in `OUT_DIR`, which the
+//! hot reload tests edit.
 
 use std::env;
 use std::fs;
@@ -37,6 +38,14 @@ const LINKS: [(LinkPoint, &str, &str, &str); 6] = [
     ),
     (LinkPoint::Medium, "air", "consumer/air.slang", "Air"),
 ];
+
+/// A large surface linked into orr's own kernels.
+const ORR_SURFACE: [(LinkPoint, &str, &str, &str); 1] = [(
+    LinkPoint::Surface,
+    "strata",
+    "consumer/strata.slang",
+    "Strata",
+)];
 
 /// The points orr's own kernels declare.
 const ORR_LINKS: [(LinkPoint, &str, &str, &str); 2] = [
@@ -212,6 +221,12 @@ fn main() {
         let edited = renderer(&edited_src, &out.join("edited-renderer"))?;
         fixture_consumer(&edited, &out.join("edited"), true)?;
         consumer(&orr_roots, &orr_points, &out.join("orr"), &ORR_LINKS)?;
+        consumer(
+            &orr_roots,
+            &orr_points,
+            &out.join("orr-strata"),
+            &ORR_SURFACE,
+        )?;
         let edited = edited_orr(
             &orr_roots,
             &out.join("edited-orr-src"),

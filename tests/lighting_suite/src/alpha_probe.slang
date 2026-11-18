@@ -31,7 +31,7 @@ struct ProbeLinks : ISurface
     }
 }
 
-typealias ProbeSurface = Surfaces<ProbeLinks>;
+typealias ProbeSurface = Surfaces<ProbeLinks, ProbeLinks>;
 
 // `Alpha`, counting its calls.
 struct Counted : IAnyHit

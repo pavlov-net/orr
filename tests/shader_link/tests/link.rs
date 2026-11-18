@@ -2,7 +2,7 @@ use std::assert_matches;
 
 use orr_shaders::{DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM, KernelSet, Mismatch};
 use shader_link::renderer::MODULES as RENDERER;
-use shader_link::{AirData, edited, linked, unlinked};
+use shader_link::{AirData, edited, linked, orr_strata, unlinked};
 
 const PRIMARY: u32 = 0;
 const SECONDARY: u32 = 1;
@@ -114,13 +114,39 @@ fn nothing_linked_keeps_the_renderer_defaults() {
 }
 
 #[test]
-fn kernel_set_names_its_environment_and_medium() {
-    let names = |set: &KernelSet| (set.environment, set.medium);
-    assert_eq!(names(&linked::KERNELS), ("Dome", "Air"));
+fn kernel_set_names_its_linked_types() {
+    let names = |set: &KernelSet| (set.surface_types, set.environment, set.medium);
+    assert_eq!(
+        names(&linked::KERNELS),
+        (&["GroundBlend", "Grass", "Moss"][..], "Dome", "Air")
+    );
     assert_eq!(
         names(&unlinked::KERNELS),
-        (DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM)
+        (&[][..], DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM)
     );
+}
+
+/// The largest pipeline a scene's own mask makes from orr's kernels with a large layered ground
+/// linked, held as an application holds its own: each stage whole, the linked code in it, and
+/// the total, to their caps. The surface's closest-hit comes near its cap, so a second copy of
+/// the surface in a stage would break it, and the emitter view holds none of a surface without a
+/// coat or fuzz.
+#[test]
+fn a_large_surface_linked_into_orr_fits_its_stage_caps() {
+    use orr::orr_lighting::path_stage_sizes;
+    const SCENE_MOST: u64 = u64::MAX >> 1;
+    let sizes = path_stage_sizes(&orr_strata::KERNELS, SCENE_MOST).unwrap();
+    assert_eq!(sizes.breaches(), Vec::<String>::new());
+    let stage = |entry: &str, geometry: &str| {
+        let s = sizes.stages.iter().find(|s| {
+            (s.entry, s.geometry) == (entry, geometry) && s.surface_type == Some("Strata")
+        });
+        s.expect("a stage made for the surface")
+    };
+    let hit = stage("surface_hit", ".copies");
+    assert!(hit.whole && hit.instructions > hit.cap / 5 * 4, "{hit:?}");
+    let view = sizes.stages.iter().find(|s| s.entry == "emitter_view");
+    assert_eq!(view.and_then(|s| s.linked), Some(0), "{view:?}");
 }
 
 #[test]

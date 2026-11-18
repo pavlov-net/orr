@@ -125,14 +125,16 @@ pub(super) fn kernel_set(kernels: &[Kernel<'_>], links: &[Link], manifest: &Path
     for i in 0..kernels.len() {
         let _ = write!(out, "&MODULE_{i}, ");
     }
-    let surfaces = ids.get(&LinkPoint::Surface).map_or_default(Vec::len);
-    let declares = link::surface_declares(links);
+    let linked = link::surfaces(links);
+    let surfaces = linked.len();
+    let declares: Vec<u32> = linked.iter().map(|&(_, d)| d).collect();
+    let types: Vec<&str> = linked.iter().map(|&(t, _)| t).collect();
     let environment =
         link::single_type(links, LinkPoint::Environment).unwrap_or(crate::DEFAULT_ENVIRONMENT);
     let medium = link::single_type(links, LinkPoint::Medium).unwrap_or(crate::DEFAULT_MEDIUM);
     let _ = writeln!(
         out,
-        "],\n    surfaces: {surfaces},\n    surface_declares: &{declares:?},\n    environment: {environment:?},\n    medium: {medium:?},\n}};"
+        "],\n    surfaces: {surfaces},\n    surface_declares: &{declares:?},\n    surface_types: &{types:?},\n    environment: {environment:?},\n    medium: {medium:?},\n}};"
     );
     for (point, list) in &ids {
         let _ = writeln!(

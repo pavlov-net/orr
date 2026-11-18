@@ -62,6 +62,25 @@ struct Switch {
     wrap: Option<&'static str>,
     /// Pairs of optional methods: a type that declares the first declares the second too.
     with: &'static [(&'static str, &'static str)],
+    /// A second switch over some of the types, which `wrap` takes after the first.
+    narrowed: Option<Narrowed>,
+}
+
+/// A switch over the types whose declares `keeps` takes, named as the first with `suffix`. It
+/// forwards the methods whose declares are among `methods`, and leaves every other, all optional,
+/// to the interface's body.
+struct Narrowed {
+    suffix: &'static str,
+    keeps: fn(u32) -> bool,
+    methods: u32,
+}
+
+/// Whether a surface type's materials may show a coat or fuzz over their emission: it declares
+/// one, or it may leave a hit to the standard surface, whose record may have one. The host's
+/// `MaterialGpu.lobes` says the same of each material.
+fn layers_emission(declares: u32) -> bool {
+    use surface_declares as d;
+    declares & (d::COAT | d::FUZZ) != 0 || declares & d::ALWAYS_SHADES == 0
 }
 
 /// The surface interface's methods, every one optional: `Surfaces` over the switch calls the
@@ -173,6 +192,12 @@ const SURFACE: Switch = Switch {
     ],
     with: &[("coverage", "coverage_reads"), ("always_shades", "surface")],
     wrap: Some("Surfaces"),
+    // An emitter's surface is shaded with no feedback: it reaches no coverage or feedback.
+    narrowed: Some(Narrowed {
+        suffix: "Emitters",
+        keeps: layers_emission,
+        methods: surface_declares::SHADING & !surface_declares::FEEDBACK,
+    }),
 };
 
 /// A lobe method of the surface interface, which a type declares the lobe by.
@@ -201,6 +226,7 @@ const DISPLACEMENT: Switch = Switch {
     }],
     with: &[],
     wrap: None,
+    narrowed: None,
 };
 
 const DRAWN: Switch = Switch {
@@ -217,6 +243,7 @@ const DRAWN: Switch = Switch {
     }],
     with: &[],
     wrap: None,
+    narrowed: None,
 };
 
 impl LinkPoint {
@@ -445,12 +472,12 @@ fn declared_methods(switch: &Switch, src: &str, ty: &str) -> u32 {
     out
 }
 
-/// What each linked surface type declares, by id from 1.
-pub(super) fn surface_declares(links: &[Link]) -> Vec<u32> {
+/// The type linked as each surface and what it declares, by id from 1.
+pub(super) fn surfaces(links: &[Link]) -> Vec<(&str, u32)> {
     links
         .iter()
         .filter(|l| l.point == LinkPoint::Surface)
-        .map(|l| l.declares)
+        .map(|l| (l.ty.as_str(), l.declares))
         .collect()
 }
 
@@ -543,8 +570,39 @@ fn source(decl: &Declared, linked: &[&Link]) -> String {
         Some(_) => (format!("{}Links", decl.name), ""),
         None => (decl.name.clone(), "export "),
     };
+    write_switch(&mut out, switch, linked, &ty, export, |_| true, u32::MAX);
+    let mut wrapped = ty.clone();
+    if let Some(n) = &switch.narrowed {
+        let narrowed = format!("{ty}{}", n.suffix);
+        write_switch(&mut out, switch, linked, &narrowed, "", n.keeps, n.methods);
+        wrapped = format!("{ty}, {narrowed}");
+    }
+    if let Some(wrap) = switch.wrap {
+        let _ = writeln!(
+            out,
+            "\nexport struct {} : {} = {wrap}<{wrapped}>;",
+            decl.name,
+            point.interface()
+        );
+    }
+    out
+}
+
+/// Writes struct `ty` of `switch` over the types of `linked` whose declares `keeps` takes, each
+/// by its id, with the methods whose declares are among `methods`; every other id takes the
+/// default type.
+fn write_switch(
+    out: &mut String,
+    switch: &Switch,
+    linked: &[&Link],
+    ty: &str,
+    export: &str,
+    keeps: fn(u32) -> bool,
+    methods: u32,
+) {
     let _ = writeln!(out, "\n{export}struct {ty} : {}\n{{", switch.linked);
-    for m in switch.methods.iter().filter(|m| m.forward) {
+    let forwarded = |m: &&Method| m.forward && m.declares & !methods == 0;
+    for m in switch.methods.iter().filter(forwarded) {
         let modifier = if m.optional { "override " } else { "" };
         // A void method's cases call, then return: `return` takes no void expression.
         let (call, end) = if m.decl.starts_with("void ") {
@@ -552,40 +610,27 @@ fn source(decl: &Declared, linked: &[&Link]) -> String {
         } else {
             ("return ", "")
         };
-        let _ = writeln!(
-            out,
-            "    {modifier}static {}\n    {{\n        switch ({})\n        {{",
-            m.decl, switch.id
-        );
-        for (i, l) in linked.iter().enumerate() {
-            if m.declares & !l.declares != 0 {
-                continue;
+        let default = format!("{call}{}.{}({});{end}", switch.default, m.name, m.args);
+        let cases: Vec<String> = linked
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| m.declares & !l.declares == 0 && keeps(l.declares))
+            .map(|(i, l)| format!("{}: {call}{}.{}({});{end}", i + 1, l.ty, m.name, m.args))
+            .collect();
+        let _ = writeln!(out, "    {modifier}static {}\n    {{", m.decl);
+        // A method no type has a case for calls the default type alone.
+        if cases.is_empty() {
+            let _ = writeln!(out, "        {default}");
+        } else {
+            let _ = writeln!(out, "        switch ({})\n        {{", switch.id);
+            for case in cases {
+                let _ = writeln!(out, "        case {case}");
             }
-            let _ = writeln!(
-                out,
-                "        case {}: {call}{}.{}({});{end}",
-                i + 1,
-                l.ty,
-                m.name,
-                m.args
-            );
+            let _ = writeln!(out, "        default: {default}\n        }}");
         }
-        let _ = writeln!(
-            out,
-            "        default: {call}{}.{}({});{end}\n        }}\n    }}",
-            switch.default, m.name, m.args
-        );
+        out.push_str("    }\n");
     }
     out.push_str("}\n");
-    if let Some(wrap) = switch.wrap {
-        let _ = writeln!(
-            out,
-            "\nexport struct {} : {} = {wrap}<{ty}>;",
-            decl.name,
-            point.interface()
-        );
-    }
-    out
 }
 
 /// Checks that where a linked type of `m` declares methods under the name of an optional method
@@ -798,5 +843,46 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// The emitters' switch keeps a type whose materials may show a coat or fuzz, by its own
+    /// lobe or by the standard surface it may leave a hit to, at its own id, and leaves out one
+    /// that shades every hit without either.
+    #[test]
+    fn the_emitters_switch_keeps_the_types_that_may_coat_their_emission() {
+        use surface_declares as d;
+        let link = |name: &str, ty: &str, declares: u32| Link {
+            declares,
+            ..Link::new(LinkPoint::Surface, name, Path::new("types.slang"), ty)
+        };
+        let links = [
+            link(
+                "plain",
+                "Plain",
+                d::SURFACE | d::ALWAYS_SHADES | d::EMISSION,
+            ),
+            link("coated", "Coated", d::SURFACE | d::ALWAYS_SHADES | d::COAT),
+            link("adjusts", "Adjusts", d::ADJUST),
+        ];
+        let decl = Declared {
+            point: LinkPoint::Surface,
+            name: "Surface".into(),
+        };
+        let src = source(&decl, &links.iter().collect::<Vec<_>>());
+        let (all, emitters) = src
+            .split_once("struct SurfaceLinksEmitters")
+            .expect("the emitters' switch");
+        assert!(all.contains("case 1: return Plain.surface(i, s, depth_offset);"));
+        assert!(!emitters.contains("Plain."));
+        assert!(emitters.contains("case 2: return Coated.surface(i, s, depth_offset);"));
+        assert!(emitters.contains("case 2: Coated.coat(i, s, lobe); return;"));
+        assert!(emitters.contains("case 3: Adjusts.adjust(i, s, depth_offset); return;"));
+        assert!(!emitters.contains("coverage") && !emitters.contains("feedback"));
+        assert!(emitters.contains(
+            "override static void subsurface(SurfaceInput i, PlainSurface s, inout SubsurfaceLobe lobe)\n    {\n        NoSurface.subsurface(i, s, lobe); return;\n    }"
+        ));
+        assert!(emitters.contains(
+            "export struct Surface : ISurfaces = Surfaces<SurfaceLinks, SurfaceLinksEmitters>;"
+        ));
     }
 }

@@ -91,9 +91,6 @@ pub enum Role {
     Disperse,
 }
 
-/// What the stages of a pipeline may hand the driver together, linked types' code among it.
-pub const PIPELINE_CAP: u32 = PIPELINE_INSTRUCTIONS;
-
 /// The geometry a hit group's shaders run on, which their stages are made for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Geometry {
@@ -197,13 +194,16 @@ impl Spec {
         surfaces != 0 && self.hit_surface != 0 && self.geometry.is_some()
     }
 
-    /// The cap on orr's own code in the stage: its role's, with each allowance its mask and kind
-    /// keep. A stage made for a linked surface has none of its own: it holds the application's
-    /// code beside the standard stage's.
-    fn cap(&self, surfaces: u32) -> Option<u32> {
-        if self.linked(surfaces) {
-            return None;
-        }
+    /// Whether the stage is a hit group's stage made for a surface of any id. The emitter view
+    /// is not one: it holds the same types that may coat their emission in every pipeline, so
+    /// it is held whole in the general pipeline too.
+    fn serves_any(&self) -> bool {
+        self.geometry.is_some() && self.hit_surface == u32::MAX
+    }
+
+    /// The cap on the stage: its role's, with each allowance its mask and kind keep. A stage
+    /// made for a linked surface takes the cap of the standard surface's in its place.
+    fn cap(&self) -> u32 {
         let base = match self.role {
             Role::Raygen => RAYGEN_INSTRUCTIONS,
             Role::Miss => MISS_INSTRUCTIONS,
@@ -232,7 +232,7 @@ impl Spec {
             .filter(|a| self.may & a.bits != 0 && (a.holds)(self))
             .map(|a| a.instructions)
             .sum::<u32>();
-        Some(base + allowed)
+        base + allowed
     }
 
     fn constants(&self) -> ([u8; 32], &'static [SpecEntry]) {
@@ -429,6 +429,9 @@ struct Table {
     walk_meets: Option<u32>,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
+    /// Whether it is the pipeline that may meet everything from kernels that link a surface,
+    /// whose stages that serve any id serve every linked type.
+    general: bool,
 }
 
 impl Table {
@@ -893,6 +896,7 @@ impl Table {
             walk_meets,
             hit_groups,
             groups,
+            general,
         }
     }
 }
@@ -907,11 +911,17 @@ pub struct StageSize {
     pub geometry: &'static str,
     /// The linked surface id the stage is made for; `u32::MAX` for any.
     pub hit_surface: u32,
+    /// The Slang type linked as that id, where it is one linked type's.
+    pub surface_type: Option<&'static str>,
     /// Whether it comes from a kernel with the coat, fuzz, thin film and thin wall lobes.
     pub rich: bool,
     pub instructions: u32,
-    /// The cap on orr's own code in it; none for a stage made for a linked surface.
-    pub cap: Option<u32>,
+    /// Its role's cap, with each allowance its mask and kind keep.
+    pub cap: u32,
+    /// Whether the cap holds the whole stage, the linked types' code among it, and not orr's
+    /// own code alone: where it comes from a module that links a type, but for a stage of the
+    /// pipeline that may meet everything that serves any surface id.
+    pub whole: bool,
     /// What the kernels' linked types add to it: its size beyond the same stage of orr's
     /// kernels with nothing linked, where a stage made for a linked surface is the standard
     /// surface's. None for those kernels themselves.
@@ -1012,9 +1022,14 @@ impl Folded {
                     role: spec.role,
                     geometry: spec.geometry.map_or("", Geometry::label),
                     hit_surface: spec.hit_surface,
+                    surface_type: (spec.linked(kernels.surfaces) && spec.hit_surface != u32::MAX)
+                        .then(|| kernels.surface_types[spec.hit_surface as usize - 1]),
                     rich: matches!(spec.kernel, Kernel::Rich | Kernel::Walk),
                     instructions,
-                    cap: spec.cap(kernels.surfaces),
+                    cap: spec.cap(),
+                    // The pipeline that may meet everything serves every linked type from its
+                    // stages that serve any id, by design: those are held to its total alone.
+                    whole: plain[at].is_some() && !(table.general && spec.serves_any()),
                     linked: beyond(plain[at]),
                     own: beyond(standard[at]),
                 }
@@ -1025,41 +1040,105 @@ impl Folded {
     }
 }
 
-/// What each stage of the pipeline of paths that may meet `may` hands the driver, from
-/// `kernels`, and what of it is orr's own.
-pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>, Error> {
-    Folded::new(kernels, may, CompileThreads::default()).map(|f| f.sizes)
+impl StageSize {
+    /// orr's own code in the stage: its instructions less what the kernels' linked types add.
+    pub fn orr_code(&self) -> i64 {
+        i64::from(self.instructions) - self.linked.unwrap_or(0)
+    }
+
+    /// What its cap holds of it: the whole stage where [`Self::whole`], else orr's own code.
+    pub fn held(&self) -> i64 {
+        if self.whole {
+            self.instructions.into()
+        } else {
+            self.orr_code()
+        }
+    }
+
+    /// Whether what its cap holds is over the cap.
+    pub fn over(&self) -> bool {
+        self.held() > i64::from(self.cap)
+    }
 }
 
-/// Each of `sizes` whose own code, without what linked types add to it, is over its cap, and the
-/// pipeline's total, the linked types' code among it, where that is over [`PIPELINE_CAP`].
-pub fn over_cap(sizes: &[StageSize]) -> Vec<String> {
-    let over = |size: i64, cap: u32| 100.0 * (size as f64 / f64::from(cap) - 1.0);
-    let mut breaches: Vec<String> = sizes
-        .iter()
-        .filter_map(|s| {
-            let own = i64::from(s.instructions) - s.linked.unwrap_or(0);
-            let cap = s.cap.filter(|&cap| own > i64::from(cap))?;
-            Some(format!(
-                "stage {}{} hands the driver {own} instructions of orr's own, {:.1} % over its \
-                 {cap} as a {:?}",
-                s.entry,
-                s.geometry,
-                over(own, cap),
-                s.role
-            ))
-        })
-        .collect();
-    let total: u32 = sizes.iter().map(|s| s.instructions).sum();
-    if total > PIPELINE_CAP {
-        breaches.push(format!(
-            "{} stages hand the driver {total} instructions, {:.1} % over the pipeline's \
-             {PIPELINE_CAP}",
-            sizes.len(),
-            over(total.into(), PIPELINE_CAP)
-        ));
+/// What a pipeline's stages hand the driver together, the linked types' code among it, and the
+/// cap on it.
+#[derive(Clone, Copy, Debug)]
+pub struct PipelineSize {
+    pub instructions: u32,
+    pub cap: u32,
+}
+
+impl PipelineSize {
+    pub fn over(self) -> bool {
+        self.instructions > self.cap
     }
-    breaches
+}
+
+/// What a path pipeline hands the driver, stage by stage and in all. A pipeline over a cap
+/// still compiles, with a warning: orr's tests hold its own kernels to the caps, and an
+/// application that links types holds its kernels' pipelines to them in its tests at the masks
+/// its scenes make, with [`Self::breaches`].
+#[derive(Clone, Debug)]
+pub struct PathStageSizes {
+    pub stages: Vec<StageSize>,
+    pub total: PipelineSize,
+}
+
+impl PathStageSizes {
+    fn new(stages: Vec<StageSize>) -> Self {
+        let total = PipelineSize {
+            instructions: stages.iter().map(|s| s.instructions).sum(),
+            cap: PIPELINE_INSTRUCTIONS,
+        };
+        Self { stages, total }
+    }
+
+    /// A line for each stage over its cap, and for the total where it is over.
+    pub fn breaches(&self) -> Vec<String> {
+        let over = |size: i64, cap: u32| 100.0 * (size as f64 / f64::from(cap) - 1.0);
+        let mut out: Vec<String> = self
+            .stages
+            .iter()
+            .filter(|s| s.over())
+            .map(|s| {
+                let made_for = s
+                    .surface_type
+                    .map_or(String::new(), |t| format!(" made for linked surface {t}"));
+                let part = match s.linked.filter(|_| s.whole) {
+                    Some(linked) => format!("{linked:+} beside orr's own kernels"),
+                    None => "orr's own".into(),
+                };
+                format!(
+                    "stage {}{}{made_for} hands the driver {} instructions, {part}, {:.1} % over \
+                     its {} as a {:?}",
+                    s.entry,
+                    s.geometry,
+                    s.held(),
+                    over(s.held(), s.cap),
+                    s.cap,
+                    s.role
+                )
+            })
+            .collect();
+        let t = self.total;
+        if t.over() {
+            out.push(format!(
+                "{} stages hand the driver {} instructions, {:.1} % over the pipeline's {}",
+                self.stages.len(),
+                t.instructions,
+                over(t.instructions.into(), t.cap),
+                t.cap
+            ));
+        }
+        out
+    }
+}
+
+/// What each stage of the pipeline of paths that may meet `may` hands the driver, from
+/// `kernels`, and what of it is orr's own.
+pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<PathStageSizes, Error> {
+    Folded::new(kernels, may, CompileThreads::default()).map(|f| PathStageSizes::new(f.sizes))
 }
 
 /// A ray tracing pipeline of the path tracer, made for what its paths may meet, and the groups a
@@ -1082,14 +1161,15 @@ impl PathPipeline {
     ) -> Result<Self, Error> {
         let started = Instant::now();
         let Folded { table, code, sizes } = Folded::new(kernels, may, threads)?;
+        let sizes = PathStageSizes::new(sizes);
         let folded = started.elapsed().as_secs_f64();
         let name = format!("path pipeline {may:#x}");
-        for s in &sizes {
+        for s in &sizes.stages {
             let stage = format!("{name}: {}{}", s.entry, s.geometry);
             match (s.own, s.linked) {
                 (Some(own), _) => log::info!(
-                    "{stage} for surface {:#x}: {} instructions, {own:+} its surface's own",
-                    s.hit_surface,
+                    "{stage} for surface {}: {} instructions, {own:+} its surface's own",
+                    s.surface_type.unwrap_or("of any id"),
                     s.instructions
                 ),
                 (None, Some(linked)) => log::info!(
@@ -1099,9 +1179,10 @@ impl PathPipeline {
                 (None, None) => log::debug!("{stage}: {} instructions", s.instructions),
             }
         }
-        // The caps are a growth budget that tests hold orr's own code to, not a limit on what a
-        // scene may run: a pipeline over one still compiles.
-        for breach in over_cap(&sizes) {
+        // The caps are a growth budget that tests hold orr's own code and an application's tests
+        // its linked code to, not a limit on what a scene may run: a pipeline over one still
+        // compiles.
+        for breach in sizes.breaches() {
             log::warn!("{name}: {breach}");
         }
         let bytes: Vec<_> = table.specs.iter().map(Spec::constants).collect();
@@ -1163,7 +1244,7 @@ impl PathPipeline {
             "{name}: {} stages, {} instructions handed over, made in {:.1} s, {folded:.1} s of \
              it folding{}",
             stages.len(),
-            sizes.iter().map(|s| s.instructions).sum::<u32>(),
+            sizes.total.instructions,
             started.elapsed().as_secs_f64(),
             driver_cost(pipeline.compile_cost())
         );
@@ -1246,7 +1327,8 @@ mod tests {
         for may in masks {
             let sizes = path_stage_sizes(&KernelSet::default(), may).unwrap();
             breaches.extend(
-                over_cap(&sizes)
+                sizes
+                    .breaches()
                     .into_iter()
                     .map(|b| format!("{may:#018x}: {b}")),
             );

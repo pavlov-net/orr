@@ -883,7 +883,7 @@ LightSample emissive_sample<S : ISurfaces>(LightSetGpu* set, uint entry, uint fi
     r.triangle = triangle;
     if ((section.flags & (MATERIAL_DOUBLE_SIDED | MATERIAL_HAS_BACK)) == MATERIAL_DOUBLE_SIDED)
         r.bits |= LIGHT_SAMPLE_TWO_SIDED;
-    if (may2(MAY2_COATED_EMITTERS) && (shown.flags & (MATERIAL_COAT | MATERIAL_FUZZ)) != 0)
+    if (may2(MAY2_COATED_EMITTERS) && (shown.lobes & (MATERIAL_LOBE_COAT | MATERIAL_LOBE_FUZZ)) != 0)
         r.bits |= LIGHT_SAMPLE_VIEW;
     return r;
 }
@@ -920,8 +920,7 @@ public float3 emitter_view_layer<S : ISurfaces>(LightSetGpu* set, ResolvedLightS
     float det = d11 * d22 - d12 * d12;
     float2 bary = float2(d22 * v1 - d12 * v2, d11 * v2 - d12 * v1) / det;
     SurfaceInput i = emitter_input(s, t, c.triangle, bary, c.dir);
-    float offset;
-    GSurface g = S.surface(i, offset, false);
+    GSurface g = S.emitter_surface(i);
     return bsdf_emission_layer(g.bsdf, g.normal, -c.dir, exterior_ior);
 }
 

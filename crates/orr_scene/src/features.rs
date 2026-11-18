@@ -86,9 +86,6 @@ impl SceneFeatures {
     /// The scene's environment may radiate: the scene's kernels link one that is not the
     /// default map, or its map is set.
     pub const ENVIRONMENT: Self = Self(1 << 27);
-    /// A record has the coat or fuzz flag, which with [`Self::EMISSIVE`] makes
-    /// [`Self::COATED_EMITTERS`].
-    const LAYERED: Self = Self(1 << 24);
     /// A record has the caster flag, which on a producer entry that rays trace makes
     /// [`Self::CASTERS`].
     const CASTING: Self = Self(1 << 28);
@@ -197,7 +194,6 @@ impl SceneFeatures {
                 m.samplers.iter().any(|s| s.modes & TILED != 0),
                 Self::TILED_TEXTURES,
             ),
-            (m.flags & (f::COAT | f::FUZZ) != 0, Self::LAYERED),
             (m.flags & f::CASTER != 0, Self::CASTING),
             (
                 m.flags & (f::DIELECTRIC | f::THIN_WALLED) == f::DIELECTRIC | f::THIN_WALLED,
@@ -303,11 +299,11 @@ impl MaterialFeatures {
                 out |= 1 << bit;
             }
         }
-        let (layered, emissive) = (SceneFeatures::LAYERED.0, SceneFeatures::EMISSIVE.0);
-        if out & layered != 0 && out & emissive != 0 {
+        let layered = SceneFeatures::COAT.0 | SceneFeatures::FUZZ.0;
+        if out & layered != 0 && out & SceneFeatures::EMISSIVE.0 != 0 {
             out |= SceneFeatures::COATED_EMITTERS.0;
         }
-        let private = layered | SceneFeatures::CASTING.0 | SceneFeatures::STACK_FACES.0;
+        let private = SceneFeatures::CASTING.0 | SceneFeatures::STACK_FACES.0;
         SceneFeatures((out & !private) | self.built)
     }
 
@@ -430,10 +426,10 @@ mod tests {
     /// record is rewritten as something else; a freed record changes nothing it showed.
     #[test]
     fn the_table_finds_coated_emitters_and_glass_that_stopped_bounding_an_interior() {
-        let coated = record(|m| m.flags = f::COAT);
+        let coated = record(|m| m.coat_weight = 1.0);
         let emits = record(|m| m.emission_luminance = 1.0);
         let fuzzy_light = record(|m| {
-            m.flags = f::FUZZ;
+            m.fuzz_weight = 1.0;
             m.emission_luminance = 1.0;
         });
         let (emitters, thin) = (
@@ -448,6 +444,25 @@ mod tests {
         t.free(1);
         assert!(!t.any().contains(emitters));
         t.set(1, fuzzy_light);
+        assert!(t.any().contains(emitters));
+        // A linked type's own coat passes its emitters' light; a record's coat does not where
+        // its type shades every hit itself.
+        let emitter_of = |declares: u32, coat_weight: f32| {
+            let mut m: MaterialGpu = bytemuck::Zeroable::zeroed();
+            m.surface = 1;
+            m.emission_luminance = 1.0;
+            m.coat_weight = coat_weight;
+            m.lobes = crate::material::record_lobes(&m, &[declares]);
+            SceneFeatures::of_material(&m, &[declares])
+        };
+        use orr_shaders::surface_declares as d;
+        let mut t = MaterialFeatures::default();
+        t.set(
+            1,
+            emitter_of(d::SURFACE | d::ALWAYS_SHADES | d::EMISSION, 1.0),
+        );
+        assert!(!t.any().contains(emitters));
+        t.set(1, emitter_of(d::COAT, 0.0));
         assert!(t.any().contains(emitters));
 
         let solid = record(|m| m.flags = f::DIELECTRIC);
