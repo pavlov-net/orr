@@ -17,7 +17,6 @@ use super::mesh::PendingPass;
 use super::pipeline::ComputePipeline;
 use super::queue::{Queue, TimestampRing};
 use super::texture::Texture;
-use super::unsupported::RayPipeline;
 use super::{lock, not_implemented};
 use crate::{
     DecompressRegion, DispatchArgs, Error, GpuPtr, Hazards, MemoryCopy, MemoryKind, Stages,
@@ -72,7 +71,8 @@ pub struct CommandList<'q> {
     pub(super) queue: &'q Queue,
     pub(super) buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
     allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
-    /// Buffer 0 holds the root, 1 the texture view pool's base ID, 2 the sampler IDs.
+    /// Buffer 0 holds the root, 1 the texture view pool's base ID, 2 the sampler IDs; a ray
+    /// tracing launch's 3 its launch block and 4 its root again.
     pub(super) table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
     pub(super) encoder: Encoder,
     /// The render pass between `begin_rendering` and `end_rendering`.
@@ -117,7 +117,7 @@ impl<'q> CommandList<'q> {
             .ok_or_else(|| fail("newCommandBuffer"))?;
         buffer.beginCommandBufferWithAllocator(&allocator);
         let desc = MTL4ArgumentTableDescriptor::new();
-        desc.setMaxBufferBindCount(3);
+        desc.setMaxBufferBindCount(5);
         let table = shared
             .device
             .newArgumentTableWithDescriptor_error(&desc)
@@ -367,31 +367,6 @@ impl<'q> CommandList<'q> {
                 size(p.workgroup()),
             );
         }
-    }
-
-    /// No call creates a [`RayPipeline`] on Metal.
-    pub fn trace_rays<R: Pod>(
-        &mut self,
-        p: &RayPipeline,
-        raygen: u32,
-        hits: &crate::HitTable,
-        root: &R,
-        extent: [u32; 3],
-    ) {
-        let _ = (raygen, hits, root, extent);
-        p.unreachable()
-    }
-
-    pub fn trace_rays_indirect<R: Pod>(
-        &mut self,
-        p: &RayPipeline,
-        raygen: u32,
-        hits: &crate::HitTable,
-        root: &R,
-        args: GpuPtr<DispatchArgs>,
-    ) {
-        let _ = (raygen, hits, root, args);
-        p.unreachable()
     }
 
     /// Copies `bytes` bytes from `src` to `dst`.

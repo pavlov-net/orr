@@ -33,12 +33,14 @@ pub struct Caps {
     /// [`crate::Device::create_mesh_set`]) run per GPU-written sequence by
     /// [`crate::CommandList::execute_generated`].
     pub generated_commands: bool,
-    /// Ray tracing pipelines (`VK_KHR_ray_tracing_pipeline` with invocation reordering):
-    /// [`crate::Device::create_ray_pipeline`], [`crate::CommandList::trace_rays`] and its
-    /// indirect form. Metal has none.
+    /// Ray tracing pipelines (`VK_KHR_ray_tracing_pipeline` with invocation reordering; on
+    /// Metal, Apple9 GPUs' intersection function buffers under `orr_shaders.pipeline`'s compute
+    /// form): [`crate::Device::create_ray_pipeline`], [`crate::CommandList::trace_rays`] and
+    /// its indirect form.
     pub ray_dispatch: bool,
-    /// The device reorders invocations in hardware where a shader asks. Without it a reorder
-    /// is a no-op. False without `ray_dispatch`.
+    /// The device reorders invocations where a shader asks: in hardware on Vulkan, by a sort
+    /// across each threadgroup of a launch on Metal. Without it a reorder is a no-op. False
+    /// without `ray_dispatch`.
     pub reorder: bool,
     /// Linear swept spheres (`VK_NV_ray_tracing_linear_swept_spheres`):
     /// [`crate::ClassicGeometry::Lss`] BLAS, which share TLAS and PTLAS with cluster and

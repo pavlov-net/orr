@@ -20,9 +20,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSArray, NSProcessInfo, NSString, NSURL};
 use objc2_metal::{
-    MTL4Archive, MTL4Compiler, MTL4CompilerTaskOptions, MTL4ComputePipelineDescriptor,
-    MTL4PipelineDataSetSerializer, MTL4PipelineDataSetSerializerConfiguration,
-    MTL4PipelineDataSetSerializerDescriptor, MTL4PipelineDescriptor, MTLComputePipelineState,
+    MTL4Archive, MTL4BinaryFunction, MTL4BinaryFunctionDescriptor, MTL4Compiler,
+    MTL4CompilerTaskOptions, MTL4ComputePipelineDescriptor, MTL4PipelineDataSetSerializer,
+    MTL4PipelineDataSetSerializerConfiguration, MTL4PipelineDataSetSerializerDescriptor,
+    MTL4PipelineDescriptor, MTL4PipelineStageDynamicLinkingDescriptor, MTLComputePipelineState,
     MTLDevice, MTLRenderPipelineState,
 };
 
@@ -42,6 +43,7 @@ type Archive = ProtocolObject<dyn MTL4Archive>;
 pub(super) type Serializer = ProtocolObject<dyn MTL4PipelineDataSetSerializer>;
 type ComputeState = ProtocolObject<dyn MTLComputePipelineState>;
 type RenderState = ProtocolObject<dyn MTLRenderPipelineState>;
+pub(super) type BinaryFunction = ProtocolObject<dyn MTL4BinaryFunction>;
 
 fn word(hash: &blake3::Hash) -> u32 {
     u32::from_le_bytes(*hash.as_bytes().first_chunk().unwrap())
@@ -90,7 +92,13 @@ fn beside(path: &Path, what: &str) -> PathBuf {
 /// The descriptors are not changed once made.
 pub(super) enum Record {
     Compute(Obj<MTL4ComputePipelineDescriptor>),
+    /// A compute pipeline that links binary functions.
+    Linked(
+        Obj<MTL4ComputePipelineDescriptor>,
+        Obj<MTL4PipelineStageDynamicLinkingDescriptor>,
+    ),
     Render(Obj<MTL4PipelineDescriptor>),
+    Binary(Obj<MTL4BinaryFunctionDescriptor>),
 }
 
 /// What the last save wrote.
@@ -126,6 +134,7 @@ pub(super) struct PipelineCache {
     /// This session's pipelines by key.
     computes: Mutex<HashMap<blake3::Hash, Obj<ComputeState>>>,
     renders: Mutex<HashMap<blake3::Hash, Obj<RenderState>>>,
+    binaries: Mutex<HashMap<blake3::Hash, Obj<BinaryFunction>>>,
     /// The keys of the pipelines being created now: a thread asking for one of them waits,
     /// then finds it among this session's.
     compiling: Mutex<HashSet<blake3::Hash>>,
@@ -181,6 +190,7 @@ impl PipelineCache {
             saved: Mutex::default(),
             computes: Mutex::default(),
             renders: Mutex::default(),
+            binaries: Mutex::default(),
             compiling: Mutex::default(),
             compiled: Condvar::new(),
         };
@@ -327,6 +337,67 @@ impl Shared {
         c.get(key, cached_only, record, &c.computes, from_archive, compile)
     }
 
+    /// The compute pipeline of `key`, which links binary functions as `linking` says, through
+    /// the cache, as [`Shared::cached_compute`].
+    pub(super) fn cached_linked_compute(
+        &self,
+        key: blake3::Hash,
+        cached_only: bool,
+        desc: &Retained<MTL4ComputePipelineDescriptor>,
+        linking: &Retained<MTL4PipelineStageDynamicLinkingDescriptor>,
+        name: &str,
+    ) -> Result<Obj<ComputeState>, Error> {
+        let c = &self.pipeline_cache;
+        let record = || Record::Linked(Obj(desc.clone()), Obj(linking.clone()));
+        c.get(
+            key,
+            cached_only,
+            record,
+            &c.computes,
+            |archive| {
+                archive
+                    .newComputePipelineStateWithDescriptor_dynamicLinkingDescriptor_error(
+                        desc, linking,
+                    )
+                    .ok()
+            },
+            |options| {
+                self.compiler
+                    .newComputePipelineStateWithDescriptor_dynamicLinkingDescriptor_compilerTaskOptions_error(
+                        desc,
+                        Some(linking),
+                        options,
+                    )
+                    .map_err(|e| named(metal_error("newComputePipelineState", &e), name))
+            },
+        )
+    }
+
+    /// The binary function `desc` describes, through the cache: compiled once per `key`, its
+    /// binary looked up in the archive, as a pipeline's.
+    pub(super) fn cached_binary(
+        &self,
+        key: blake3::Hash,
+        cached_only: bool,
+        desc: &Retained<MTL4BinaryFunctionDescriptor>,
+        name: &str,
+    ) -> Result<Obj<BinaryFunction>, Error> {
+        let c = &self.pipeline_cache;
+        let record = || Record::Binary(Obj(desc.clone()));
+        c.get(
+            key,
+            cached_only,
+            record,
+            &c.binaries,
+            |archive| archive.newBinaryFunctionWithDescriptor_error(desc).ok(),
+            |options| {
+                self.compiler
+                    .newBinaryFunctionWithDescriptor_compilerTaskOptions_error(desc, options)
+                    .map_err(|e| named(metal_error("newBinaryFunction", &e), name))
+            },
+        )
+    }
+
     /// The render pipeline of `key` through the cache, as [`Shared::cached_compute`].
     pub(super) fn cached_render(
         &self,
@@ -340,6 +411,14 @@ impl Shared {
         let record = || Record::Render(Obj(desc));
         c.get(key, cached_only, record, &c.renders, from_archive, compile)
     }
+}
+
+/// `e` with `name` before its message.
+fn named(mut e: Error, name: &str) -> Error {
+    if let Error::Metal { message, .. } = &mut e {
+        *message = format!("{name}: {message}");
+    }
+    e
 }
 
 impl Device {
@@ -383,6 +462,19 @@ impl Device {
                 let again = match r {
                     Record::Compute(d) => compiler
                         .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(
+                            d,
+                            Some(&options),
+                        )
+                        .map(drop),
+                    Record::Linked(d, l) => compiler
+                        .newComputePipelineStateWithDescriptor_dynamicLinkingDescriptor_compilerTaskOptions_error(
+                            d,
+                            Some(l),
+                            Some(&options),
+                        )
+                        .map(drop),
+                    Record::Binary(d) => compiler
+                        .newBinaryFunctionWithDescriptor_compilerTaskOptions_error(
                             d,
                             Some(&options),
                         )

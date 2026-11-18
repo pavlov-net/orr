@@ -3,7 +3,8 @@
 //!
 //! Kernels reach everything as `abi.slang` lays it out for Metal: argument-table buffer 0 holds
 //! the root's address, buffer 1 the address of the texture view pool's base resource ID and
-//! buffer 2 the address of the sampler resource IDs. Memory is reached by address
+//! buffer 2 the address of the sampler resource IDs; a ray tracing launch adds its launch block
+//! at 3 and the root again at 4 (`ray.rs`). Memory is reached by address
 //! (`MTLBuffer::gpuAddress`): each allocation is a buffer placed in a heap that orr_memory
 //! sub-allocates, every heap sits in one residency set, and each queue's timeline is an
 //! `MTLSharedEvent`.
@@ -26,6 +27,7 @@ mod memory;
 mod mesh;
 mod pipeline;
 mod queue;
+mod ray;
 mod sparse;
 mod swapchain;
 mod texture;
@@ -47,10 +49,11 @@ pub use memory::{Allocation, DeviceArenas, HostArenas};
 pub use mesh::MeshPipeline;
 pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{HostTimeline, Queue};
+pub use ray::RayPipeline;
 pub use sparse::{SparseAllocation, SparseBinds};
 pub use swapchain::{LowLatency, Swapchain, SwapchainFrame, WindowExtent};
 pub use texture::Texture;
-pub use unsupported::{Diagnostics, ExecutionSet, ImportedMemory, RayPipeline};
+pub use unsupported::{Diagnostics, ExecutionSet, ImportedMemory};
 
 /// The most queues a device has, one per [`QueueKind`].
 const MAX_TIMELINES: usize = 5;
