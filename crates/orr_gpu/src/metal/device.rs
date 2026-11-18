@@ -74,11 +74,13 @@ pub(super) struct Shared {
     /// The debug PTLAS check, created by the first PTLAS build of a debug build.
     pub(super) ptlas_check: OnceLock<PtlasCheck>,
     pub(super) cluster_kernels: OnceLock<Kernels>,
+    /// What every ray tracing pipeline shares, made by the first.
+    pub(super) ray: OnceLock<super::ray::RayShared>,
     /// Command buffers that completed with an error.
     pub(super) gpu_errors: AtomicU32,
     /// Metal libraries by the hash that names them (a module's own by the module's hash, a
-    /// reload's by its contents') and whether they hold the pixel entries.
-    pub(super) libraries: Mutex<HashMap<(u64, bool), Obj<Library>>>,
+    /// reload's by its contents') and their kind.
+    pub(super) libraries: Mutex<HashMap<(u64, super::pipeline::LibraryKind), Obj<Library>>>,
     pub(super) bindings: Bindings,
     pub(super) caps: Caps,
 }
@@ -238,6 +240,7 @@ impl Device {
             structure_ids: StructureIds::default(),
             ptlas_check: OnceLock::new(),
             cluster_kernels: OnceLock::new(),
+            ray: OnceLock::new(),
             gpu_errors: AtomicU32::new(0),
             libraries: Mutex::default(),
             bindings,
@@ -309,15 +312,20 @@ impl Device {
     }
 
     /// Command buffers the GPU failed: a fault or a validation error, each logged with
-    /// Metal's description as it completes; and PTLAS builds the debug check rejected among
-    /// completed work.
+    /// Metal's description as it completes; PTLAS builds the debug check rejected among
+    /// completed work; and the checks of `ASSERTS` builds' ray tracing launches that failed.
     pub fn validation_messages(&self) -> u32 {
         let rejected = self
             .shared
             .ptlas_check
             .get()
             .map_or_default(PtlasCheck::failures);
-        self.shared.gpu_errors.load(Ordering::Relaxed) + rejected
+        let rays = self
+            .shared
+            .ray
+            .get()
+            .map_or_default(super::ray::RayShared::failures);
+        self.shared.gpu_errors.load(Ordering::Relaxed) + rejected + rays
     }
 }
 
@@ -339,6 +347,8 @@ pub(super) fn metal_error(call: &'static str, e: &objc2_foundation::NSError) -> 
 fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
     let threads = device.maxThreadsPerThreadgroup();
     let working_set = device.recommendedMaxWorkingSetSize();
+    // Intersection function buffers, which ray tracing pipelines trace through, are Apple9's.
+    let rays = device.supportsFamily(MTLGPUFamily::Apple9);
     Caps {
         device_name: device.name().to_string(),
         vendor_id: 0x106b,
@@ -352,8 +362,9 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
         host_memory_import: false,
         occupancy_priority: false,
         generated_commands: false,
-        ray_dispatch: false,
-        reorder: false,
+        ray_dispatch: rays,
+        // Launch kernels sort each threadgroup's invokes (`orr_shaders.pipeline`).
+        reorder: rays,
         lss: false,
         omm: false,
         device_address_commands: false,
@@ -416,12 +427,20 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
             // Metal's feature tables name no such total for mesh grids that this was checked
             // against, so draws keep to the least `VK_EXT_mesh_shader` guarantees.
             max_mesh_draw_groups: 1 << 22,
-            max_ray_dispatch_invocations: 0,
-            ray_handle_bytes: 0,
-            ray_handle_align: 0,
-            ray_table_align: 0,
-            max_ray_record_stride: 0,
-            max_ray_recursion: 0,
+            // As Vulkan guarantees; a launch is threadgroups of 64 over a grid Metal bounds
+            // by 32-bit counts.
+            max_ray_dispatch_invocations: if rays { 1 << 30 } else { 0 },
+            ray_handle_bytes: if rays { super::ray::HANDLE_BYTES } else { 0 },
+            ray_handle_align: if rays { super::ray::HANDLE_ALIGN } else { 0 },
+            ray_table_align: if rays { super::ray::TABLE_ALIGN } else { 0 },
+            max_ray_record_stride: if rays {
+                super::ray::MAX_RECORD_STRIDE
+            } else {
+                0
+            },
+            // Traces nest through stage calls, as deep as the pipeline's call depth: the most
+            // Vulkan allows.
+            max_ray_recursion: if rays { 31 } else { 0 },
             device_local_bytes: working_set,
             upload_bytes: working_set,
             max_memory_allocations: u32::MAX,

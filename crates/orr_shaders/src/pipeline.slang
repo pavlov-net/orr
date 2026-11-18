@@ -1256,7 +1256,7 @@ public uint4 intersection_report()
 // launch index `index`.
 void table_call<D>(uint stage, inout D data, Traced hit, uint64_t record, uint3 index)
 {
-    metal_table_call(metal_launch.table, stage, data, hit, record, index, metal_root, metal_texture_pool, metal_samplers, metal_launch);
+    metal_table_call(stage, data, hit, record, index, metal_root, metal_texture_pool, metal_samplers, metal_launch);
 }
 
 // The definitions the Metal intrinsics below and the build's wrappers share, once a program: the
@@ -1308,18 +1308,20 @@ T orr_from_id(ulong id)
 }
 )";
 
-void metal_table_call<D>(uint64_t table, uint stage, inout D data, inout Traced hit, uint64_t record, uint3 index, ConstantBuffer<MetalRoot> root, ConstantBuffer<uint64_t> pool, StructuredBuffer<MetalSampler> samplers, ConstantBuffer<PipelineLaunch> launch)
+// The launch block starts with the table's resource ID, which is how an argument buffer holds a
+// visible function table.
+void metal_table_call<D>(uint stage, inout D data, inout Traced hit, uint64_t record, uint3 index, ConstantBuffer<MetalRoot> root, ConstantBuffer<uint64_t> pool, StructuredBuffer<MetalSampler> samplers, ConstantBuffer<PipelineLaunch> launch)
 {
     __requirePrelude(METAL_PRELUDE);
     __requirePrelude(R"(
 template <typename D>
-inline void orr_table_call(ulong table, uint stage, thread D* data, thread const void* hit, ulong record, uint3 index, constant void* root, constant ulong* pool, device void* samplers, constant void* launch)
+inline void orr_table_call(uint stage, thread D* data, thread const void* hit, ulong record, uint3 index, constant void* root, constant ulong* pool, device void* samplers, constant void* launch)
 {
-    metal::visible_function_table<orr_stage_fn> t = orr_from_id<metal::visible_function_table<orr_stage_fn>>(table);
+    constant metal::visible_function_table<orr_stage_fn>& t = *reinterpret_cast<constant metal::visible_function_table<orr_stage_fn>*>(launch);
     t[stage]((thread void*)data, hit, record, index, root, pool, (device void*)samplers, launch);
 }
 )");
-    __intrinsic_asm "orr_table_call($0, $1, $2, $3, $4, $5, $6, $7, $8, $9)";
+    __intrinsic_asm "orr_table_call($0, $1, $2, $3, $4, $5, $6, $7, $8)";
 }
 
 // Traces with an intersector over the hit table as intersection function buffer: false for a

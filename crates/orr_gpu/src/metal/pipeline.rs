@@ -92,13 +92,26 @@ impl<'a> ShaderStage<'a> {
         )
     }
 
-    /// The stage's library for pixel entries when `fragment`, else for the others: the
-    /// module's own, named by the module's hash, or a reload's, named by its contents.
-    fn library(&self, fragment: bool) -> Library<'a> {
-        let (bytes, own) = if fragment {
-            (self.metallib_fragment, self.module.metallib_fragment)
-        } else {
-            (self.metallib, self.module.metallib)
+    /// Which of its module's libraries holds the entry's function.
+    fn library_kind(&self) -> LibraryKind {
+        match self.entry.stage {
+            crate::Stage::Pixel => LibraryKind::Fragment,
+            crate::Stage::ClosestHit
+            | crate::Stage::AnyHit
+            | crate::Stage::Intersection
+            | crate::Stage::Miss
+            | crate::Stage::Callable => LibraryKind::Stages,
+            _ => LibraryKind::Main,
+        }
+    }
+
+    /// The stage's library of `kind`: the module's own, named by the module's hash, or a
+    /// reload's, named by its contents.
+    fn library(&self, kind: LibraryKind) -> Library<'a> {
+        let (bytes, own) = match kind {
+            LibraryKind::Main => (self.metallib, self.module.metallib),
+            LibraryKind::Fragment => (self.metallib_fragment, self.module.metallib_fragment),
+            LibraryKind::Stages => (self.metallib_stages, self.module.metallib_stages),
         };
         if std::ptr::eq(bytes, own) {
             return Library::Module(self.module.hash, own);
@@ -111,20 +124,36 @@ impl<'a> ShaderStage<'a> {
     }
 
     /// The Metal function descriptor of the entry: its name in the module's library, the
-    /// fragment library for pixel entries, specialized when the function declares constants.
+    /// fragment library for pixel entries and the stages library for ray tracing stages but
+    /// raygens, specialized when the function declares constants.
     pub(super) fn function(
         &self,
         shared: &Shared,
     ) -> Result<Retained<MTL4FunctionDescriptor>, Error> {
-        let name = self.entry.metal_name.to_str().unwrap_or("");
-        if name.is_empty() {
-            return Err(Error::Shader(format!(
+        let name = self.metal_name()?;
+        self.function_named(shared, name)
+    }
+
+    /// The entry's Metal function name, which the build records.
+    pub(super) fn metal_name(&self) -> Result<&'a str, Error> {
+        match self.entry.metal_name.to_str() {
+            Ok(name) if !name.is_empty() => Ok(name),
+            _ => Err(Error::Shader(format!(
                 "{} entry {:?} has no Metal function",
                 self.module.name, self.entry.name
-            )));
+            ))),
         }
-        let fragment = self.entry.stage == crate::Stage::Pixel;
-        let library = shared.library(self.module.name, fragment, self.library(fragment))?;
+    }
+
+    /// As [`Self::function`], for the function `name` of the entry's library, which takes the
+    /// entry's constants.
+    pub(super) fn function_named(
+        &self,
+        shared: &Shared,
+        name: &str,
+    ) -> Result<Retained<MTL4FunctionDescriptor>, Error> {
+        let kind = self.library_kind();
+        let library = shared.library(self.module.name, kind, self.library(kind))?;
         let f = MTL4LibraryFunctionDescriptor::new();
         f.setName(Some(&NSString::from_str(name)));
         f.setLibrary(Some(&library));
@@ -149,8 +178,9 @@ impl<'a> ShaderStage<'a> {
     /// Adds what tells this stage apart from others to a pipeline cache key: the module's
     /// code, the entry and the specialization data.
     pub(super) fn key(&self, hasher: &mut blake3::Hasher) {
-        let fragment = self.entry.stage == crate::Stage::Pixel;
-        hasher.update(&self.library(fragment).hash().to_le_bytes());
+        let kind = self.library_kind();
+        hasher.update(&[kind as u8]);
+        hasher.update(&self.library(kind).hash().to_le_bytes());
         hasher.update(self.entry.metal_name.to_bytes_with_nul());
         hasher.update(&(self.spec.bytes.len() as u64).to_le_bytes());
         hasher.update(self.spec.bytes);
@@ -238,15 +268,15 @@ impl Shared {
             })
     }
 
-    /// The Metal library `library` of the module `module`, of its pixel entries when
-    /// `fragment`. Loaded once per hash and kind.
+    /// The Metal library `library` of kind `kind` of the module `module`. Loaded once per
+    /// hash and kind.
     fn library(
         &self,
         module: &str,
-        fragment: bool,
+        kind: LibraryKind,
         library: Library<'_>,
     ) -> Result<Obj<ProtocolObject<dyn MTLLibrary>>, Error> {
-        let key = (library.hash(), fragment);
+        let key = (library.hash(), kind);
         let mut libraries = lock(&self.libraries);
         if let Some(l) = libraries.get(&key) {
             return Ok(l.clone());
@@ -272,6 +302,16 @@ impl Shared {
     }
 }
 
+/// Which of a module's Metal libraries: Metal needs pixel entries apart from the others, and
+/// the ray tracing stages but the raygens apart from the launch kernels (`orr_shaders`'
+/// `ShaderModule::metallib_stages`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) enum LibraryKind {
+    Main,
+    Fragment,
+    Stages,
+}
+
 /// A stage's Metal library and the hash that names it.
 #[derive(Clone, Copy)]
 enum Library<'a> {
@@ -290,7 +330,7 @@ impl Library<'_> {
 }
 
 /// The descriptor of a compute pipeline over `function` with threadgroups of `workgroup`.
-fn compute_descriptor(
+pub(super) fn compute_descriptor(
     function: &MTL4FunctionDescriptor,
     workgroup: [u32; 3],
     name: &str,
