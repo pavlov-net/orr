@@ -397,6 +397,7 @@ fn mark_defined(inst: &[u32], defined: &mut [bool]) {
 /// `code` with its entry point `entry` named `name` instead, and the debug name of the entry's
 /// function with it: what a driver's tools show for the stage. `None` where the module has no
 /// such entry point.
+#[cfg(not(target_vendor = "apple"))]
 pub(crate) fn rename_entry(code: &[u32], entry: &[u8], name: &[u8]) -> Option<Vec<u32>> {
     let mut bytes = name.to_vec();
     bytes.resize((name.len() / 4 + 1) * 4, 0);
