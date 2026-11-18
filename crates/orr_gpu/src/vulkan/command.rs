@@ -10,7 +10,7 @@ use super::garbage::Item;
 use super::mesh::MeshPipeline;
 use super::pipeline::ComputePipeline;
 use super::queue::{ListResources, Queue};
-use super::ray::{RayDispatchPipeline, RayPipeline};
+use super::ray::RayPipeline;
 use super::texture::{Texture, indirect_copy_format, vk_extent, vk_offset};
 use crate::{
     Caps, ClearColor, ColorLoad, DecompressRegion, DepthLoad, DispatchArgs, Error, GpuAddress,
@@ -382,22 +382,6 @@ impl<'q> CommandList<'q> {
             self.device()
                 .cmd_dispatch(self.cmd(), groups[0], groups[1], groups[2]);
         };
-    }
-
-    /// Runs `p`'s raygen entry once per element of `extent`, with `root` pushed with the dispatch.
-    pub fn dispatch_rays<R: Pod>(&mut self, p: &RayDispatchPipeline, root: &R, extent: [u32; 3]) {
-        self.trace_rays(&p.0, 0, &HitTable::NONE, root, extent);
-    }
-
-    /// Runs `p`'s raygen entry once per element of the extent `args` holds on the GPU
-    /// (width, height, depth).
-    pub fn dispatch_rays_indirect<R: Pod>(
-        &mut self,
-        p: &RayDispatchPipeline,
-        root: &R,
-        args: GpuPtr<DispatchArgs>,
-    ) {
-        self.trace_rays_indirect(&p.0, 0, &HitTable::NONE, root, args);
     }
 
     /// Binds `p` with `root` and returns the regions of a launch of raygen `raygen` over the

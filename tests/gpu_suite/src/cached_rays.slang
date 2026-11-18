@@ -1,5 +1,5 @@
-// The ray tracing entries of the pipeline cache tests. The ray-dispatch entry writes its
-// specialization constant plus one.
+// The ray tracing entries of the pipeline cache tests. The raygen-only pipeline's entry writes
+// its specialization constant plus one.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 

@@ -120,8 +120,6 @@ fn every_surface_method_reaches_the_type_linked_for_its_id() {
         assert_eq!(o.albedo, albedo, "{i:?}");
         assert_eq!(o.depth_offset, depth_offset, "{i:?}");
         assert_eq!(o.coverage, coverage, "{i:?}");
-        assert_eq!(o.key_bits, 5);
-        assert_eq!(o.key, 1 | (i.surface << 3));
 
         let cpu = shader_link::surface(i.surface as u8, c.kind, c.depth, 0.01, 0.002);
         assert_eq!(
@@ -139,7 +137,6 @@ fn nothing_linked_runs_the_defaults() {
         for (i, o) in resolve_on_gpu(set) {
             assert_eq!(o.albedo, [0.5, 0.5, 0.5, 1.0], "{i:?}");
             assert_eq!((o.depth_offset, o.coverage), (0.0, 0.25), "{i:?}");
-            assert_eq!(o.key_bits, 3);
         }
         let d = displace_on_gpu(set);
         assert_eq!(d, [[0.0, 0.0, 0.5, 0.0]; 2]);

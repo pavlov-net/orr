@@ -7,7 +7,7 @@
 // ends the walk there, ends it with nothing, reflects it back or lets it leave through the
 // surface. A walk that takes `max_steps` steps without leaving stops there, keeping the
 // subsurface table's share of what it would yet carry out where its caller asks. A caller may
-// run a walk's steps in several calls, with a coherence point between them.
+// run a walk's steps in several calls, with a reorder between them.
 module subsurface;
 
 import orr_shaders.abi;
@@ -26,7 +26,7 @@ public static const uint WALK_LEAVE = 3;    // the walk leaves along `dir` from 
 public static const uint WALK_REFLECT = 4;  // the walk goes on along `dir` from `origin`, `WalkMeet` only
 public static const uint WALK_RUNNING = 5;  // steps remain, `Walk` only
 
-// Steps of a walk between two coherence points.
+// Steps of a walk between two reorders.
 public static const uint WALK_POINT_STEPS = 8;
 
 // What a walk that reaches its step cap inside a semi-infinite medium would yet carry out

@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use gpu_suite::clusters::*;
-use gpu_suite::shaders::cluster_trace;
 use gpu_suite::{assert_clean, device, noise, readback, render, upload};
 use orr_gpu::rtas::consts::{
     GEOMETRY_CULL_DISABLE, GEOMETRY_NO_DUPLICATE_ANY_HIT, GEOMETRY_OPAQUE, PTLAS_GLOBAL_PARTITION,
@@ -15,7 +14,7 @@ use orr_gpu::{
     BlasLimits, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance, ClassicKind,
     ClusterVertexFormat, GpuAddress, Hazards, LssEndCaps, LssIndexing, MemoryKind, MicromapDesc,
     MicromapTriangle, MicromapUsage, OmmFormat, PageBind, RtasFlags, RtasLimits, RtasMode, RtasOp,
-    RtasOpDesc, ShaderStage, SpecData, Stages, Tlas,
+    RtasOpDesc, Stages, Tlas,
 };
 use orr_math::Vec2;
 
@@ -765,20 +764,14 @@ fn lss_blas(b: &mut Builder, segs: &[Segment], indexing: LssIndexing) -> GpuAddr
 }
 
 /// A classic TLAS and a PTLAS that mix a cluster BLAS with an LSS BLAS (list indexing in
-/// one, successive in the other) give the reference hits from the compute entry and from
-/// the raygen entry of one kernel. LSS hits report their segment and cluster id -1.
+/// one, successive in the other) give the reference hits. LSS hits report their segment and
+/// cluster id -1.
 #[test]
 fn lss_beside_clusters() {
     let d = device();
     if !gpu_suite::require(d.caps().lss, "no linear swept spheres") {
         return;
     }
-    let raygen = d.caps().ray_dispatch.then(|| {
-        let stage =
-            ShaderStage::new(&cluster_trace::MODULE, "raygen", SpecData::default()).unwrap();
-        d.create_ray_dispatch_pipeline(&stage, "lss raygen")
-            .unwrap()
-    });
     let clusters = base_clusters();
     let segs = segments();
     let mut b = Builder::new();
@@ -815,28 +808,9 @@ fn lss_beside_clusters() {
         &clusters[..4].iter().collect::<Vec<_>>(),
     );
     for (label, scene) in [("tlas", tlas), ("ptlas", Tlas(dst.0))] {
-        let compute = b.trace(scene, 0);
-        let rays = raygen.as_ref().map(|p| b.trace_rays(p, scene, 0));
+        let out = b.trace(scene, 0);
         b.flush();
-        let compute = compute.as_slice().unwrap();
-        let hits = check_lss(compute, &front, &segs, &format!("{label} compute"));
-        if let Some(rays) = rays {
-            let rays = rays.as_slice().unwrap();
-            assert_eq!(
-                check_lss(rays, &front, &segs, &format!("{label} raygen")),
-                hits,
-                "{label}: raygen and compute hit counts"
-            );
-            let differ = compute
-                .chunks(REC)
-                .zip(rays.chunks(REC))
-                .filter(|(c, r)| c[..7] != r[..7])
-                .count();
-            assert_eq!(
-                differ, 0,
-                "{label}: rays whose raygen and compute hits differ"
-            );
-        }
+        let hits = check_lss(out.as_slice().unwrap(), &front, &segs, label);
         log::info!("{label}: {} LSS and {} cluster hits", hits.0, hits.1);
     }
     assert_clean();

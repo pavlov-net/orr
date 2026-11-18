@@ -4,9 +4,8 @@
 //!
 //! Shaders read everything through the root: [`CommandList::dispatch`] and
 //! [`CommandList::draw_mesh_tasks`] push the [`GpuPtr`] of a root struct in GPU memory, and
-//! [`CommandList::trace_rays`], [`CommandList::dispatch_rays`] and
-//! [`CommandList::dispatch_inline`] push the struct itself, for kernels that declare
-//! `ORR_ROOT_INLINE`;
+//! [`CommandList::trace_rays`] and [`CommandList::dispatch_inline`] push the struct itself, for
+//! kernels that declare `ORR_ROOT_INLINE`;
 //! buffers are pointers inside it, textures and samplers are heap slots ([`TextureIndex`],
 //! [`StorageImageIndex`], [`SamplerIndex`]) and acceleration structures are [`Tlas`]
 //! addresses. Textures stay in one layout for their whole life; [`CommandList::discard`]
@@ -133,8 +132,8 @@ pub use vulkan::CounterSession;
 pub use backend::{
     Allocation, ClassicAs, CommandList, ComputePipeline, Device, DeviceArenas, DeviceHooks,
     Diagnostics, ExecutionSet, HostArenas, HostTimeline, ImportedMemory, LowLatency, MeshPipeline,
-    Micromap, Queue, RayDispatchPipeline, RayPipeline, ShaderStage, SparseAllocation, SparseBinds,
-    Swapchain, SwapchainFrame, Texture, WindowExtent,
+    Micromap, Queue, RayPipeline, ShaderStage, SparseAllocation, SparseBinds, Swapchain,
+    SwapchainFrame, Texture, WindowExtent,
 };
 
 #[cfg(not(target_vendor = "apple"))]

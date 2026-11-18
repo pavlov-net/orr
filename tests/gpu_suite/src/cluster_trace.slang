@@ -1,5 +1,4 @@
-// Orthographic +z rays over the unit square, one closest-hit trace each, from a compute and a
-// raygen entry. Writes a 20-word record per ray: hit, custom index, instance index, cluster
+// Orthographic +z rays over the unit square, one closest-hit trace each. Writes a 20-word record per ray: hit, custom index, instance index, cluster
 // id, primitive, geometry index, t, non-opaque candidates seen, the nearest candidate's
 // cluster id and primitive, the hit triangle's positions, and 0x600d.
 #include "orr_root.h"
@@ -86,11 +85,4 @@ void main(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(main);
     body(id.xy);
-}
-
-[shader("raygeneration")]
-void raygen()
-{
-    ORR_OMM(raygen);
-    body(DispatchRaysIndex().xy);
 }

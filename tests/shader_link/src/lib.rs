@@ -125,12 +125,6 @@ pub fn medium(data: &AirData, t: f32) -> [f32; 10] {
     out
 }
 
-/// `orr_shaders.coherence`'s `KEY_BITS` in the CPU build.
-pub fn key_bits() -> u32 {
-    // SAFETY: no arguments.
-    unsafe { ffi::link_key_bits() }
-}
-
 mod ffi {
     unsafe extern "C" {
         pub(crate) fn link_surface(
@@ -149,6 +143,5 @@ mod ffi {
         );
         pub(crate) fn link_environment(dir: *const f32, out: *mut f32);
         pub(crate) fn link_medium(data: u64, t: f32, out: *mut f32);
-        pub(crate) fn link_key_bits() -> u32;
     }
 }

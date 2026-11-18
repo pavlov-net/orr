@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use orr_gpu::{
     Allocation, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance,
-    ClassicKind, CommandList, ComputePipeline, Device, DeviceDesc, Diagnostics, GpuPtr,
-    InstanceFlags, LatencyMarker, LatencyTimings, LowLatency, MemoryKind, OutputFormat, Queue,
-    QueueKind, QueueRequest, RtasFlags, ShaderModule, ShaderStage, SpecData, SwapchainFrame,
-    TimelinePoint,
+    ClassicKind, CommandList, CompileThreads, ComputePipeline, Device, DeviceDesc, Diagnostics,
+    GpuPtr, InstanceFlags, LatencyMarker, LatencyTimings, LowLatency, MemoryKind, OutputFormat,
+    Queue, QueueKind, QueueRequest, RayPipeline, RayPipelineDesc, RayPipelineFlags, RtasFlags,
+    ShaderModule, ShaderRecord, ShaderStage, SpecData, SwapchainFrame, TimelinePoint,
 };
 use orr_shaders::bytemuck::Pod;
 
@@ -20,11 +20,6 @@ pub mod window;
 
 pub mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
-}
-
-/// Kernels compiled with `-fp-mode precise`, whose raygen and compute entries must agree.
-pub mod parity {
-    include!(concat!(env!("OUT_DIR"), "/parity/orr_shaders.rs"));
 }
 
 /// Logs info and above to stderr, with `RUST_LOG` adding to or overriding that.
@@ -206,6 +201,27 @@ pub fn pipeline(module: &'static ShaderModule, entry: &str) -> ComputePipeline {
     device()
         .create_compute_pipeline(&stage, module.name)
         .unwrap()
+}
+
+/// A ray tracing pipeline of the raygen `stage` alone, compiled on the calling thread.
+pub fn raygen_pipeline(
+    d: &Device,
+    stage: &ShaderStage<'_>,
+    name: &str,
+) -> Result<RayPipeline, orr_gpu::Error> {
+    d.create_ray_pipeline(
+        &RayPipelineDesc {
+            stages: std::slice::from_ref(stage),
+            raygens: &[ShaderRecord::new(0)],
+            misses: &[],
+            hit_groups: &[],
+            callables: &[],
+            max_recursion: 0,
+            flags: RayPipelineFlags::empty(),
+            threads: CompileThreads::Spawned(1),
+        },
+        name,
+    )
 }
 
 /// The render queue.

@@ -1,7 +1,7 @@
 //! The shader_abi kernels on the GPU, each against a CPU reference: writes through a
 //! pointer, heap views, the 64-bit max, alpha-tested traces of a classic TLAS and of the
-//! opacity-micromap cluster scene, one body behind raygen and compute entries over a PTLAS,
-//! candidate traces and a task/mesh/pixel draw into two targets.
+//! opacity-micromap cluster scene, candidate traces and a task/mesh/pixel draw into two
+//! targets.
 
 use gpu_suite::clusters::{self as cl, Builder, Cluster};
 use gpu_suite::{assert_clean, device, pipeline, readback, render, run, upload};
@@ -14,7 +14,7 @@ use orr_gpu::{
     TextureRegion, TextureUsage, Tlas,
 };
 use orr_math::Vec2;
-use shader_abi::shaders::{alpha, atomic, candidates, clusters, mesh, pattern, texture};
+use shader_abi::shaders::{alpha, atomic, candidates, mesh, pattern, texture};
 
 const EDGE: f32 = 2e-4;
 /// `RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE` of `orr_shaders.trace`.
@@ -504,136 +504,6 @@ fn alpha_test_on_micromap_clusters() {
         "forcing two states changes the result"
     );
     drop((micromap, block));
-    assert_clean();
-}
-
-/// The object-space corners of triangle `t` of `c` as position fetch returns them.
-fn cluster_positions(c: &Cluster, t: u32) -> [[f32; 3]; 3] {
-    let truncate = |v: f32| {
-        if c.truncate == 0 {
-            v
-        } else {
-            f32::from_bits(v.to_bits() & !((1u32 << c.truncate) - 1))
-        }
-    };
-    corners(c, t as usize).map(|v| v.map(truncate))
-}
-
-/// One body behind a raygen and a compute entry over a PTLAS: the entries agree on every
-/// ray, agree with the probe kernel (checked against the CPU reference) on hits, and the
-/// fetched positions equal the CPU positions bit for bit.
-#[test]
-fn raygen_and_compute_entries_trace_one_ptlas() {
-    let d = device();
-    if !d.caps().ray_dispatch {
-        log::warn!(
-            "skipped: {} has no ray-dispatch pipelines",
-            d.caps().device_name
-        );
-        return;
-    }
-    let base = cl::base_clusters();
-    let mut b = Builder::new();
-    let clas = b.build_clas(&base, cl::data_flags(), 0, None, None);
-    let blas = b.build_blas(clas.addrs.gpu(), &[vec![0, 1, 2, 3], vec![4]], None);
-    let limits = cl::ptlas_limits(2);
-    let (dst, scratch) = b.ptlas_blocks(limits);
-    let ops = cl::PtlasOps {
-        writes: vec![
-            cl::ptlas_write(0, 0, cl::FRONT_CUSTOM, [0.0, 0.0, cl::FRONT_Z], 0, true),
-            cl::ptlas_write(1, 1, cl::BACK_CUSTOM, [0.0; 3], 1, false),
-        ],
-        ..Default::default()
-    };
-    b.build_ptlas(limits, blas.addrs.gpu(), &ops, dst, scratch, false);
-    let tlas = Tlas(dst.0);
-    let probe = b.trace(tlas, 0);
-
-    let stage = |entry| ShaderStage::new(&clusters::MODULE, entry, SpecData::default()).unwrap();
-    let compute = d
-        .create_compute_pipeline(&stage("main_compute"), "abi clusters compute")
-        .unwrap();
-    let rays = d
-        .create_ray_dispatch_pipeline(&stage("main_rays"), "abi clusters raygen")
-        .unwrap();
-    let (w, h) = (cl::W, cl::H);
-    let outs =
-        [0, 1].map(|_| readback::<clusters::ClusterHit>(u64::from(w * h), "abi cluster hits"));
-    let roots = outs.each_ref().map(|out| clusters::Root {
-        out: out.gpu(),
-        scene: tlas,
-        width: w,
-        height: h,
-        pad0: 0,
-        pad1: 0,
-    });
-    let [gx, gy, _] = compute.workgroup();
-    let list = b.list();
-    list.barrier(
-        Stages::ALL,
-        Stages::COMPUTE | Stages::RAY,
-        Hazards::ACCEL_STRUCT,
-    );
-    list.dispatch_inline(&compute, &roots[0], [w.div_ceil(gx), h.div_ceil(gy), 1]);
-    list.dispatch_rays(&rays, &roots[1], [w, h, 1]);
-    list.barrier(
-        Stages::COMPUTE | Stages::RAY,
-        Stages::HOST,
-        Hazards::empty(),
-    );
-    b.flush();
-
-    let insts = [
-        cl::ref_inst(
-            cl::FRONT_CUSTOM,
-            0,
-            [0.0, 0.0, cl::FRONT_Z],
-            &base[..4].iter().collect::<Vec<_>>(),
-        ),
-        cl::ref_inst(cl::BACK_CUSTOM, 1, [0.0; 3], &[&base[4]]),
-    ];
-    let probe = probe.as_slice().unwrap();
-    cl::check(probe, &insts, 0).assert_ok("probe kernel");
-    let (from_compute, from_rays) = (outs[0].as_slice().unwrap(), outs[1].as_slice().unwrap());
-    let bits = |r: &clusters::ClusterHit| {
-        let mut v = vec![r.hit, r.instance, r.cluster as u32, r.primitive];
-        v.extend(r.positions.iter().flatten().map(|f| f.to_bits()));
-        v
-    };
-    let (mut hits, mut wrong) = (0, Vec::new());
-    for i in 0..(w * h) as usize {
-        let (c, r) = (&from_compute[i], &from_rays[i]);
-        let o = &probe[i * cl::REC..][..cl::REC];
-        let mut bad = |what: &str| {
-            if wrong.len() < 8 {
-                wrong.push(format!("ray {i}: {what}"));
-            }
-        };
-        if bits(c) != bits(r) {
-            bad("raygen and compute differ");
-        }
-        if c.hit != o[0] {
-            bad("hit differs from the probe kernel");
-            continue;
-        }
-        if c.hit == 0 {
-            continue;
-        }
-        hits += 1;
-        if [c.instance, c.cluster as u32, c.primitive] != [o[2], o[3], o[4]] {
-            bad("ids differ from the probe kernel");
-        }
-        let Some(cluster) = base.iter().find(|k| k.id == c.cluster as u32) else {
-            bad("unknown cluster id");
-            continue;
-        };
-        let want = cluster_positions(cluster, c.primitive);
-        if c.positions.map(|v| v.map(f32::to_bits)) != want.map(|v| v.map(f32::to_bits)) {
-            bad("positions differ from the CPU positions");
-        }
-    }
-    assert!(hits > (w * h) as usize / 2, "only {hits} hits");
-    assert!(wrong.is_empty(), "{}", wrong.join("; "));
     assert_clean();
 }
 

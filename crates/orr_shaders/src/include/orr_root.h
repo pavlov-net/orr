@@ -6,8 +6,8 @@
 
 // ORR_ROOT_INLINE(T) declares a root held in the push data itself, up to 248 bytes (240, since
 // a root's size is a multiple of 16). Kernels with a raygen entry use it: on the NVIDIA drivers
-// measured (621.01, 621.12) a ray-dispatch pipeline with the mapped root above never hits a
-// pipeline cache. `dispatch_rays`, `dispatch_inline` and their indirect forms push it with each
+// measured (621.01, 621.12) a ray tracing pipeline with the mapped root above never hits a
+// pipeline cache. `trace_rays`, `dispatch_inline` and their indirect forms push it with each
 // command. Its members have no address.
 #define ORR_ROOT_INLINE(T) [[vk::push_constant]] ConstantBuffer<T> root
 

@@ -4,7 +4,6 @@ import orr_scene.surface;
 import orr_scene.displacement;
 import orr_lighting.environment;
 import orr_lighting.media;
-import orr_shaders.coherence;
 
 extern struct Surface : ISurfaces = StandardSurface;
 extern struct Displace : IDisplacement = TextureDisplacement;
@@ -65,9 +64,4 @@ export __extern_cpp void link_medium(uint64_t data, float t, float* out)
     out[7] = tr.x;
     out[8] = tr.y;
     out[9] = tr.z;
-}
-
-export __extern_cpp uint link_key_bits()
-{
-    return KEY_BITS;
 }

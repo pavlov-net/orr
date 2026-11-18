@@ -1,4 +1,4 @@
-//! Kernels over `orr_shaders.abi`, `orr_shaders.trace`, `orr_shaders.coherence` and `orr_shaders.atomic`, which `ORR_METAL_CHECK=1`
+//! Kernels over `orr_shaders.abi`, `orr_shaders.trace` and `orr_shaders.atomic`, which `ORR_METAL_CHECK=1`
 //! also compiles to MSL: the build passing is the check. The kernels under `asserts` link `ASSERTS = true`.
 //! The tests under `tests/` run them on the GPU against CPU references.
 
@@ -12,7 +12,6 @@ pub mod assert_shaders {
 
 #[cfg(test)]
 mod tests {
-    use core::mem::{offset_of, size_of};
     use std::path::Path;
     use std::process::Command;
 
@@ -35,7 +34,6 @@ mod tests {
     fn asserts_abort_only_when_linked() {
         assert!(aborts(assert_shaders::null_tlas::MODULE.spirv));
         assert!(!aborts(shaders::alpha::MODULE.spirv));
-        assert!(!aborts(shaders::clusters::MODULE.spirv));
     }
 
     /// Every module validates under `spirv-val` from `ORR_SPIRV_TOOLS` (v2026.4 or newer
@@ -73,12 +71,5 @@ mod tests {
             }
         }
         assert!(checked >= 4, "{checked} modules found");
-    }
-
-    #[test]
-    fn records_keep_c_layout() {
-        use shaders::clusters::ClusterHit;
-        assert_eq!(offset_of!(ClusterHit, positions), 16);
-        assert_eq!(size_of::<ClusterHit>(), 52);
     }
 }

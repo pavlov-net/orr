@@ -84,12 +84,6 @@ fn displacement_environment_and_medium_reach_the_linked_types() {
 }
 
 #[test]
-fn coherence_key_widens_with_the_highest_surface_id() {
-    // Three surfaces: 3 + bit length of 3.
-    assert_eq!(shader_link::key_bits(), 5);
-}
-
-#[test]
 fn kernel_set_holds_the_kernels_that_declare_a_linked_point() {
     let mut kernels: Vec<&str> = linked::KERNELS.modules.iter().map(|m| m.kernel).collect();
     kernels.sort_unstable();

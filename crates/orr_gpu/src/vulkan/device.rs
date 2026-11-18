@@ -825,9 +825,9 @@ impl Device {
     }
 
     /// A handle to this device whose [`Device::create_compute_pipeline`],
-    /// [`Device::create_ray_dispatch_pipeline`] and [`Device::create_mesh_pipeline`] compile
-    /// nothing: a pipeline in the driver's disk cache, the [`DeviceDesc::pipeline_cache`] file or
-    /// the [`DeviceDesc::pipeline_store`] comes back at once, and any other returns
+    /// [`Device::create_ray_pipeline`] and [`Device::create_mesh_pipeline`] compile nothing: a
+    /// pipeline in the driver's disk cache, the [`DeviceDesc::pipeline_cache`] file or the
+    /// [`DeviceDesc::pipeline_store`] comes back at once, and any other returns
     /// [`crate::Error::CompileRequired`] without doing the work. So a thread that must not stall
     /// can find out whether a start is warm.
     pub fn cached_pipelines_only(&self) -> Device {

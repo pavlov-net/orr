@@ -1,4 +1,4 @@
-// `timing`'s multiply-add chain in a raygen thread: ray dispatch needs an inline root.
+// `timing`'s multiply-add chain in a raygen thread: a ray tracing pipeline needs an inline root.
 #include "orr_root.h"
 
 struct Root

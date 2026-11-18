@@ -88,10 +88,6 @@ mod tests {
                 (Stage::Pixel, [1, 1, 1])
             ]
         );
-        assert_eq!(
-            stages(&ser::MODULE),
-            [(Stage::RayGen, [1, 1, 1]), (Stage::Compute, [8, 4, 1])]
-        );
         assert_eq!(root::MODULE.spirv[0], 0x0723_0203);
     }
 }

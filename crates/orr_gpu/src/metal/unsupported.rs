@@ -154,11 +154,6 @@ impl CommandList<'_> {
     }
 }
 
-/// A ray-dispatch pipeline; Metal has none.
-pub struct RayDispatchPipeline {
-    never: !,
-}
-
 /// A ray tracing pipeline; Metal has none.
 pub struct RayPipeline {
     never: !,
@@ -193,22 +188,7 @@ impl RayPipeline {
     }
 }
 
-impl RayDispatchPipeline {
-    pub(super) fn unreachable(&self) -> ! {
-        match self.never {}
-    }
-}
-
 impl Device {
-    pub fn create_ray_dispatch_pipeline(
-        &self,
-        s: &ShaderStage<'_>,
-        name: &str,
-    ) -> Result<RayDispatchPipeline, Error> {
-        let _ = (s, name);
-        Err(Error::NotImplemented("ray-dispatch pipelines"))
-    }
-
     pub fn create_ray_pipeline(
         &self,
         desc: &crate::RayPipelineDesc<'_>,

@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use gpu_suite::shaders::{cached, cached_rays};
-use gpu_suite::{log_to_stderr, require};
+use gpu_suite::{log_to_stderr, raygen_pipeline, require};
 use orr_gpu::{
     ClearColor, ColorAttachment, ColorLoad, ColorTarget, CompileThreads, ComputePipeline, Cull,
     Device, DeviceDesc, Error, Format, Hazards, HitGroup, HitTable, MemoryKind, MeshPipeline,
-    MeshPipelineDesc, QueueKind, RasterState, RayDispatchPipeline, RayPipeline, RayPipelineDesc,
-    RayPipelineFlags, Rendering, ShaderRecord, ShaderStage, SpecData, Stages, TextureDesc,
-    TextureMemory, TextureRegion, TextureUsage,
+    MeshPipelineDesc, QueueKind, RasterState, RayPipeline, RayPipelineDesc, RayPipelineFlags,
+    Rendering, ShaderRecord, ShaderStage, SpecData, Stages, TextureDesc, TextureMemory,
+    TextureRegion, TextureUsage,
 };
 
 fn cache_path(test: &str) -> PathBuf {
@@ -38,12 +38,14 @@ struct Set {
     value: u32,
     compute: ComputePipeline,
     mesh: MeshPipeline,
-    raygen: Option<RayDispatchPipeline>,
+    /// A ray tracing pipeline of a raygen alone.
+    raygen: Option<RayPipeline>,
     /// A ray tracing pipeline with a shader of every kind.
     traced: Option<RayPipeline>,
-    /// Whether the compute, mesh, ray-dispatch and ray tracing pipelines came from the cache,
-    /// when created alone; the last two are true on a device without ray dispatch, and where a
-    /// hit is not known to be reported for one: only NVIDIA's driver has been measured.
+    /// Whether the compute, mesh, raygen-only and full ray tracing pipelines came from the
+    /// cache, when created alone; the last two are true on a device without ray tracing
+    /// pipelines, and where a hit is not known to be reported for one: only NVIDIA's driver has
+    /// been measured.
     cached: [bool; 4],
 }
 
@@ -79,8 +81,7 @@ impl Set {
                 bytes: &spec,
             };
             let stage = ShaderStage::new(&cached_rays::MODULE, "raygen_main", data).unwrap();
-            d.create_ray_dispatch_pipeline(&stage, "cached raygen")
-                .unwrap()
+            raygen_pipeline(d, &stage, "cached raygen").unwrap()
         });
         let after_raygen = hits();
         let traced = d.caps().ray_dispatch.then(|| {
@@ -180,7 +181,7 @@ impl Set {
                 pad0: 0,
                 pad1: 0,
             };
-            list.dispatch_rays(r, &rays_root, [1, 1, 1]);
+            list.trace_rays(r, 0, &HitTable::NONE, &rays_root, [1, 1, 1]);
         }
         if let Some(p) = &self.traced {
             let rays_root = cached_rays::Root {
@@ -285,14 +286,11 @@ fn a_cached_only_handle_compiles_nothing() {
         };
         let stage = ShaderStage::new(&cached_rays::MODULE, "raygen_main", data).unwrap();
         assert_matches!(
-            only.create_ray_dispatch_pipeline(&stage, "cached raygen")
-                .err(),
+            raygen_pipeline(&only, &stage, "cached raygen").err(),
             Some(Error::CompileRequired)
         );
-        d.create_ray_dispatch_pipeline(&stage, "cached raygen")
-            .unwrap();
-        only.create_ray_dispatch_pipeline(&stage, "cached raygen")
-            .unwrap();
+        raygen_pipeline(&d, &stage, "cached raygen").unwrap();
+        raygen_pipeline(&only, &stage, "cached raygen").unwrap();
     }
     assert_clean(&d);
 }

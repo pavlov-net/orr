@@ -10,7 +10,6 @@ import orr_shaders.random;
 import orr_shaders.sampling;
 import orr_shaders.trace;
 import orr_shaders.hits;
-import orr_shaders.coherence;
 import orr_pack.mesh;
 import orr_scene.hit;
 import orr_scene.visibility;

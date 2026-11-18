@@ -16,9 +16,8 @@ use orr_gpu::rtas::{
 use orr_gpu::{
     Allocation, BlasLimits, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance,
     ClassicKind, ClusterLimits, ClusterVertexFormat, CommandList, ComputePipeline, GpuAddress,
-    GpuPtr, Hazards, InstanceFlags, MemoryKind, MoveKind, MoveLimits, PtlasLimits,
-    RayDispatchPipeline, RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, RtasSizes,
-    Stages, TimelinePoint, Tlas,
+    GpuPtr, Hazards, InstanceFlags, MemoryKind, MoveKind, MoveLimits, PtlasLimits, RtasFlags,
+    RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, RtasSizes, Stages, TimelinePoint, Tlas,
 };
 use orr_math::{Mat4, Vec2};
 use orr_shaders::bytemuck::{Pod, Zeroable};
@@ -887,23 +886,6 @@ impl Builder {
     pub fn trace(&mut self, tlas: Tlas, mode: u32) -> Allocation<u32> {
         let out = readback::<u32>(u64::from(W * H) * REC as u64, "rays");
         self.trace_into(tlas, mode, out.gpu());
-        out
-    }
-
-    /// Traces `tlas` from the raygen entry of `p`, the ray-dispatch pipeline of
-    /// `cluster_trace`.
-    pub fn trace_rays(
-        &mut self,
-        p: &RayDispatchPipeline,
-        tlas: Tlas,
-        mode: u32,
-    ) -> Allocation<u32> {
-        let out = readback::<u32>(u64::from(W * H) * REC as u64, "rays");
-        let root = trace_root(tlas, mode, out.gpu());
-        let list = self.list.as_mut().unwrap();
-        list.barrier(Stages::ALL, Stages::RAY, Hazards::ACCEL_STRUCT);
-        list.dispatch_rays(p, &root, [W, H, 1]);
-        list.barrier(Stages::RAY, Stages::HOST, Hazards::empty());
         out
     }
 

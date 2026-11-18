@@ -11,7 +11,7 @@ use ash::vk;
 
 use super::device::{Device, Shared};
 use super::garbage::{Item, RawBuffer};
-use super::pipeline::{ShaderStage, StageParts};
+use super::pipeline::StageParts;
 use crate::{
     CompileThreads, Error, HitGroup, MemoryKind, RayPipelineDesc, RayPipelineFlags, ShaderRecord,
     Stage,
@@ -85,10 +85,6 @@ impl RayPipeline {
         rest[..data.len()].copy_from_slice(data);
     }
 }
-
-/// A raygen-only ray tracing pipeline, run by [`crate::CommandList::dispatch_rays`], for
-/// kernels that trace with ray queries and reorder at coherence points.
-pub struct RayDispatchPipeline(pub(super) Box<RayPipeline>);
 
 /// One deferred creation and the threads joined to it, shared with the tasks of a pool.
 struct Joined {
@@ -714,31 +710,5 @@ impl Device {
             table: Some(DropGuard::dismiss(table)),
             shared: Arc::clone(shared),
         })
-    }
-
-    /// Creates a ray-dispatch pipeline from a raygen entry point: one raygen and no miss, hit
-    /// or callable records, recursion depth 0, compiled on the calling thread. The entry traces
-    /// with ray queries; it cannot call `TraceRay`. Threads asking for one pipeline at once
-    /// compile it once: the others wait for it. Fails unless `Caps::ray_dispatch`.
-    pub fn create_ray_dispatch_pipeline(
-        &self,
-        s: &ShaderStage<'_>,
-        name: &str,
-    ) -> Result<RayDispatchPipeline, Error> {
-        let stages = [*s];
-        let pipeline = self.create_ray_pipeline(
-            &RayPipelineDesc {
-                stages: &stages,
-                raygens: &[ShaderRecord::new(0)],
-                misses: &[],
-                hit_groups: &[],
-                callables: &[],
-                max_recursion: 0,
-                flags: RayPipelineFlags::empty(),
-                threads: CompileThreads::Spawned(1),
-            },
-            name,
-        )?;
-        Ok(RayDispatchPipeline(Box::new(pipeline)))
     }
 }

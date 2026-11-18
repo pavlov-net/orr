@@ -1,17 +1,17 @@
 //! Exactly timed passes read their own work's time, against CPU wall time, for compute, raster
-//! and ray-dispatch work and whatever runs before them; passes not asked for stay unexact.
+//! and ray tracing work and whatever runs before them; passes not asked for stay unexact.
 
 use std::time::{Duration, Instant};
 
 use gpu_suite::shaders::{timing, timing_rays};
-use gpu_suite::{assert_clean, device, render, require};
+use gpu_suite::{assert_clean, device, raygen_pipeline, render, require};
 use orr_gpu::{
     Allocation, ColorAttachment, ColorLoad, ColorTarget, CommandList, ComputePipeline, Format,
-    MemoryKind, MeshPipeline, MeshPipelineDesc, PassResult, RayDispatchPipeline, Rendering,
+    HitTable, MemoryKind, MeshPipeline, MeshPipelineDesc, PassResult, RayPipeline, Rendering,
     ShaderStage, SpecData, Texture, TextureDesc, TextureMemory, TextureUsage,
 };
 
-/// Workgroups of 64 compute threads, and the raster and ray-dispatch extent's side, each about
+/// Workgroups of 64 compute threads, and the raster and ray tracing extent's side, each about
 /// as many threads as the GPU holds at once, so a pass has a tail of late workgroups.
 const GROUPS: u32 = 4096;
 const SIDE: u32 = 512;
@@ -31,7 +31,7 @@ enum Kind {
 struct Bench {
     alu: ComputePipeline,
     raster: MeshPipeline,
-    rays: Option<RayDispatchPipeline>,
+    rays: Option<RayPipeline>,
     target: Texture,
     out: Allocation<f32>,
     roots: Vec<(u32, Allocation<timing::Root>)>,
@@ -44,8 +44,7 @@ impl Bench {
         let rays = d.caps().ray_dispatch.then(|| {
             let stage =
                 ShaderStage::new(&timing_rays::MODULE, "alu_rays", SpecData::default()).unwrap();
-            d.create_ray_dispatch_pipeline(&stage, "timing rays")
-                .unwrap()
+            raygen_pipeline(d, &stage, "timing rays").unwrap()
         });
         Bench {
             alu: d
@@ -118,7 +117,8 @@ impl Bench {
                     iterations: steps,
                     pad: 0,
                 };
-                list.dispatch_rays(self.rays.as_ref().unwrap(), &root, [SIDE, SIDE, 1]);
+                let rays = self.rays.as_ref().unwrap();
+                list.trace_rays(rays, 0, &HitTable::NONE, &root, [SIDE, SIDE, 1]);
             }
         }
         list.end_pass();
@@ -205,7 +205,7 @@ fn exact_passes_read_their_own_work() {
         "{long} ms for 4 times the steps of {short} ms"
     );
     let mut kinds = vec![(Kind::Compute, STEPS), (Kind::Raster, STEPS)];
-    if require(bench.rays.is_some(), "no ray-dispatch pipelines") {
+    if require(bench.rays.is_some(), "no ray tracing pipelines") {
         // A raygen thread takes the chain's steps faster than a compute or pixel thread.
         kinds.push((Kind::Rays, 4 * STEPS));
     }
