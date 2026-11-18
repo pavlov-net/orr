@@ -117,7 +117,38 @@ pub(super) struct Object {
     verts: u32,
     /// Every triangle opaque, so its geometry is.
     opaque: bool,
+    /// A CLAS's triangles in runs, as `pack` sorts them.
+    runs: Vec<Run>,
     raw: Option<Obj<Structure>>,
+}
+
+/// Triangles of a CLAS of one geometry index and opacity, in a row: one Metal geometry, whose
+/// intersection function table offset is the geometry index, so a trace's intersection
+/// function buffer index is the hit record orr's geometry index names.
+#[derive(Clone, Copy, Debug)]
+struct Run {
+    geometry: u32,
+    opaque: bool,
+    first: u32,
+    count: u32,
+}
+
+/// The runs of a CLAS whose triangles' geometry words are `words`, in `pack`'s order.
+fn runs(words: &[u32]) -> Vec<Run> {
+    let mut out: Vec<Run> = Vec::new();
+    for (t, &w) in words.iter().enumerate() {
+        let (geometry, opaque) = (w & 0xff_ffff, w >> 31 != 0);
+        match out.last_mut() {
+            Some(r) if r.geometry == geometry && r.opaque == opaque => r.count += 1,
+            _ => out.push(Run {
+                geometry,
+                opaque,
+                first: t as u32,
+                count: 1,
+            }),
+        }
+    }
+    out
 }
 
 /// The objects the backend placed, by start address.
@@ -426,8 +457,9 @@ fn max_args(d: &RtasOpDesc) -> u32 {
     }
 }
 
-/// The triangle geometry of a CLAS at `at`, or of the opaque or other triangles of a flat
-/// BLAS: unindexed when `indices` is 0.
+/// The triangle geometry of a run of a CLAS, or of a flat BLAS's triangles of one geometry index
+/// and opacity: unindexed when `indices` is 0. `geometry`, the orr geometry index, is its
+/// intersection function table offset.
 fn triangles(
     vertices: u64,
     verts: u64,
@@ -435,6 +467,7 @@ fn triangles(
     tris: u32,
     data: u64,
     opaque: bool,
+    geometry: u32,
 ) -> Retained<MTL4AccelerationStructureGeometryDescriptor> {
     let g = MTL4AccelerationStructureTriangleGeometryDescriptor::new();
     // SAFETY: the ranges are objects the build's kernels wrote, live until it completes.
@@ -448,6 +481,7 @@ fn triangles(
         g.setPrimitiveDataBuffer(range(data, DATA_BYTES * u64::from(tris)));
         g.setPrimitiveDataElementSize(DATA_BYTES as usize);
         g.setPrimitiveDataStride(DATA_BYTES as usize);
+        g.setIntersectionFunctionTableOffset(geometry as usize);
     }
     g.setVertexFormat(MTLAttributeFormat::Float3);
     g.setIndexType(MTLIndexType::UInt32);
@@ -483,6 +517,11 @@ fn instances(descriptors: u64, count: u32) -> Retained<MTL4AccelerationStructure
     Retained::into_super(t)
 }
 
+/// The address of the Metal instance descriptors of a PTLAS whose state is at `state`.
+fn ptlas_instances(state: u64, instances: u32, partitions: u32) -> u64 {
+    state + PTLAS_HEADER + 16 * (u64::from(partitions) + 1) + WRITE_BYTES * u64::from(instances)
+}
+
 /// The rebuilt TLAS of a PTLAS whose state is at `state`.
 fn ptlas_descriptor(
     state: u64,
@@ -490,10 +529,7 @@ fn ptlas_descriptor(
     partitions: u32,
 ) -> Retained<MTL4AccelerationStructureDescriptor> {
     let t = MTL4IndirectInstanceAccelerationStructureDescriptor::new();
-    let descriptors = state
-        + PTLAS_HEADER
-        + 16 * (u64::from(partitions) + 1)
-        + WRITE_BYTES * u64::from(instances);
+    let descriptors = ptlas_instances(state, instances, partitions);
     // SAFETY: the state holds `instances` descriptors and the count at header word 4.
     unsafe {
         t.setInstanceDescriptorBuffer(range(
@@ -684,7 +720,7 @@ impl CommandList<'_> {
         }
         match d.op {
             RtasOp::BuildClas | RtasOp::BuildTemplates | RtasOp::InstantiateTemplates => {
-                self.build_objects(d, io, rb, count);
+                self.build_objects(d, io, rb, count, reservation);
             }
             RtasOp::BuildClusterBlas => self.build_blas(d, io, rb, count, reservation),
             RtasOp::Move => self.move_objects(d, io, rb, count),
@@ -829,8 +865,17 @@ impl CommandList<'_> {
         }
     }
 
-    /// CLAS builds, template builds and instantiations.
-    fn build_objects(&mut self, d: &RtasOpDesc, io: &RtasIo, rb: &Readback, count: usize) {
+    /// CLAS builds, template builds and instantiations. A CLAS's triangles come back as their
+    /// geometry words in `pack`'s order, from which a second step makes its runs and its Metal
+    /// BLAS, within `reservation`.
+    fn build_objects(
+        &mut self,
+        d: &RtasOpDesc,
+        io: &RtasIo,
+        rb: &Readback,
+        count: usize,
+        reservation: Reservation,
+    ) {
         let shared = Arc::clone(&self.queue.shared);
         let clas = d.op != RtasOp::BuildTemplates;
         let structures = clas && !d.flags.contains(RtasFlags::FLAT_ONLY);
@@ -864,31 +909,12 @@ impl CommandList<'_> {
             return;
         }
         let addresses = Self::destinations(d, io, rb, &sizes);
-        let mut builds = Vec::new();
+        let total: u64 = shapes.iter().map(|&(t, _, _)| 4 * u64::from(t)).sum();
+        let keys = clas
+            .then(|| self.scratch_memory(MemoryKind::Readback, total, "cluster triangle words"));
+        let mut key_at = keys.as_ref().map_or(0, |k| k.gpu().address().0);
         let mut jobs = Vec::with_capacity(count);
         for (i, (&(tris, verts, opaque), &at)) in shapes.iter().zip(&addresses).enumerate() {
-            let mut id = 0;
-            let mut raw = None;
-            if structures {
-                let vertices = at + HEADER;
-                let indices = vertices + 12 * u64::from(verts);
-                let data = indices + 12 * u64::from(tris);
-                let desc = primitive(
-                    &[triangles(
-                        vertices,
-                        u64::from(verts),
-                        indices,
-                        tris,
-                        data,
-                        opaque,
-                    )],
-                    false,
-                );
-                let (s, scratch) = shared.structure(&desc);
-                id = id_bits(s.gpuResourceID());
-                builds.push((s.clone(), desc, scratch));
-                raw = Some(s);
-            }
             shared.place(
                 at,
                 Object {
@@ -897,13 +923,15 @@ impl CommandList<'_> {
                     tris,
                     verts,
                     opaque,
-                    raw,
+                    runs: Vec::new(),
+                    raw: None,
                 },
             );
             jobs.push(PackJob {
                 dst: at,
-                id,
+                id: 0,
                 record: io.args.0 + i as u64 * u64::from(args_stride(d.op)),
+                keys: key_at,
                 kind: match d.op {
                     RtasOp::BuildClas => 1,
                     RtasOp::BuildTemplates => 2,
@@ -911,12 +939,102 @@ impl CommandList<'_> {
                 },
                 pad: 0,
             });
+            if clas {
+                key_at += 4 * u64::from(tris);
+            }
         }
         let pack = Kernels::get(&shared).pack.clone();
         self.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         self.run_jobs(&pack, &jobs);
-        self.encode_builds(builds);
         self.write_results(io, &addresses, &sizes);
+        let Some(keys) = keys else { return };
+        self.split(Box::new(move |list: &mut CommandList<'_>| {
+            let _reservation = reservation;
+            list.place_runs(&keys, &shapes, &addresses, structures);
+        }));
+    }
+
+    /// The second step of a CLAS build: each CLAS's runs, from the geometry words `pack` wrote
+    /// to `keys`, and with `structures` its Metal BLAS, one geometry per run.
+    fn place_runs(
+        &mut self,
+        keys: &Allocation<u8>,
+        shapes: &[(u32, u32, bool)],
+        addresses: &[u64],
+        structures: bool,
+    ) {
+        let shared = Arc::clone(&self.queue.shared);
+        let words: &[u32] = bytemuck::cast_slice(keys.as_slice().expect("readback is mapped"));
+        let mut first = 0;
+        let mut builds = Vec::new();
+        let mut ids = Vec::new();
+        for (&(tris, verts, _), &at) in shapes.iter().zip(addresses) {
+            let runs = runs(&words[first..first + tris as usize]);
+            first += tris as usize;
+            let mut object = lock(&shared.objects)
+                .by_start
+                .remove(&at)
+                .unwrap_or_else(|| panic!("the CLAS at {at:#x} is gone before its build"));
+            if structures {
+                let vertices = at + HEADER;
+                let indices = vertices + 12 * u64::from(verts);
+                let data = indices + 12 * u64::from(tris);
+                let geometry = |r: &Run| {
+                    triangles(
+                        vertices,
+                        u64::from(verts),
+                        indices + 12 * u64::from(r.first),
+                        r.count,
+                        data + DATA_BYTES * u64::from(r.first),
+                        r.opaque,
+                        r.geometry,
+                    )
+                };
+                let geometries: Vec<_> = if runs.is_empty() {
+                    vec![triangles(
+                        vertices,
+                        u64::from(verts),
+                        indices,
+                        0,
+                        data,
+                        true,
+                        0,
+                    )]
+                } else {
+                    runs.iter().map(geometry).collect()
+                };
+                let desc = primitive(&geometries, false);
+                let (s, scratch) = shared.structure(&desc);
+                ids.push((at, id_bits(s.gpuResourceID())));
+                builds.push((s.clone(), desc, scratch));
+                object.raw = Some(s);
+            }
+            object.runs = runs;
+            shared.place(at, object);
+        }
+        if ids.is_empty() {
+            return;
+        }
+        // Each CLAS header's resource ID, words 2 and 3.
+        let bytes: Vec<u8> = ids.iter().flat_map(|(_, id)| id.to_le_bytes()).collect();
+        let mut m = self.scratch_memory(MemoryKind::Upload, bytes.len() as u64, "cluster ids");
+        m.as_mut_slice().unwrap()[..bytes.len()].copy_from_slice(&bytes);
+        let src = m.gpu().address().0;
+        let jobs: Vec<CopyJob> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, &(at, _))| CopyJob {
+                src: src + 8 * i as u64,
+                dst: at + 8,
+                words: 2,
+                pad: 0,
+            })
+            .collect();
+        self.keep.push(Box::new(m));
+        let copy = Kernels::get(&shared).copy_words.clone();
+        self.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+        self.run_jobs(&copy, &jobs);
+        self.encode_builds(builds);
     }
 
     /// Cluster BLAS builds.
@@ -1018,6 +1136,7 @@ impl CommandList<'_> {
                     tris: 0,
                     verts: 0,
                     opaque: false,
+                    runs: Vec::new(),
                     raw: Some(s),
                 },
             );
@@ -1035,22 +1154,32 @@ impl CommandList<'_> {
     fn build_flat(&mut self, clas: &[Vec<u64>], addresses: &[u64]) {
         let shared = Arc::clone(&self.queue.shared);
         // Each BLAS's opaque and other triangles, gathered unindexed.
-        let shapes: Vec<Vec<(u64, u32, bool)>> = {
+        // Each BLAS's CLAS runs by (geometry index, opacity), each gathered unindexed into one
+        // geometry.
+        type Groups = BTreeMap<(u32, bool), Vec<(u64, Run)>>;
+        let groups: Vec<Groups> = {
             let objects = lock(&shared.objects);
             clas.iter()
                 .map(|list| {
-                    list.iter()
-                        .map(|a| {
-                            let o = objects.by_start.get(a).unwrap_or_else(|| {
-                                panic!("a cluster BLAS over {a:#x}, which holds no CLAS")
-                            });
-                            (*a, o.tris, o.opaque)
-                        })
-                        .collect()
+                    let mut g = Groups::new();
+                    for a in list {
+                        let o = objects.by_start.get(a).unwrap_or_else(|| {
+                            panic!("a cluster BLAS over {a:#x}, which holds no CLAS")
+                        });
+                        for r in &o.runs {
+                            g.entry((r.geometry, r.opaque)).or_default().push((*a, *r));
+                        }
+                    }
+                    g
                 })
                 .collect()
         };
-        let total: u64 = shapes.iter().flatten().map(|&(_, t, _)| u64::from(t)).sum();
+        let total: u64 = groups
+            .iter()
+            .flat_map(BTreeMap::values)
+            .flatten()
+            .map(|(_, r)| u64::from(r.count))
+            .sum();
         let vertices =
             self.scratch_memory(MemoryKind::DeviceLocal, 36 * total, "flat BLAS vertices");
         let data = self.scratch_memory(
@@ -1062,24 +1191,32 @@ impl CommandList<'_> {
         let mut jobs = Vec::new();
         let mut builds = Vec::new();
         let mut headers = Vec::new();
-        for (list, &at) in shapes.iter().zip(addresses) {
+        for (g, &at) in groups.iter().zip(addresses) {
             let mut geometries = Vec::new();
-            for opaque in [true, false] {
+            for (&(geometry, opaque), runs) in g {
                 let (v0, d0) = (v_at, d_at);
                 let mut tris = 0;
-                for &(clas, t, _) in list.iter().filter(|&&(_, _, o)| o == opaque) {
+                for &(clas, r) in runs {
                     jobs.push(GatherJob {
                         clas,
                         vertices: v_at,
                         data: d_at,
+                        first: r.first,
+                        count: r.count,
                     });
-                    v_at += 36 * u64::from(t);
-                    d_at += DATA_BYTES * u64::from(t);
-                    tris += t;
+                    v_at += 36 * u64::from(r.count);
+                    d_at += DATA_BYTES * u64::from(r.count);
+                    tris += r.count;
                 }
-                if tris > 0 {
-                    geometries.push(triangles(v0, 3 * u64::from(tris), 0, tris, d0, opaque));
-                }
+                geometries.push(triangles(
+                    v0,
+                    3 * u64::from(tris),
+                    0,
+                    tris,
+                    d0,
+                    opaque,
+                    geometry,
+                ));
             }
             let (s, kind) = if geometries.is_empty() {
                 // No triangles: an instance structure over none.
@@ -1099,6 +1236,7 @@ impl CommandList<'_> {
                     tris: 0,
                     verts: 0,
                     opaque: false,
+                    runs: Vec::new(),
                     raw: Some(raw),
                 },
             );
@@ -1219,6 +1357,7 @@ impl CommandList<'_> {
                         tris: 0,
                         verts: 0,
                         opaque: false,
+                        runs: Vec::new(),
                         raw: Some(raw.clone()),
                     },
                 );
@@ -1278,7 +1417,16 @@ impl CommandList<'_> {
             }
         }
         self.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-        let h = header(Kind::Ptlas, size, id, &[l.instances, l.partitions]);
+        // Words 12 to 14: the instance descriptors' address and stride, which ray tracing
+        // pipelines read as a classic TLAS's (`accel.rs`).
+        let instances = ptlas_instances(state, l.instances, l.partitions);
+        let mut extra = [0u32; 11];
+        extra[0] = l.instances;
+        extra[1] = l.partitions;
+        extra[8] = instances as u32;
+        extra[9] = (instances >> 32) as u32;
+        extra[10] = INSTANCE_BYTES as u32;
+        let h = header(Kind::Ptlas, size, id, &extra);
         self.write_headers(&[(state, h)]);
         for op in 0..3 {
             self.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
@@ -1312,6 +1460,7 @@ struct PackJob {
     dst: u64,
     id: u64,
     record: u64,
+    keys: u64,
     kind: u32,
     pad: u32,
 }
@@ -1331,6 +1480,8 @@ struct GatherJob {
     clas: u64,
     vertices: u64,
     data: u64,
+    first: u32,
+    count: u32,
 }
 
 #[repr(C)]
