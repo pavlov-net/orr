@@ -113,12 +113,13 @@ public struct PhotonSourceGpu
     public EyeInterior* interiors;
     public uint entry_count;
     public float total;             // the last value of `cdf`
-    // The grid's finest level this frame, the frames resolved at it before this one, and the
-    // level the next frame takes, which the resolve's `finish` sets after this frame's reads.
+    // The grid's finest level this frame, the frames resolved at it before this one, the level
+    // the next frame takes, which the resolve's `finish` sets after this frame's reads, and the
+    // coarsest level this frame, which the origin's cell allows.
     public uint finest;
     public uint held;
     public uint next_finest;
-    public uint _pad0;
+    public uint top;
 }
 
 // A reference photon: where it deposited, the receiver's geometric normal on its side, its flux
@@ -167,17 +168,12 @@ public struct CausticsGpu
 // The grid levels a point `distance` m from the focus reads: the first and, in `blend`, the
 // share of the next coarser, which its reads take with that probability. None is finer than
 // the frame's finest level.
-public uint caustic_level(CausticsGpu* g, SceneRoot* s, float distance, out float blend)
+public uint caustic_level(CausticsGpu* g, float distance, out float blend)
 {
-    float level = clamp(log2(max(distance, 1e-6) / g.lod_scale), float(g.source.finest), float(caustic_max_level(g, s)));
+    float level = clamp(log2(max(distance, 1e-6) / g.lod_scale), float(g.source.finest), float(g.source.top));
     float first = floor(level);
     blend = level - first;
     return uint(first);
-}
-
-public uint caustic_max_level(CausticsGpu* g, SceneRoot* s)
-{
-    return caustic_max_level(s, g.base_cell_log2);
 }
 
 public uint caustic_max_level(SceneRoot* s, int base_cell_log2)
@@ -254,8 +250,8 @@ void add_wide(uint* low, uint* high, float v, float u)
 public void grid_deposit(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float3 flux, float4 u)
 {
     float blend;
-    uint level = caustic_level(g, s, length(p - g.focus), blend);
-    uint top = caustic_max_level(g, s);
+    uint level = caustic_level(g, length(p - g.focus), blend);
+    uint top = g.source.top;
     float3 a = abs(n);
     uint first = a.x >= a.y && a.x >= a.z ? 0 : a.y >= a.z ? 1 : 2;
     float3 per_cosine = flux / asfloat(g.counters[CAUSTIC_QUANTUM]);
@@ -318,8 +314,8 @@ bool grid_cell(CausticsGpu* g, uint2 key, out float3 irradiance, out float photo
 public float3 grid_irradiance(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float width, float4 u)
 {
     float blend;
-    uint level = caustic_level(g, s, length(p - g.focus), blend);
-    uint top = caustic_max_level(g, s);
+    uint level = caustic_level(g, length(p - g.focus), blend);
+    uint top = g.source.top;
     uint bucket = read_bucket(n, u.y);
     uint axis = (bucket - 1) / 2;
     float3 t, b;

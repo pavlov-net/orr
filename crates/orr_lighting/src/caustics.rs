@@ -485,14 +485,11 @@ impl Caustics {
             slot,
             resolve::Root {
                 caustics: self.roots.at(slot),
-                scene,
                 stats: self.readback.gpu().offset(slot as u64),
                 capacity: capacity as u32,
                 cell_lifetime: s.cell_lifetime,
                 max_temporal_samples: s.max_temporal_samples,
                 clear: u32::from(clear),
-                _pad0: 0,
-                _pad1: 0,
             },
         );
         let p = &self.pipelines;
@@ -603,14 +600,11 @@ impl Caustics {
             slot,
             resolve::Root {
                 caustics: root,
-                scene: GpuPtr::NULL,
                 stats: GpuPtr::NULL,
                 capacity: heads as u32,
                 cell_lifetime: 0,
                 max_temporal_samples: 0.0,
                 clear: 0,
-                _pad0: 0,
-                _pad1: 0,
             },
         );
         list.dispatch(&self.pipelines.heads, clear, resolve_grid(heads));

@@ -8,21 +8,17 @@
 import orr_color.luminance;
 import orr_shaders.math;
 import orr_shaders.packing;
-import orr_scene.tables;
 import orr_lighting.caustics;
 import orr_lighting.world_cache;
 
 struct Root
 {
     CausticsGpu* caustics;
-    SceneRoot* scene;               // null for a map
     CausticStatsGpu* stats;         // the frame slot's readback; null for a map
     uint capacity;                  // grid cells or map heads
     uint cell_lifetime;             // frames without a deposit before eviction
     float max_temporal_samples;
     uint clear;                     // 1: start the quantum over
-    uint _pad0;
-    uint _pad1;
 }
 ORR_ROOT(Root);
 
@@ -188,7 +184,7 @@ void finish()
     // run measured nothing, and the resolve takes each counted frame a cell was absent as 0. The
     // move waits for the next frame's `weigh`, since this frame's gathers read at this level.
     float load = float(n[CAUSTIC_OCCUPIED]) / float(root.capacity);
-    uint top = caustic_max_level(root.caustics, root.scene);
+    uint top = p.top;
     uint finest = p.finest;
     uint held = p.held + 1;
     if (held > root.cell_lifetime && ((load > CAUSTIC_LOAD_HIGH && finest < top) || (load < CAUSTIC_LOAD_LOW && finest > 0)))

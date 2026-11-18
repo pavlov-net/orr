@@ -351,6 +351,7 @@ void weigh(uint lane: SV_GroupIndex)
         p.held = 0;
     }
     p.finest = min(p.next_finest, top);
+    p.top = top;
 }
 
 // A point on light `id` (a feedback id) to walk out from, and the way out: a sphere or rect
