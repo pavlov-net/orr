@@ -1127,6 +1127,9 @@ impl PathPipeline {
                 table.disperse.map(ShaderRecord::new),
             ],
             max_recursion: 1,
+            // A closest-hit or callable a raygen runs calls the gather, map gather, disperse
+            // and emitter view callables.
+            call_depth: 2,
             flags: RayPipelineFlags::scene(device.caps()),
             threads,
         };

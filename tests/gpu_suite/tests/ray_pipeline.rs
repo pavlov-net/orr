@@ -127,6 +127,7 @@ fn create(salt: u32, threads: CompileThreads<'_>, flags: RayPipelineFlags) -> Ra
             Some(ShaderRecord::new(12)),
         ],
         max_recursion: 1,
+        call_depth: 1,
         flags: flags | RayPipelineFlags::CLUSTERS,
         threads,
     };

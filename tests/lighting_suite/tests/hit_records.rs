@@ -78,6 +78,7 @@ fn create_pipeline() -> (RayPipeline, HitGroups) {
         ],
         callables: &[],
         max_recursion: 1,
+        call_depth: 1,
         flags: RayPipelineFlags::scene(device().caps()),
         threads: CompileThreads::default(),
     };
