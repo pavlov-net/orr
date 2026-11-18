@@ -938,49 +938,10 @@ public Walk walk_interior(float3 from, float3 dir, InteriorMedium im, float ior,
     return walk_start(from, sample_hg(im.anisotropy, dir, u), volume, ior, walk);
 }
 
-// What a path records about its vertices as it traces them.
-public interface IPathRecord
-{
-    // Whether an opaque hit past `scattered` opaque vertices and scatters (x1 is the first)
-    // may end the path in the cache, given that the ray reaching it left a diffuse lobe, that
-    // its cone is wider than the hit's cell, and that it is the last bounce's.
-    bool may_end(uint scattered, bool diffuse, bool wide, bool last);
-    // Whether its subsurface vertices may walk; where they do not, their subsurface share is
-    // diffuse reflection.
-    bool walks();
-    // Whether its paths carry flux from a light rather than importance from the camera, so
-    // refraction leaves their weight unscaled.
-    bool adjoint();
-    // Whether it is a caustic photon's: it estimates no light, deposits where it meets a
-    // surface after a chain vertex, and ends at its first vertex that is not one.
-    bool photon();
-    // Whether dispersive materials split its paths by wavelength.
-    bool spectral();
-    // Whether the ray leaving x1 resolves particles by their emission.
-    bool particles();
-    // The path reached its first vertex `x`, prepared as `b` (`t` m from the eye), a layer's
-    // where `layer` holds; a sky pixel's path reaches none.
-    [mutating]
-    void arrive(PathRoot r, PathVertex x, Bsdf b, float t, bool layer);
-    // Vertex `x`, prepared as `b`, reached with `throughput` once the path's radiance (its
-    // emission included) was `radiance`; next-event estimation and a BSDF ray follow it.
-    [mutating]
-    void vertex(PathRoot r, PathVertex x, Bsdf b, float3 throughput, float3 radiance, inout Sampler rng);
-    // A photon of flux `flux` met vertex `l`, prepared as `b`, past a chain vertex.
-    [mutating]
-    void deposit(PathRoot r, LayerVertex l, Bsdf b, float3 flux, inout Sampler rng);
-    // Light with feedback id `id` added `contribution` of luminance to the path's radiance.
-    [mutating]
-    void light(uint id, float contribution);
-    // The path ended with `radiance` after `layers` layer vertices.
-    [mutating]
-    void finish(PathRoot r, float3 radiance, uint layers);
-}
-
 // An update path: it resamples the cache from its second opaque vertex on, and adds to the
 // cell of each of its first `UPDATE_VERTICES` opaque vertices the light that vertex scattered,
 // over its albedo.
-public struct CacheUpdate : IPathRecord
+public struct CacheUpdate
 {
     uint count;
     uint2 keys[UPDATE_VERTICES];
@@ -998,71 +959,27 @@ public struct CacheUpdate : IPathRecord
         }
     }
 
-    public bool may_end(uint scattered, bool diffuse, bool wide, bool last)
-    {
-        return scattered >= 2;
-    }
-
-    // The cache holds the zero mean free path limit of subsurface surfaces.
-    public bool walks()
-    {
-        return false;
-    }
-
-    public bool adjoint()
-    {
-        return false;
-    }
-
-    public bool photon()
-    {
-        return false;
-    }
-
-    public bool spectral()
-    {
-        return false;
-    }
-
-    public bool particles()
-    {
-        return false;
-    }
-
+    // The path reached a vertex at `position` with geometric normal `normal` whose albedo, as the
+    // cache holds light by it, times the path's throughput is `albedo`, with `radiance` gathered,
+    // and drew `u` for it: whether it adds to a cell for the vertex, and that cell's `key`.
     [mutating]
-    public void arrive(PathRoot r, PathVertex x, Bsdf b, float t, bool layer) {}
-
-    [mutating]
-    public void vertex(PathRoot r, PathVertex x, Bsdf b, float3 throughput, float3 radiance, inout Sampler rng)
+    public bool vertex(PathRoot r, float3 albedo, float3 position, float3 normal, float3 radiance, float u, out uint2 key)
     {
-        float u = rng.next();
-        if (count >= UPDATE_VERTICES)
-            return;
-        vertex_at(r, cache_albedo(b.albedo(), x.surface.bsdf) * throughput, x.surface.position, x.surface.geometric_normal, radiance, u);
-    }
-
-    // `vertex` of a vertex at `position` with geometric normal `normal` whose albedo, as the cache
-    // holds light by it, times the path's throughput is `albedo`, from its draw `u`.
-    [mutating]
-    public void vertex_at(PathRoot r, float3 albedo, float3 position, float3 normal, float3 radiance, float u)
-    {
+        key = uint2(0);
         if (count >= UPDATE_VERTICES || !any(albedo > 1e-6))
-            return;
+            return false;
         CacheCell cell = cache_cell(r.cache, r.scene, position, normal, float3(0.5, 0.5, u), false);
+        key = cell.key;
         keys[count] = cell.key;
         scale[count] = select(albedo > 1e-6, 1.0 / albedo, float3(0.0));
         before[count] = radiance;
         count++;
+        return true;
     }
 
+    // The path ended with `radiance`.
     [mutating]
-    public void deposit(PathRoot r, LayerVertex l, Bsdf b, float3 flux, inout Sampler rng) {}
-
-    [mutating]
-    public void light(uint id, float contribution) {}
-
-    [mutating]
-    public void finish(PathRoot r, float3 radiance, uint layers)
+    public void finish(PathRoot r, float3 radiance)
     {
         for (uint i = 0; i < count; i++)
             cache_add(r.cache, keys[i], (radiance - before[i]) * scale[i]);

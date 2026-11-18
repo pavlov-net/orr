@@ -1,11 +1,12 @@
 //! The world cache: keys across render origins, probing and eviction against a CPU model,
 //! the sample guards, the reset, the global light rescale and the responsive class, then
-//! cache-terminated paths on the bed against the reference and through a fall of the light.
+//! cache-terminated paths on the bed against the reference, where rays are short too, and
+//! through a fall of the light.
 
 use bytemuck::Zeroable;
 use lighting_suite::bed::{
-    Accumulated, Analytic, Bed, CLOUD_SPHERE, CONVERGES, CORNELL, Converges, EMITTER, FLOOR, Item,
-    Paths, SKY, Spec, WHITE_SPHERE, assert_converges, reference,
+    Accumulated, Analytic, Bed, CLOUD_SPHERE, CONVERGES, CORNELL, Converges, EMITTER, FLOOR, GRASS,
+    GROOVES, Item, Paths, SKY, Spec, WHITE_SPHERE, assert_converges, reference,
 };
 use lighting_suite::shaders::cache_probe;
 use lighting_suite::{TestScene, assert_clean, finish, pipeline, readback, render, upload};
@@ -864,5 +865,40 @@ fn update_paths_fill_the_cache_inside_an_interior() {
         &truth,
         tolerance,
     );
+    assert_clean();
+}
+
+/// The realtime path against the reference where many rays are short: in grass, whose rays
+/// between blades are, and in V-grooves, whose faces share a normal bucket. The whole image
+/// within 1% once the cache is warm.
+#[test]
+fn cache_terminated_paths_match_the_reference_where_rays_are_short() {
+    for (copies, grass) in [
+        (vec![at(FLOOR, Vec3::ZERO), at(GRASS, Vec3::ZERO)], true),
+        (vec![at(GROOVES, Vec3::ZERO)], false),
+    ] {
+        let mut bed = Bed::with(Spec {
+            environment: Some(SKY),
+            ..day_spec(copies, Vec3::new(0.0, 1.0, 1.6), Vec3::ZERO)
+        });
+        bed.set_pre_exposure(1.0 / 64.0);
+        let warm = 256;
+        let frames = 1024;
+        let realtime_paths = paths(realtime());
+        render_paths(&mut bed, &realtime_paths, 0, warm);
+        let cached = render_paths(&mut bed, &realtime_paths, warm, frames);
+        let s = bed.lighting.stats(bed.last_frame()).unwrap().world_cache;
+        // In grass the comparison is of the cache's light.
+        assert!(!grass || s.hits > 0, "grass: {s:?}");
+        let truth = render_paths(&mut bed, &paths(reference(32)), 0, frames);
+        let (a, b) = (
+            luminance(surface_mean(&cached)),
+            luminance(surface_mean(&truth)),
+        );
+        assert!(
+            (a / b - 1.0).abs() < 0.01,
+            "grass {grass}: image {a} against {b}, {s:?}"
+        );
+    }
     assert_clean();
 }

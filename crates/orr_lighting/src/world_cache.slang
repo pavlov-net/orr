@@ -66,8 +66,8 @@ public static const float CACHE_DELTA_RATE = 0.25;
 public static const float CACHE_RESPONSIVE_DELTA = 0.3;
 public static const float CACHE_CHANGE_MAX = 64.0;
 
-// A path may end in a cell only when the ray that reached it is longer than this many cell
-// edges, so it never reads the cell it left.
+// A voxel's diagonal in cell edges: a ray longer than this many reaches a voxel other than its
+// start's.
 public static const float CACHE_MIN_RAY_CELLS = 1.7320508;
 
 // `WorldCacheGpu.counters`, by index. The views of a frame count cache lookups that may end
@@ -161,6 +161,12 @@ public uint2 cache_key(int4 origin_cell, float3 p, int k, uint level, uint bucke
     uint high = (y >> (32 - CACHE_AXIS_BITS)) | (z << (2 * CACHE_AXIS_BITS - 32))
         | (level << (CACHE_LEVEL_SHIFT - 32)) | (bucket << (CACHE_BUCKET_SHIFT - 32));
     return uint2(low, high);
+}
+
+// The normal bucket of a cell by its key.
+public uint key_bucket(uint2 key)
+{
+    return key.y >> (CACHE_BUCKET_SHIFT - 32);
 }
 
 // Levels above 0 a scene's cache uses: voxels grow to the cell edge.

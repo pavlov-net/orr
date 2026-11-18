@@ -1012,10 +1012,28 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     if (alive && cache && !first && !LAYER)
     {
         CacheCell cell = cache_cell(r.cache, r.scene, g.position, g.geometric_normal, u_cell, true);
-        bool wide = cone.x > cell.size;
-        bool ends = update ? scattered >= 2 : was_diffuse || wide || opaque == r.max_bounces + 2;
+        bool ends;
+        if (update)
+        {
+            // An update path ends in no cell it last added to, whose light would feed on itself.
+            ends = scattered >= 2 && any(cell.key != load_coherent(path_record(r, slot) + UPDATE_CELL_AT).xy);
+        }
+        else
+        {
+            // A cell holds the light of its voxel as update paths from the view meet it, and a
+            // short ray from a surface in the hit's normal bucket meets it otherwise, as the faces
+            // of a groove meet each other. A view path ends there only where its ray is longer
+            // than a voxel's diagonal or the vertex it left lies in another bucket by its shading
+            // normal, the one normal the path keeps. The last bounce's hit ends there regardless:
+            // no ray past it finds the light another way.
+            bool last = opaque == r.max_bounces + 2;
+            float3 left = left_normal(w0.w, load_coherent(at + 1));
+            bool apart = t > CACHE_MIN_RAY_CELLS * cell.size
+                || (any(left != 0.0) && normal_bucket(left) != key_bucket(cell.key));
+            ends = last || ((was_diffuse || cone.x > cell.size) && apart);
+        }
         float3 cached;
-        if (ends && t > CACHE_MIN_RAY_CELLS * cell.size && cache_lookup(r.cache, cell.key, cached))
+        if (ends && cache_lookup(r.cache, cell.key, cached))
         {
             if (along)
                 added += throughput * cache_albedo(b.albedo(), g.bsdf) * cached;

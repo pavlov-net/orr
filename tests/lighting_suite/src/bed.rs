@@ -304,6 +304,13 @@ pub const QUADRANT_EMITTER: &str = "quadrant emitter";
 pub const SKINNED_EMITTER: &str = "skinned emitter";
 /// The alpha-tested 2 m quad of rings, facing +z, with opacity micromaps.
 pub const LEAF: &str = "leaf";
+/// A 3 m square of upright diffuse blades 25 cm tall and 1.5 cm wide, double-sided, one on each
+/// point of a 4 cm grid around its origin, jittered and turned about y: a dense patch, whose
+/// rays between blades are short.
+pub const GRASS: &str = "grass";
+/// A 3 m square of diffuse V-grooves 4 cm wide along x, around its origin and below it, their
+/// faces 35 degrees off up: a concave surface whose faces share a world cache normal bucket.
+pub const GROOVES: &str = "grooves";
 /// [`LEAF`] cooked without opacity micromaps.
 pub const BARE_LEAF: &str = "bare leaf";
 /// An upright green 2 m square facing +z, thin-walled with a full subsurface, which carries light
@@ -770,6 +777,64 @@ fn upright(half: f32) -> MeshInput {
     mesh(|b| b.quad(0, upright_square(half), Vec3::Z, 1))
 }
 
+/// [`GRASS`]: the blades' grid points are jittered by up to a third of the spacing, and the
+/// blades turned about y, by a hash of the point.
+fn grass() -> MeshInput {
+    const SPACING: f32 = 0.04;
+    let hash = |i: u32, j: u32, k: u32| {
+        let mut h =
+            i.wrapping_mul(0x9E37_79B9) ^ j.wrapping_mul(0x85EB_CA6B) ^ k.wrapping_mul(0xC2B2_AE35);
+        h ^= h >> 16;
+        h = h.wrapping_mul(0x7FEB_352D);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x846C_A68B);
+        h ^= h >> 16;
+        h as f32 / u32::MAX as f32
+    };
+    mesh(|b| {
+        let n = (3.0 / SPACING) as u32;
+        let up = Vec3::new(0.0, 0.25, 0.0);
+        for j in 0..n {
+            for i in 0..n {
+                let jitter = |k| (hash(i, j, k) - 0.5) * (2.0 / 3.0) * SPACING;
+                let c = Vec3::new(
+                    (i as f32 + 0.5) * SPACING - 1.5 + jitter(0),
+                    0.0,
+                    (j as f32 + 0.5) * SPACING - 1.5 + jitter(1),
+                );
+                let angle = hash(i, j, 2) * std::f32::consts::PI;
+                let along = Vec3::new(angle.cos(), 0.0, angle.sin()) * 0.0075;
+                let normal = Vec3::new(-angle.sin(), 0.0, angle.cos());
+                b.quad(
+                    0,
+                    [c - along, c + along, c + along + up, c - along + up],
+                    normal,
+                    1,
+                );
+            }
+        }
+    })
+}
+
+/// [`GROOVES`].
+fn grooves() -> MeshInput {
+    let half = 0.02;
+    let slope = 35f32.to_radians();
+    let (s, c) = slope.sin_cos();
+    let depth = half * slope.tan();
+    let line = |y: f32, z: f32| (Vec3::new(-1.5, y, z), Vec3::new(1.5, y, z));
+    mesh(|b| {
+        for k in 0..75 {
+            let z = -1.5 + 2.0 * half * k as f32;
+            let (a0, a1) = line(0.0, z);
+            let (m0, m1) = line(-depth, z + half);
+            let (e0, e1) = line(0.0, z + 2.0 * half);
+            b.quad(0, [a0, a1, m1, m0], Vec3::new(0.0, c, s), 1);
+            b.quad(0, [m0, m1, e1, e0], Vec3::new(0.0, c, -s), 1);
+        }
+    })
+}
+
 fn mesh(build: impl FnOnce(&mut MeshBuilder)) -> MeshInput {
     let mut b = MeshBuilder::default();
     build(&mut b);
@@ -1025,6 +1090,10 @@ fn cook() -> Arc<[u8]> {
         ..Material::default()
     };
     let white = diffuse([0.73; 3]);
+    let grass_blade = Material {
+        double_sided: 1,
+        ..diffuse([0.3, 0.6, 0.2])
+    };
     let mirror = Material {
         base_color: [1.0; 3],
         metalness: 1.0,
@@ -1387,6 +1456,8 @@ fn cook() -> Arc<[u8]> {
                     }),
                     vec![emitter],
                 ),
+                model(GRASS, grass(), vec![grass_blade]),
+                model(GROOVES, grooves(), vec![diffuse([0.8; 3])]),
                 model(LEAF, upright(1.0), vec![leaf]),
                 model(TRANSLUCENT_SHEET, upright(1.0), vec![sheet]),
                 AssetSpec {

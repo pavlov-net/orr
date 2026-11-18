@@ -1250,6 +1250,7 @@ public void update_paths(PathRoot r)
     uint4* at = path_hot(r, slot);
     uint4* record = path_record(r, slot);
     CacheUpdate update = CacheUpdate();
+    store_coherent(record + UPDATE_CELL_AT, uint4(0));
     uint state = pcg3d(uint3(pixel, r.frame ^ path_stream(r))).y;
     start_path(r, slot, pixel, at, path_cold(r, slot), 1.0, false, layered(r, pixel));
     Payload first;
@@ -1266,7 +1267,9 @@ public void update_paths(PathRoot r)
             uint4 a = load_coherent(record + UPDATE_VERTEX_AT);
             uint4 b = load_coherent(record + UPDATE_VERTEX_AT + 1);
             state = pcg(state);
-            update.vertex_at(r, asfloat(b.xyz), asfloat(a.xyz), oct_decode_snorm16(a.w), asfloat(load_coherent(at + 3).xyz), unit_float(state));
+            uint2 key;
+            if (update.vertex(r, asfloat(b.xyz), asfloat(a.xyz), oct_decode_snorm16(a.w), asfloat(load_coherent(at + 3).xyz), unit_float(state), key))
+                store_coherent(record + UPDATE_CELL_AT, uint4(key, 0, 0));
             store_coherent(at, uint4(w0.xyz, w0.w & ~HOT_ARRIVED));
         }
         if ((w0.w & HOT_SHADOW) != 0)
@@ -1291,5 +1294,5 @@ public void update_paths(PathRoot r)
         else if (h.hit() && may(MAY_LAYERS) && layer_record(h) && may(MAY_INTERIORS) && may2(MAY2_THIN_DIELECTRICS))
             trail.exterior = asfloat(p.words.z);
     }
-    update.finish(r, asfloat(load_coherent(at + 3).xyz), 0);
+    update.finish(r, asfloat(load_coherent(at + 3).xyz));
 }

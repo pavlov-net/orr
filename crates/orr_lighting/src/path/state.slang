@@ -550,10 +550,12 @@ public static const uint PHOTON_DEPOSITED = 1u << 31;
 // A view path's record, a word in its slot of the launch's records: the light its feedback names,
 // one of those that lit it, kept in proportion to what each added (`view_light`).
 [Host] public static const uint PATH_VIEW_RECORD_WORDS = 1;
-// An update path's: its `CacheUpdate`, then the vertex its last hit left for the raygen to record,
-// two words (`UpdateVertex`).
-[Host] public static const uint PATH_UPDATE_RECORD_WORDS = 11;
-public static const uint UPDATE_VERTEX_AT = 9;
+// An update path's: the key of the cell it last added to in its first word's first two lanes, 0
+// (no cell's key) before it adds to one, then the vertex its last hit left for the raygen to
+// record, two words (`UpdateVertex`).
+[Host] public static const uint PATH_UPDATE_RECORD_WORDS = 3;
+public static const uint UPDATE_CELL_AT = 0;
+public static const uint UPDATE_VERTEX_AT = 1;
 
 // What an update path's hit leaves of its vertex, which the raygen adds to the path's record.
 public struct UpdateVertex
