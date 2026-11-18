@@ -154,10 +154,6 @@ pub enum Error {
         kernel: &'static str,
         message: String,
     },
-    /// A stage of a path pipeline, or the pipeline, is over the cap on what it may hand the
-    /// driver.
-    #[error("path pipeline: {0}")]
-    StageSize(String),
     /// A replacement kernel does not match the module it replaces.
     #[error("kernel {kernel}: {reason}")]
     Kernel {

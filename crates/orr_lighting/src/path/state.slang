@@ -90,9 +90,13 @@ public static const uint PAYLOAD_BENT = 1;
 // largest shader up to 128, past which that shader spills.
 [Host] public static const uint HIT_REGISTERS = 128;
 [Host] public static const uint ANY_HIT_REGISTERS = 64;
-// The most instructions a stage may hand the driver, by what it does, and the stages of a
-// pipeline together: the driver compiles a pipeline's stages side by side, so its largest stage
-// sets how long a cold start waits, and the total what the threads share.
+// The caps on what a stage hands the driver, in instructions after the fold, by what it does: a
+// growth budget on orr's own code per stage role, which a feature's allowance adds to where the
+// pipeline's mask keeps the feature. A cap is raised only as a stated decision with its reason.
+// Instruction counts track the driver's CPU work, so a cap catches a heavy body inlined at one more
+// site; they track neither a cold compile's wall time nor a pass's time, which are measured as
+// themselves. Tests hold orr's stages to their caps over the masks that matter; a pipeline over
+// one is still made, with a warning.
 [Host] public static const uint RAYGEN_INSTRUCTIONS = 4000;
 [Host] public static const uint MISS_INSTRUCTIONS = 4000;
 // What a raygen holds more where the scene may hold a layer: the camera ray's search for layers,
@@ -213,12 +217,11 @@ public static const uint CALL_WALK_MEETS = 15;
 // subsurface lobe, the start of its walk and what it leaves of the surface where a walk leaves.
 [Host] public static const uint WALK_HIT_INSTRUCTIONS = 5400;
 // A hit's cap is the standard surface's hit on a copy's clusters, with every scene flag set; the
-// standard alpha test's any-hit likewise. They stand for the cold compile of the pipeline and the
-// weight of the shaders at run time, and what is left in either is not code held twice. A stage
-// made for producer entries, or for both kinds of geometry, adds what resolves a producer's
-// triangle. The caps hold orr's own code: what an application's linked types add to a stage (a
-// medium, an environment, a surface's own code in the stage made for it) is the application's,
-// so the host reports each part and holds it to the pipeline's cap alone.
+// standard alpha test's any-hit likewise. A stage made for producer entries, or for both kinds of
+// geometry, adds what resolves a producer's triangle where the scene may hold producer entries.
+// The caps hold orr's own code: what an application's linked types add to a stage (a medium, an
+// environment, a surface's own code in the stage made for it) is the application's, so the host
+// reports each part and holds it to the pipeline's cap alone.
 [Host] public static const uint HIT_INSTRUCTIONS = 46000;
 [Host] public static const uint ANY_HIT_INSTRUCTIONS = 4800;
 [Host] public static const uint PRODUCER_HIT_INSTRUCTIONS = 2000;
@@ -241,8 +244,8 @@ public static const uint CALL_WALK_MEETS = 15;
 // What a hit holds more where the scene's paths may lie in an interior: the medium's
 // transmittance over the whole of a ray inside it, from the surface its origin lies off.
 [Host] public static const uint INTERIOR_HIT_INSTRUCTIONS = 100;
-// The stages of a pipeline together. What it stands for is the cold compile of the largest
-// pipeline a full scene links, linked surface types and water among them: under 10 s.
+// The stages of a pipeline together, linked types' code among them: room for the largest pipeline
+// a full scene links, linked surface types and water among them.
 [Host] public static const uint PIPELINE_INSTRUCTIONS = 1500000;
 
 // `PathHot.flags`.

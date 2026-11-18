@@ -112,33 +112,6 @@ public bool two_passes(PathRoot r, uint2 pixel)
     return r.layers[pixel.y * r.gbuffer.extent.x + pixel.x].frost != 0;
 }
 
-// The camera ray a path of `pixel` starts with, as its source makes it: a view's
-// on a traced tile or through the lens, the background layer's, or a photon's, whose hit is
-// given.
-public PathStart camera_start(PathRoot r, uint2 pixel)
-{
-    if (from_photon(r))
-    {
-        PathStart given = PathStart();
-        given.mask = MASK_OPAQUE | MASK_DIELECTRIC;
-        given.given = true;
-        return given;
-    }
-    if (from_background(r))
-    {
-        float mask = r.dof_mask.get<Texture2D<float>>().Load(int3(pixel, 0));
-        float near = r.view.clip_from_view[2][3];
-        Sampler rng = Sampler(pixel, r.frame, r.seed ^ DOF_STREAM);
-        return lens_start(r, pixel, r.dof_aperture, *r.dof_focus, near / mask, MASK_CAMERA | MASK_DIELECTRIC, rng);
-    }
-    if (thin_lens(r))
-    {
-        Sampler rng = Sampler(pixel, r.frame, r.seed);
-        return lens_start(r, pixel, r.aperture_radius, r.focus_distance, 0.0, MASK_CAMERA | MASK_DIELECTRIC, rng);
-    }
-    return pinhole_start(r.view, r.gbuffer, pixel, true);
-}
-
 // Whether the root's mode is a debug view of the first vertex alone, which a view's start writes.
 public bool first_vertex_mode(PathRoot r)
 {

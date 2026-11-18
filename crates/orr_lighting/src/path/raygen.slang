@@ -1121,7 +1121,7 @@ public void background_paths<E : IEnvironment, M : IMedium>(PathRoot r)
     float near = v.clip_from_view[2][3];
     float4 texel;
     if (!(depth > 0.0))
-        texel = float4(apply_hdr_ceiling(pre_exposure * sky_radiance<E, M>(r.set, v.eye_render.xyz, camera_start(r, pixel).dir)), 0.0);
+        texel = float4(apply_hdr_ceiling(pre_exposure * sky_radiance<E, M>(r.set, v.eye_render.xyz, s.dir)), 0.0);
     else
         texel = float4(apply_hdr_ceiling(pre_exposure * radiance), near / depth);
     r.dof_background.get<RWTexture2D<float4>>()[pixel] = texel;

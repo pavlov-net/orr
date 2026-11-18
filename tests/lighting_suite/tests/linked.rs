@@ -330,7 +330,7 @@ const SCENE_MOST: u64 = u64::MAX >> 1;
 fn the_stages_of_a_pipeline_with_linked_surfaces_hold_their_caps() {
     use linked::surface::{CONTEXT, RINGS};
     let sizes = orr_lighting::path_stage_sizes(&linked::KERNELS, SCENE_MOST).unwrap();
-    assert_eq!(orr_lighting::over_cap(&sizes), None);
+    assert_eq!(orr_lighting::over_cap(&sizes), Vec::<String>::new());
     let own = |entry: &str, surface: u8| {
         let stage = sizes
             .iter()
@@ -371,7 +371,7 @@ fn the_stages_of_a_pipeline_with_linked_surfaces_hold_their_caps() {
 #[test]
 fn the_pipeline_that_may_meet_everything_holds_no_stage_per_linked_type() {
     let sizes = orr_lighting::path_stage_sizes(&linked::KERNELS, u64::MAX).unwrap();
-    assert_eq!(orr_lighting::over_cap(&sizes), None);
+    assert_eq!(orr_lighting::over_cap(&sizes), Vec::<String>::new());
     let shaded = |s: &&orr_lighting::StageSize| !s.geometry.is_empty();
     assert!(
         sizes

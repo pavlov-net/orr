@@ -1,6 +1,6 @@
 //! The pipeline of the path tracer: its stage table for what its paths may meet, each stage
-//! folded with that and held to a cap on what it hands the driver, its hit groups, and its
-//! creation.
+//! folded with that and measured against its cap on what it hands the driver, its hit groups, and
+//! its creation.
 
 use std::ffi::CString;
 use std::sync::Arc;
@@ -91,7 +91,7 @@ pub enum Role {
     Disperse,
 }
 
-/// The most instructions the stages of a pipeline may hand the driver together.
+/// What the stages of a pipeline may hand the driver together, linked types' code among it.
 pub const PIPELINE_CAP: u32 = PIPELINE_INSTRUCTIONS;
 
 /// The geometry a hit group's shaders run on, which their stages are made for.
@@ -197,159 +197,42 @@ impl Spec {
         surfaces != 0 && self.hit_surface != 0 && self.geometry.is_some()
     }
 
-    /// The most instructions the stage may hand the driver: its role's, with what a producer
-    /// entry's geometry adds to a hit or an any-hit shader. A stage made for a linked surface
-    /// has none of its own: it holds the application's code beside the standard stage's.
+    /// The cap on orr's own code in the stage: its role's, with each allowance its mask and kind
+    /// keep. A stage made for a linked surface has none of its own: it holds the application's
+    /// code beside the standard stage's.
     fn cap(&self, surfaces: u32) -> Option<u32> {
         if self.linked(surfaces) {
             return None;
         }
-        let producers = !matches!(self.geometry, None | Some(Geometry::Copies));
-        // Where the paths may meet a plane stack, a stage that runs a vertex holds its re-run for
-        // a bent job, and a layer's stage the stack question's answer and a crossing's track.
-        let stacks = self.may & MAY_STACK != 0;
-        let vertex_stack = if stacks { STACK_VERTEX_INSTRUCTIONS } else { 0 };
-        // Where the paths may gather caustic photons, a stage that runs a vertex holds whether it
-        // is a chain vertex, the light its paths find past chain vertices and the gather's call; a
-        // hit, a photon's vertex where the pipeline runs photons and the call of the reference
-        // map's gather where it may be the reference's.
-        let caustics = if self.may & MAY_CAUSTICS != 0 {
-            CAUSTIC_HIT_INSTRUCTIONS
-        } else {
-            0
+        let base = match self.role {
+            Role::Raygen => RAYGEN_INSTRUCTIONS,
+            Role::Miss => MISS_INSTRUCTIONS,
+            Role::Hit => HIT_INSTRUCTIONS,
+            Role::AnyHit => ANY_HIT_INSTRUCTIONS,
+            Role::Medium => MEDIUM_VERTEX_INSTRUCTIONS,
+            Role::Meets => WALK_MEETS_INSTRUCTIONS,
+            Role::Exit => WALK_EXIT_INSTRUCTIONS,
+            Role::PhotonRaygen => RAYGEN_PHOTON_INSTRUCTIONS,
+            Role::PhotonStart => PHOTON_START_INSTRUCTIONS,
+            Role::Deposit => DEPOSIT_INSTRUCTIONS,
+            Role::Gather => GATHER_INSTRUCTIONS,
+            Role::MapGather => MAP_GATHER_INSTRUCTIONS,
+            Role::Disperse => DISPERSE_INSTRUCTIONS,
+            Role::View => EMITTER_VIEW_INSTRUCTIONS,
+            Role::Stack => STACK_STEP_INSTRUCTIONS,
+            Role::Front => FRONT_INSTRUCTIONS,
+            Role::FrontAnyHit => FRONT_ANY_HIT_INSTRUCTIONS,
+            Role::LightBox => LIGHT_BOX_INSTRUCTIONS,
+            Role::ProxyBox => PROXY_INTERSECTION_INSTRUCTIONS,
+            Role::ProxyAnyHit => PROXY_ANY_HIT_INSTRUCTIONS,
+            Role::ProxyMarch => PROXY_MARCH_INSTRUCTIONS,
         };
-        let photon = if self.may & MAY_PHOTON != 0 {
-            PHOTON_HIT_INSTRUCTIONS
-        } else {
-            0
-        };
-        let map = if self.may & MAY_CAUSTICS != 0 && self.may & MAY_REFERENCE != 0 {
-            MAP_GATHER_HIT_INSTRUCTIONS
-        } else {
-            0
-        };
-        let (base, producer) = match self.role {
-            Role::Raygen => {
-                let layers = self.may & MAY_LAYERS != 0;
-                let walks = self.may & (MAY_SCATTERING | MAY_WALK) != 0;
-                let front = self.may & (MAY_PARTICLES | MAY_LOCAL_LIGHTS | MAY_MEDIUM) != 0;
-                let proxies = self.may & MAY_PROXIES != 0;
-                let lens = self.may & (MAY_LENS | MAY_BACKGROUND) != 0;
-                let dispersion = self.may & MAY_DISPERSION != 0;
-                return Some(
-                    RAYGEN_INSTRUCTIONS
-                        + if layers { RAYGEN_LAYER_INSTRUCTIONS } else { 0 }
-                        + if walks { RAYGEN_WALK_INSTRUCTIONS } else { 0 }
-                        + if stacks { RAYGEN_STACK_INSTRUCTIONS } else { 0 }
-                        + if front { RAYGEN_FRONT_INSTRUCTIONS } else { 0 }
-                        + if proxies {
-                            RAYGEN_PROXY_INSTRUCTIONS
-                        } else {
-                            0
-                        }
-                        + if lens { RAYGEN_LENS_INSTRUCTIONS } else { 0 }
-                        + if dispersion {
-                            RAYGEN_DISPERSION_INSTRUCTIONS
-                        } else {
-                            0
-                        },
-                );
-            }
-            Role::Miss => return Some(MISS_INSTRUCTIONS),
-            Role::Medium => return Some(MEDIUM_VERTEX_INSTRUCTIONS + vertex_stack + caustics),
-            Role::Meets => return Some(WALK_MEETS_INSTRUCTIONS + vertex_stack + caustics),
-            Role::Exit => return Some(WALK_EXIT_INSTRUCTIONS + vertex_stack + caustics),
-            Role::PhotonRaygen => return Some(RAYGEN_PHOTON_INSTRUCTIONS),
-            Role::PhotonStart => return Some(PHOTON_START_INSTRUCTIONS),
-            Role::Deposit => return Some(DEPOSIT_INSTRUCTIONS),
-            Role::Gather => return Some(GATHER_INSTRUCTIONS),
-            Role::MapGather => return Some(MAP_GATHER_INSTRUCTIONS),
-            Role::Disperse => return Some(DISPERSE_INSTRUCTIONS),
-            Role::View => return Some(EMITTER_VIEW_INSTRUCTIONS),
-            Role::Stack => return Some(STACK_STEP_INSTRUCTIONS),
-            Role::Front => return Some(FRONT_INSTRUCTIONS),
-            Role::FrontAnyHit => return Some(FRONT_ANY_HIT_INSTRUCTIONS),
-            Role::LightBox => return Some(LIGHT_BOX_INSTRUCTIONS),
-            Role::ProxyBox => return Some(PROXY_INTERSECTION_INSTRUCTIONS),
-            Role::ProxyAnyHit => return Some(PROXY_ANY_HIT_INSTRUCTIONS),
-            Role::ProxyMarch => return Some(PROXY_MARCH_INSTRUCTIONS),
-            Role::Hit => (HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS),
-            Role::AnyHit => (ANY_HIT_INSTRUCTIONS, PRODUCER_ANY_HIT_INSTRUCTIONS),
-        };
-        // A hit of a view's camera ray writes the view's G-buffer too, but for a layer's, which
-        // writes none.
-        let primary = self.role == Role::Hit
-            && self.kernel != Kernel::Layer
-            && self.geometry.is_some()
-            && self.may & MAY_TRACED != 0;
-        let traced = if primary { TRACED_HIT_INSTRUCTIONS } else { 0 };
-        // A hit a camera ray may reach may be its path's first vertex, which draws with its
-        // pixel's local sampler.
-        let local = self.role == Role::Hit
-            && self.geometry.is_some()
-            && self.may & MAY_LOCAL != 0
-            && self.may & (MAY_LAYERS | MAY_TRACED | MAY_LENS | MAY_BACKGROUND) != 0;
-        let local = if local {
-            LOCAL_FIRST_HIT_INSTRUCTIONS
-        } else {
-            0
-        };
-        let coated = self.role == Role::Hit && self.may & may2(SceneFeatures::COATED_EMITTERS) != 0;
-        let coated = if coated {
-            COATED_EMITTER_HIT_INSTRUCTIONS
-        } else {
-            0
-        };
-        let emitter = self.role == Role::Hit && self.may & MAY_EMITTER != 0;
-        let emitter = if emitter { EMITTER_HIT_INSTRUCTIONS } else { 0 };
-        let interiors = self.role == Role::Hit && self.may & MAY_INTERIORS != 0;
-        let interiors = if interiors {
-            INTERIOR_HIT_INSTRUCTIONS
-        } else {
-            0
-        };
-        let rich = match (self.role, self.kernel) {
-            (Role::Hit, Kernel::Rich) => RICH_HIT_INSTRUCTIONS,
-            (Role::Hit, Kernel::Walk) => RICH_HIT_INSTRUCTIONS + WALK_HIT_INSTRUCTIONS,
-            (Role::Hit, Kernel::Layer) => LAYER_HIT_INSTRUCTIONS,
-            _ => 0,
-        };
-        let stack = match (self.role, self.kernel) {
-            (Role::Hit, Kernel::Layer) if stacks => vertex_stack + STACK_LAYER_INSTRUCTIONS,
-            (Role::Hit, _) => vertex_stack,
-            _ => 0,
-        };
-        // A layer's stage where an interior's medium may scatter holds the call of the vertex where
-        // a real-time walk meets its surface.
-        let walks = match (self.role, self.kernel) {
-            (Role::Hit, Kernel::Layer) if self.may & MAY_SCATTERING != 0 => WALK_LAYER_INSTRUCTIONS,
-            _ => 0,
-        };
-        // A layer's stage where its paths may split by wavelength holds the start of the path's
-        // wavelengths, the hero's IOR and the call that weighs the companions.
-        let dispersion = match (self.role, self.kernel) {
-            (Role::Hit, Kernel::Layer) if self.may & MAY_DISPERSION != 0 => {
-                DISPERSION_LAYER_INSTRUCTIONS
-            }
-            _ => 0,
-        };
-        Some(
-            base + if producers { producer } else { 0 }
-                + traced
-                + local
-                + emitter
-                + interiors
-                + rich
-                + coated
-                + stack
-                + walks
-                + dispersion
-                + if self.role == Role::Hit {
-                    caustics + photon + map
-                } else {
-                    0
-                },
-        )
+        let allowed = allowances()
+            .iter()
+            .filter(|a| self.may & a.bits != 0 && (a.holds)(self))
+            .map(|a| a.instructions)
+            .sum::<u32>();
+        Some(base + allowed)
     }
 
     fn constants(&self) -> ([u8; 32], &'static [SpecEntry]) {
@@ -393,6 +276,109 @@ impl Spec {
             }
         }
     }
+}
+
+/// What a stage may hold beyond its role's cap where its mask has any of `bits` and `holds` says
+/// the stage is one that holds the feature's code.
+struct Allowance {
+    bits: u64,
+    instructions: u32,
+    holds: fn(&Spec) -> bool,
+}
+
+/// Whether a stage runs a whole vertex: a hit, the first vertex, or a medium's, a walk's meeting
+/// or a walk's exit callable.
+fn runs_vertex(s: &Spec) -> bool {
+    matches!(s.role, Role::Hit | Role::Medium | Role::Meets | Role::Exit)
+}
+
+/// Every allowance of a stage's cap.
+fn allowances() -> [Allowance; 24] {
+    let raygen = |s: &Spec| s.role == Role::Raygen;
+    let hit = |s: &Spec| s.role == Role::Hit;
+    let layer = |s: &Spec| s.role == Role::Hit && s.kernel == Kernel::Layer;
+    fn allow(bits: u64, instructions: u32, holds: fn(&Spec) -> bool) -> Allowance {
+        Allowance {
+            bits,
+            instructions,
+            holds,
+        }
+    }
+    fn producer(s: &Spec) -> bool {
+        !matches!(s.geometry, None | Some(Geometry::Copies))
+    }
+    [
+        // What a raygen holds per feature its paths may meet.
+        allow(MAY_LAYERS, RAYGEN_LAYER_INSTRUCTIONS, raygen),
+        allow(MAY_SCATTERING | MAY_WALK, RAYGEN_WALK_INSTRUCTIONS, raygen),
+        allow(MAY_STACK, RAYGEN_STACK_INSTRUCTIONS, raygen),
+        allow(
+            MAY_PARTICLES | MAY_LOCAL_LIGHTS | MAY_MEDIUM,
+            RAYGEN_FRONT_INSTRUCTIONS,
+            raygen,
+        ),
+        allow(MAY_PROXIES, RAYGEN_PROXY_INSTRUCTIONS, raygen),
+        allow(MAY_LENS | MAY_BACKGROUND, RAYGEN_LENS_INSTRUCTIONS, raygen),
+        allow(MAY_DISPERSION, RAYGEN_DISPERSION_INSTRUCTIONS, raygen),
+        // Where the paths may meet a plane stack, a stage that runs a vertex holds its re-run for
+        // a bent job, and a layer's stage the stack question's answer and a crossing's track.
+        allow(MAY_STACK, STACK_VERTEX_INSTRUCTIONS, runs_vertex),
+        allow(MAY_STACK, STACK_LAYER_INSTRUCTIONS, layer),
+        // Where the paths may gather caustic photons, a stage that runs a vertex holds whether it
+        // is a chain vertex, the light its paths find past chain vertices and the gather's call; a
+        // hit, a photon's vertex where the pipeline runs photons and the call of the reference
+        // map's gather where it may be the reference's.
+        allow(MAY_CAUSTICS, CAUSTIC_HIT_INSTRUCTIONS, runs_vertex),
+        allow(MAY_PHOTON, PHOTON_HIT_INSTRUCTIONS, hit),
+        allow(MAY_REFERENCE, MAP_GATHER_HIT_INSTRUCTIONS, |s| {
+            s.role == Role::Hit && s.may & MAY_CAUSTICS != 0
+        }),
+        // A hit of a view's camera ray writes the view's G-buffer too, but for a layer's, which
+        // writes none.
+        allow(MAY_TRACED, TRACED_HIT_INSTRUCTIONS, |s| {
+            s.role == Role::Hit && s.kernel != Kernel::Layer && s.geometry.is_some()
+        }),
+        // A hit a camera ray may reach may be its path's first vertex, which draws with its
+        // pixel's local sampler.
+        allow(MAY_LOCAL, LOCAL_FIRST_HIT_INSTRUCTIONS, |s| {
+            s.role == Role::Hit
+                && s.geometry.is_some()
+                && s.may & (MAY_LAYERS | MAY_TRACED | MAY_LENS | MAY_BACKGROUND) != 0
+        }),
+        allow(
+            may2(SceneFeatures::COATED_EMITTERS),
+            COATED_EMITTER_HIT_INSTRUCTIONS,
+            hit,
+        ),
+        allow(MAY_EMITTER, EMITTER_HIT_INSTRUCTIONS, hit),
+        allow(MAY_INTERIORS, INTERIOR_HIT_INSTRUCTIONS, hit),
+        // The lobes of the kernel a hit comes from: the rich ones, the walk's beside them, or a
+        // dielectric's.
+        allow(MAY_LOBES, RICH_HIT_INSTRUCTIONS, |s| {
+            s.role == Role::Hit && matches!(s.kernel, Kernel::Rich | Kernel::Walk)
+        }),
+        allow(MAY_WALK, WALK_HIT_INSTRUCTIONS, |s| {
+            s.role == Role::Hit && s.kernel == Kernel::Walk
+        }),
+        allow(MAY_LAYERS, LAYER_HIT_INSTRUCTIONS, layer),
+        // A layer's stage where an interior's medium may scatter holds the call of the vertex where
+        // a real-time walk meets its surface, and where its paths may split by wavelength the
+        // start of the path's wavelengths, the hero's IOR and the call that weighs the companions.
+        allow(MAY_SCATTERING, WALK_LAYER_INSTRUCTIONS, layer),
+        allow(MAY_DISPERSION, DISPERSION_LAYER_INSTRUCTIONS, layer),
+        // What resolves a producer entry's triangle, in a stage made for its geometry where the
+        // scene may hold producer entries.
+        allow(
+            may2(SceneFeatures::PRODUCERS),
+            PRODUCER_HIT_INSTRUCTIONS,
+            |s| s.role == Role::Hit && producer(s),
+        ),
+        allow(
+            may2(SceneFeatures::PRODUCERS),
+            PRODUCER_ANY_HIT_INSTRUCTIONS,
+            |s| s.role == Role::AnyHit && producer(s),
+        ),
+    ]
 }
 
 /// The stages of a pipeline, each once, with its hit groups and what the scene's hit records
@@ -924,8 +910,7 @@ pub struct StageSize {
     /// Whether it comes from a kernel with the coat, fuzz, thin film and thin wall lobes.
     pub rich: bool,
     pub instructions: u32,
-    /// The most of orr's own code it may hand the driver; none for a stage made for a linked
-    /// surface.
+    /// The cap on orr's own code in it; none for a stage made for a linked surface.
     pub cap: Option<u32>,
     /// What the kernels' linked types add to it: its size beyond the same stage of orr's
     /// kernels with nothing linked, where a stage made for a linked surface is the standard
@@ -1046,27 +1031,35 @@ pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<Vec<StageSize>,
     Folded::new(kernels, may, CompileThreads::default()).map(|f| f.sizes)
 }
 
-/// The first of `sizes` whose own code, without what linked types add to it, is over its cap,
-/// or the pipeline's total, the linked types' code among it, where that is over
-/// [`PIPELINE_CAP`].
-pub fn over_cap(sizes: &[StageSize]) -> Option<String> {
-    for s in sizes {
-        let own = i64::from(s.instructions) - s.linked.unwrap_or(0);
-        if let Some(cap) = s.cap.filter(|&cap| own > i64::from(cap)) {
-            return Some(format!(
-                "stage {}{} hands the driver {own} instructions of orr's own, over its {cap} as \
-                 a {:?}",
-                s.entry, s.geometry, s.role
-            ));
-        }
-    }
+/// Each of `sizes` whose own code, without what linked types add to it, is over its cap, and the
+/// pipeline's total, the linked types' code among it, where that is over [`PIPELINE_CAP`].
+pub fn over_cap(sizes: &[StageSize]) -> Vec<String> {
+    let over = |size: i64, cap: u32| 100.0 * (size as f64 / f64::from(cap) - 1.0);
+    let mut breaches: Vec<String> = sizes
+        .iter()
+        .filter_map(|s| {
+            let own = i64::from(s.instructions) - s.linked.unwrap_or(0);
+            let cap = s.cap.filter(|&cap| own > i64::from(cap))?;
+            Some(format!(
+                "stage {}{} hands the driver {own} instructions of orr's own, {:.1} % over its \
+                 {cap} as a {:?}",
+                s.entry,
+                s.geometry,
+                over(own, cap),
+                s.role
+            ))
+        })
+        .collect();
     let total: u32 = sizes.iter().map(|s| s.instructions).sum();
-    (total > PIPELINE_CAP).then(|| {
-        format!(
-            "{} stages hand the driver {total} instructions, over the pipeline's {PIPELINE_CAP}",
-            sizes.len()
-        )
-    })
+    if total > PIPELINE_CAP {
+        breaches.push(format!(
+            "{} stages hand the driver {total} instructions, {:.1} % over the pipeline's \
+             {PIPELINE_CAP}",
+            sizes.len(),
+            over(total.into(), PIPELINE_CAP)
+        ));
+    }
+    breaches
 }
 
 /// A ray tracing pipeline of the path tracer, made for what its paths may meet, and the groups a
@@ -1106,8 +1099,10 @@ impl PathPipeline {
                 (None, None) => log::debug!("{stage}: {} instructions", s.instructions),
             }
         }
-        if let Some(message) = over_cap(&sizes) {
-            return Err(Error::StageSize(message));
+        // The caps are a growth budget that tests hold orr's own code to, not a limit on what a
+        // scene may run: a pipeline over one still compiles.
+        for breach in over_cap(&sizes) {
+            log::warn!("{name}: {breach}");
         }
         let bytes: Vec<_> = table.specs.iter().map(Spec::constants).collect();
         let labels: Vec<CString> = table.specs.iter().map(Spec::label).collect();
@@ -1226,15 +1221,35 @@ impl Members for PathPipelines {
 mod tests {
     use super::*;
 
-    /// A stage over its cap compiles for longer than a cold start may wait, whatever the scene
-    /// holds: the pipeline that may meet everything is the one a session runs. It holds the
-    /// camera rays' hits, with their allowance; the same pipeline without them holds the plain
-    /// caps.
+    /// `path_may` and `path_may2` of the pipelines of the bench's synthetic walk, as it logs them:
+    /// the one of its view's and update paths and the one of its caustic photons. Both are over
+    /// cooked clusters and producer entries, with interiors, layers, particles, coverage,
+    /// caustics, a plane stack, froxels, a medium, directional and emissive lights; the view's
+    /// paths have local light samplers and the cache too.
+    const BENCH_MAY: [u64; 2] = [0xfffe_1430_2378_702d, 0xfffe_1430_2378_2045];
+
+    /// The caps are a growth budget on orr's own code, held here and not at a pipeline's
+    /// creation: on the pipeline that may meet everything, on the bench's, and on the first with
+    /// each allowance taken away in turn, so the room one feature's allowance leaves at the widest
+    /// mask hides no growth in the rest of a stage.
     #[test]
-    fn the_stages_of_the_pipeline_that_may_meet_everything_hold_their_caps() {
-        for may in [u64::MAX, !MAY_TRACED] {
+    fn the_stages_of_orrs_own_kernels_hold_their_caps() {
+        let mut bits: Vec<u64> = allowances().iter().map(|a| a.bits).collect();
+        bits.sort_unstable();
+        bits.dedup();
+        let masks = [MAY_ALL]
+            .into_iter()
+            .chain(BENCH_MAY)
+            .chain(bits.into_iter().map(|bits| MAY_ALL & !bits));
+        let mut breaches = Vec::new();
+        for may in masks {
             let sizes = path_stage_sizes(&KernelSet::default(), may).unwrap();
-            assert_eq!(over_cap(&sizes), None, "{may:#x}");
+            breaches.extend(
+                over_cap(&sizes)
+                    .into_iter()
+                    .map(|b| format!("{may:#018x}: {b}")),
+            );
         }
+        assert!(breaches.is_empty(), "{}", breaches.join("\n"));
     }
 }

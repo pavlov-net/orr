@@ -1005,12 +1005,6 @@ public struct PathStart
     public bool gbuffer;            // the ray only looks for layers before the G-buffer's surface
     public Interior interior;
     public float3 throughput;       // what the path carries from its start
-    // The camera ray's hit and its corners, given in place of tracing it.
-    public bool given;
-    public Hit hit;
-    public float3 positions[3];
-    // A photon's light is a directional light, along `-dir`.
-    public bool directional;
 }
 
 // The first vertex of `pixel` from the G-buffer; false for sky pixels.
