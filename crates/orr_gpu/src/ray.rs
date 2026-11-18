@@ -1,5 +1,5 @@
 //! Descriptions of ray tracing pipelines and their binding tables, alike on every backend.
-//! Only the Vulkan backend creates them (`Caps::ray_dispatch`).
+//! Backends with `Caps::ray_dispatch` create them.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Condvar, Mutex};
@@ -248,6 +248,11 @@ pub struct RayPipelineDesc<'a> {
     /// How deep traces nest: 1 where only raygens trace, 2 where a closest-hit or miss shader
     /// traces too. A raygen's invoke of a hit object counts as its trace's level.
     pub max_recursion: u32,
+    /// How deep stages run one another, where a backend runs closest-hit, miss and callable
+    /// stages as functions a raygen calls (Metal): a stage a raygen's trace, invoke or call runs
+    /// is at depth 1, a stage that one's trace or call runs at 2. The backend reserves stack for
+    /// this many nested calls. The Vulkan backend, whose driver sizes the stack, ignores it.
+    pub call_depth: u32,
     pub flags: RayPipelineFlags,
     pub threads: CompileThreads<'a>,
 }

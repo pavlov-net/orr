@@ -220,6 +220,7 @@ pub fn raygen_pipeline(
             hit_groups: &[],
             callables: &[],
             max_recursion: 0,
+            call_depth: 0,
             flags: RayPipelineFlags::empty(),
             threads: CompileThreads::Spawned(1),
         },

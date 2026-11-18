@@ -121,6 +121,7 @@ impl Set {
                     ],
                     callables: &[Some(ShaderRecord::new(6))],
                     max_recursion: 1,
+                    call_depth: 1,
                     flags: RayPipelineFlags::empty(),
                     // A deferred creation's feedback reports no cache hit on NVIDIA's 621.24.
                     threads: CompileThreads::Spawned(1),

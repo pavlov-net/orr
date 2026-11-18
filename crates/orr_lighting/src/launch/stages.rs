@@ -1078,6 +1078,9 @@ impl PathPipeline {
             ],
             // The walks' stage traces its rays and invokes their hits below the raygen's invoke.
             max_recursion: if table.misses.len() > 2 { 2 } else { 1 },
+            // A closest-hit or callable a raygen runs, or a hit the walks' stage invokes, calls
+            // the gather, map gather, disperse, emitter view, face and walk-meet callables.
+            call_depth: if table.misses.len() > 2 { 3 } else { 2 },
             flags: RayPipelineFlags::scene(device.caps()),
             threads,
         };

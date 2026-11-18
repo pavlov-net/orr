@@ -63,6 +63,7 @@ fn create(d: &Device, size: &str, salt: u32, callables: u32, threads: u32) -> (R
                 }],
                 callables: &calls,
                 max_recursion: 1,
+                call_depth: 1,
                 flags: RayPipelineFlags::empty(),
                 threads: CompileThreads::Spawned(threads),
             },
