@@ -925,76 +925,97 @@ uint trace_ray<let VIEW : bool, let PHOTON : bool>(PathRoot r, uint slot, uint4*
 }
 
 // Runs the view path in hot words `at` to its end from `next`, NEXT_FIRST where it starts on the
-// G-buffer's surface: the rays it traced, as `count_ray` counts them.
-uint run_path(PathRoot r, uint slot, uint4* at, uint next)
+// G-buffer's surface, where `live`: the rays it traced, as `count_ray` counts them. Where it is
+// not, under UNIFORM_REORDER, the thread runs its group's loop with nothing to invoke.
+uint run_path(PathRoot r, uint slot, uint4* at, uint next, bool live)
 {
     PathTrail trail = { false, false, 0, 0.0 };
-    // The ray's hit and a walk's last step's, each recorded by its trace: a hit object is never
-    // copied.
+    // The hit of the path's ray or of a walk's last step, which the trace that met it records: a
+    // hit object is never copied.
     Traced h = traced_nothing();
-    Traced w = traced_nothing();
     for (;;)
     {
-        uint4 w0 = load_coherent(at);
-        if ((w0.w & HOT_SHADOW) != 0)
-        {
-            trace_shadow(r, slot, at, w0.w, trail.exterior);
-            count_ray(r, trail);
-        }
-        trail.exterior = 0.0;
+        if (UNIFORM_REORDER && !group_any(live))
+            break;
         Payload p;
         bool invokes = false;
-        if (may(MAY_WALK) && next == NEXT_EXIT)
+        if (!UNIFORM_REORDER || live)
         {
-            p.words = uint4(1, 0, 0, 0);
-            call(CALL_EXIT, p);
-            next = NEXT_RAY;
-            continue;
-        }
-        if (next == NEXT_FIRST)
-        {
-            p.words = uint4(0);
-            call(CALL_FIRST, p);
-            trail.chain = false;
-            next = may(MAY_WALK) && p.words.y == PAYLOAD_WALKS ? NEXT_WALK : NEXT_RAY;
-            continue;
-        }
-        bool walked = may_any(MAY_WALK | MAY_SCATTERING) && (next == NEXT_WALK || next == NEXT_INTERIOR);
-        if (walked)
-            next = run_walk(r, slot, at, next == NEXT_INTERIOR, trail, w, p, invokes);
-        else if ((w0.w & HOT_RAY) == 0)
-            break;
-        else
-            next = trace_ray<true, false>(r, slot, at, w0, trail, h, p, invokes);
-        if (!invokes)
-            continue;
-        // A hit past a walk takes it as walked, but where a walk leaves.
-        if (trail.walked && (p.words.x & PAYLOAD_EXIT) == 0)
-            p.words.x |= PAYLOAD_WALKED;
-        // A miss whose ray crossed plane stack faces is told whether its light through them is
-        // next-event estimation's, which a probe from the vertex before them says.
-        if (may(MAY_STACK))
-        {
-            if (!walked && h.miss() && stack_miss(r, slot, at, p))
+            uint4 w0 = load_coherent(at);
+            if ((w0.w & HOT_SHADOW) != 0)
             {
+                trace_shadow(r, slot, at, w0.w, trail.exterior);
+                count_ray(r, trail);
+            }
+            trail.exterior = 0.0;
+            // A vertex that runs in a callable is its iteration's step, which invokes nothing.
+            bool called = false;
+            if (may(MAY_WALK) && next == NEXT_EXIT)
+            {
+                p.words = uint4(1, 0, 0, 0);
+                call(CALL_EXIT, p);
+                next = NEXT_RAY;
+                if (!UNIFORM_REORDER)
+                    continue;
+                called = true;
+            }
+            if (next == NEXT_FIRST)
+            {
+                p.words = uint4(0);
+                call(CALL_FIRST, p);
                 trail.chain = false;
-                continue;
+                next = may(MAY_WALK) && p.words.y == PAYLOAD_WALKS ? NEXT_WALK : NEXT_RAY;
+                if (!UNIFORM_REORDER)
+                    continue;
+                called = true;
+            }
+            if (!called)
+            {
+                bool walked = may_any(MAY_WALK | MAY_SCATTERING) && (next == NEXT_WALK || next == NEXT_INTERIOR);
+                if (walked)
+                    next = run_walk(r, slot, at, next == NEXT_INTERIOR, trail, h, p, invokes);
+                else if ((w0.w & HOT_RAY) == 0)
+                {
+                    if (!UNIFORM_REORDER)
+                        break;
+                    live = false;
+                    p.words = uint4(0);
+                }
+                else
+                    next = trace_ray<true, false>(r, slot, at, w0, trail, h, p, invokes);
+                if (!invokes)
+                {
+                    if (!UNIFORM_REORDER)
+                        continue;
+                    h = traced_nothing();
+                }
+                // A hit past a walk takes it as walked, but where a walk leaves.
+                if (trail.walked && (p.words.x & PAYLOAD_EXIT) == 0)
+                    p.words.x |= PAYLOAD_WALKED;
+                // A miss whose ray crossed plane stack faces is told whether its light through
+                // them is next-event estimation's, which a probe from the vertex before them says.
+                if (may(MAY_STACK))
+                {
+                    if (!walked && h.miss() && stack_miss(r, slot, at, p))
+                    {
+                        trail.chain = false;
+                        if (!UNIFORM_REORDER)
+                            continue;
+                        invokes = false;
+                    }
+                }
             }
         }
-        bool hit;
-        bool layer;
-        if (walked)
+        if (UNIFORM_REORDER && !invokes)
         {
-            invoke_path<true>(w, INVOKE_VERTEX, p);
-            hit = w.hit();
-            layer = hit && may(MAY_LAYERS) && layer_record(w);
+            h = traced_nothing();
+            p.words = uint4(0);
         }
-        else
-        {
-            invoke_path<true>(h, INVOKE_VERTEX, p);
-            hit = h.hit();
-            layer = hit && may(MAY_LAYERS) && layer_record(h);
-        }
+        invoke_path<true>(h, INVOKE_VERTEX, p);
+        if (UNIFORM_REORDER && !invokes)
+            continue;
+        bool hit = h.hit();
+        bool layer = hit && may(MAY_LAYERS) && layer_record(h);
         if (!hit)
         {
             trail.chain = false;
@@ -1005,7 +1026,10 @@ uint run_path(PathRoot r, uint slot, uint4* at, uint next)
         if (p.words.x != 0)
         {
             end_path(at);
-            break;
+            if (!UNIFORM_REORDER)
+                break;
+            live = false;
+            continue;
         }
         trail.chain = layer;
         if (layer && may(MAY_INTERIORS) && may2(MAY2_THIN_DIELECTRICS))
@@ -1028,70 +1052,95 @@ uint run_path(PathRoot r, uint slot, uint4* at, uint next)
 public void view_paths(PathRoot r)
 {
     uint slot = launch_index().x;
+    // Under UNIFORM_REORDER a thread past the slice runs its group's loops with no path of its
+    // own, where it would return.
+    bool own = true;
     if (slot >= r.slice_count)
-        return;
+    {
+        if (!UNIFORM_REORDER)
+            return;
+        own = false;
+    }
     uint2 pixel = item_pixel(r, r.slice_base + slot);
     // A debug view of the first vertex alone runs no path; its callable writes the pixel.
     if (may(MAY_DEBUG) && first_vertex_mode(r) && !traces_primary(r))
     {
-        Payload p;
-        p.words = uint4(0);
-        call(CALL_FIRST_VIEW, p);
+        if (own)
+        {
+            Payload p;
+            p.words = uint4(0);
+            call(CALL_FIRST_VIEW, p);
+        }
         return;
     }
     ViewConstants* v = r.view;
     uint4* at = path_hot(r, slot);
     uint4* record = path_record(r, slot);
     StoredViewLights lights = { NO_LIGHT, 0.0, pcg3d(uint3(pixel, r.frame ^ path_stream(r))).x, 0.0 };
-    store_coherent(record, reinterpret<uint4>(lights));
+    if (own)
+        store_coherent(record, reinterpret<uint4>(lights));
     float3 radiance = float3(0.0);
     // Where the paths trace the view's camera rays every pixel's is traced: its hit writes the
     // G-buffer and the record's distance, and takes the view's share of pixels on from there. A
     // thin lens's is traced from a point of the lens, and its hit writes the record's distance.
     bool lens = thin_lens(r);
     bool traced = traces_primary(r) || lens;
-    bool layers = !lens && layered(r, pixel);
+    bool layers = own && !lens && layered(r, pixel);
     float depth = 0.0;
-    if (!traced)
+    if (own && !traced)
         depth = r.gbuffer.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
     bool surface = !traced && depth > 0.0;
     bool carried = false;
     uint rays = 0;
     // A surface's path runs on the view's share of pixels; the sky shows in all.
-    bool runs = traced || depth == 0.0 || runs_path(r, pixel);
+    bool runs = own && (traced || depth == 0.0 || runs_path(r, pixel));
     // A frosted pixel runs a second path, from the G-buffer's surface behind its layers, for what
     // the frosted-glass term blurs: its luminance, which the layer memory keeps. Every other pixel
     // keeps its own there.
     bool two = runs && surface && frost_pass(r) && two_passes(r, pixel);
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
     uint index = pixel.y * r.gbuffer.extent.x + pixel.x;
-    if (path_layer_view(r))
+    if (own && path_layer_view(r))
         store_coherent(path_debug(r, slot), uint4(0));
-    for (uint pass = 0; pass < (two ? 2u : 1u); pass++)
+    uint passes = two ? 2u : 1u;
+    for (uint pass = 0; UNIFORM_REORDER ? group_any(pass < passes) : pass < passes; pass++)
     {
         bool second = pass == 1;
-        if (runs)
+        // Under UNIFORM_REORDER a thread past its own passes runs its group's with no path.
+        bool here = !UNIFORM_REORDER || pass < passes;
+        bool live = runs && here;
+        if (UNIFORM_REORDER || live)
         {
-            bool starts_inside = start_path(r, slot, pixel, at, path_cold(r, slot), surface && !second ? 1.0 / r.pixel_fraction : 1.0, layers && !second, second);
-            if (may(MAY_LENS) && lens)
+            bool starts_inside = false;
+            if (!UNIFORM_REORDER || live)
             {
-                Sampler rng = path_sampler(r, pixel);
-                PathStart s = lens_start(r, pixel, r.aperture_radius, r.focus_distance, 0.0, MASK_CAMERA | MASK_DIELECTRIC, rng);
-                lens_ray(at, s, rng.dimension, true);
+                starts_inside = start_path(r, slot, pixel, at, path_cold(r, slot), surface && !second ? 1.0 / r.pixel_fraction : 1.0, layers && !second, second);
+                if (may(MAY_LENS) && lens)
+                {
+                    Sampler rng = path_sampler(r, pixel);
+                    PathStart s = lens_start(r, pixel, r.aperture_radius, r.focus_distance, 0.0, MASK_CAMERA | MASK_DIELECTRIC, rng);
+                    lens_ray(at, s, rng.dimension, true);
+                }
             }
-            rays = run_path(r, slot, at, surface && (second || !layers) ? NEXT_FIRST : NEXT_RAY);
-            radiance = path_radiance(r, slot, at);
-            if (!second)
+            rays = run_path(r, slot, at, surface && (second || !layers) ? NEXT_FIRST : NEXT_RAY, live);
+            if (!UNIFORM_REORDER || live)
             {
-                carried = starts_inside;
-                lights = reinterpret<StoredViewLights>(load_coherent(record));
+                radiance = path_radiance(r, slot, at);
+                if (!second)
+                {
+                    carried = starts_inside;
+                    lights = reinterpret<StoredViewLights>(load_coherent(record));
+                }
             }
         }
         if (second)
         {
-            r.layers[index].background = guide_luminance(pre_exposure * radiance);
+            if (here)
+                r.layers[index].background = guide_luminance(pre_exposure * radiance);
             break;
         }
+        if (!own)
+            continue;
         float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
         // The layer a layered pixel's camera ray met first, as far from the eye as the record says.
         float layer_distance = layers ? lights.first_distance : 0.0;
@@ -1133,20 +1182,38 @@ public void background_paths<E : IEnvironment, M : IMedium>(PathRoot r)
 {
     uint slot = launch_index().x;
     uint2 extent = r.gbuffer.extent;
+    // Under UNIFORM_REORDER a thread with no path runs its group's loop, where it would return.
+    bool own = true;
     if (slot >= r.slice_count || r.slice_base + slot >= extent.x * extent.y)
-        return;
+    {
+        if (!UNIFORM_REORDER)
+            return;
+        own = false;
+    }
     uint2 pixel = item_pixel(r, r.slice_base + slot);
-    Sampler rng = path_sampler(r, pixel);
-    PathStart s;
-    if (!background_path_start(r, pixel, rng, s))
-        return;
     uint4* at = path_hot(r, slot);
     uint4* record = path_record(r, slot);
-    StoredViewLights lights = { NO_LIGHT, 0.0, pcg3d(uint3(pixel, r.frame ^ path_stream(r))).x, 0.0 };
-    store_coherent(record, reinterpret<uint4>(lights));
-    start_path(r, slot, pixel, at, path_cold(r, slot), 1.0, false, false);
-    lens_ray(at, s, rng.dimension, false);
-    run_path(r, slot, at, NEXT_RAY);
+    if (own)
+    {
+        Sampler rng = path_sampler(r, pixel);
+        PathStart s;
+        if (background_path_start(r, pixel, rng, s))
+        {
+            StoredViewLights lights = { NO_LIGHT, 0.0, pcg3d(uint3(pixel, r.frame ^ path_stream(r))).x, 0.0 };
+            store_coherent(record, reinterpret<uint4>(lights));
+            start_path(r, slot, pixel, at, path_cold(r, slot), 1.0, false, false);
+            lens_ray(at, s, rng.dimension, false);
+        }
+        else
+        {
+            if (!UNIFORM_REORDER)
+                return;
+            own = false;
+        }
+    }
+    run_path(r, slot, at, NEXT_RAY, own);
+    if (!own)
+        return;
     float3 radiance = path_radiance(r, slot, at);
     float depth = reinterpret<StoredViewLights>(load_coherent(record)).first_distance;
     ViewConstants* v = r.view;
@@ -1213,57 +1280,122 @@ bool photon_stack_owned(PathRoot r, uint slot, uint4* at)
 public void photon_paths(PathRoot r)
 {
     uint slot = launch_index().x;
+    // Under UNIFORM_REORDER a thread with no photon reaches its group's reorder points with
+    // nothing to invoke, where it would return, and so does one whose photon ended (`live`).
+    bool own = true;
     if (slot >= r.slice_count)
-        return;
+    {
+        if (!UNIFORM_REORDER)
+            return;
+        own = false;
+    }
     Payload start;
     start.words = uint4(0);
-    call(CALL_PHOTON_START, start);
+    if (own)
+        call(CALL_PHOTON_START, start);
     uint4* at = path_hot(r, slot);
-    if (start.words.x == 0 || !photon_light_reaches(r, at))
-        return;
+    if (own && (start.words.x == 0 || !photon_light_reaches(r, at)))
+    {
+        if (!UNIFORM_REORDER)
+            return;
+        own = false;
+    }
+    bool live = own;
     PathTrail trail = { false, false, 0, 0.0 };
     Traced h;
     {
-        uint4 w0 = load_coherent(at);
-        uint4 w1 = load_coherent(at + 1);
-        RayCone cone = { 0.0, 0.0 };
-        uint mask = MASK_OPAQUE | (may(MAY_LAYERS) ? MASK_DIELECTRIC : 0);
         Payload p;
-        p.words = path_payload(new_path_cover(mask, COVER_ALPHA, PRESENCE_NONE, 0, hit_context(HIT_SECONDARY, 0, cone, 0.0)));
-        // What the light sees of an alpha-tested caster is its coverage itself.
-        h = trace_hit(r.scene.tlas, RAY_FLAG_NONE, mask, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), asfloat(start.words.y)), p);
-        if (!h.hit())
-            return;
+        if (live)
+        {
+            uint4 w0 = load_coherent(at);
+            uint4 w1 = load_coherent(at + 1);
+            RayCone cone = { 0.0, 0.0 };
+            uint mask = MASK_OPAQUE | (may(MAY_LAYERS) ? MASK_DIELECTRIC : 0);
+            p.words = path_payload(new_path_cover(mask, COVER_ALPHA, PRESENCE_NONE, 0, hit_context(HIT_SECONDARY, 0, cone, 0.0)));
+            // What the light sees of an alpha-tested caster is its coverage itself.
+            h = trace_hit(r.scene.tlas, RAY_FLAG_NONE, mask, RAY_TYPE_PATH, RAY_TYPES, MISS_SCATTER, path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), asfloat(start.words.y)), p);
+            if (!h.hit())
+            {
+                if (!UNIFORM_REORDER)
+                    return;
+                live = false;
+                h = traced_nothing();
+            }
+        }
+        else
+        {
+            h = traced_nothing();
+            p.words = uint4(0);
+        }
         invoke_path<true>(h, INVOKE_VERTEX, p);
-        if (p.words.x != 0)
-            return;
-        trail.chain = may(MAY_LAYERS) && layer_record(h);
+        if (live)
+        {
+            if (p.words.x != 0)
+            {
+                if (!UNIFORM_REORDER)
+                    return;
+                live = false;
+            }
+            trail.chain = may(MAY_LAYERS) && layer_record(h);
+        }
     }
     for (;;)
     {
-        uint4 w0 = load_coherent(at);
-        if ((w0.w & HOT_ARRIVED) != 0)
+        if (UNIFORM_REORDER && !group_any(live))
+            break;
+        uint4 w0 = uint4(0);
+        if (live)
         {
-            store_coherent(at, uint4(w0.xyz, w0.w & ~HOT_ARRIVED));
-            if (!(may(MAY_STACK) && photon_stack_owned(r, slot, at)))
+            w0 = load_coherent(at);
+            if ((w0.w & HOT_ARRIVED) != 0)
             {
-                Payload d;
-                d.words = uint4(0);
-                call(CALL_DEPOSIT, d);
+                store_coherent(at, uint4(w0.xyz, w0.w & ~HOT_ARRIVED));
+                if (!(may(MAY_STACK) && photon_stack_owned(r, slot, at)))
+                {
+                    Payload d;
+                    d.words = uint4(0);
+                    call(CALL_DEPOSIT, d);
+                }
+            }
+            if ((w0.w & HOT_RAY) == 0)
+            {
+                if (!UNIFORM_REORDER)
+                    break;
+                live = false;
             }
         }
-        if ((w0.w & HOT_RAY) == 0)
-            break;
         Payload p;
-        bool invokes;
-        trace_ray<false, true>(r, slot, at, w0, trail, h, p, invokes);
-        if (!invokes || !h.hit())
-            break;
+        if (live)
+        {
+            bool invokes;
+            trace_ray<false, true>(r, slot, at, w0, trail, h, p, invokes);
+            if (!invokes || !h.hit())
+            {
+                if (!UNIFORM_REORDER)
+                    break;
+                live = false;
+                h = traced_nothing();
+            }
+        }
+        else
+        {
+            h = traced_nothing();
+            p.words = uint4(0);
+        }
         invoke_path<true>(h, INVOKE_VERTEX, p);
+        if (!live)
+            continue;
         if (p.words.x != 0)
-            break;
+        {
+            if (!UNIFORM_REORDER)
+                break;
+            live = false;
+            continue;
+        }
         trail.chain = may(MAY_LAYERS) && layer_record(h);
     }
+    if (!own)
+        return;
     uint entry = load_coherent(path_record(r, slot)).w;
     if ((entry & PHOTON_DEPOSITED) != 0)
         InterlockedAdd(r.caustics.source.deposited[entry & ~PHOTON_DEPOSITED], 1u);
@@ -1275,54 +1407,100 @@ public void photon_paths(PathRoot r)
 public void update_paths(PathRoot r)
 {
     uint slot = launch_index().x;
+    // Under UNIFORM_REORDER a thread with no path runs its group's loop with nothing to invoke,
+    // where it would return, and so does one whose path ended (`live`).
+    bool own = true;
     if (slot >= r.slice_count)
-        return;
+    {
+        if (!UNIFORM_REORDER)
+            return;
+        own = false;
+    }
     uint2 pixel = item_pixel(r, r.slice_base + slot);
-    if (any(pixel >= r.gbuffer.extent) || r.gbuffer.depth.get<Texture2D<float>>().Load(int3(pixel, 0)) == 0.0)
-        return;
+    if (own && (any(pixel >= r.gbuffer.extent) || r.gbuffer.depth.get<Texture2D<float>>().Load(int3(pixel, 0)) == 0.0))
+    {
+        if (!UNIFORM_REORDER)
+            return;
+        own = false;
+    }
     uint4* at = path_hot(r, slot);
     uint4* record = path_record(r, slot);
     CacheUpdate update = CacheUpdate();
     uint state = pcg3d(uint3(pixel, r.frame ^ path_stream(r))).y;
-    start_path(r, slot, pixel, at, path_cold(r, slot), 1.0, false, layered(r, pixel));
-    Payload first;
-    first.words = uint4(0);
-    call(CALL_FIRST, first);
+    if (own)
+    {
+        start_path(r, slot, pixel, at, path_cold(r, slot), 1.0, false, layered(r, pixel));
+        Payload first;
+        first.words = uint4(0);
+        call(CALL_FIRST, first);
+    }
+    bool live = own;
     PathTrail trail = { false, false, 0, 0.0 };
     Traced h;
     for (;;)
     {
-        uint4 w0 = load_coherent(at);
-        if ((w0.w & HOT_ARRIVED) != 0)
-        {
-            // The vertex the path's last shader left, with the radiance the path arrived with.
-            uint4 a = load_coherent(record + UPDATE_VERTEX_AT);
-            uint4 b = load_coherent(record + UPDATE_VERTEX_AT + 1);
-            state = pcg(state);
-            update.vertex_at(r, asfloat(b.xyz), asfloat(a.xyz), oct_decode_snorm16(a.w), asfloat(load_coherent(at + 3).xyz), unit_float(state));
-            store_coherent(at, uint4(w0.xyz, w0.w & ~HOT_ARRIVED));
-        }
-        if ((w0.w & HOT_SHADOW) != 0)
-            trace_shadow(r, slot, at, w0.w, trail.exterior);
-        trail.exterior = 0.0;
-        if ((w0.w & HOT_RAY) == 0)
+        if (UNIFORM_REORDER && !group_any(live))
             break;
+        uint4 w0 = uint4(0);
+        if (live)
+        {
+            w0 = load_coherent(at);
+            if ((w0.w & HOT_ARRIVED) != 0)
+            {
+                // The vertex the path's last shader left, with the radiance the path arrived with.
+                uint4 a = load_coherent(record + UPDATE_VERTEX_AT);
+                uint4 b = load_coherent(record + UPDATE_VERTEX_AT + 1);
+                state = pcg(state);
+                update.vertex_at(r, asfloat(b.xyz), asfloat(a.xyz), oct_decode_snorm16(a.w), asfloat(load_coherent(at + 3).xyz), unit_float(state));
+                store_coherent(at, uint4(w0.xyz, w0.w & ~HOT_ARRIVED));
+            }
+            if ((w0.w & HOT_SHADOW) != 0)
+                trace_shadow(r, slot, at, w0.w, trail.exterior);
+            trail.exterior = 0.0;
+            if ((w0.w & HOT_RAY) == 0)
+            {
+                if (!UNIFORM_REORDER)
+                    break;
+                live = false;
+            }
+        }
         Payload p;
         bool invokes;
-        trace_ray<false, false>(r, slot, at, w0, trail, h, p, invokes);
-        // What covered the ray in front of its hit may have ended the path.
-        if (!invokes)
-            continue;
-        if (may(MAY_STACK))
+        if (live)
         {
-            if (h.miss() && stack_miss(r, slot, at, p))
-                continue;
+            trace_ray<false, false>(r, slot, at, w0, trail, h, p, invokes);
+            // What covered the ray in front of its hit may have ended the path.
+            if (!invokes)
+            {
+                if (!UNIFORM_REORDER)
+                    continue;
+                h = traced_nothing();
+            }
+            if (may(MAY_STACK))
+            {
+                if (h.miss() && stack_miss(r, slot, at, p))
+                {
+                    if (!UNIFORM_REORDER)
+                        continue;
+                    invokes = false;
+                    h = traced_nothing();
+                }
+            }
+        }
+        else
+        {
+            invokes = false;
+            h = traced_nothing();
+            p.words = uint4(0);
         }
         invoke_path<true>(h, INVOKE_VERTEX, p);
+        if (UNIFORM_REORDER && !invokes)
+            continue;
         if (h.hit() && p.words.x != 0)
             end_path(at);
         else if (h.hit() && may(MAY_LAYERS) && layer_record(h) && may(MAY_INTERIORS) && may2(MAY2_THIN_DIELECTRICS))
             trail.exterior = asfloat(p.words.z);
     }
-    update.finish(r, asfloat(load_coherent(at + 3).xyz), 0);
+    if (own)
+        update.finish(r, asfloat(load_coherent(at + 3).xyz), 0);
 }
