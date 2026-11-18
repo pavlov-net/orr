@@ -173,7 +173,7 @@ impl RayPipeline {
         match self.never {}
     }
 
-    pub fn compile_cost(&self) -> Option<crate::CompileCost> {
+    pub fn compile_cost(&self) -> Option<&crate::CompileCost> {
         match self.never {}
     }
 

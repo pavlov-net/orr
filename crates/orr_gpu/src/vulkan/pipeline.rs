@@ -16,7 +16,8 @@ use super::garbage::Item;
 use super::spirv;
 use crate::specialize;
 use crate::{
-    CodeStatistics, CompileCost, EntryPoint, Error, PipelineKind, ShaderModule, SpecData, Stage,
+    CodeStatistics, CompileCost, EntryPoint, Error, PipelineKind, ShaderModule, ShaderStack,
+    SpecData, Stage, StageEntry,
 };
 
 /// One shader stage of a pipeline: SPIR-V words, the entry point and specialization data.
@@ -154,35 +155,14 @@ impl ComputePipeline {
 
     /// What compiling the pipeline cost the driver; `None` where it came from a cache or the
     /// pipeline store.
-    pub fn compile_cost(&self) -> Option<CompileCost> {
-        self.compiled
+    pub fn compile_cost(&self) -> Option<&CompileCost> {
+        self.compiled.as_ref()
     }
 
     /// What the driver reports of the pipeline's code; `None` where it reports nothing
-    /// (without `Caps::pipeline_executable_info`).
+    /// (without `Caps::pipeline_executable_info`) or not these figures.
     pub fn statistics(&self) -> Option<CodeStatistics> {
-        // A compute pipeline has one executable.
-        let stats = self.shared.executable_statistics(self.raw, 0)?;
-        let mut out = CodeStatistics::default();
-        for s in &stats {
-            // SAFETY: the format says which union member is set.
-            let value = unsafe {
-                match s.format {
-                    vk::PipelineExecutableStatisticFormatKHR::UINT64 => s.value.u64,
-                    vk::PipelineExecutableStatisticFormatKHR::INT64 => s.value.i64 as u64,
-                    _ => continue,
-                }
-            };
-            match s.name_as_c_str().ok().and_then(|c| c.to_str().ok()) {
-                Some("Register Count") => out.registers = value as u32,
-                // NVIDIA's drivers set bit 36 beside the bytes.
-                Some("Local Memory Size") => out.local_bytes = value & 0xffff_ffff,
-                Some("Shared Memory Size") => out.shared_bytes = value,
-                Some("Binary Size") => out.binary_bytes = value,
-                _ => {}
-            }
-        }
-        Some(out)
+        self.shared.code_statistics(self.raw)
     }
 }
 
@@ -193,6 +173,50 @@ impl Drop for ComputePipeline {
 }
 
 impl Shared {
+    /// What the driver reports of the code of `pipeline`, which was created with
+    /// CAPTURE_STATISTICS: of its executables the most registers, local and shared memory any
+    /// one takes, and the code of all of them. `None` where it reports no executables, or names
+    /// no register count or local memory among their statistics, as only NVIDIA's do.
+    pub(super) fn code_statistics(&self, pipeline: vk::Pipeline) -> Option<CodeStatistics> {
+        let exec = self.exec_fn.as_ref()?;
+        let info = vk::PipelineInfoKHR::default().pipeline(pipeline);
+        // SAFETY: the pipeline was created with CAPTURE_STATISTICS.
+        let count = unsafe { exec.get_pipeline_executable_properties_len(&info) }.ok()?;
+        if count == 0 {
+            return None;
+        }
+        let mut out = CodeStatistics::default();
+        let (mut registers, mut local) = (false, false);
+        for i in 0..count as u32 {
+            let stats = self.executable_statistics(pipeline, i)?;
+            for s in &stats {
+                // SAFETY: the format says which union member is set.
+                let value = unsafe {
+                    match s.format {
+                        vk::PipelineExecutableStatisticFormatKHR::UINT64 => s.value.u64,
+                        vk::PipelineExecutableStatisticFormatKHR::INT64 => s.value.i64 as u64,
+                        _ => continue,
+                    }
+                };
+                match s.name_as_c_str().ok().and_then(|c| c.to_str().ok()) {
+                    Some("Register Count") => {
+                        registers = true;
+                        out.registers = out.registers.max(value as u32);
+                    }
+                    // NVIDIA's drivers set bit 36 beside the bytes.
+                    Some("Local Memory Size") => {
+                        local = true;
+                        out.local_bytes = out.local_bytes.max(value & 0xffff_ffff);
+                    }
+                    Some("Shared Memory Size") => out.shared_bytes = out.shared_bytes.max(value),
+                    Some("Binary Size") => out.binary_bytes += value,
+                    _ => {}
+                }
+            }
+        }
+        (registers && local).then_some(out)
+    }
+
     /// The statistics the driver reports for executable `index` of `pipeline`, which was
     /// created with CAPTURE_STATISTICS; `None` without `Caps::pipeline_executable_info`.
     fn executable_statistics(
@@ -347,6 +371,14 @@ impl<'a> StageParts<'a> {
         })
     }
 
+    /// The stage as the driver is handed it.
+    pub(super) fn stage_entry(&self) -> StageEntry {
+        StageEntry {
+            name: self.entry.to_string_lossy().into_owned(),
+            spec: self.spec.to_vec(),
+        }
+    }
+
     /// The instructions the stage's functions hand the driver.
     pub(super) fn instructions(&self) -> u32 {
         specialize::handed_instructions(&self.code)
@@ -406,7 +438,8 @@ impl Shared {
     }
 
     /// Names a new pipeline and logs its creation, what it cost the driver where it `compiled`,
-    /// and its statistics when it was created with `statistics`.
+    /// its statistics when it was created with `statistics`, and its shaders' `stacks`: at info
+    /// for a compile, at debug for a pipeline from a cache, which a run loads again and again.
     pub(super) fn created(
         &self,
         raw: vk::Pipeline,
@@ -414,6 +447,7 @@ impl Shared {
         start: Instant,
         compiled: Option<&CompileCost>,
         statistics: bool,
+        stacks: &[ShaderStack],
     ) {
         name_object(&self.debug_fn, raw, name);
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
@@ -435,6 +469,30 @@ impl Shared {
         }
         if statistics {
             self.log_statistics(raw, name);
+        }
+        if !stacks.is_empty() {
+            let mut kept: Vec<_> = stacks.iter().filter(|s| s.bytes > 0).collect();
+            kept.sort_by_key(|s| std::cmp::Reverse(s.bytes));
+            let listed: Vec<_> = kept
+                .iter()
+                .map(|s| format!("{} {} B", s.shader, s.bytes))
+                .collect();
+            let level = if compiled.is_some() {
+                log::Level::Info
+            } else {
+                log::Level::Debug
+            };
+            log::log!(
+                level,
+                "pipeline {name}: shader stacks {}; {} of {} shaders keep none",
+                if listed.is_empty() {
+                    "none".into()
+                } else {
+                    listed.join(", ")
+                },
+                stacks.len() - kept.len(),
+                stacks.len()
+            );
         }
     }
 
@@ -464,6 +522,7 @@ impl Shared {
                 });
                 created.map(|p| (p[0], cpu)).map_err(|(_, e)| e)
             },
+            |_| Vec::new(),
         )
     }
 }

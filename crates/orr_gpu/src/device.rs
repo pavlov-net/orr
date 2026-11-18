@@ -30,8 +30,8 @@ pub struct DeviceDesc<'a> {
     /// modification time says when a pipeline last came from it. Vulkan only.
     pub pipeline_store: Option<&'a Path>,
     /// A file the device adds a [`CompileRecord`](crate::CompileRecord) line to for each
-    /// pipeline it compiles, created if missing, so that processes sharing it each add their
-    /// own. `None`: no file; the compiles are still logged. Vulkan only: Metal compiles in a
+    /// pipeline it compiles, and once for each pipeline it takes from a cache, created if
+    /// missing, so that processes sharing it each add their own. `None`: no file; the compiles are still logged. Vulkan only: Metal compiles in a
     /// service of its own, whose CPU time no thread here takes.
     pub compile_records: Option<&'a Path>,
     /// Optional extensions to leave off even when the device offers them; their `Caps`

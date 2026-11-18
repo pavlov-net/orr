@@ -14,7 +14,7 @@ use crate::specialize::MAY_ALL;
 
 /// What a pipeline's "made in" log line adds about the driver's compile, where the backend
 /// measured one: nothing for a pipeline from a cache, nor on a backend that measures none.
-pub(crate) fn driver_cost(compiled: Option<CompileCost>) -> String {
+pub(crate) fn driver_cost(compiled: Option<&CompileCost>) -> String {
     compiled.map_or_else(String::new, |c| {
         format!(
             ", the driver's compile {:.2} s with {:.2} s of CPU, {:.2} s of it serial and {:.2} s \

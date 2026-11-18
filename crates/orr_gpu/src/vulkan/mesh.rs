@@ -217,6 +217,7 @@ impl Shared {
                 });
                 created.map(|p| (p[0], cpu)).map_err(|(_, e)| e)
             },
+            |_| Vec::new(),
         )
         .map(|(raw, _)| raw)
     }

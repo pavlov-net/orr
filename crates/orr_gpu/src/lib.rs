@@ -80,7 +80,9 @@ pub use accel::{
 pub use cache_file::PipelineCacheReport;
 pub use caps::{Caps, ComponentType, CooperativeVectorCombination, Limits};
 pub use command::{DecompressRegion, DispatchArgs, MemoryCopy, MeshArgs, TextureCopy};
-pub use compile::{CompileCost, CompileRecord, PipelineKind};
+pub use compile::{
+    CodeStatistics, CompileCost, CompileRecord, PipelineKind, ShaderStack, StageEntry,
+};
 pub use coopvec::{MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout};
 #[cfg(feature = "nsight-perf")]
 pub use counters::{
@@ -114,8 +116,7 @@ pub use raster::{
     MeshPipelineDesc, RasterState, Rendering,
 };
 pub use ray::{
-    CodeStatistics, CompileThreads, HitGroup, HitTable, RayPipelineDesc, RayPipelineFlags,
-    ShaderRecord,
+    CompileThreads, HitGroup, HitTable, RayPipelineDesc, RayPipelineFlags, ShaderRecord,
 };
 pub use rtas::{
     BlasLimits, ClusterCaps, ClusterLimits, ClusterVertexFormat, MoveKind, MoveLimits, PtlasArgs,

@@ -87,6 +87,18 @@ report those with the GPU and driver beside every number.
   over several. The examples read `RUST_LOG`, as do the tests on `gpu_suite`'s device (the
   lighting suite's among them), whose output the test runner writes to `target/test-logs`, a
   passing test's only with `-- --nocapture`.
+- **Spill and stacks per test run.** Each pipeline a test run uses is a line in
+  `target/test-logs/<target>.compiles` (`orr_gpu::CompileRecord`), one from a cache or the
+  pipeline store marked `hit=1`: its entries and their specialization, registers, local and
+  shared memory, and a ray tracing pipeline's stack per shader, which the log also prints, at
+  info for a compile and at debug for a hit. NVIDIA reports no executables for ray tracing
+  pipelines, so a stage's stack is the one figure of its own. The driver spills to shared
+  memory before local memory, and keeps arrays indexed at run time in either, so neither
+  figure alone is spill. `xtask test` fails a run where an orr kernel it used takes local
+  memory past the 16 B some kernels without spill report, or a path stage's stack passes its
+  budget; `xtask/src/code_limits.rs` holds the budgets and the kernels that spill today, with
+  the device and driver they were measured on. On another device or driver it reports breaches
+  without failing: re-measure after a driver update.
 - **Call sites.** `python -I ${CLAUDE_SKILL_DIR}/scripts/spv_size.py --lines --kernel plain`,
   on a build with line tables (dev, or the `profiling` profile), lists a path kernel's
   instructions by source file and the lines with the most copies: a heavy body inlined at many

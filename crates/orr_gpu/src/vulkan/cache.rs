@@ -37,7 +37,7 @@ use super::device::{Device, Shared};
 use super::driver_cpu::DriverCpu;
 use super::pipeline::StageParts;
 use crate::cache_file::{Identity, decode, encode, mark_used, write};
-use crate::{CompileCost, CompileRecord, Error, PipelineCacheReport, PipelineKind};
+use crate::{CompileCost, CompileRecord, Error, PipelineCacheReport, PipelineKind, ShaderStack};
 
 /// The bytes `vkGetPipelineCacheData` would write for `cache`.
 fn data_size(device: &ash::Device, cache: vk::PipelineCache) -> Option<usize> {
@@ -534,8 +534,9 @@ impl Shared {
     /// tell pipelines apart. `create` builds the create info with `next` as its `p_next` (creation
     /// flags, then creation feedback), calls the create function with `cache` and returns the
     /// driver CPU the call took. A ray tracing pipeline takes no executable statistics, which
-    /// other pipelines capture where the device reports them. Returns the pipeline and, where it
-    /// compiled, what that cost, which is also logged and recorded.
+    /// other pipelines capture where the device reports them; `stacks` reads its shaders' stacks.
+    /// Returns the pipeline and, where it compiled, what that cost and what the driver reports of
+    /// the code it made, which is also logged. Every pipeline is recorded, one from a cache once.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn create_pipeline(
         &self,
@@ -549,6 +550,7 @@ impl Shared {
             vk::PipelineCache,
             *const c_void,
         ) -> Result<(vk::Pipeline, DriverCpu), vk::Result>,
+        stacks: impl FnOnce(vk::Pipeline) -> Vec<ShaderStack>,
     ) -> Result<(vk::Pipeline, Option<CompileCost>), Error> {
         let ray = kind == PipelineKind::Ray;
         let cache = &self.pipeline_cache;
@@ -619,20 +621,55 @@ impl Shared {
             count.fetch_add(1, Ordering::Release);
         }
         drop(guard);
-        let compiled = (compiles && !created.hit).then(|| CompileCost {
-            wall: created.wall,
-            cpu: created.cpu.serial + created.cpu.joined,
-            serial: created.cpu.serial,
-            longest_join: created.cpu.longest_join,
-            joins: created.cpu.joins,
-            stages: stages.len() as u32,
-            instructions: stages.iter().map(|s| s.instructions()).sum(),
+        let compiled = compiles && !created.hit;
+        // Every pipeline is recorded, one from a cache too, so a run's limits hold on all the
+        // pipelines it uses: the driver reports a cached pipeline's statistics and stacks as it
+        // did when it compiled it.
+        let recorded = key.filter(|&key| {
+            self.compile_records.is_some()
+                && (compiled || self.recorded_hits.lock().unwrap().insert(key))
         });
-        self.created(raw, name, start, compiled.as_ref(), !ray);
-        if let (Some(cost), Some(key), Some(file)) = (compiled, key, &self.compile_records) {
+        let level = if compiled {
+            log::Level::Info
+        } else {
+            log::Level::Debug
+        };
+        let stacks = if recorded.is_some() || log::log_enabled!(level) {
+            stacks(raw)
+        } else {
+            Vec::new()
+        };
+        let cost = (compiled || recorded.is_some()).then(|| {
+            let mut cost = CompileCost {
+                stages: stages.len() as u32,
+                instructions: stages.iter().map(|s| s.instructions()).sum(),
+                entries: if ray {
+                    Vec::new()
+                } else {
+                    stages.iter().map(|s| s.stage_entry()).collect()
+                },
+                code: if ray { None } else { self.code_statistics(raw) },
+                stacks: stacks.clone(),
+                ..CompileCost::default()
+            };
+            if compiled {
+                cost.wall = created.wall;
+                cost.cpu = created.cpu.serial + created.cpu.joined;
+                cost.serial = created.cpu.serial;
+                cost.longest_join = created.cpu.longest_join;
+                cost.joins = created.cpu.joins;
+            }
+            cost
+        });
+        let compile = cost.clone().filter(|_| compiled);
+        self.created(raw, name, start, compile.as_ref(), !ray, &stacks);
+        if let (Some(key), Some(file), Some(cost)) = (recorded, &self.compile_records, cost) {
             let record = CompileRecord {
                 kind,
                 key: key.to_hex().to_string(),
+                device: self.caps.device_name.replace(' ', "_"),
+                driver: self.caps.driver.replace(' ', "_"),
+                hit: !compiled,
                 name: name.to_owned(),
                 cost,
             };
@@ -644,7 +681,7 @@ impl Shared {
                 log::warn!("compile records: {e}");
             }
         }
-        Ok((raw, compiled))
+        Ok((raw, compile))
     }
 }
 

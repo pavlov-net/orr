@@ -1,4 +1,5 @@
-//! The run's report on the pipelines its test devices compiled, from their compile records.
+//! The run's report on the pipelines its test devices compiled, from their compile records,
+//! which list the pipelines that came from a cache or the store too.
 //!
 //! Driver times move with the machine's load, by tens of percent between an idle and a busy
 //! machine, so the report reads each compile against others of the same run: as a share of the
@@ -19,10 +20,14 @@ const REFERENCE: &str = "path pipeline 0xffffffffffffffff";
 const LISTED: usize = 10;
 
 /// The fields the listed compiles' columns show or leave out on purpose; a compile shows any
-/// other after its name.
+/// other after its name. A run's device and driver are the same for every compile, and the
+/// code limits name what they need of entries, specializations and stacks.
 const KNOWN: &[&str] = &[
     "kind",
     "key",
+    "device",
+    "driver",
+    "hit",
     "wall_us",
     "cpu_us",
     "serial_us",
@@ -30,12 +35,15 @@ const KNOWN: &[&str] = &[
     "joins",
     "stages",
     "instructions",
+    "entries",
+    "specs",
+    "stacks",
 ];
 
 /// One pipeline compile of a test target.
 pub(crate) struct Compile {
     target: String,
-    record: CompileRecord,
+    pub(crate) record: CompileRecord,
     /// The record's fields outside [`KNOWN`], as they appear in its line.
     other: Vec<String>,
 }
@@ -44,6 +52,8 @@ pub(crate) struct Compile {
 #[derive(Default)]
 pub(crate) struct Records {
     pub(crate) compiles: Vec<Compile>,
+    /// The pipelines that came from a cache or the store, which compiled nothing.
+    pub(crate) hits: Vec<Compile>,
     /// Lines that are no whole record, such as the last of a process killed while writing it.
     pub(crate) unread: usize,
 }
@@ -57,7 +67,12 @@ pub(crate) fn read(target: &str, text: &str) -> Records {
             records.unread += 1;
             continue;
         };
-        records.compiles.push(Compile {
+        let list = if record.hit {
+            &mut records.hits
+        } else {
+            &mut records.compiles
+        };
+        list.push(Compile {
             target: target.to_owned(),
             record,
             other: fields
@@ -91,11 +106,23 @@ fn reference_cpu(compiles: &[Compile]) -> Option<Duration> {
     Some(cpus.iter().sum::<Duration>() / n)
 }
 
-/// The report's lines. Empty when nothing compiled; never an error, since driver times say
-/// nothing certain about a change on a shared machine.
-pub(crate) fn report(mut compiles: Vec<Compile>, unread: usize, load: Option<&Load>) -> String {
+/// The report's lines on `compiles`, beside the count of pipelines `loaded` from a cache or the
+/// store. Never an error, since driver times say nothing certain about a change on a shared
+/// machine.
+pub(crate) fn report(
+    mut compiles: Vec<Compile>,
+    loaded: usize,
+    unread: usize,
+    load: Option<&Load>,
+) -> String {
     let mut out = String::new();
     if compiles.is_empty() {
+        if loaded > 0 {
+            let _ = writeln!(
+                out,
+                "\npipelines compiled: none; {loaded} came from a cache or the store"
+            );
+        }
         if unread > 0 {
             let _ = writeln!(out, "\ncompile records: {unread} lines hold no record");
         }
@@ -124,7 +151,7 @@ pub(crate) fn report(mut compiles: Vec<Compile>, unread: usize, load: Option<&Lo
     let _ = writeln!(
         out,
         "\npipelines compiled: {}, {:.1} s wall, {:.1} s driver CPU, {:.1} s of it \
-         serial{per_instruction}",
+         serial{per_instruction}; {loaded} more came from a cache or the store",
         compiles.len(),
         secs(sum(|r| r.cost.wall)),
         secs(cpu),
@@ -198,21 +225,27 @@ mod tests {
     fn compiles_read_against_the_runs_reference() {
         let line = |name: &str, cpu_us: u64, instructions: u32, more: &str| {
             format!(
-                "orr-compile kind=ray key=k wall_us=1000000 cpu_us={cpu_us} serial_us=0 \
-                 longest_join_us=0 joins=2 stages=3 instructions={instructions}{more} name={name}"
+                "orr-compile kind=ray key=k device=d driver=v wall_us=1000000 cpu_us={cpu_us} \
+                 serial_us=0 longest_join_us=0 joins=2 stages=3 instructions={instructions}{more} name={name}"
             )
         };
         let a = format!(
             "{}\n{}\norr-compile kind=ray key=k wall_us=5\n",
             line(REFERENCE, 2_000_000, 40_000, ""),
-            line("path pipeline 0x3", 4_000_000, 80_000, " registers=128"),
+            line("path pipeline 0x3", 4_000_000, 80_000, " later=7"),
         );
-        let b = format!("{}\n", line(REFERENCE, 6_000_000, 40_000, ""));
+        // A pipeline from the store, whose times the report must leave out.
+        let b = format!(
+            "{}\n{}\n",
+            line(REFERENCE, 6_000_000, 40_000, ""),
+            line("path pipeline 0x5", 9_000_000, 90_000, " hit=1"),
+        );
         let mut compiled = read("a", &a);
         let mut b = read("b", &b);
         assert_eq!((compiled.unread, b.unread), (1, 0));
+        assert_eq!(b.hits.len(), 1);
         compiled.compiles.append(&mut b.compiles);
-        let text = report(compiled.compiles, 1, None);
+        let text = report(compiled.compiles, b.hits.len(), 1, None);
         let rows: Vec<Vec<&str>> = text
             .lines()
             .filter(|l| l.contains(" (a)") || l.contains(" (b)"))
@@ -229,9 +262,10 @@ mod tests {
             ]
             .map(|r| r.map(str::to_owned))
         );
-        assert!(rows[1].ends_with(&["(a)", "registers=128"]));
+        assert!(rows[1].ends_with(&["(a)", "later=7"]));
         assert!(text.contains("12.0 s driver CPU"));
         assert!(text.contains("75.0 µs of driver CPU per instruction"));
-        assert!(report(Vec::new(), 0, None).is_empty());
+        assert!(text.contains("1 more came from a cache or the store"));
+        assert!(report(Vec::new(), 0, 0, None).is_empty());
     }
 }

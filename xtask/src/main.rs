@@ -6,6 +6,7 @@
     reason = "a command-line tool reports on its standard streams"
 )]
 
+mod code_limits;
 mod compiles;
 mod load;
 mod test;

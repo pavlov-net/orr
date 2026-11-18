@@ -320,7 +320,7 @@ impl ComputePipeline {
     }
 
     /// `None`: Metal compiles in a service of its own, whose CPU time no thread here takes.
-    pub fn compile_cost(&self) -> Option<crate::CompileCost> {
+    pub fn compile_cost(&self) -> Option<&crate::CompileCost> {
         None
     }
 }

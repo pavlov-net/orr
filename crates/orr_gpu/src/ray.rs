@@ -274,15 +274,3 @@ impl HitTable {
         count: 0,
     };
 }
-
-/// What the driver reports of a compute pipeline's code. Ray tracing pipelines report none.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CodeStatistics {
-    /// Registers per thread.
-    pub registers: u32,
-    /// Bytes of local memory per thread: spill to memory.
-    pub local_bytes: u64,
-    /// Bytes of shared memory per workgroup, the compiler's spill among it.
-    pub shared_bytes: u64,
-    pub binary_bytes: u64,
-}

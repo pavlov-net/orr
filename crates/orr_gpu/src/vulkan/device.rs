@@ -1,6 +1,6 @@
 //! Device creation and the state every object shares.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::mem::{DropGuard, ManuallyDrop};
 use std::sync::atomic::AtomicU64;
@@ -76,6 +76,9 @@ pub(crate) struct Shared {
     pub(super) pipeline_cache: PipelineCache,
     /// The file of `DeviceDesc::compile_records`, opened to append.
     pub(super) compile_records: Option<std::fs::File>,
+    /// The keys of the pipelines from a cache the file has a record of: a pipeline created
+    /// again has the same figures, so it is recorded once.
+    pub(super) recorded_hits: Mutex<HashSet<blake3::Hash>>,
     pub(super) heap_props: vk::PhysicalDeviceDescriptorHeapPropertiesEXT<'static>,
     pub(super) as_scratch_align: u32,
     pub(super) memory: MemoryTypes,
@@ -715,6 +718,7 @@ impl Device {
             caps,
             pipeline_cache,
             compile_records,
+            recorded_hits: Mutex::default(),
             heap_props,
             as_scratch_align: as_props.min_acceleration_structure_scratch_offset_alignment,
             memory,
