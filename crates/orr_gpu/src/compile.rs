@@ -94,11 +94,8 @@ impl fmt::Display for CompileRecord {
 impl CompileRecord {
     /// The record `line` holds; `None` for a line that is not a whole record.
     pub fn parse(line: &str) -> Option<Self> {
-        let (fields, name) = line.strip_prefix(PREFIX)?.split_once(" name=")?;
-        let fields: HashMap<&str, &str> = fields
-            .split(' ')
-            .filter_map(|f| f.split_once('='))
-            .collect();
+        let (fields, name) = Self::fields(line)?;
+        let fields: HashMap<&str, &str> = fields.collect();
         let micros = |k| fields.get(k)?.parse().ok().map(Duration::from_micros);
         let count = |k| fields.get(k)?.parse().ok();
         Some(Self {
@@ -120,6 +117,13 @@ impl CompileRecord {
                 instructions: count("instructions")?,
             },
         })
+    }
+
+    /// Every `key=value` field of a record line in line order, those [`Self::parse`] doesn't
+    /// read among them, and its name; `None` for a line that is no record.
+    pub fn fields(line: &str) -> Option<(impl Iterator<Item = (&str, &str)>, &str)> {
+        let (fields, name) = line.strip_prefix(PREFIX)?.split_once(" name=")?;
+        Some((fields.split(' ').filter_map(|f| f.split_once('=')), name))
     }
 }
 

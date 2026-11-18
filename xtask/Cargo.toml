@@ -11,5 +11,11 @@ publish = false
 orr_gpu.workspace = true
 serde_json.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-link.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true

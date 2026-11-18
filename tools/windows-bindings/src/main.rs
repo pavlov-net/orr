@@ -44,6 +44,7 @@ const TARGETS: &[(&str, &str, Style)] = &[
         "tests/output_suite/tests/watch_at_exit/bindings.rs",
         Style::Raw,
     ),
+    ("xtask", "xtask/src/windows_bindings.rs", Style::Raw),
 ];
 
 /// The I/O ring API, which windows-bindgen's newer metadata leaves out, so it comes from the

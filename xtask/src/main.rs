@@ -6,7 +6,11 @@
     reason = "a command-line tool reports on its standard streams"
 )]
 
+mod compiles;
+mod load;
 mod test;
+#[cfg(windows)]
+mod windows_bindings;
 
 use std::env;
 use std::process::ExitCode;

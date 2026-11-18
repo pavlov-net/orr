@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::compiles::{self, Records};
+use crate::load;
+
 const HELP: &str = "\
 Builds the tests once, then runs the test executables directly, a few at a time.
 
@@ -36,8 +39,9 @@ by targets, worktrees and commits. It defaults to target/test-pipelines in the m
 
 Each target's output goes to target/test-logs/<target>.log, and a line for each pipeline its
 test devices compile, in orr_gpu::CompileRecord's format, to target/test-logs/<target>.compiles,
-which ORR_TEST_COMPILE_RECORDS names to them. Exits 0 when every selected target passes, 1 when
-one fails and 2 when the tests can't be built or run.
+which ORR_TEST_COMPILE_RECORDS names to them. The summary lists the costliest of the run's
+compiles and how busy the machine was. Exits 0 when every selected target passes, 1 when one
+fails and 2 when the tests can't be built or run; compile times never fail a run.
 ";
 
 /// More GPU runs at once have coincided with device resets, and gain little: the driver's
@@ -619,6 +623,7 @@ struct Outcome {
     status: Result<ExitStatus, String>,
     time: Duration,
     summary: LogSummary,
+    records: Records,
 }
 
 impl Outcome {
@@ -653,7 +658,9 @@ fn run_job(mut job: Job, logs: &Path) -> Outcome {
         .map_err(|e| e.to_string());
     let time = start.elapsed();
     let text = fs::read(&log).unwrap_or_default();
+    let records = fs::read(&records).unwrap_or_default();
     Outcome {
+        records: compiles::read(&job.name, &String::from_utf8_lossy(&records)),
         name: job.name,
         log,
         status,
@@ -742,7 +749,13 @@ fn skipped(
     lines
 }
 
-fn report(outcomes: &mut [Outcome], skipped: &[String], build: Duration, wall: Duration) {
+fn report(
+    outcomes: &mut [Outcome],
+    skipped: &[String],
+    build: Duration,
+    wall: Duration,
+    load: Option<&load::Load>,
+) {
     outcomes.sort_by_key(|outcome| Reverse(outcome.time));
     println!("\nslowest:");
     for outcome in outcomes.iter().take(10) {
@@ -786,6 +799,14 @@ fn report(outcomes: &mut [Outcome], skipped: &[String], build: Duration, wall: D
         wall.as_secs_f64(),
         total.as_secs_f64(),
     );
+    let mut unread = 0;
+    let mut compiled = Vec::new();
+    for outcome in outcomes.iter_mut() {
+        let records = std::mem::take(&mut outcome.records);
+        unread += records.unread;
+        compiled.extend(records.compiles);
+    }
+    print!("{}", compiles::report(compiled, unread, load));
 }
 
 pub(crate) fn run(args: Vec<String>) -> ExitCode {
@@ -838,11 +859,13 @@ fn try_run(args: Vec<String>) -> Result<ExitCode, String> {
 
     fs::create_dir_all(&ws.logs).map_err(|e| format!("{}: {e}", ws.logs.display()))?;
     let start = Instant::now();
+    let load = load::Start::now();
     let mut outcomes = run_jobs(jobs, options.jobs, &ws.logs);
     let wall = start.elapsed();
+    let load = load.load();
 
     let not_run = skipped(&ws, &options, &features);
-    report(&mut outcomes, &not_run, build_time, wall);
+    report(&mut outcomes, &not_run, build_time, wall, load.as_ref());
     let unbuilt = ws
         .selected(&options)
         .any(|t| t.exe.is_none() && t.required_features.is_empty());
