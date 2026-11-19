@@ -3,11 +3,8 @@
 //! displacement, and a small mip of the emission texture that weighs each emissive cluster.
 //!
 //! A slot reads one texture or a tile set ([`Map`]). A set reads as `texture_tile` does: the cell
-//! under a point's mapped uv, moved into the set's grid on an axis that repeats ([`Grid::wrap`]),
-//! picks a tile or nothing, and the point reads that tile clamped to its own square. So a read over
-//! a triangle walks its parts, one or more to each texture it reaches. A triangle spanning more
-//! than two grid periods along an axis that repeats reads every cell of the grid whole, as one
-//! spanning more than two periods of a texture visits every texel ([`Raster::footprint`]).
+//! under a point's mapped uv picks a tile or nothing, and the point reads that tile clamped to its
+//! own square. So a read over a triangle walks its parts, one or more to each texture it reaches.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,7 +14,6 @@ use crate::simd::{self, Simd, dispatch, simd};
 use crate::texture::Wrap;
 use crate::texture::tiles::Cell;
 use orr_math::{Mat3, Vec3};
-use orr_pack::tiles::Grid;
 use rustc_hash::FxHashMap;
 
 /// One mip of one channel, row-major, with the sampler's edge modes, the material slot's uv
@@ -42,8 +38,6 @@ pub(crate) enum Map<T> {
 pub(crate) struct Tiles<T> {
     /// The slot's uv transform, in `Material::uv_transforms` form.
     pub(crate) uv: [f32; 6],
-    /// The grid of the whole set, which repeats on the axes it says.
-    pub(crate) grid: Grid,
     /// By row, then column.
     pub(crate) tiles: BTreeMap<(u16, u16), T>,
     /// What reads where the set has no tile.
@@ -110,24 +104,11 @@ impl Reach {
         }
     }
 
-    /// Whether a read can land in tile `cell` of a set of grid `grid`. The tile covers u from
-    /// `column` to `column + 1` and v from `-row` to `1 - row`, and on an axis that repeats so does
-    /// each copy of it a whole number of grid widths away.
-    pub(crate) fn holds(&self, cell: Cell, grid: &Grid) -> bool {
-        // Per axis, the columns and the rows of the cells that reach the box.
-        let (starts_lo, starts_hi) = (
-            [self.lo[0] - 1.0, -self.hi[1]],
-            [self.hi[0], 1.0 - self.lo[1]],
-        );
-        (0..2).all(|a| {
-            let at = f64::from(cell[a]);
-            if !grid.repeat[a] {
-                return at >= starts_lo[a] && at <= starts_hi[a];
-            }
-            let n = f64::from(grid.size[a]);
-            let first = at + ((starts_lo[a] - at) / n).ceil() * n;
-            first <= starts_hi[a]
-        })
+    /// Whether a read can land in tile `cell`, which covers u from `column` to `column + 1` and v
+    /// from `-row` to `1 - row`.
+    pub(crate) fn holds(&self, [column, row]: Cell) -> bool {
+        let (u, v) = (f64::from(column), -f64::from(row));
+        u <= self.hi[0] && u + 1.0 >= self.lo[0] && v <= self.hi[1] && v + 1.0 >= self.lo[1]
     }
 }
 
@@ -215,42 +196,13 @@ fn spread<const N: usize>(c: &[[f64; N]], a: usize) -> f64 {
 }
 
 impl<T> Tiles<T> {
-    /// The tile a read in cell `cell`, a column and a row, lands on.
-    fn held(&self, cell: [i64; 2]) -> Option<&T> {
-        let [column, row] = self.grid.wrap(cell);
-        let (column, row) = (u16::try_from(column).ok()?, u16::try_from(row).ok()?);
-        self.tiles.get(&(row, column))
-    }
-
     /// The tile in the cell at whole numbers `u`, `v`. Row 1 lies above row 0.
     fn tile(&self, u: f64, v: f64) -> Option<&T> {
-        self.held([u as i64, (-v) as i64])
-    }
-
-    /// The cells along axis `a` from `lo` to `hi` where a tile can lie, ascending: every one on
-    /// an axis that repeats, and otherwise the columns of the tiles in row `row` or the rows of
-    /// all the tiles.
-    fn lines(&self, a: usize, lo: i64, hi: i64, row: i64) -> Vec<i64> {
-        if self.grid.repeat[a] {
-            return (lo..=hi).collect();
-        }
-        let (lo, hi) = (lo.max(0), hi.min(i64::from(u16::MAX)));
-        if lo > hi {
-            return Vec::new();
-        }
-        let (lo, hi) = (lo as u16, hi as u16);
-        let mut at: Vec<i64> = if a == 0 {
-            let Ok(row) = u16::try_from(self.grid.wrap([0, row])[1]) else {
-                return Vec::new();
-            };
-            let tiles = self.tiles.range((row, lo)..=(row, hi));
-            tiles.map(|(k, _)| i64::from(k.1)).collect()
-        } else {
-            let tiles = self.tiles.range((lo, 0)..=(hi, u16::MAX));
-            tiles.map(|(k, _)| i64::from(k.0)).collect()
-        };
-        at.dedup();
-        at
+        let (column, row) = (u, -v);
+        let held = |c: f64| (0.0..65536.0).contains(&c);
+        (held(column) && held(row))
+            .then(|| self.tiles.get(&(row as u16, column as u16)))
+            .flatten()
     }
 
     /// What reads in the cell at whole numbers `u`, `v`.
@@ -275,20 +227,8 @@ impl<T> Tiles<T> {
 
     /// `texture_tile` of a point on no surface.
     fn at(&self, uv: [f32; 2]) -> (&T, [f32; 2]) {
-        self.at_mapped(mapped(self.uv, uv))
-    }
-
-    /// `texture_tile` of mapped uv `p`, on no surface.
-    pub(super) fn at_mapped(&self, p: [f64; 2]) -> (&T, [f32; 2]) {
+        let p = mapped(self.uv, uv);
         self.read(p, p.map(f64::floor))
-    }
-
-    /// Whether mapped uv triangle `p` spans more than two grid periods along an axis that
-    /// repeats, which [`Self::whole`] reads.
-    fn wide(&self, p: &[[f64; 2]; 3]) -> bool {
-        let (lo, hi) = bounds(p);
-        let periods = |a: usize| (hi[a] - lo[a]) / f64::from(self.grid.size[a]);
-        (0..2).any(|a| self.grid.repeat[a] && periods(a) > 2.0)
     }
 
     /// `texture_tile` of corner `k` of uv triangle `tri`, pointing inward at the triangle's center.
@@ -312,9 +252,7 @@ impl<T> Tiles<T> {
 
     /// Calls `f` with the parts of mapped uv triangle `p`. A part flat along a cell's edge counts
     /// with `edges`, unless it reads no tile: there a point on the edge reads the tile beside it,
-    /// and so does a part no wider than `texture_tile`'s rounding. A triangle spanning more than
-    /// two grid periods along an axis that repeats has the parts [`Self::whole`] gives it, so no
-    /// read costs more than the grid holds.
+    /// and so does a part no wider than `texture_tile`'s rounding.
     fn walk<'a>(
         &'a self,
         p: [[f64; 2]; 3],
@@ -328,10 +266,6 @@ impl<T> Tiles<T> {
                 uv: p.map(|c| [0, 1].map(|a| (c[a] - cell[a]) as f32)),
                 weights: WHOLE,
             });
-        }
-        let (lo, hi) = bounds(&p);
-        if self.wide(&p) {
-            return self.whole(lo, hi, f);
         }
         let (e1, e2) = (
             [p[1][0] - p[0][0], p[1][1] - p[0][1]],
@@ -363,96 +297,36 @@ impl<T> Tiles<T> {
             [p[1][0], p[1][1], 0.0, 1.0, 0.0],
             [p[2][0], p[2][1], 0.0, 0.0, 1.0],
         ];
-        let (low, high) = (
-            |a: usize| lo[a].floor() as i64,
-            |a: usize| hi[a].floor() as i64,
-        );
+        let low = |a: usize| p.iter().map(|c| c[a]).fold(f64::INFINITY, f64::min).floor();
+        let index = |c: f64| c.clamp(0.0, 65535.0) as u16;
+        let (first_column, first_row) = (index(low(0)), index(-low(1)));
+        let row_of = |(k, _): (&(u16, u16), &T)| k.0;
         // Rows run against v, so the sweep up v takes them from the last down.
-        let rows = self.lines(1, -high(1), -low(1), 0);
+        let rows = std::iter::successors(
+            self.tiles
+                .range(..=(first_row, u16::MAX))
+                .next_back()
+                .map(row_of),
+            |&row| self.tiles.range(..(row, 0)).next_back().map(row_of),
+        );
         sweep(
             poly,
             1,
-            rows.into_iter().rev().map(|row| (-row as f64, row)),
+            rows.map(|row| (-f64::from(row), row)),
             &mut |row, poly| {
                 let Some(row) = row else {
                     let origin = [poly[0][0].floor(), poly[0][1].floor()];
                     return emit(&self.missing, origin, poly);
                 };
-                let v = -row as f64;
-                let columns = self.lines(0, low(0), high(0), row).into_iter();
-                let cells =
-                    columns.filter_map(|u| Some((u as f64, (u as f64, self.held([u, row])?))));
+                let v = -f64::from(row);
+                let tiles = self.tiles.range((row, first_column)..=(row, u16::MAX));
+                let cells = tiles.map(|(k, t)| (f64::from(k.1), (f64::from(k.1), t)));
                 sweep(poly, 0, cells, &mut |tile, poly| match tile {
                     Some((u, t)) => emit(t, [u, v], poly),
                     None => emit(&self.missing, [poly[0][0].floor(), v], poly),
                 })
             },
         )
-    }
-}
-
-impl<T> Tiles<T> {
-    /// The parts of a triangle whose mapped uvs span `lo` to `hi`, more than two grid periods
-    /// along an axis that repeats. Each cell of the grid it can read stands for the whole
-    /// triangle and reads whole, as two halves of its square: along an axis that repeats every
-    /// cell of the grid, and along one that doesn't the cells of the span that hold tiles, with
-    /// one more square of what reads where there is no tile if the span reaches such a cell. A
-    /// triangle spanning more than two periods of a texture visits every texel likewise
-    /// ([`Raster::footprint`]), and each square, like a texel there, counts alike.
-    ///
-    /// The squares hold every texel the triangle reads, so what the opacity, micromap and
-    /// displacement checks take of them stays conservative, and the emission mean they give
-    /// weighs light selection alone, as a probability: an emitter's radiance comes from its
-    /// texture where a sample lands. The tangent check, which weighs texels by the area that
-    /// reads them, samples such a triangle point by point instead ([`Map::wide`]).
-    fn whole<'a>(
-        &'a self,
-        lo: [f64; 2],
-        hi: [f64; 2],
-        f: &mut impl FnMut(Part<'a, T>) -> bool,
-    ) -> bool {
-        // The cells along axis `a` that the span holds area of, or the grid's along one that
-        // repeats. Row `r` covers v from `-r` to `1 - r`.
-        let cells = |a: usize| {
-            if self.grid.repeat[a] {
-                let first = i64::from(self.grid.first[a]);
-                return (first, first + i64::from(self.grid.size[a]) - 1);
-            }
-            let first = lo[a].floor();
-            let last = (hi[a].ceil() - 1.0).max(first);
-            match a {
-                0 => (first as i64, last as i64),
-                _ => (-last as i64, -first as i64),
-            }
-        };
-        let count = |(first, last): (i64, i64)| last as f64 - first as f64 + 1.0;
-        let square = |read: &'a T, f: &mut dyn FnMut(Part<'a, T>) -> bool| {
-            let halves = [
-                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
-                [[0.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
-            ];
-            halves.into_iter().all(|uv| {
-                f(Part {
-                    read,
-                    uv,
-                    weights: WHOLE,
-                })
-            })
-        };
-        let (columns, rows) = (cells(0), cells(1));
-        let held_rows = self.lines(1, rows.0, rows.1, 0);
-        let mut beyond = count(rows) > held_rows.len() as f64;
-        for row in held_rows {
-            let held = self.lines(0, columns.0, columns.1, row);
-            beyond |= count(columns) > held.len() as f64;
-            for column in held {
-                let read = self.held([column, row]).unwrap_or(&self.missing);
-                if !square(read, f) {
-                    return false;
-                }
-            }
-        }
-        !beyond || square(&self.missing, f)
     }
 }
 
@@ -544,16 +418,6 @@ impl<T> Map<T> {
         })
     }
 
-    /// The tile set and mapped uvs of mesh uv triangle `uv` where it reads the set whole
-    /// ([`Tiles::whole`]), for a reader that needs each point's tile at the triangle's own area.
-    pub(super) fn wide(&self, uv: [[f32; 2]; 3]) -> Option<(&Tiles<T>, [[f64; 2]; 3])> {
-        let Self::Tiles(t) = self else {
-            return None;
-        };
-        let p = uv.map(|c| mapped(t.uv, c));
-        t.wide(&p).then_some((t, p))
-    }
-
     /// Every texture, and what reads where a set has none.
     pub(super) fn each(&self) -> impl Iterator<Item = &T> {
         let (image, tiles, missing) = match self {
@@ -575,7 +439,6 @@ impl<T> Map<T> {
             Self::Image(t) => Map::Image(f(t)?),
             Self::Tiles(t) => Map::Tiles(Tiles {
                 uv: t.uv,
-                grid: t.grid,
                 tiles: t
                     .tiles
                     .iter()
@@ -1532,7 +1395,6 @@ mod tests {
         let tiles = tiles.iter().map(|&(r, c, v)| ((r, c), Raster::solid(v)));
         Map::Tiles(Tiles {
             uv,
-            grid: Grid::default(),
             tiles: tiles.collect(),
             missing: Raster::solid(missing),
         })
@@ -1549,8 +1411,7 @@ mod tests {
         let cells = |uv: [f32; 6], uvs: &[[f32; 2]]| {
             let reach = Reach::new(uv, uvs.iter().copied());
             let all = (0..4).flat_map(|row| (0..4).map(move |column| [column, row]));
-            all.filter(|&c| reach.holds(c, &Grid::default()))
-                .collect::<Vec<_>>()
+            all.filter(|&c| reach.holds(c)).collect::<Vec<_>>()
         };
         let none = [0.0; 6];
         assert_eq!(cells(none, &[[1.25, 0.25], [1.75, 0.75]]), [[1, 0]]);
@@ -1601,63 +1462,6 @@ mod tests {
         assert!((emission([[0.0, 0.0], [2.0, 0.0], [0.0, 1.0]]) - 1.5).abs() < 1e-5);
         // On a line in uv space it reads each tile it crosses alike.
         assert!((emission([[0.5, 0.5], [1.5, 0.5], [1.0, 0.5]]) - 2.0).abs() < 1e-5);
-    }
-
-    /// A set that repeats reads as `texture_tile` wraps it: points, a triangle's parts and a
-    /// mesh's reach in cells past the grid, below 0 among them, land on the tile a whole number of
-    /// grid widths away, and past the grid along an axis that doesn't repeat on none. A triangle
-    /// spanning many grid periods reads each cell of the grid once, at the weights its cells'
-    /// areas tend to, however far it reaches.
-    #[test]
-    fn a_repeating_set_reads_the_tile_its_cell_wraps_to() {
-        // Columns 1 and 2 of row 0, repeating along u alone.
-        let grid = Grid {
-            first: [1, 0],
-            size: [2, 1],
-            repeat: [true, false],
-        };
-        let map = Map::Tiles(Tiles {
-            uv: [0.0; 6],
-            grid,
-            tiles: [((0, 1), Raster::solid(1.0)), ((0, 2), Raster::solid(3.0))].into(),
-            missing: Raster::solid(7.0),
-        });
-        for (uv, want) in [
-            ([-0.5, 0.5], 1.0),
-            ([0.5, 0.5], 3.0),
-            ([3.5, 0.5], 1.0),
-            ([0.5, 1.5], 7.0),
-            ([0.5, -0.5], 7.0),
-        ] {
-            assert_eq!(value(&map, uv), want, "{uv:?}");
-        }
-        // Three quarters of the triangle lie in cell -1, which reads column 1.
-        let emission = Emission { map, uv_set: 0 };
-        let mean = emission.mean([[-1.0, 0.0], [1.0, 0.0], [-1.0, 1.0]]);
-        assert!((mean - 1.5).abs() < 1e-5, "{mean}");
-        let reach = Reach::new([0.0; 6], [[-0.5, 0.5]].into_iter());
-        assert!(reach.holds([1, 0], &grid) && !reach.holds([2, 0], &grid));
-
-        // 40 periods: cell k from -40 holds (39.5 - k) / 160 of the triangle's area and reads
-        // column 1 where k is odd. Each cell's part of it differs from its neighbor's by a 40th.
-        let cells = (-40..40).map(|k: i32| ((39.5 - f64::from(k)) / 160.0, k.rem_euclid(2)));
-        let (area, sum) = cells.fold((0.0, 0.0), |(area, sum), (a, odd)| {
-            (area + a, sum + a * if odd == 1 { 1.0 } else { 3.0 })
-        });
-        let wide = emission.mean([[-40.0, 0.25], [40.0, 0.25], [-40.0, 0.75]]);
-        assert!(
-            (wide - sum / area).abs() < 2.0 / 40.0,
-            "{wide} against {}",
-            sum / area
-        );
-        assert_eq!(wide, 2.0);
-        let far = emission.mean([[-1e19, 0.25], [1e19, 0.25], [-1e19, 0.75]]);
-        assert_eq!(far, 2.0, "a span past any cell index");
-        let below = emission.mean([[-40.0, 0.25], [40.0, 0.25], [-40.0, 1.75]]);
-        assert!(
-            (below - 11.0 / 3.0).abs() < 1e-5,
-            "and the row above, which has no tile"
-        );
     }
 
     #[test]
@@ -1828,7 +1632,6 @@ mod tests {
             max: 1.0,
             map: Some(Map::Tiles(Tiles {
                 uv: [0.0; 6],
-                grid: Grid::default(),
                 tiles: tiles.into(),
                 missing: vec![Raster::solid(0.5)],
             })),
@@ -1893,7 +1696,6 @@ mod tests {
         let tiled = |missing: f32| {
             texture(Map::Tiles(Tiles {
                 uv: [0.0; 6],
-                grid: Grid::default(),
                 tiles: [((2, 3), OpacityRead::new(gradient(32), 0.5))].into(),
                 missing: OpacityRead::solid(missing, 0.5),
             }))

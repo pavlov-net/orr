@@ -8,9 +8,7 @@
 //! does from positions on the grid the mesh is stored on, and from the source uvs: the stored
 //! ones follow the clusters, which follow the check, and lie within half a cluster's uv step of
 //! them. A tile set counts each tile's texels,
-//! and the cells it has no tile in at the density of its largest. A triangle spanning more than
-//! two periods of a set that repeats counts at that density too, read point by point across it
-//! ([`Map::wide`]), so it weighs by its own area. A mesh whose triangles cover
+//! and the cells it has no tile in at the density of its largest. A mesh whose triangles cover
 //! more than [`SAMPLES`] texels, as uvs that repeat a map many times do, samples a lattice of
 //! texel centers at a whole-texel stride instead, offset by a hash of each triangle, so every
 //! center has the same chance of a sample and the histogram is the dense one's in expectation.
@@ -202,12 +200,7 @@ pub(super) fn check(
                 .map(|chunk| {
                     let mut area = 0u64;
                     for t in chunk.as_chunks::<3>().0 {
-                        let uv = t.map(|i| m.uvs[set][i as usize]);
-                        if let Some((_, p)) = map.wide(uv) {
-                            area += texel_area(largest, p).ceil() as u64;
-                            continue;
-                        }
-                        map.parts(uv, |p| {
+                        map.parts(t.map(|i| m.uvs[set][i as usize]), |p| {
                             let [x, ..] = p.read;
                             let size = match [x.w, x.h] {
                                 [1, 1] => largest,
@@ -238,27 +231,6 @@ pub(super) fn check(
                         let v = t.map(|i| i as usize);
                         let tri = Triangle::new(m, snap, [set, frame], tangents, v);
                         let lattice = stride.map(|s| (s, phase((first + k * CHUNK + j) as u64)));
-                        if let Some((tiles, p)) = map.wide(tri.uv) {
-                            texel_centers(largest, p, lattice, |w, weight| {
-                                let at = [0, 1].map(|i| {
-                                    let [a, b, c] = p.map(|q| q[i]);
-                                    f64::from(w.x) * a + f64::from(w.y) * b + f64::from(w.z) * c
-                                });
-                                let (read, place) = tiles.at_mapped(at);
-                                // The center of the tile's texel there, as a dense read takes.
-                                let size = [read[0].w, read[0].h].map(|n| n as f32);
-                                let at = [0, 1].map(|i| {
-                                    ((place[i] * size[i]).floor().clamp(0.0, size[i] - 1.0) + 0.5)
-                                        / size[i]
-                                });
-                                let v = normal::decode([read[0].sample(at), read[1].sample(at)]);
-                                let v = Vec3::from(map.normal_frame(v));
-                                let deg = tri.angle(v, w);
-                                h[((deg / BIN) as usize).min(BINS - 1)] += weight;
-                                n += 1;
-                            });
-                            continue;
-                        }
                         map.parts(tri.uv, |p| {
                             let [x, ..] = p.read;
                             // One texel holds one value and no grid: it reads as finely as the set.

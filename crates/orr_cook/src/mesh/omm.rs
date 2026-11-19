@@ -663,7 +663,6 @@ mod tests {
     fn set(tiles: Vec<((u16, u16), OpacityRead)>) -> Map<OpacityRead> {
         Map::Tiles(Tiles {
             uv: [0.0; 6],
-            grid: orr_pack::tiles::Grid::default(),
             tiles: tiles.into_iter().collect(),
             missing: OpacityRead::solid(0.0, 0.5),
         })

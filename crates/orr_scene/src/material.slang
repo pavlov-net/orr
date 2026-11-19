@@ -305,22 +305,14 @@ public bool texture_outside(float2 uv, uint modes)
 }
 
 // The tile of a set under `uv`, or IMAGE_NONE where the set has none, with `uv` moved to its place
-// in 0..1 of that square. `tiles` holds a multiplier, a shift, the set's grid as a wrap (below),
-// padding to TEXTURE_TILES_HEADER, then buckets of eight entries of a key `row << 16 | column` and a
-// heap index, IMAGE_NONE where empty (orr_pack::tiles). Keys in a bucket differ, so at most one
-// entry adds a heap index. Row 1 lies above row 0, so it covers v from -1 to 0. A point within a
-// few f32 steps of a cell's edge lies on it, and belongs to the cell `inward`
-// (`UvFootprint.inward`) points into, which a read by its uv alone can't tell from the cell across
-// the edge. A point on a cell's lower edge lies on the cells before it too, and reads one of those
-// where its own cell has no tile: a surface ending on a tile's edge has its last points there, and
-// rounding puts others there.
-//
-// Along an axis that repeats, a cell reads the grid's cell a whole number of grid widths away
-// (orr_pack::tiles::Grid::wrap): `at - size * floor((at - first + 0.5) / size)`, whose half cell
-// keeps the quotient's rounding off a whole number for cells within 2^22 of the grid. The header
-// holds `1 / size`, `(0.5 - first) / size` and `-size`, and 0 along an axis that doesn't repeat,
-// which leaves the cell where it is. The move is whole cells, so `uv`'s place in its cell and the
-// footprint's extent, which picks the mip, carry over unchanged across the grid's seam.
+// in 0..1 of that square. `tiles` holds a multiplier and a shift, padding to TEXTURE_TILES_HEADER,
+// then buckets of eight entries of a key `row << 16 | column` and a heap index, IMAGE_NONE where
+// empty (orr_pack::tiles). Keys in a bucket differ, so at most one entry adds a heap index. Row 1
+// lies above row 0, so it covers v from -1 to 0. A point within a few f32 steps of a cell's edge
+// lies on it, and belongs to the cell `inward` (`UvFootprint.inward`) points into, which a read by
+// its uv alone can't tell from the cell across the edge. A point on a cell's lower edge lies on
+// the cells before it too, and reads one of those where its own cell has no tile: a surface ending
+// on a tile's edge has its last points there, and rounding puts others there.
 public TextureIndex texture_tile(uint* tiles, inout float2 uv, float2 inward)
 {
     float slack = 4.0 * 1.1920929e-7 * max(1.0, max(abs(uv.x), abs(uv.y)));
@@ -330,10 +322,6 @@ public TextureIndex texture_tile(uint* tiles, inout float2 uv, float2 inward)
     float2 place = uv - cell;
     uint edges = (place.x < slack ? 1 : 0) | (place.y < slack ? 2 : 0);
     uv = place;
-    uint4* head = (uint4*)tiles;
-    uint4 hash = head[0];
-    float4 wrap = asfloat(head[1]);
-    float2 inverse = asfloat(hash.zw);
     TextureIndex t = { IMAGE_NONE };
     for (uint before = 0; before < 4 && t.index == IMAGE_NONE; before++)
     {
@@ -341,12 +329,11 @@ public TextureIndex texture_tile(uint* tiles, inout float2 uv, float2 inward)
             continue;
         float2 back = float2(before & 1, before >> 1);
         float2 at = float2(cell.x - back.x, back.y - cell.y);
-        at = mad(wrap.zw, floor(mad(at, inverse, wrap.xy)), at);
         if (!all(and(at >= 0.0, at < 65536.0)))
             continue;
         uint key = uint(at.y) << 16 | uint(at.x);
-        uint bucket = (key * hash.x) >> hash.y;
-        uint4* entries = head + TEXTURE_TILES_HEADER / 4 + 4 * bucket;
+        uint bucket = (key * tiles[0]) >> tiles[1];
+        uint4* entries = (uint4*)(tiles + TEXTURE_TILES_HEADER) + 4 * bucket;
         for (uint i = 0; i < 4; i++)
         {
             uint4 e = entries[i];

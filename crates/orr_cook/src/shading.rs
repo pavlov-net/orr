@@ -78,19 +78,15 @@
 //!
 //! A file name holding a tile token is a set of images, one to each unit square of st
 //! ([`crate::texture::tiles`]). Those values are what a square with no tile reads, as a point there
-//! names a file that isn't. A token picks the tile, so no point lies past a tile's edge, and each
-//! tile clamps at its edges, as USD's Storm has them. Neither specification says what an address
-//! mode does to a set: usdShaders' `UsdUVTexture` reads "tiled textures such as Mari UDIM's", and
-//! of `wrapS` and `wrapT` says only "<options> black, clamp, repeat, mirror, useMetadata". The cook
-//! reads `repeat`, and MaterialX's `periodic`, as repeating the set as one texture over its grid:
-//! the columns and rows from its first tile to its last ([`orr_pack::tiles::Grid`]). Along an axis
-//! that repeats, a point in a cell past the grid reads the grid's cell a whole number of grid
-//! widths away, as `frac` of st over the grid's size reads a texture of the whole grid, below 0
-//! too. Every other mode (`black`, `clamp`, `mirror`, `useMetadata`, and MaterialX's `clamp`,
-//! `mirror` and `constant`) leaves each cell reading what its token names. Read as one texture of
-//! the grid, those would hold the grid's edge texels past it, reflect the grid, or read black or
-//! the stated value past it; the cook doesn't read them so. A cell of the grid with no tile reads
-//! the value above under every mode.
+//! names a file that isn't. A token, not an address mode, picks the tile: the whole parts of st
+//! name a point's square, and the point reads that square's tile clamped at the tile's edges,
+//! whatever `wrapS`, `wrapT`, `uaddressmode` or `vaddressmode` state. Neither specification says
+//! what an address mode does to a set. The reference readers agree that the whole parts of st pick
+//! the tile and that a square past the set's tiles or with no tile reads as a missing texture, and
+//! differ only at a tile's edges: USD's Storm samples every set with clamp, as "wrap modes such as
+//! repeat or mirror do not make sense for udim", and the cook reads sets as Storm does, while
+//! OpenImageIO, which MaterialX's OSL shaders read textures through, applies the wrap mode within
+//! the tile alone.
 //!
 //! A `UsdUVTexture` reads as its `sourceColorSpace` says, or under `auto` as the file's
 //! `colorSpace` metadata names, and a MaterialX image of a color type as its `colorspace` names;

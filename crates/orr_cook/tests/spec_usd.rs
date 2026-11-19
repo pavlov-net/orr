@@ -2858,42 +2858,6 @@ fn a_udim_file_reads_as_tiles_across_st() {
     assert_eq!(tiles_of(&a, &material(&a), slot::ROUGHNESS).len(), 1);
 }
 
-/// usdShaders `UsdUVTexture` reads "tiled textures such as Mari UDIM's", and `wrapS` and `wrapT`
-/// name "black, clamp, repeat, mirror, useMetadata" without a word on tiles. `repeat` repeats the
-/// set as one texture over the grid from its first tile to its last; every other mode leaves a cell
-/// past the tiles reading `fallback`. Each tile clamps at its own edges whatever the mode.
-#[test]
-fn a_udim_set_repeats_over_its_grid_along_axes_of_repeat() {
-    use orr_pack::tiles::Grid;
-    let d = dir("udim-wrap");
-    let tile = png(8, 8, |x, y| [(x * 32) as u8, (y * 32) as u8, 0, 255]);
-    for name in ["1002", "1013"] {
-        std::fs::write(d.join(format!("tex.{name}.png")), &tile).unwrap();
-    }
-    let wired = "float inputs:roughness.connect = </M/T.outputs:r>";
-    let modes = |s: &str, t: &str| {
-        format!("{RAW}\ntoken inputs:wrapS = \"{s}\"\ntoken inputs:wrapT = \"{t}\"")
-    };
-    for (inputs, repeat) in [
-        (modes("repeat", "repeat"), [true, true]),
-        (modes("repeat", "clamp"), [true, false]),
-        (modes("mirror", "black"), [false, false]),
-        (RAW.to_string(), [false, false]),
-    ] {
-        let a = cook_at(&d, &udim_stage(&inputs, wired), UsdSettings::default()).unwrap();
-        let b = material(&a).textures[slot::ROUGHNESS];
-        assert_eq!(b.wrap, [wrap::CLAMP; 2], "{inputs}");
-        let e = a.find(b.texture).expect("bound");
-        let set = TextureTiles::parse(&read(&a, &a.blobs(e)[0])).unwrap();
-        let grid = Grid {
-            first: [1, 0],
-            size: [2, 2],
-            repeat,
-        };
-        assert_eq!(set.grid(), grid, "{inputs}");
-    }
-}
-
 /// PS `fallback`, per tile: a tile that can't be read is a point's file that can't be, and with
 /// none left the texture itself can't be.
 #[test]
@@ -3082,31 +3046,6 @@ fn the_tangent_check_reads_one_tile_as_the_same_image() {
         std::fs::write(d.join(file), &normals).unwrap();
     }
     let check = |file: &str| tangent_check(&d, &grid_stage(file, [0.0, 0.0], NORMAL));
-    let (image, tile) = (check("tex.png"), check("tex.<UDIM>.png"));
-    assert!(image.angle_p99.is_some() && image.texels > 0, "{image:?}");
-    assert_eq!(
-        (image.angle_p99, image.texels, image.derived),
-        (tile.angle_p99, tile.texels, tile.derived)
-    );
-}
-
-/// A triangle spanning many periods of a set that repeats weighs in the tangent check by its own
-/// area, at the same points, as one spanning a repeating image does.
-#[test]
-fn the_tangent_check_reads_a_repeating_set_over_many_periods_as_the_same_image() {
-    let d = dir("udim-mesh-normals-wide");
-    let normals = png(32, 32, |x, y| {
-        [64 + (x * 4) as u8, 192 - (y * 4) as u8, 255, 255]
-    });
-    for file in ["tex.png", "tex.1001.png"] {
-        std::fs::write(d.join(file), &normals).unwrap();
-    }
-    // Each quad spans three periods.
-    let check = |file: &str| {
-        let stage =
-            grid_over(file, [0.0, 0.0], [0.0, 48.0], NORMAL).replace("\"clamp\"", "\"repeat\"");
-        tangent_check(&d, &stage)
-    };
     let (image, tile) = (check("tex.png"), check("tex.<UDIM>.png"));
     assert!(image.angle_p99.is_some() && image.texels > 0, "{image:?}");
     assert_eq!(
