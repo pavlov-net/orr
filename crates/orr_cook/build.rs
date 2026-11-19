@@ -4,13 +4,13 @@
 //! `ORR_COOK_RASTER_LIBS` for raster sets and `ORR_COOK_VOLUME_LIBS` for volumes.
 //!
 //! With the `ntc` feature, compiles the LibNTC shim against the headers of the RTXNTC-Library
-//! checkout in `ORR_NTC_SDK` (else `RTXNTC-Library` under `ORR_TOOLS` or the nearest
-//! `.tools`, where `ORR_FETCH_NTC=1 tools/fetch-slang.sh` puts it) and sets
+//! checkout in `ORR_NTC_SDK` (else `RTXNTC/libraries/RTXNTC-Library` under `ORR_TOOLS` or the
+//! nearest `.tools`, where `ORR_FETCH_NTC=1 tools/fetch-slang.sh` puts it) and sets
 //! `ORR_COOK_NTC_SDK`, `ORR_COOK_NTC_INTERFACE` (the headers' `InterfaceVersion`) and
 //! `ORR_COOK_NTC_SCHEMA` (the NTC file schema version the checkout writes).
 //!
 //! With the `subd` feature, compiles OpenSubdiv's Sdc, Vtr and Far sources from the release
-//! checkout in `ORR_OPENSUBDIV` (else `OpenSubdiv-3.8.0` under `ORR_TOOLS` or the nearest
+//! checkout in `ORR_OPENSUBDIV` (else `OpenSubdiv-<tag>` under `ORR_TOOLS` or the nearest
 //! `.tools`) with the Far shim, and sets `ORR_COOK_SUBD_LIBS` to the release it read.
 //!
 //! With the `gdeflate` feature, compiles the GDeflate codec of NVIDIA's libdeflate fork from
@@ -93,12 +93,13 @@ fn constant(text: &str, marker: &str, file: &Path) -> String {
 
 #[cfg(feature = "ntc")]
 fn ntc() {
-    let sdk = orr_shaders::build::fetched("ORR_NTC_SDK", "RTXNTC-Library").unwrap_or_else(|e| {
-        panic!(
-            "the ntc feature needs an RTXNTC-Library checkout, which only \
-             `ORR_FETCH_NTC=1 tools/fetch-slang.sh` fetches: {e}"
-        )
-    });
+    let sdk = orr_shaders::build::fetched("ORR_NTC_SDK", "RTXNTC/libraries/RTXNTC-Library")
+        .unwrap_or_else(|e| {
+            panic!(
+                "the ntc feature needs an RTXNTC-Library checkout, which only \
+                 `ORR_FETCH_NTC=1 tools/fetch-slang.sh` fetches: {e}"
+            )
+        });
     let header = sdk.join("include/libntc/ntc.h");
     let schema = sdk.join("src/JsonFileFormat.h");
     for f in [&header, &schema] {
@@ -124,25 +125,28 @@ fn ntc() {
 #[cfg(not(feature = "ntc"))]
 fn ntc() {}
 
-/// The OpenSubdiv release the cook is pinned to: its checkout directory and version number.
+/// The OpenSubdiv release tag the cook is pinned to, which `OPENSUBDIV_VERSION` in its
+/// `version.h` spells the same way.
 #[cfg(feature = "subd")]
-const OPENSUBDIV: (&str, &str) = ("OpenSubdiv-3.8.0", "30800");
+// renovate: datasource=github-releases depName=PixarAnimationStudios/OpenSubdiv
+const OPENSUBDIV: &str = "v3_8_0";
 
 #[cfg(feature = "subd")]
 fn subd() {
-    let src = orr_shaders::build::fetched("ORR_OPENSUBDIV", OPENSUBDIV.0)
+    let dir = format!("OpenSubdiv-{OPENSUBDIV}");
+    let src = orr_shaders::build::fetched("ORR_OPENSUBDIV", dir)
         .unwrap_or_else(|e| panic!("the subd feature needs an OpenSubdiv checkout: {e}"));
     let version = src.join("opensubdiv/version.h");
     let text =
         std::fs::read_to_string(&version).unwrap_or_else(|e| panic!("{}: {e}", version.display()));
-    let number = constant_define(&text, "OPENSUBDIV_VERSION_NUMBER", &version);
+    let tag = constant_define(&text, "OPENSUBDIV_VERSION", &version);
     assert_eq!(
-        number,
-        OPENSUBDIV.1,
-        "{} is OpenSubdiv {number}; the cook is pinned to {}",
+        tag,
+        OPENSUBDIV,
+        "{} is OpenSubdiv {tag}; the cook is pinned to {OPENSUBDIV}",
         src.display(),
-        OPENSUBDIV.1
     );
+    let number = constant_define(&text, "OPENSUBDIV_VERSION_NUMBER", &version);
     println!("cargo::rustc-env=ORR_COOK_SUBD_LIBS=OpenSubdiv {number}");
     println!("cargo::rerun-if-changed=src/subd/osd.cpp");
     let mut files = Vec::new();
@@ -172,7 +176,10 @@ fn subd() {
 #[cfg(feature = "subd")]
 fn constant_define(text: &str, name: &str, file: &Path) -> String {
     text.lines()
-        .find_map(|l| l.trim().strip_prefix("#define ")?.strip_prefix(name))
+        .find_map(|l| {
+            let rest = l.trim().strip_prefix("#define ")?.strip_prefix(name)?;
+            rest.starts_with(char::is_whitespace).then_some(rest)
+        })
         .unwrap_or_else(|| panic!("{} has no {name}", file.display()))
         .trim()
         .to_string()

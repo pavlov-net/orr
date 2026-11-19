@@ -1,0 +1,85 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "enabledManagers": ["custom.regex"],
+  "timezone": "America/Los_Angeles",
+  "schedule": ["* 0-8 * * *"],
+  "labels": ["dependencies"],
+  "commitMessagePrefix": "deps:",
+  "prConcurrentLimit": 10,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Pins in the tool scripts, each under a `# renovate:` comment",
+      "managerFilePatterns": ["/^tools/fetch-slang\\.sh$/", "/^tools/gen-slang-bindings\\.sh$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\n\\w+_version=(?<currentValue>\\S+)\\n",
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\n\\w+_tag=(?<currentValue>\\S+)\\n\\w+_commit=(?<currentDigest>[0-9a-f]{40})\\n",
+        "# renovate: datasource=(?<datasource>git-refs) depName=(?<depName>\\S+) packageName=(?<packageName>\\S+) branch=(?<currentValue>\\S+)\\n\\w+_commit=(?<currentDigest>[0-9a-f]{40})\\n",
+        "# renovate: datasource=(?<datasource>github-release-attachments) depName=(?<depName>\\S+) digestVersion=(?<currentValue>\\S+)\\n\\s*\\w+=(?<currentDigest>[0-9a-f]{64})\\b"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "Pins in build code, each under a `// renovate:` comment",
+      "managerFilePatterns": ["/^crates/orr_shaders/src/build/locate\\.rs$/", "/^crates/orr_cook/build\\.rs$/"],
+      "matchStrings": [
+        "// renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\n\\s*(?:pub\\(crate\\) )?const \\w+: &str = \"(?<currentValue>[^\"]+)\";"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "New releases wait two days; branch heads have no release date and wait for the weekly schedule instead",
+      "matchDatasources": ["!git-refs"],
+      "minimumReleaseAge": "2 days"
+    },
+    {
+      "matchDatasources": ["git-refs"],
+      "schedule": ["* 0-8 * * 1"]
+    },
+    {
+      "description": "Slang's version, its asset sums and the build's version check land together",
+      "matchDepNames": ["shader-slang/slang"],
+      "groupName": "Slang",
+      "prBodyNotes": [
+        "Regenerate `crates/orr_shaders/src/build/slang_sys.rs` with `tools/gen-slang-bindings.sh` on Windows, and update the Slang version that `THIRD_PARTY_LICENSES.md` names for it."
+      ]
+    },
+    {
+      "matchDatasources": ["github-releases"],
+      "matchDepNames": ["shader-slang/slang"],
+      "extractVersion": "^v(?<version>.+)$"
+    },
+    {
+      "description": "The fetch script and the cook's version check land together",
+      "matchDepNames": ["PixarAnimationStudios/OpenSubdiv"],
+      "groupName": "OpenSubdiv",
+      "versioning": "regex:^v(?<major>\\d+)_(?<minor>\\d+)_(?<patch>\\d+)$"
+    },
+    {
+      "matchDepNames": ["bindgen-cli"],
+      "prBodyNotes": [
+        "Regenerate `crates/orr_shaders/src/build/slang_sys.rs` with `tools/gen-slang-bindings.sh` on Windows, so the committed bindings come from the pinned bindgen."
+      ]
+    },
+    {
+      "matchDepNames": ["NVIDIA/DLSS"],
+      "prBodyNotes": [
+        "Update the DLSS SDK version that `crates/orr_dlss/README.md` names for orr_dlss."
+      ]
+    },
+    {
+      "description": "Track the Vulkan SDK tags, which also announce new SDKs",
+      "matchDepNames": ["KhronosGroup/Vulkan-Headers"],
+      "versioning": "regex:^vulkan-sdk-(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)\\.(?<build>\\d+)$"
+    },
+    {
+      "description": "Every RTXNTC release is a beta",
+      "matchDepNames": ["NVIDIA-RTX/RTXNTC"],
+      "versioning": "regex:^v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(?:-beta)?$",
+      "prBodyNotes": [
+        "Renovate can't update `ntc_windows_zip` and `ntc_windows_sum` in `tools/fetch-slang.sh`: set them to this release's Windows x64 zip and its sha256, then check with `ORR_FETCH_NTC=1 bash tools/fetch-slang.sh` on Windows."
+      ]
+    }
+  ]
+}

@@ -20,6 +20,7 @@ case "$(uname -s)" in
     ;;
 esac
 
+# renovate: datasource=crate depName=bindgen-cli
 bindgen_version=0.73.2
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
