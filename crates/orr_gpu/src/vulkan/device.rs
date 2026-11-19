@@ -528,6 +528,7 @@ impl Device {
                 max_workgroup_invocations: props.limits.max_compute_work_group_invocations,
                 max_workgroup_count: props.limits.max_compute_work_group_count,
                 max_image_extent_2d: props.limits.max_image_dimension2_d,
+                max_image_extent_cube: props.limits.max_image_dimension_cube,
                 max_image_extent_3d: props.limits.max_image_dimension3_d,
                 max_image_layers: props.limits.max_image_array_layers,
                 max_color_targets: props.limits.max_color_attachments,

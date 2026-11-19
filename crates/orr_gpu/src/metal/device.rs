@@ -409,6 +409,7 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
             max_workgroup_invocations: 1024,
             max_workgroup_count: [u32::MAX; 3],
             max_image_extent_2d: 16384,
+            max_image_extent_cube: 16384,
             max_image_extent_3d: 2048,
             max_image_layers: 2048,
             max_color_targets: 8,

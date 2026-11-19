@@ -6,6 +6,11 @@
 //! Tile (`column`, `row`) covers u from `column` to `column + 1` and v from `-row` to `1 - row`:
 //! uvs have a top-left origin and rows count up the image, so row 1 lies above row 0.
 //!
+//! A set's [`Grid`] spans the columns and rows from its first tile to its last. On an axis the set
+//! repeats, a read in any cell lands in the cell of the grid a whole number of grid widths away, as
+//! a texture of the whole grid repeats; on an axis that doesn't, a read stays in its cell. A cell
+//! with no tile reads the binding's [`outside`](crate::material::TextureBinding::outside).
+//!
 //! A slot finds a tile through a hash of its key `row << 16 | column`, so a table's size follows
 //! the tiles a set has and not how far apart their names lie. Bucket `(key * multiplier) >> shift`
 //! holds up to [`BUCKET`] entries of a key and a heap index, one cache line in all, which a tap
@@ -18,13 +23,15 @@ use bytemuck::{Pod, Zeroable};
 use crate::blob::{put_table, read, table};
 use crate::{AssetId, Error, Result, Span};
 
-pub const SCHEMA: u16 = 1;
+pub const SCHEMA: u16 = 2;
 
 /// Entries of a bucket.
 pub const BUCKET: u32 = 8;
 
-/// Words of a table before its first bucket: the multiplier, the shift, then padding to a cache
-/// line, on which every bucket starts.
+/// Words of a table before its first bucket: the multiplier, the shift, then the [`Grid`] as a
+/// kernel wraps by it, per axis in f32 bits: `1 / size`, `(0.5 - first) / size` and `-size` along an
+/// axis that repeats and 0 along one that doesn't, which leaves a cell where it is; then padding to
+/// a cache line, on which every bucket starts.
 pub const HEADER_WORDS: usize = 16;
 
 /// Seeds a size of table tries before it doubles.
@@ -48,7 +55,34 @@ struct Header {
     multiplier: u32,
     shift: u32,
     buckets: u32,
+    /// Bit 0: u repeats, bit 1: v does.
+    repeat: u32,
     tiles: Span,
+}
+
+/// The columns and rows of a set from its first tile to its last, and per axis whether reads
+/// repeat over them.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Grid {
+    /// The first column and row.
+    pub first: [u16; 2],
+    /// Columns and rows.
+    pub size: [u32; 2],
+    pub repeat: [bool; 2],
+}
+
+impl Grid {
+    /// The cell a read in cell `cell`, a column and a row, lands in.
+    pub fn wrap(&self, cell: [i64; 2]) -> [i64; 2] {
+        std::array::from_fn(|a| {
+            let first = i64::from(self.first[a]);
+            if self.repeat[a] {
+                first + (cell[a] - first).rem_euclid(i64::from(self.size[a]))
+            } else {
+                cell[a]
+            }
+        })
+    }
 }
 
 /// A tile set's blob.
@@ -59,6 +93,8 @@ pub struct TextureTiles {
     /// 32 less the log2 of the buckets: below 32, as a shift has to be.
     pub shift: u32,
     pub buckets: u32,
+    /// Per axis, whether reads repeat over the [`Grid`].
+    pub repeat: [bool; 2],
     pub tiles: Vec<Tile>,
 }
 
@@ -71,14 +107,14 @@ fn hashed(key: u32, multiplier: u32, shift: u32) -> u32 {
 }
 
 impl TextureTiles {
-    /// The set of `tiles`, each a column, a row and a texture, in distinct cells: its table at a
-    /// load of about 35%, in the first of a fixed run of multipliers that leaves no bucket over
-    /// [`BUCKET`] keys, so the same tiles lay out the same.
-    pub fn new(tiles: &[(u16, u16, AssetId)]) -> Self {
+    /// The set of `tiles`, each a column, a row and a texture, in distinct cells, repeating on the
+    /// axes of `repeat`: its table at a load of about 35%, in the first of a fixed run of
+    /// multipliers that leaves no bucket over [`BUCKET`] keys, so the same tiles lay out the same.
+    pub fn new(tiles: &[(u16, u16, AssetId)], repeat: [bool; 2]) -> Self {
         let mut buckets = (tiles.len().div_ceil(3).next_power_of_two()) as u32;
         loop {
             if buckets == 1 {
-                if let Some(set) = Self::placed(tiles, 0, 0, 1) {
+                if let Some(set) = Self::placed(tiles, 0, 0, 1, repeat) {
                     return set;
                 }
                 buckets = 2;
@@ -86,7 +122,7 @@ impl TextureTiles {
             let shift = 32 - buckets.trailing_zeros();
             let mut multiplier = 0x9e37_79b1u32;
             for _ in 0..TRIES {
-                if let Some(set) = Self::placed(tiles, multiplier, shift, buckets) {
+                if let Some(set) = Self::placed(tiles, multiplier, shift, buckets, repeat) {
                     return set;
                 }
                 multiplier = (multiplier ^ multiplier >> 15).wrapping_mul(0x85eb_ca77) | 1;
@@ -101,6 +137,7 @@ impl TextureTiles {
         multiplier: u32,
         shift: u32,
         buckets: u32,
+        repeat: [bool; 2],
     ) -> Option<Self> {
         let mut used = vec![0; buckets as usize];
         let mut placed = Vec::with_capacity(tiles.len());
@@ -122,6 +159,7 @@ impl TextureTiles {
             multiplier,
             shift,
             buckets,
+            repeat,
             tiles: placed,
         })
     }
@@ -133,9 +171,10 @@ impl TextureTiles {
             multiplier: h.multiplier,
             shift: h.shift,
             buckets: h.buckets,
+            repeat: [h.repeat & 1 != 0, h.repeat & 2 != 0],
             tiles,
         };
-        if !set.well_formed() {
+        if h.repeat > 3 || !set.well_formed() {
             return Err(Error::Malformed("texture tiles"));
         }
         Ok(set)
@@ -169,6 +208,7 @@ impl TextureTiles {
             multiplier: self.multiplier,
             shift: self.shift,
             buckets: self.buckets,
+            repeat: u32::from(self.repeat[0]) | u32::from(self.repeat[1]) << 1,
             tiles: put_table(&mut out, &self.tiles),
         };
         out[..size_of::<Header>()].copy_from_slice(bytemuck::bytes_of(&header));
@@ -178,6 +218,25 @@ impl TextureTiles {
     /// The bucket a tap of cell (`column`, `row`) reads.
     pub fn bucket(&self, column: u16, row: u16) -> u32 {
         hashed(key(column, row), self.multiplier, self.shift)
+    }
+
+    /// The set's grid; a set has a tile.
+    pub fn grid(&self) -> Grid {
+        let (lo, hi) = self
+            .tiles
+            .iter()
+            .fold(([u16::MAX; 2], [0; 2]), |(lo, hi), t| {
+                let c = [t.column, t.row];
+                (
+                    [0, 1].map(|a| lo[a].min(c[a])),
+                    [0, 1].map(|a| hi[a].max(c[a])),
+                )
+            });
+        Grid {
+            first: lo,
+            size: [0, 1].map(|a| u32::from(hi[a]) - u32::from(lo[a]) + 1),
+            repeat: self.repeat,
+        }
     }
 
     /// Words of the table a kernel reads.
@@ -193,7 +252,22 @@ impl TextureTiles {
         mut index: impl FnMut(AssetId) -> Option<u32>,
     ) -> std::result::Result<Vec<u32>, AssetId> {
         let mut words = vec![0; self.words()];
-        words[..2].copy_from_slice(&[self.multiplier, self.shift]);
+        let grid = self.grid();
+        let wrap = |a: usize, f: fn(f64, f64) -> f64| {
+            let (first, size) = (f64::from(grid.first[a]), f64::from(grid.size[a]));
+            let v = if grid.repeat[a] { f(first, size) } else { 0.0 };
+            (v as f32).to_bits()
+        };
+        words[..8].copy_from_slice(&[
+            self.multiplier,
+            self.shift,
+            wrap(0, |_, size| 1.0 / size),
+            wrap(1, |_, size| 1.0 / size),
+            wrap(0, |first, size| (0.5 - first) / size),
+            wrap(1, |first, size| (0.5 - first) / size),
+            wrap(0, |_, size| -size),
+            wrap(1, |_, size| -size),
+        ]);
         for t in &self.tiles {
             let at = HEADER_WORDS + 2 * t.entry as usize;
             words[at] = key(t.column, t.row);
@@ -212,7 +286,7 @@ mod tests {
             .enumerate()
             .map(|(i, (u, v))| (u, v, AssetId::from_name(&i.to_string())))
             .collect();
-        TextureTiles::new(&tiles)
+        TextureTiles::new(&tiles, [false; 2])
     }
 
     /// A table holds every tile, in the bucket a tap of its cell reads, and survives its blob.

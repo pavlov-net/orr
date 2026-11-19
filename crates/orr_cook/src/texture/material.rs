@@ -41,8 +41,9 @@
 //!   [`TextureTiles`](orr_pack::tiles::TextureTiles) asset holds them, and the slot binds that.
 //!   Two inputs share a texture, or pair for Toksvig roughness, only with tiles at the same cells.
 //!   A token picks the tile, so no point lies past a tile's edge: tiles clamp whatever wrap the
-//!   input states, and mips filter each tile alone. What the input reads where there is no tile
-//!   goes to the binding, and a set never collapses into a factor.
+//!   input states, and mips filter each tile alone. An axis of [`Wrap::Repeat`] repeats the set
+//!   over its grid ([`orr_pack::tiles::Grid`]), and the set holds that. What the input reads where
+//!   there is no tile goes to the binding, and a set never collapses into a factor.
 //!
 //! - The slots from [`slot::MORE`] on take their inputs from [`MaterialTextures::more`]: a weight
 //!   as a coat weight is, a value that can read past 1 as a specular weight is, a color as
@@ -1157,10 +1158,11 @@ impl<'a> Packer<'a> {
         self.tile(r, &tiles[tile])
     }
 
-    /// `r`, of a set, as it reads `tile`.
+    /// `r`, of a set, as it reads `tile`, which clamps at its edges.
     fn tile(&self, r: &TexRef, tile: &ImageTile) -> TexRef {
         let image = tile.image;
-        self.channel_override(TexRef { image, ..*r })
+        let wrap = [Wrap::Clamp; 2];
+        self.channel_override(TexRef { image, wrap, ..*r })
     }
 
     /// `r`, or each tile of the set it reads.
@@ -1591,7 +1593,10 @@ impl<'a> Packer<'a> {
                 r.wrap = std::array::from_fn(|a| if r.file_wrap[a] { wrap[a] } else { r.wrap[a] });
             }
             if self.tiled(r) {
-                r.wrap = [Wrap::Clamp; 2];
+                r.wrap = r.wrap.map(|w| match w {
+                    Wrap::Repeat => Wrap::Repeat,
+                    _ => Wrap::Clamp,
+                });
                 r.outside = r.missing;
             }
         }
@@ -2310,8 +2315,9 @@ impl<'a> Packer<'a> {
     }
 
     /// The pack `build` gives for `r`: planned as it stands for an image, and for a set of tiles
-    /// once per tile, by its cell, into a [`TextureTiles`] asset. Where no tile lies the set reads
-    /// what the pack of the set as a whole says, which no one tile's file or overrides change.
+    /// once per tile, by its cell, into a [`TextureTiles`] asset that repeats on the axes `r`
+    /// repeats. Where no tile lies the set reads what the pack of the set as a whole says, which no
+    /// one tile's file or overrides change.
     fn make_each(
         &mut self,
         material: &MaterialName,
@@ -2337,7 +2343,8 @@ impl<'a> Packer<'a> {
             set = Some((made, role));
         }
         let (made, role) = set.expect("a set has a tile");
-        let id = self.tile_set(material, role, &tiles, &keys);
+        let repeat = r.wrap.map(|w| w == Wrap::Repeat);
+        let id = self.tile_set(material, role, &tiles, repeat, &keys);
         Ok(Made {
             id,
             channels: [0, 1, 2, 3],
@@ -2348,16 +2355,17 @@ impl<'a> Packer<'a> {
         })
     }
 
-    /// Plans the tile set of `tiles`, whose textures' keys are `keys`, or returns the one planned
-    /// with the same tiles.
+    /// Plans the tile set of `tiles`, repeating on the axes of `repeat`, whose textures' keys are
+    /// `keys`, or returns the one planned with the same tiles and repeats.
     fn tile_set(
         &mut self,
         material: &MaterialName,
         role: &str,
         tiles: &[(u16, u16, AssetId)],
+        repeat: [bool; 2],
         keys: &[u8],
     ) -> AssetId {
-        let set = TextureTiles::new(tiles);
+        let set = TextureTiles::new(tiles, repeat);
         let bytes = set.to_bytes();
         *self.made_sets.entry(Hash32::of(&bytes)).or_insert_with(|| {
             let name = material.texture(self.asset, role);

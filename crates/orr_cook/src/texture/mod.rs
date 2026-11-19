@@ -325,6 +325,23 @@ pub(crate) struct Built {
     pub(crate) clips: bool,
 }
 
+/// The largest 2D texture and cube face every Metal GPU family creates. Vulkan states no such
+/// size: a device's `maxImageDimension2D` and `maxImageDimensionCube` may lie above it or below it.
+const METAL_EXTENT: u32 = 16384;
+
+/// The report's warning for texture `name` past [`METAL_EXTENT`] a side, which mounts only on a
+/// device whose limits reach it.
+pub(crate) fn extent_warning(name: &str, built: &Built) -> Option<String> {
+    let h = built.info.header;
+    (h.width.max(h.height) > METAL_EXTENT).then(|| {
+        format!(
+            "texture {name} is {} x {}, past the {METAL_EXTENT} a side Metal creates; it mounts \
+             only on devices whose limits reach it",
+            h.width, h.height
+        )
+    })
+}
+
 /// The report's warning for a source that reads the animated image `image`.
 pub(crate) fn first_frame_warning(image: &str) -> String {
     format!("image {image} is animated; only its first frame is cooked")

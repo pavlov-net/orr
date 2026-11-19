@@ -445,6 +445,8 @@ pub(crate) struct MapTexture {
     pub(crate) key: Hash32,
     /// A set's tiles: each one's column and row, unit and key. Empty for a lone texture.
     pub(crate) tiles: Vec<(Cell, String, Hash32)>,
+    /// A set's grid.
+    pub(crate) grid: orr_pack::tiles::Grid,
 }
 
 impl MapTexture {
@@ -453,6 +455,7 @@ impl MapTexture {
             unit: unit.to_string(),
             key,
             tiles: Vec::new(),
+            grid: orr_pack::tiles::Grid::default(),
         }
     }
 

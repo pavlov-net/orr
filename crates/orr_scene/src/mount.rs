@@ -1379,6 +1379,7 @@ fn place_texture(
         layers: u32::from(h.layers),
         usage: TextureUsage::SAMPLED,
     };
+    fits_device(t, entry, &desc)?;
     let mut neural = neural.map(|n| neural_link(t, n)).transpose()?;
     let has_tail = (1..h.mip_count).contains(&h.tail_first_mip);
     if stream && has_tail && place_streamed(t, entry, id, &info, &desc, &mut neural)? {
@@ -1469,6 +1470,33 @@ fn neural_link(t: &Arc<MountTask>, (set, tex): (AssetId, NeuralTexture)) -> Resu
         },
         latents: None,
         latent_mips: Vec::new(),
+    })
+}
+
+/// Fails, naming archive entry `entry`, when the device's limits leave out a texture of `desc`.
+/// Vulkan guarantees an optimally tiled 2D image of a sampled format up to `maxImageDimension2D`
+/// a side, `maxImageDimensionCube` with cube faces, and `maxImageArrayLayers` layers (Image
+/// Creation Limits), and Metal states its limits per GPU family.
+fn fits_device(t: &MountTask, entry: usize, desc: &TextureDesc) -> Result<()> {
+    let limits = &t.device.caps().limits;
+    let (side, which) = match desc.kind {
+        TextureKind::Cube => (limits.max_image_extent_cube, "cube extent"),
+        _ => (limits.max_image_extent_2d, "2D extent"),
+    };
+    let limit = if desc.extent[0].max(desc.extent[1]) > side {
+        format!("{which} of {side}")
+    } else if desc.layers > limits.max_image_layers {
+        format!("layer limit of {}", limits.max_image_layers)
+    } else {
+        return Ok(());
+    };
+    let archive = t.archive();
+    Err(Error::TextureLimit {
+        entry: archive.name(&archive.entries()[entry]).to_string(),
+        width: desc.extent[0],
+        height: desc.extent[1],
+        layers: desc.layers,
+        limit,
     })
 }
 

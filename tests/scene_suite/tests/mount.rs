@@ -3335,7 +3335,10 @@ fn a_tile_set_mounts_as_a_table_of_streamed_textures() {
         );
     }
     let named = AssetId::from_name;
-    let set = TextureTiles::new(&[(0, 0, named(names[0])), (2, 1, named(names[1]))]);
+    let set = TextureTiles::new(
+        &[(0, 0, named(names[0])), (2, 1, named(names[1]))],
+        [false; 2],
+    );
     let bytes = set.to_bytes();
     let blob = [BlobIn {
         mount: true,

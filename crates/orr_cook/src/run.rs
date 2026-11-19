@@ -1241,6 +1241,7 @@ impl<'m, 's> Run<'m, 's> {
                     unit: unit.name.clone(),
                     key: unit.key,
                     tiles,
+                    grid: set.grid(),
                 })
             }
             _ => None,
@@ -2349,6 +2350,7 @@ fn plan_scene(
             unit: set.name.clone(),
             key: set.key,
             tiles: tiles.collect(),
+            grid: held.grid(),
         };
         textures.insert(AssetId::from_name(&set.name), texture);
         let work = Work::Blobs {
@@ -3278,7 +3280,8 @@ fn section_maps(
 }
 
 /// `t` under `at` as a map of what `texture` makes of each of its textures. Tiles read clamped in
-/// their own squares, and `missing` makes what reads where a set has none from the slot's values.
+/// their own squares, across the set's grid as it repeats, and `missing` makes what reads where a
+/// set has none from the slot's values.
 /// Of a set, it holds the tiles a mesh with vertex uvs `uvs` can reach.
 fn read_map<T>(
     t: &MapTexture,
@@ -3299,10 +3302,11 @@ fn read_map<T>(
     let tiles = t
         .tiles
         .iter()
-        .filter(|(cell, ..)| reach.holds(*cell))
+        .filter(|(cell, ..)| reach.holds(*cell, &t.grid))
         .map(|([column, row], unit, key)| Ok(((*row, *column), texture(unit, *key, tile)?)));
     Ok(Map::Tiles(Tiles {
         uv: at.uv,
+        grid: t.grid,
         tiles: tiles.collect::<Result<_>>()?,
         missing: missing(at.outside),
     }))
@@ -3641,6 +3645,9 @@ fn cook_unit(
         Work::Texture(job, images) => {
             let built = job.run(&images, &shared.images)?;
             drop(images);
+            detail
+                .warnings
+                .extend(texture::extent_warning(name, &built));
             texture::add(&mut w, name, key, &built)?;
         }
         Work::Neural(set, images) => {
@@ -3655,6 +3662,9 @@ fn cook_unit(
             if built.clips {
                 detail.warnings.push(texture::gamut_warning(name));
             }
+            detail
+                .warnings
+                .extend(texture::extent_warning(name, &built));
             texture::add(&mut w, name, key, &built)?;
         }
         Work::Subd(data, materials, settings) => {

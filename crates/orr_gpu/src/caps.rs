@@ -131,6 +131,8 @@ pub struct Limits {
     pub max_workgroup_invocations: u32,
     pub max_workgroup_count: [u32; 3],
     pub max_image_extent_2d: u32,
+    /// Of a cube's faces.
+    pub max_image_extent_cube: u32,
     pub max_image_extent_3d: u32,
     pub max_image_layers: u32,
     /// Color targets one mesh pipeline can write.

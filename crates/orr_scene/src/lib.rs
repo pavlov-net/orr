@@ -221,6 +221,18 @@ pub enum Error {
     UnknownBlob(BlobId),
     #[error("texture format {0} has no GPU format")]
     TextureFormat(u32),
+    /// A texture's extent or layers are past what the device creates: its 2D or cube extent
+    /// limit, or its array layer limit.
+    #[error(
+        "texture {entry} of {width} x {height} with {layers} layers is past the device's {limit}"
+    )]
+    TextureLimit {
+        entry: String,
+        width: u32,
+        height: u32,
+        layers: u32,
+        limit: String,
+    },
     /// Cage-only models have no mesh for instances to draw; their copies are
     /// subdivision entries.
     #[error("{0:?} has no mesh")]
