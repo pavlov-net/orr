@@ -363,6 +363,14 @@ pub(crate) fn gamut_warning(images: &str) -> String {
     format!("colors of {images} below 0 or outside Rec.2020 clip")
 }
 
+/// The report's warning for `images`, whose colors fit but which a scale and bias, first in
+/// `material`, take below 0.
+pub(crate) fn remap_clip_warning(material: &str, images: &str) -> String {
+    format!(
+        "scale and bias take colors of {images} below 0, which clip (first in material {material})"
+    )
+}
+
 /// The report's warning for a USD normal map `image` with no scale or bias, which an unsigned
 /// file can't mean literally.
 pub(crate) fn unscaled_normal_warning(image: &str) -> String {

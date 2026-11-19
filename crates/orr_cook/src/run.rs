@@ -2318,13 +2318,29 @@ fn plan_scene(
         materials.push((AssetId::from_name(&unit.name), unit.key, cooked));
         units.push(unit);
     }
-    let clipped = packer.clipped(src.materials.iter().map(|m| &m.textures))?;
-    if let Some(&first) = clipped.first() {
+    let entries: Vec<String> = src.materials.iter().map(|m| m.name.entry(name)).collect();
+    let read = entries
+        .iter()
+        .map(String::as_str)
+        .zip(src.materials.iter().map(|m| &m.textures));
+    let clipped = packer.clipped(read)?;
+    let (own, remapped): (Vec<_>, Vec<_>) = clipped.into_iter().partition(|(_, by)| by.is_none());
+    if let Some(&(first, _)) = own.first() {
         let name = &src.images[first].name;
-        warnings.push(texture::gamut_warning(&match clipped.len() - 1 {
+        warnings.push(texture::gamut_warning(&match own.len() - 1 {
             0 => name.clone(),
             more => format!("{name} and {more} more images"),
         }));
+    }
+    if let Some(&(first, Some(material))) = remapped.first() {
+        let name = &src.images[first].name;
+        warnings.push(texture::remap_clip_warning(
+            material,
+            &match remapped.len() - 1 {
+                0 => name.clone(),
+                more => format!("{name} and {more} more images"),
+            },
+        ));
     }
     let jobs = std::mem::take(&mut packer.jobs);
     let sets = std::mem::take(&mut packer.neural);

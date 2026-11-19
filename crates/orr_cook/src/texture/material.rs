@@ -58,7 +58,7 @@
 
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -137,6 +137,9 @@ pub(crate) enum ImageRules {
     Usd,
     MaterialX,
 }
+
+/// A read of an image and the first material that reads it so.
+type NamedRead<'m> = (TexRef, &'m str);
 
 /// One image a material reads.
 #[derive(Copy, Clone, Debug)]
@@ -1499,32 +1502,37 @@ impl<'a> Packer<'a> {
     }
 
     /// The images of `materials`' color inputs with colors a texture can't hold, measured through
-    /// what they convert to. An image is decoded here only if a value below 0 or primaries past
-    /// Rec.2020 can clip.
+    /// what they convert to, each with the material whose scale and bias take its colors there
+    /// when the image's own colors fit. An image is decoded here only if a value below 0 or
+    /// primaries past Rec.2020 can clip.
     pub(crate) fn clipped<'m>(
         &self,
-        materials: impl Iterator<Item = &'m MaterialTextures>,
-    ) -> Result<BTreeSet<usize>> {
-        // Per file, the image the report names, a tile's being its set, and how it reads.
-        let mut reads: BTreeMap<usize, (usize, Vec<TexRef>)> = BTreeMap::new();
+        materials: impl Iterator<Item = (&'m str, &'m MaterialTextures)>,
+    ) -> Result<BTreeMap<usize, Option<&'m str>>> {
+        // Per file, the image the report names, a tile's being its set, and how it reads, with
+        // the first material that reads it so.
+        let mut reads: BTreeMap<usize, (usize, Vec<NamedRead<'m>>)> = BTreeMap::new();
         // A stated value has no texels, and stands whole.
         let filed = |r: &&TexRef| !matches!(self.images[r.image].data, ImageData::Solid(_));
-        for r in materials.flat_map(MaterialTextures::colors).filter(filed) {
-            for t in self.each(r) {
-                let (read, _, gamut) = self.color_read(&t);
-                let below = self.image(t.image).minus_infinity || self.reads_below(&t, &read);
-                if below || read.reaches_past(gamut.as_ref()) {
-                    let (_, refs) = reads.entry(t.image).or_insert((r.image, Vec::new()));
-                    let same =
-                        |o: &TexRef| (o.color, o.rules, o.remap) == (t.color, t.rules, t.remap);
-                    if !refs.iter().any(same) {
-                        refs.push(t);
+        for (material, textures) in materials {
+            for r in textures.colors().filter(filed) {
+                for t in self.each(r) {
+                    let (read, _, gamut) = self.color_read(&t);
+                    let below = self.image(t.image).minus_infinity || self.reads_below(&t, &read);
+                    if below || read.reaches_past(gamut.as_ref()) {
+                        let (_, refs) = reads.entry(t.image).or_insert((r.image, Vec::new()));
+                        let same = |(o, _): &NamedRead| {
+                            (o.color, o.rules, o.remap) == (t.color, t.rules, t.remap)
+                        };
+                        if !refs.iter().any(same) {
+                            refs.push((t, material));
+                        }
                     }
                 }
             }
         }
         let reads: Vec<_> = reads.into_iter().collect();
-        let found: Vec<Option<usize>> = reads
+        let found: Vec<Option<(usize, Option<&str>)>> = reads
             .par_iter()
             .map(|(i, (named, refs))| {
                 let file = &self.images[*i];
@@ -1533,10 +1541,23 @@ impl<'a> Packer<'a> {
                     message: format!("image {}: {message}", file.name),
                 };
                 let (src, swizzled) = load::open_blocks(&file.bytes()?).map_err(fail)?;
-                let clips = load::any_stored(&src, swizzled, |l| {
-                    refs.iter().any(|r| self.texels_clip(r, l))
-                });
-                Ok(clips.map_err(fail)?.then_some(*named))
+                let clips = |refs: &mut dyn Iterator<Item = TexRef>| {
+                    let refs: Vec<TexRef> = refs.collect();
+                    load::any_stored(&src, swizzled, |l| {
+                        refs.iter().any(|r| self.texels_clip(r, l))
+                    })
+                    .map_err(fail)
+                };
+                let own = |r: &TexRef| TexRef { remap: None, ..*r };
+                if clips(&mut refs.iter().map(|(r, _)| own(r)))? {
+                    return Ok(Some((*named, None)));
+                }
+                for (r, material) in refs.iter().filter(|(r, _)| r.remap.is_some()) {
+                    if clips(&mut std::iter::once(*r))? {
+                        return Ok(Some((*named, Some(*material))));
+                    }
+                }
+                Ok(None)
             })
             .collect::<Result<_>>()?;
         Ok(found.into_iter().flatten().collect())
