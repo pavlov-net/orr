@@ -3,7 +3,7 @@
 #   slang-VERSION/   the Slang release slang_version names, for the host (Linux, Windows or
 #                    Apple silicon macOS), checked against its sha256
 #   openpbr-bsdf/    adobe/openpbr-bsdf at a pinned commit
-#   glm/             GLM 1.0.1 at its tag commit
+#   glm/             GLM 1.0.3 at its tag commit
 #   display/gt7/     Polyphony Digital's GT7 tone-mapping sample (MIT), checked against its
 #                    sha256
 #   libdeflate-gdeflate/
@@ -45,7 +45,7 @@ set -euo pipefail
 
 slang_version=2026.22
 openpbr_commit=c91aad1d1ce1693e803f039d7c92c2965c4eb013
-glm_commit=0af55ccecd98d4e5a8d1fad7de25ba429d60e863
+glm_commit=8d1fd52e5ab5590e2c81768ace50c72bae28f2ed
 gdeflate_commit=8ba9502fb30d2bf728592d121f0d402e40c8cb05
 opensubdiv_commit=1d90921ea32b9dcae31d30b907cbacefc0c616bf
 sky_commit=34f14e745cff948f4ca3157d1b62a445ffa7286f

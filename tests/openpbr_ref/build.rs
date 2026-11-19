@@ -2,7 +2,7 @@
 //! (`slang/openpbr_cpu.slang`, array LUTs) and adobe/openpbr-bsdf's own C++ with GLM
 //! (`cpp/reference.cpp`), and compiles the GPU kernels under `gpu/` to SPIR-V.
 //!
-//! GLM comes from `ORR_GLM`, else `.tools/glm` in or above the crate.
+//! GLM comes from `ORR_GLM`, else `glm` under `ORR_TOOLS` or the nearest `.tools`.
 
 use std::env;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ fn main() {
     let fail = |e: orr_shaders::build::Error| -> ! { panic!("{e}") };
     let openpbr = fetched("ORR_OPENPBR_BSDF", "openpbr-bsdf").unwrap_or_else(|e| fail(e));
     let lighting = manifest.join("../../crates/orr_lighting/src");
-    let glm = glm_dir(&manifest);
+    let glm = fetched("ORR_GLM", "glm").unwrap_or_else(|e| fail(e));
 
     CpuLibrary::new()
         .and_then(|b| {
@@ -29,7 +29,6 @@ fn main() {
         .unwrap_or_else(|e| fail(e));
 
     println!("cargo::rerun-if-changed=cpp/reference.cpp");
-    println!("cargo::rerun-if-env-changed=ORR_GLM");
     cc::Build::new()
         .cpp(true)
         .std("c++17")
@@ -47,19 +46,4 @@ fn main() {
                 .compile()
         })
         .unwrap_or_else(|e| fail(e));
-}
-
-fn glm_dir(manifest: &std::path::Path) -> PathBuf {
-    if let Some(dir) = env::var_os("ORR_GLM").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir);
-    }
-    manifest
-        .ancestors()
-        .map(|d| d.join(".tools").join("glm"))
-        .find(|d| d.join("glm").join("glm.hpp").is_file())
-        .unwrap_or_else(|| {
-            panic!(
-                "GLM not found: run tools/fetch-slang.sh, or set ORR_GLM to a GLM 1.0.1 checkout"
-            )
-        })
 }
