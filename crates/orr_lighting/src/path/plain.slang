@@ -229,11 +229,18 @@ void proxy_shadow_hit(inout Payload p, SpanAttributes a)
     any_hit_decides(proxy_any_hit(root.scene, p.words, InstanceIndex(), a.span));
 }
 
+[shader("callable")]
+void sky(inout Payload p)
+{
+    ORR_OMM(sky);
+    path_sky<Environment>(root, p.words);
+}
+
 [shader("miss")]
 void miss_scatter(inout Payload p)
 {
     ORR_OMM(miss_scatter);
-    path_miss<Medium, Environment>(root, DispatchRaysIndex().x, p.words.y != 0);
+    p.words = path_miss<Medium, Environment>(root, DispatchRaysIndex().x, p.words.y != 0);
 }
 
 [shader("miss")]

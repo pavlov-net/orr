@@ -153,6 +153,7 @@ const PATH_STACKS: &[(&str, u64)] = &[
     ("photons", 128),
     ("proxy_shadow_hit", 0),
     ("shadow_hit.triangles", 0),
+    ("sky", 0),
     ("stack_step", 0),
     ("strand_hit.strands", 448),
     ("strand_hit.strands.emitter", 480),

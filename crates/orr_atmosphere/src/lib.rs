@@ -23,6 +23,7 @@ use orr_math::{DVec3, Vec3};
 
 impl orr::EnvironmentData for AtmosphereGpu {
     const TYPE: &'static str = "AtmosphereSky";
+    const DRAWN: bool = true;
 }
 
 impl orr::MediumData for AtmosphereGpu {

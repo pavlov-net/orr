@@ -17,6 +17,11 @@ import orr_scene.tables;
 public interface IEnvironment
 {
     static float3 radiance(uint64_t data, float3 dir, float3 eye_render);
+    // What the accumulation reference averages for `radiance`, a draw from random numbers seeded
+    // by `seed` whose mean is the environment's exact radiance: `radiance` itself where that is
+    // exact, a draw that path traces it where `radiance` approximates it. Where the `camera` sees
+    // along `dir` the draw may spend more to vary less.
+    static float3 reference_radiance(uint64_t data, float3 dir, float3 eye_render, uint seed, bool camera);
 }
 
 float copy_sign(float magnitude, float sign)
@@ -109,6 +114,11 @@ public struct EnvironmentMap : IEnvironment
         else if (m.primaries == PRIMARIES_DISPLAY_P3)
             c = mul(P3_TO_REC2020, c);
         return c * m.intensity;
+    }
+
+    public static float3 reference_radiance(uint64_t data, float3 dir, float3 eye_render, uint seed, bool camera)
+    {
+        return radiance(data, dir, eye_render);
     }
 }
 

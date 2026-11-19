@@ -89,6 +89,13 @@ static const uint path_may = 0xffffffffu;
 [Host] public static const uint MAY_PROXIES = 1u << 30;
 [Host] public static const uint MAY_SMOKE = 1u << 31;
 
+// A path may scatter in a medium: an interior's, or the linked medium, which the accumulation
+// reference's paths fly through.
+public bool may_scatter()
+{
+    return may(MAY_SCATTERING) || (may(MAY_REFERENCE) && may(MAY_MEDIUM));
+}
+
 // Whether any of `bits` may be met.
 public bool may_any(uint bits)
 {

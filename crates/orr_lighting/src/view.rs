@@ -212,7 +212,9 @@ pub enum LightingDebugView {
     /// albedo in red, its transmission's in green, and the path's dielectric vertices over
     /// `dielectric_depth` in blue.
     DielectricLayer,
-    /// The media's in-scatter over each pixel's camera segment alone.
+    /// The media's in-scatter over each pixel's camera segment alone. Under the reference, whose
+    /// paths take the linked medium's in-scatter themselves, the linked medium's is its single
+    /// scattering, marched per pixel with next-event estimation.
     Media,
     /// The froxel volume: each pixel's media transmittance in red, its depth as a share of
     /// the froxel slices in green, and a checker of the froxel columns in blue.
@@ -267,7 +269,11 @@ pub enum GuideKind {
 /// The accumulation reference: no world cache, no Russian roulette before 64 bounces, a walk
 /// at every subsurface vertex of up to the most steps, light leaving a dense interior by its
 /// way out's ray alone, and optionally a thin lens traced from the eye for depth-of-field
-/// references. Each frame the
+/// references. Its paths fly through the linked medium and scatter in it as often as it
+/// scatters them, to each ray's hit or, where a ray escapes, to the scene's `near_range`, and
+/// take the environment by their rays alone, at its exact radiance
+/// (`IEnvironment::reference_radiance`), which an atmosphere draws by path tracing its own
+/// medium. Each frame the
 /// view traces caustic photons of its own into a map that holds that frame's alone, gathered
 /// within a radius that shrinks every frame as progressive photon mapping's.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -320,6 +326,8 @@ const LOCAL_TILE: u32 = 16;
 const LIGHT_FEEDBACK_COUNT: u32 = 1;
 /// `path`'s `LIGHT_TRACED_PRIMARY`.
 const LIGHT_TRACED_PRIMARY: u32 = 2;
+/// `path`'s `LIGHT_ENVIRONMENT_BY_RAYS`.
+const LIGHT_ENVIRONMENT_BY_RAYS: u32 = 4;
 
 /// Bounces from which Russian roulette may end a path: after the first, or 64 in the
 /// reference.
@@ -352,6 +360,8 @@ const DIELECTRIC_REFERENCE: u32 = 1;
 const DIELECTRIC_DEBUG_LAYER: u32 = 2;
 const DIELECTRIC_DISPERSION: u32 = 4;
 const DIELECTRIC_FROST: u32 = 8;
+/// `path`'s `DIELECTRIC_LINKED_MEDIUM`.
+const DIELECTRIC_LINKED_MEDIUM: u32 = 16;
 
 /// Opaque vertices a photon goes on from at most, the mirrors of its chain: as a path's bounces,
 /// it meets one more, the surface after them (`iteration_runs`).
@@ -1925,8 +1935,8 @@ impl LightingKernels {
     /// beyond. Medium proxies the camera ray crosses, at most the nearest 4 per pixel, are
     /// marched per pixel at their voxel spacing, lit by the froxels' isotropic light and
     /// [`MediaSettings::proxy_shadow_rays`] shadow rays. Smoke producers come through the
-    /// froxels inside `near_range` and as one lit layer per pixel past it. The reference marches
-    /// the segment per pixel instead. Where no camera segment can hold a medium
+    /// froxels inside `near_range` and as one lit layer per pixel past it. The reference's paths
+    /// take the linked medium themselves, and it marches the proxies and smoke per pixel. Where no camera segment can hold a medium
     /// ([`Self::record_media`]) the radiance stays as the paths wrote it. Also writes the frame's
     /// [`LightingView::particle_lighting`] for the transparency hook after it. Orders nothing
     /// after it. Waits for media apply's pipeline where no view asked for it ahead
@@ -2092,6 +2102,9 @@ impl LightingKernels {
         if reference {
             flags |= DIELECTRIC_REFERENCE;
             froxels = GpuPtr::NULL;
+            if self.support.masked.linked_medium() {
+                flags |= DIELECTRIC_LINKED_MEDIUM;
+            }
         }
         if lighting.debug_view == LightingDebugView::DielectricLayer {
             flags |= DIELECTRIC_DEBUG_LAYER;
@@ -2137,6 +2150,15 @@ impl LightingKernels {
             light_flags: if reference { 0 } else { LIGHT_FEEDBACK_COUNT }
                 | if lighting.traced_primary {
                     LIGHT_TRACED_PRIMARY
+                } else {
+                    0
+                }
+                | if reference
+                    && pass
+                        .scene_features
+                        .contains(SceneFeatures::DRAWN_ENVIRONMENT)
+                {
+                    LIGHT_ENVIRONMENT_BY_RAYS
                 } else {
                     0
                 },

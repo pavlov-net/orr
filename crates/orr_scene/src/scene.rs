@@ -851,6 +851,9 @@ pub(crate) struct SceneCpu {
     pub(crate) origin_cell: IVec3,
     /// `None` until `set_environment`: a data-free type's call sets null.
     pub(crate) environment: Option<u64>,
+    /// The environment's data is for a type whose exact radiance is drawn
+    /// ([`EnvironmentData::DRAWN`]).
+    pub(crate) environment_drawn: bool,
     /// `None` until `set_medium`: a data-free type's call sets null.
     pub(crate) medium: Option<u64>,
     pub(crate) surface_data: u64,
@@ -2028,6 +2031,7 @@ impl Scene {
                 requested_detail: None,
                 origin_cell: IVec3::ZERO,
                 environment: None,
+                environment_drawn: false,
                 medium: None,
                 surface_data: 0,
                 near_range: 256.0,
@@ -2072,6 +2076,10 @@ pub trait EnvironmentData: 'static {
     /// `TYPE` is safe on a null pointer, as it reads no data or checks for null, so
     /// `SceneWriter::set_environment` takes one.
     const NULL_SAFE: bool = false;
+    /// `TYPE`'s exact radiance is a draw that path traces it (`IEnvironment::reference_radiance`),
+    /// too costly for every vertex's next-event estimation: the accumulation reference takes it
+    /// by its paths' rays alone.
+    const DRAWN: bool = false;
 }
 
 /// A record a linked medium reads; `TYPE` is the Slang type that reads it.
@@ -3765,7 +3773,9 @@ impl<'f> SceneWriter<'f> {
             "{} reads its data, and this data is null",
             T::TYPE
         );
-        self.scene.cpu.lock().unwrap().environment = Some(data.address().0);
+        let mut cpu = self.scene.cpu.lock().unwrap();
+        cpu.environment = Some(data.address().0);
+        cpu.environment_drawn = T::DRAWN;
     }
 
     /// Consumer data for the linked medium, which kernels that link one need before the scene's

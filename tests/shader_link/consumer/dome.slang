@@ -6,4 +6,9 @@ public struct Dome : IEnvironment
     {
         return float3(4.0, dir.y, 6.0);
     }
+
+    static float3 reference_radiance(uint64_t data, float3 dir, float3 eye_render, uint seed, bool camera)
+    {
+        return radiance(data, dir, eye_render);
+    }
 }

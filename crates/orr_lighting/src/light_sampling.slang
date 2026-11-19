@@ -1550,20 +1550,20 @@ public float3 medium_source<M : IMedium>(LightSetGpu* set, MediumPoint m, float3
         float3 e = directional_illuminance(set, id);
         float3 phase = M.phase(data, m, dot(to_light, dir));
         float3 lit = M.transmittance(data, x, to_light, positive_infinity());
-        source += m.sigma_s * e * (phase * lit + M.multiple_scattering(data, x, to_light));
+        source += m.sigma_s * e * (phase * lit + M.multiple_scattering(data, x, to_light, dir));
     }
     return source;
 }
 
-// Multiply-scattered radiance per unit `sigma_s` at point `x` of the linked medium `M`, from
-// every directional light.
-public float3 multiple_scattered<M : IMedium>(LightSetGpu* set, float3 x)
+// Multiply-scattered radiance per unit `sigma_s` that point `x` of the linked medium `M` scatters
+// toward a view along unit `dir`, from every directional light.
+public float3 multiple_scattered<M : IMedium>(LightSetGpu* set, float3 x, float3 dir)
 {
     float3 light = float3(0.0);
     for (uint j = 0; j < set.directional_count; j++)
     {
         uint id = set.directional_ids[j];
-        light += directional_illuminance(set, id) * M.multiple_scattering(set.scene.medium, x, set.scene.lights[id].direction);
+        light += directional_illuminance(set, id) * M.multiple_scattering(set.scene.medium, x, set.scene.lights[id].direction, dir);
     }
     return light;
 }

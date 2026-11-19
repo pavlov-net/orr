@@ -91,7 +91,20 @@ public static const uint PAYLOAD_BENT = 1;
 // themselves. Tests hold orr's stages to their caps over the masks that matter; a pipeline over
 // one is still made, with a warning.
 [Host] public static const uint RAYGEN_INSTRUCTIONS = 4000;
+// What a raygen holds more where its paths may be the accumulation reference's: the flights of its
+// rays through the linked medium, an environment job's exact radiance over its baked one, and the
+// environment's exact radiance a miss leaves to it.
+[Host] public static const uint RAYGEN_REFERENCE_INSTRUCTIONS = 2100;
 [Host] public static const uint MISS_INSTRUCTIONS = 4000;
+// What a miss holds more where its paths may be the accumulation reference's: what weighs the
+// environment's exact radiance, which the raygen draws.
+[Host] public static const uint MISS_REFERENCE_INSTRUCTIONS = 100;
+// The callable of the linked environment's exact radiance, which the reference's raygen calls
+// for its misses and environment jobs: orr's own part is the call of the linked type's draw.
+[Host] public static const uint SKY_INSTRUCTIONS = 200;
+// What the callable of a medium vertex holds more where the reference's paths may fly through
+// the linked medium: the free flight, and the vertex's phase function and its draw.
+[Host] public static const uint MEDIUM_LINKED_INSTRUCTIONS = 600;
 // What a raygen holds more where the scene may hold a layer: the camera ray's search for layers,
 // the walk of a shadow ray through thin walls in the medium its vertex says, and a frosted
 // pixel's second path.
@@ -206,6 +219,11 @@ public static const uint CALL_DISPERSE = 14;
 // The callable of the vertex where an interior's real-time walk meets its surface, which the
 // surface's layer stage calls with what it resolved there.
 public static const uint CALL_WALK_MEETS = 15;
+// The callable of the linked environment's exact radiance, which the accumulation reference's
+// raygen calls for its misses and environment shadow jobs (`path_sky`): its payload holds the
+// direction in xyz and in w a seed, whose lowest bit says the camera sees along it; it hands back
+// the radiance.
+public static const uint CALL_SKY = 16;
 // What a hit made for surfaces that may walk holds more than one with the rich lobes alone: the
 // subsurface lobe, the start of its walk and what it leaves of the surface where a walk leaves.
 [Host] public static const uint WALK_HIT_INSTRUCTIONS = 5400;
@@ -276,6 +294,11 @@ public static const uint PAYLOAD_GOES_ON = 3;
 public static const uint MEDIUM_SCATTERS = 0;
 public static const uint MEDIUM_WALKS = 1;
 public static const uint MEDIUM_CAPPED = 2;
+// In the accumulation reference, outside every interior: the free flight of the path's ray
+// through the linked medium over the payload's first word in m, which runs the vertex where it
+// scatters (`linked_flight`), and that vertex.
+public static const uint MEDIUM_FLIGHT = 3;
+public static const uint MEDIUM_LINKED = 4;
 // With one of those, the vertex's re-run that weighs its bent job's light.
 public static const uint MEDIUM_BENT = 1 << 8;
 // The density word of a ray whose vertex's next-event estimation took the lights it meets, which

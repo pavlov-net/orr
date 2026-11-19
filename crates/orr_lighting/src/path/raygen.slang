@@ -226,8 +226,20 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior)
         passed *= cross_walls(r, slot, at, flags, ray, exterior);
     if (may(MAY_PROXIES) && ShadowCover.of_words(p.words).has(SHADOW_VOLUME) && any(passed > 0.0))
         passed *= march_proxies(ray);
+    // The reference's environment job drew its direction and light from the baked map, which its
+    // exact radiance there replaces.
+    if (path_reference(r) && load_coherent(at + 2).w == feedback_environment(r.set) && any(passed > 0.0))
+    {
+        float3 baked = environment_map(r.set.environment, dir);
+        Sampler rng = path_sampler(r, item_pixel(r, r.slice_base + slot));
+        rng.dimension = flags >> HOT_DIMENSION_SHIFT;
+        passed *= select(baked > 0.0, sky_call(dir, rng.next_bits() ^ SKY_JOB_STREAM, false) / baked, float3(0.0));
+    }
     path_shadow_add(r, slot, passed);
 }
+
+// Separates an environment job's draw of the sky from the path's next draw.
+static const uint SKY_JOB_STREAM = 0x5bd1e995;
 
 // What the medium proxies with a volume that shadow ray `ray` passed let through, by their marches
 // in a callable.
@@ -482,12 +494,6 @@ static const uint NEXT_FIRST = 1;      // its first vertex, on the G-buffer's su
 static const uint NEXT_EXIT = 2;       // the vertex where a subsurface walk leaves at its cap
 static const uint NEXT_WALK = 3;       // the subsurface walk its last vertex started
 static const uint NEXT_INTERIOR = 4;   // the walk through an interior's dense medium its ray scattered into
-
-// Whether the root is the accumulation reference.
-bool path_reference(PathRoot r)
-{
-    return may(MAY_REFERENCE) && (r.dielectric_flags & DIELECTRIC_REFERENCE) != 0;
-}
 
 // The cover of a ray of `slot`'s path in hot words `at`, under instance mask `mask`, as a
 // scattered ray's.
@@ -842,6 +848,11 @@ uint trace_ray<let VIEW : bool, let PHOTON : bool>(PathRoot r, uint slot, uint4*
         ray.TMin = asfloat(asuint(h.t()) + 1);
     }
     invokes = false;
+    // The reference's view rays outside every interior fly through the linked medium, but a
+    // layered camera ray that met no layer, whose flight the G-buffer's surface starts.
+    bool flies = VIEW && !PHOTON && path_flies(r)
+        && !(may(MAY_INTERIORS) && (w0.w & HOT_INTERIOR) != 0)
+        && !(!h.hit() && layers && isfinite(t_max));
     // A thin lens's camera ray writes what its pixel shows first: for a view, how far from the eye
     // it lies, and for the background layer, how deep along the view's axis.
     if (lens && h.hit())
@@ -857,7 +868,7 @@ uint trace_ray<let VIEW : bool, let PHOTON : bool>(PathRoot r, uint slot, uint4*
         bool met = may_any(MAY_PARTICLES | MAY_LOCAL_LIGHTS) && (p.words.x & FRONT_MET) != 0;
         p.words.x &= ~FRONT_MET;
         uint march = MARCH_NONE;
-        if (may(MAY_MEDIUM) && !PHOTON && h.hit() && !camera && !(may(MAY_INTERIORS) && (w0.w & HOT_INTERIOR) != 0))
+        if (may(MAY_MEDIUM) && !PHOTON && h.hit() && !camera && !(may(MAY_INTERIORS) && (w0.w & HOT_INTERIOR) != 0) && !flies)
             march = trail.chain ? MARCH_FROXELS : h.t() >= INSCATTER_SEGMENT ? MARCH_PLAIN : MARCH_NONE;
         if (met || march != MARCH_NONE)
         {
@@ -881,11 +892,34 @@ uint trace_ray<let VIEW : bool, let PHOTON : bool>(PathRoot r, uint slot, uint4*
         if (!on)
             return next;
     }
+    // To its hit, or where it escapes to the scene's `near_range`, past which the environment
+    // holds the medium; where it scatters, the medium's callable runs the vertex there instead.
+    if (flies)
+    {
+        if (fly(h.hit() ? h.t() : r.scene.near_range, !h.hit()))
+        {
+            trail.chain = true;
+            return NEXT_RAY;
+        }
+        // The flight weighed the linked medium up to the hit.
+        p.words.x |= PAYLOAD_WEIGHED;
+    }
     // A layered camera ray that met no layer reaches the G-buffer's surface.
     if (!h.hit() && layers && isfinite(t_max))
         return NEXT_FIRST;
     invokes = true;
     return NEXT_RAY;
+}
+
+// The free flight of the path's ray through the linked medium over its first `t` m, which
+// `escapes` the scene there, in the medium's callable: whether it scattered, and the callable ran
+// the vertex there (`linked_flight`).
+bool fly(float t, bool escapes)
+{
+    Payload f;
+    f.words = uint4(asuint(t), MEDIUM_FLIGHT, escapes ? 1 : 0, 0);
+    call(CALL_MEDIUM, f);
+    return f.words.z != 0;
 }
 
 // Runs the view path in hot words `at` to its end from `next`, NEXT_FIRST where it starts on the
@@ -917,6 +951,17 @@ uint run_path(PathRoot r, uint slot, uint4* at, uint next)
         }
         if (next == NEXT_FIRST)
         {
+            // The reference's camera ray flies through the linked medium to the G-buffer's
+            // surface, outside every interior and in front of every layer behind which a path
+            // starts.
+            if (path_flies(r) && (w0.w & HOT_CAMERA) != 0
+                && !(may(MAY_INTERIORS) && (w0.w & HOT_INTERIOR) != 0) && load_coherent(at + 2).z == 0
+                && fly(pinhole_start(r.view, r.gbuffer, item_pixel(r, r.slice_base + slot), true).t_max, false))
+            {
+                trail.chain = true;
+                next = NEXT_RAY;
+                continue;
+            }
             p.words = uint4(0);
             call(CALL_FIRST, p);
             trail.chain = false;
@@ -937,23 +982,16 @@ uint run_path(PathRoot r, uint slot, uint4* at, uint next)
             p.words.x |= PAYLOAD_WALKED;
         // A miss whose ray crossed plane stack faces is told whether its light through them is
         // next-event estimation's, which a probe from the vertex before them says.
-        if (may(MAY_STACK))
-        {
-            if (!walked && h.miss() && stack_miss(r, slot, at, p))
-            {
-                trail.chain = false;
-                continue;
-            }
-        }
-        bool hit;
-        bool layer;
+        bool stacked = may(MAY_STACK) && !walked && h.miss() && stack_miss(r, slot, at, p);
+        bool hit = false;
+        bool layer = false;
         if (walked)
         {
             invoke_path<true>(w, INVOKE_VERTEX, p);
             hit = w.hit();
             layer = hit && may(MAY_LAYERS) && layer_record(w);
         }
-        else
+        else if (!stacked)
         {
             invoke_path<true>(h, INVOKE_VERTEX, p);
             hit = h.hit();
@@ -962,6 +1000,7 @@ uint run_path(PathRoot r, uint slot, uint4* at, uint next)
         if (!hit)
         {
             trail.chain = false;
+            path_sky_after_miss(r, slot, at, p.words);
             continue;
         }
         // A hit shader zeroes the cover word, which a trace never leaves zero. A hit whose record

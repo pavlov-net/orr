@@ -75,6 +75,10 @@ public static const uint DIELECTRIC_REFERENCE = 1 << 0;   // the accumulation re
 public static const uint DIELECTRIC_DEBUG_LAYER = 1 << 1; // the radiance shows the first layer's shares
 public static const uint DIELECTRIC_DISPERSION = 1 << 2;  // dispersive materials split paths by wavelength
 public static const uint DIELECTRIC_FROST = 1 << 3;       // the view keeps each pixel's `background`
+// The reference's paths fly through the linked medium: the kernels link one. The pipeline that
+// may meet everything is compiled with a medium the kernels may not link, and its paths draw no
+// flight there, so it renders as the scene's own pipeline does.
+public static const uint DIELECTRIC_LINKED_MEDIUM = 1 << 4;
 
 // `PathRoot.cache_flags`: paths may end in the world cache.
 public static const uint CACHE_TERMINATE = 1 << 0;
@@ -86,6 +90,9 @@ public static const uint LIGHT_FEEDBACK_COUNT = 1 << 0;
 // `PathRoot.gbuffer` is the one in the view's raster state (`RasterGpu`), through whose targets
 // they write it.
 public static const uint LIGHT_TRACED_PRIMARY = 1 << 1;
+// The accumulation reference takes the environment by its paths' rays alone: its exact radiance
+// is a draw (`EnvironmentData::DRAWN`) that next-event estimation at every vertex would pay for.
+public static const uint LIGHT_ENVIRONMENT_BY_RAYS = 1 << 2;
 
 // `PathRoot.sss_flags`: only the first vertex walks.
 public static const uint SSS_PRIMARY_ONLY = 1 << 0;
@@ -554,6 +561,19 @@ public interface IScatter
     float3 eval_and_pdf(float3 wi, out float pdf, out float3 diffuse);
     // Whether `eval_and_pdf` gives 0 toward every direction.
     bool specular_only();
+}
+
+// Whether the root is the accumulation reference.
+public bool path_reference(PathRoot r)
+{
+    return may(MAY_REFERENCE) && (r.dielectric_flags & DIELECTRIC_REFERENCE) != 0;
+}
+
+// Whether the root's paths fly their rays outside every interior through the linked medium: the
+// reference's, where the kernels link one.
+public bool path_flies(PathRoot r)
+{
+    return may(MAY_MEDIUM) && path_reference(r) && (r.dielectric_flags & DIELECTRIC_LINKED_MEDIUM) != 0;
 }
 
 // Whether a vertex on `s` at path depth `depth` walks its subsurface share, on a path that

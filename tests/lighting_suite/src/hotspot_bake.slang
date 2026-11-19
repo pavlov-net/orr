@@ -13,6 +13,11 @@ public struct HotSpot : IEnvironment
             c += float3(250000.0, 240000.0, 230000.0);
         return c;
     }
+
+    static float3 reference_radiance(uint64_t data, float3 dir, float3 eye_render, uint seed, bool camera)
+    {
+        return radiance(data, dir, eye_render);
+    }
 }
 
 // A sample point of texel (100, 60) of the 256^2 bake.

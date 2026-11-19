@@ -237,7 +237,7 @@ public float inside_length(uint4* at, float3 dir, float t)
 // `w1`: none (0) where the ray left a point in a medium.
 float3 left_normal(uint flags, uint4 w1)
 {
-    if (may(MAY_SCATTERING) && (flags & HOT_MEDIUM) != 0)
+    if (may_scatter() && (flags & HOT_MEDIUM) != 0)
         return float3(0.0);
     return oct_decode_snorm16(w1.y);
 }
@@ -727,7 +727,7 @@ LightPick pick_light<let LOCAL : bool, B : IVertexScatter>(PathRoot r, B b, floa
     {
         ResolvedLightSample c = nee_tile_candidate<LOCAL>(set, v, local, rng);
         float u = rng.next();
-        if (!(c.pdf > 0.0) || (b.no_environment() && c.kind == LIGHT_SAMPLE_ENVIRONMENT))
+        if (!(c.pdf > 0.0) || ((b.no_environment() || environment_by_rays(r)) && c.kind == LIGHT_SAMPLE_ENVIRONMENT))
             continue;
         float target = luminance_rec2020(c.radiance) * b.density(c.dir);
         float w = target / c.pdf;
@@ -1171,8 +1171,8 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
             if (!stacked)
                 e *= beer(toward, k.distance);
         }
-        else if (k.kind != LIGHT_SAMPLE_ENVIRONMENT)
-            e *= medium_transmittance<M>(r.scene.medium, origin, k.dir, k.distance);
+        else
+            e *= linked_toward<M>(r, origin, k);
         // The point drawn on the light is the candidate's distance along its direction from the
         // vertex.
         float3 target = far ? k.dir : g.position + k.dir * k.distance;
@@ -1818,7 +1818,7 @@ bool stack_track(PathRoot r, uint slot, uint4* at, uint4 w0, float3 face, uint c
     float3 origin = asfloat(w0.xyz);
     if (may2(MAY2_THIN_DIELECTRICS) && (w0.w & HOT_WINDOW) != 0)
         origin = asfloat(load_coherent(path_cold(r, slot) + COLD_FROM_WORD).xyz);
-    bool medium = may(MAY_SCATTERING) && (w0.w & HOT_MEDIUM) != 0;
+    bool medium = may_scatter() && (w0.w & HOT_MEDIUM) != 0;
     uint depth = min((w0.w >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK, 0x7fu);
     // The vertex's density of the ray, over the squared IOR it leaves into, which a directional
     // light's density at the vertex through the stack divides by.
@@ -1900,6 +1900,18 @@ public Walk load_walk(uint4* cold, uint frame, out uint owner)
 // outside every interior, PATH_MEDIUM in the path's own): its callable evaluates the emitter's
 // surface there. The ray reaches it in the shadow job's words `at`, which the job then takes
 // back.
+// The linked medium's transmittance from `origin` outside every interior toward light pick `k`.
+// The environment's radiance holds the medium of its own, but where the paths fly their rays
+// (`path_flies`), a ray that misses flies the stretch to the scene's `near_range` first.
+float3 linked_toward<M : IMedium>(PathRoot r, float3 origin, LightPick k)
+{
+    if (k.kind != LIGHT_SAMPLE_ENVIRONMENT)
+        return medium_transmittance<M>(r.scene.medium, origin, k.dir, k.distance);
+    if (path_flies(r))
+        return medium_transmittance<M>(r.scene.medium, origin, k.dir, r.scene.near_range);
+    return float3(1.0);
+}
+
 float3 emitter_view(uint4* at, LightPick k, float3 origin, float3 target, uint medium)
 {
     store_coherent(at + 4, uint4(asuint(origin), k.light));
@@ -1980,17 +1992,21 @@ bool roulette_survives(PathRoot r, uint opaque, float u, inout float3 throughput
 // the multiple scattering's transmission reaches past those the visible normals refract.
 static const float EVEN_WAYS_IN = 0.1;
 
-// The scatter of a point in an interior's medium: its phase function at a scatter, of anisotropy
-// `anisotropy`, reached along `travel`, or where a walk stopped at its cap leaves through the
-// surface it entered by, its way out (`InteriorExitScatter`), whose ray takes the environment's
-// light where `skip_environment`.
-struct MediumScatter : IVertexScatter
+// The scatter of a point in a medium: at a scatter in an interior's its phase function, of
+// anisotropy `anisotropy`, and in the linked medium `M` (`linked`) that medium's at the point it
+// sampled as `point`, reached along `travel`; or where a walk stopped at its cap leaves through
+// the surface it entered by, its way out (`InteriorExitScatter`), whose ray takes the
+// environment's light where `skip_environment`.
+struct MediumScatter<M : IMedium> : IVertexScatter
 {
     bool leave;
     bool skip_environment;
     float anisotropy;
     float3 travel;
     InteriorExitScatter exit;
+    bool linked;
+    uint64_t data;
+    MediumPoint point;
 
     bool specular_only()
     {
@@ -2004,7 +2020,11 @@ struct MediumScatter : IVertexScatter
 
     float density(float3 wi)
     {
-        return leave ? exit.pdf(wi) : hg_phase(anisotropy, dot(travel, wi));
+        if (leave)
+            return exit.pdf(wi);
+        if (linked)
+            return M.phase_pdf(data, point, dot(travel, wi));
+        return hg_phase(anisotropy, dot(travel, wi));
     }
 
     float3 eval_and_pdf(float3 wi, out float pdf, out float3 diffuse)
@@ -2013,8 +2033,58 @@ struct MediumScatter : IVertexScatter
         if (leave)
             return exit.eval_and_pdf(wi, pdf, diffuse);
         pdf = density(wi);
+        if (linked)
+            return M.phase(data, point, dot(travel, wi));
         return float3(pdf);
     }
+}
+
+// The accumulation reference's free flight of `slot`'s path ray through the linked medium `M`,
+// outside every interior, over the first `asfloat(words.x)` m of the ray: a distance drawn by one
+// channel's extinction picked uniformly and weighed by the channels' mean density, as
+// `scatter_segment` draws one in an interior. A ray that reaches the end takes the share of the
+// draw its transmittance leaves out and, where it escapes (`words.z`), leaves from the end, past
+// which the environment holds the medium. One that scatters adds the medium's emission there and
+// leaves `words` as its vertex's (`MEDIUM_LINKED`), with `words.z` 1.
+bool linked_flight<M : IMedium>(PathRoot r, uint slot, inout uint4 words)
+{
+    uint4* at = path_hot(r, slot);
+    uint4 w0 = load_coherent(at);
+    uint4 w1 = load_coherent(at + 1);
+    float t = asfloat(words.x);
+    float3 origin = asfloat(w0.xyz);
+    float3 dir = oct_decode_snorm16(w1.x);
+    uint64_t data = r.scene.medium;
+    Sampler rng = path_sampler(r, item_pixel(r, r.slice_base + slot));
+    rng.dimension = w0.w >> HOT_DIMENSION_SHIFT;
+    float u = rng.next();
+    uint channel = min(uint(rng.next() * 3.0), 2u);
+    float s = M.distance(data, origin, dir, t, channel, -log(1.0 - u));
+    bool scattered = s < t;
+    float3 tr = M.transmittance(data, origin, dir, scattered ? s : t);
+    float3 throughput = hot_throughput(w1);
+    if (scattered)
+    {
+        MediumPoint m = M.sample(data, origin + dir * s);
+        float density = dot(m.sigma_t * tr, float3(1.0 / 3.0));
+        if ((w0.w & HOT_COUNTED) != 0 && density > 0.0 && any(m.emission > 0.0))
+        {
+            float4 gathered = asfloat(load_coherent(at + 3));
+            store_coherent(at + 3, asuint(float4(gathered.xyz + throughput * m.emission * tr / density, gathered.w)));
+        }
+        throughput *= density > 0.0 ? m.sigma_s * tr / density : float3(0.0);
+    }
+    else
+    {
+        float p = dot(tr, float3(1.0 / 3.0));
+        throughput *= p > 0.0 ? tr / p : float3(0.0);
+        if (words.z != 0)
+            origin += dir * t;
+    }
+    store_coherent(at, uint4(asuint(origin), hot_flags(w0.w, rng.dimension)));
+    store_coherent(at + 1, uint4(w1.xy, as_halves(throughput.xy), as_halves(float2(throughput.z, halves(w1.w).y))));
+    words = uint4(asuint(s), MEDIUM_LINKED, scattered ? 1 : 0, words.w);
+    return scattered;
 }
 
 // The vertex of `slot`'s path in an interior's medium, which its raygen made and weighed the path
@@ -2031,6 +2101,9 @@ struct MediumScatter : IVertexScatter
 // it leaves.
 public void path_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 words)
 {
+    // The reference's flight through the linked medium runs the vertex where it scatters.
+    if (may(MAY_REFERENCE) && may(MAY_MEDIUM) && words.y == MEDIUM_FLIGHT && !linked_flight<M>(r, slot, words))
+        return;
     uint word = words.x;
     // A re-run (`MEDIUM_BENT`) weighs the light of the job the vertex left where a plane stack
     // bent it, from the words the vertex started with.
@@ -2099,8 +2172,15 @@ public void path_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
     float3 sigma = float3(0.0);
     // The interior the vertex's light lies in: past the surface, the one outside the walk's.
     uint beyond = MATERIAL_NONE;
-    // The phase function of the medium the vertex scatters in.
-    float anisotropy = asfloat(load_coherent(cold + COLD_SCATTER_WORD).w);
+    // The phase function of the medium the vertex scatters in: an interior's, or the linked one's
+    // at the point, which lies outside every interior.
+    bool linked = may(MAY_REFERENCE) && may(MAY_MEDIUM) && kind == MEDIUM_LINKED;
+    float anisotropy = 0.0;
+    MediumPoint at_point = MediumPoint();
+    if (linked)
+        at_point = M.sample(r.scene.medium, point);
+    else
+        anisotropy = asfloat(load_coherent(cold + COLD_SCATTER_WORD).w);
     float ior = 1.0;
     if (capped)
     {
@@ -2163,12 +2243,17 @@ public void path_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
     InteriorExitScatter way_out = { normal, ior, 1.0 };
     if (capped)
         way_out = interior_exit(normal, ior);
-    MediumScatter scatter = { capped, capped && mode.count_bsdf, anisotropy, dir, way_out };
+    MediumScatter<M> scatter = { capped, capped && mode.count_bsdf, anisotropy, dir, way_out, linked, r.scene.medium, at_point };
     // The way out takes its lights by its next-event estimation, and its ray the environment.
     bool lit = capped && mode.count_nee && !mode.one_technique;
     float4 u = rng.next4();
     float u_roulette = rng.next();
     float3 wi = capped ? dir : sample_hg(scatter.anisotropy, dir, u.xy);
+    if (linked)
+    {
+        float unused;
+        wi = M.sample_phase(r.scene.medium, at_point, dir, u.xyz, unused);
+    }
     if (may(MAY_STACK))
     {
         if (bent)
@@ -2188,6 +2273,10 @@ public void path_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
             return;
         }
     }
+    float3 onward = throughput;
+    // The linked medium's draw is not its phase function's, which weighs the next ray.
+    if (linked)
+        onward *= scatter_pdf > 0.0 ? scatter_f / scatter_pdf : float3(0.0);
     float job_blue = 0.0;
     uint job_light = NO_LIGHT;
     if (k.sum > 0.0)
@@ -2205,8 +2294,8 @@ public void path_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
             stacked = k.kind == LIGHT_SAMPLE_DIRECTIONAL && r.set.stack_entries != 0 && inside;
         if (inside && !stacked)
             e *= beer(sigma, k.distance);
-        else if (!inside && k.kind != LIGHT_SAMPLE_ENVIRONMENT)
-            e *= medium_transmittance<M>(r.scene.medium, origin, k.dir, k.distance);
+        else if (!inside)
+            e *= linked_toward<M>(r, origin, k);
         store_job(at, k, origin, point, e, beyond, flags, job_blue, job_light);
         if (may(MAY_STACK))
         {
@@ -2219,7 +2308,7 @@ public void path_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
     }
     // The phase function draws its own density, so the next ray keeps the throughput; a way out is
     // the direction the cosine draw took.
-    bool goes = !cache_ends && (capped || scatter_pdf > 0.0) && (capped || roulette_survives(r, opaque, u_roulette, throughput)) && carries(throughput);
+    bool goes = !cache_ends && (capped || scatter_pdf > 0.0) && (capped || roulette_survives(r, opaque, u_roulette, onward)) && carries(onward);
     // A scatter's next ray leaves from the point itself: no offset for the medium to cover. A way
     // out's leaves the interior, and the medium of an outer one covers its offset too.
     float3 origin = capped ? surface_ray_origin(r, point, normal, wi) : point;
@@ -2235,7 +2324,7 @@ public void path_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
         // The surface's normal is what the way out's light pick drew by, and the lights its ray
         // meets are weighed with.
         store_coherent(at, uint4(asuint(origin), hot_flags(flags, rng.dimension)));
-        store_coherent(at + 1, uint4(oct_encode_snorm16(wi), capped ? oct_encode_snorm16(normal) : 0, as_halves(throughput.xy), as_halves(float2(throughput.z, mode.count_nee ? 1.0 : 0.0))));
+        store_coherent(at + 1, uint4(oct_encode_snorm16(wi), capped ? oct_encode_snorm16(normal) : 0, as_halves(onward.xy), as_halves(float2(onward.z, mode.count_nee ? 1.0 : 0.0))));
         float4 gathered = asfloat(load_coherent(at + 3));
         store_coherent(at + 3, asuint(float4(gathered.xyz, capped ? (lit ? PDF_LIT : 0.0) : scatter_pdf)));
     }
@@ -2596,8 +2685,8 @@ public void path_walk_meets<M : IMedium>(PathRoot r, uint slot, inout WalkMeetCa
             stacked = k.kind == LIGHT_SAMPLE_DIRECTIONAL && r.set.stack_entries != 0 && inside;
         if (inside && !stacked)
             light *= beer(sigma, k.distance);
-        else if (!inside && k.kind != LIGHT_SAMPLE_ENVIRONMENT)
-            light *= medium_transmittance<M>(r.scene.medium, origin, k.dir, k.distance);
+        else if (!inside)
+            light *= linked_toward<M>(r, origin, k);
         store_job(at, k, origin, point, light, beyond, flags, job_blue, job_light);
         // The job's ray lies outside the walk's interior, whose walls take that medium's IOR.
         if (may(MAY_INTERIORS) && may2(MAY2_THIN_DIELECTRICS))
@@ -2778,8 +2867,8 @@ void path_exit_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathVertex 
             stacked = k.kind == LIGHT_SAMPLE_DIRECTIONAL && r.set.stack_entries != 0 && inside;
         if (inside && !stacked)
             e *= beer(interior_sigma(path_cold(r, slot)), k.distance);
-        else if (!inside && k.kind != LIGHT_SAMPLE_ENVIRONMENT)
-            e *= medium_transmittance<M>(r.scene.medium, origin, k.dir, k.distance);
+        else if (!inside)
+            e *= linked_toward<M>(r, origin, k);
         store_job(at, k, origin, g.position, e, inside ? PATH_MEDIUM : MATERIAL_NONE, flags, job_blue, job_light);
         if (may(MAY_STACK))
         {
@@ -3148,15 +3237,47 @@ void path_feedback(PathRoot r, uint slot, uint id, float contribution)
     store_coherent(record, reinterpret<uint4>(v));
 }
 
+// Whether the root's paths take the environment by their rays alone (`LIGHT_ENVIRONMENT_BY_RAYS`).
+bool environment_by_rays(PathRoot r)
+{
+    return path_reference(r) && (r.light_flags & LIGHT_ENVIRONMENT_BY_RAYS) != 0;
+}
+
+// The linked environment's exact radiance along unit `dir`, a draw of its reference radiance from
+// `seed`, where the `camera` sees along it, in the sky callable (`path_sky`).
+public float3 sky_call(float3 dir, uint seed, bool camera)
+{
+    Payload p;
+    p.words = uint4(asuint(dir), (seed & ~1u) | (camera ? 1u : 0u));
+    call(CALL_SKY, p);
+    return asfloat(p.words.xyz);
+}
+
+// The sky callable: the linked environment `E`'s reference radiance along the direction in
+// `words.xyz` from the view's eye, drawn from the seed in `words.w`, whose lowest bit says the
+// camera sees along it; the radiance in `words.xyz`.
+public void path_sky<E : IEnvironment>(PathRoot r, inout uint4 words)
+{
+    float3 l = E.reference_radiance(r.set.scene.environment, asfloat(words.xyz), r.view.eye_render.xyz, words.w, (words.w & 1u) != 0);
+    words = uint4(asuint(l), 0);
+}
+
 // What `slot`'s path ray that met nothing adds: the environment along it and the directional
 // lights' discs, each weighed against next-event estimation at the vertex the ray left. A ray past
 // plane stack faces weighs a disc against next-event estimation at the vertex before them where
 // its probe found the stack there, `stack_owned`, as its raygen says.
-public void path_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, bool stack_owned)
+//
+// The reference's environment is its exact radiance, a draw in the sky callable that the raygen
+// makes once the miss returns (`path_sky_after_miss`), so the miss calls nothing and keeps no
+// stack: the miss returns what that radiance is weighed by, the path's throughput there by its
+// weight against next-event estimation, with SKY_PENDING and, where the camera sees along the ray,
+// SKY_CAMERA in w. It returns zeros where the environment adds nothing.
+public uint4 path_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, bool stack_owned)
 {
+    uint4 pending = uint4(0);
     uint4* at = path_hot(r, slot);
     PathHot p = load_hot(at);
-    if (may(MAY_SCATTERING) && (p.flags & HOT_MEDIUM) != 0)
+    if (may_scatter() && (p.flags & HOT_MEDIUM) != 0)
         p.normal = float3(0.0);
     LightSetGpu* set = r.set;
     ModeCounts mode = mode_counts(r);
@@ -3173,12 +3294,18 @@ public void path_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, bool
         // A ray whose vertex's next-event estimation took the lights meets them for nothing.
         bool lit = may(MAY_SCATTERING) && p.pdf == PDF_LIT;
         // The camera sees the environment itself; every other ray the map its light is drawn from.
-        float3 env = camera ? E.radiance(set.scene.environment, p.dir, r.view.eye_render.xyz) : environment_map(set.environment, p.dir);
         LocalLights* local = nullptr;
         if (may(MAY_LOCAL) && ran_local(p.run))
             local = pixel_local_lights(r, item_pixel(r, r.slice_base + slot));
-        float3 e = env * (weigh ? mis_balance(p.pdf, abs(p.run) * nee_environment_pdf(set, local, p.normal, p.dir)) : 1.0);
-        path_feedback(r, slot, feedback_environment(set), luminance_rec2020(p.throughput * e));
+        float weight = weigh && !environment_by_rays(r) ? mis_balance(p.pdf, abs(p.run) * nee_environment_pdf(set, local, p.normal, p.dir)) : 1.0;
+        float3 e = float3(0.0);
+        if (path_reference(r))
+            pending = uint4(asuint(p.throughput * weight), SKY_PENDING | (camera ? SKY_CAMERA : 0));
+        else
+        {
+            e = weight * (camera ? E.radiance(set.scene.environment, p.dir, r.view.eye_render.xyz) : environment_map(set.environment, p.dir));
+            path_feedback(r, slot, feedback_environment(set), luminance_rec2020(p.throughput * e));
+        }
         if (may(MAY_DIRECTIONAL))
         {
             // Past chain vertices the photons own a directional light's, but where next-event
@@ -3213,6 +3340,25 @@ public void path_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, bool
         p.radiance += p.throughput * e;
     }
     store_hot(at, p);
+    return pending;
+}
+
+// `path_miss`'s marks of a reference's miss whose environment the raygen draws.
+public static const uint SKY_PENDING = 1;
+public static const uint SKY_CAMERA = 2;
+
+// After the miss of `slot`'s path in hot words `at`, which returned `words`: the environment's
+// exact radiance along its ray, drawn in the sky callable and weighed as the miss says.
+public void path_sky_after_miss(PathRoot r, uint slot, uint4* at, uint4 words)
+{
+    if (!path_reference(r) || (words.w & SKY_PENDING) == 0)
+        return;
+    uint4 w0 = load_coherent(at);
+    Sampler rng = path_sampler(r, item_pixel(r, r.slice_base + slot));
+    rng.dimension = w0.w >> HOT_DIMENSION_SHIFT;
+    float3 sky = sky_call(oct_decode_snorm16(load_coherent(at + 1).x), rng.next_bits(), (words.w & SKY_CAMERA) != 0);
+    float4 w3 = asfloat(load_coherent(at + 3));
+    store_coherent(at + 3, asuint(float4(w3.xyz + asfloat(words.xyz) * sky, w3.w)));
 }
 
 // The bit of a path ray's cover word (`path_payload`) its any-hit shaders set where it met a

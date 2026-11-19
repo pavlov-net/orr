@@ -20,17 +20,18 @@ use crate::shaders::consts::{
     EMITTER_HIT_INSTRUCTIONS, EMITTER_VIEW_INSTRUCTIONS, FRONT_ANY_HIT_INSTRUCTIONS,
     FRONT_INSTRUCTIONS, GATHER_INSTRUCTIONS, HIT_INSTRUCTIONS, INTERIOR_HIT_INSTRUCTIONS,
     LAYER_HIT_INSTRUCTIONS, LIGHT_BOX_INSTRUCTIONS, LOCAL_FIRST_HIT_INSTRUCTIONS,
-    MAP_GATHER_HIT_INSTRUCTIONS, MAP_GATHER_INSTRUCTIONS, MEDIUM_VERTEX_INSTRUCTIONS,
-    MISS_INSTRUCTIONS, PATH_SOURCE_BACKGROUND, PATH_SOURCE_PHOTON, PATH_SOURCE_UPDATE,
-    PATH_SOURCE_VIEW, PHOTON_HIT_INSTRUCTIONS, PHOTON_START_INSTRUCTIONS, PIPELINE_INSTRUCTIONS,
+    MAP_GATHER_HIT_INSTRUCTIONS, MAP_GATHER_INSTRUCTIONS, MEDIUM_LINKED_INSTRUCTIONS,
+    MEDIUM_VERTEX_INSTRUCTIONS, MISS_INSTRUCTIONS, MISS_REFERENCE_INSTRUCTIONS,
+    PATH_SOURCE_BACKGROUND, PATH_SOURCE_PHOTON, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW,
+    PHOTON_HIT_INSTRUCTIONS, PHOTON_START_INSTRUCTIONS, PIPELINE_INSTRUCTIONS,
     PRODUCER_ANY_HIT_INSTRUCTIONS, PRODUCER_HIT_INSTRUCTIONS, PROXY_ANY_HIT_INSTRUCTIONS,
     PROXY_INTERSECTION_INSTRUCTIONS, PROXY_MARCH_INSTRUCTIONS, RAYGEN_DISPERSION_INSTRUCTIONS,
     RAYGEN_FRONT_INSTRUCTIONS, RAYGEN_INSTRUCTIONS, RAYGEN_LAYER_INSTRUCTIONS,
     RAYGEN_LENS_INSTRUCTIONS, RAYGEN_PHOTON_INSTRUCTIONS, RAYGEN_PROXY_INSTRUCTIONS,
-    RAYGEN_STACK_INSTRUCTIONS, RAYGEN_WALK_INSTRUCTIONS, RICH_HIT_INSTRUCTIONS,
-    STACK_LAYER_INSTRUCTIONS, STACK_STEP_INSTRUCTIONS, STACK_VERTEX_INSTRUCTIONS,
-    TRACED_HIT_INSTRUCTIONS, WALK_EXIT_INSTRUCTIONS, WALK_HIT_INSTRUCTIONS,
-    WALK_LAYER_INSTRUCTIONS, WALK_MEETS_INSTRUCTIONS,
+    RAYGEN_REFERENCE_INSTRUCTIONS, RAYGEN_STACK_INSTRUCTIONS, RAYGEN_WALK_INSTRUCTIONS,
+    RICH_HIT_INSTRUCTIONS, SKY_INSTRUCTIONS, STACK_LAYER_INSTRUCTIONS, STACK_STEP_INSTRUCTIONS,
+    STACK_VERTEX_INSTRUCTIONS, TRACED_HIT_INSTRUCTIONS, WALK_EXIT_INSTRUCTIONS,
+    WALK_HIT_INSTRUCTIONS, WALK_LAYER_INSTRUCTIONS, WALK_MEETS_INSTRUCTIONS,
 };
 use crate::shaders::path::{layer, plain, rich, walk};
 use crate::specialize::{
@@ -89,6 +90,8 @@ pub enum Role {
     MapGather,
     /// The callable that weighs a dispersive layer's companion wavelengths.
     Disperse,
+    /// The callable of the linked environment's exact radiance, which the reference reads.
+    Sky,
 }
 
 /// The geometry a hit group's shaders run on, which their stages are made for.
@@ -218,6 +221,7 @@ impl Spec {
             Role::Gather => GATHER_INSTRUCTIONS,
             Role::MapGather => MAP_GATHER_INSTRUCTIONS,
             Role::Disperse => DISPERSE_INSTRUCTIONS,
+            Role::Sky => SKY_INSTRUCTIONS,
             Role::View => EMITTER_VIEW_INSTRUCTIONS,
             Role::Stack => STACK_STEP_INSTRUCTIONS,
             Role::Front => FRONT_INSTRUCTIONS,
@@ -293,7 +297,7 @@ fn runs_vertex(s: &Spec) -> bool {
 }
 
 /// Every allowance of a stage's cap.
-fn allowances() -> [Allowance; 24] {
+fn allowances() -> [Allowance; 27] {
     let raygen = |s: &Spec| s.role == Role::Raygen;
     let hit = |s: &Spec| s.role == Role::Hit;
     let layer = |s: &Spec| s.role == Role::Hit && s.kernel == Kernel::Layer;
@@ -320,6 +324,17 @@ fn allowances() -> [Allowance; 24] {
         allow(MAY_PROXIES, RAYGEN_PROXY_INSTRUCTIONS, raygen),
         allow(MAY_LENS | MAY_BACKGROUND, RAYGEN_LENS_INSTRUCTIONS, raygen),
         allow(MAY_DISPERSION, RAYGEN_DISPERSION_INSTRUCTIONS, raygen),
+        // Where the paths may be the reference's, a raygen holds the flight of its view rays
+        // through the linked medium and the environment's exact radiance along an environment
+        // job's or a missed ray's direction, a miss what weighs that radiance, and the medium
+        // vertex the linked medium's flight and phase where the kernels may link one.
+        allow(MAY_REFERENCE, RAYGEN_REFERENCE_INSTRUCTIONS, raygen),
+        allow(MAY_REFERENCE, MISS_REFERENCE_INSTRUCTIONS, |s| {
+            s.role == Role::Miss
+        }),
+        allow(MAY_REFERENCE, MEDIUM_LINKED_INSTRUCTIONS, |s| {
+            s.role == Role::Medium && s.may & MAY_MEDIUM != 0
+        }),
         // Where the paths may meet a plane stack, a stage that runs a vertex holds its re-run for
         // a bent job, and a layer's stage the stack question's answer and a crossing's track.
         allow(MAY_STACK, STACK_VERTEX_INSTRUCTIONS, runs_vertex),
@@ -427,6 +442,9 @@ struct Table {
     /// The callable of the vertex where an interior's real-time walk meets its surface, where an
     /// interior's medium may scatter.
     walk_meets: Option<u32>,
+    /// The callable of the linked environment's exact radiance, where the paths may be the
+    /// reference's.
+    sky: Option<u32>,
     hit_groups: Vec<HitGroup>,
     groups: HitGroups,
     /// Whether it is the pipeline that may meet everything from kernels that link a surface,
@@ -536,8 +554,10 @@ impl Table {
             .then(|| Self::stage(&mut specs, folded("eye_interior", Role::Hit)));
         let eye_lens = (viewed && may & MAY_INTERIORS != 0 && may & MAY_LENS != 0)
             .then(|| Self::stage(&mut specs, folded("eye_lens", Role::Hit)));
-        // A photon scatters in no medium and walks no surface.
-        let medium = (viewed && may & MAY_SCATTERING != 0)
+        // A photon scatters in no medium and walks no surface. The reference's paths fly through
+        // the linked medium in the medium vertex's callable.
+        let linked = MAY_REFERENCE | MAY_MEDIUM;
+        let medium = (viewed && (may & MAY_SCATTERING != 0 || may & linked == linked))
             .then(|| Self::stage(&mut specs, folded("medium_vertex", Role::Medium)));
         let walk_exit = (viewed && may & MAY_WALK != 0).then(|| {
             Self::stage(
@@ -586,6 +606,8 @@ impl Table {
                 },
             )
         });
+        let sky = (viewed && may & MAY_REFERENCE != 0)
+            .then(|| Self::stage(&mut specs, folded("sky", Role::Sky)));
         let front = (may & (MAY_PARTICLES | MAY_LOCAL_LIGHTS | MAY_MEDIUM) != 0)
             .then(|| Self::stage(&mut specs, folded("front", Role::Front)));
         let proxies = may & MAY_PROXIES != 0;
@@ -894,6 +916,7 @@ impl Table {
             map_gather,
             disperse,
             walk_meets,
+            sky,
             hit_groups,
             groups,
             general,
@@ -1234,6 +1257,7 @@ impl PathPipeline {
                 table.map_gather.map(ShaderRecord::new),
                 table.disperse.map(ShaderRecord::new),
                 table.walk_meets.map(ShaderRecord::new),
+                table.sky.map(ShaderRecord::new),
             ],
             max_recursion: 1,
             flags: RayPipelineFlags::scene(device.caps()),

@@ -22,7 +22,7 @@ public struct Slab : IMedium
         return float3(0.0);
     }
 
-    public static float3 multiple_scattering(uint64_t data, float3 p, float3 dir_to_light)
+    public static float3 multiple_scattering(uint64_t data, float3 p, float3 dir_to_light, float3 dir)
     {
         return float3(0.0);
     }
@@ -33,6 +33,22 @@ public struct Slab : IMedium
         float a = dir.y == 0.0 ? (origin.y >= 0.0 && origin.y <= HEIGHT ? t : 0.0)
                                : abs(((dir.y > 0.0 ? HEIGHT : 0.0) - y0) / dir.y);
         return exp(-SIGMA_T * min(a, t));
+    }
+
+    public static float distance(uint64_t data, float3 origin, float3 dir, float t_max, uint channel, float depth)
+    {
+        return positive_infinity();
+    }
+
+    public static float3 sample_phase(uint64_t data, MediumPoint m, float3 dir, float3 u, out float pdf)
+    {
+        pdf = 0.0;
+        return dir;
+    }
+
+    public static float phase_pdf(uint64_t data, MediumPoint m, float cos_theta)
+    {
+        return 0.0;
     }
 }
 
@@ -61,7 +77,7 @@ public struct StockFog : IMedium
         return fog_phase(10.0, cos_theta);
     }
 
-    public static float3 multiple_scattering(uint64_t data, float3 p, float3 dir_to_light)
+    public static float3 multiple_scattering(uint64_t data, float3 p, float3 dir_to_light, float3 dir)
     {
         return float3(0.0);
     }
@@ -71,5 +87,21 @@ public struct StockFog : IMedium
         FogData f = *(FogData*)data;
         return height_fog_transmittance(f.density, f.base_height, f.falloff_height, origin.y,
                                         dir.y, t);
+    }
+
+    public static float distance(uint64_t data, float3 origin, float3 dir, float t_max, uint channel, float depth)
+    {
+        FogData f = *(FogData*)data;
+        return height_fog_distance(f.density, f.base_height, f.falloff_height, origin.y, dir.y, t_max, depth);
+    }
+
+    public static float3 sample_phase(uint64_t data, MediumPoint m, float3 dir, float3 u, out float pdf)
+    {
+        return sample_fog_phase(10.0, dir, u, pdf);
+    }
+
+    public static float phase_pdf(uint64_t data, MediumPoint m, float cos_theta)
+    {
+        return fog_phase_pdf(10.0, cos_theta);
     }
 }

@@ -5,12 +5,17 @@ use orr::WorldPos;
 use orr_color::luminance;
 use orr_math::{DVec3, Vec3};
 
+use crate::shaders::consts::MAX_GROUP_PASSES;
 use crate::shaders::types::{AtmosphereGpu, AtmosphereGroups};
 use crate::spectrum::{GROUPS, RGB, SOLAR_COLOR, SPECTRAL_GROUPS, rgb_at};
 use crate::{Atmosphere, DOBSON_UNIT};
 
 /// LUT passes per frame: the wavelength groups three at a time.
 pub(crate) const PASSES: usize = SPECTRAL_GROUPS / 3;
+const _: () = assert!(
+    PASSES == MAX_GROUP_PASSES as usize,
+    "the shaders hold MAX_GROUP_PASSES passes"
+);
 
 /// A linear Rec.709 color in linear Rec.2020.
 pub(crate) fn rec2020(c: Vec3) -> [f64; 3] {

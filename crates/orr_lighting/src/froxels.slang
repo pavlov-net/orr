@@ -978,12 +978,13 @@ public void froxel_accumulate<M : IMedium>(FroxelRoot r, uint k)
 }
 
 // Light point `x` of a froxel, sampled as `m`, emits and scatters back along unit `dir` per
-// m: its emission, its isotropic `incident` light, the shadowed `lights` by the visibility in
-// `incident.a` and `more`, and every directional light's multiple scattering. Its smoke's
-// `smoke_scatter` takes the same light with a Henyey-Greenstein response of `anisotropy`. A froxel
-// of a dielectric's interior `im` takes `im`'s phase function, its shadowed lights through their
-// distance in it (`depth` over their visibility) along the direction a plane stack of `stacks`
-// bends them to in its IOR `ior`, and no multiple scattering of the linked medium.
+// m: its emission, its isotropic `incident` light and the shadowed `lights` by the visibility in
+// `incident.a` and `more`. The incident light holds the environment's, which carries the light
+// the linked medium scatters more than once, so the medium's own multiple scattering is not
+// added. Its smoke's `smoke_scatter` takes the same light with a Henyey-Greenstein response of
+// `anisotropy`. A froxel of a dielectric's interior `im` takes `im`'s phase function and its
+// shadowed lights through their distance in it (`depth` over their visibility) along the
+// direction a plane stack of `stacks` bends them to in its IOR `ior`.
 float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumPoint m, float3 smoke_scatter, float anisotropy, float4 incident, float4 more, float3 x, float3 dir, bool in_interior = false, InteriorMedium im = InteriorMedium(), float4 depth = float4(0.0), float4 stacks[MAX_FROXEL_SHADOWED_LIGHTS] = {}, float ior = AMBIENT_IOR)
 {
     uint64_t data = set.scene.medium;
@@ -1005,8 +1006,7 @@ float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumP
             smoke_light += arriving * hg_phase(anisotropy, cos_theta);
         }
     }
-    float3 isotropic = in_interior ? incident.rgb : incident.rgb + multiple_scattered<M>(set, x);
-    return m.emission + m.sigma_s * (isotropic + medium_light) + smoke_scatter * (isotropic + smoke_light);
+    return m.emission + m.sigma_s * (incident.rgb + medium_light) + smoke_scatter * (incident.rgb + smoke_light);
 }
 
 // The column coordinate (column k's ray at k) of view-space point `d` with `d.z` < 0, in a

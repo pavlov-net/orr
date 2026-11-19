@@ -5,6 +5,7 @@
 #include "orr_root.h"
 import orr_shaders.math;
 import orr_shaders.packing;
+import orr_shaders.random;
 import orr_color.luminance;
 import orr_scene.lights;
 import orr_lighting.media;
@@ -46,19 +47,56 @@ void transmittance_texels(uint3 id: SV_DispatchThreadID)
     root.output[id.x] = float4(h, mu, abs(back - unit) * float2(size - 1));
 }
 
+// Per multiple-scattering table texel (altitude, light, view and azimuth, the first fastest): its
+// altitude and view zenith cosine, and the round trip's error in texels on the altitude and light
+// axes and on the view and azimuth axes. The azimuth of a view or light at the zenith or nadir is
+// every azimuth, and counts no error.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void multiple_scattering_texels(uint3 id: SV_DispatchThreadID)
 {
-    uint2 size = MULTIPLE_SCATTERING_SIZE;
-    if (id.x >= size.x * size.y)
+    uint4 size = uint4(MS_ALTITUDES, MS_LIGHT_ZENITHS, MS_VIEW_ZENITHS, MS_AZIMUTHS);
+    if (id.x >= size.x * size.y * size.z * size.w)
         return;
     AtmosphereGpu* a = root.atmosphere;
-    float2 unit = float2(id.x % size.x, id.x / size.x) / float2(size - 1);
-    float h, mu;
-    atmosphere_multiple_scattering_point(a, unit, h, mu);
-    float2 back = atmosphere_multiple_scattering_unit(a, h, mu);
-    root.output[id.x] = float4(h, mu, abs(back - unit) * float2(size - 1));
+    uint4 index = uint4(id.x % size.x, (id.x / size.x) % size.y, (id.x / (size.x * size.y)) % size.z,
+                        id.x / (size.x * size.y * size.z));
+    float4 unit = float4(index) / float4(size - 1);
+    float h = atmosphere_ms_altitude(a, unit.x);
+    float mu_light = atmosphere_ms_light(unit.y);
+    float mu = atmosphere_ms_view(a, h, unit.z);
+    float sines = sqrt(max((1.0 - mu * mu) * (1.0 - mu_light * mu_light), 0.0));
+    float nu = mu * mu_light + sines * cos(PI * unit.w);
+    float4 error = abs(atmosphere_ms_unit(a, h, mu_light, mu, nu) - unit) * float4(size - 1);
+    if (!(sines > 0.0))
+        error.w = 0.0;
+    root.output[id.x] = float4(h, mu, max(error.x, error.y), max(error.z, error.w));
+}
+
+static groupshared float3 reference_sums[64];
+
+// Per input direction, a workgroup's mean of `count` x 64 draws of `atmosphere_reference_sky` from
+// an eye at altitude `light.w`, the draws of batch `layer`, half of them integrating the view ray's
+// single scattering.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void reference_sky(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
+{
+    AtmosphereGpu* a = root.atmosphere;
+    float3 dir = normalize(root.input[group.x].xyz);
+    float3 sum = float3(0.0);
+    for (uint k = 0; k < root.count; ++k)
+        sum += atmosphere_reference_sky(a, root.light.w, dir, pcg3d(uint3(group.x, lane, root.layer * root.count + k)).x, (k & 1) == 0);
+    reference_sums[lane] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint w = 32; w > 0; w >>= 1)
+    {
+        if (lane < w)
+            reference_sums[lane] += reference_sums[lane + w];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (lane == 0)
+        root.output[group.x] = float4(reference_sums[0] / float(64 * root.count), 0.0);
 }
 
 // Per sky-view texel from a LUT eye at altitude `light.w`: the direction and the round
@@ -217,7 +255,7 @@ struct SkyTransmittance : IMedium
         return float3(0.0);
     }
 
-    static float3 multiple_scattering(uint64_t data, float3 p_render, float3 dir_to_light)
+    static float3 multiple_scattering(uint64_t data, float3 p_render, float3 dir_to_light, float3 dir)
     {
         return float3(0.0);
     }
@@ -226,6 +264,22 @@ struct SkyTransmittance : IMedium
     {
         AtmosphereGpu* a = (AtmosphereGpu*)data;
         return atmosphere_transmittance_to_space(a, atmosphere_altitude(a, origin), dot(dir, a.up.xyz));
+    }
+
+    static float distance(uint64_t data, float3 origin, float3 dir, float t_max, uint channel, float depth)
+    {
+        return positive_infinity();
+    }
+
+    static float3 sample_phase(uint64_t data, MediumPoint m, float3 dir, float3 u, out float pdf)
+    {
+        pdf = 0.0;
+        return dir;
+    }
+
+    static float phase_pdf(uint64_t data, MediumPoint m, float cos_theta)
+    {
+        return 0.0;
     }
 }
 

@@ -20,11 +20,13 @@ fn lut_parameterizations_round_trip() {
     let block = rig.block();
     let radius = f64::from(atmosphere.planet_radius);
 
-    for (entry, size) in [
-        ("transmittance_texels", TRANSMITTANCE_SIZE),
-        ("multiple_scattering_texels", MULTIPLE_SCATTERING_SIZE),
+    for (entry, n) in [
+        ("transmittance_texels", texels(TRANSMITTANCE_SIZE)),
+        (
+            "multiple_scattering_texels",
+            MULTIPLE_SCATTERING_SIZE.iter().product(),
+        ),
     ] {
-        let n = texels(size);
         let out = probe(
             block,
             entry,
@@ -37,6 +39,7 @@ fn lut_parameterizations_round_trip() {
         let worst = out.iter().map(|t| t[2].max(t[3])).fold(0.0f32, f32::max);
         assert!(worst < 1e-2, "{entry}: round trip off by {worst} texels");
         if entry == "transmittance_texels" {
+            let size = TRANSMITTANCE_SIZE;
             // The last column is the horizon: the ray grazes the ground.
             for row in 0..size[1] {
                 let t = out[(row * size[0] + size[0] - 1) as usize];

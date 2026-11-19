@@ -1694,6 +1694,9 @@ impl Core {
         if environment != DEFAULT_ENVIRONMENT || cpu.environment.is_some_and(|data| data != 0) {
             features |= SceneFeatures::ENVIRONMENT;
         }
+        if cpu.environment_drawn {
+            features |= SceneFeatures::DRAWN_ENVIRONMENT;
+        }
         features
     }
 

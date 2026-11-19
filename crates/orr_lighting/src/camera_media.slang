@@ -278,7 +278,9 @@ struct ProxyMarch<S : ISurfaces, M : IMedium> : IProxyStep
 
     // Light at `p`, `x` m along the ray, scattering toward the eye per unit albedo with a
     // Henyey-Greenstein response of `anisotropy`. The froxels' visibility stands where no rays
-    // are asked for; past the froxels there is none, so one ray is traced.
+    // are asked for; past the froxels there is none, so one ray is traced, and the linked
+    // medium's multiple scattering stands in for the sky's light that the froxels' incident light
+    // holds.
     [mutating]
     float3 light(float3 p, float x, float anisotropy)
     {
@@ -309,6 +311,8 @@ struct ProxyMarch<S : ISurfaces, M : IMedium> : IProxyStep
                 arrives[j] = ray_arrives[j];
             }
         }
+        if (!inside)
+            ambient += multiple_scattered<M>(froxels.set, p, dir);
         return ambient + particle_directional<M>(root.lighting, p, -dir, anisotropy, inside, vis, arrives);
     }
 
@@ -330,7 +334,7 @@ struct ProxyMarch<S : ISurfaces, M : IMedium> : IProxyStep
             ProxyMedium m = proxy_medium(scene_proxy(s, span.instance), span.origin + span.direction * x);
             sigma_t += m.sigma_t;
             if (any(m.sigma_s > 0.0))
-                source += m.sigma_s * (light(p, x, m.anisotropy) + multiple_scattered<M>(froxels.set, p));
+                source += m.sigma_s * light(p, x, m.anisotropy);
         }
         march_step(sigma_t, source * fog.transmittance * pre_exposure, h, inscatter, through);
     }
@@ -447,12 +451,14 @@ SmokeSheet next_sheet(FroxelRoot f, float3 dir, float after, float t_max)
     return nearest.sheet;
 }
 
-// The reference camera segment: in-scatter (pre-exposed) over `t` m from the eye along `dir`,
-// to the scene's `near_range` in the linked medium on sky pixels and to the end of the spans
-// in the proxies. Jittered steps at the proxies' voxel spacing, at most `segment_steps` per
-// stretch, each lit by one next-event candidate with its shadow ray and by the linked
-// medium's multiple scattering, with the smoke triangles between them lit the same way and
-// seen through by what their opacity lets through; the linked medium's transmittance exactly.
+// The reference camera segment: in-scatter (pre-exposed) and transmittance over `t` m from the
+// eye along `dir` of the proxies, to the end of their spans, and of the smoke. The linked medium
+// is the paths': their camera rays fly through it, so it only dims what lies in front of it here,
+// exactly, to the scene's `near_range` on sky pixels. The in-scatter debug view
+// (`MEDIA_INSCATTER`) marches the linked medium's single scattering too. Jittered steps at the
+// proxies' voxel spacing, at most `segment_steps` per stretch, each lit by one next-event
+// candidate with its shadow ray, with the smoke triangles between them lit the same way and seen
+// through by what their opacity lets through.
 Fog reference_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 pixel, float3 dir, float t, ProxySpans spans)
 {
     SceneRoot* s = f.scene;
@@ -461,6 +467,7 @@ Fog reference_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, ui
     float3 eye = f.view.eye_render.xyz;
     Sampler rng = Sampler(pixel, f.frame, f.seed ^ MEDIA_STREAM);
     float linked_end = isinf(t) ? s.near_range : t;
+    bool marches = r.mode == MEDIA_INSCATTER;
     // On a sky pixel smoke reaches as far as the aerial-perspective LUT.
     float end = isinf(t) ? max(max(linked_end, spans.end()), f.smoke != nullptr ? f.ap_range : 0.0) : t;
     SmokeSheet sheet = SmokeSheet();
@@ -473,11 +480,11 @@ Fog reference_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, ui
     {
         float next;
         uint active = spans.piece(x, end, next);
-        if (x < linked_end)
+        if (marches && x < linked_end)
             next = min(next, linked_end);
         float h = spans.step_size(s, active, next - x, r.segment_steps);
-        // Past the linked medium and the proxies only smoke is left.
-        uint steps = active == 0 && x >= linked_end ? 0 : uint(ceil((next - x) / h - 1e-3));
+        // Past the marched linked medium and the proxies only smoke is left.
+        uint steps = active == 0 && (!marches || x >= linked_end) ? 0 : uint(ceil((next - x) / h - 1e-3));
         h = (next - x) / float(max(steps, 1u));
         uint k = 0;
         float step_at = steps > 0 ? x + rng.next() * h : next;
@@ -495,7 +502,7 @@ Fog reference_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, ui
             float d = at_sheet ? sheet.t : step_at;
             float3 p = eye + dir * d;
             MediumPoint m = MediumPoint();
-            if (!at_sheet && d < linked_end)
+            if (marches && !at_sheet && d < linked_end)
                 m = M.sample(data, p);
             NeeVertex nv = nee_vertex(set, p, float3(0.0), pixel, nullptr);
             ResolvedLightSample c = nee_candidate<S>(set, nv, rng);
@@ -537,7 +544,6 @@ Fog reference_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, ui
                         vis *= emitter_view_layer<S>(set, c, AMBIENT_IOR);
                     source += scatter * l * vis / c.pdf;
                 }
-                source += sigma_s * multiple_scattered<M>(set, p);
             }
             source *= medium_transmittance<M>(data, eye, dir, at_sheet ? d : min(d, linked_end));
             if (at_sheet)
@@ -556,7 +562,7 @@ Fog reference_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, ui
     }
     Fog out;
     out.inscatter = inscatter * f.view.exposure[f.view.exposure_slot].pre_exposure;
-    out.transmittance = through * medium_transmittance<M>(data, eye, dir, linked_end);
+    out.transmittance = through * (marches ? medium_transmittance<M>(data, eye, dir, linked_end) : float3(1.0));
     return out;
 }
 
@@ -631,7 +637,7 @@ Fog smoky_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 
     ViewConstants* v = f.view;
     Sampler rng = Sampler(pixel, f.frame, f.seed ^ PARTICLE_STREAM);
     float3 p = v.eye_render.xyz + dir * smoke_t;
-    float3 light = particle_light<S, M>(r.lighting, p, -dir, f.smoke_anisotropy, rng) + multiple_scattered<M>(f.set, p);
+    float3 light = particle_light<S, M>(r.lighting, p, -dir, f.smoke_anisotropy, rng) + multiple_scattered<M>(f.set, p, dir);
     float3 color = (smoke.albedo * light + smoke.emission) / smoke.weight;
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
     fog.inscatter = front.inscatter + front.transmittance * (1.0 - smoke.through) * color * pre_exposure

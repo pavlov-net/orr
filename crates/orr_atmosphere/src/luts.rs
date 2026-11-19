@@ -3,22 +3,46 @@
 use orr::abi::{GpuPtr, StorageImageIndex, TextureIndex};
 use orr::orr_gpu::{
     AddressMode, Allocation, ComputePipeline, Device, Filter, Format, Hazards, MemoryKind,
-    SamplerDesc, ShaderStage, SpecData, Stages, Texture, TextureDesc, TextureMemory, TextureUsage,
-    TimelinePoint, ViewDesc,
+    SamplerDesc, ShaderStage, SpecData, Stages, Texture, TextureDesc, TextureKind, TextureMemory,
+    TextureUsage, TimelinePoint, ViewDesc,
 };
 use orr::{LightId, Result, SceneCompute};
 use orr_math::DVec3;
 use orr_shaders::bytemuck::Zeroable;
 
 use crate::block::{self, PASSES};
+use crate::shaders::consts::{
+    MS_ALTITUDES, MS_AZIMUTHS, MS_FIRST_AZIMUTHS, MS_LIGHT_ZENITHS, MS_MODES, MS_RAY_ZENITHS,
+    MS_VIEW_ZENITHS,
+};
 use crate::shaders::luts::{MODULE, Root};
 use crate::shaders::types::{AtmosphereGpu, AtmosphereGroups, FoldGpu};
 use crate::{Atmosphere, MAX_EXTRA_VIEWS, MAX_FOLDED_LIGHTS, MAX_SKY_LIGHTS};
 
 /// Transmittance LUT texels: zenith cosine (Bruneton's distance mapping) by altitude.
 pub const TRANSMITTANCE_SIZE: [u32; 2] = [256, 128];
-/// Multiple-scattering LUT texels: the light's zenith cosine by altitude.
-pub const MULTIPLE_SCATTERING_SIZE: [u32; 2] = [64, 32];
+/// Multiple-scattering table texels, as `atmosphere.slang` has them: altitude, the light's zenith
+/// cosine, the view's zenith cosine and the azimuth between the view and the light.
+pub const MULTIPLE_SCATTERING_SIZE: [u32; 4] =
+    [MS_ALTITUDES, MS_LIGHT_ZENITHS, MS_VIEW_ZENITHS, MS_AZIMUTHS];
+/// Azimuth texels of the radiance of the orders past the first.
+const MS_LATER_AZIMUTHS: u32 = 8;
+/// The last scattering order the table sums; a tail stands for the rest.
+const MS_LAST_ORDER: u32 = 6;
+/// The extent of one layer of the in-scatter tables.
+const MS_SIZE: [u32; 3] = [
+    MS_VIEW_ZENITHS * MS_AZIMUTHS,
+    MS_LIGHT_ZENITHS,
+    MS_ALTITUDES,
+];
+/// Entries of the build's radiance table, its phase operator and what else it keeps
+/// (`luts.slang`'s `MS_AUX_*`).
+const MS_RADIANCE_ENTRIES: u64 =
+    (MS_ALTITUDES * MS_LIGHT_ZENITHS * MS_RAY_ZENITHS * MS_AZIMUTHS) as u64 * PASSES as u64;
+const MS_KERNEL_ENTRIES: u64 = (MS_ALTITUDES * MS_VIEW_ZENITHS * MS_MODES * MS_RAY_ZENITHS) as u64;
+const MS_AUX_ENTRIES: u64 = MS_RAY_ZENITHS as u64
+    + (MS_ALTITUDES * MS_LIGHT_ZENITHS) as u64 * PASSES as u64
+    + MS_LIGHT_ZENITHS as u64 * PASSES as u64;
 /// Sky-view LUT texels: longitude by warped latitude.
 pub const SKY_VIEW_SIZE: [u32; 2] = [400, 200];
 /// Entries of the ground irradiance table, over the light's zenith cosine.
@@ -84,7 +108,24 @@ impl Lut {
                 TextureUsage::SAMPLED | TextureUsage::STORAGE,
             )
         };
-        let texture = device.create_texture(&desc, TextureMemory::Dedicated, name)?;
+        Self::with(device, &desc, name)
+    }
+
+    /// A 3D texture of `extent` of encoded logs (`atmosphere_ms_encode`).
+    fn volume(device: &Device, extent: [u32; 3], name: &str) -> Result<Self> {
+        let desc = TextureDesc {
+            kind: TextureKind::D3,
+            format: Format::Rgba16Unorm,
+            extent,
+            mips: 1,
+            layers: 1,
+            usage: TextureUsage::SAMPLED | TextureUsage::STORAGE,
+        };
+        Self::with(device, &desc, name)
+    }
+
+    fn with(device: &Device, desc: &TextureDesc, name: &str) -> Result<Self> {
+        let texture = device.create_texture(desc, TextureMemory::Dedicated, name)?;
         let slots = [device.alloc_image_slot()?, device.alloc_image_slot()?];
         Ok(Self {
             sampled: device.write_sampled(slots[0], &texture, &ViewDesc::default()),
@@ -97,7 +138,11 @@ impl Lut {
 
 struct Pipelines {
     transmittance: ComputePipeline,
-    multiple_scattering: ComputePipeline,
+    ms_kernel: ComputePipeline,
+    ms_single: ComputePipeline,
+    ms_scatter: ComputePipeline,
+    ms_gather: ComputePipeline,
+    ms_fog: ComputePipeline,
     ground_irradiance: ComputePipeline,
     fold: ComputePipeline,
     sky_view: ComputePipeline,
@@ -106,6 +151,11 @@ struct Pipelines {
 /// Workgroups of 8x8 threads over a LUT.
 fn tiles(size: [u32; 2]) -> [u32; 3] {
     [size[0].div_ceil(8), size[1].div_ceil(8), 1]
+}
+
+/// Workgroups of 8x8x1 threads over a volume.
+fn volume_tiles(size: [u32; 3]) -> [u32; 3] {
+    [size[0].div_ceil(8), size[1].div_ceil(8), size[2]]
 }
 
 fn pipeline(device: &Device, entry: &str) -> Result<ComputePipeline> {
@@ -118,7 +168,12 @@ fn pipeline(device: &Device, entry: &str) -> Result<ComputePipeline> {
 ///
 /// After a [`set`](Self::set), the next [`record`](Self::record) rebuilds the
 /// transmittance, multiple-scattering and ground irradiance tables, which depend only on the
-/// medium. Every `record` refolds the candidate lights and rebuilds the sky-view LUTs, in
+/// medium. The multiple-scattering table sums the second to the sixth scattering order and a
+/// geometric tail for the rest, each order's in-scatter computed from the last one's radiance
+/// with the medium's phase functions, so the light the aerosol and fog scatter forward stays
+/// toward the light. The phase functions' operator is rebuilt only when the aerosol's asymmetry,
+/// the fog's droplet diameter or the radii change. Every `record` refolds the candidate lights
+/// and rebuilds the sky-view LUTs, in
 /// [`SPECTRAL_GROUPS`](crate::spectrum::SPECTRAL_GROUPS) wavelength groups summed to
 /// Rec.2020: one at the scene focus altitude and one for each other view far enough above or
 /// below it (see [`record`](Self::record)).
@@ -135,6 +190,18 @@ pub struct AtmosphereState {
     _ground: Allocation<[f32; 4]>,
     transmittance: Lut,
     multiple_scattering: Lut,
+    /// The build's tables: one order's in-scatter as the next march reads it, one order's
+    /// radiance, the phase operator, what else the build keeps, the running sum of the orders and
+    /// the order's sky irradiance on the ground.
+    ms_march: Lut,
+    ms_radiance: Allocation<[f32; 4]>,
+    ms_kernel: Allocation<[f32; 4]>,
+    ms_aux: Allocation<[f32; 4]>,
+    ms_sum: Allocation<[f32; 4]>,
+    ms_ground: Allocation<[f32; 4]>,
+    /// The planet and top radii, aerosol asymmetry and droplet diameter the phase operator was
+    /// built for.
+    ms_kernel_for: Option<[f32; 4]>,
     sky_views: Vec<Lut>,
 }
 
@@ -187,11 +254,26 @@ impl AtmosphereState {
             layers,
             "atmosphere transmittance",
         )?;
-        let multiple_scattering = Lut::new(
+        let [w, h, d] = MS_SIZE;
+        let multiple_scattering =
+            Lut::volume(device, [w, h, d * layers], "atmosphere multiple scattering")?;
+        let ms_march = Lut::volume(
             device,
-            MULTIPLE_SCATTERING_SIZE,
-            layers,
-            "atmosphere multiple scattering",
+            [w, h, d * PASSES as u32],
+            "atmosphere scattering order in-scatter",
+        )?;
+        let buffer =
+            |entries: u64, name: &str| device.gpu_malloc(MemoryKind::DeviceLocal, entries, name);
+        let ms_radiance = buffer(MS_RADIANCE_ENTRIES, "atmosphere scattering order radiance")?;
+        let ms_kernel = buffer(MS_KERNEL_ENTRIES, "atmosphere phase operator")?;
+        let ms_aux = buffer(MS_AUX_ENTRIES, "atmosphere scattering build")?;
+        let ms_sum = buffer(
+            u64::from(w * h * d) * PASSES as u64,
+            "atmosphere scattering order sum",
+        )?;
+        let ms_ground = buffer(
+            u64::from(MS_LIGHT_ZENITHS) * PASSES as u64,
+            "atmosphere scattering order ground irradiance",
         )?;
         let sky_views = (0..=extra_views)
             .map(|_| Lut::new(device, SKY_VIEW_SIZE, 1, "atmosphere sky view"))
@@ -227,7 +309,11 @@ impl AtmosphereState {
             discarded: false,
             pipelines: Pipelines {
                 transmittance: pipeline(device, "transmittance")?,
-                multiple_scattering: pipeline(device, "multiple_scattering")?,
+                ms_kernel: pipeline(device, "ms_kernel")?,
+                ms_single: pipeline(device, "ms_single")?,
+                ms_scatter: pipeline(device, "ms_scatter")?,
+                ms_gather: pipeline(device, "ms_gather")?,
+                ms_fog: pipeline(device, "ms_fog")?,
                 ground_irradiance: pipeline(device, "ground_irradiance")?,
                 fold: pipeline(device, "fold")?,
                 sky_view: pipeline(device, "sky_view")?,
@@ -239,6 +325,13 @@ impl AtmosphereState {
             _ground: ground,
             transmittance,
             multiple_scattering,
+            ms_march,
+            ms_radiance,
+            ms_kernel,
+            ms_aux,
+            ms_sum,
+            ms_ground,
+            ms_kernel_for: None,
             sky_views,
         })
     }
@@ -346,6 +439,7 @@ impl AtmosphereState {
         if !self.discarded {
             cx.cmd.discard(&self.transmittance.texture);
             cx.cmd.discard(&self.multiple_scattering.texture);
+            cx.cmd.discard(&self.ms_march.texture);
             for lut in &self.sky_views {
                 cx.cmd.discard(&lut.texture);
             }
@@ -356,8 +450,19 @@ impl AtmosphereState {
 
         let root = |output: StorageImageIndex, view: u32| Root {
             atmosphere: self.block.gpu(),
+            ground: self.ms_ground.gpu(),
+            radiance: self.ms_radiance.gpu(),
+            kernel: self.ms_kernel.gpu(),
+            aux: self.ms_aux.gpu(),
+            sum: self.ms_sum.gpu(),
             output,
             view,
+            input: TextureIndex::NONE,
+            table: StorageImageIndex::NONE,
+            order: 0,
+            azimuths: 0,
+            last: 0,
+            _pad: 0,
         };
         if self.medium_changed {
             cx.cmd.begin_pass("atmosphere medium", false);
@@ -366,15 +471,90 @@ impl AtmosphereState {
                 .dispatch(&self.pipelines.transmittance, t, tiles(TRANSMITTANCE_SIZE));
             cx.cmd
                 .barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-            let ms = cx.put_root(&root(self.multiple_scattering.storage, 0))?;
-            let [w, h] = MULTIPLE_SCATTERING_SIZE;
-            cx.cmd
-                .dispatch(&self.pipelines.multiple_scattering, ms, [w, h, 1]);
-            cx.cmd
-                .barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+            let compute = |cx: &mut SceneCompute<'_, '_>| {
+                cx.cmd
+                    .barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+            };
+            let r = &self.record;
+            let kernel_for = [
+                r.planet_radius,
+                r.top_radius,
+                r.aerosol_asymmetry,
+                r.fog_diameter,
+            ];
+            if self.ms_kernel_for != Some(kernel_for) {
+                let k = cx.put_root(&root(StorageImageIndex::NONE, 0))?;
+                cx.cmd.dispatch(
+                    &self.pipelines.ms_kernel,
+                    k,
+                    [MS_VIEW_ZENITHS, MS_ALTITUDES, 1],
+                );
+                self.ms_kernel_for = Some(kernel_for);
+            }
+            let fog = self.record.fog_density > 0.0;
+            let s = cx.put_root(&root(StorageImageIndex::NONE, 0))?;
+            cx.cmd.dispatch(
+                &self.pipelines.ms_single,
+                s,
+                volume_tiles([
+                    MS_RAY_ZENITHS * MS_FIRST_AZIMUTHS,
+                    MS_LIGHT_ZENITHS,
+                    MS_ALTITUDES,
+                ]),
+            );
+            compute(cx);
+            for order in 2..=MS_LAST_ORDER {
+                let d = cx.put_root(&Root {
+                    table: self.multiple_scattering.storage,
+                    order,
+                    last: MS_LAST_ORDER,
+                    azimuths: if order == 2 {
+                        MS_FIRST_AZIMUTHS
+                    } else {
+                        MS_LATER_AZIMUTHS
+                    },
+                    ..root(self.ms_march.storage, 0)
+                })?;
+                cx.cmd.dispatch(
+                    &self.pipelines.ms_scatter,
+                    d,
+                    [MS_LIGHT_ZENITHS, MS_ALTITUDES, 1],
+                );
+                compute(cx);
+                if order < MS_LAST_ORDER {
+                    let r = cx.put_root(&Root {
+                        input: self.ms_march.sampled,
+                        azimuths: MS_LATER_AZIMUTHS,
+                        ..root(StorageImageIndex::NONE, 0)
+                    })?;
+                    cx.cmd.dispatch(
+                        &self.pipelines.ms_gather,
+                        r,
+                        volume_tiles([
+                            MS_RAY_ZENITHS * MS_LATER_AZIMUTHS,
+                            MS_LIGHT_ZENITHS,
+                            MS_ALTITUDES,
+                        ]),
+                    );
+                    compute(cx);
+                }
+            }
+            if fog {
+                let f = cx.put_root(&Root {
+                    input: self.ms_march.sampled,
+                    table: self.multiple_scattering.storage,
+                    ..root(StorageImageIndex::NONE, 0)
+                })?;
+                cx.cmd
+                    .dispatch(&self.pipelines.ms_fog, f, volume_tiles(MS_SIZE));
+                compute(cx);
+            }
             let g = cx.put_root(&root(StorageImageIndex::NONE, 0))?;
-            cx.cmd
-                .dispatch(&self.pipelines.ground_irradiance, g, [GROUND_SIZE, 1, 1]);
+            cx.cmd.dispatch(
+                &self.pipelines.ground_irradiance,
+                g,
+                [GROUND_SIZE, PASSES as u32, 1],
+            );
             cx.cmd.end_pass();
             self.medium_changed = false;
         }
@@ -398,7 +578,7 @@ impl AtmosphereState {
     /// Frees the LUTs' heap slots once `after` has completed; the rest is freed when
     /// dropped.
     pub fn free(self, device: &Device, after: TimelinePoint) {
-        let luts = [self.transmittance, self.multiple_scattering]
+        let luts = [self.transmittance, self.multiple_scattering, self.ms_march]
             .into_iter()
             .chain(self.sky_views);
         for lut in luts {

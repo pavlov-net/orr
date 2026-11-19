@@ -32,11 +32,21 @@ public interface IMedium
     // and the scattered direction.
     static float3 phase(uint64_t data, MediumPoint m, float cos_theta);
     // Multiply-scattered radiance per unit `sigma_s` and per unit illuminance of the light
-    // before the medium; 0 when the medium has none.
-    static float3 multiple_scattering(uint64_t data, float3 p_render, float3 dir_to_light);
+    // before the medium that `p_render` scatters toward a view along unit `dir`; 0 when the
+    // medium has none.
+    static float3 multiple_scattering(uint64_t data, float3 p_render, float3 dir_to_light, float3 dir);
     // Transmittance over `t` meters from `origin` along unit `dir`; `t` is +inf toward
     // directional lights.
     static float3 transmittance(uint64_t data, float3 origin, float3 dir, float t);
+    // The distance along unit `dir` from `origin` at which channel `channel`'s optical depth
+    // reaches `depth`, or +inf where it stays below it over the finite `t_max` meters: with
+    // `depth` drawn as -log(1 - u), a free flight of that channel.
+    static float distance(uint64_t data, float3 origin, float3 dir, float t_max, uint channel, float depth);
+    // A unit direction for the next ray of a path that scatters at a point sampled as `m`, which
+    // it reached along unit `dir`, from three uniform numbers, and its density per steradian,
+    // `phase_pdf` there; the path weighs it by `phase` over that density.
+    static float3 sample_phase(uint64_t data, MediumPoint m, float3 dir, float3 u, out float pdf);
+    static float phase_pdf(uint64_t data, MediumPoint m, float cos_theta);
 }
 
 // No medium: transmittance 1, nothing scatters or emits.
@@ -52,7 +62,7 @@ public struct NoMedium : IMedium
         return float3(0.0);
     }
 
-    public static float3 multiple_scattering(uint64_t data, float3 p_render, float3 dir_to_light)
+    public static float3 multiple_scattering(uint64_t data, float3 p_render, float3 dir_to_light, float3 dir)
     {
         return float3(0.0);
     }
@@ -60,6 +70,22 @@ public struct NoMedium : IMedium
     public static float3 transmittance(uint64_t data, float3 origin, float3 dir, float t)
     {
         return float3(1.0);
+    }
+
+    public static float distance(uint64_t data, float3 origin, float3 dir, float t_max, uint channel, float depth)
+    {
+        return positive_infinity();
+    }
+
+    public static float3 sample_phase(uint64_t data, MediumPoint m, float3 dir, float3 u, out float pdf)
+    {
+        pdf = 0.0;
+        return dir;
+    }
+
+    public static float phase_pdf(uint64_t data, MediumPoint m, float cos_theta)
+    {
+        return 0.0;
     }
 }
 
@@ -112,6 +138,21 @@ public float height_fog_transmittance(float density, float base_height, float fa
     return exp(-height_fog_optical_depth(density, base_height, falloff_height, h0, dir_y, t));
 }
 
+// The distance from altitude `h0` along a direction that rises `dir_y` per meter at which height
+// fog's optical depth reaches `depth`, or +inf where it does not within `t_max` meters.
+public float height_fog_distance(float density, float base_height, float falloff_height,
+                                 float h0, float dir_y, float t_max, float depth)
+{
+    float start = height_fog_extinction(density, base_height, falloff_height, h0);
+    float k = dir_y / falloff_height;
+    // Optical depth start (1 - exp(-k s)) / k, inverted; level rays have it linear.
+    float x = depth * k / start;
+    if (!(x < 1.0))
+        return positive_infinity();
+    float s = abs(x) < 1e-4 ? depth / start * (1.0 + 0.5 * x) : -log(1.0 - x) / k;
+    return s < t_max ? s : positive_infinity();
+}
+
 // Henyey-Greenstein phase function, per steradian.
 public float hg_phase(float g, float cos_theta)
 {
@@ -119,23 +160,41 @@ public float hg_phase(float g, float cos_theta)
     return INV_FOUR_PI * (1.0 - g * g) / (d * sqrt(d));
 }
 
+// The cosine of a Henyey-Greenstein draw of anisotropy `g` from a uniform number: the inverse
+// of its distribution.
+public float sample_hg_cosine(float g, float u)
+{
+    if (abs(g) < 1e-3)
+        return 1.0 - 2.0 * u;
+    float s = (1.0 - g * g) / (1.0 - g + 2.0 * g * u);
+    return clamp((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
+}
+
 // A direction scattered from travel direction `d` (unit) by the Henyey-Greenstein phase
 // function of anisotropy `g`, from two uniform numbers; its density is `hg_phase(g, cos)`.
 public float3 sample_hg(float g, float3 d, float2 u)
 {
-    float c;
-    if (abs(g) < 1e-3)
-        c = 1.0 - 2.0 * u.x;
-    else
-    {
-        float s = (1.0 - g * g) / (1.0 - g + 2.0 * g * u.x);
-        c = clamp((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
-    }
+    return direction_about(d, sample_hg_cosine(g, u.x), TWO_PI * u.y);
+}
+
+// The unit direction at cosine `c` to unit `d` and azimuth `phi` about it.
+public float3 direction_about(float3 d, float c, float phi)
+{
     float sine = sqrt(max(0.0, 1.0 - c * c));
-    float phi = TWO_PI * u.y;
     float3 t, b;
     orthonormal_basis(d, t, b);
     return normalize(t * (sine * cos(phi)) + b * (sine * sin(phi)) + d * c);
+}
+
+// The cosine of a draw of the Rayleigh phase function from a uniform number: the root of
+// c^3 + 3c + 4 - 8u, its distribution's inverse, by Cardano's formula.
+public float sample_rayleigh_cosine(float u)
+{
+    float a = 4.0 * u - 2.0;
+    float d = sqrt(a * a + 1.0);
+    float p = a + d;
+    float q = a - d;
+    return clamp(sign(p) * pow(abs(p), 1.0 / 3.0) + sign(q) * pow(abs(q), 1.0 / 3.0), -1.0, 1.0);
 }
 
 // Draine's phase function, per steradian.
@@ -160,12 +219,33 @@ public float cornette_shanks_phase(float g, float cos_theta)
 // fit of Mie scattering.
 public float fog_phase(float diameter_um, float cos_theta)
 {
+    float4 p = fog_phase_parameters(diameter_um);
+    return (1.0 - p.w) * hg_phase(p.x, cos_theta) + p.w * draine_phase(p.y, p.z, cos_theta);
+}
+
+// A draw for `fog_phase` of droplet diameter `diameter_um` about travel direction `d` from three
+// uniform numbers: its Henyey-Greenstein lobe, or one of Draine's anisotropy for the Draine lobe,
+// each by its weight. Its density is `fog_phase_pdf`.
+public float3 sample_fog_phase(float diameter_um, float3 d, float3 u, out float pdf)
+{
+    float4 p = fog_phase_parameters(diameter_um);
+    float c = sample_hg_cosine(u.z < p.w ? p.y : p.x, u.x);
+    pdf = (1.0 - p.w) * hg_phase(p.x, c) + p.w * hg_phase(p.y, c);
+    return direction_about(d, c, TWO_PI * u.y);
+}
+
+public float fog_phase_pdf(float diameter_um, float cos_theta)
+{
+    float4 p = fog_phase_parameters(diameter_um);
+    return (1.0 - p.w) * hg_phase(p.x, cos_theta) + p.w * hg_phase(p.y, cos_theta);
+}
+
+// `fog_phase`'s (g_HG, g_D, alpha, w_D).
+public float4 fog_phase_parameters(float diameter_um)
+{
     float d = clamp(diameter_um, 5.0, 50.0);
-    float g_hg = exp(-0.0990567 / (d - 1.67154));
-    float g_d = exp(-2.20679 / (d + 3.91029) - 0.428934);
-    float alpha = exp(3.62489 - 8.29288 / (d + 5.52825));
-    float w_d = exp(-0.599085 / (d - 0.641583) - 0.665888);
-    return (1.0 - w_d) * hg_phase(g_hg, cos_theta) + w_d * draine_phase(g_d, alpha, cos_theta);
+    return float4(exp(-0.0990567 / (d - 1.67154)), exp(-2.20679 / (d + 3.91029) - 0.428934),
+                  exp(3.62489 - 8.29288 / (d + 5.52825)), exp(-0.599085 / (d - 0.641583) - 0.665888));
 }
 
 // One `dt` m step of a medium march with extinction `sigma_t` and `source` radiance per m:

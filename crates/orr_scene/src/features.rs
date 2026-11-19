@@ -113,6 +113,9 @@ impl SceneFeatures {
     /// A material of a linked type that may leave a hit to the standard surface transmits by
     /// its own weight.
     pub const LINKED_TRANSMISSION_FACTORS: Self = Self(1 << 38);
+    /// The environment's exact radiance is a draw ([`crate::EnvironmentData::DRAWN`]), which
+    /// the accumulation reference takes by its paths' rays alone.
+    pub const DRAWN_ENVIRONMENT: Self = Self(1 << 39);
     /// What a mesh keeps from the material it was built with, whatever the record holds now:
     /// once a record has shown one of these, the table keeps it.
     const BUILT: Self = Self(Self::LAYERS.0 | Self::COVERAGE.0);

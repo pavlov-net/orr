@@ -15,6 +15,11 @@ public struct ProceduralSky : IEnvironment
             c += float3(20000.0, 18000.0, 15000.0);
         return c;
     }
+
+    static float3 reference_radiance(uint64_t data, float3 dir, float3 eye_render, uint seed, bool camera)
+    {
+        return radiance(data, dir, eye_render);
+    }
 }
 
 ORR_ROOT(BakeRoot);

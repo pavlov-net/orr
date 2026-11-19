@@ -5,7 +5,7 @@
 use atmosphere_suite::{Probe, Rig, dir, earth, foggy, probe, solar_rec2020};
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
 use orr_atmosphere::spectrum::{SOLAR_ILLUMINANCE, SPECTRAL_GROUPS};
-use orr_atmosphere::{SKY_VIEW_SIZE, TRANSMITTANCE_SIZE};
+use orr_atmosphere::{Atmosphere, SKY_VIEW_SIZE, TRANSMITTANCE_SIZE};
 use orr_color::luminance;
 use orr_math::DVec3;
 use orr_scene::testing::assert_clean;
@@ -81,16 +81,16 @@ const SKY_DIRECTIONS: [(f64, f64); 9] = [
 ];
 
 /// The worst per-channel error of the sky-view LUT against the reference over
-/// `SKY_DIRECTIONS` at light elevations -12, -5, 5, 30 and 60 deg, height fog off and on.
+/// `SKY_DIRECTIONS` at light elevations -12, -5, 5, 30 and 60 deg, in each of `atmospheres`.
 /// `multiple`: with multiple scattering, else single scattering on both sides.
-fn sky_view_error(multiple: bool, precision: &Precision) -> f64 {
+fn sky_view_error(multiple: bool, precision: &Precision, atmospheres: &[Atmosphere]) -> f64 {
     let n = SKY_VIEW_SIZE[0] * SKY_VIEW_SIZE[1];
     let mut worst = 0.0f64;
-    for atmosphere in [earth(), foggy()] {
-        let fog = atmosphere.height_fog.is_some();
-        let mut rig = Rig::new(&atmosphere);
+    for atmosphere in atmospheres {
+        let fog = atmosphere.height_fog.map_or(0.0, |f| f.density);
+        let mut rig = Rig::new(atmosphere);
         rig.sky.set_multiple_scattering(multiple);
-        let reference = Reference::new(&atmosphere);
+        let reference = Reference::new(atmosphere);
         let groups = reference.run(Channels::Groups);
         for elevation in [-12.0, -5.0, 5.0, 30.0, 60.0] {
             let sun = dir(elevation, 0.0);
@@ -131,9 +131,10 @@ fn sky_view_error(multiple: bool, precision: &Precision) -> f64 {
                     0.0
                 };
                 eprintln!(
-                    "fog {fog:>5}, light {elevation:>5} deg, view ({e:>4}, {a:>4}): {y:.3e} cd/m^2, \
-                     worst channel off by {:.2}%",
-                    error * 100.0
+                    "fog {fog:>6}, light {elevation:>5} deg, view ({e:>4}, {a:>4}): {y:.3e} cd/m^2, \
+                     worst channel off by {:.2}%, luminance by {:+.2}%",
+                    error * 100.0,
+                    (luminance(got) / y - 1.0) * 100.0
                 );
                 worst = worst.max(error);
             }
@@ -149,22 +150,119 @@ fn sky_view_single_scattering_matches_reference() {
         relative_error: 1.0,
         max_samples: 0,
     };
-    let worst = sky_view_error(false, &only_single);
+    let worst = sky_view_error(false, &only_single, &[earth(), foggy()]);
     assert!(worst < 0.05, "sky radiance off by {:.2}%", worst * 100.0);
     assert_clean();
 }
 
-/// The full sky against the reference's multiple scattering: measures the error of the
-/// multiple-scattering LUT model.
-#[test]
-#[ignore = "measurement, about 7 minutes: run with --ignored --nocapture"]
-fn sky_view_multiple_scattering_error() {
+/// The full sky against the reference's multiple scattering in `atmosphere`: measures the error
+/// of the multiple-scattering LUT model.
+fn multiple_scattering_error(atmosphere: Atmosphere) {
     let precision = Precision {
         relative_error: 0.01,
         max_samples: 1 << 22,
     };
-    let worst = sky_view_error(true, &precision);
+    let worst = sky_view_error(true, &precision, &[atmosphere]);
     eprintln!("worst channel {:.1}%", worst * 100.0);
+    assert_clean();
+}
+
+#[test]
+#[ignore = "measurement, about 4 minutes: run with --ignored --nocapture"]
+fn sky_view_multiple_scattering_error() {
+    multiple_scattering_error(earth());
+}
+
+#[test]
+#[ignore = "measurement, about 5 minutes: run with --ignored --nocapture"]
+fn sky_view_multiple_scattering_error_in_fog() {
+    multiple_scattering_error(foggy());
+}
+
+/// The test's fog ten times as dense.
+#[test]
+#[ignore = "measurement, about 8 minutes: run with --ignored --nocapture"]
+fn sky_view_multiple_scattering_error_in_dense_fog() {
+    let mut dense = foggy();
+    if let Some(f) = dense.height_fog.as_mut() {
+        f.density *= 10.0;
+    }
+    multiple_scattering_error(dense);
+}
+
+/// The accumulation reference's sky, which path traces the medium, against the f64 reference's
+/// full multiple scattering in the same wavelength groups: the reference that the path tracer's
+/// converged images rest on, above and below the horizon, at a low and a high light, fog off and
+/// on.
+#[test]
+fn reference_sky_matches_reference() {
+    let precision = Precision {
+        relative_error: 0.005,
+        max_samples: 1 << 23,
+    };
+    let mut worst = 0.0f64;
+    for atmosphere in [earth(), foggy()] {
+        let fog = atmosphere.height_fog.is_some();
+        let mut rig = Rig::new(&atmosphere);
+        let reference = Reference::new(&atmosphere);
+        let groups = reference.run(Channels::Groups);
+        for elevation in [5.0, 30.0] {
+            let sun = dir(elevation, 0.0);
+            rig.frame(Some(sun), EYE);
+            let views = [
+                (2.0, 0.0),
+                (2.0, 90.0),
+                (5.0, 180.0),
+                (40.0, 135.0),
+                (-5.0, 45.0),
+            ];
+            let input: Vec<[f32; 4]> = views
+                .iter()
+                .map(|&(e, a)| {
+                    let d = dir(e, a);
+                    [d.x as f32, d.y as f32, d.z as f32, 0.0]
+                })
+                .collect();
+            // Batches of draws, each dispatch short enough for the driver's watchdog.
+            const BATCHES: u32 = 64;
+            let mut got = vec![[0.0f64; 3]; views.len()];
+            for layer in 0..BATCHES {
+                let batch = probe(
+                    rig.block(),
+                    "reference_sky",
+                    views.len() as u64,
+                    Probe {
+                        threads: 64 * views.len() as u32,
+                        count: 256,
+                        input: &input,
+                        layer,
+                        light: [0.0, 0.0, 0.0, EYE.y as f32],
+                        ..Probe::default()
+                    },
+                );
+                for (g, b) in got.iter_mut().zip(&batch) {
+                    for c in 0..3 {
+                        g[c] += f64::from(b[c]) / f64::from(BATCHES);
+                    }
+                }
+            }
+            for (&(e, a), g) in views.iter().zip(&got) {
+                let r = groups.sky(EYE, dir(e, a), &Light::solar(sun), NEAR_RANGE, &precision);
+                let expected = groups.rec2020(&r.values).map(|v| v * SOLAR_ILLUMINANCE);
+                let y = luminance(expected);
+                let error = (0..3)
+                    .map(|c| (g[c] - expected[c]).abs() / expected[c].abs().max(0.05 * y))
+                    .fold(0.0, f64::max);
+                eprintln!(
+                    "fog {fog:>5}, light {elevation:>4} deg, view ({e:>4}, {a:>4}): {y:.3e} cd/m^2, \
+                     worst channel off by {:.2}%",
+                    error * 100.0
+                );
+                worst = worst.max(error);
+            }
+        }
+    }
+    assert!(worst < 0.02, "reference sky off by {:.2}%", worst * 100.0);
     assert_clean();
 }
 
