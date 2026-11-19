@@ -25,10 +25,15 @@ public static const uint2 TRANSMITTANCE_SIZE = uint2(256, 128);
 // texels) and the azimuth between the view and the light.
 [Host] public static const uint MS_ALTITUDES = 16;
 [Host] public static const uint MS_LIGHT_ZENITHS = 32;
-[Host] public static const uint MS_VIEW_ZENITHS = 16;
+[Host] public static const uint MS_VIEW_ZENITHS = 24;
 [Host] public static const uint MS_RAY_ZENITHS = 32;
 [Host] public static const uint MS_AZIMUTHS = 16;
 public static const uint2 SKY_VIEW_SIZE = uint2(400, 200);
+// The sky-view LUTs' layers: the sky from the scene's `near_range` on, which the camera's view
+// sees past the froxels, and the same with the medium from the LUT's eye to `near_range` in front
+// of it, which the light a ray leaving the eye meets.
+public static const uint SKY_VIEW_FAR = 0;
+public static const uint SKY_VIEW_EYE = 1;
 // Entries of the ground irradiance table, over the light's zenith cosine.
 public static const uint GROUND_SIZE = 64;
 
@@ -125,6 +130,7 @@ public struct AtmosphereGpu
     public TextureIndex multiple_scattering;
     // Linear filtering, repeating.
     public SamplerIndex sampler;
+    // Two layers each: SKY_VIEW_FAR from `near_range` on, SKY_VIEW_EYE from the eye.
     public TextureIndex sky_view[MAX_SKY_VIEWS];
     // How much of each sky-view LUT a view reads, the rest from the focus LUT (entry 0).
     public float sky_view_weight[MAX_SKY_VIEWS];
@@ -369,43 +375,102 @@ public void atmosphere_transmittance_point(AtmosphereGpu* a, float2 unit, out fl
 }
 
 // The multiple-scattering tables' axes. Altitude is quadratic in its coordinate, so rows crowd
-// near the ground where the aerosol and the fog are; the light's zenith cosine is
-// quadratic either side of the horizon, where sunlight changes fastest; the view's zenith
-// angle is warped toward the horizon as the sky-view LUT's latitude is; the azimuth between the
-// view and the light is linear in angle.
+// near the ground where the aerosol is; with height fog it is geometric past a scale of the
+// fog's own, so they crowd within the fog. The light's zenith cosine is quadratic above the
+// horizon, where sunlight changes fastest; below it the light's elevation is linear, with most of
+// the texels over twilight, where the light the sky still holds falls fast, and few through the
+// night past it. The view's zenith angle is warped toward the horizon, where the in-scatter
+// falls fast with the view's elevation above it; the radiance table's ray zenith angle as the
+// sky-view LUT's latitude is. The azimuth between the view and the light is linear in angle.
+
+// With height fog, the altitude over which the multiple-scattering table's rows grow from evenly
+// spaced to geometric: half the fog's falloff height, at most the atmosphere's height, past which
+// the fog is all but even over it. An infinite falloff, uniform fog, would leave the rows 0 / 0.
+float ms_fog_scale(AtmosphereGpu* a)
+{
+    return min(0.5 * a.fog_falloff, a.top_radius - a.planet_radius);
+}
+
 public float atmosphere_ms_altitude_unit(AtmosphereGpu* a, float h)
 {
-    return sqrt(saturate(h / (a.top_radius - a.planet_radius)));
+    float top = a.top_radius - a.planet_radius;
+    if (!(a.fog_density > 0.0))
+        return sqrt(saturate(h / top));
+    float s = ms_fog_scale(a);
+    return saturate(log(1.0 + max(h, 0.0) / s) / log(1.0 + top / s));
 }
 
 public float atmosphere_ms_altitude(AtmosphereGpu* a, float unit)
 {
-    return (a.top_radius - a.planet_radius) * unit * unit;
+    float top = a.top_radius - a.planet_radius;
+    if (!(a.fog_density > 0.0))
+        return top * unit * unit;
+    float s = ms_fog_scale(a);
+    return s * (exp(unit * log(1.0 + top / s)) - 1.0);
 }
+
+// The light's elevation below the horizon down to which the light-zenith axis is twilight, and
+// the coordinate there.
+static const float MS_TWILIGHT = 0.34906585;
+static const float MS_TWILIGHT_UNIT = 0.03;
 
 public float atmosphere_ms_light_unit(float mu_light)
 {
-    return 0.5 + 0.5 * sign(mu_light) * sqrt(min(abs(mu_light), 1.0));
+    if (mu_light >= 0.0)
+        return 0.5 + 0.5 * sqrt(min(mu_light, 1.0));
+    float d = asin(min(-mu_light, 1.0));
+    if (d <= MS_TWILIGHT)
+        return 0.5 - (0.5 - MS_TWILIGHT_UNIT) * d / MS_TWILIGHT;
+    return MS_TWILIGHT_UNIT * (0.5 * PI - d) / (0.5 * PI - MS_TWILIGHT);
 }
 
 public float atmosphere_ms_light(float unit)
 {
-    float t = 2.0 * unit - 1.0;
-    return sign(t) * t * t;
+    if (unit >= 0.5)
+    {
+        float t = 2.0 * unit - 1.0;
+        return t * t;
+    }
+    float d = unit >= MS_TWILIGHT_UNIT
+        ? MS_TWILIGHT * (0.5 - unit) / (0.5 - MS_TWILIGHT_UNIT)
+        : 0.5 * PI - unit / MS_TWILIGHT_UNIT * (0.5 * PI - MS_TWILIGHT);
+    return -sin(d);
 }
+
+// The power of the warp that crowds the in-scatter table's view texels toward the horizon: below
+// 2, so the texels within some ten degrees of it, where the in-scatter of a low view falls
+// fastest, are not spent on the horizon itself.
+static const float MS_VIEW_WARP = 1.6;
 
 public float atmosphere_ms_view_unit(AtmosphereGpu* a, float h, float mu_view)
 {
-    return horizon_unit(horizon_zenith_angle(a, h), acos(clamp(mu_view, -1.0, 1.0)));
+    float horizon = horizon_zenith_angle(a, h);
+    float theta = acos(clamp(mu_view, -1.0, 1.0));
+    return theta < horizon ? 0.5 - 0.5 * pow(max(1.0 - theta / horizon, 0.0), 1.0 / MS_VIEW_WARP)
+                           : 0.5 + 0.5 * pow(max((theta - horizon) / (PI - horizon), 0.0), 1.0 / MS_VIEW_WARP);
 }
 
 public float atmosphere_ms_view(AtmosphereGpu* a, float h, float unit)
 {
+    float horizon = horizon_zenith_angle(a, h);
+    float w = pow(abs(2.0 * unit - 1.0), MS_VIEW_WARP);
+    return cos(unit < 0.5 ? horizon * (1.0 - w) : horizon + (PI - horizon) * w);
+}
+
+// The radiance table's ray zenith axis, quadratic toward the horizon: coordinate of a ray at
+// zenith cosine mu from altitude h, the ray of a coordinate, and the zenith angle with its
+// derivative by the coordinate.
+public float atmosphere_ms_ray_unit(AtmosphereGpu* a, float h, float mu)
+{
+    return horizon_unit(horizon_zenith_angle(a, h), acos(clamp(mu, -1.0, 1.0)));
+}
+
+public float atmosphere_ms_ray(AtmosphereGpu* a, float h, float unit)
+{
     return cos(horizon_angle(horizon_zenith_angle(a, h), unit));
 }
 
-// The zenith angle at view coordinate `unit` from altitude h, and in y its derivative by `unit`.
-public float2 atmosphere_ms_view_angle(AtmosphereGpu* a, float h, float unit)
+public float2 atmosphere_ms_ray_angle(AtmosphereGpu* a, float h, float unit)
 {
     float horizon = horizon_zenith_angle(a, h);
     float c = abs(2.0 * unit - 1.0);
@@ -553,11 +618,23 @@ public float3 step_integral(float3 sigma, float dt)
 
 // Lookups.
 
-float3 transmittance_texel(AtmosphereGpu* a, float h, float mu, uint layer)
+// The transmittance LUT's texture coordinates of altitude h and zenith cosine mu, which every
+// layer shares (`atmosphere_lut_transmittance_at`).
+public float2 atmosphere_transmittance_uv(AtmosphereGpu* a, float h, float mu)
 {
-    float2 uv = atmosphere_lut_coord(atmosphere_transmittance_unit(a, h, mu), TRANSMITTANCE_SIZE);
+    return atmosphere_lut_coord(atmosphere_transmittance_unit(a, h, mu), TRANSMITTANCE_SIZE);
+}
+
+// The transmittance LUT's `layer` at texture coordinates `uv` (`atmosphere_transmittance_uv`).
+public float3 atmosphere_lut_transmittance_at(AtmosphereGpu* a, float2 uv, uint layer)
+{
     return a.transmittance.get<Texture2DArray<float4>>()
         .SampleLevel(a.sampler.get(), float3(uv, float(layer)), 0.0).rgb;
+}
+
+float3 transmittance_texel(AtmosphereGpu* a, float h, float mu, uint layer)
+{
+    return atmosphere_lut_transmittance_at(a, atmosphere_transmittance_uv(a, h, mu), layer);
 }
 
 // Transmittance to space of the clear air (no fog) from altitude h along zenith cosine mu:
@@ -579,6 +656,103 @@ public float3 atmosphere_light_transmittance(AtmosphereGpu* a, float h, float mu
         * exp(-atmosphere_fog_optical_depth_to_space(a, h, mu));
 }
 
+// The lobe scattering depth along a view past which the light the fog's lobe keeps on its way
+// stops growing: past it the view's transmittance leaves under e^-64 of that light.
+public static const float LOBE_VIEW_DEPTH = 64.0;
+
+// Scattering counts the fog lobe's sum (`atmosphere_fog_lobe`) takes one by one; one term stands
+// for the counts past them.
+static const uint FOG_LOBE_TERMS = 4;
+// Terms past FOG_LOBE_TERMS that sum the tail's mass and mean of g^n where the depth is below 1,
+// where the first it leaves out is at most 5!/11!, about 3e-6, of the first it takes.
+static const uint FOG_LOBE_TAIL_TERMS = 6;
+
+// The fog droplets' forward Henyey-Greenstein lobe of anisotropy `g` (`fog_phase_parameters`)
+// on the light of a directional light that reaches a point and leaves it toward a view: what the
+// point's lobe scatters toward the view at cosine c to the light, per unit of the lobe's
+// scattering coefficient and of the light the rest of the medium's extinction leaves on the way
+// in and out, where `depth` is the lobe's scattering depth along both ways (to the light, and
+// back to where the view starts). The lobe all but keeps light on its way, so a path that the
+// lobe scatters n times between the light and the view spreads as the lobes composed,
+// HG(g^n), and is met once at each of its n scatterings: sum over n >= 1 of
+// e^-depth depth^(n - 1) / n! HG(g^n, c). It is exact for a view toward the light, where both
+// ways are one line, and for a view far outside the lobe, where one scattering turns the light
+// and the rest keep it on its way. The counts past FOG_LOBE_TERMS go as one lobe whose
+// anisotropy is their mean of g^n.
+public float3 atmosphere_fog_lobe(float g, float c, float3 depth)
+{
+    return atmosphere_fog_lobe_sum(atmosphere_fog_lobe_terms(g, c), depth);
+}
+
+// The terms of `atmosphere_fog_lobe` that do not depend on the depth, for sums over several
+// depths at one cosine.
+public struct FogLobe
+{
+    public float g;
+    public float c;
+    // HG(g^n, c) for n from 1.
+    public float phase[FOG_LOBE_TERMS];
+}
+
+public FogLobe atmosphere_fog_lobe_terms(float g, float c)
+{
+    FogLobe t;
+    t.g = g;
+    t.c = c;
+    float lobe = g;
+    for (uint n = 0; n < FOG_LOBE_TERMS; ++n)
+    {
+        t.phase[n] = hg_phase(lobe, c);
+        lobe *= g;
+    }
+    return t;
+}
+
+public float3 atmosphere_fog_lobe_sum(FogLobe t, float3 depth)
+{
+    float g = t.g;
+    float c = t.c;
+    float3 a = exp(-depth);
+    float3 sum = float3(0.0);
+    float3 mass = float3(0.0);
+    float3 moment = float3(0.0);
+    float lobe = g;
+    for (uint n = 1; n <= FOG_LOBE_TERMS; ++n)
+    {
+        sum += a * t.phase[n - 1];
+        mass += a;
+        moment += a * lobe;
+        a *= depth / float(n + 1);
+        lobe *= g;
+    }
+    // The tail's mass and its sum of g^n: below a depth of 1 by its next terms, where the
+    // difference of the totals below would lose it to rounding; from 1 by that difference, the
+    // sums over every n of e^-depth depth^(n - 1) / n! and of the same times g^n less the terms
+    // taken one by one.
+    float3 series = float3(0.0);
+    float3 series_moment = float3(0.0);
+    float tail_lobe = lobe;
+    for (uint n = FOG_LOBE_TERMS + 1; n <= FOG_LOBE_TERMS + FOG_LOBE_TAIL_TERMS; ++n)
+    {
+        series += a;
+        series_moment += a * tail_lobe;
+        a *= depth / float(n + 1);
+        tail_lobe *= g;
+    }
+    bool3 small = depth < 1.0;
+    float3 total = (1.0 - exp(-depth)) / depth;
+    float3 total_moment = (exp(-depth * (1.0 - g)) - exp(-depth)) / depth;
+    float3 rest = select(small, series, total - mass);
+    float3 rest_moment = select(small, series_moment, total_moment - moment);
+    // The tail's mean of g^n is below g^(FOG_LOBE_TERMS + 1), which rounding in the differences
+    // can break where the tail is all but empty.
+    float3 tail = clamp(rest_moment / rest, 0.0, lobe);
+    for (uint k = 0; k < 3; ++k)
+        if (rest[k] > 0.0)
+            sum[k] += rest[k] * hg_phase(tail[k], c);
+    return sum;
+}
+
 // What a point at altitude h scatters toward a view along zenith cosine mu_view by every order
 // from the second, per unit scattering coefficient, of a light at zenith cosine mu_light at
 // cosine nu to the view: three groups from `layer`, per unit spectral irradiance, or the
@@ -588,9 +762,15 @@ public float3 atmosphere_light_transmittance(AtmosphereGpu* a, float h, float mu
 public float3 atmosphere_lut_multiple_scattering(AtmosphereGpu* a, float h, float mu_light,
                                                  float mu_view, float nu, uint layer)
 {
-    return atmosphere_ms_table(a.multiple_scattering.get<Texture3D<float4>>(), a.sampler.get(),
-                               atmosphere_ms_unit(a, h, mu_light, mu_view, nu), MS_VIEW_ZENITHS,
-                               layer, a.group_passes + 1);
+    return atmosphere_lut_multiple_scattering_at(a, atmosphere_ms_unit(a, h, mu_light, mu_view, nu), layer);
+}
+
+// `atmosphere_lut_multiple_scattering` at the table's coordinates `unit` (`atmosphere_ms_unit`),
+// which every layer shares.
+public float3 atmosphere_lut_multiple_scattering_at(AtmosphereGpu* a, float4 unit, uint layer)
+{
+    return atmosphere_ms_table(a.multiple_scattering.get<Texture3D<float4>>(), a.sampler.get(), unit,
+                               MS_VIEW_ZENITHS, layer, a.group_passes + 1);
 }
 
 // Rec.2020 transmittance to space of sunlight, fog included, from altitude h above the
@@ -619,16 +799,16 @@ public uint atmosphere_sky_view_index(AtmosphereGpu* a, float h)
 public float3 atmosphere_sky_view(AtmosphereGpu* a, float3 dir, float3 eye_render)
 {
     uint i = atmosphere_sky_view_index(a, atmosphere_altitude(a, eye_render));
-    float3 l = sky_view_lookup(a, i, dir);
+    float3 l = sky_view_lookup(a, i, dir, SKY_VIEW_FAR);
     float w = a.sky_view_weight[i];
-    return w < 1.0 ? lerp(sky_view_lookup(a, 0, dir), l, w) : l;
+    return w < 1.0 ? lerp(sky_view_lookup(a, 0, dir, SKY_VIEW_FAR), l, w) : l;
 }
 
-float3 sky_view_lookup(AtmosphereGpu* a, uint i, float3 dir)
+float3 sky_view_lookup(AtmosphereGpu* a, uint i, float3 dir, uint layer)
 {
     float h = max(a.sky_view_altitude[i], 0.0);
-    return a.sky_view[i].get<Texture2D<float4>>()
-        .SampleLevel(a.sampler.get(), atmosphere_sky_view_uv(a, h, dir), 0.0).rgb;
+    return a.sky_view[i].get<Texture2DArray<float4>>()
+        .SampleLevel(a.sampler.get(), float3(atmosphere_sky_view_uv(a, h, dir), float(layer)), 0.0).rgb;
 }
 
 // Altitude of the airglow layer, m.
@@ -644,16 +824,16 @@ public float atmosphere_night_background(AtmosphereGpu* a, float h, float mu)
     return a.night_background * (2.0 / 3.0 * airglow + 1.0 / 3.0);
 }
 
-// Sky-view LUT i along `dir` plus the night background, extinguished from `near_range` to
-// space.
-float3 sky_view_radiance(AtmosphereGpu* a, uint i, float3 dir)
+// Layer `layer` of sky-view LUT i along `dir` plus the night background, extinguished to space
+// from where the layer starts.
+float3 sky_view_radiance(AtmosphereGpu* a, uint i, float3 dir, uint layer)
 {
-    float3 l = sky_view_lookup(a, i, dir);
+    float3 l = sky_view_lookup(a, i, dir, layer);
     float h = max(a.sky_view_altitude[i], 0.0);
     float mu = dot(dir, a.up.xyz);
     if (a.night_background <= 0.0 || atmosphere_ray_hits_ground(a, h, mu))
         return l;
-    float t = atmosphere_scene(a).near_range;
+    float t = layer == SKY_VIEW_FAR ? atmosphere_scene(a).near_range : 0.0;
     float hs = atmosphere_altitude_along(a, h, mu, t);
     float mu_s = ((a.planet_radius + h) * mu + t) / (a.planet_radius + hs);
     return l + atmosphere_night_background(a, h, mu)
@@ -730,10 +910,10 @@ struct ReferenceEvent
 // where it leaves to space, each times `throughput`. Its next event lies where the groups' mean
 // transmittance falls to `target`: in the medium there, or past the leg, where `ground` says
 // whether it reaches the ground, at `end` with each group's transmittance over the mean in
-// `passed`.
+// `passed`. With `quadrature`, `through` is the mean transmittance over the whole leg.
 ReferenceEvent reference_leg(AtmosphereGpu* a, float3 q, float3 d, float target, bool quadrature, float3 throughput[MAX_GROUP_PASSES],
                              inout float3 radiance[MAX_GROUP_PASSES], inout float3 background[MAX_GROUP_PASSES],
-                             out bool ground, out float end, out float3 passed[MAX_GROUP_PASSES])
+                             out bool ground, out float end, out float3 passed[MAX_GROUP_PASSES], out float through)
 {
     SceneRoot* scene = atmosphere_scene(a);
     FoldGpu* fold = a.fold;
@@ -864,6 +1044,7 @@ ReferenceEvent reference_leg(AtmosphereGpu* a, float3 q, float3 d, float target,
     }
     for (uint p = 0; p < passes; ++p)
         passed[p] = transmittance[p] / mean;
+    through = mean;
     if (!quadrature)
         return e;
     if (ground)
@@ -880,45 +1061,6 @@ ReferenceEvent reference_leg(AtmosphereGpu* a, float3 q, float3 d, float target,
             background[p] += throughput[p] * transmittance[p] * night;
     }
     return e;
-}
-
-// Adds to `radiance` the folded lights' light that event `e` scatters back along unit `d`, times
-// `throughput`.
-void reference_event_light(AtmosphereGpu* a, ReferenceEvent e, float3 d, float3 throughput[MAX_GROUP_PASSES],
-                           inout float3 radiance[MAX_GROUP_PASSES])
-{
-    SceneRoot* scene = atmosphere_scene(a);
-    FoldGpu* fold = a.fold;
-    uint passes = a.group_passes;
-    float h = length(e.point) - a.planet_radius;
-    float3 up = normalize(e.point);
-    // Each group's weight per unit scattering.
-    float3 weight[MAX_GROUP_PASSES];
-    for (uint p = 0; p < passes; ++p)
-    {
-        float3 scattering = e.rayleigh[p] + e.aerosol[p] + e.fog[p];
-        weight[p] = throughput[p] * select(scattering > 0.0, e.weight[p] / scattering, float3(0.0));
-    }
-    for (uint l = 0; l < fold.folded_count; ++l)
-    {
-        uint slot = fold.folded[l];
-        float3 to_light = normalize(scene.lights[a.candidates[slot]].direction);
-        float c = dot(d, to_light);
-        float3 phase = float3(rayleigh_phase(c), cornette_shanks_phase(a.aerosol_asymmetry, c),
-                              a.fog_density > 0.0 ? fog_phase(a.fog_diameter, c) : 0.0);
-        float mu = dot(up, to_light);
-        if (atmosphere_ray_hits_ground(a, h, mu))
-            continue;
-        float fogged = a.fog_density > 0.0 ? exp(-atmosphere_fog_optical_depth_to_space(a, h, mu)) : 1.0;
-        float3 color = fold.illuminance[slot].rgb * fold.weight[slot] * fogged;
-        for (uint p = 0; p < passes; ++p)
-        {
-            AtmosphereGroups g = a.groups[p];
-            float3 e_light = atmosphere_light_groups(g, color);
-            radiance[p] += weight[p] * e_light * atmosphere_lut_transmittance(a, h, mu, p)
-                * (e.rayleigh[p] * phase.x + e.aerosol[p] * phase.y + e.fog[p] * phase.z);
-        }
-    }
 }
 
 // The folded lights' direct light on the ground at unit normal `n`, of group pass p.
@@ -942,14 +1084,14 @@ float3 reference_ground_lit(AtmosphereGpu* a, uint p, float3 n)
 // What `AtmosphereSky` approximates, by path tracing the medium on the spherical planet, as the
 // f64 reference does: the radiance arriving at an eye at altitude h0 along unit `dir` from
 // `near_range` on, the folded lights' light scattered any number of times, the virtual ground's
-// reflection of it and the night background, from random numbers seeded by `seed`. With
-// `quadrature` the view ray adds the light scattered once along it by quadrature, which lowers the
-// draw's variance for what it costs. Each leg's next event is drawn from the groups' mean density
-// along it, each group weighed by its own over that mean, and scatters by a phase component drawn
-// by the groups' mean share of it, or reflects off the ground by a cosine draw, and every event
-// past the integrated view ray takes the lights' light there. All wavelength groups ride every
+// reflection of it and the night background, from random numbers seeded by `seed`. As the f64
+// reference does, every leg adds the light scattered once along it by quadrature, and a leg that
+// leaves to space scatters for certain, its weight times the share of the light the leg
+// scatters. Each leg's next event is drawn from the groups' mean density along it, each group
+// weighed by its own over that mean, and scatters by a phase component drawn by the groups' mean
+// share of it, or reflects off the ground by a cosine draw. All wavelength groups ride every
 // path. Rec.2020, nits.
-public float3 atmosphere_reference_sky(AtmosphereGpu* a, float h0, float3 dir, uint seed, bool quadrature)
+public float3 atmosphere_reference_sky(AtmosphereGpu* a, float h0, float3 dir, uint seed)
 {
     uint state = pcg(seed);
     uint passes = a.group_passes;
@@ -972,16 +1114,37 @@ public float3 atmosphere_reference_sky(AtmosphereGpu* a, float h0, float3 dir, u
     for (uint leg = 0; leg < REFERENCE_SKY_LEGS; ++leg)
     {
         state = pcg(state);
-        bool ground;
+        float u = unit_float(state);
+        float r0 = length(q);
+        bool ground = atmosphere_ray_hits_ground(a, r0 - big_r, dot(q, d) / r0);
         float end;
+        float through;
         float3 passed[MAX_GROUP_PASSES];
-        bool integrated = quadrature && leg == 0;
-        ReferenceEvent e = reference_leg(a, q, d, 1.0 - unit_float(state), integrated, throughput, radiance, background, ground, end, passed);
+        // A leg to space walks twice, one call site for both: the quadrature finds the share of
+        // the light it scatters, over which the second walk draws the scattering.
+        float target = ground ? 1.0 - u : -1.0;
+        float scattered = 1.0;
+        ReferenceEvent e;
+        for (bool quadrature = true;; quadrature = false)
+        {
+            e = reference_leg(a, q, d, target, quadrature, throughput, radiance, background, ground, end, passed, through);
+            if (ground || !quadrature)
+                break;
+            scattered = 1.0 - through;
+            if (!(scattered > 0.0))
+                break;
+            target = 1.0 - u * scattered;
+        }
+        if (!ground)
+        {
+            if (!e.met)
+                break;
+            for (uint p = 0; p < passes; ++p)
+                e.weight[p] *= scattered;
+        }
         float largest = 0.0;
         if (e.met)
         {
-            if (!integrated)
-                reference_event_light(a, e, d, throughput, radiance);
             // The phase component by the groups' mean share of the scattering there.
             float3 shares = float3(0.0);
             for (uint p = 0; p < passes; ++p)
@@ -1033,8 +1196,6 @@ public float3 atmosphere_reference_sky(AtmosphereGpu* a, float h0, float3 dir, u
             for (uint p = 0; p < passes; ++p)
             {
                 throughput[p] *= passed[p] * a.groups[p].ground_albedo.xyz;
-                if (!integrated)
-                    radiance[p] += throughput[p] * INV_PI * reference_ground_lit(a, p, n);
                 largest = max(largest, max_component(throughput[p]));
             }
             state = pcg(state);
@@ -1043,16 +1204,7 @@ public float3 atmosphere_reference_sky(AtmosphereGpu* a, float h0, float3 dir, u
             d = direction_about(n, sqrt(u0), TWO_PI * unit_float(state));
         }
         else
-        {
-            if (!integrated)
-            {
-                float r = length(q);
-                float night = atmosphere_night_background(a, r - big_r, dot(q, d) / r);
-                for (uint p = 0; p < passes; ++p)
-                    background[p] += throughput[p] * passed[p] * night;
-            }
             break;
-        }
         if (leg >= REFERENCE_SKY_ROULETTE)
         {
             float survive = min(largest, 1.0);
@@ -1077,25 +1229,35 @@ public float3 atmosphere_reference_sky(AtmosphereGpu* a, float h0, float3 dir, u
 // The sky as orr's environment link point reads it: the nearest sky-view LUT (the medium
 // beyond `near_range`, the folded lights' in-scatter and the virtual ground below the
 // horizon) plus the night background, extinguished from `near_range` to space, blended with
-// the focus LUT's by the nearest LUT's weight. No light discs. Link it with
-// `Build::link(LinkPoint::Environment, ..)`.
+// the focus LUT's by the nearest LUT's weight; lighting's bake takes the same from the eye on.
+// No light discs. Link it with `Build::link(LinkPoint::Environment, ..)`.
 public struct AtmosphereSky : IEnvironment
 {
     public static float3 radiance(uint64_t data, float3 dir, float3 eye_render)
     {
-        AtmosphereGpu* a = (AtmosphereGpu*)data;
-        uint i = atmosphere_sky_view_index(a, atmosphere_altitude(a, eye_render));
-        float3 l = sky_view_radiance(a, i, dir);
-        float w = a.sky_view_weight[i];
-        return w < 1.0 ? lerp(sky_view_radiance(a, 0, dir), l, w) : l;
+        return sky(data, dir, eye_render, SKY_VIEW_FAR);
     }
 
-    // `atmosphere_reference_sky` from the eye's own altitude; where the camera sees along `dir` it
-    // integrates the view ray's single scattering.
-    public static float3 reference_radiance(uint64_t data, float3 dir, float3 eye_render, uint seed, bool camera)
+    // The sky from the focus: the medium within `near_range` belongs to the atmosphere too.
+    public static float3 baked_radiance(uint64_t data, float3 dir, float3 focus)
+    {
+        return sky(data, dir, focus, SKY_VIEW_EYE);
+    }
+
+    static float3 sky(uint64_t data, float3 dir, float3 eye_render, uint layer)
     {
         AtmosphereGpu* a = (AtmosphereGpu*)data;
-        return atmosphere_reference_sky(a, max(atmosphere_altitude(a, eye_render), 0.0), dir, seed, camera);
+        uint i = atmosphere_sky_view_index(a, atmosphere_altitude(a, eye_render));
+        float3 l = sky_view_radiance(a, i, dir, layer);
+        float w = a.sky_view_weight[i];
+        return w < 1.0 ? lerp(sky_view_radiance(a, 0, dir, layer), l, w) : l;
+    }
+
+    // `atmosphere_reference_sky` from the eye's own altitude.
+    public static float3 reference_radiance(uint64_t data, float3 dir, float3 eye_render, uint seed)
+    {
+        AtmosphereGpu* a = (AtmosphereGpu*)data;
+        return atmosphere_reference_sky(a, max(atmosphere_altitude(a, eye_render), 0.0), dir, seed);
     }
 }
 
@@ -1149,6 +1311,39 @@ public struct AtmosphereMedium : IMedium
         return a.multiple_scattering_scale
             * atmosphere_lut_multiple_scattering(a, h, dot(dir_to_light, up), dot(dir, up),
                                                  dot(dir, dir_to_light), a.group_passes);
+    }
+
+    // The phase function's parts times the transmittance toward the light, but with multiple
+    // scattering the fog's forward lobe, which takes the light it keeps on its way from the light
+    // to `p_render` and on along the view (`atmosphere_fog_lobe`).
+    public static float3 light_scattering(uint64_t data, MediumPoint m, float3 p_render, float3 to_light, float3 dir, float3 view_origin)
+    {
+        AtmosphereGpu* a = (AtmosphereGpu*)data;
+        float3 up = a.up.xyz;
+        float h = clamp(atmosphere_altitude(a, p_render), 0.0, a.top_radius - a.planet_radius);
+        float mu = dot(to_light, up);
+        if (atmosphere_ray_hits_ground(a, h, mu))
+            return float3(0.0);
+        float c = dot(to_light, dir);
+        float3 rest = max(1.0 - m.phase_share - m.phase_share_second, 0.0);
+        float3 phase = m.phase_share_second * cornette_shanks_phase(a.aerosol_asymmetry, c) + rest * rayleigh_phase(c);
+        float3 clear = max(transmittance_texel(a, h, mu, a.group_passes), 0.0);
+        if (!(a.fog_density > 0.0))
+            return phase * clear;
+        float4 droplets = fog_phase_parameters(a.fog_diameter);
+        phase += m.phase_share * droplets.w * draine_phase(droplets.y, droplets.z, c);
+        if (!(a.multiple_scattering_scale > 0.0))
+            return (phase + m.phase_share * (1.0 - droplets.w) * hg_phase(droplets.x, c)) * clear
+                * exp(-atmosphere_fog_optical_depth_to_space(a, h, mu));
+        float fog_depth = atmosphere_fog_optical_depth_to_space(a, h, mu);
+        // The lobe's share of the fog's extinction, and its scattering depth along the view.
+        float3 share = a.fog_albedo.rgb * (1.0 - droplets.w);
+        float3 view_depth = share * height_fog_optical_depth(a.fog_density, a.fog_base, a.fog_falloff, atmosphere_altitude(a, view_origin), dot(dir, up), dot(p_render - view_origin, dir));
+        // The lobe's light grows along the view as e^view_depth, up to LOBE_VIEW_DEPTH, which the
+        // reader's transmittance, below e^-view_depth, takes back.
+        float3 kept = clear * exp(-fog_depth * (1.0 - share) + min(view_depth, LOBE_VIEW_DEPTH));
+        return phase * clear * exp(-fog_depth)
+            + m.phase_share * (1.0 - droplets.w) * kept * atmosphere_fog_lobe(droplets.x, c, fog_depth * share + view_depth);
     }
 
     public static float3 transmittance(uint64_t data, float3 origin, float3 dir, float t)

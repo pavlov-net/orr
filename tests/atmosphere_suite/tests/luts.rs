@@ -216,33 +216,37 @@ fn reference_sky_matches_reference() {
                 (40.0, 135.0),
                 (-5.0, 45.0),
             ];
-            let input: Vec<[f32; 4]> = views
-                .iter()
+            // Each view's draws spread over ROWS workgroups of a dispatch to fill the GPU, over
+            // DISPATCHES dispatches each short enough for the driver's watchdog.
+            const ROWS: usize = 256;
+            const DISPATCHES: u32 = 4;
+            const COUNT: u32 = 16;
+            let input: Vec<[f32; 4]> = (0..ROWS)
+                .flat_map(|_| views.iter())
                 .map(|&(e, a)| {
                     let d = dir(e, a);
                     [d.x as f32, d.y as f32, d.z as f32, 0.0]
                 })
                 .collect();
-            // Batches of draws, each dispatch short enough for the driver's watchdog.
-            const BATCHES: u32 = 64;
             let mut got = vec![[0.0f64; 3]; views.len()];
-            for layer in 0..BATCHES {
+            for layer in 0..DISPATCHES {
                 let batch = probe(
                     rig.block(),
                     "reference_sky",
-                    views.len() as u64,
+                    input.len() as u64,
                     Probe {
-                        threads: 64 * views.len() as u32,
-                        count: 256,
+                        threads: 64 * input.len() as u32,
+                        count: COUNT,
                         input: &input,
                         layer,
                         light: [0.0, 0.0, 0.0, EYE.y as f32],
                         ..Probe::default()
                     },
                 );
-                for (g, b) in got.iter_mut().zip(&batch) {
+                for (i, b) in batch.iter().enumerate() {
                     for c in 0..3 {
-                        g[c] += f64::from(b[c]) / f64::from(BATCHES);
+                        got[i % views.len()][c] +=
+                            f64::from(b[c]) / (ROWS as f64 * f64::from(DISPATCHES));
                     }
                 }
             }

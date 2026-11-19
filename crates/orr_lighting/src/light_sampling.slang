@@ -1536,8 +1536,9 @@ public float3 directional_illuminance(LightSetGpu* set, uint id)
 }
 
 // Light point `x` of the linked medium `M`, sampled as `m`, emits and scatters back along
-// unit `dir` per m: its emission and every directional light, unshadowed.
-public float3 medium_source<M : IMedium>(LightSetGpu* set, MediumPoint m, float3 x, float3 dir)
+// unit `dir` per m, toward a view that runs from `view_origin`: its emission and every
+// directional light, unshadowed.
+public float3 medium_source<M : IMedium>(LightSetGpu* set, MediumPoint m, float3 x, float3 dir, float3 view_origin)
 {
     uint64_t data = set.scene.medium;
     float3 source = m.emission;
@@ -1548,9 +1549,7 @@ public float3 medium_source<M : IMedium>(LightSetGpu* set, MediumPoint m, float3
         uint id = set.directional_ids[j];
         float3 to_light = set.scene.lights[id].direction;
         float3 e = directional_illuminance(set, id);
-        float3 phase = M.phase(data, m, dot(to_light, dir));
-        float3 lit = M.transmittance(data, x, to_light, positive_infinity());
-        source += m.sigma_s * e * (phase * lit + M.multiple_scattering(data, x, to_light, dir));
+        source += m.sigma_s * e * (M.light_scattering(data, m, x, to_light, dir, view_origin) + M.multiple_scattering(data, x, to_light, dir));
     }
     return source;
 }
@@ -1590,7 +1589,7 @@ public float3 segment_inscatter<M : IMedium>(LightSetGpu* set, float3 origin, fl
         float s = (float(k) + jitter) * dt;
         float3 x = origin + dir * s;
         MediumPoint m = M.sample(data, x);
-        float3 source = medium_source<M>(set, m, x, dir) * cover.passed(s);
+        float3 source = medium_source<M>(set, m, x, dir, origin) * cover.passed(s);
         march_step(m.sigma_t, source, dt, inscatter, transmittance);
     }
     transmittance = medium_transmittance<M>(data, origin, dir, t);

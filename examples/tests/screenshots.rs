@@ -772,14 +772,13 @@ fn render_view_runs_ray_reconstruction() {
         "against the converged image: noisy {noisy:?}, still {denoised_error:?}, \
          moving {moving:?}, averaged in the hook {summed:?}"
     );
-    // DLSS: measured mean 0.062 still and 0.064 moving, and one path per pixel without ray
-    // reconstruction 0.146. MetalFX (Apple M5): 0.0683 still and 0.0685 moving, against 0.138
-    // for one path per pixel. The rest of the error is the fireflies in the converged image and
-    // the real-time image lying 2 to 3% below it.
+    // DLSS: measured mean 0.048 still and 0.054 moving, and one path per pixel without ray
+    // reconstruction 0.138. MetalFX (Apple M5): 0.0683 still and 0.0685 moving, against 0.138
+    // for one path per pixel. The rest of the error is the fireflies in the converged image.
     let (still_bound, moving_bound) = if cfg!(metalfx) {
         (0.071, 0.071)
     } else {
-        (0.065, 0.066)
+        (0.052, 0.055)
     };
     assert!(
         denoised_error.mean < still_bound,

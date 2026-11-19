@@ -38,6 +38,13 @@ public interface IMedium
     // Transmittance over `t` meters from `origin` along unit `dir`; `t` is +inf toward
     // directional lights.
     static float3 transmittance(uint64_t data, float3 origin, float3 dir, float t);
+    // What point `p_render`, sampled as `m`, scatters once toward a view along unit `dir` of a
+    // directional light toward unit `to_light`, per unit `sigma_s` and per unit illuminance of the
+    // light before the medium: `phase` times `transmittance` toward the light, where a medium
+    // whose phase function is too peaked for a march to resolve may add the light that keeps on
+    // its way to `p_render` and from it back along the view, which runs from `view_origin`. A
+    // reader takes the view's transmittance from `view_origin` itself.
+    static float3 light_scattering(uint64_t data, MediumPoint m, float3 p_render, float3 to_light, float3 dir, float3 view_origin);
     // The distance along unit `dir` from `origin` at which channel `channel`'s optical depth
     // reaches `depth`, or +inf where it stays below it over the finite `t_max` meters: with
     // `depth` drawn as -log(1 - u), a free flight of that channel.
@@ -70,6 +77,11 @@ public struct NoMedium : IMedium
     public static float3 transmittance(uint64_t data, float3 origin, float3 dir, float t)
     {
         return float3(1.0);
+    }
+
+    public static float3 light_scattering(uint64_t data, MediumPoint m, float3 p_render, float3 to_light, float3 dir, float3 view_origin)
+    {
+        return float3(0.0);
     }
 
     public static float distance(uint64_t data, float3 origin, float3 dir, float t_max, uint channel, float depth)

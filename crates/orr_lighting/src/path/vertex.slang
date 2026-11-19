@@ -3244,21 +3244,20 @@ bool environment_by_rays(PathRoot r)
 }
 
 // The linked environment's exact radiance along unit `dir`, a draw of its reference radiance from
-// `seed`, where the `camera` sees along it, in the sky callable (`path_sky`).
-public float3 sky_call(float3 dir, uint seed, bool camera)
+// `seed`, in the sky callable (`path_sky`).
+public float3 sky_call(float3 dir, uint seed)
 {
     Payload p;
-    p.words = uint4(asuint(dir), (seed & ~1u) | (camera ? 1u : 0u));
+    p.words = uint4(asuint(dir), seed);
     call(CALL_SKY, p);
     return asfloat(p.words.xyz);
 }
 
 // The sky callable: the linked environment `E`'s reference radiance along the direction in
-// `words.xyz` from the view's eye, drawn from the seed in `words.w`, whose lowest bit says the
-// camera sees along it; the radiance in `words.xyz`.
+// `words.xyz` from the view's eye, drawn from the seed in `words.w`; the radiance in `words.xyz`.
 public void path_sky<E : IEnvironment>(PathRoot r, inout uint4 words)
 {
-    float3 l = E.reference_radiance(r.set.scene.environment, asfloat(words.xyz), r.view.eye_render.xyz, words.w, (words.w & 1u) != 0);
+    float3 l = E.reference_radiance(r.set.scene.environment, asfloat(words.xyz), r.view.eye_render.xyz, words.w);
     words = uint4(asuint(l), 0);
 }
 
@@ -3270,8 +3269,8 @@ public void path_sky<E : IEnvironment>(PathRoot r, inout uint4 words)
 // The reference's environment is its exact radiance, a draw in the sky callable that the raygen
 // makes once the miss returns (`path_sky_after_miss`), so the miss calls nothing and keeps no
 // stack: the miss returns what that radiance is weighed by, the path's throughput there by its
-// weight against next-event estimation, with SKY_PENDING and, where the camera sees along the ray,
-// SKY_CAMERA in w. It returns zeros where the environment adds nothing.
+// weight against next-event estimation, with SKY_PENDING in w. It returns zeros where the
+// environment adds nothing.
 public uint4 path_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, bool stack_owned)
 {
     uint4 pending = uint4(0);
@@ -3300,7 +3299,7 @@ public uint4 path_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, boo
         float weight = weigh && !environment_by_rays(r) ? mis_balance(p.pdf, abs(p.run) * nee_environment_pdf(set, local, p.normal, p.dir)) : 1.0;
         float3 e = float3(0.0);
         if (path_reference(r))
-            pending = uint4(asuint(p.throughput * weight), SKY_PENDING | (camera ? SKY_CAMERA : 0));
+            pending = uint4(asuint(p.throughput * weight), SKY_PENDING);
         else
         {
             e = weight * (camera ? E.radiance(set.scene.environment, p.dir, r.view.eye_render.xyz) : environment_map(set.environment, p.dir));
@@ -3343,9 +3342,8 @@ public uint4 path_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, boo
     return pending;
 }
 
-// `path_miss`'s marks of a reference's miss whose environment the raygen draws.
+// `path_miss`'s mark of a reference's miss whose environment the raygen draws.
 public static const uint SKY_PENDING = 1;
-public static const uint SKY_CAMERA = 2;
 
 // After the miss of `slot`'s path in hot words `at`, which returned `words`: the environment's
 // exact radiance along its ray, drawn in the sky callable and weighed as the miss says.
@@ -3356,7 +3354,7 @@ public void path_sky_after_miss(PathRoot r, uint slot, uint4* at, uint4 words)
     uint4 w0 = load_coherent(at);
     Sampler rng = path_sampler(r, item_pixel(r, r.slice_base + slot));
     rng.dimension = w0.w >> HOT_DIMENSION_SHIFT;
-    float3 sky = sky_call(oct_decode_snorm16(load_coherent(at + 1).x), rng.next_bits(), (words.w & SKY_CAMERA) != 0);
+    float3 sky = sky_call(oct_decode_snorm16(load_coherent(at + 1).x), rng.next_bits());
     float4 w3 = asfloat(load_coherent(at + 3));
     store_coherent(at + 3, asuint(float4(w3.xyz + asfloat(words.xyz) * sky, w3.w)));
 }

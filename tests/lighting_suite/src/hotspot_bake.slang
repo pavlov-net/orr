@@ -14,9 +14,14 @@ public struct HotSpot : IEnvironment
         return c;
     }
 
-    static float3 reference_radiance(uint64_t data, float3 dir, float3 eye_render, uint seed, bool camera)
+    static float3 reference_radiance(uint64_t data, float3 dir, float3 eye_render, uint seed)
     {
         return radiance(data, dir, eye_render);
+    }
+
+    static float3 baked_radiance(uint64_t data, float3 dir, float3 focus)
+    {
+        return HotSpot.radiance(data, dir, focus);
     }
 }
 

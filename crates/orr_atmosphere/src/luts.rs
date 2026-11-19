@@ -172,8 +172,8 @@ fn pipeline(device: &Device, entry: &str) -> Result<ComputePipeline> {
 /// geometric tail for the rest, each order's in-scatter computed from the last one's radiance
 /// with the medium's phase functions, so the light the aerosol and fog scatter forward stays
 /// toward the light. The phase functions' operator is rebuilt only when the aerosol's asymmetry,
-/// the fog's droplet diameter or the radii change. Every `record` refolds the candidate lights
-/// and rebuilds the sky-view LUTs, in
+/// the fog's droplet diameter or falloff height, or the radii change. Every `record` refolds the
+/// candidate lights and rebuilds the sky-view LUTs, each from `near_range` on and from its eye, in
 /// [`SPECTRAL_GROUPS`](crate::spectrum::SPECTRAL_GROUPS) wavelength groups summed to
 /// Rec.2020: one at the scene focus altitude and one for each other view far enough above or
 /// below it (see [`record`](Self::record)).
@@ -199,9 +199,10 @@ pub struct AtmosphereState {
     ms_aux: Allocation<[f32; 4]>,
     ms_sum: Allocation<[f32; 4]>,
     ms_ground: Allocation<[f32; 4]>,
-    /// The planet and top radii, aerosol asymmetry and droplet diameter the phase operator was
-    /// built for.
-    ms_kernel_for: Option<[f32; 4]>,
+    /// The planet and top radii, aerosol asymmetry, droplet diameter and, with height fog, the
+    /// fog's falloff height, which places the table's altitude rows, the phase operator was built
+    /// for.
+    ms_kernel_for: Option<[f32; 5]>,
     sky_views: Vec<Lut>,
 }
 
@@ -276,7 +277,7 @@ impl AtmosphereState {
             "atmosphere scattering order ground irradiance",
         )?;
         let sky_views = (0..=extra_views)
-            .map(|_| Lut::new(device, SKY_VIEW_SIZE, 1, "atmosphere sky view"))
+            .map(|_| Lut::new(device, SKY_VIEW_SIZE, 2, "atmosphere sky view"))
             .collect::<Result<Vec<_>>>()?;
         let block = device.gpu_malloc(MemoryKind::DeviceLocal, 1, "atmosphere")?;
         let groups = device.gpu_malloc(MemoryKind::DeviceLocal, 1, "atmosphere groups")?;
@@ -481,6 +482,11 @@ impl AtmosphereState {
                 r.top_radius,
                 r.aerosol_asymmetry,
                 r.fog_diameter,
+                if r.fog_density > 0.0 {
+                    r.fog_falloff
+                } else {
+                    0.0
+                },
             ];
             if self.ms_kernel_for != Some(kernel_for) {
                 let k = cx.put_root(&root(StorageImageIndex::NONE, 0))?;

@@ -35,6 +35,11 @@ public struct Slab : IMedium
         return exp(-SIGMA_T * min(a, t));
     }
 
+    public static float3 light_scattering(uint64_t data, MediumPoint m, float3 p_render, float3 to_light, float3 dir, float3 view_origin)
+    {
+        return Slab.phase(data, m, dot(to_light, dir)) * Slab.transmittance(data, p_render, to_light, positive_infinity());
+    }
+
     public static float distance(uint64_t data, float3 origin, float3 dir, float t_max, uint channel, float depth)
     {
         return positive_infinity();
@@ -87,6 +92,11 @@ public struct StockFog : IMedium
         FogData f = *(FogData*)data;
         return height_fog_transmittance(f.density, f.base_height, f.falloff_height, origin.y,
                                         dir.y, t);
+    }
+
+    public static float3 light_scattering(uint64_t data, MediumPoint m, float3 p_render, float3 to_light, float3 dir, float3 view_origin)
+    {
+        return StockFog.phase(data, m, dot(to_light, dir)) * StockFog.transmittance(data, p_render, to_light, positive_infinity());
     }
 
     public static float distance(uint64_t data, float3 origin, float3 dir, float t_max, uint channel, float depth)

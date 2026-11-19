@@ -40,6 +40,11 @@ public struct Air : IMedium
         return exp(-(d.scattering + d.absorption) * t);
     }
 
+    static float3 light_scattering(uint64_t data, MediumPoint m, float3 p_render, float3 to_light, float3 dir, float3 view_origin)
+    {
+        return Air.phase(data, m, dot(to_light, dir)) * Air.transmittance(data, p_render, to_light, asfloat(0x7f800000u));
+    }
+
     static float distance(uint64_t data, float3 origin, float3 dir, float t_max, uint channel, float depth)
     {
         AirData* d = (AirData*)data;

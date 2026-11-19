@@ -221,8 +221,7 @@ public static const uint CALL_DISPERSE = 14;
 public static const uint CALL_WALK_MEETS = 15;
 // The callable of the linked environment's exact radiance, which the accumulation reference's
 // raygen calls for its misses and environment shadow jobs (`path_sky`): its payload holds the
-// direction in xyz and in w a seed, whose lowest bit says the camera sees along it; it hands back
-// the radiance.
+// direction in xyz and in w a seed; it hands back the radiance.
 public static const uint CALL_SKY = 16;
 // What a hit made for surfaces that may walk holds more than one with the rich lobes alone: the
 // subsurface lobe, the start of its walk and what it leaves of the surface where a walk leaves.

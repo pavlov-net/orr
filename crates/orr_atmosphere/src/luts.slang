@@ -52,6 +52,8 @@ ORR_ROOT(Root);
 static const uint COLUMN_STEPS = 64;
 static const uint GROUND_STEPS = 32;
 static const uint SKY_VIEW_STEPS = 40;
+// Steps of the sky-view march from the eye to `near_range`.
+static const uint SKY_VIEW_NEAR_STEPS = 4;
 // Lanes of the workgroups that sum over themselves (`workgroup_sum`).
 static const uint WORKGROUP_LANES = 256;
 // Directions per ground irradiance texel, a lane each.
@@ -112,8 +114,12 @@ struct Medium
 
 Medium medium(AtmosphereGpu* a, AtmosphereGroups g, float h, bool fog)
 {
-    float3 d = atmosphere_densities(a, h);
-    float f = fog ? atmosphere_fog_extinction(a, h) : 0.0;
+    return medium_of(g, atmosphere_densities(a, h), fog ? atmosphere_fog_extinction(a, h) : 0.0);
+}
+
+// The same from the densities `d` (`atmosphere_densities`) and the fog's extinction `f`.
+Medium medium_of(AtmosphereGroups g, float3 d, float f)
+{
     Medium m;
     m.rayleigh = g.rayleigh.xyz * d.x;
     m.aerosol = g.aerosol_scattering.xyz * d.y;
@@ -136,70 +142,164 @@ float3 ground_sky_irradiance(AtmosphereGpu* a, uint pass, float mu)
 struct Lights
 {
     float3 direction[MAX_FOLDED_LIGHTS];
-    // Spectral irradiance of the pass's three groups.
-    float3 groups[MAX_FOLDED_LIGHTS];
+    // Rec.2020 illuminance.
+    float3 color[MAX_FOLDED_LIGHTS];
     uint count;
+    // Each light is a unit spectral irradiance in every group in place of its color.
+    bool unit;
 }
 
-// Radiance of one pass's three groups arriving at distance t0 along unit `dir` from a LUT
-// eye at altitude h0, from the medium over [t0, t1] and, with `ground`, the ground at t1.
-// Multiple scattering, and the sky's light on the ground, are scaled by `multiple`. Without
-// `lobe` the fog scatters the lights once by its Draine part alone, its forward lobe left out.
-float3 march(AtmosphereGpu* a, uint pass, float h0, float3 dir, float t0, float t1, bool ground,
-             uint steps, Lights lights, float multiple, bool lobe = true)
+// A light's spectral irradiance in group pass `g`'s three groups.
+float3 light_groups(Lights lights, uint l, AtmosphereGroups g)
 {
-    AtmosphereGroups g = a.groups[pass];
+    return lights.unit ? float3(1.0) : atmosphere_light_groups(g, lights.color[l]);
+}
+
+// Radiance of the three groups of each of `passes` group passes from `first` arriving at
+// distance t0 along unit `dir` from a LUT eye at altitude h0, from the medium over [t0, t1] and,
+// with `ground`, the ground at t1. Multiple scattering, and the sky's light on the ground, are
+// scaled by `multiple`. The fog scatters the lights once by its Draine part, and with `lobe` by
+// its forward lobe too; with multiple scattering the light that lobe keeps on its way on both
+// legs is included (`atmosphere_fog_lobe`), and reaches t0 through the extinction the lobe's
+// scattering leaves out. What the passes share at a step is found once there. `lobe_depth` is the
+// lobe's scattering depth over [t0, t1]. With `before`, the view started before t0, over a lobe
+// depth of `lobe_before` up to it: `lobe_more` is what that adds at t0 to the lobe's light, which
+// keeps on its way along the view from where it started, seen through the full extinction before
+// t0.
+void march(AtmosphereGpu* a, float h0, float3 dir, float t0, float t1, bool ground, uint steps,
+           Lights lights, float multiple, bool lobe, uint first, uint passes, bool before,
+           float3 lobe_before[MAX_GROUP_PASSES], out float3 radiance[MAX_GROUP_PASSES],
+           out float3 transmittance[MAX_GROUP_PASSES], out float3 lobe_depth[MAX_GROUP_PASSES],
+           out float3 lobe_more[MAX_GROUP_PASSES])
+{
     float3 up = a.up.xyz;
     float mu = dot(dir, up);
     float r0 = a.planet_radius + h0;
     bool fog = a.fog_density > 0.0;
     float4 droplets = fog_phase_parameters(a.fog_diameter);
+    // The share of the fog's scattering in its lobe, where the march sums the light the lobe
+    // keeps on its way; single scattering takes the lobe as it is.
+    float lobe_weight = lobe && fog && multiple > 0.0 ? 1.0 - droplets.w : 0.0;
     float3 phase[MAX_FOLDED_LIGHTS];
     for (uint l = 0; l < lights.count; ++l)
     {
         float c = dot(dir, lights.direction[l]);
-        float f = lobe ? fog_phase(a.fog_diameter, c) : droplets.w * draine_phase(droplets.y, droplets.z, c);
+        float f = droplets.w * draine_phase(droplets.y, droplets.z, c);
+        if (lobe && !(multiple > 0.0))
+            f += (1.0 - droplets.w) * hg_phase(droplets.x, c);
         phase[l] = float3(rayleigh_phase(c), cornette_shanks_phase(a.aerosol_asymmetry, c), fog ? f : 0.0);
     }
-    float3 radiance = float3(0.0);
-    float3 transmittance = float3(1.0);
+    // The lobe's largest share of the fog's extinction over the groups, and its largest depth
+    // before t0.
+    float lobe_share = 0.0;
+    float lobe_ahead = 0.0;
+    for (uint p = 0; p < passes; ++p)
+    {
+        radiance[p] = float3(0.0);
+        transmittance[p] = float3(1.0);
+        lobe_depth[p] = float3(0.0);
+        lobe_more[p] = float3(0.0);
+        lobe_share = max(lobe_share, max_component(a.groups[first + p].fog_albedo.xyz) * lobe_weight);
+        if (before)
+            lobe_ahead = max(lobe_ahead, max_component(lobe_before[p]));
+    }
+    // Where the lobe's in-scatter can't reach f32's rounding of the air's own, the march leaves
+    // its sum out. Per unit fog extinction its in-scatter is at most the lobe's share times the
+    // lobe's peak, times e^depth for the light the lobe keeps on its way over its depth `depth`
+    // on both legs, which the march sees through the transmittance without the lobe; the air's
+    // is at least its Rayleigh scattering times that phase function's least.
+    float lobe_peak = lobe_share * hg_phase(droplets.x, 1.0);
+    float rayleigh_floor = 0x1p-24 * min(min(a.rayleigh.x, a.rayleigh.y), a.rayleigh.z) * rayleigh_phase(0.0);
+    // The fog's optical depth from t0.
+    float fog_along = 0.0;
     for (uint i = 0; i < steps; ++i)
     {
         float2 s = step_at(t0, t1, i, steps);
         float h = atmosphere_altitude_along(a, h0, mu, s.x);
         float r = a.planet_radius + h;
-        Medium m = medium(a, g, h, fog);
-        float3 scattering = m.rayleigh + m.aerosol + m.fog;
-        float3 source = float3(0.0);
+        float3 densities = atmosphere_densities(a, h);
+        float f = fog ? atmosphere_fog_extinction(a, h) : 0.0;
+        float3 source[MAX_GROUP_PASSES];
+        float3 lobe_source[MAX_GROUP_PASSES];
+        float3 lobe_ahead_source[MAX_GROUP_PASSES];
+        for (uint p = 0; p < passes; ++p)
+        {
+            source[p] = float3(0.0);
+            lobe_source[p] = float3(0.0);
+            lobe_ahead_source[p] = float3(0.0);
+        }
         for (uint l = 0; l < lights.count; ++l)
         {
             float3 ld = lights.direction[l];
-            float mu_l = (r0 * dot(up, ld) + s.x * dot(dir, ld)) / r;
-            float3 single = m.rayleigh * phase[l].x + m.aerosol * phase[l].y + m.fog * phase[l].z;
-            float3 lit = atmosphere_light_transmittance(a, h, mu_l, pass) * single;
-            if (multiple > 0.0)
-                lit += multiple * scattering
-                    * atmosphere_lut_multiple_scattering(a, h, mu_l, (r0 * mu + s.x) / r, dot(dir, ld), pass);
-            source += lights.groups[l] * lit;
+            float c = dot(dir, ld);
+            float mu_l = (r0 * dot(up, ld) + s.x * c) / r;
+            bool shadowed = atmosphere_ray_hits_ground(a, h, mu_l);
+            float2 uv = atmosphere_transmittance_uv(a, h, mu_l);
+            float fog_depth = fog && !shadowed ? atmosphere_fog_optical_depth_to_space(a, h, mu_l) : 0.0;
+            float4 unit = multiple > 0.0 ? atmosphere_ms_unit(a, h, mu_l, (r0 * mu + s.x) / r, c) : float4(0.0);
+            float depth = (fog_depth + fog_along + 0.5 * f * s.y) * lobe_share + lobe_ahead;
+            bool lobe_here = lobe_share > 0.0 && log(f * lobe_peak) + depth > log(rayleigh_floor * densities.x);
+            FogLobe terms = {};
+            if (lobe_here)
+                terms = atmosphere_fog_lobe_terms(droplets.x, c);
+            for (uint p = 0; p < passes; ++p)
+            {
+                AtmosphereGroups g = a.groups[first + p];
+                Medium m = medium_of(g, densities, f);
+                float3 e = light_groups(lights, l, g);
+                float3 clear = shadowed ? float3(0.0) : atmosphere_lut_transmittance_at(a, uv, first + p);
+                float3 lit = clear * exp(-fog_depth) * (m.rayleigh * phase[l].x + m.aerosol * phase[l].y + m.fog * phase[l].z);
+                if (multiple > 0.0)
+                    lit += multiple * (m.rayleigh + m.aerosol + m.fog) * atmosphere_lut_multiple_scattering_at(a, unit, first + p);
+                source[p] += e * lit;
+                if (lobe_here)
+                {
+                    float3 share = g.fog_albedo.xyz * lobe_weight;
+                    float3 sigma = m.fog * lobe_weight;
+                    float3 kept = e * clear * exp(-fog_depth * (1.0 - share)) * sigma;
+                    float3 depth_here = fog_depth * share + lobe_depth[p] + 0.5 * sigma * s.y;
+                    lobe_source[p] += kept * atmosphere_fog_lobe_sum(terms, depth_here);
+                    if (before)
+                        lobe_ahead_source[p] += kept * atmosphere_fog_lobe_sum(terms, depth_here + lobe_before[p]);
+                }
+            }
         }
-        radiance += transmittance * source * step_integral(m.extinction, s.y);
-        transmittance *= exp(-m.extinction * s.y);
+        for (uint p = 0; p < passes; ++p)
+        {
+            Medium m = medium_of(a.groups[first + p], densities, f);
+            radiance[p] += transmittance[p] * source[p] * step_integral(m.extinction, s.y);
+            // The lobe's light reaches t0 through the transmittance without the lobe's scattering,
+            // the transmittance times e^lobe_depth, up to LOBE_VIEW_DEPTH.
+            if (lobe_share > 0.0)
+            {
+                float3 sigma = m.fog * lobe_weight;
+                float3 kept = exp(min(lobe_depth[p], LOBE_VIEW_DEPTH)) * lobe_source[p];
+                float3 lobe_step = transmittance[p] * step_integral(m.extinction - sigma, s.y);
+                radiance[p] += kept * lobe_step;
+                if (before)
+                    lobe_more[p] += lobe_step * (exp(min(lobe_depth[p] + lobe_before[p], LOBE_VIEW_DEPTH)) * lobe_ahead_source[p] - kept);
+                lobe_depth[p] += sigma * s.y;
+            }
+            transmittance[p] *= exp(-m.extinction * s.y);
+        }
+        fog_along += f * s.y;
     }
     if (ground)
     {
         float3 n = (r0 * up + t1 * dir) / a.planet_radius;
-        float3 lit = float3(0.0);
         for (uint l = 0; l < lights.count; ++l)
         {
             float mu_l = dot(n, lights.direction[l]);
-            float3 e = atmosphere_light_transmittance(a, 0.0, mu_l, pass) * max(mu_l, 0.0);
-            if (multiple > 0.0)
-                e += multiple * ground_sky_irradiance(a, pass, mu_l);
-            lit += lights.groups[l] * e;
+            for (uint p = 0; p < passes; ++p)
+            {
+                AtmosphereGroups g = a.groups[first + p];
+                float3 e = atmosphere_light_transmittance(a, 0.0, mu_l, first + p) * max(mu_l, 0.0);
+                if (multiple > 0.0)
+                    e += multiple * ground_sky_irradiance(a, first + p, mu_l);
+                radiance[p] += transmittance[p] * g.ground_albedo.xyz * INV_PI * light_groups(lights, l, g) * e;
+            }
         }
-        radiance += transmittance * g.ground_albedo.xyz * INV_PI * lit;
     }
-    return radiance;
 }
 
 [shader("compute")]
@@ -318,7 +418,7 @@ float3 ms_light_transmittance(AtmosphereGpu* a, AtmosphereGroups g, float h, flo
 void ms_ray_pair(AtmosphereGpu* a, float h, float mu, out uint x0, out float tx)
 {
     uint half = MS_RAY_ZENITHS / 2;
-    float v = atmosphere_ms_view_unit(a, h, mu);
+    float v = atmosphere_ms_ray_unit(a, h, mu);
     bool below = v >= 0.5;
     float x = v * float(MS_RAY_ZENITHS - 1) - (below ? float(half) : 0.0);
     x = clamp(x, 0.0, float(half - 1));
@@ -345,7 +445,7 @@ void ms_ray_texel(AtmosphereGpu* a, uint3 id, uint azimuths, out float h, out fl
 {
     h = atmosphere_ms_altitude(a, float(id.z) / float(MS_ALTITUDES - 1));
     mu_light = atmosphere_ms_light(float(id.y) / float(MS_LIGHT_ZENITHS - 1));
-    mu = atmosphere_ms_view(a, h, float(id.x % MS_RAY_ZENITHS) / float(MS_RAY_ZENITHS - 1));
+    mu = atmosphere_ms_ray(a, h, float(id.x % MS_RAY_ZENITHS) / float(MS_RAY_ZENITHS - 1));
     phi = PI * float(id.x / MS_RAY_ZENITHS) / float(azimuths - 1);
 }
 
@@ -390,7 +490,7 @@ void ms_kernel(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
     float4 droplets = fog_phase_parameters(a.fog_diameter);
     for (uint k = lane; k < MS_KERNEL_ZENITHS; k += MS_KERNEL_LANES)
     {
-        float2 theta = atmosphere_ms_view_angle(a, h, (float(k) + 0.5) / float(MS_KERNEL_ZENITHS));
+        float2 theta = atmosphere_ms_ray_angle(a, h, (float(k) + 0.5) / float(MS_KERNEL_ZENITHS));
         float mu = cos(theta.x);
         float s = sin(theta.x);
         // The band's solid angle per azimuth cell, both sides of the view's plane.
@@ -517,6 +617,11 @@ void ms_single(uint3 id: SV_DispatchThreadID)
     }
 }
 
+// The (view, mode) items and the view and azimuth texels each lane of `ms_scatter` takes; the
+// in-scatter's modes reuse `ms_hat`, which holds the radiance's for at least as many ray texels.
+static const uint MS_MODE_SPAN = (MS_VIEW_ZENITHS * MS_MODES + WORKGROUP_LANES - 1) / WORKGROUP_LANES;
+static const uint MS_TEXEL_SPAN = (MS_VIEW_ZENITHS * MS_AZIMUTHS + WORKGROUP_LANES - 1) / WORKGROUP_LANES;
+
 // The radiance's cosine modes, then the in-scatter's.
 static groupshared float3 ms_hat[MS_RAY_ZENITHS * MS_MODES * MAX_GROUP_PASSES];
 static groupshared float ms_cos_in[MS_MODES * MS_AZIMUTHS];
@@ -589,13 +694,15 @@ void ms_scatter(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
 
     float h = atmosphere_ms_altitude(a, float(altitude) / float(MS_ALTITUDES - 1));
     float4 droplets = fog_phase_parameters(a.fog_diameter);
-    float3 jm[MAX_GROUP_PASSES];
-    for (uint p = 0; p < MAX_GROUP_PASSES; ++p)
-        jm[p] = float3(0.0);
+    float3 jm[MS_MODE_SPAN][MAX_GROUP_PASSES];
+    for (uint i = 0; i < MS_MODE_SPAN; ++i)
     {
-        uint view = lane / MS_MODES;
-        uint m = lane % MS_MODES;
-        if (m < azimuths)
+        for (uint p = 0; p < MAX_GROUP_PASSES; ++p)
+            jm[i][p] = float3(0.0);
+        uint item = lane + i * WORKGROUP_LANES;
+        uint view = item / MS_MODES;
+        uint m = item % MS_MODES;
+        if (view < MS_VIEW_ZENITHS && m < azimuths)
         {
             float3 rayleigh[MAX_GROUP_PASSES];
             float3 aerosol[MAX_GROUP_PASSES];
@@ -624,7 +731,7 @@ void ms_scatter(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
                 Medium md = ms_medium(a.groups[p], d, droplets);
                 float3 scattering = md.rayleigh + md.aerosol + md.fog;
                 float3 j = (md.rayleigh * rayleigh[p] + md.aerosol * aerosol[p] + md.fog * fog[p]) / scattering;
-                jm[p] = select(scattering > 0.0, j, float3(0.0));
+                jm[i][p] = select(scattering > 0.0, j, float3(0.0));
             }
         }
     }
@@ -641,48 +748,75 @@ void ms_scatter(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
         sum[at] = float4(root.order == 2 ? e : sum[at].xyz + e, 0.0);
     }
     GroupMemoryBarrierWithGroupSync();
-    for (uint p = 0; p < MAX_GROUP_PASSES; ++p)
-        ms_hat[lane * MAX_GROUP_PASSES + p] = jm[p];
+    for (uint i = 0; i < MS_MODE_SPAN; ++i)
+        if (lane + i * WORKGROUP_LANES < MS_VIEW_ZENITHS * MS_MODES)
+            for (uint p = 0; p < MAX_GROUP_PASSES; ++p)
+                ms_hat[(lane + i * WORKGROUP_LANES) * MAX_GROUP_PASSES + p] = jm[i][p];
     GroupMemoryBarrierWithGroupSync();
 
-    uint view = lane % MS_VIEW_ZENITHS;
-    uint azimuth = lane / MS_VIEW_ZENITHS;
-    uint4 index = uint4(altitude, light, view, azimuth);
+    // The in-scatter at the table's texels, a few per lane.
+    uint4 index[MS_TEXEL_SPAN];
+    bool held[MS_TEXEL_SPAN];
+    float3 jt[MS_TEXEL_SPAN][MAX_GROUP_PASSES];
+    for (uint i = 0; i < MS_TEXEL_SPAN; ++i)
+    {
+        uint texel = lane + i * WORKGROUP_LANES;
+        held[i] = texel < MS_VIEW_ZENITHS * MS_AZIMUTHS;
+        uint view = texel % MS_VIEW_ZENITHS;
+        uint azimuth = min(texel / MS_VIEW_ZENITHS, MS_AZIMUTHS - 1);
+        index[i] = uint4(altitude, light, view, azimuth);
+        for (uint p = 0; p < MAX_GROUP_PASSES; ++p)
+        {
+            float3 j = float3(0.0);
+            for (uint m = 0; m < MS_MODES; ++m)
+                j += ms_hat[(view * MS_MODES + m) * MAX_GROUP_PASSES + p] * ms_cos_out[m * MS_AZIMUTHS + azimuth];
+            // A cut series rings below 0 where the radiance falls fast.
+            jt[i][p] = held[i] ? max(j, 0.0) : float3(0.0);
+        }
+    }
     RWTexture3D<float4> march = root.output.get<RWTexture3D<float4>>();
-    float3 total[MAX_GROUP_PASSES];
+    float3 total[MS_TEXEL_SPAN][MAX_GROUP_PASSES];
     for (uint p = 0; p < MAX_GROUP_PASSES; ++p)
     {
-        total[p] = float3(0.0);
-        float3 j = float3(0.0);
-        for (uint m = 0; m < MS_MODES; ++m)
-            j += ms_hat[(view * MS_MODES + m) * MAX_GROUP_PASSES + p] * ms_cos_out[m * MS_AZIMUTHS + azimuth];
-        // A cut series rings below 0 where the radiance falls fast.
-        j = max(j, 0.0);
-        uint3 texel = atmosphere_ms_texel(index, MS_VIEW_ZENITHS, p);
-        uint at = ms_sum_index(index, p);
-        float3 sum = root.order == 2 ? float3(0.0) : root.sum[at].xyz;
+        float3 lane_sum = float3(0.0);
+        for (uint i = 0; i < MS_TEXEL_SPAN; ++i)
+            lane_sum += jt[i][p];
         uint slice = (altitude * MS_LIGHT_ZENITHS + light) * MAX_GROUP_PASSES + p;
         if (root.order == root.last - 1)
         {
-            float3 s = workgroup_sum(j, lane, p);
+            float3 s = workgroup_sum(lane_sum, lane, p);
             if (lane == 0)
                 root.aux[MS_AUX_SLICES + slice] = float4(s, 0.0);
         }
-        if (root.order < root.last)
+        float3 ratio = float3(0.0);
+        if (root.order == root.last)
         {
-            march[texel] = float4(atmosphere_ms_encode(j), 0.0);
-            root.sum[at] = float4(sum + j, 0.0);
-            continue;
+            float3 last = workgroup_sum(lane_sum, lane, p);
+            float3 before = root.aux[MS_AUX_SLICES + slice].xyz;
+            ratio = select(before > 0.0, last / before, float3(0.0));
         }
-        float3 last = workgroup_sum(j, lane, p);
-        float3 before = root.aux[MS_AUX_SLICES + slice].xyz;
-        float3 ratio = select(before > 0.0, last / before, float3(0.0));
-        total[p] = sum + j * (1.0 + select(ratio > 0.0 && ratio < 1.0, ratio / (1.0 - ratio), float3(0.0)));
-        if (a.fog_density > 0.0)
-            march[texel] = float4(atmosphere_ms_encode(total[p]), 0.0);
+        for (uint i = 0; i < MS_TEXEL_SPAN; ++i)
+        {
+            if (!held[i])
+                continue;
+            uint3 texel = atmosphere_ms_texel(index[i], MS_VIEW_ZENITHS, p);
+            uint at = ms_sum_index(index[i], p);
+            float3 sum = root.order == 2 ? float3(0.0) : root.sum[at].xyz;
+            if (root.order < root.last)
+            {
+                march[texel] = float4(atmosphere_ms_encode(jt[i][p]), 0.0);
+                root.sum[at] = float4(sum + jt[i][p], 0.0);
+                continue;
+            }
+            total[i][p] = sum + jt[i][p] * (1.0 + select(ratio > 0.0 && ratio < 1.0, ratio / (1.0 - ratio), float3(0.0)));
+            if (a.fog_density > 0.0)
+                march[texel] = float4(atmosphere_ms_encode(total[i][p]), 0.0);
+        }
     }
     if (root.order == root.last && a.fog_density <= 0.0)
-        ms_write_table(a, index, total);
+        for (uint i = 0; i < MS_TEXEL_SPAN; ++i)
+            if (held[i])
+                ms_write_table(a, index[i], total[i]);
 }
 
 // The sky irradiance on the ground under a light at zenith cosine mu_light from `sky`, per
@@ -837,12 +971,17 @@ void ground_irradiance(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
     orthonormal_basis(up, x, y);
     Lights lights;
     lights.count = 1;
+    lights.unit = true;
     lights.direction[0] = sqrt(max(1.0 - mu_light * mu_light, 0.0)) * x + mu_light * up;
-    lights.groups[0] = float3(1.0);
     float3 dir = fibonacci(lane, true, x, y, up);
-    float3 l = march(a, group.y, 0.0, dir, 0.0, atmosphere_distance_to_top(a, 0.0, dot(dir, up)), false,
-                     GROUND_STEPS, lights, 1.0, false);
-    float3 e = workgroup_sum(l * dot(dir, up), lane, 0) * (TWO_PI / float(DIRECTIONS));
+    float3 none[MAX_GROUP_PASSES] = {};
+    float3 l[MAX_GROUP_PASSES];
+    float3 passed[MAX_GROUP_PASSES];
+    float3 lobe_depth[MAX_GROUP_PASSES];
+    float3 lobe_more[MAX_GROUP_PASSES];
+    march(a, 0.0, dir, 0.0, atmosphere_distance_to_top(a, 0.0, dot(dir, up)), false, GROUND_STEPS, lights,
+          1.0, false, group.y, 1, false, none, l, passed, lobe_depth, lobe_more);
+    float3 e = workgroup_sum(l[0] * dot(dir, up), lane, 0) * (TWO_PI / float(DIRECTIONS));
     float depth = ms_fog_depth(a, 0.0, mu_light);
     e += atmosphere_lut_transmittance(a, 0.0, mu_light, group.y) * max(mu_light, 0.0)
         * (exp(-depth * ms_fog_keep(a.groups[group.y], fog_phase_parameters(a.fog_diameter))) - exp(-depth));
@@ -933,7 +1072,8 @@ void fold(uint3 id: SV_DispatchThreadID)
 }
 
 // One sky-view LUT: from `near_range` along each texel's direction, the folded lights'
-// in-scatter, and the virtual ground below the horizon.
+// in-scatter, and the virtual ground below the horizon (SKY_VIEW_FAR); and the same seen
+// through the medium from the eye to `near_range` (SKY_VIEW_EYE).
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void sky_view(uint3 id: SV_DispatchThreadID)
@@ -951,23 +1091,38 @@ void sky_view(uint3 id: SV_DispatchThreadID)
     float start = min(scene.near_range, end);
 
     FoldGpu* f = a.fold;
-    float3 color[MAX_FOLDED_LIGHTS];
     Lights lights;
     lights.count = f.folded_count;
+    lights.unit = false;
     for (uint l = 0; l < lights.count; ++l)
     {
         uint slot = f.folded[l];
         lights.direction[l] = normalize(scene.lights[a.candidates[slot]].direction);
-        color[l] = f.illuminance[slot].rgb * f.weight[slot];
+        lights.color[l] = f.illuminance[slot].rgb * f.weight[slot];
     }
+    // From the eye to `near_range` first, whose lobe depth the light the lobe keeps on its way
+    // from past it carries on to the eye.
+    float3 none[MAX_GROUP_PASSES] = {};
+    float3 near[MAX_GROUP_PASSES];
+    float3 near_passed[MAX_GROUP_PASSES];
+    float3 near_lobe[MAX_GROUP_PASSES];
+    float3 unused[MAX_GROUP_PASSES];
+    march(a, h0, dir, 0.0, start, false, SKY_VIEW_NEAR_STEPS, lights, a.multiple_scattering_scale, true, 0,
+          a.group_passes, false, none, near, near_passed, near_lobe, unused);
+    float3 far[MAX_GROUP_PASSES];
+    float3 passed[MAX_GROUP_PASSES];
+    float3 far_lobe[MAX_GROUP_PASSES];
+    float3 more[MAX_GROUP_PASSES];
+    march(a, h0, dir, start, end, ground, SKY_VIEW_STEPS, lights, a.multiple_scattering_scale, true, 0,
+          a.group_passes, true, near_lobe, far, passed, far_lobe, more);
     float3 rgb = float3(0.0);
+    float3 eye = float3(0.0);
     for (uint p = 0; p < a.group_passes; ++p)
     {
-        AtmosphereGroups g = a.groups[p];
-        for (uint l = 0; l < lights.count; ++l)
-            lights.groups[l] = atmosphere_light_groups(g, color[l]);
-        rgb += atmosphere_rec2020(g, march(a, p, h0, dir, start, end, ground, SKY_VIEW_STEPS, lights,
-                                           a.multiple_scattering_scale));
+        rgb += atmosphere_rec2020(a.groups[p], far[p]);
+        eye += atmosphere_rec2020(a.groups[p], near[p] + near_passed[p] * (far[p] + more[p]));
     }
-    root.output.get<RWTexture2D<float4>>()[id.xy] = float4(rgb, 1.0);
+    RWTexture2DArray<float4> lut = root.output.get<RWTexture2DArray<float4>>();
+    lut[uint3(id.xy, SKY_VIEW_FAR)] = float4(rgb, 1.0);
+    lut[uint3(id.xy, SKY_VIEW_EYE)] = float4(eye, 1.0);
 }

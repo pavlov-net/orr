@@ -978,14 +978,15 @@ public void froxel_accumulate<M : IMedium>(FroxelRoot r, uint k)
 }
 
 // Light point `x` of a froxel, sampled as `m`, emits and scatters back along unit `dir` per
-// m: its emission, its isotropic `incident` light and the shadowed `lights` by the visibility in
-// `incident.a` and `more`. The incident light holds the environment's, which carries the light
-// the linked medium scatters more than once, so the medium's own multiple scattering is not
-// added. Its smoke's `smoke_scatter` takes the same light with a Henyey-Greenstein response of
-// `anisotropy`. A froxel of a dielectric's interior `im` takes `im`'s phase function and its
-// shadowed lights through their distance in it (`depth` over their visibility) along the
-// direction a plane stack of `stacks` bends them to in its IOR `ior`.
-float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumPoint m, float3 smoke_scatter, float anisotropy, float4 incident, float4 more, float3 x, float3 dir, bool in_interior = false, InteriorMedium im = InteriorMedium(), float4 depth = float4(0.0), float4 stacks[MAX_FROXEL_SHADOWED_LIGHTS] = {}, float ior = AMBIENT_IOR)
+// m, toward a view that runs from `view_origin`: its emission, its isotropic `incident` light
+// and the shadowed `lights` by the visibility in `incident.a` and `more`. The incident light
+// holds the environment's, which carries the light the linked medium scatters more than once, so
+// the medium's own multiple scattering is not added. Its smoke's `smoke_scatter` takes the same
+// light with a Henyey-Greenstein response of `anisotropy`. A froxel of a dielectric's interior
+// `im` takes `im`'s phase function and its shadowed lights through their distance in it (`depth`
+// over their visibility) along the direction a plane stack of `stacks` bends them to in its IOR
+// `ior`.
+float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumPoint m, float3 smoke_scatter, float anisotropy, float4 incident, float4 more, float3 x, float3 dir, float3 view_origin, bool in_interior = false, InteriorMedium im = InteriorMedium(), float4 depth = float4(0.0), float4 stacks[MAX_FROXEL_SHADOWED_LIGHTS] = {}, float ior = AMBIENT_IOR)
 {
     uint64_t data = set.scene.medium;
     float3 medium_light = float3(0.0);
@@ -1001,9 +1002,10 @@ float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumP
             if (in_interior && stacks[j].w > 0.0 && !stack_direction(to_light, stacks[j].xyz, ior, arrives))
                 continue;
             float cos_theta = dot(arrives, dir);
-            float3 arriving = directional_illuminance(set, id) * vis * beer(im.sigma_t, depth[j] / vis) * M.transmittance(data, x, to_light, positive_infinity());
-            medium_light += arriving * (in_interior ? float3(hg_phase(im.anisotropy, cos_theta)) : M.phase(data, m, cos_theta));
-            smoke_light += arriving * hg_phase(anisotropy, cos_theta);
+            float3 arriving = directional_illuminance(set, id) * vis * beer(im.sigma_t, depth[j] / vis);
+            float3 through = in_interior || any(smoke_scatter > 0.0) ? M.transmittance(data, x, to_light, positive_infinity()) : float3(0.0);
+            medium_light += arriving * (in_interior ? through * hg_phase(im.anisotropy, cos_theta) : M.light_scattering(data, m, x, to_light, dir, view_origin));
+            smoke_light += arriving * through * hg_phase(anisotropy, cos_theta);
         }
     }
     return m.emission + m.sigma_s * (incident.rgb + medium_light) + smoke_scatter * (incident.rgb + smoke_light);
@@ -1097,12 +1099,12 @@ public float3 froxel_segment_inscatter<M : IMedium>(FroxelVolume* volume, ViewCo
             m = froxel_point(fm, volume.chromatic != 0);
             float4 incident = volume.incident.get<RWTexture3D<float4>>()[f];
             float4 more = lights.count > 1 ? volume.visibility.get<RWTexture3D<float4>>()[f] : float4(1.0);
-            source = any(m.sigma_s > 0.0) ? froxel_source<M>(set, lights, m, float3(0.0), 0.0, incident, more, x, dir) : m.emission;
+            source = any(m.sigma_s > 0.0) ? froxel_source<M>(set, lights, m, float3(0.0), 0.0, incident, more, x, dir, origin) : m.emission;
         }
         else
         {
             m = M.sample(data, x);
-            source = medium_source<M>(set, m, x, dir);
+            source = medium_source<M>(set, m, x, dir, origin);
         }
         march_step(m.sigma_t, source * cover.passed(s), dt, inscatter, transmittance);
     }
@@ -1159,7 +1161,7 @@ public void froxel_integrate<M : IMedium>(FroxelRoot r, uint2 column)
             float4 incident = r.incident.get<RWTexture3D<float4>>()[f];
             float4 more = lights.count > 1 ? r.visibility.get<RWTexture3D<float4>>()[f] : float4(1.0);
             float4 depth = inside && r.eye_depth.index != IMAGE_NONE ? r.eye_depth.get<RWTexture3D<float4>>()[f] : float4(0.0);
-            source = froxel_source<M>(set, lights, m, smoke_scatter, r.smoke_anisotropy, incident, more, x, dir, inside, im, depth, stacks, interior_ior(r.scene, eye_column.interior.innermost()));
+            source = froxel_source<M>(set, lights, m, smoke_scatter, r.smoke_anisotropy, incident, more, x, dir, eye, inside, im, depth, stacks, interior_ior(r.scene, eye_column.interior.innermost()));
         }
         march_step(m.sigma_t, source, dt, inscatter, transmittance);
         r.integrated.get<RWTexture3D<float4>>()[f] = float4(apply_hdr_ceiling(inscatter * pre_exposure), luminance_rec2020(transmittance));
@@ -1340,7 +1342,7 @@ public void aerial_build<M : IMedium>(FroxelRoot r, uint2 column)
             float3 x = start + dir * (d + 0.5 * dt);
             MediumPoint m = M.sample(data, x);
             float3 through = medium_transmittance<M>(data, start, dir, d);
-            march_step(m.sigma_t, medium_source<M>(r.set, m, x, dir), dt, inscatter, through);
+            march_step(m.sigma_t, medium_source<M>(r.set, m, x, dir, start), dt, inscatter, through);
         }
         float3 transmittance = medium_transmittance<M>(data, start, dir, d1);
         uint3 texel = uint3(column, k);

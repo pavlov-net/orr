@@ -76,8 +76,7 @@ void multiple_scattering_texels(uint3 id: SV_DispatchThreadID)
 static groupshared float3 reference_sums[64];
 
 // Per input direction, a workgroup's mean of `count` x 64 draws of `atmosphere_reference_sky` from
-// an eye at altitude `light.w`, the draws of batch `layer`, half of them integrating the view ray's
-// single scattering.
+// an eye at altitude `light.w`, the draws of batch `layer`.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void reference_sky(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
@@ -86,7 +85,7 @@ void reference_sky(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
     float3 dir = normalize(root.input[group.x].xyz);
     float3 sum = float3(0.0);
     for (uint k = 0; k < root.count; ++k)
-        sum += atmosphere_reference_sky(a, root.light.w, dir, pcg3d(uint3(group.x, lane, root.layer * root.count + k)).x, (k & 1) == 0);
+        sum += atmosphere_reference_sky(a, root.light.w, dir, pcg3d(uint3(group.x, lane, root.layer * root.count + k)).x);
     reference_sums[lane] = sum;
     GroupMemoryBarrierWithGroupSync();
     for (uint w = 32; w > 0; w >>= 1)
@@ -144,15 +143,15 @@ void transmittance_lut(uint3 id: SV_DispatchThreadID)
             .Load(int4(id.x % size.x, id.x / size.x, root.layer, 0));
 }
 
-// Every texel of sky-view LUT `layer`, row by row.
+// Every texel of sky-view LUT `layer`'s view from `near_range` on, row by row.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void sky_view_lut(uint3 id: SV_DispatchThreadID)
 {
     uint2 size = SKY_VIEW_SIZE;
     if (id.x < size.x * size.y)
-        root.output[id.x] = root.atmosphere.sky_view[root.layer].get<Texture2D<float4>>()
-            .Load(int3(id.x % size.x, id.x / size.x, 0));
+        root.output[id.x] = root.atmosphere.sky_view[root.layer].get<Texture2DArray<float4>>()
+            .Load(int4(id.x % size.x, id.x / size.x, SKY_VIEW_FAR, 0));
 }
 
 static groupshared float3 sums[64];
@@ -264,6 +263,11 @@ struct SkyTransmittance : IMedium
     {
         AtmosphereGpu* a = (AtmosphereGpu*)data;
         return atmosphere_transmittance_to_space(a, atmosphere_altitude(a, origin), dot(dir, a.up.xyz));
+    }
+
+    static float3 light_scattering(uint64_t data, MediumPoint m, float3 p_render, float3 to_light, float3 dir, float3 view_origin)
+    {
+        return float3(0.0);
     }
 
     static float distance(uint64_t data, float3 origin, float3 dir, float t_max, uint channel, float depth)

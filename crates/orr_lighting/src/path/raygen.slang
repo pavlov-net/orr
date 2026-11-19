@@ -233,7 +233,7 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior)
         float3 baked = environment_map(r.set.environment, dir);
         Sampler rng = path_sampler(r, item_pixel(r, r.slice_base + slot));
         rng.dimension = flags >> HOT_DIMENSION_SHIFT;
-        passed *= select(baked > 0.0, sky_call(dir, rng.next_bits() ^ SKY_JOB_STREAM, false) / baked, float3(0.0));
+        passed *= select(baked > 0.0, sky_call(dir, rng.next_bits() ^ SKY_JOB_STREAM) / baked, float3(0.0));
     }
     path_shadow_add(r, slot, passed);
 }

@@ -19,9 +19,13 @@ public interface IEnvironment
     static float3 radiance(uint64_t data, float3 dir, float3 eye_render);
     // What the accumulation reference averages for `radiance`, a draw from random numbers seeded
     // by `seed` whose mean is the environment's exact radiance: `radiance` itself where that is
-    // exact, a draw that path traces it where `radiance` approximates it. Where the `camera` sees
-    // along `dir` the draw may spend more to vary less.
-    static float3 reference_radiance(uint64_t data, float3 dir, float3 eye_render, uint seed, bool camera);
+    // exact, a draw that path traces it where `radiance` approximates it.
+    static float3 reference_radiance(uint64_t data, float3 dir, float3 eye_render, uint seed);
+    // What lighting's bake holds along `dir` from the scene focus `focus`, the light a ray
+    // leaving the focus meets: `radiance`, with whatever medium of its own the environment holds
+    // within the scene's `near_range` in front of it, which the camera's view takes from the
+    // froxels instead.
+    static float3 baked_radiance(uint64_t data, float3 dir, float3 focus);
 }
 
 float copy_sign(float magnitude, float sign)
@@ -116,9 +120,14 @@ public struct EnvironmentMap : IEnvironment
         return c * m.intensity;
     }
 
-    public static float3 reference_radiance(uint64_t data, float3 dir, float3 eye_render, uint seed, bool camera)
+    public static float3 reference_radiance(uint64_t data, float3 dir, float3 eye_render, uint seed)
     {
         return radiance(data, dir, eye_render);
+    }
+
+    public static float3 baked_radiance(uint64_t data, float3 dir, float3 focus)
+    {
+        return radiance(data, dir, focus);
     }
 }
 
@@ -219,7 +228,7 @@ public float3 environment_sample(EnvironmentGpu* e, float3 u, out float pdf)
     return equal_area_to_dir((float2(t) + u.yz) / float(n));
 }
 
-// The radiance a texel of the baked map holds: the mean of `E.radiance` at 2 x 2 points,
+// The radiance a texel of the baked map holds: the mean of `E.baked_radiance` at 2 x 2 points,
 // non-finite values dropped and the result capped to what RGBA16F holds.
 public float3 bake_texel<E : IEnvironment>(uint64_t data, float3 focus, uint2 texel, uint n)
 {
@@ -227,7 +236,7 @@ public float3 bake_texel<E : IEnvironment>(uint64_t data, float3 focus, uint2 te
     for (uint k = 0; k < 4; k++)
     {
         float2 st = (float2(texel) + 0.25 + 0.5 * float2(k & 1, k >> 1)) / float(n);
-        float3 c = E.radiance(data, equal_area_to_dir(st), focus);
+        float3 c = E.baked_radiance(data, equal_area_to_dir(st), focus);
         if (all(isfinite(c)))
             sum += max(c, 0.0);
     }
