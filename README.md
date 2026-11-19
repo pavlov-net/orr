@@ -202,7 +202,12 @@ exactly. In Tracy a GPU zone's CPU-side times are when orr read its result, not
 when it was recorded. Metal has no GPU zones. `orr_cook` has a `tracy` feature of its own.
 
 The examples' `tracy` feature turns on orr's and the cook's, with the Tracy client's default
-features. tracy-client's `only-localhost` keeps the client off the network:
+features. The client that the pinned `tracy-client-sys` bundles speaks the protocol of one Tracy
+release only, so capture with that release's tools. The release is listed against the
+`tracy-client-sys` minor version in the version support table of
+[tracy-client's README](https://crates.io/crates/tracy-client), and
+`tracy/common/TracyVersion.hpp` in the `tracy-client-sys` source gives it exactly.
+tracy-client's `only-localhost` keeps the client off the network:
 
 ```sh
 cargo run --profile profiling -p orr_examples --features tracy,tracy-client/only-localhost --example bench -- --headless
@@ -210,8 +215,8 @@ tracy-capture -a 127.0.0.1 -o bench.tracy
 ```
 
 A program built on orr turns on `orr`'s `tracy` feature and links the same Tracy client: it
-depends on `tracy-client` `=0.19.0` and `tracy-client-sys` `=0.30.1`, the versions orr pins,
-which speak the protocol of Tracy 0.14.1, so capture with that release's tools. orr asks only for
+depends on the `tracy-client` and `tracy-client-sys` versions orr pins exactly in its root
+`Cargo.toml`, so it captures with the same Tracy release's tools. orr asks only for
 the client's `enable` feature; the program chooses the rest (`only-localhost`, `ondemand`,
 sampling and so on) on its own dependency. orr never starts the client: it runs from process start
 by default, and under `manual-lifetime` orr records nothing until the program starts it. The
