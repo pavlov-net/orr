@@ -936,7 +936,7 @@ pub(crate) fn import(
         clips: settings.clips.clone(),
         instances,
         groups: Vec::new(),
-        partitions: vec![Vec::new()],
+        partitions: vec![crate::import::ScenePartition::default()],
         files,
         warnings,
     })

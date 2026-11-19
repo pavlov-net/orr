@@ -18,7 +18,7 @@ use orr_math::{DQuat, DVec3, Quat, Vec3};
 use crate::blob::{put_table, read, span, table, text};
 use crate::{AssetId, Error, Result, Span};
 
-pub const SCHEMA: u16 = 3;
+pub const SCHEMA: u16 = 4;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
@@ -109,27 +109,32 @@ pub struct AttributeRecord {
 const LIGHT_DIRECTIONAL: u32 = 1;
 const LIGHT_SPHERE: u32 = 2;
 const LIGHT_RECT: u32 = 3;
+const LIGHT_POINT: u32 = 4;
 
-/// `LightRecord::flags`: a sphere's cone is set.
-const LIGHT_CONE: u32 = 1;
+/// `LightRecord::flags`: the light's shaping is set.
+const LIGHT_SHAPED: u32 = 1;
+/// `LightRecord::flags`: surfaces cast no shadow from the light.
+const LIGHT_UNSHADOWED: u32 = 2;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct LightRecord {
-    /// Sphere and rect: the center.
+    /// Point, sphere and rect: the center.
     pub position: [f64; 3],
     pub kind: u32,
     /// Sphere: the radius; directional: the angular radius.
     pub radius: f32,
-    /// Directional: illuminance; sphere: intensity; rect: luminance.
+    /// Directional: illuminance; point and sphere: intensity; rect: luminance.
     pub color: [f32; 3],
-    pub cone_inner: f32,
-    /// Directional: toward the light; sphere: the cone's axis.
+    pub cone_angle: f32,
+    /// Directional: toward the light; shaped: the shaping's axis.
     pub direction: [f32; 3],
-    pub cone_outer: f32,
+    pub cone_softness: f32,
     pub edge_x: [f32; 3],
     pub flags: u32,
     pub edge_y: [f32; 3],
+    pub focus: f32,
+    pub focus_tint: [f32; 3],
     pub _pad: u32,
 }
 
@@ -398,7 +403,8 @@ pub struct Group {
     pub attributes: Vec<Attribute>,
 }
 
-/// A light, in world space (meters, Y up), colors linear Rec.709.
+/// A light, in world space (meters, Y up), colors linear Rec.709, as `orr_scene`'s `Light`
+/// takes it. Surfaces cast no shadow from a point, sphere or rect light without `shadows`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LightSource {
     Directional {
@@ -408,12 +414,20 @@ pub enum LightSource {
         /// Radians.
         angular_radius: f32,
     },
+    Point {
+        position: DVec3,
+        /// Candela.
+        intensity: Vec3,
+        shaping: Option<ShapingSource>,
+        shadows: bool,
+    },
     Sphere {
         position: DVec3,
         radius: f32,
         /// Candela.
         intensity: Vec3,
-        cone: Option<ConeSource>,
+        shaping: Option<ShapingSource>,
+        shadows: bool,
     },
     /// One-sided, emitting toward `edge_x` x `edge_y`.
     Rect {
@@ -422,16 +436,21 @@ pub enum LightSource {
         edge_y: Vec3,
         /// Nits.
         luminance: Vec3,
+        shaping: Option<ShapingSource>,
+        shadows: bool,
     },
 }
 
-/// A sphere light's cone: full intensity within `inner` of `direction`, none past `outer`,
-/// both radians.
+/// How a light's emission falls off around `axis`, in UsdLux `ShapingAPI`'s terms: none past
+/// `cone_angle` (radians), smoothly to 0 over the outer `cone_softness` share of it (in
+/// [0, 1]), and by `lerp(focus_tint, 1, |cos|^focus)` (`focus` at least 0).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ConeSource {
-    pub direction: Vec3,
-    pub inner: f32,
-    pub outer: f32,
+pub struct ShapingSource {
+    pub axis: Vec3,
+    pub cone_angle: f32,
+    pub cone_softness: f32,
+    pub focus: f32,
+    pub focus_tint: Vec3,
 }
 
 /// A box decal, as `orr_scene`'s `Decal` takes it, its material an asset of the archive or of
@@ -517,27 +536,40 @@ fn string(strings: &[u8], s: Span) -> Result<String> {
 fn light(r: &LightRecord) -> Result<LightSource> {
     let position = DVec3::from_array(r.position);
     let color = Vec3::from_array(r.color);
+    let shaping = (r.flags & LIGHT_SHAPED != 0).then(|| ShapingSource {
+        axis: Vec3::from_array(r.direction),
+        cone_angle: r.cone_angle,
+        cone_softness: r.cone_softness,
+        focus: r.focus,
+        focus_tint: Vec3::from_array(r.focus_tint),
+    });
+    let shadows = r.flags & LIGHT_UNSHADOWED == 0;
     Ok(match r.kind {
         LIGHT_DIRECTIONAL => LightSource::Directional {
             direction_to_light: Vec3::from_array(r.direction),
             illuminance: color,
             angular_radius: r.radius,
         },
+        LIGHT_POINT => LightSource::Point {
+            position,
+            intensity: color,
+            shaping,
+            shadows,
+        },
         LIGHT_SPHERE => LightSource::Sphere {
             position,
             radius: r.radius,
             intensity: color,
-            cone: (r.flags & LIGHT_CONE != 0).then(|| ConeSource {
-                direction: Vec3::from_array(r.direction),
-                inner: r.cone_inner,
-                outer: r.cone_outer,
-            }),
+            shaping,
+            shadows,
         },
         LIGHT_RECT => LightSource::Rect {
             center: position,
             edge_x: Vec3::from_array(r.edge_x),
             edge_y: Vec3::from_array(r.edge_y),
             luminance: color,
+            shaping,
+            shadows,
         },
         _ => return Err(Error::Malformed("layout light kind")),
     })
@@ -545,7 +577,7 @@ fn light(r: &LightRecord) -> Result<LightSource> {
 
 fn light_record(l: &LightSource) -> LightRecord {
     let mut r = LightRecord::zeroed();
-    match *l {
+    let shaping = match *l {
         LightSource::Directional {
             direction_to_light,
             illuminance,
@@ -555,36 +587,58 @@ fn light_record(l: &LightSource) -> LightRecord {
             r.direction = direction_to_light.to_array();
             r.color = illuminance.to_array();
             r.radius = angular_radius;
+            None
+        }
+        LightSource::Point {
+            position,
+            intensity,
+            shaping,
+            shadows,
+        } => {
+            r.kind = LIGHT_POINT;
+            r.position = position.to_array();
+            r.color = intensity.to_array();
+            r.flags = if shadows { 0 } else { LIGHT_UNSHADOWED };
+            shaping
         }
         LightSource::Sphere {
             position,
             radius,
             intensity,
-            cone,
+            shaping,
+            shadows,
         } => {
             r.kind = LIGHT_SPHERE;
             r.position = position.to_array();
             r.radius = radius;
             r.color = intensity.to_array();
-            if let Some(c) = cone {
-                r.flags = LIGHT_CONE;
-                r.direction = c.direction.to_array();
-                r.cone_inner = c.inner;
-                r.cone_outer = c.outer;
-            }
+            r.flags = if shadows { 0 } else { LIGHT_UNSHADOWED };
+            shaping
         }
         LightSource::Rect {
             center,
             edge_x,
             edge_y,
             luminance,
+            shaping,
+            shadows,
         } => {
             r.kind = LIGHT_RECT;
             r.position = center.to_array();
             r.edge_x = edge_x.to_array();
             r.edge_y = edge_y.to_array();
             r.color = luminance.to_array();
+            r.flags = if shadows { 0 } else { LIGHT_UNSHADOWED };
+            shaping
         }
+    };
+    if let Some(s) = shaping {
+        r.flags |= LIGHT_SHAPED;
+        r.direction = s.axis.to_array();
+        r.cone_angle = s.cone_angle;
+        r.cone_softness = s.cone_softness;
+        r.focus = s.focus;
+        r.focus_tint = s.focus_tint.to_array();
     }
     r
 }
@@ -950,23 +1004,28 @@ mod tests {
                             position: DVec3::new(1e6, 2.0, -3.0),
                             radius: 0.1,
                             intensity: Vec3::new(10.0, 20.0, 30.0),
-                            cone: Some(ConeSource {
-                                direction: -Vec3::Y,
-                                inner: 0.2,
-                                outer: 0.5,
+                            shaping: Some(ShapingSource {
+                                axis: -Vec3::Y,
+                                cone_angle: 0.5,
+                                cone_softness: 0.25,
+                                focus: 2.0,
+                                focus_tint: Vec3::new(0.1, 0.2, 0.3),
                             }),
+                            shadows: true,
                         },
-                        LightSource::Sphere {
+                        LightSource::Point {
                             position: DVec3::ZERO,
-                            radius: 0.0,
                             intensity: Vec3::ONE,
-                            cone: None,
+                            shaping: None,
+                            shadows: false,
                         },
                         LightSource::Rect {
                             center: DVec3::new(0.0, 3.0, 0.0),
                             edge_x: Vec3::X,
                             edge_y: Vec3::Z,
                             luminance: Vec3::splat(500.0),
+                            shaping: None,
+                            shadows: true,
                         },
                     ],
                     decals: vec![DecalSource {

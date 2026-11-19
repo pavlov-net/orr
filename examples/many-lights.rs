@@ -17,9 +17,9 @@ use orr::orr_gpu::{Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, 
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    Cone, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime,
-    GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LitView, PackSource, Projection,
-    Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
+    DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter,
+    InstanceFlags, InstancesDesc, Lens, Light, LitView, PackSource, Projection, Renderer,
+    RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, Shaping, TextureFilter,
     TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshSettings, Source};
@@ -102,7 +102,8 @@ fn lights() -> Vec<Light> {
                     position: p.as_dvec3(),
                     radius: 0.12,
                     intensity: lamp_color(t) * 220.0,
-                    cone: None,
+                    shaping: None,
+                    shadows: true,
                 });
             }
         }
@@ -121,11 +122,14 @@ fn lights() -> Vec<Light> {
                         position: (c + d * s + Vec3::Y * 0.3).as_dvec3(),
                         radius: 0.08,
                         intensity: lamp_color(0.3) * 900.0,
-                        cone: Some(Cone {
-                            direction: (Vec3::Y * 2.0 - d).normalize(),
-                            inner: 0.25,
-                            outer: 0.4,
+                        shaping: Some(Shaping {
+                            axis: (Vec3::Y * 2.0 - d).normalize(),
+                            cone_angle: 0.4,
+                            cone_softness: 0.375,
+                            focus: 0.0,
+                            focus_tint: Vec3::ZERO,
                         }),
+                        shadows: true,
                     });
                 }
                 let up = Vec3::Y;
@@ -137,6 +141,8 @@ fn lights() -> Vec<Light> {
                         edge_x: across * 1.4,
                         edge_y: up * 0.9,
                         luminance: lamp_color(((i + 2 * j + floor) % 3) as f32 / 2.0) * 35.0,
+                        shaping: None,
+                        shadows: true,
                     });
                 }
             }
@@ -438,7 +444,7 @@ fn cook() -> Arc<[u8]> {
     for light in lights() {
         if let Light::Sphere {
             position,
-            cone: None,
+            shaping: None,
             ..
         } = light
         {

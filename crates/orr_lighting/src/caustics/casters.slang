@@ -354,8 +354,8 @@ void weigh(uint lane: SV_GroupIndex)
     p.top = top;
 }
 
-// A point on light `id` (a feedback id) to walk out from, and the way out: a sphere or rect
-// light's center, an emissive entry's first triangle's centroid on the side it emits, nothing
+// A point on light `id` (a feedback id) to walk out from, and the way out: a sphere, point or
+// rect light's center, an emissive entry's first triangle's centroid on the side it emits, nothing
 // for directional lights and the environment, which lie outside every interior.
 bool light_point(SceneRoot* s, LightSetGpu* set, uint id, out float3 p, out float3 dir)
 {
@@ -365,7 +365,7 @@ bool light_point(SceneRoot* s, LightSetGpu* set, uint id, out float3 p, out floa
     {
         LightGpu l = s.lights[id];
         p = l.position;
-        return l.kind == LIGHT_SPHERE || l.kind == LIGHT_RECT;
+        return l.kind == LIGHT_SPHERE || l.kind == LIGHT_POINT || l.kind == LIGHT_RECT;
     }
     uint entry = id - s.light_capacity;
     if (entry >= s.emissive_capacity)

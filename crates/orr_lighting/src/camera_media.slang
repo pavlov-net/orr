@@ -539,7 +539,9 @@ Fog reference_fog<S : ISurfaces, M : IMedium>(MediaApplyRoot r, FroxelRoot f, ui
                     float3 l = c.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, c.light, c.dir) : c.radiance;
                     float t_max = isfinite(c.distance) ? c.distance * (1.0 - 1e-4) : c.distance;
                     RayCone cone = { 0.0, 0.0 };
-                    float3 vis = visibility<S, M, SHADOW_UNBENT>(s, f.view, origin, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind == LIGHT_SAMPLE_ENVIRONMENT, Interior(), set.shadow_overflows);
+                    // A light surfaces cast no shadow from takes the media alone.
+                    bool media_only = may2(MAY2_UNSHADOWED_LIGHTS) && (c.kind & LIGHT_SAMPLE_UNSHADOWED) != 0;
+                    float3 vis = visibility<S, M, SHADOW_UNBENT>(s, f.view, origin, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind == LIGHT_SAMPLE_ENVIRONMENT, Interior(), set.shadow_overflows, media_only);
                     if (c.view && any(vis > 0.0))
                         vis *= emitter_view_layer<S>(set, c, AMBIENT_IOR);
                     source += scatter * l * vis / c.pdf;

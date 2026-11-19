@@ -8,10 +8,10 @@
 use orr_gpu::TextureIndex;
 use orr_math::{Quat, Vec3};
 use orr_pack::AssetId;
-use orr_pack::layout::{CameraSource, Group, LightSource};
+use orr_pack::layout::{CameraSource, Group, LightSource, ShapingSource};
 
 use crate::decals::{Decal, DecalChannels, DecalId};
-use crate::lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
+use crate::lights::{DirectionalLight, DiscProfile, Light, LightId, Shaping};
 use crate::mount::{MountId, Mounts, Resident};
 use crate::scene::{InstanceFlags, InstancePageRef, InstanceRange, ModelId, SceneWriter};
 use crate::scenes::insert;
@@ -90,6 +90,16 @@ pub(crate) struct PlacedPartition {
     pub(crate) decals: Vec<DecalId>,
 }
 
+fn shaping(s: &ShapingSource) -> Shaping {
+    Shaping {
+        axis: s.axis,
+        cone_angle: s.cone_angle,
+        cone_softness: s.cone_softness,
+        focus: s.focus,
+        focus_tint: s.focus_tint,
+    }
+}
+
 fn light(l: &LightSource) -> Light {
     match *l {
         // UsdLux and glTF state no profile over a distant light's disc.
@@ -103,31 +113,44 @@ fn light(l: &LightSource) -> Light {
             angular_radius,
             disc: DiscProfile::Uniform,
         }),
+        LightSource::Point {
+            position,
+            intensity,
+            shaping: s,
+            shadows,
+        } => Light::Point {
+            position,
+            intensity,
+            shaping: s.as_ref().map(shaping),
+            shadows,
+        },
         LightSource::Sphere {
             position,
             radius,
             intensity,
-            cone,
+            shaping: s,
+            shadows,
         } => Light::Sphere {
             position,
             radius,
             intensity,
-            cone: cone.map(|c| Cone {
-                direction: c.direction,
-                inner: c.inner,
-                outer: c.outer,
-            }),
+            shaping: s.as_ref().map(shaping),
+            shadows,
         },
         LightSource::Rect {
             center,
             edge_x,
             edge_y,
             luminance,
+            shaping: s,
+            shadows,
         } => Light::Rect {
             center,
             edge_x,
             edge_y,
             luminance,
+            shaping: s.as_ref().map(shaping),
+            shadows,
         },
     }
 }
@@ -285,6 +308,16 @@ impl SceneWriter<'_> {
         let decals = placed.decals.iter().map(|&id| self.remove_decal(id));
         let decals: Vec<Result<()>> = decals.collect();
         lights.into_iter().chain(decals).collect()
+    }
+
+    /// The ids of placed partition `id`'s lights, in the order of its [`Partition::lights`].
+    pub fn partition_lights(&self, id: PartitionId) -> Result<Vec<LightId>> {
+        let cpu = self.scene.cpu.lock().unwrap();
+        let placed = cpu.partitions.get(id.0 as usize).and_then(Option::as_ref);
+        Ok(placed
+            .ok_or(Error::UnknownPlacedPartition(id))?
+            .lights
+            .clone())
     }
 
     /// Removes placed partition `id` from this frame on: its copies, lights and decals, whose

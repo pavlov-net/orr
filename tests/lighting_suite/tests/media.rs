@@ -1069,7 +1069,8 @@ fn a_light_in_the_water_lights_it_through_the_water() {
         position: DVec3::new(4.0, 0.0, 1.0),
         radius: 0.1,
         intensity: Vec3::splat(2000.0),
-        cone: None,
+        shaping: None,
+        shadows: true,
     };
     let (mut bed, _fog, water) = turbid_lit(
         vec![light],
@@ -1082,6 +1083,56 @@ fn a_light_in_the_water_lights_it_through_the_water() {
     assert!(
         (lit - reference).abs() < 0.05 * reference,
         "the froxels' view is {lit:.4}, the reference's {reference:.4}"
+    );
+    assert_clean();
+}
+
+/// A sphere light in turbid water behind and beside the view, a sphere between it and the froxels
+/// out of the view's sight: from a light surfaces cast no shadow from, the froxels' view matches
+/// the reference's and the view without the sphere, the water's depth along the way kept; from
+/// one with shadows, the sphere darkens it.
+#[test]
+fn a_light_without_shadows_lights_the_water_past_a_sphere() {
+    let light = |shadows| Light::Sphere {
+        position: DVec3::new(4.0, 0.0, 3.0),
+        radius: 0.1,
+        intensity: Vec3::splat(2000.0),
+        shaping: None,
+        shadows,
+    };
+    let view = |shadows, occluded: bool, reference: bool| {
+        let mut more = vec![at(FLOOR, Vec3::new(0.0, -4.0, 0.0))];
+        if occluded {
+            more.push(Item {
+                model: WHITE_SPHERE,
+                linear: Mat3::from_diagonal(Vec3::splat(1.2)),
+                at: Vec3::new(2.0, 0.0, 1.5),
+            });
+        }
+        let (mut bed, _fog, water) = turbid_lit(
+            vec![light(shadows)],
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(0.0, 0.0, -10.0),
+            more,
+        );
+        let frames = if reference { 768 } else { 64 };
+        mean_luminance(&shown(&mut bed, water_view(Some(water), reference), frames))
+    };
+    let froxels = view(false, true, false);
+    let reference = view(false, true, true);
+    assert!(
+        (froxels - reference).abs() < 0.05 * reference,
+        "the froxels' view is {froxels:.4}, the reference's {reference:.4}"
+    );
+    let open = view(false, false, false);
+    assert!(
+        (froxels - open).abs() < 0.05 * open,
+        "past the sphere {froxels:.4}, without it {open:.4}"
+    );
+    let shadowed = view(true, true, false);
+    assert!(
+        shadowed < 0.9 * open,
+        "from a light with shadows {shadowed:.4}, without the sphere {open:.4}"
     );
     assert_clean();
 }

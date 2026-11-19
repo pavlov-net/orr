@@ -189,7 +189,15 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior)
         float magnitude = max(abs(target.x), max(abs(target.y), abs(target.z)));
         t_max = max(0.0, reach - max(1e-4 * reach, magnitude * F32_PRECISION));
     }
-    ShadowCover cover = shadow_cover(SHADOW_PATH, SHADOW_MASK, context_depth(r, slot, flags), false);
+    // Surfaces cast no shadow from some lights, whose rays meet the medium proxies alone.
+    uint mask = SHADOW_MASK;
+    if (may2(MAY2_UNSHADOWED_LIGHTS))
+    {
+        uint job = load_coherent(at + 2).w;
+        if (job < r.scene.light_capacity && (r.scene.lights[job].flags & LIGHT_UNSHADOWED) != 0)
+            mask = MASK_MEDIUM;
+    }
+    ShadowCover cover = shadow_cover(SHADOW_PATH, mask, context_depth(r, slot, flags), false);
     cover.product = float3(asfloat(w4.w), asfloat(w5.w), asfloat(load_coherent(at + 2).y));
     Payload p;
     p.words = cover.words();
@@ -217,7 +225,7 @@ void trace_shadow(PathRoot r, uint slot, uint4* at, uint flags, float exterior)
         p.words.w |= SHADOW_MISSED;
     }
     else
-        trace(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, ray, p);
+        trace(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, mask, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, ray, p);
     if ((p.words.w & SHADOW_MISSED) == 0)
         return;
     float3 passed = asfloat(p.words.xyz);
@@ -1174,12 +1182,14 @@ bool photon_light_reaches(PathRoot r, uint4* at)
 {
     uint4 w4 = load_coherent(at + 4);
     uint4 w5 = load_coherent(at + 5);
+    // A photon of a light surfaces cast no shadow from meets the medium proxies alone.
+    uint mask = may2(MAY2_UNSHADOWED_LIGHTS) && w5.w == PHOTON_UNSHADOWED ? MASK_MEDIUM : SHADOW_MASK;
     RayDesc ray = path_ray(asfloat(w4.xyz), asfloat(w5.xyz), asfloat(w4.w));
-    ShadowCover cover = shadow_cover(SHADOW_PHOTON, SHADOW_MASK, 0, false);
+    ShadowCover cover = shadow_cover(SHADOW_PHOTON, mask, 0, false);
     cover.product = float3(1.0);
     Payload p;
     p.words = cover.words();
-    trace(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, SHADOW_MASK, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, ray, p);
+    trace(r.scene.tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER, mask, RAY_TYPE_SHADOW, RAY_TYPES, MISS_SHADOW, ray, p);
     if ((p.words.w & SHADOW_MISSED) == 0)
         return false;
     float3 passed = asfloat(p.words.xyz);

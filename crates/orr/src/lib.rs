@@ -62,7 +62,7 @@ pub use orr_scene::Error as SceneError;
 pub use orr_scene::{self, RasterView};
 pub use orr_scene::{
     AffineRows, ArenaReport, ArenaTarget, BlobId, BlobTarget, BoundTexture, Budgets, ClassStats,
-    ClipRef, ClusterTopology, Cone, ConsumerMarker, CopyVariant, Decal, DecalChannels, DecalId,
+    ClipRef, ClusterTopology, ConsumerMarker, CopyVariant, Decal, DecalChannels, DecalId,
     DepthOfField, DetailStats, DirectionalLight, DiscProfile, EditDesc, EditId, EditRef,
     EnvironmentData, ExposureState, Focus, FrameStats, FrameTime, Glare, GroupWriter,
     InstanceFlags, InstancePage, InstancePageRef, InstanceRange, InstancesDesc, JobResult, Layout,
@@ -72,8 +72,8 @@ pub use orr_scene::{
     PartitionId, PartitionRef, PipelineId, PoolSize, Pose, ProducerBatch, ProducerDesc, ProducerId,
     ProducerStats, ProducerUpdate, Projection, RasterGpu, ReloadReport, RendererDesc,
     RequestSource, ResidencyClass, ResidencyStats, RtStats, SceneCompute, SceneDesc, SceneId,
-    SceneMemory, SceneRoot, SkeletonRef, SkinStats, SkinnedDesc, SkinnedPageRef, SkyStats, Span,
-    TextureFilter, TextureSamplerGpu, TextureStreamGpu, TransformGroupDesc, TransformGroupId,
+    SceneMemory, SceneRoot, Shaping, SkeletonRef, SkinStats, SkinnedDesc, SkinnedPageRef, SkyStats,
+    Span, TextureFilter, TextureSamplerGpu, TextureStreamGpu, TransformGroupDesc, TransformGroupId,
     TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId, ViewStep, WorldPos, abi,
     binding_sampler, material_flags, orr_gpu, orr_pack,
 };

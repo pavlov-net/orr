@@ -1,6 +1,7 @@
 //! USD import (`.usda`, `.usdc`, `.usdz`) through `openusd`: the composed stage's meshes as
 //! one mesh per model, the UsdShade materials they bind, `PointInstancer`s as instance
-//! records, and with UsdSkel a skeleton and its clips ([`skel`]).
+//! records, with UsdSkel a skeleton and its clips ([`skel`]), and its UsdLux lights as layout
+//! light records of their partitions ([`lux`]), a prototype's once per still copy.
 //!
 //! The stage composes its references, payloads (all loaded) and variants, with the
 //! selections of [`UsdSettings::variants`] in a session layer; any composition error fails
@@ -114,6 +115,8 @@
 //! ([`Variant::DoubleSided`]). Meshes that differ in what they hold for a material's primvar
 //! readers take a copy each ([`Variant::Primvars`]).
 
+mod blackbody;
+mod lux;
 mod mesh;
 mod read;
 mod shade;
@@ -129,7 +132,7 @@ use openusd::usd::PathRule;
 use openusd::{sdf, usd};
 use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, DVec4};
 use orr_pack::instance::MotionRow;
-use orr_pack::layout::{Attribute, AttributeValue, Group};
+use orr_pack::layout::{Attribute, AttributeValue, Group, LightSource};
 use orr_pack::material::Material;
 use orr_pack::names::{Derived, MaterialBase, MaterialName, ModelBase, ModelName, Variant};
 use orr_pack::skeleton::{NO_PARENT, SkeletonInfo, Trs};
@@ -137,8 +140,8 @@ use serde::Deserialize;
 
 use crate::import::SceneSubd;
 use crate::import::{
-    NodeSelect, Placed, PlacedModel, Scene, SceneMaterial, SceneModel, SceneSkeleton, collapses,
-    kept_lengths, placements,
+    NodeSelect, Placed, PlacedModel, Scene, SceneMaterial, SceneModel, ScenePartition,
+    SceneSkeleton, collapses, kept_lengths, placements,
 };
 use crate::instances::InstanceMotion;
 use crate::mesh::{MeshData, MeshSettings, MeshSource, PartData, Pivots, SectionData, Skin};
@@ -723,6 +726,8 @@ struct Prototype {
     also: Vec<usize>,
     /// Instancers in its subtree, each placed by every copy of it.
     nested: Vec<usize>,
+    /// Lights it draws, outside its instancers.
+    lights: Vec<usize>,
 }
 
 /// What an instancer places, the same for every copy of it.
@@ -749,6 +754,9 @@ struct Instancing {
     meshes: Vec<(usize, usize)>,
     /// How the skinned ones among them bind a skeleton.
     bound: HashMap<usize, Bound>,
+    /// Lights the prototypes draw: per copy, the light's node, scene space from its space, and
+    /// the partition that holds it.
+    lights: Vec<(usize, DMat4, usize)>,
 }
 
 /// The shading of a material prim.
@@ -1166,6 +1174,7 @@ impl<'s> Importer<'s> {
         }
 
         meshes.append(&mut instancing.meshes);
+        let lights = self.lights(&instancing.lights)?;
         // What each mesh binds and whether it is a cage, and the models that bake a height into a
         // mesh of theirs.
         let mut bindings = Vec::with_capacity(meshes.len());
@@ -1634,7 +1643,11 @@ impl<'s> Importer<'s> {
             clips: self.settings.clips.clone(),
             instances: instance_out,
             groups: std::mem::take(&mut self.groups),
-            partitions: std::mem::take(&mut self.partitions),
+            partitions: std::mem::take(&mut self.partitions)
+                .into_iter()
+                .zip(lights)
+                .map(|(groups, lights)| ScenePartition { groups, lights })
+                .collect(),
             files: self.reads.borrow().inputs(),
             warnings: std::mem::take(&mut self.warnings),
         })
@@ -2081,6 +2094,54 @@ impl<'s> Importer<'s> {
         }
     }
 
+    /// Whether a prim at or above node `n` moves it over time, up to and with `top`, or the
+    /// stage's root without it, or a prim that resets the transform stack.
+    fn moves(&self, n: usize, top: Option<usize>) -> bool {
+        let mut at = Some(n);
+        while let Some(i) = at {
+            let node = &self.nodes[i];
+            if !node.times.is_empty() {
+                return true;
+            }
+            at = node.parent.filter(|_| Some(i) != top && !node.reset);
+        }
+        false
+    }
+
+    /// The lights of the stage, per partition: those it draws outside the instancers', and the
+    /// copies of those its instancers' prototypes draw, `placed`.
+    fn lights(&self, placed: &[(usize, DMat4, usize)]) -> Result<Vec<Vec<LightSource>>, String> {
+        let mut out = vec![Vec::new(); self.partitions.len()];
+        let mut found = Vec::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            if !lux::LIGHT_TYPES.contains(&node.ty.as_str()) {
+                if let Some(api) = lux::light_api(&node.prim)? {
+                    return Err(format!(
+                        "{}: {api} makes a light of a {}, which is not cooked",
+                        node.prim.path().as_str(),
+                        node.ty
+                    ));
+                }
+                continue;
+            }
+            if node.instanced || self.hidden(i, None) {
+                continue;
+            }
+            if self.moves(i, None) {
+                return Err(format!(
+                    "{}: a light that a transform sampled over time moves is not cooked",
+                    node.prim.path().as_str()
+                ));
+            }
+            found.push((i, node.world, self.partition_of[i]));
+        }
+        for &(i, to_scene, p) in found.iter().chain(placed) {
+            let node = &self.nodes[i];
+            out[p].push(lux::light(&self.reader(&node.prim), &node.ty, to_scene)?);
+        }
+        Ok(out)
+    }
+
     /// Whether node `n` stands at or under node `top`.
     fn under(&self, n: usize, top: usize) -> bool {
         std::iter::successors(Some(n), |&k| self.nodes[k].parent).any(|k| k == top)
@@ -2289,6 +2350,7 @@ impl<'s> Importer<'s> {
         models.push(Building::new(name.clone(), None, None, None));
         models[model].prototype = Some(root);
         let mut nested = Vec::new();
+        let mut lights = Vec::new();
         let mut also = Vec::new();
         // Each skeleton binding met so far, with its model.
         let mut sites: Vec<(usize, usize)> = Vec::new();
@@ -2314,6 +2376,9 @@ impl<'s> Importer<'s> {
                 }
                 k = at.end;
                 continue;
+            }
+            if lux::LIGHT_TYPES.contains(&at.ty.as_str()) && drawn {
+                lights.push(k);
             }
             if at.ty == "Mesh" && drawn {
                 let skel_root = self.skel_root(k);
@@ -2375,6 +2440,7 @@ impl<'s> Importer<'s> {
             model,
             also,
             nested,
+            lights,
         };
         instancing.prototypes.insert(root, p.clone());
         Ok(p)
@@ -2430,11 +2496,28 @@ impl<'s> Importer<'s> {
             };
             self.place_moving(ins, motion, &instancer, to_scene, at)?;
         }
+        for (root, p) in instancer.protos.iter().flatten() {
+            let carried = motion.is_some() || frame.is_some();
+            let moved = p
+                .lights
+                .iter()
+                .find(|&&l| carried || self.moves(l, Some(*root)));
+            if let Some(&l) = moved {
+                return Err(format!(
+                    "{}: a light that moves with its prototype or instancer is not cooked",
+                    self.nodes[l].prim.path().as_str()
+                ));
+            }
+        }
         for &(proto, local) in &instancer.placed {
             let Some((root, p)) = &instancer.protos[proto] else {
                 continue;
             };
             let transform = to_scene * local;
+            for &l in &p.lights {
+                let light = transform * self.to_prototype(*root, l);
+                instancing.lights.push((l, light, partition));
+            }
             let copied = std::iter::once(&p.model).chain(&p.also);
             for &m in copied.filter(|_| motion.is_none()) {
                 let key = (m, Dest { frame, partition });

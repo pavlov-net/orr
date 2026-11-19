@@ -12,11 +12,11 @@
 //! name followed by literals, so no two entries meet whatever the source's names are.
 //!
 //! A glTF or USD source also emits its layout `N/layout` ([`orr_pack::layout`]): its groups
-//! and partitions, each partition with its instance sources. The part of a partition's scene no
-//! instancer places is a model of its own, `N` for the partition in no group and
-//! `N/model/partition/<p>` for partition `p`, which an identity record on the partition's
-//! instance source places at the origin, or which the layout lists as posed where it has a
-//! skeleton.
+//! and partitions, each partition with its instance sources and, from USD, its UsdLux lights.
+//! The part of a partition's scene no instancer places is a model of its own, `N` for the
+//! partition in no group and `N/model/partition/<p>` for partition `p`, which an identity record
+//! on the partition's instance source places at the origin, or which the layout lists as posed
+//! where it has a skeleton.
 //!
 //! A glTF source emits, under the asset name `N`:
 //! - `N`: a model binding the mesh to one material per section,

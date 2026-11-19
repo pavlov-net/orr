@@ -10,8 +10,8 @@ use lighting_suite::bed::{
     QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR, SUN, Spec, StrandRow, TILED_FLOOR,
     TINTED_FLOOR, TRANSLUCENT_SHEET, TROUGH, WATER_BOX, WHITE_FLOOR, assert_close,
     assert_converges, assert_renders_alike, assert_within_noise, glass_scene, image_mean,
-    light_bed, luminance, mean_where, particle_bed, pixel_of, plane_stack_spec, plume_bed,
-    producer_stack_bed, reference, render_paths, surface_mean,
+    light_bed, luminance, mean_where, occluded_light_spec, particle_bed, pixel_of,
+    plane_stack_spec, plume_bed, producer_stack_bed, reference, render_paths, surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
@@ -442,6 +442,109 @@ fn next_event_and_bsdf_estimators_agree_with_their_combination() {
     );
     assert_close("next-event only", image_mean(&nee), full, 0.01);
     assert_close("BSDF only", image_mean(&bsdf), full, 0.01);
+    assert_clean();
+}
+
+/// A point light, which no ray meets, lights the scene as a sphere of 5 mm and the same
+/// intensity does, which next-event estimation and the scatter's rays share: next-event
+/// estimation carries the point whole.
+#[test]
+fn a_point_light_lights_as_a_small_sphere_of_its_intensity() {
+    let position = DVec3::new(1.5, 2.5, 1.2);
+    let intensity = Vec3::new(40.0, 30.0, 20.0);
+    let mut means = Vec::new();
+    for light in [
+        Light::Point {
+            position,
+            intensity,
+            shaping: None,
+            shadows: true,
+        },
+        Light::Sphere {
+            position,
+            radius: 0.005,
+            intensity,
+            shaping: None,
+            shadows: true,
+        },
+    ] {
+        let mut bed = Bed::with(sphere_on_ground(vec![light], None));
+        means.push(image_mean(&render_paths(
+            &mut bed,
+            &paths(reference(2)),
+            128,
+            1,
+        )));
+    }
+    assert!(means[1].iter().all(|&c| c > 1e-3), "{means:?}");
+    assert_close("point against sphere", means[0], means[1], 0.01);
+    assert_clean();
+}
+
+/// A light that surfaces cast no shadow from lights a floor under a sphere in its way as it does
+/// with the sphere gone, carried whole by next-event estimation; one with shadows leaves the
+/// sphere's shadow. Smoke between the sphere and the floor, a medium, dims the light without
+/// shadows as it dims the one with shadows and no sphere.
+#[test]
+fn surfaces_cast_no_shadow_from_a_light_without_shadows() {
+    let position = DVec3::new(0.0, 6.0, 0.0);
+    let intensity = Vec3::splat(400.0);
+    let point = |shadows| Light::Point {
+        position,
+        intensity,
+        shaping: None,
+        shadows,
+    };
+    let sphere = |shadows| Light::Sphere {
+        position,
+        radius: 0.05,
+        intensity,
+        shaping: None,
+        shadows,
+    };
+    // An absorbing slab 0.8 m thick under the sphere, over the view.
+    let smoke = MediumProxy {
+        position: DVec3::new(0.0, 3.4, 0.0),
+        rotation: Quat::IDENTITY,
+        scale: 1.0,
+        density: ProxyDensity::Uniform {
+            half_extent: Vec3::new(4.0, 0.4, 4.0),
+        },
+        extinction: Vec3::splat(0.5),
+        albedo: Vec3::ZERO,
+        anisotropy: 0.0,
+    };
+    let direct = |light, occluded, smoky: bool| {
+        let mut bed = Bed::with(occluded_light_spec(light, occluded));
+        if smoky {
+            bed.set_medium_proxy(MediumProxyId(0), Some(smoke));
+        }
+        let p = paths(debug(LightingDebugView::DirectOnly, 1));
+        image_mean(&render_paths(&mut bed, &p, 64, 1))
+    };
+    for (what, light) in [
+        ("point", &point as &dyn Fn(bool) -> Light),
+        ("sphere", &sphere),
+    ] {
+        let open = direct(light(true), false, false);
+        assert_close(what, direct(light(false), true, false), open, 0.01);
+        let shadowed = direct(light(true), true, false);
+        assert!(
+            shadowed[1] < 0.9 * open[1],
+            "{what}: the sphere's shadow, {shadowed:?} against {open:?}"
+        );
+        let smoky = direct(light(true), false, true);
+        assert_close(
+            &format!("{what} through smoke"),
+            direct(light(false), true, true),
+            smoky,
+            0.01,
+        );
+        assert!(
+            smoky[1] < 0.85 * open[1],
+            "{what}: the smoke, {smoky:?} against {open:?}"
+        );
+    }
     assert_clean();
 }
 
@@ -919,7 +1022,8 @@ fn many_lights() -> Spec {
             position: DVec3::new(r * a.cos(), 0.3 + 0.2 * f64::from(k % 4), r * a.sin()),
             radius: 0.05,
             intensity: hue * (2.0 + (k % 7) as f32 * 3.0),
-            cone: None,
+            shaping: None,
+            shadows: true,
         });
     }
     for x in [-0.8f64, 0.8] {
@@ -927,11 +1031,14 @@ fn many_lights() -> Spec {
             position: DVec3::new(x, 2.5, 0.8),
             radius: 0.1,
             intensity: Vec3::splat(150.0),
-            cone: Some(orr_scene::Cone {
-                direction: Vec3::new(-x as f32 * 0.3, -1.0, -0.2).normalize(),
-                inner: 0.3,
-                outer: 0.45,
+            shaping: Some(orr_scene::Shaping {
+                axis: Vec3::new(-x as f32 * 0.3, -1.0, -0.2).normalize(),
+                cone_angle: 0.45,
+                cone_softness: 1.0 / 3.0,
+                focus: 0.0,
+                focus_tint: Vec3::ZERO,
             }),
+            shadows: true,
         });
     }
     for (k, z) in [-1.5f64, 0.0, 1.5].into_iter().enumerate() {
@@ -940,6 +1047,8 @@ fn many_lights() -> Spec {
             edge_x: Vec3::new(0.0, 0.0, 0.6),
             edge_y: Vec3::new(0.0, 0.4, 0.0),
             luminance: Vec3::splat(40.0 * (k + 1) as f32),
+            shaping: None,
+            shadows: true,
         });
     }
     Spec {
@@ -1030,7 +1139,8 @@ fn a_views_light_feedback_follows_its_lights_as_the_light_tables_grow() {
         position: DVec3::new(x, 1.5, 1.0),
         radius: 0.1,
         intensity: Vec3::splat(intensity),
-        cone: None,
+        shaping: None,
+        shadows: true,
     };
     let mut bed = Bed::with(sphere_on_ground(
         vec![lamp(200.0, 0.0)],
@@ -1121,7 +1231,8 @@ fn a_traced_views_local_samplers_follow_a_camera_step() {
         position: DVec3::new(x, 0.3, 0.0),
         radius: 0.05,
         intensity: Vec3::splat(20.0),
-        cone: None,
+        shaping: None,
+        shadows: true,
     };
     let spec = Spec {
         copies: vec![at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
@@ -1907,13 +2018,16 @@ fn sphere_and_rect_lights_reach_bsdf_rays_through_their_proxies() {
             position: DVec3::new(-0.6, 1.2, -0.5),
             radius: 0.15,
             intensity: Vec3::splat(40.0),
-            cone: None,
+            shaping: None,
+            shadows: true,
         },
         Light::Rect {
             center: DVec3::new(0.6, 1.2, -0.5),
             edge_x: Vec3::new(0.4, 0.0, 0.0),
             edge_y: Vec3::new(0.0, 0.0, 0.3),
             luminance: Vec3::splat(200.0),
+            shaping: None,
+            shadows: true,
         },
     ];
     // The rect faces edge_x x edge_y: down.
@@ -1999,7 +2113,8 @@ fn a_sphere_light_smaller_than_any_half_lights_like_a_larger_one() {
             position: DVec3::new(0.0, 1.0, 0.0),
             radius,
             intensity: Vec3::splat(40.0),
-            cone: None,
+            shaping: None,
+            shadows: true,
         }],
         environment: None,
         eye: Vec3::new(0.0, 1.0, 3.0),
@@ -2046,7 +2161,8 @@ fn a_sphere_light_behind_glass_lights_a_glossy_floor_alike_by_full_and_bsdf_rays
             position: DVec3::new(0.0, 1.5, 0.0),
             radius: 0.12,
             intensity: Vec3::splat(60.0),
-            cone: None,
+            shaping: None,
+            shadows: true,
         }],
         environment: None,
         eye: Vec3::new(0.0, 1.2, 2.5),

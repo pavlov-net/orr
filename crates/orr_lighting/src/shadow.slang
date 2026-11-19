@@ -383,10 +383,10 @@ public struct ProxyDepth : IProxyStep
 // it unless the ray goes to the `environment`, whose map holds that medium. A ray past
 // SHADOW_CANDIDATES non-opaque candidates in one of its traces keeps the product so far and adds
 // 1 to `overflows` (null: not counted).
-public float3 visibility<S : ISurfaces, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows)
+public float3 visibility<S : ISurfaces, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows, bool media_only = false)
 {
     float3 depth;
-    float3 product = surface_visibility<S, M, MODE>(s, v, origin, dir, t_max, flags, context, environment, inside, overflows, depth);
+    float3 product = surface_visibility<S, M, MODE>(s, v, origin, dir, t_max, flags, context, environment, inside, overflows, depth, media_only);
     if (all(product == 0.0))
         return product;
     product *= exp(-depth);
@@ -396,18 +396,19 @@ public float3 visibility<S : ISurfaces, M : IMedium, let MODE : uint>(SceneRoot*
 }
 
 // `visibility` without the linked medium, with the dielectric interiors' optical depth over the
-// segment left out of the product and returned in `depth`.
-public float3 surface_visibility<S : ISurfaces, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows, out float3 depth)
+// segment left out of the product and returned in `depth`. With `media_only` the ray meets the
+// medium proxies alone: a light surfaces cast no shadow from.
+public float3 surface_visibility<S : ISurfaces, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows, out float3 depth, bool media_only = false)
 {
     uint committed;
     float committed_t;
-    return surface_visibility<S, M, MODE>(s, v, origin, dir, t_max, flags, context, environment, inside, overflows, depth, committed, committed_t);
+    return surface_visibility<S, M, MODE>(s, v, origin, dir, t_max, flags, context, environment, inside, overflows, depth, committed, committed_t, media_only);
 }
 
 // As above, and in `committed` and `committed_t` the CLASS_* and distance of an opaque hit the AS
 // committed, which made the product 0, or ~0 and +inf for none: the first one found, not the
 // nearest. A SHADOW_PATH ray ending at solid glass commits CLASS_DIELECTRIC.
-public float3 surface_visibility<S : ISurfaces, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows, out float3 depth, out uint committed, out float committed_t)
+public float3 surface_visibility<S : ISurfaces, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, Interior inside, uint* overflows, out float3 depth, out uint committed, out float committed_t, bool media_only = false)
 {
     ShadowCandidates<S, M, MODE> h;
     h.scene = s;
@@ -435,7 +436,7 @@ public float3 surface_visibility<S : ISurfaces, M : IMedium, let MODE : uint>(Sc
     // of the candidate handling in the kernel.
     float3 product = float3(1.0);
     overflow = false;
-    uint mask = MODE == SHADOW_UNBENT ? SHADOW_MASK & ~MASK_DIELECTRIC : SHADOW_MASK;
+    uint mask = media_only ? MASK_MEDIUM : MODE == SHADOW_UNBENT ? SHADOW_MASK & ~MASK_DIELECTRIC : SHADOW_MASK;
     uint pass_flags = flags;
     for (uint pass = 0; pass < 2; pass++)
     {
@@ -450,7 +451,7 @@ public float3 surface_visibility<S : ISurfaces, M : IMedium, let MODE : uint>(Sc
             committed = c;
             committed_t = c_t;
         }
-        if (MODE != SHADOW_UNBENT || pass == 1)
+        if (MODE != SHADOW_UNBENT || pass == 1 || media_only)
             break;
         if (c == CLASS_DIELECTRIC)
         {

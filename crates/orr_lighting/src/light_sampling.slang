@@ -64,11 +64,18 @@ public static const uint LIGHT_SAMPLE_SPHERE = 1;
 public static const uint LIGHT_SAMPLE_RECT = 2;
 public static const uint LIGHT_SAMPLE_EMISSIVE = 3;
 public static const uint LIGHT_SAMPLE_DIRECTIONAL = 4;
+// The kind of a candidate of a point light, which a sphere sample of it resolves to: one that
+// no ray meets, so next-event estimation weighs it whole.
+public static const uint LIGHT_SAMPLE_POINT = 5;
 // `LightSample.bits`: the light emits from both faces.
 public static const uint LIGHT_SAMPLE_TWO_SIDED = 4;
 // `LightSample.bits`: the emissive sample's side has a coat or fuzz, which the radiance seen
 // along the shadow ray passes through (`emitter_view_layer`).
 public static const uint LIGHT_SAMPLE_VIEW = 8;
+// `LightSample.bits`, and a flag on a resolved candidate's kind: surfaces cast no shadow from the
+// sphere, point or rect light (LIGHT_UNSHADOWED), so no ray meets it and no shadow ray is traced
+// toward it.
+public static const uint LIGHT_SAMPLE_UNSHADOWED = 16;
 
 // What lighting's scene pass derives per directional light each frame.
 public struct DirectionalState
@@ -113,22 +120,24 @@ public struct EmissiveSelection
 
 // One presampled light sample, 40 B, in render space. Its density includes the selection
 // probability: per m² of the light for rect and emissive samples, per sr (stored negated)
-// for the environment; a sphere sample holds the sphere, whose point is drawn at resolve.
+// for the environment; a sphere sample holds the sphere, whose point is drawn at resolve, or a
+// point light.
 public struct LightSample
 {
-    // Environment: unit direction. Sphere: center. Rect, emissive: a point on the light.
+    // Environment: unit direction. Sphere, point: center. Rect, emissive: a point on the light.
     public float3 point;
-    // Octahedral 2x16 snorm: the normal of the side that emits (rect, emissive) or the spot
-    // axis (sphere).
+    // Octahedral 2x16 snorm: the normal of the side that emits (rect, emissive).
     public uint normal;
-    // Emitted radiance, nits: shared-exponent rgb (`pack_rgb9e5`), times 2^(bits 8-15 - 128).
+    // Emitted radiance, nits, or a point light's intensity, cd: shared-exponent rgb
+    // (`pack_rgb9e5`), times 2^(bits 8-15 - 128). A sphere's, point's or rect's unshaped.
     public uint radiance;
-    // Environment: -(probability per sr). Rect, emissive: probability per m². Sphere: the
-    // light's selection probability. 0: no sample.
+    // Environment: -(probability per sr). Rect, emissive: probability per m². Sphere, point:
+    // the light's selection probability. 0: no sample.
     public float pdf;
     // The light's feedback id (`feedback_environment`).
     public uint light;
-    // Bits 0-1: LIGHT_SAMPLE_*. Bit 2: LIGHT_SAMPLE_TWO_SIDED. Bit 3: LIGHT_SAMPLE_VIEW.
+    // Bits 0-1: LIGHT_SAMPLE_*. Bit 2: LIGHT_SAMPLE_TWO_SIDED. Bit 3: LIGHT_SAMPLE_VIEW. Bit 4:
+    // LIGHT_SAMPLE_UNSHADOWED.
     // Bits 8-15: the radiance exponent + 128. A sphere's radius is its light's.
     public uint bits;
     // Emissive: the position drawn in its entry's list; 0 for other lights.
@@ -269,11 +278,13 @@ public struct ResolvedLightSample
     // Distance to the light's surface; +inf for the environment and directional lights.
     public float distance;
     // Incident radiance along `dir`: 0 when the light faces away; a directional light's
-    // carries the medium's transmittance at the scene focus.
+    // carries the medium's transmittance at the scene focus. A point light's is its illuminance
+    // on a surface facing it.
     public float3 radiance;
-    // Density per sr of this candidate in the vertex's mixture; 0 when there is none.
+    // Density per sr of this candidate in the vertex's mixture, or a point light's probability
+    // in it; 0 when there is none.
     public float pdf;
-    // LIGHT_SAMPLE_*.
+    // LIGHT_SAMPLE_*, a sphere's, point's or rect's with LIGHT_SAMPLE_UNSHADOWED.
     public uint kind;
     // LIGHT_SAMPLE_DIRECTIONAL: the light's LightId; otherwise its feedback id, or NO_LIGHT
     // without a candidate.
@@ -284,7 +295,7 @@ public struct ResolvedLightSample
     public uint triangle;
     // Emissive: LIGHT_SAMPLE_VIEW, the radiance not yet through the side's coat and fuzz.
     public bool view;
-    // Rect, sphere, emissive: the point on the light, render space.
+    // Rect, sphere, point, emissive: the point on the light, render space.
     public float3 point;
 }
 
@@ -661,15 +672,13 @@ LightSample light_sample(uint kind, uint light, float3 point, float3 normal, flo
     return s;
 }
 
-// Spot falloff at `c`, the cosine between the spot axis and the direction from the light;
-// full within the inner angle, none beyond the outer.
-float spot_falloff(float c, float cos_inner, float cos_outer)
+// The balance weight of a candidate of LIGHT_SAMPLE_* `kind` and density `pdf` against a scatter
+// that draws its direction with density `scatter_pdf`: whole for a point light and a light
+// surfaces cast no shadow from, which no ray meets.
+public float nee_weight(uint kind, float pdf, float scatter_pdf)
 {
-    if (cos_outer <= -1.0)
-        return 1.0;
-    if (cos_inner <= cos_outer)
-        return c >= cos_outer ? 1.0 : 0.0;
-    return smoothstep(cos_outer, cos_inner, c);
+    bool unmet = kind == LIGHT_SAMPLE_POINT || (kind & LIGHT_SAMPLE_UNSHADOWED) != 0;
+    return mis_balance(pdf, unmet ? 0.0 : scatter_pdf);
 }
 
 // `x` x `total`, kept below `total`.
@@ -1025,8 +1034,8 @@ EmitterHit emitter_on(LightSetGpu* set, uint entry, uint p, uint triangles, uint
     return h;
 }
 
-// Sample of sphere or rect light `id` from `u`, the light chosen with `probability`: one that
-// `candidate` weighs, so a sphere is a `sphere_light`.
+// Sample of sphere, point or rect light `id` from `u`, the light chosen with `probability`:
+// one that `candidate` weighs, so a sphere is a `sphere_light`.
 LightSample local_sample(LightSetGpu* set, uint id, float2 u, float probability)
 {
     LightGpu l = set.scene.lights[id];
@@ -1035,13 +1044,17 @@ LightSample local_sample(LightSetGpu* set, uint id, float2 u, float probability)
         float3 n = cross(l.edge_x, l.edge_y);
         float area = length(n);
         float3 x = l.position + (u.x - 0.5) * l.edge_x + (u.y - 0.5) * l.edge_y;
-        return light_sample(LIGHT_SAMPLE_RECT, id, x, n / area, l.color, probability / area);
+        LightSample rect = light_sample(LIGHT_SAMPLE_RECT, id, x, n / area, l.color, probability / area);
+        rect.bits |= (l.flags & LIGHT_UNSHADOWED) != 0 ? LIGHT_SAMPLE_UNSHADOWED : 0;
+        return rect;
     }
     float r2;
-    float3 radiance;
-    sphere_light(l, r2, radiance);
-    float3 axis = l.cone_cos_outer > -1.0 ? l.direction : float3(0.0, 0.0, 1.0);
-    return light_sample(LIGHT_SAMPLE_SPHERE, id, l.position, axis, radiance, probability);
+    float3 radiance = l.color;
+    if (l.kind == LIGHT_SPHERE)
+        sphere_light(l, r2, radiance);
+    LightSample sphere = light_sample(LIGHT_SAMPLE_SPHERE, id, l.position, float3(0.0, 0.0, 1.0), radiance, probability);
+    sphere.bits |= (l.flags & LIGHT_UNSHADOWED) != 0 ? LIGHT_SAMPLE_UNSHADOWED : 0;
+    return sphere;
 }
 
 // The environment's feedback id. Sphere and rect lights take their LightId, and emissive
@@ -1196,14 +1209,16 @@ public ResolvedLightSample no_candidate()
 
 // Light sample `s` of `set` seen from `x`: a sphere's point is drawn here with `u`, uniform
 // over the cone the sphere subtends. The density is the sample's, without the vertex's
-// directional share.
+// directional share. A sphere, point or rect light's radiance is shaped along the way it leaves
+// toward `x`.
 public ResolvedLightSample resolve_light_sample(LightSetGpu* set, LightSample s, float3 x, float2 u)
 {
     if (s.pdf == 0.0)
         return no_candidate();
     ResolvedLightSample r = no_candidate();
     uint kind = s.bits & 3;
-    r.kind = kind;
+    uint unshadowed = may2(MAY2_UNSHADOWED_LIGHTS) ? s.bits & LIGHT_SAMPLE_UNSHADOWED : 0;
+    r.kind = kind | unshadowed;
     r.light = s.light;
     r.position = s.position;
     r.triangle = s.triangle;
@@ -1220,6 +1235,20 @@ public ResolvedLightSample resolve_light_sample(LightSetGpu* set, LightSample s,
     if (kind == LIGHT_SAMPLE_SPHERE)
     {
         LightGpu* light = set.scene.lights + s.light;
+        if (light.kind == LIGHT_POINT)
+        {
+            float3 v = s.point - x;
+            float d2 = dot(v, v);
+            if (!(d2 > 0.0))
+                return no_candidate();
+            r.kind = LIGHT_SAMPLE_POINT | unshadowed;
+            r.distance = sqrt(d2);
+            r.dir = v / r.distance;
+            r.point = s.point;
+            r.radiance = l * light_shaping(light, -r.dir) / d2;
+            r.pdf = s.pdf;
+            return r;
+        }
         float3 to_center = s.point - x;
         float d2 = dot(to_center, to_center);
         float r2 = light.radius * light.radius;
@@ -1237,8 +1266,7 @@ public ResolvedLightSample resolve_light_sample(LightSetGpu* set, LightSample s,
         float3 h = to_center - b * r.dir;
         r.distance = b - sqrt(max(0.0, r2 - dot(h, h)));
         r.point = x + r.dir * r.distance;
-        float c = dot(oct_decode_snorm16(s.normal), -axis);
-        r.radiance = l * spot_falloff(c, light.cone_cos_inner, light.cone_cos_outer);
+        r.radiance = l * light_shaping(light, -r.dir);
         r.pdf = s.pdf * cone_pdf(one_minus_cos);
         return r;
     }
@@ -1254,6 +1282,8 @@ public ResolvedLightSample resolve_light_sample(LightSetGpu* set, LightSample s,
         return no_candidate();
     bool lit = cos_light > 0.0 || (s.bits & LIGHT_SAMPLE_TWO_SIDED) != 0;
     r.radiance = lit ? l : float3(0.0);
+    if (kind == LIGHT_SAMPLE_RECT && lit)
+        r.radiance *= light_shaping(set.scene.lights + s.light, -r.dir);
     r.pdf = s.pdf * d2 / abs(cos_light);
     return r;
 }
@@ -1483,9 +1513,9 @@ public float local_light_density(LightSetGpu* set, uint id, float3 x, float3 dir
 }
 
 // Where a ray from `origin` along unit `dir` first meets sphere or rect light `id`, before
-// `t_max`, and the radiance it sees there from a vertex at `from`: a sphere's by the spot
-// falloff toward `from`, a rect's front alone. False on a miss.
-public bool light_proxy_hit(LightSetGpu* set, uint id, float3 origin, float3 dir, float t_max, float3 from, out float t, out float3 radiance)
+// `t_max`, and the radiance it sees there, shaped along `-dir`: a rect's front alone. False on
+// a miss.
+public bool light_proxy_hit(LightSetGpu* set, uint id, float3 origin, float3 dir, float t_max, out float t, out float3 radiance)
 {
     LightGpu l = set.scene.lights[id];
     t = 0.0;
@@ -1506,11 +1536,7 @@ public bool light_proxy_hit(LightSetGpu* set, uint id, float3 origin, float3 dir
             t = -b + q;
         if (!(t > 0.0) || !(t < t_max))
             return false;
-        float3 away = from - l.position;
-        // The axis as tile samples store it.
-        float3 axis = oct_decode_snorm16(oct_encode_snorm16(l.cone_cos_outer > -1.0 ? l.direction : float3(0.0, 0.0, 1.0)));
-        float c = dot(axis, normalize(away));
-        radiance = emitted * spot_falloff(c, l.cone_cos_inner, l.cone_cos_outer);
+        radiance = emitted * light_shaping(set.scene.lights + id, -dir);
         return true;
     }
     if (l.kind != LIGHT_RECT)
@@ -1525,7 +1551,7 @@ public bool light_proxy_hit(LightSetGpu* set, uint id, float3 origin, float3 dir
     float ey = dot(q, l.edge_y) / dot(l.edge_y, l.edge_y);
     if (!(t > 0.0) || !(t < t_max) || abs(ex) > 0.5 || abs(ey) > 0.5)
         return false;
-    radiance = dn < 0.0 ? l.color : float3(0.0);
+    radiance = dn < 0.0 ? l.color * light_shaping(set.scene.lights + id, -dir) : float3(0.0);
     return true;
 }
 

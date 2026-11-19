@@ -472,7 +472,7 @@ public struct PathEmission : ITranslucent
             float3 l;
             float t;
             uint id = c.instance_index - scene.light_base;
-            if (!adds || c.class_id != CLASS_LIGHT || id >= scene.light_capacity || !light_proxy_hit(set, id, origin, dir, t_max, from, t, l) || !any(l > 0.0))
+            if (!adds || c.class_id != CLASS_LIGHT || id >= scene.light_capacity || !light_proxy_hit(set, id, origin, dir, t_max, t, l) || !any(l > 0.0))
                 return float4(0.0);
             c.t = t;
             float w = 1.0;

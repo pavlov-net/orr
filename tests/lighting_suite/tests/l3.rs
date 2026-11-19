@@ -19,10 +19,10 @@ use orr_lighting::{
 use orr_math::{Affine3, DVec3, Mat3, Vec3};
 use orr_pack::texture::octahedral;
 use orr_scene::{
-    ClusterTopology, Cone, EmissiveGpu, EnvironmentData, FrameDesc, FrameTime, GroupWriter,
+    ClusterTopology, EmissiveGpu, EnvironmentData, FrameDesc, FrameTime, GroupWriter,
     InstanceFlags, LightTables, MaterialGpu, MaterialId, MaterialWriter, Opacity, ProducerBatch,
     ProducerClusterGpu, ProducerDesc, ProducerId, ProducerUpdate, SceneCompute, SceneDesc,
-    SceneWriter, TransformGroupDesc, material_flags,
+    SceneWriter, Shaping, TransformGroupDesc, material_flags,
 };
 use shader_math::stats::chi_square_p;
 
@@ -222,7 +222,8 @@ fn tiles(scene: &TestScene, lighting: &mut SceneLighting, bins: &Bins) -> Tiles 
             mismatches.as_slice().unwrap()[0],
             n,
         ),
-        irradiance: (mean, ((sum2 / n - mean * mean) / n).sqrt()),
+        // A point light's samples are all alike, whose variance can round below 0.
+        irradiance: (mean, ((sum2 / n - mean * mean).max(0.0) / n).sqrt()),
     }
 }
 
@@ -288,11 +289,14 @@ fn sphere_tiles_match_the_density_and_irradiance() {
                 position: a,
                 radius: 0.5,
                 intensity: Vec3::new(100.0, 80.0, 60.0),
-                cone: Some(Cone {
-                    direction: -Vec3::Y,
-                    inner: 30f32.to_radians(),
-                    outer: 40f32.to_radians(),
+                shaping: Some(Shaping {
+                    axis: -Vec3::Y,
+                    cone_angle: 40f32.to_radians(),
+                    cone_softness: 0.25,
+                    focus: 0.0,
+                    focus_tint: Vec3::ZERO,
                 }),
+                shadows: true,
             },
         );
         add_light_at(
@@ -302,7 +306,8 @@ fn sphere_tiles_match_the_density_and_irradiance() {
                 position: b,
                 radius: 0.25,
                 intensity: Vec3::splat(500.0),
-                cone: None,
+                shaping: None,
+                shadows: true,
             },
         );
     });
@@ -338,6 +343,8 @@ fn rect_tiles_match_the_density_and_irradiance() {
             edge_x: ex,
             edge_y: ey,
             luminance: Vec3::new(3000.0, 2500.0, 2000.0),
+            shaping: None,
+            shadows: true,
         })
         .unwrap();
         // Faces away from the receiver: sampled, but it adds no irradiance.
@@ -349,6 +356,8 @@ fn rect_tiles_match_the_density_and_irradiance() {
                 edge_x: Vec3::new(0.0, 0.0, 0.6),
                 edge_y: Vec3::new(0.6, 0.0, 0.0),
                 luminance: Vec3::splat(500.0),
+                shaping: None,
+                shadows: true,
             },
         );
     });
@@ -368,6 +377,129 @@ fn rect_tiles_match_the_density_and_irradiance() {
     ];
     let y = y2020(scene.lights()[0].color);
     t.assert_irradiance(polygon_irradiance(&corners, DVec3::Y, y), "rects");
+    assert_clean();
+}
+
+/// Bins of nothing but the irradiance on a surface facing +Y at `receiver`.
+fn facing_up(receiver: Vec3) -> Bins {
+    Bins {
+        receiver,
+        ..Bins::around_y(PI, 1, 1)
+    }
+}
+
+/// A point light's tile samples give a receiver on a plane below it its intensity x cos / d²,
+/// at any distance and angle: no ray meets the point, so its samples carry it whole.
+#[test]
+fn point_tiles_give_inverse_square_irradiance_on_a_plane() {
+    let mut scene = TestScene::new(SceneDesc::default());
+    let light = DVec3::new(0.3, 2.0, -0.2);
+    scene.write(|w, _| {
+        w.add_light(&Light::Point {
+            position: light,
+            intensity: Vec3::new(100.0, 80.0, 60.0),
+            shaping: None,
+            shadows: true,
+        })
+        .unwrap();
+    });
+    let mut lighting = scene.lighting();
+    let y = y2020(scene.lights()[0].color);
+    for x in [0.0, 1.0, 3.0, 8.0] {
+        let receiver = Vec3::new(x, 0.0, 0.5);
+        let t = tiles(&scene, &mut lighting, &facing_up(receiver));
+        let v = light - receiver.as_dvec3();
+        let e = y * v.normalize().y / v.length_squared();
+        t.assert_irradiance(e, &format!("point over x = {x}"));
+    }
+    assert_clean();
+}
+
+/// UsdLux `ShapingAPI` as `usdLux/schema.usda` (OpenUSD v26.05) defines it, at `theta` rad off
+/// the axis: `lerp(tint, 1, |cos θ|^focus) x (1 - smoothstep(θ, cone (1 - softness), cone))`,
+/// 0 past the cone; a gray tint, so it is one factor in any primaries.
+fn usdlux_shaping(s: &Shaping, theta: f64) -> f64 {
+    let cone = f64::from(s.cone_angle);
+    if theta > cone {
+        return 0.0;
+    }
+    let tint = f64::from(s.focus_tint.x);
+    let focus = theta.cos().abs().powf(f64::from(s.focus));
+    let start = cone * (1.0 - f64::from(s.cone_softness));
+    let t = ((theta - start) / (cone - start)).clamp(0.0, 1.0);
+    (tint + (1.0 - tint) * focus) * (1.0 - t * t * (3.0 - 2.0 * t))
+}
+
+/// A shaped point and a shaped sphere, 2 m above a plane and aimed straight down, light it
+/// across their cone's edge as `ShapingAPI` shapes each direction light leaves along: the
+/// point by its one direction, the sphere over the directions from its surface to the receiver.
+#[test]
+fn shaped_lights_fall_off_across_the_cone_edge_as_usdlux_defines() {
+    let shaping = Shaping {
+        axis: -Vec3::Y,
+        cone_angle: 30f32.to_radians(),
+        cone_softness: 0.5,
+        focus: 3.0,
+        focus_tint: Vec3::splat(0.25),
+    };
+    let center = DVec3::new(0.0, 2.0, 0.0);
+    let radius = 0.25;
+    let angles = [0.0f64, 10.0, 18.0, 24.0, 28.0, 31.0, 36.0];
+    for sphere in [false, true] {
+        let mut scene = TestScene::new(SceneDesc::default());
+        scene.write(|w, _| {
+            let intensity = Vec3::new(400.0, 300.0, 200.0);
+            let light = match sphere {
+                false => Light::Point {
+                    position: center,
+                    intensity,
+                    shaping: Some(shaping),
+                    shadows: true,
+                },
+                true => Light::Sphere {
+                    position: center,
+                    radius,
+                    intensity,
+                    shaping: Some(shaping),
+                    shadows: true,
+                },
+            };
+            w.add_light(&light).unwrap();
+        });
+        let mut lighting = scene.lighting();
+        let y = y2020(scene.lights()[0].color);
+        for deg in angles {
+            let x = 2.0 * deg.to_radians().tan();
+            let receiver = DVec3::new(x, 0.0, 0.0);
+            let to = center - receiver;
+            let e = if sphere {
+                // Over the sphere's cone of directions ω from the receiver, its luminance
+                // shaped along -ω, x cos to +Y: midpoint quadrature in 1 - cos and azimuth.
+                let luminance = y / (PI * f64::from(radius).powi(2));
+                let (d, n) = (to.length(), 512);
+                let omc = 1.0 - (1.0 - (f64::from(radius) / d).powi(2)).sqrt();
+                let (t, b) = to.normalize().any_orthonormal_pair();
+                let mut sum = 0.0;
+                for i in 0..n {
+                    let u = omc * (f64::from(i) + 0.5) / f64::from(n);
+                    let (cos, sin) = (1.0 - u, (u * (2.0 - u)).sqrt());
+                    for j in 0..n {
+                        let phi = 2.0 * PI * (f64::from(j) + 0.5) / f64::from(n);
+                        let w = to.normalize() * cos + (t * phi.cos() + b * phi.sin()) * sin;
+                        let theta = (-w).dot(DVec3::NEG_Y).clamp(-1.0, 1.0).acos();
+                        sum += usdlux_shaping(&shaping, theta) * w.y.max(0.0);
+                    }
+                }
+                luminance * sum * 2.0 * PI * omc / f64::from(n * n)
+            } else {
+                y * usdlux_shaping(&shaping, deg.to_radians()) * to.normalize().y
+                    / to.length_squared()
+            };
+            let what = format!("{} at {deg} deg", if sphere { "sphere" } else { "point" });
+            tiles(&scene, &mut lighting, &facing_up(receiver.as_vec3()))
+                .assert_irradiance(e, &what);
+        }
+    }
     assert_clean();
 }
 
@@ -774,7 +906,8 @@ fn local_sampler_candidates_match_the_hit_side_density() {
                     position: DVec3::new(0.0, 2.5, 1.5),
                     radius: 0.2,
                     intensity: Vec3::splat(300.0),
-                    cone: None,
+                    shaping: None,
+                    shadows: true,
                 },
             );
         },
@@ -856,7 +989,8 @@ fn directional_share_matches_the_lights_weights() {
             position: DVec3::new(0.0, 4.0, 0.0),
             radius: 0.1,
             intensity: Vec3::splat(50.0),
-            cone: None,
+            shaping: None,
+            shadows: true,
         };
         let directional = ids
             .iter()
@@ -1001,7 +1135,8 @@ fn selection_probabilities_follow_power_and_sum_to_one() {
                 position: DVec3::new(f64::from(id), 3.0, 0.0),
                 radius: 0.2,
                 intensity: Vec3::splat(i),
-                cone: None,
+                shaping: None,
+                shadows: true,
             };
             let directional = |id: u32| {
                 Light::Directional(DirectionalLight {
@@ -1016,6 +1151,8 @@ fn selection_probabilities_follow_power_and_sum_to_one() {
                 edge_x: Vec3::new(2.0, 0.0, 0.0),
                 edge_y: Vec3::new(0.0, 0.0, 0.5),
                 luminance: Vec3::splat(2000.0),
+                shaping: None,
+                shadows: true,
             };
             // Ids 1 and 5 stay empty.
             for (id, l) in [
@@ -1410,7 +1547,8 @@ fn light_feedback_blends_into_the_selection_and_clears_on_a_reset() {
                     position: DVec3::new(f64::from(id), 3.0, 0.0),
                     radius: 0.2,
                     intensity: Vec3::splat(i),
-                    cone: None,
+                    shaping: None,
+                    shadows: true,
                 },
             );
         }
@@ -1500,7 +1638,8 @@ fn grow_tables(in_flight: bool) -> (Vec<Passed>, LightTables, [[f64; 3]; 2]) {
         position: DVec3::new(f64::from(id), 3.0, 0.0),
         radius: 0.2,
         intensity: Vec3::splat(100.0 + id as f32),
-        cone: None,
+        shaping: None,
+        shadows: true,
     };
     let p = pipeline(&emit::MODULE, "main");
     scene.frame(

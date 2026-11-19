@@ -1072,11 +1072,13 @@ public static const uint LIGHT_JOB = 0x80000000;
 
 // The placement of light `l`'s proxy: the proxy BLAS's cube [-1, 1]^3 around a `sphere_light`,
 // or flat around a rect, a little larger so its box holds every point light sampling and hits
-// test.
+// test. A light surfaces cast no shadow from has none.
 bool light_placement(LightGpu l, out Placement pl)
 {
     pl = Placement();
     pl.translation = l.position;
+    if ((l.flags & LIGHT_UNSHADOWED) != 0)
+        return false;
     float r2;
     float3 radiance;
     if (sphere_light(l, r2, radiance))

@@ -424,7 +424,8 @@ fn lights_move_with_the_render_origin() {
         position: far,
         radius: 0.1,
         intensity: Vec3::new(1.0, 0.0, 0.0),
-        cone: None,
+        shaping: None,
+        shadows: true,
     };
     let origin_of = |root: &SceneRoot| {
         DVec3::new(
@@ -439,6 +440,8 @@ fn lights_move_with_the_render_origin() {
         edge_x: Vec3::X,
         edge_y: Vec3::Z,
         luminance: Vec3::ONE,
+        shaping: None,
+        shadows: true,
     };
     let sun = Light::Directional(orr_scene::DirectionalLight {
         direction_to_light: Vec3::Y,

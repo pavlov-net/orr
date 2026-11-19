@@ -101,7 +101,7 @@ pub use drawn::{OpaqueHook, OpaquePass};
 pub use edit::{EditDesc, EditId, EditRef};
 pub use features::SceneFeatures;
 pub use hits::HitGroups;
-pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId, LightTables};
+pub use lights::{DirectionalLight, DiscProfile, Light, LightId, LightTables, Shaping};
 pub use loading::{JobResult, Loading, ReadArenaStats, Urgency};
 pub use material::{
     BoundTexture, MaterialId, MaterialWriter, binding_sampler, material_flags, material_lobes,

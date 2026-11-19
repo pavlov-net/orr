@@ -29,7 +29,7 @@ impl SceneFeatures {
     pub const MEDIUM_PROXIES: Self = Self(1 << 4);
     /// The scene holds a directional light.
     pub const DIRECTIONAL_LIGHTS: Self = Self(1 << 5);
-    /// The scene holds a sphere or rect light.
+    /// The scene holds a sphere, point or rect light.
     pub const LOCAL_LIGHTS: Self = Self(1 << 6);
     /// The scene holds a smoke entry: a view's [`RasterView::smoke_args`](crate::RasterView)
     /// is then set.
@@ -116,6 +116,10 @@ impl SceneFeatures {
     /// The environment's exact radiance is a draw ([`crate::EnvironmentData::DRAWN`]), which
     /// the accumulation reference takes by its paths' rays alone.
     pub const DRAWN_ENVIRONMENT: Self = Self(1 << 39);
+    /// The scene holds a light surfaces cast no shadow from.
+    pub const UNSHADOWED_LIGHTS: Self = Self(1 << 40);
+    /// The scene holds a light whose emission a cone or focus shapes.
+    pub const SHAPED_LIGHTS: Self = Self(1 << 41);
     /// What a mesh keeps from the material it was built with, whatever the record holds now:
     /// once a record has shown one of these, the table keeps it.
     const BUILT: Self = Self(Self::LAYERS.0 | Self::COVERAGE.0);
@@ -145,6 +149,8 @@ impl SceneFeatures {
             (Self::LOBE_FACTORS, 1 << 14),
             (Self::LINKED_LOBE_FACTORS, 1 << 15),
             (Self::LINKED_TRANSMISSION_FACTORS, 1 << 16),
+            (Self::UNSHADOWED_LIGHTS, 1 << 17),
+            (Self::SHAPED_LIGHTS, 1 << 18),
         ] {
             if !self.contains(feature) {
                 ruled_out |= bit;

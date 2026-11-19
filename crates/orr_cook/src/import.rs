@@ -54,14 +54,21 @@ pub(crate) struct Scene {
     /// How the skeletons' clips are resampled.
     pub(crate) clips: ClipSettings,
     pub(crate) instances: Vec<PlacedModel>,
-    /// The source's groups, and its partitions by the ascending groups that hold them: the
-    /// layout ([`orr_pack::layout`]) a scene source cooks. No partitions: the source cooks no
-    /// layout.
+    /// The source's groups and partitions: the layout ([`orr_pack::layout`]) a scene source
+    /// cooks. No partitions: the source cooks no layout.
     pub(crate) groups: Vec<orr_pack::layout::Group>,
-    pub(crate) partitions: Vec<Vec<u32>>,
+    pub(crate) partitions: Vec<ScenePartition>,
     /// Every file read.
     pub(crate) files: Vec<Input>,
     pub(crate) warnings: Vec<String>,
+}
+
+/// A partition of a scene source: the groups that hold it, ascending, and its lights in scene
+/// space.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ScenePartition {
+    pub(crate) groups: Vec<u32>,
+    pub(crate) lights: Vec<orr_pack::layout::LightSource>,
 }
 
 impl Scene {

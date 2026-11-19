@@ -1152,7 +1152,7 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     {
         float3 radiance = k.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(r.set, k.light, k.dir) : k.radiance;
         float W = k.sum / (float(k.drawn) * k.target);
-        float mis = mode.one_technique ? 1.0 : mis_balance(run * k.pdf, k.scatter_pdf);
+        float mis = mode.one_technique ? 1.0 : nee_weight(k.kind, run * k.pdf, k.scatter_pdf);
         float3 origin = vertex_origin(x, k.dir);
         bool far = !isfinite(k.distance);
         float3 e = throughput * k.f * radiance * (W * mis / run);
@@ -1732,7 +1732,8 @@ public bool path_photon_start<M : IMedium>(PathRoot r, uint slot, out float reac
     store_coherent(at + 2, uint4(0));
     store_coherent(at + 3, uint4(0));
     store_coherent(at + 4, uint4(asuint(light.origin), asuint(light.t_max)));
-    store_coherent(at + 5, uint4(asuint(light.dir), 0));
+    bool unshadowed = may2(MAY2_UNSHADOWED_LIGHTS) && (c.kind & LIGHT_SAMPLE_UNSHADOWED) != 0;
+    store_coherent(at + 5, uint4(asuint(light.dir), unshadowed ? PHOTON_UNSHADOWED : 0));
     if (may(MAY_STACK))
         store_coherent(path_stack(r, slot) + STACK_TRACK_WORD, uint4(oct_encode_snorm16(p.dir), 0, 0, p.directional && path_stacks(r) ? 1 : 0));
     if (path_disperses(r))
@@ -1972,7 +1973,7 @@ float3 picked_light(PathRoot r, LightPick k, float3 throughput, float run, bool 
 {
     float3 radiance = k.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(r.set, k.light, k.dir) : k.radiance;
     float W = k.sum / (float(k.drawn) * k.target);
-    float mis = weight_one ? 1.0 : mis_balance(run * k.pdf, k.scatter_pdf);
+    float mis = weight_one ? 1.0 : nee_weight(k.kind, run * k.pdf, k.scatter_pdf);
     before = throughput * radiance * (W / run);
     return before * k.f * mis;
 }
@@ -3380,7 +3381,7 @@ public bool path_light_box(PathRoot r, uint instance_index, float3 origin, float
     t = 0.0;
     uint id = instance_index - r.scene.light_base;
     float3 radiance;
-    return id < r.scene.light_capacity && light_proxy_hit(r.set, id, origin, dir, t_max, origin, t, radiance) && t >= t_min && any(radiance > 0.0);
+    return id < r.scene.light_capacity && light_proxy_hit(r.set, id, origin, dir, t_max, t, radiance) && t >= t_min && any(radiance > 0.0);
 }
 
 // Where a ray inside an interior's medium of extinction `sigma_t` scatters, by `rng`: a free flight

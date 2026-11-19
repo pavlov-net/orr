@@ -117,7 +117,8 @@ impl Bench {
                     position: STEP_POSITION,
                     radius: 0.1,
                     intensity: Vec3::splat(STEP_INTENSITY),
-                    cone: None,
+                    shaping: None,
+                    shadows: true,
                 };
                 self.step_light = Some(writer.add_light(&light).expect("step light"));
             }

@@ -460,6 +460,22 @@ impl PrimReader<'_> {
             .map_err(|e| format!("{} {name}: {e}", self.path()))
     }
 
+    /// Whether attribute `name` holds time samples of more than one value.
+    pub(super) fn varies(&self, name: &str) -> Result<bool, String> {
+        let times = self.prim.attribute(name).time_sample_times();
+        let times = times.map_err(|e| format!("{} {name}: {e}", self.path()))?;
+        let Some((&first, rest)) = times.split_first() else {
+            return Ok(false);
+        };
+        let value = self.at(first).value(name)?;
+        for &t in rest {
+            if self.at(t).value(name)? != value {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The times the prim's `xformOpOrder` ops are sampled at, in order; none where each op holds
     /// one value. Values tell that and matrices can't: a full turn ends where it began.
     pub(super) fn xform_times(&self) -> Result<Vec<f64>, String> {

@@ -3492,13 +3492,16 @@ pub fn light_bed() -> Bed {
                 position: DVec3::new(-0.6, 1.2, -0.5),
                 radius: 0.15,
                 intensity: Vec3::splat(40.0),
-                cone: None,
+                shaping: None,
+                shadows: true,
             },
             Light::Rect {
                 center: DVec3::new(0.6, 1.2, -0.5),
                 edge_x: Vec3::new(0.4, 0.0, 0.0),
                 edge_y: Vec3::new(0.0, 0.0, 0.3),
                 luminance: Vec3::splat(200.0),
+                shaping: None,
+                shadows: true,
             },
         ],
         environment: None,
@@ -3507,6 +3510,61 @@ pub fn light_bed() -> Bed {
         fov_y: 0.8,
         focus: None,
     })
+}
+
+/// A white floor lit by `light` 6 m above it, with `occluded` a sphere of 0.5 m 1.5 m below the
+/// light in its way, which the view does not see.
+pub fn occluded_light_spec(light: Light, occluded: bool) -> Spec {
+    let mut copies = vec![item_at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)];
+    if occluded {
+        copies.push(item_at(
+            WHITE_SPHERE,
+            Mat3::from_diagonal(Vec3::splat(0.5)),
+            Vec3::new(0.0, 4.5, 0.0),
+        ));
+    }
+    Spec {
+        copies,
+        lights: vec![light],
+        environment: None,
+        ..Analytic::SunAndGround.spec()
+    }
+}
+
+/// [`occluded_light_spec`]'s occluded floor under a sphere light that surfaces cast no shadow
+/// from.
+pub fn unshadowed_bed() -> Bed {
+    Bed::with(occluded_light_spec(
+        Light::Sphere {
+            position: DVec3::new(0.0, 6.0, 0.0),
+            radius: 0.05,
+            intensity: Vec3::splat(400.0),
+            shaping: None,
+            shadows: false,
+        },
+        true,
+    ))
+}
+
+/// [`occluded_light_spec`]'s open floor under a sphere light aimed straight down, its cone 30
+/// degrees, half of it soft, with focus.
+pub fn shaped_bed() -> Bed {
+    Bed::with(occluded_light_spec(
+        Light::Sphere {
+            position: DVec3::new(0.0, 6.0, 0.0),
+            radius: 0.05,
+            intensity: Vec3::splat(400.0),
+            shaping: Some(orr_scene::Shaping {
+                axis: -Vec3::Y,
+                cone_angle: 30f32.to_radians(),
+                cone_softness: 0.5,
+                focus: 2.0,
+                focus_tint: Vec3::splat(0.25),
+            }),
+            shadows: true,
+        },
+        false,
+    ))
 }
 
 /// The sun through a smoke plume's medium proxy.

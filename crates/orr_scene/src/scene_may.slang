@@ -60,6 +60,11 @@ public static const uint MAY2_LINKED_LOBE_FACTORS = 1 << 15;
 // A material of a linked type that may leave a hit to the standard surface transmits by its own
 // weight. No shader tests it.
 public static const uint MAY2_LINKED_TRANSMISSION_FACTORS = 1 << 16;
+// The scene may hold a sphere, point or rect light that surfaces cast no shadow from
+// (LIGHT_UNSHADOWED).
+public static const uint MAY2_UNSHADOWED_LIGHTS = 1 << 17;
+// The scene may hold a sphere, point or rect light whose emission a cone or focus shapes.
+public static const uint MAY2_SHAPED_LIGHTS = 1 << 18;
 
 public bool may2(uint bit)
 {

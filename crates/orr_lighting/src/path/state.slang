@@ -259,6 +259,10 @@ public static const uint CALL_SKY = 16;
 // a full scene links, linked surface types and water among them.
 [Host] public static const uint PIPELINE_INSTRUCTIONS = 1500000;
 
+// A caustic photon's hot word 5's last word where surfaces cast no shadow from its light: its ray
+// toward the light is not traced.
+public static const uint PHOTON_UNSHADOWED = 1;
+
 // `PathHot.flags`.
 public static const uint HOT_SHADOW = 1 << 0;       // a shadow job is pending: the raygen traces it before the path's ray
 public static const uint HOT_SHADOW_FAR = 1 << 1;   // its target is a direction: the light lies at infinity

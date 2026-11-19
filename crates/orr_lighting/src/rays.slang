@@ -48,6 +48,8 @@ public static const uint JOB_BEND = 1u << 24;
 // The hit context's: HIT_PRIMARY in place of HIT_SECONDARY, and texture feedback.
 public static const uint JOB_PRIMARY = 1u << 25;
 public static const uint JOB_FEEDBACK = 1u << 26;
+// A shadow ray of a light surfaces cast no shadow from: it meets medium proxies alone.
+public static const uint JOB_MEDIA_ONLY = 1u << 27;
 
 // Job kinds.
 public static const uint RAY_SHADOW = 0;
@@ -277,7 +279,8 @@ public ShadowResult trace_shadow<S : ISurfaces>(SceneRoot* s, ViewConstants* v, 
     float3 product = float3(1.0);
     bool overflow = false;
     bool flagged = false;
-    uint mask = mode == SHADOW_UNBENT ? SHADOW_MASK & ~MASK_DIELECTRIC : SHADOW_MASK;
+    bool media_only = (job.flags & JOB_MEDIA_ONLY) != 0;
+    uint mask = media_only ? MASK_MEDIUM : mode == SHADOW_UNBENT ? SHADOW_MASK & ~MASK_DIELECTRIC : SHADOW_MASK;
     uint pass_flags = flags;
     for (uint pass = 0; pass < 2; pass++)
     {
@@ -295,7 +298,7 @@ public ShadowResult trace_shadow<S : ISurfaces>(SceneRoot* s, ViewConstants* v, 
         product *= p;
         overflow = overflow || more;
         flagged = h.flagged && !all(product == 0.0);
-        if (pass == 1)
+        if (pass == 1 || media_only)
             break;
         if (mode == SHADOW_UNBENT)
         {
@@ -358,7 +361,7 @@ public float3 shadow_full<S : ISurfaces, M : IMedium, let MODE : uint>(SceneRoot
         return stack.transmittance;
     }
     stack = straight_light(job.direction);
-    return surface_visibility<S, M, MODE>(s, v, job.origin, job.direction, job.t_max, flags, context, job_environment(job), inside, overflows, depth);
+    return surface_visibility<S, M, MODE>(s, v, job.origin, job.direction, job.t_max, flags, context, job_environment(job), inside, overflows, depth, (job.flags & JOB_MEDIA_ONLY) != 0);
 }
 
 // Lane `lane` of workgroup `group` of a thin shadow tracer: traces its job where it

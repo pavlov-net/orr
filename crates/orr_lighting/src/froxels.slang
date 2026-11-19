@@ -864,10 +864,11 @@ public void froxel_walk<S : ISurfaces>(FroxelRoot r, uint k)
     r.around[k] = EyeInterior(around);
 }
 
-// Draws the light reaching listed froxel `k`, where `valid`: its sample point, the local winner
-// and the shadowed lights' directions, and writes its shadow rays as jobs, light j's at
-// j x `active` + k and the winner's appended after the shadowed lights'. Every lane of a wave
-// takes part.
+// Draws the light reaching listed froxel `k`, where `valid`: its sample point, the light that
+// takes no shadow ray, the local winner and the shadowed lights' directions, and writes its
+// shadow rays as jobs, light j's at j x `active` + k and the winner's appended after the
+// shadowed lights'. The ray of a winner surfaces cast no shadow from meets media alone. Every
+// lane of a wave takes part.
 public void froxel_sample_rays<S : ISurfaces>(FroxelRoot r, uint k, bool valid)
 {
     uint count = r.lights.count;
@@ -896,6 +897,8 @@ public void froxel_sample_rays<S : ISurfaces>(FroxelRoot r, uint k, bool valid)
             // The baked environment carries the medium, as next-event estimation takes it.
             bool environment = local.chosen.kind == LIGHT_SAMPLE_ENVIRONMENT;
             winner = shadow_job(x, local.chosen.dir, local.t_max, FROXEL_RAY_FLAGS, SHADOW_UNBENT, froxel_ray_context(), environment, false, k);
+            if (may2(MAY2_UNSHADOWED_LIGHTS) && (local.chosen.kind & LIGHT_SAMPLE_UNSHADOWED) != 0)
+                winner.flags |= JOB_MEDIA_ONLY;
             out.radiance = local.radiance;
             out.scale = local.scale;
             if (local.chosen.view)

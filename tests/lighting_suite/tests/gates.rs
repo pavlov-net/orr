@@ -6,7 +6,7 @@ use std::any::Any;
 use lighting_suite::bed::{
     Analytic, Bed, EXTENT, FrostGuide, GLOSSY_FLOOR, Gate, Item, NEAR, Paths, SUN, Spec, WATER_BOX,
     assert_gate, glass_scene, light_bed, particle_bed, plane_stack_spec, plume_bed,
-    producer_stack_bed, reference,
+    producer_stack_bed, reference, shaped_bed, unshadowed_bed,
 };
 use lighting_suite::{assert_clean, texture, upload};
 use orr_gpu::KernelSet;
@@ -268,6 +268,20 @@ fn gates() -> Vec<Row> {
             reference(2),
         ),
         row(
+            "a light a cone shapes",
+            &[view | u64::from(MAY_LOCAL_LIGHTS) | may2(SceneFeatures::SHAPED_LIGHTS)],
+            shaped_bed,
+            plain,
+            real_time,
+        ),
+        row(
+            "a light surfaces cast no shadow from",
+            &[view | u64::from(MAY_LOCAL_LIGHTS) | may2(SceneFeatures::UNSHADOWED_LIGHTS)],
+            unshadowed_bed,
+            plain,
+            real_time,
+        ),
+        row(
             "plane stack on a producer entry",
             &[view | u64::from(MAY_STACK | MAY_LAYERS) | may2(SceneFeatures::PRODUCERS)],
             producer_stack_bed,
@@ -313,8 +327,9 @@ fn specialized_pipelines_launch_the_paths_the_general_one_does_through_layers() 
     gate_rows(16..20);
 }
 
-/// As above, through a producer entry's glass.
+/// As above, through a producer entry's glass, and from a shaped light and a light surfaces
+/// cast no shadow from.
 #[test]
 fn specialized_pipelines_launch_the_paths_the_general_one_does_through_producer_glass() {
-    gate_rows(20..21);
+    gate_rows(20..23);
 }

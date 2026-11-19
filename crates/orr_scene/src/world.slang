@@ -19,6 +19,6 @@ void rebase_lights(uint3 id: SV_DispatchThreadID)
     if (id.x >= s.light_capacity)
         return;
     LightGpu* l = s.lights + id.x;
-    if (l.kind == LIGHT_SPHERE || l.kind == LIGHT_RECT)
+    if (l.kind == LIGHT_SPHERE || l.kind == LIGHT_POINT || l.kind == LIGHT_RECT)
         l.position = float3((l.cell - s.origin_cell.xyz) << uint(s.origin_cell.w)) + l.offset;
 }

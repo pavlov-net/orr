@@ -2449,7 +2449,7 @@ fn plan_scene(
     }
     let mut instances = Vec::new();
     let mut partitions = Vec::with_capacity(src.partitions.len());
-    for ((groups, models), posed) in src.partitions.into_iter().zip(placed).zip(posed) {
+    for ((part, models), posed) in src.partitions.into_iter().zip(placed).zip(posed) {
         let first = instances.len();
         let (alone, shared): (Vec<_>, Vec<_>) = models.into_iter().partition(|m| m.alone);
         // Pages of a model with a skeleton or that hang from a joint are the consumer's to place.
@@ -2476,10 +2476,11 @@ fn plan_scene(
                 .collect()
         };
         partitions.push(layout::Partition {
-            groups,
+            groups: part.groups,
             sources: ids(first..plain_end),
             posed_sources: ids(plain_end..instances.len()),
             posed,
+            lights: part.lights,
             ..layout::Partition::default()
         });
     }

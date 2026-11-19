@@ -2562,3 +2562,445 @@ def Scope "Layers"
         );
     }
 }
+
+/// UsdLux lights cook into their partitions' layout records in scene space, each value as the
+/// UsdLux schema (OpenUSD v26.05 `usdLux/schema.usda`) defines it: luminance `intensity ·
+/// 2^exposure · color`, divided under `normalize` by the world-space area (a sphere's 4π r², a
+/// rect's width x height) or a distant light's π sin²θmax; a sphere emits that luminance over
+/// its disc π r²; lights emit along their −Z axis; a DistantLight's `angle` is a diameter in
+/// degrees; `ShapingAPI` takes its fallbacks where applied; a normalized sphere of radius 0 is
+/// the point every larger one is from afar; `colorTemperature` is white at 6500 K; ShadowAPI's
+/// `shadow:enable` turns shadows off. Invisible lights are not cooked,
+/// a light in a group lands in its partition, and a prototype's light lands once per copy.
+#[test]
+fn usd_lights_cook_into_layout_records_as_usdlux_defines_them() {
+    use orr_cook::GroupSpec;
+    use orr_math::Vec3;
+    use orr_pack::layout::{LayoutInfo, LightSource, ShapingSource};
+    use orr_pack::names;
+    use std::f64::consts::PI;
+
+    let d = dir("usd-lights");
+    let path = d.join("stage.usda");
+    let light = |ty: &str, name: &str, at: [i32; 3], api: &str, body: &str| {
+        format!(
+            r#"        def {ty} "{name}" (
+            prepend apiSchemas = [{api}]
+        )
+        {{
+            double3 xformOp:translate = ({}, {}, {})
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+{body}        }}
+"#,
+            at[0], at[1], at[2]
+        )
+    };
+    let lights = [
+        light(
+            "DistantLight",
+            "Sun",
+            [0, 0, 0],
+            "",
+            "            float inputs:angle = 2\n            float inputs:intensity = 1000\n            \
+             float inputs:exposure = 1\n            bool inputs:normalize = 1\n            \
+             color3f inputs:color = (1, 0.9, 0.8)\n",
+        ),
+        light(
+            "DistantLight",
+            "Moon",
+            [0, 0, 0],
+            "",
+            "            float inputs:angle = 1\n            float inputs:intensity = 3\n",
+        ),
+        light(
+            "SphereLight",
+            "Spot",
+            [10, 20, 30],
+            r#""ShapingAPI""#,
+            "            float inputs:radius = 10\n            float inputs:intensity = 400\n            \
+             bool inputs:normalize = 1\n            color3f inputs:color = (1, 0.5, 0.25)\n            \
+             float inputs:shaping:cone:angle = 40\n            float inputs:shaping:cone:softness = 1.5\n            \
+             float inputs:shaping:focus = 2\n            color3f inputs:shaping:focusTint = (0.1, 0.2, 0.3)\n",
+        ),
+        light(
+            "SphereLight",
+            "Bulb",
+            [-40, 0, 0],
+            r#""ShadowAPI""#,
+            "            float inputs:radius = 20\n            float inputs:intensity = 5\n            \
+             float inputs:exposure = -1\n            bool inputs:shadow:enable = 0\n            \
+             bool inputs:enableColorTemperature = 1\n",
+        ),
+        light(
+            "SphereLight",
+            "Pin",
+            [0, 60, 0],
+            r#""ShapingAPI""#,
+            "            float inputs:radius = 5\n            float inputs:intensity = 12\n            \
+             bool inputs:normalize = 1\n            bool treatAsPoint = 1\n            \
+             float inputs:shaping:focus = -3\n",
+        ),
+        light(
+            "SphereLight",
+            "Dot",
+            [0, 0, 90],
+            "",
+            "            float inputs:radius = 0\n            float inputs:intensity = 7\n",
+        ),
+        light(
+            "SphereLight",
+            "Spark",
+            [0, 0, 95],
+            "",
+            "            float inputs:radius = 0\n            float inputs:intensity = 8\n            \
+             bool inputs:normalize = 1\n",
+        ),
+        light(
+            "RectLight",
+            "Panel",
+            [5, 5, 5],
+            "",
+            "            float inputs:width = 40\n            float inputs:height = 20\n            \
+             float inputs:intensity = 50\n            bool inputs:normalize = 1\n",
+        ),
+        light(
+            "SphereLight",
+            "Hidden",
+            [0, 0, 0],
+            "",
+            "            token visibility = \"invisible\"\n",
+        ),
+        light("SphereLight", "Lamp", [1, 2, 3], "", ""),
+    ]
+    .concat();
+    let stage = format!(
+        r#"#usda 1.0
+(
+    metersPerUnit = 0.01
+    upAxis = "Z"
+)
+
+class "Protos"
+{{
+    def Xform "Lantern"
+    {{
+        def Mesh "Body"
+        {{
+            int[] faceVertexCounts = [3]
+            int[] faceVertexIndices = [0, 1, 2]
+            point3f[] points = [(0, 0, 0), (0, 1, 0), (0, 0, 1)]
+            uniform token subdivisionScheme = "none"
+        }}
+
+        def SphereLight "Flame"
+        {{
+            double3 xformOp:translate = (0, 0, 10)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+            float inputs:radius = 1
+            float inputs:intensity = 4
+        }}
+    }}
+}}
+
+def Xform "World"
+{{
+    def Mesh "Floor"
+    {{
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+        uniform token subdivisionScheme = "none"
+    }}
+
+    def Xform "Rig"
+    {{
+        double3 xformOp:translate = (100, -50, 200)
+        double3 xformOp:rotateXYZ = (30, 0, 90)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+{lights}    }}
+
+    def PointInstancer "Lanterns"
+    {{
+        rel prototypes = [</Protos/Lantern>]
+        int[] protoIndices = [0, 0]
+        point3f[] positions = [(0, 0, 0), (100, 0, 0)]
+    }}
+}}
+
+def Scope "Night" (
+    prepend apiSchemas = ["CollectionAPI:members"]
+)
+{{
+    rel collection:members:includes = [</World/Rig/Lamp>]
+}}
+"#
+    );
+    std::fs::write(&path, stage).unwrap();
+    let settings = UsdSettings {
+        groups: vec![GroupSpec {
+            prim: "/Night".into(),
+            collection: "members".into(),
+            attributes: Vec::new(),
+        }],
+        ..UsdSettings::default()
+    };
+    let (a, _) = usd(&path, settings).unwrap();
+    let info = LayoutInfo::parse(&blob(&a, &names::layout("u"), 0)).unwrap();
+
+    // Stage space to scene space, with the rig's transform for its lights.
+    let s = stage_to_scene();
+    let rig = s
+        * DMat4::from_translation(DVec3::new(100.0, -50.0, 200.0))
+        * DMat4::from_rotation_z(90f64.to_radians())
+        * DMat4::from_rotation_x(30f64.to_radians());
+    let at = |p: [f64; 3]| rig.transform_point3(DVec3::from_array(p));
+    let axis = rig.transform_vector3(DVec3::NEG_Z).normalize().as_vec3();
+    let rgb = |c: [f64; 3], k: f64| (DVec3::from_array(c) * k).as_vec3();
+    let deg = |x: f64| x.to_radians() as f32;
+    let shaped = |cone: f64, softness: f32, focus: f32, tint: Vec3| ShapingSource {
+        axis,
+        cone_angle: deg(cone),
+        cone_softness: softness,
+        focus,
+        focus_tint: tint,
+    };
+    let lantern = |x: f64| LightSource::Sphere {
+        position: s.transform_point3(DVec3::new(x, 0.0, 10.0)),
+        radius: 0.01,
+        intensity: rgb([1.0; 3], 4.0 * PI * 0.01f64.powi(2)),
+        shaping: None,
+        shadows: true,
+    };
+    let want = vec![
+        // 2^1 x 1000 lux with normalize, over a 1 deg angular radius.
+        LightSource::Directional {
+            direction_to_light: -axis,
+            illuminance: rgb([1.0, 0.9, 0.8], 2000.0),
+            angular_radius: deg(1.0),
+        },
+        // Without normalize, 3 nits over the disc: 3 π sin²(0.5 deg) lux.
+        LightSource::Directional {
+            direction_to_light: -axis,
+            illuminance: rgb([1.0; 3], 3.0 * PI * 0.5f64.to_radians().sin().powi(2)),
+            angular_radius: deg(0.5),
+        },
+        // 400 nits over its area 4π (0.1 m)², seen over its disc π (0.1 m)²; softness clamps.
+        LightSource::Sphere {
+            position: at([10.0, 20.0, 30.0]),
+            radius: 0.1,
+            intensity: rgb([1.0, 0.5, 0.25], 400.0 / (4.0 * PI * 0.01) * PI * 0.01),
+            shaping: Some(shaped(40.0, 1.0, 2.0, Vec3::new(0.1, 0.2, 0.3))),
+            shadows: true,
+        },
+        // Surfaces cast no shadow from it, and its fallback colorTemperature, 6500 K, is white.
+        LightSource::Sphere {
+            position: at([-40.0, 0.0, 0.0]),
+            radius: 0.2,
+            intensity: rgb([1.0; 3], 5.0 * 0.5 * PI * 0.04),
+            shaping: None,
+            shadows: false,
+        },
+        // The sphere it stands for, 12 nits over 4π (0.05 m)² seen over π (0.05 m)²; the
+        // fallback cone, and a negative focus ignored.
+        LightSource::Point {
+            position: at([0.0, 60.0, 0.0]),
+            intensity: rgb([1.0; 3], 12.0 / 4.0),
+            shaping: Some(shaped(90.0, 0.0, 0.0, Vec3::ZERO)),
+            shadows: true,
+        },
+        // A sphere of no area emits nothing without normalize.
+        LightSource::Point {
+            position: at([0.0, 0.0, 90.0]),
+            intensity: Vec3::ZERO,
+            shaping: None,
+            shadows: true,
+        },
+        // Normalized, the quarter of its emission every larger sphere gives.
+        LightSource::Point {
+            position: at([0.0, 0.0, 95.0]),
+            intensity: rgb([1.0; 3], 8.0 / 4.0),
+            shaping: None,
+            shadows: true,
+        },
+    ];
+    let lights = &info.partitions[0].lights;
+    assert_eq!(lights.len(), want.len() + 3, "{lights:#?}");
+    let close = |a: Vec3, b: Vec3| close(a, b);
+    for (got, want) in lights.iter().zip(&want) {
+        assert!(
+            same_light(got, want),
+            "{got:#?}
+want {want:#?}"
+        );
+    }
+    // A 40 x 20 cm rect, 50 nits over its 0.08 m², emitting along its −Z axis.
+    let LightSource::Rect {
+        center,
+        edge_x,
+        edge_y,
+        luminance,
+        shaping: None,
+        shadows: true,
+    } = lights[want.len()]
+    else {
+        panic!("a rect: {:?}", lights[want.len()]);
+    };
+    assert!(center.abs_diff_eq(at([5.0, 5.0, 5.0]), 1e-9));
+    let x = rig.transform_vector3(DVec3::new(40.0, 0.0, 0.0)).as_vec3();
+    assert!(close(edge_x, x), "{edge_x} {x}");
+    assert!((edge_y.length() - 0.2).abs() < 1e-6);
+    assert!(edge_y.dot(x).abs() < 1e-6);
+    assert!(close(edge_x.cross(edge_y).normalize(), axis));
+    assert!(close(luminance, Vec3::splat(50.0 / 0.08)));
+    // Each copy of the lantern places its flame.
+    for (got, x) in lights[want.len() + 1..].iter().zip([0.0, 100.0]) {
+        let want = lantern(x);
+        assert!(
+            same_light(got, &want),
+            "{got:#?}
+want {want:#?}"
+        );
+    }
+    // The lamp is in the group's partition, at its fallback intensity of 1 nit over a radius of
+    // 0.5 cm.
+    let night = info.partitions.iter().find(|p| p.groups == [0]).unwrap();
+    let [
+        LightSource::Sphere {
+            position,
+            radius,
+            intensity,
+            shaping: None,
+            shadows: true,
+        },
+    ] = night.lights[..]
+    else {
+        panic!("one lamp in the group: {:?}", night.lights);
+    };
+    assert!(position.abs_diff_eq(at([1.0, 2.0, 3.0]), 1e-9));
+    assert!((radius - 0.005).abs() < 1e-9);
+    assert!(close(
+        intensity,
+        Vec3::splat((PI * 0.005f64.powi(2)) as f32)
+    ));
+}
+
+fn close(a: orr_math::Vec3, b: orr_math::Vec3) -> bool {
+    a.abs_diff_eq(b, 1e-5 * b.length().max(1.0))
+}
+
+fn same_light(got: &orr_pack::layout::LightSource, want: &orr_pack::layout::LightSource) -> bool {
+    use orr_pack::layout::LightSource as L;
+    match (got, want) {
+        (
+            L::Directional {
+                direction_to_light: d,
+                illuminance: e,
+                angular_radius: r,
+            },
+            L::Directional {
+                direction_to_light: wd,
+                illuminance: we,
+                angular_radius: wr,
+            },
+        ) => close(*d, *wd) && close(*e, *we) && (r - wr).abs() < 1e-6,
+        (
+            L::Sphere {
+                position: p,
+                radius: r,
+                intensity: i,
+                shaping: s,
+                shadows: h,
+            },
+            L::Sphere {
+                position: wp,
+                radius: wr,
+                intensity: wi,
+                shaping: ws,
+                shadows: wh,
+            },
+        ) => {
+            p.abs_diff_eq(*wp, 1e-9)
+                && (r - wr).abs() < 1e-6
+                && close(*i, *wi)
+                && same_shaping(s, ws)
+                && h == wh
+        }
+        (
+            L::Point {
+                position: p,
+                intensity: i,
+                shaping: s,
+                shadows: h,
+            },
+            L::Point {
+                position: wp,
+                intensity: wi,
+                shaping: ws,
+                shadows: wh,
+            },
+        ) => p.abs_diff_eq(*wp, 1e-9) && close(*i, *wi) && same_shaping(s, ws) && h == wh,
+        _ => false,
+    }
+}
+
+fn same_shaping(
+    a: &Option<orr_pack::layout::ShapingSource>,
+    b: &Option<orr_pack::layout::ShapingSource>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.axis.abs_diff_eq(b.axis, 1e-6)
+                && (a.cone_angle - b.cone_angle).abs() < 1e-6
+                && a.cone_softness == b.cone_softness
+                && a.focus == b.focus
+                && a.focus_tint.abs_diff_eq(b.focus_tint, 1e-7)
+        }
+        _ => false,
+    }
+}
+
+/// A light input whose samples change over time fails the import by name, as a light's record
+/// holds one value; samples that all hold one value cook.
+#[test]
+fn time_sampled_light_inputs_fail_by_name() {
+    let d = dir("usd-light-samples");
+    let path = d.join("stage.usda");
+    let stage = |samples: &str| {
+        format!(
+            r#"#usda 1.0
+(
+    metersPerUnit = 0.01
+    upAxis = "Z"
+)
+
+def Xform "World"
+{{
+    def Mesh "Floor"
+    {{
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+        uniform token subdivisionScheme = "none"
+    }}
+
+    def SphereLight "Lamp"
+    {{
+        float inputs:intensity.timeSamples = {{ {samples} }}
+    }}
+}}
+"#
+        )
+    };
+    std::fs::write(&path, stage("0: 5, 10: 5")).unwrap();
+    usd(&path, UsdSettings::default()).unwrap();
+    std::fs::write(&path, stage("0: 5, 10: 50")).unwrap();
+    let Err(error) = usd(&path, UsdSettings::default()) else {
+        panic!("an intensity that changes over time cooked");
+    };
+    let error = error.to_string();
+    assert!(
+        error.contains("/World/Lamp inputs:intensity") && error.contains("sampled over time"),
+        "{error}"
+    );
+}

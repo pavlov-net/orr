@@ -3789,10 +3789,11 @@ impl<'f> SceneWriter<'f> {
     }
 
     fn put_light(&mut self, id: LightId, light: &Light) -> Result<()> {
-        let proxied = matches!(
+        let proxied = (matches!(
             light,
             Light::Sphere { radius, .. } if *radius > 0.0
-        ) || matches!(light, Light::Rect { .. });
+        ) || matches!(light, Light::Rect { .. }))
+            && crate::lights::casts_shadows(light);
         let table = &self.scene.tables.lights;
         let held = table.capacity();
         let entries = if id.0 < held {

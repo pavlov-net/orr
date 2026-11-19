@@ -122,8 +122,9 @@ void candidate(SceneRoot* s, uint i, out float w, out uint count, out uint poole
         float y = luminance_rec2020(max(l.color, 0.0));
         float r2;
         float3 radiance;
-        if (sphere_light(l, r2, radiance))
-            w = y * TWO_PI * (1.0 - l.cone_cos_outer);
+        // A sphere or point by the solid angle of its cone, a rect unshaped.
+        if (sphere_light(l, r2, radiance) || l.kind == LIGHT_POINT)
+            w = y * TWO_PI * (1.0 - cos(min(l.cone_angle, PI)));
         else if (l.kind == LIGHT_RECT)
             w = y * length(cross(l.edge_x, l.edge_y)) * PI;
         if (!isfinite(w))

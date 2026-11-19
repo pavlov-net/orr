@@ -842,7 +842,8 @@ fn a_placement_past_the_devices_partitions_is_refused_and_leaves_the_scene_as_it
             position: DVec3::ZERO,
             radius: 0.5,
             intensity: Vec3::ONE,
-            cone: None,
+            shaping: None,
+            shadows: true,
         };
         let root = frame_with(&mut scenes, &mut |w| {
             let r = w.add_light(&lamp);
@@ -941,7 +942,8 @@ fn proxies_keep_their_instances_as_a_full_ptlas_trades_their_room() {
             position: at(k, 8.0),
             radius: 0.5,
             intensity: Vec3::ONE,
-            cone: None,
+            shaping: None,
+            shadows: true,
         };
         let untraced = ProducerDesc {
             flags: InstanceFlags::RASTER,
@@ -6329,13 +6331,16 @@ def Scope "Night" (
         position: DVec3::new(0.0, 3.0, 0.0),
         radius: 0.25,
         intensity: Vec3::splat(100.0),
-        cone: None,
+        shaping: None,
+        shadows: true,
     };
     let rect = LightSource::Rect {
         center: DVec3::new(0.0, 4.0, 0.0),
         edge_x: Vec3::X,
         edge_y: Vec3::Z,
         luminance: Vec3::splat(50.0),
+        shaping: None,
+        shadows: true,
     };
     let decal = DecalSource {
         center: DVec3::ZERO,
