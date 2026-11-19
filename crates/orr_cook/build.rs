@@ -5,9 +5,9 @@
 //!
 //! With the `ntc` feature, compiles the LibNTC shim against the headers of the RTXNTC-Library
 //! checkout in `ORR_NTC_SDK` (else `RTXNTC-Library` under `ORR_TOOLS` or the nearest
-//! `.tools`) and sets `ORR_COOK_NTC_SDK`, `ORR_COOK_NTC_INTERFACE` (the headers'
-//! `InterfaceVersion`) and `ORR_COOK_NTC_SCHEMA` (the NTC file schema version the checkout
-//! writes).
+//! `.tools`, where `ORR_FETCH_NTC=1 tools/fetch-slang.sh` puts it) and sets
+//! `ORR_COOK_NTC_SDK`, `ORR_COOK_NTC_INTERFACE` (the headers' `InterfaceVersion`) and
+//! `ORR_COOK_NTC_SCHEMA` (the NTC file schema version the checkout writes).
 //!
 //! With the `subd` feature, compiles OpenSubdiv's Sdc, Vtr and Far sources from the release
 //! checkout in `ORR_OPENSUBDIV` (else `OpenSubdiv-3.8.0` under `ORR_TOOLS` or the nearest
@@ -93,8 +93,12 @@ fn constant(text: &str, marker: &str, file: &Path) -> String {
 
 #[cfg(feature = "ntc")]
 fn ntc() {
-    let sdk = orr_shaders::build::fetched("ORR_NTC_SDK", "RTXNTC-Library")
-        .unwrap_or_else(|e| panic!("the ntc feature needs an RTXNTC-Library checkout: {e}"));
+    let sdk = orr_shaders::build::fetched("ORR_NTC_SDK", "RTXNTC-Library").unwrap_or_else(|e| {
+        panic!(
+            "the ntc feature needs an RTXNTC-Library checkout, which only \
+             `ORR_FETCH_NTC=1 tools/fetch-slang.sh` fetches: {e}"
+        )
+    });
     let header = sdk.join("include/libntc/ntc.h");
     let schema = sdk.join("src/JsonFileFormat.h");
     for f in [&header, &schema] {

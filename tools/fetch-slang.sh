@@ -36,6 +36,13 @@
 #   DLSS/            NVIDIA/DLSS v310.9.16's headers and link libraries, without the DLLs that
 #                    running needs, for `DLSS_SDK`
 #   vulkan-headers/  KhronosGroup/Vulkan-Headers at vulkan-sdk-1.4.363.0, for `VULKAN_SDK`
+# With ORR_FETCH_NTC=1 it also fetches LibNTC for orr_cook's `ntc` feature (NVIDIA RTX SDK
+# license):
+#   RTXNTC-Library/  NVIDIA-RTX/RTXNTC-Library at the commit NVIDIA-RTX/RTXNTC v0.10.1-beta
+#                    pins, with its submodules; on Windows also libntc.dll from that release's
+#                    RTXNTC_windows_x64_v0.10.1b.zip, checked against its sha256, in
+#                    bin/windows-x64/. Elsewhere libntc builds from the checkout, and
+#                    ORR_NTC_LIB names it.
 # Build scripts never download; run this once after cloning and after a pin changes.
 #
 # SLANG_ASSET=glibc-2.28 selects the Linux build for glibc older than 2.34.
@@ -57,6 +64,9 @@ prague_ground_sum=76bd619dc6dfcbc900c2996436dd6cf68197c03e3982fe5580f2b109ce1c71
 smoke_sum=dca7a0477e77fac197a969f5f418057fc3f89b12887c35d1fc9c1b0d2892f20f
 dlss_commit=9981c6350dc58c0ce21f024fd65e31e851c31689
 vulkan_headers_commit=6802bb4733b63ed5efd3adb308a6c885ef180ea1
+ntc_release=0.10.1
+ntc_commit=a8dca629c51708273560c08e9df771a496e49011
+ntc_windows_sum=ce87104df62184fd035b4b56fe6ffea870faf82da86295ec5ee6b1909aed9eed
 gltf_samples_commit=8f492390ddc7a2ae221a1369ef560589cf8c70fb
 tangent_test_sum=31ce5f3c873fc55531a17ccacf001e3d1d482a508695aa826fa79cc196e0ce78
 
@@ -156,6 +166,31 @@ if [ "${ORR_FETCH_DLSS:-0}" = 1 ]; then
     include lib/Windows_x86_64/x64
   fetch_commit https://github.com/KhronosGroup/Vulkan-Headers "$vulkan_headers_commit" \
     "$tools/vulkan-headers"
+fi
+
+if [ "${ORR_FETCH_NTC:-0}" = 1 ]; then
+  ntc="$tools/RTXNTC-Library"
+  fetch_commit https://github.com/NVIDIA-RTX/RTXNTC-Library "$ntc_commit" "$ntc"
+  git -C "$ntc" submodule update -q --init --depth 1
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      dll="$ntc/bin/windows-x64/libntc.dll"
+      if [ -f "$dll" ] && [ "$(cat "$dll.zip-sha256" 2>/dev/null)" = "$ntc_windows_sum" ]; then
+        echo "libntc $ntc_release already in $dll"
+      else
+        mkdir -p "$tools/dl"
+        zip="$tools/dl/RTXNTC_windows_x64_v${ntc_release}b.zip"
+        if ! echo "$ntc_windows_sum  $zip" | sha256sum -c --quiet - 2>/dev/null; then
+          curl -fsSL --retry 3 -o "$zip.part" \
+            "https://github.com/NVIDIA-RTX/RTXNTC/releases/download/v$ntc_release-beta/RTXNTC_windows_x64_v${ntc_release}b.zip"
+          echo "$ntc_windows_sum  $zip.part" | sha256sum -c --quiet -
+          mv "$zip.part" "$zip"
+        fi
+        unzip -o -q "$zip" bin/windows-x64/libntc.dll -d "$ntc"
+        echo "$ntc_windows_sum" > "$dll.zip-sha256"
+        echo "libntc $ntc_release in $dll"
+      fi ;;
+  esac
 fi
 
 if [ "${ORR_VALIDATION_DATA:-0}" = 1 ]; then
