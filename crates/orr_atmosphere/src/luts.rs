@@ -277,7 +277,7 @@ impl AtmosphereState {
             "atmosphere scattering order ground irradiance",
         )?;
         let sky_views = (0..=extra_views)
-            .map(|_| Lut::new(device, SKY_VIEW_SIZE, 2, "atmosphere sky view"))
+            .map(|_| Lut::new(device, SKY_VIEW_SIZE, 3, "atmosphere sky view"))
             .collect::<Result<Vec<_>>>()?;
         let block = device.gpu_malloc(MemoryKind::DeviceLocal, 1, "atmosphere")?;
         let groups = device.gpu_malloc(MemoryKind::DeviceLocal, 1, "atmosphere groups")?;

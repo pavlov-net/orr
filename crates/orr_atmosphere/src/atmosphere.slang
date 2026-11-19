@@ -29,11 +29,15 @@ public static const uint2 TRANSMITTANCE_SIZE = uint2(256, 128);
 [Host] public static const uint MS_RAY_ZENITHS = 32;
 [Host] public static const uint MS_AZIMUTHS = 16;
 public static const uint2 SKY_VIEW_SIZE = uint2(400, 200);
-// The sky-view LUTs' layers: the sky from the scene's `near_range` on, which the camera's view
-// sees past the froxels, and the same with the medium from the LUT's eye to `near_range` in front
-// of it, which the light a ray leaving the eye meets.
+// The sky-view LUTs' layers: the sky from the scene's `near_range` on; the same with the medium
+// from the LUT's eye to `near_range` in front of it, which the light a ray leaving the eye meets;
+// and what of the light from past `near_range` the fog's lobe within it keeps on its way to the
+// eye, over the transmittance to `near_range`. The camera's view sees the first and the last
+// past the froxels, which take the whole extinction and scatter the lobe's light as they do the
+// rest.
 public static const uint SKY_VIEW_FAR = 0;
 public static const uint SKY_VIEW_EYE = 1;
+public static const uint SKY_VIEW_KEPT = 2;
 // Entries of the ground irradiance table, over the light's zenith cosine.
 public static const uint GROUND_SIZE = 64;
 
@@ -130,7 +134,7 @@ public struct AtmosphereGpu
     public TextureIndex multiple_scattering;
     // Linear filtering, repeating.
     public SamplerIndex sampler;
-    // Two layers each: SKY_VIEW_FAR from `near_range` on, SKY_VIEW_EYE from the eye.
+    // Three layers each: SKY_VIEW_FAR, SKY_VIEW_EYE and SKY_VIEW_KEPT.
     public TextureIndex sky_view[MAX_SKY_VIEWS];
     // How much of each sky-view LUT a view reads, the rest from the focus LUT (entry 0).
     public float sky_view_weight[MAX_SKY_VIEWS];
@@ -825,10 +829,12 @@ public float atmosphere_night_background(AtmosphereGpu* a, float h, float mu)
 }
 
 // Layer `layer` of sky-view LUT i along `dir` plus the night background, extinguished to space
-// from where the layer starts.
+// from where the layer starts. SKY_VIEW_FAR takes SKY_VIEW_KEPT with it.
 float3 sky_view_radiance(AtmosphereGpu* a, uint i, float3 dir, uint layer)
 {
     float3 l = sky_view_lookup(a, i, dir, layer);
+    if (layer == SKY_VIEW_FAR)
+        l += sky_view_lookup(a, i, dir, SKY_VIEW_KEPT);
     float h = max(a.sky_view_altitude[i], 0.0);
     float mu = dot(dir, a.up.xyz);
     if (a.night_background <= 0.0 || atmosphere_ray_hits_ground(a, h, mu))
@@ -1228,9 +1234,10 @@ public float3 atmosphere_reference_sky(AtmosphereGpu* a, float h0, float3 dir, u
 
 // The sky as orr's environment link point reads it: the nearest sky-view LUT (the medium
 // beyond `near_range`, the folded lights' in-scatter and the virtual ground below the
-// horizon) plus the night background, extinguished from `near_range` to space, blended with
-// the focus LUT's by the nearest LUT's weight; lighting's bake takes the same from the eye on.
-// No light discs. Link it with `Build::link(LinkPoint::Environment, ..)`.
+// horizon, and what of that light the fog's lobe within `near_range` keeps) plus the night
+// background, extinguished from `near_range` to space, blended with the focus LUT's by the
+// nearest LUT's weight; lighting's bake takes the same from the eye on. No light discs. Link it
+// with `Build::link(LinkPoint::Environment, ..)`.
 public struct AtmosphereSky : IEnvironment
 {
     public static float3 radiance(uint64_t data, float3 dir, float3 eye_render)

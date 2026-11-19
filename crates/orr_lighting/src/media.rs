@@ -626,7 +626,6 @@ impl MediaKernels {
             view: pass.view,
             gbuffer: pass.gbuffer,
             set: scene.light_set(),
-            cache: scene.world_cache(pass.frame),
             lights: media.lights.gpu(),
             raster: pass.raster,
             smoke: v
@@ -673,8 +672,6 @@ impl MediaKernels {
             trace,
             froxels: media.list(offset_of!(FroxelQueue, froxels)),
             winners: media.list(offset_of!(FroxelQueue, winners)),
-            _pad0: 0,
-            _pad1: 0,
         }
     }
 

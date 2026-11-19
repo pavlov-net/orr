@@ -1072,8 +1072,9 @@ void fold(uint3 id: SV_DispatchThreadID)
 }
 
 // One sky-view LUT: from `near_range` along each texel's direction, the folded lights'
-// in-scatter, and the virtual ground below the horizon (SKY_VIEW_FAR); and the same seen
-// through the medium from the eye to `near_range` (SKY_VIEW_EYE).
+// in-scatter, and the virtual ground below the horizon (SKY_VIEW_FAR); the same seen through the
+// medium from the eye to `near_range` (SKY_VIEW_EYE); and what of it the fog's lobe within
+// `near_range` keeps on its way (SKY_VIEW_KEPT).
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void sky_view(uint3 id: SV_DispatchThreadID)
@@ -1117,12 +1118,15 @@ void sky_view(uint3 id: SV_DispatchThreadID)
           a.group_passes, true, near_lobe, far, passed, far_lobe, more);
     float3 rgb = float3(0.0);
     float3 eye = float3(0.0);
+    float3 kept = float3(0.0);
     for (uint p = 0; p < a.group_passes; ++p)
     {
         rgb += atmosphere_rec2020(a.groups[p], far[p]);
         eye += atmosphere_rec2020(a.groups[p], near[p] + near_passed[p] * (far[p] + more[p]));
+        kept += atmosphere_rec2020(a.groups[p], more[p]);
     }
     RWTexture2DArray<float4> lut = root.output.get<RWTexture2DArray<float4>>();
     lut[uint3(id.xy, SKY_VIEW_FAR)] = float4(rgb, 1.0);
     lut[uint3(id.xy, SKY_VIEW_EYE)] = float4(eye, 1.0);
+    lut[uint3(id.xy, SKY_VIEW_KEPT)] = float4(kept, 1.0);
 }

@@ -14,9 +14,9 @@
 // they scatter with their own phase function and because the integrate alone reads them: other
 // rays see those triangles themselves, as shadow rays do through their opacity.
 //
-// A froxel's light is isotropic incident radiance (the world cache's ambient on two opposed
-// normals and resampled tile lights, one shadow ray) plus one visibility per shadowed
-// directional light, so the phase function applies per view direction at integration.
+// A froxel's light is isotropic incident radiance (resampled tile lights and the environment,
+// one shadow ray) plus one visibility per shadowed directional light, so the phase function
+// applies per view direction at integration.
 //
 // When a column's near-plane point lies in a dielectric's interior (the eye below a water
 // surface), `froxel_eye_columns` finds what of the column that interior holds, and those slices
@@ -45,8 +45,8 @@ import orr_scene.gbuffer;
 import orr_scene.hit;
 import orr_scene.visibility;
 import orr_lighting.media;
+import orr_lighting.environment;
 import orr_lighting.light_sampling;
-import orr_lighting.world_cache;
 import orr_lighting.shadow;
 import orr_lighting.interiors;
 import orr_lighting.rays;
@@ -111,7 +111,6 @@ public struct FroxelRoot
     public ViewConstants* view;
     public GBufferGpu* gbuffer;
     public LightSetGpu* set;
-    public WorldCacheGpu* cache;
     public FroxelLights* lights;
     public RasterGpu* raster;
     public uint* smoke;                         // SMOKE_WORDS per froxel; null without smoke entries
@@ -152,8 +151,6 @@ public struct FroxelRoot
     public ShadowTraceRoot* trace;              // the shadow rays' jobs, light j's of listed froxel k at j x `queue.froxels.count` + k and the local winners' after; its lists `queue.jobs` and `queue.flagged`
     public RayList* froxels;                    // `queue.froxels`
     public RayList* winners;                    // `queue.winners`
-    public uint _pad0;
-    public uint _pad1;
 }
 
 // The view-space ray through point `p` of the view's unjittered image, in render pixels,
@@ -201,14 +198,45 @@ Sampler froxel_sampler(FroxelRoot r, uint3 f)
     return Sampler(uint2(f.x, f.y * r.slices + f.z), r.frame, r.seed ^ FROXEL_STREAM);
 }
 
-// The render-space point froxel `f` samples this frame, jittered between the neighboring
-// columns' rays and across its slice. Draws one sampler dimension.
+// Whether the point `t` m along the ray through image point `p` of view `v`, in render pixels,
+// lies in front of the opaque surface the G-buffer `g` holds at that pixel.
+bool in_front_of_surface(GBufferGpu* g, ViewConstants* v, float2 p, float t)
+{
+    int2 pixel = clamp(int2(p), int2(0), int2(g.extent) - 1);
+    float depth = g.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
+    if (!(depth > 0.0))
+        return true;
+    // Reverse Z with an infinite far plane: depth = near / view distance along the axis.
+    float surface = v.clip_from_view[2][3] / depth * length(unjittered_ray(v, p));
+    return t < surface - T_MIN_BASE * (1.0 + surface * T_MIN_SCALE);
+}
+
+// Lateral draws of `froxel_sample`, its column's ray last.
+static const uint FROXEL_SAMPLE_TRIES = 4;
+
+// The render-space point froxel `f` samples this frame, at a distance jittered across its slice:
+// the first of three draws between the neighboring columns' rays, then the column's own ray,
+// that lies in front of the opaque surface its pixel sees. Where a froxel straddles a surface,
+// the eye's rays at that distance pass through its part in front alone, which takes its light;
+// one no draw puts in front of a surface takes the first. Draws two sampler dimensions.
 public float3 froxel_sample(FroxelRoot r, uint3 f, inout Sampler rng)
 {
     float4 u = rng.next4();
+    float4 more = rng.next4();
     float t = froxel_distance(float(f.z) + u.z, r.slices, r.scene.near_range);
-    float3 dir = unjittered_direction(r.view, column_pixel(r, float2(f.xy) + u.xy - 0.5));
-    return r.view.eye_render.xyz + dir * t;
+    ViewConstants* v = r.view;
+    float2 p = column_pixel(r, float2(f.xy) + u.xy - 0.5);
+    for (uint i = 0; i < FROXEL_SAMPLE_TRIES; i++)
+    {
+        float2 draw = i == 0 ? u.xy : i == 1 ? more.xy : i == 2 ? more.zw : float2(0.5);
+        float2 q = column_pixel(r, float2(f.xy) + draw - 0.5);
+        if (in_front_of_surface(r.gbuffer, v, q, t))
+        {
+            p = q;
+            break;
+        }
+    }
+    return v.eye_render.xyz + unjittered_direction(v, p) * t;
 }
 
 // The farthest distance of an opaque surface seen through the 8 x 8 tiles of every pixel
@@ -521,8 +549,10 @@ struct FroxelLocal
 
 // Light reaching point `x` of froxel `f`'s tile from the scene's lights other than the
 // shadowed directional ones, as mean radiance over the sphere once its shadow ray's visibility
-// multiplies it: FROXEL_TILE_CANDIDATES tile samples and one unshadowed directional light by
-// selection weight, resampled by luminance.
+// multiplies it: FROXEL_TILE_CANDIDATES tile samples, one direction of the environment drawn
+// uniformly over the sphere and one unshadowed directional light by selection weight, resampled
+// by luminance. The tiles draw the environment where it is brighter than its mean alone, which
+// the uniform direction covers; the two weigh the environment by the balance heuristic.
 FroxelLocal froxel_local(FroxelRoot r, uint3 f, float3 x, inout Sampler rng)
 {
     FroxelLocal local;
@@ -537,6 +567,9 @@ FroxelLocal froxel_local(FroxelRoot r, uint3 f, float3 x, inout Sampler rng)
     ResolvedLightSample chosen = no_candidate();
     float chosen_target = 0.0;
     float sum = 0.0;
+    bool sky = set.environment.mean.a > 0.0;
+    // The tile candidates' density of the environment over its own (`environment_pdf`).
+    float tile_sky = tiles ? float(FROXEL_TILE_CANDIDATES) * global_selection(set, feedback_environment(set)) : 0.0;
     for (uint i = 0; i < FROXEL_TILE_CANDIDATES; i++)
     {
         float pick = rng.next();
@@ -547,7 +580,8 @@ FroxelLocal froxel_local(FroxelRoot r, uint3 f, float3 x, inout Sampler rng)
         uint index = min(uint(pick * float(TILE_SIZE)), TILE_SIZE - 1);
         ResolvedLightSample c = resolve_light_sample(set, set.tiles[tile * TILE_SIZE + index], x, u);
         float target = c.pdf > 0.0 ? luminance_rec2020(c.radiance) : 0.0;
-        float w = target / (float(FROXEL_TILE_CANDIDATES) * c.pdf);
+        bool environment = c.kind == LIGHT_SAMPLE_ENVIRONMENT && sky;
+        float w = target / (float(FROXEL_TILE_CANDIDATES) * c.pdf + (environment ? INV_FOUR_PI : 0.0));
         if (!(w > 0.0) || !isfinite(w))
             continue;
         sum += w;
@@ -555,6 +589,28 @@ FroxelLocal froxel_local(FroxelRoot r, uint3 f, float3 x, inout Sampler rng)
         {
             chosen = c;
             chosen_target = target;
+        }
+    }
+    float2 u_sky = rng.next2();
+    float u_sky_choose = rng.next();
+    if (sky)
+    {
+        ResolvedLightSample c = no_candidate();
+        c.dir = sample_uniform_sphere(u_sky);
+        c.distance = positive_infinity();
+        c.radiance = environment_map(set.environment, c.dir);
+        c.pdf = INV_FOUR_PI;
+        c.light = feedback_environment(set);
+        float target = luminance_rec2020(c.radiance);
+        float w = target / (tile_sky * environment_pdf(set.environment, c.dir) + INV_FOUR_PI);
+        if (w > 0.0 && isfinite(w))
+        {
+            sum += w;
+            if (u_sky_choose * sum < w)
+            {
+                chosen = c;
+                chosen_target = target;
+            }
         }
     }
     // The unshadowed directional lights, drawn by weight.
@@ -752,11 +808,10 @@ public void column_stacks(uint64_t* stacks, uint index, out float4 planes[MAX_FR
     }
 }
 
-// What the light pass keeps of a listed froxel between its kernels: the light that reaches it
-// with no shadow ray, its local winner's job and what that ray's visibility multiplies.
+// What the light pass keeps of a listed froxel between its kernels: its local winner's job and
+// what that ray's visibility multiplies.
 public struct FroxelRays
 {
-    public float3 light;        // particle irradiance, as mean radiance over the sphere
     public uint winner;         // the local winner's job, NO_JOB for none
     public float3 radiance;     // the winner's radiance
     public float scale;         // and its resampling weight sum over its target
@@ -809,10 +864,10 @@ public void froxel_walk<S : ISurfaces>(FroxelRoot r, uint k)
     r.around[k] = EyeInterior(around);
 }
 
-// Draws the light reaching listed froxel `k`, where `valid`: its sample point, the light that
-// takes no shadow ray, the local winner and the shadowed lights' directions, and writes its
-// shadow rays as jobs, light j's at j x `active` + k and the winner's appended after the
-// shadowed lights'. Every lane of a wave takes part.
+// Draws the light reaching listed froxel `k`, where `valid`: its sample point, the local winner
+// and the shadowed lights' directions, and writes its shadow rays as jobs, light j's at
+// j x `active` + k and the winner's appended after the shadowed lights'. Every lane of a wave
+// takes part.
 public void froxel_sample_rays<S : ISurfaces>(FroxelRoot r, uint k, bool valid)
 {
     uint count = r.lights.count;
@@ -827,8 +882,6 @@ public void froxel_sample_rays<S : ISurfaces>(FroxelRoot r, uint k, bool valid)
         uint3 f = indexed_froxel(r, r.lit[k]);
         Sampler rng = froxel_sampler(r, f);
         float3 x = froxel_sample(r, f, rng);
-        float3 to_eye = normalize(r.view.eye_render.xyz - x);
-        out.light = particle_irradiance(r.cache, r.scene, x, to_eye, rng) * (0.5 * INV_PI);
         FroxelLocal local = froxel_local(r, f, x, rng);
         for (uint j = 0; j < count; j++)
         {
@@ -915,7 +968,7 @@ public void froxel_accumulate<M : IMedium>(FroxelRoot r, uint k)
     bool keep_depth = r.eye_depth.index != IMAGE_NONE;
     Interior around = froxel_around(r, k);
     FroxelRays rays = r.rays[k];
-    float3 l = rays.light;
+    float3 l = float3(0.0);
     if (rays.winner != NO_JOB)
     {
         RayJob job = r.trace.jobs[rays.winner];

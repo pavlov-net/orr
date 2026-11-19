@@ -71,7 +71,7 @@ const KNOWN_SPILL: &[KnownSpill] = &[
     },
     KnownSpill {
         entries: "orr_lighting.media.froxel_light.sample_main",
-        spec: "00000000000000000000000000000000010000007ff83f3f105ffeff00000000",
+        spec: MASKED_ALL,
         bead: "orr-cye4",
     },
     KnownSpill {
