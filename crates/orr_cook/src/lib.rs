@@ -3,45 +3,65 @@
 //! [`cook`] runs a [`Manifest`]: each [`ArchiveSpec`] becomes one archive, written to a file
 //! or returned in memory.
 //!
+//! A scene source `N` names its entries as [`orr_pack::names`] builds them: its whole-scene
+//! model is `N`, and every other entry stands under a kind, `N/model/...`, `N/material/...`,
+//! `N/texture/...`, `N/neural/...` or `N/instances...`. A model `M` (`N`, or `N/model/<name>`)
+//! has its mesh `M/mesh`, cage `M/subd`, skeleton `M/skeleton` and clips `M/clip/<clip>`. A name
+//! from the source (a node or prim name, a prim path, a clip name) is one component, with `%`
+//! written `%25` and `/` written `%2F`, and a model or material derived from another is its
+//! name followed by literals, so no two entries meet whatever the source's names are.
+//!
+//! A glTF or USD source also emits its layout `N/layout` ([`orr_pack::layout`]): its groups
+//! and partitions, each partition with its instance sources. The part of a partition's scene no
+//! instancer places is a model of its own, `N` for the partition in no group and
+//! `N/model/partition/<p>` for partition `p`, which an identity record on the partition's
+//! instance source places at the origin, or which the layout lists as posed where it has a
+//! skeleton.
+//!
 //! A glTF source emits, under the asset name `N`:
 //! - `N`: a model binding the mesh to one material per section,
 //! - `N/mesh`: every triangle primitive of the default scene, one section per glTF material:
 //!   with node transforms applied, or with skins in bind space with joints and weights,
-//! - with [`GltfSettings::models`], instead of those two, `N/<node>` and `N/<node>/mesh` per
-//!   selected node, in the node's space,
-//! - with [`GltfLayout::Meshes`], instead of all three, `N/mesh/<i>` and `N/mesh/<i>/mesh`
-//!   per glTF mesh the scene places, in the mesh's space, placed by instance pages
-//!   `N/instances/...`,
-//! - `N/<model>/baked/<k>` and its mesh for the copies of a model whose transform collapses
-//!   an axis, with the transform applied,
-//! - `N/<rig>` and `N/<rig>/mesh` for each set of meshes that moves together, in scene space,
-//!   named after its first joint and out of the models above: a skin's meshes, and the meshes
-//!   under a node an animation targets, the latter as rigid parts, one per joint with part 0 on
-//!   a still joint; a scene that is all one such set keeps the names `N` and `N/mesh`. Its mesh
-//!   and palettes stand in its skeleton's space, at the skeleton's origin in scene space
-//!   (`SkeletonInfo::origin`), which a copy of it takes and its pages hold already,
-//! - `N/<model>/skeleton` for a model that moves: the joints of its skins, the nodes animated
+//! - with [`GltfSettings::models`], instead of those two, a model `N/model/<node>` per selected
+//!   node, in the node's space,
+//! - with [`GltfLayout::Meshes`], instead of all three, a model `N/model/mesh/<i>` per glTF
+//!   mesh the scene places (`.../morph/<k>` for each other set of morph weights), in the mesh's
+//!   space, placed by instance pages `N/instances...`,
+//! - `<model>/baked/<k>` for the copies of a model whose transform collapses an axis, with the
+//!   transform applied,
+//! - a model `N/model/<rig>` for each set of meshes that moves together, in scene space, named
+//!   after its first joint (`N/model/node/<i>` after its node where the name is empty or taken)
+//!   and out of the models above: a skin's meshes, and the meshes under a node an animation
+//!   targets, the latter as rigid parts, one per joint with part 0 on a still joint; a scene
+//!   that is all one such set keeps the names `N` and `N/mesh`. Its mesh and palettes stand in
+//!   its skeleton's space, at the skeleton's origin in scene space (`SkeletonInfo::origin`),
+//!   which a copy of it takes and its pages hold already,
+//! - `<model>/skeleton` for a model that moves: the joints of its skins, the nodes animated
 //!   above its meshes and the nodes between them,
-//! - `N/<model>/clip/<animation>`: each animation that moves the skeleton, resampled at
+//! - `<model>/clip/<animation>`: each animation that moves the skeleton, resampled at
 //!   [`ClipSettings`], running over the whole animation so its clips keep time; an animation
 //!   without a unique name that is not all digits is named by its glTF animation index,
 //! - `N/material/<i>`: glTF material `i`, or `N/material/default` for primitives without one,
-//! - `N/texture/<material>/<role>`: the material's textures (roles `base_color`, `opacity`,
-//!   `normal`, `roughness`, `metalness`, `roughness_metalness`, `emission`,
-//!   `subsurface_color`, `specular_weight`, `coat`, `transmission`, `displacement`);
-//!   materials that would cook the same texture share the first one's entry.
+//! - `N/texture/<material>/<role>`: the textures of material `N/material/<material>` (roles
+//!   `base_color`, `opacity`, `normal`, `roughness`, `metalness`, `roughness_metalness`,
+//!   `emission`, `subsurface_color`, `specular_weight`, `coat`, `transmission`,
+//!   `displacement`); materials that would cook the same texture share the first one's entry.
+//!   A set of tiles has its tiles at `<texture>/tile/<u>_<v>`, and a neural set of a
+//!   material's textures is `N/neural/<material>` (`.../tile/<u>_<v>` per cell of tiles), with
+//!   its latents at `<set>/latents`.
 //!
 //! A USD source emits the same classes under the same names, with these differences
 //! ([`UsdSettings`]): the whole-stage model holds the meshes no other model holds; each
-//! `SkelRoot` is a model `N/<root>` of its skinned meshes with skeleton `N/<root>/skeleton`
-//! and clips `N/<root>/clip/<animation>`; prims whose xforms are sampled over time move what
-//! is under them as glTF's animated nodes do, by a clip `<model>/clip/xform`; every clip and
-//! animated page of a stage runs on one timeline, so they keep time; each `PointInstancer` prototype is a model
-//! `N/<prototype>` placed by instance pages `N/instances/...`; materials are
-//! `N/material/<prim path>` (`<prim path>/double_sided` on double-sided meshes,
-//! `<prim path>/primvars/<k>` on meshes that differ in what its primvar readers fetch), their
-//! textures `N/texture/<prim path>/<role>`. A MaterialX source emits one material `N` and its
-//! textures `N/texture/<role>`.
+//! `SkelRoot` is a model `N/model/<root>` of its skinned meshes; prims whose xforms are sampled
+//! over time move what is under them as glTF's animated nodes do, by a clip
+//! `<model>/clip/xform`; every clip and animated page of a stage runs on one timeline, so they
+//! keep time; each `PointInstancer` prototype is a model `N/model/<prototype>` placed by
+//! instance pages `N/instances...`; materials are `N/material/<prim path>`, by the whole path
+//! with its leading `/` (`.../double_sided` on double-sided meshes, `.../primvars/<k>` on meshes
+//! that differ in what its primvar readers fetch, `.../object/<n>` for each other object space
+//! of its maps). A MaterialX source emits one material `N`, its back `N/material/back` where
+//! the two differ, and their textures `N/texture/<role>` and `N/texture/back/<role>`. A material
+//! whose displacement a mesh bakes has a copy without it, `<material>/static`.
 //!
 //! A mesh source emits the model `N`, its mesh `N/mesh` and its materials
 //! `N/material/<section>`. A subdivision cage source emits the model `N`, its cage `N/subd`
@@ -170,7 +190,7 @@ pub use subd::{
 pub use texture::material::{InputChannels, TextureOverride, TextureRules};
 pub use texture::neural::NeuralSettings;
 pub use texture::{DataFormat, MipFilter, Primaries, TextureSettings, Usage, Wrap};
-pub use usd::{Subdivision, UsdSettings, VariantSelection};
+pub use usd::{GroupSpec, Subdivision, UsdSettings, VariantSelection};
 pub use volume::{
     Block, GridInput, GridVoxels, VolumeFormat, VolumeGridReport, VolumeGridSpec, VolumeGrids,
     VolumeInput, VolumeReport, VolumeSettings,

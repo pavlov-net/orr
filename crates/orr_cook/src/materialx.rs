@@ -50,6 +50,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use orr_pack::material::{Material, slot};
+use orr_pack::names::{MaterialName, Variant};
 use roxmltree::{Document, Node as XmlNode, NodeId};
 
 use crate::import::{Scene, SceneMaterial};
@@ -264,7 +265,7 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         mapped.material.double_sided = 1;
         side.material.double_sided = 1;
         back = Some(SceneMaterial {
-            suffix: "back".to_string(),
+            name: MaterialName::OWN.with(Variant::Back),
             material: side.material,
             textures: side.textures,
             model: side.model,
@@ -272,9 +273,11 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         });
     }
     Ok(Scene {
+        groups: Vec::new(),
+        partitions: Vec::new(),
         models: Vec::new(),
         materials: std::iter::once(SceneMaterial {
-            suffix: String::new(),
+            name: MaterialName::OWN,
             material: mapped.material,
             textures: mapped.textures,
             model: mapped.model,

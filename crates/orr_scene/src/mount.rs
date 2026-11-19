@@ -17,6 +17,7 @@ use orr_gpu::{
 use orr_io::{AlignedBuf, Read, SECTOR};
 use orr_math::{DVec3, IVec3, Vec3};
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
+use orr_pack::layout::LayoutInfo;
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{
     Cluster, Group, MeshHeader, MeshInfo, NodePage, PageHeader, PageView, Part, Section,
@@ -335,6 +336,7 @@ struct Placed {
     volumes: Vec<(AssetId, VolumeRef)>,
     neural: Vec<PlacedNeural>,
     tiles: Vec<PlacedTiles>,
+    layouts: Vec<(AssetId, Arc<LayoutInfo>)>,
 }
 
 /// A texture tile set, and the table `resolve` fills in a block of the mount.
@@ -855,6 +857,7 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
                 | Class::Subd
                 | Class::Volume
                 | Class::TextureTiles
+                | Class::Layout
         ) {
             continue;
         }
@@ -889,6 +892,11 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
             Class::Subd => fetch(t, i, 0, false, move |t, b| place_subd(t, i, id, b)),
             Class::Volume => fetch(t, i, 0, staged, move |t, b| place_volume(t, i, id, b)),
             Class::TextureTiles => fetch(t, i, 0, false, move |t, b| place_tiles(t, id, b)),
+            Class::Layout => fetch(t, i, 0, false, move |t, b| {
+                let layout = Arc::new(LayoutInfo::parse(b)?);
+                t.placed.lock().unwrap().layouts.push((id, layout));
+                Ok(())
+            }),
             _ => fetch(t, i, 0, false, move |t, b| place_page(t, i, id, b)),
         }
     }
@@ -1737,6 +1745,7 @@ struct Resolved {
     neural: Vec<PlacedNeural>,
     /// Tile tables and what they hold.
     tiles: Vec<(GpuPtr<u32>, Vec<u32>)>,
+    layouts: Vec<(AssetId, Arc<LayoutInfo>)>,
     accel: MountAccel,
     /// Resident cluster id ranges taken for the mount's meshes.
     cluster_ranges: Vec<(u32, u32)>,
@@ -1984,6 +1993,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
         volumes: p.volumes,
         neural: p.neural,
         tiles,
+        layouts: p.layouts,
         accel: MountAccel::default(),
         cluster_ranges: Vec::new(),
     })
@@ -2300,9 +2310,12 @@ pub(crate) struct Resident {
     pub(crate) texture_primaries: HashMap<AssetId, u8>,
     pub(crate) materials: HashMap<AssetId, MaterialId>,
     pub(crate) pages: HashMap<AssetId, PageId>,
+    /// The pages of each instance source, in archive order: the cook's order of their cells.
+    pub(crate) sources: HashMap<AssetId, Vec<PageId>>,
     pub(crate) skeletons: HashMap<AssetId, SkeletonRef>,
     pub(crate) clips: HashMap<AssetId, ClipRef>,
     pub(crate) volumes: HashMap<AssetId, VolumeRef>,
+    pub(crate) layouts: HashMap<AssetId, Arc<LayoutInfo>>,
     /// Where the mount's blobs are read from, for requested blobs.
     source: Arc<BlobSource>,
     meshes: Vec<u32>,
@@ -3452,12 +3465,7 @@ impl Mounts {
     /// other ready mounts, and their overrides.
     pub(crate) fn page_prototypes(&self, id: PageId) -> Result<Vec<PagePrototype>> {
         let page = self.page(id).ok_or(Error::UnknownPage(id))?;
-        let home = self.resident(page.mount)?;
-        let others = self.entries.iter().flatten().filter_map(|e| match e {
-            Entry::Ready(r) => Some(&**r),
-            _ => None,
-        });
-        let search: Vec<&Resident> = std::iter::once(home).chain(others).collect();
+        let search = self.search_from(page.mount)?;
         page.info
             .prototypes
             .iter()
@@ -3698,7 +3706,14 @@ impl Mounts {
         }
     }
 
-    fn resident(&self, m: MountId) -> Result<&Resident> {
+    /// Ready mount `m`, then the other ready mounts: where what `m` names is found.
+    pub(crate) fn search_from(&self, m: MountId) -> Result<Vec<&Resident>> {
+        let home = self.resident(m)?;
+        let others = self.ready().filter(|&(id, _)| id != m).map(|(_, r)| r);
+        Ok(std::iter::once(home).chain(others).collect())
+    }
+
+    pub(crate) fn resident(&self, m: MountId) -> Result<&Resident> {
         match self.entries.get(m.0 as usize).and_then(Option::as_ref) {
             Some(Entry::Ready(r)) => Ok(r),
             Some(Entry::Pending(_)) => Err(Error::NotReady(m)),
@@ -3849,6 +3864,7 @@ impl Mounts {
     /// Ends the pages of `r` at once: nothing on the GPU follows a slot, and what a frame in
     /// flight reads of them lives in the stream pool.
     fn free_pages(&mut self, r: &mut Resident) {
+        r.sources.clear();
         for (_, id) in r.pages.drain() {
             let slot = id.slot as usize;
             self.pages[slot] = None;
@@ -3918,6 +3934,8 @@ impl Mounts {
             skeletons: r.skeletons.into_iter().collect(),
             clips: r.clips.into_iter().collect(),
             volumes: r.volumes.into_iter().collect(),
+            layouts: r.layouts.into_iter().collect(),
+            sources: HashMap::new(),
             source: Arc::clone(&r.source),
             meshes: Vec::new(),
             rt: Vec::new(),
@@ -4136,6 +4154,14 @@ impl Mounts {
             };
             res.pages.insert(p.id, id);
             page_entries.push((id, p));
+        }
+        let mut by_entry: Vec<_> = page_entries.iter().collect();
+        by_entry.sort_unstable_by_key(|(_, p)| p.entry);
+        for &(id, p) in by_entry {
+            res.sources
+                .entry(p.info.header.source)
+                .or_default()
+                .push(id);
         }
         let units = units(
             &meshes,

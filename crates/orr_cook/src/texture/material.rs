@@ -68,6 +68,7 @@ use ctt::Quality;
 use orr_color::RgbPrimaries;
 use orr_math::{DMat3, DVec3};
 use orr_pack::material::{Material, TextureBinding, slot};
+use orr_pack::names::{self, MaterialName};
 use orr_pack::texture::{full_mip_count, mip_size, normal, object_normal};
 use orr_pack::tiles::{TextureTiles, Tile};
 use orr_pack::{AssetId, Class, Hash32};
@@ -1042,14 +1043,6 @@ struct Made {
     source_mips: bool,
 }
 
-/// The name of the texture, or tile set, of `role` in a material.
-fn texture_name(asset: &str, suffix: &str, role: &str) -> String {
-    match suffix {
-        "" => format!("{asset}/texture/{role}"),
-        _ => format!("{asset}/texture/{suffix}/{role}"),
-    }
-}
-
 /// The span from the lowest to the highest of `ranges`.
 fn widest(ranges: impl Iterator<Item = (f32, f32)>) -> (f32, f32) {
     ranges.fold((f32::INFINITY, f32::NEG_INFINITY), |a, b| {
@@ -1588,7 +1581,7 @@ impl<'a> Packer<'a> {
     /// Cooks the material's textures, binds them and folds constants into its factors.
     pub(crate) fn material(
         &mut self,
-        suffix: &str,
+        material: &MaterialName,
         m: &mut Material,
         t: &MaterialTextures,
     ) -> Result<()> {
@@ -1624,7 +1617,7 @@ impl<'a> Packer<'a> {
             let alpha_free = m.alpha_mode == Material::OPAQUE
                 || t.opacity
                     .is_some_and(|o| self.constant_opacity(m, &o).is_none());
-            self.color(suffix, m, r, slot::BASE_COLOR, alpha_free)?;
+            self.color(material, m, r, slot::BASE_COLOR, alpha_free)?;
         }
         if m.alpha_mode != Material::OPAQUE
             && let Some(r) = &t.opacity
@@ -1634,7 +1627,7 @@ impl<'a> Packer<'a> {
                 None => {
                     let coverage = (m.alpha_mode == Material::MASK).then_some((0, m.alpha_cutoff));
                     let opacity = m.geometry_opacity;
-                    let id = self.make_each(suffix, r, |s, cell| {
+                    let id = self.make_each(material, r, |s, cell| {
                         let r = s.at(r, cell);
                         let channel = usize::from(r.channel);
                         Pack {
@@ -1659,12 +1652,12 @@ impl<'a> Packer<'a> {
         if let Some((raw, scale)) = t.normal {
             // A normal map whose source mips the cook keeps instead of remaking them adds no
             // Toksvig roughness.
-            if self.normal_map(suffix, m, &raw, scale, slot::NORMAL, "normal")? {
+            if self.normal_map(material, m, &raw, scale, slot::NORMAL, "normal")? {
                 normal_packed = Some((raw, scale));
             }
         }
         if let Some((raw, scale)) = t.coat_normal {
-            self.normal_map(suffix, m, &raw, scale, slot::COAT_NORMAL, "coat_normal")?;
+            self.normal_map(material, m, &raw, scale, slot::COAT_NORMAL, "coat_normal")?;
         }
 
         // Roughness and metalness.
@@ -1761,7 +1754,7 @@ impl<'a> Packer<'a> {
                 && cells
                     .into_iter()
                     .any(|cell| !self.keeps_source_mips(&build(self, cell, false)));
-            let id = self.make_each(suffix, &refs[0], |s, cell| build(s, cell, toksvig))?;
+            let id = self.make_each(material, &refs[0], |s, cell| build(s, cell, toksvig))?;
             for (i, &(s, _, v)) in rm.iter().enumerate() {
                 bind(m, s, id, i, &refs[0]);
                 match s {
@@ -1773,10 +1766,10 @@ impl<'a> Packer<'a> {
         }
 
         if let Some(r) = &t.emissive {
-            self.color(suffix, m, r, slot::EMISSION, true)?;
+            self.color(material, m, r, slot::EMISSION, true)?;
         }
         if let Some(r) = &t.subsurface_color {
-            self.color(suffix, m, r, slot::SUBSURFACE_COLOR, true)?;
+            self.color(material, m, r, slot::SUBSURFACE_COLOR, true)?;
         }
         if let Some(r) = &t.specular {
             let hdr = self.past_one(r);
@@ -1794,7 +1787,7 @@ impl<'a> Packer<'a> {
                     } else {
                         Encoding::Bc4
                     };
-                    let id = self.single(suffix, r, 1.0, "specular_weight", encoding)?;
+                    let id = self.single(material, r, 1.0, "specular_weight", encoding)?;
                     bind(m, slot::SPECULAR_WEIGHT, id, 0, r);
                 }
             }
@@ -1811,7 +1804,7 @@ impl<'a> Packer<'a> {
             match self.constant_input(r) {
                 Some(v) => *weight(m) *= v,
                 None => {
-                    let id = self.single(suffix, r, 1.0, role, Encoding::Bc4)?;
+                    let id = self.single(material, r, 1.0, role, Encoding::Bc4)?;
                     bind(m, s, id, 0, r);
                 }
             }
@@ -1823,7 +1816,7 @@ impl<'a> Packer<'a> {
                 m.displacement_min,
                 m.displacement_max,
             ];
-            self.height(suffix, m, r, slot::DISPLACEMENT, "displacement", &mut h)?;
+            self.height(material, m, r, slot::DISPLACEMENT, "displacement", &mut h)?;
             [
                 m.displacement_scale,
                 m.displacement_offset,
@@ -1833,11 +1826,11 @@ impl<'a> Packer<'a> {
         }
         for (&s, r) in &t.more {
             if let Some(r) = r {
-                self.more(suffix, m, s, r)?;
+                self.more(material, m, s, r)?;
             }
         }
         if let Some(settings) = &self.rules.neural {
-            self.neural_set(suffix, m, settings)?;
+            self.neural_set(material, m, settings)?;
         }
         Ok(())
     }
@@ -1846,7 +1839,7 @@ impl<'a> Packer<'a> {
     /// varies through mips the cook made.
     fn normal_map(
         &mut self,
-        suffix: &str,
+        material: &MaterialName,
         m: &mut Material,
         raw: &TexRef,
         scale: [f32; 2],
@@ -1854,7 +1847,7 @@ impl<'a> Packer<'a> {
         role: &'static str,
     ) -> Result<bool> {
         if m.object_normal(s) {
-            return self.object_normal_map(suffix, m, raw, s, role);
+            return self.object_normal_map(material, m, raw, s, role);
         }
         let (r, source) = self.normal_source(raw);
         let r = &r;
@@ -1873,7 +1866,7 @@ impl<'a> Packer<'a> {
             return Ok(false);
         }
         let shrink = consts.iter().all(Option::is_some);
-        let id = self.make_each(suffix, r, |this, cell| {
+        let id = self.make_each(material, r, |this, cell| {
             let (r, source) = this.normal_source(&this.at(raw, cell));
             let channel = |c: usize, scale: f32| this.source(&r, c, c, 0.0, scale);
             Pack {
@@ -1916,7 +1909,7 @@ impl<'a> Packer<'a> {
     /// Roughness takes no variance from it.
     fn object_normal_map(
         &mut self,
-        suffix: &str,
+        material: &MaterialName,
         m: &mut Material,
         raw: &TexRef,
         s: usize,
@@ -1926,7 +1919,7 @@ impl<'a> Packer<'a> {
         // A two-channel image's z follows from its x and y.
         let held = if source.rg { 2 } else { 3 };
         let shrink = (0..held).all(|c| self.constant(&r, c).is_some());
-        let id = self.make_each(suffix, &r, |this, cell| {
+        let id = self.make_each(material, &r, |this, cell| {
             let (r, source) = this.normal_source(&this.at(raw, cell));
             let (a, b) = (object_normal::OFFSET, object_normal::SCALE);
             let channel = |c: usize| this.source(&r, c, c, a, b);
@@ -1966,7 +1959,7 @@ impl<'a> Packer<'a> {
     /// Packs height texture `r` into slot `s`, whose `h` is scale, offset and declared range.
     fn height(
         &mut self,
-        suffix: &str,
+        material: &MaterialName,
         m: &mut Material,
         r: &TexRef,
         s: usize,
@@ -2001,7 +1994,7 @@ impl<'a> Packer<'a> {
             0.0
         };
         let shrink = self.constant(r, channel).is_some();
-        let id = self.make_each(suffix, r, |s, cell| {
+        let id = self.make_each(material, r, |s, cell| {
             let r = s.at(r, cell);
             let channel = usize::from(r.channel);
             Pack {
@@ -2034,12 +2027,18 @@ impl<'a> Packer<'a> {
     }
 
     /// Cooks input `r` of slot `s`, from [`slot::MORE`] on.
-    fn more(&mut self, suffix: &str, m: &mut Material, s: usize, r: &TexRef) -> Result<()> {
+    fn more(
+        &mut self,
+        material: &MaterialName,
+        m: &mut Material,
+        s: usize,
+        r: &TexRef,
+    ) -> Result<()> {
         match More::of(s) {
-            More::Color => self.color(suffix, m, r, s, true),
+            More::Color => self.color(material, m, r, s, true),
             More::Height(axis, role) => {
                 let mut h = m.displacement_tangent[axis];
-                self.height(suffix, m, r, s, role, &mut h)?;
+                self.height(material, m, r, s, role, &mut h)?;
                 m.displacement_tangent[axis] = h;
                 Ok(())
             }
@@ -2047,7 +2046,7 @@ impl<'a> Packer<'a> {
                 match self.constant_input(r) {
                     Some(v) => *scalar_field(m, s) *= v,
                     None => {
-                        let id = self.single(suffix, r, 1.0, role, Encoding::Bc4)?;
+                        let id = self.single(material, r, 1.0, role, Encoding::Bc4)?;
                         bind(m, s, id, 0, r);
                     }
                 }
@@ -2069,7 +2068,7 @@ impl<'a> Packer<'a> {
                         } else {
                             Encoding::Bc4
                         };
-                        let id = self.single(suffix, r, 1.0, role, encoding)?;
+                        let id = self.single(material, r, 1.0, role, encoding)?;
                         bind(m, s, id, 0, r);
                     }
                 }
@@ -2086,7 +2085,7 @@ impl<'a> Packer<'a> {
                         } else {
                             Encoding::Bc4
                         };
-                        let id = self.make_each(suffix, r, |this, cell| {
+                        let id = self.make_each(material, r, |this, cell| {
                             let r = this.at(r, cell);
                             let channel = usize::from(r.channel);
                             Pack {
@@ -2107,7 +2106,7 @@ impl<'a> Packer<'a> {
                 Ok(())
             }
             More::Direction(role) => {
-                let id = self.make_each(suffix, r, |this, cell| {
+                let id = self.make_each(material, r, |this, cell| {
                     let r = this.vector_source(&this.at(r, cell));
                     let channels = vec![
                         this.source(&r, 0, 0, 0.0, 1.0),
@@ -2135,14 +2134,16 @@ impl<'a> Packer<'a> {
 
     /// Plans the neural set of the material's textures, unless one with the same textures
     /// is planned.
-    fn neural_set(&mut self, suffix: &str, m: &Material, settings: &NeuralSettings) -> Result<()> {
+    fn neural_set(
+        &mut self,
+        material: &MaterialName,
+        m: &Material,
+        settings: &NeuralSettings,
+    ) -> Result<()> {
         for (cell, ids) in self.neural_members(m) {
-            let suffix = match cell {
-                Some([u, v]) => format!("{suffix}/tile/{u}_{v}"),
-                None => suffix.to_string(),
-            };
+            let name = material.neural(self.asset, cell);
             let jobs: Vec<&TextureJob> = ids.iter().map(|id| &self.jobs[self.by_id[id]]).collect();
-            let Some(set) = neural::plan(self.asset, &suffix, &jobs, settings)? else {
+            let Some(set) = neural::plan(self.asset, name, &jobs, settings)? else {
                 continue;
             };
             if self.sets.insert(set.members()) {
@@ -2183,7 +2184,7 @@ impl<'a> Packer<'a> {
     /// the image's primaries.
     fn color(
         &mut self,
-        suffix: &str,
+        material: &MaterialName,
         m: &mut Material,
         r: &TexRef,
         s: usize,
@@ -2253,7 +2254,7 @@ impl<'a> Packer<'a> {
                 [x, y, z, w]
             }
         };
-        let id = self.make_each(suffix, r, |this, cell| {
+        let id = self.make_each(material, r, |this, cell| {
             let r = this.at(r, cell);
             let (read, ..) = this.color_read(&r);
             let texture = TexRef { outside, ..r };
@@ -2281,13 +2282,13 @@ impl<'a> Packer<'a> {
     /// A one-channel texture of the reference's channel times `scale`.
     fn single(
         &mut self,
-        suffix: &str,
+        material: &MaterialName,
         r: &TexRef,
         scale: f32,
         role: &'static str,
         encoding: Encoding,
     ) -> Result<Made> {
-        self.make_each(suffix, r, |s, cell| {
+        self.make_each(material, r, |s, cell| {
             let r = s.at(r, cell);
             Pack {
                 role,
@@ -2313,12 +2314,12 @@ impl<'a> Packer<'a> {
     /// what the pack of the set as a whole says, which no one tile's file or overrides change.
     fn make_each(
         &mut self,
-        suffix: &str,
+        material: &MaterialName,
         r: &TexRef,
         build: impl Fn(&Self, Option<Cell>) -> Pack,
     ) -> Result<Made> {
         let Some(cells) = self.cells(r) else {
-            return self.make(suffix, build(self, None));
+            return self.make(material, build(self, None));
         };
         let mut tiles = Vec::with_capacity(cells.len());
         let mut keys = Vec::new();
@@ -2329,14 +2330,14 @@ impl<'a> Packer<'a> {
             let primaries = p.tile.and_then(|t| t.1);
             p.tile = Some((cell, primaries));
             let role = p.role;
-            let made = self.make(suffix, p)?;
+            let made = self.make(material, p)?;
             keys.extend_from_slice(&self.jobs[self.by_id[&made.id]].key.0);
             tiles.push((cell[0], cell[1], made.id));
             source_mips |= made.source_mips;
             set = Some((made, role));
         }
         let (made, role) = set.expect("a set has a tile");
-        let id = self.tile_set(suffix, role, &tiles, &keys);
+        let id = self.tile_set(material, role, &tiles, &keys);
         Ok(Made {
             id,
             channels: [0, 1, 2, 3],
@@ -2351,7 +2352,7 @@ impl<'a> Packer<'a> {
     /// with the same tiles.
     fn tile_set(
         &mut self,
-        suffix: &str,
+        material: &MaterialName,
         role: &str,
         tiles: &[(u16, u16, AssetId)],
         keys: &[u8],
@@ -2359,7 +2360,7 @@ impl<'a> Packer<'a> {
         let set = TextureTiles::new(tiles);
         let bytes = set.to_bytes();
         *self.made_sets.entry(Hash32::of(&bytes)).or_insert_with(|| {
-            let name = texture_name(self.asset, suffix, role);
+            let name = material.texture(self.asset, role);
             let key = Key::new(Class::TextureTiles, &name)
                 .bytes(&bytes)
                 .bytes(keys)
@@ -2519,7 +2520,7 @@ impl<'a> Packer<'a> {
     }
 
     /// Plans one pack, or returns the one an identical pack planned before.
-    fn make(&mut self, suffix: &str, mut p: Pack) -> Result<Made> {
+    fn make(&mut self, material: &MaterialName, mut p: Pack) -> Result<Made> {
         let mut images = Self::pack_images(&p);
         let source_mips = self.keeps_source_mips(&p);
         if source_mips {
@@ -2609,9 +2610,9 @@ impl<'a> Packer<'a> {
         if let Some(id) = self.made.get(&same) {
             return Ok(made(*id));
         }
-        let mut name = texture_name(self.asset, suffix, p.role);
-        if let Some(([u, v], _)) = p.tile {
-            name = format!("{name}/tile/{u}_{v}");
+        let mut name = material.texture(self.asset, p.role);
+        if let Some((cell, _)) = p.tile {
+            name = names::tile(&name, cell);
         }
         let key = Key::new(Class::Texture, &name)
             .str(&super::encoders(self.quality))
@@ -3007,6 +3008,7 @@ impl TextureJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orr_pack::names::MaterialBase;
 
     fn gradient(shift: u32) -> ImageData {
         let img = image::RgbaImage::from_fn(8, 8, |x, y| {
@@ -3095,18 +3097,21 @@ mod tests {
         };
         let rules = TextureRules::default();
         let mut packer = Packer::new("a", &images, &facts, &rules, Quality::UltraFast);
-        packer.material("m", &mut m, &textures).unwrap();
+        let name = MaterialName::new(MaterialBase::Index(0));
+        packer.material(&name, &mut m, &textures).unwrap();
 
-        let id = |role: &str| AssetId::from_name(&format!("a/texture/m/{role}"));
+        let id = |role: &str| AssetId::from_name(&name.texture("a", role));
+        let tile =
+            |role: &str, cell| AssetId::from_name(&names::tile(&name.texture("a", role), cell));
         let want: BTreeMap<Option<Cell>, Vec<AssetId>> = [
             (None, vec![id("specular_weight")]),
             (
                 Some([0, 0]),
-                vec![id("base_color/tile/0_0"), id("roughness/tile/0_0")],
+                vec![tile("base_color", [0, 0]), tile("roughness", [0, 0])],
             ),
             (
                 Some([1, 0]),
-                vec![id("base_color/tile/1_0"), id("roughness/tile/1_0")],
+                vec![tile("base_color", [1, 0]), tile("roughness", [1, 0])],
             ),
         ]
         .into();

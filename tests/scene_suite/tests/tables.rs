@@ -462,9 +462,9 @@ fn lights_move_with_the_render_origin() {
     };
     // The lights are written against the old origin and the focus moves in the same frame.
     let root = run_frame(&mut scenes, s, |w| {
-        w.set_light(orr_scene::LightId(0), Some(&light)).unwrap();
-        w.set_light(orr_scene::LightId(1), Some(&rect)).unwrap();
-        w.set_light(orr_scene::LightId(2), Some(&sun)).unwrap();
+        for l in [&light, &rect, &sun] {
+            w.add_light(l).unwrap();
+        }
         w.set_focus(far + DVec3::new(10.0, 0.0, 0.0));
     });
     assert_eq!(origin_of(&root), DVec3::new(19_968.0, 0.0, -9_216.0));

@@ -24,8 +24,9 @@ use orr_pack::clip::Clip;
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{MeshInfo, PageView};
 use orr_pack::model::ModelInfo;
+use orr_pack::names::{Derived, MaterialBase, MaterialName, ModelName};
 use orr_pack::skeleton::{SkeletonInfo, Trs};
-use orr_pack::{Archive, AssetId, Class, Target};
+use orr_pack::{Archive, AssetId, Class, Entry, Target};
 
 fn dir(name: &str) -> PathBuf {
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -63,6 +64,10 @@ fn blob(a: &Archive, name: &str, i: usize) -> Vec<u8> {
     let e = a
         .find(AssetId::from_name(name))
         .unwrap_or_else(|| panic!("no entry {name}"));
+    entry_blob(a, e, i)
+}
+
+fn entry_blob(a: &Archive, e: &Entry, i: usize) -> Vec<u8> {
     let b = &a.blobs(e)[i];
     let mut v = vec![0; b.raw_len as usize];
     a.read(b, &mut v).unwrap();
@@ -394,7 +399,10 @@ fn composed_stage_cooks_instancer_cage_skin_and_openpbr() {
     uvs.sort_unstable();
     uvs.dedup();
     assert_eq!(uvs, [[0, 0], [0, 1000], [1000, 0], [1000, 1000]]);
-    let bark = material(&a, "u/material/World/Looks/Bark");
+    let bark = material(
+        &a,
+        &MaterialName::new(MaterialBase::Path("/World/Looks/Bark".into())).entry("u"),
+    );
     // The place2d scale halves st about the bottom-left origin, which is v = 1 here.
     assert_eq!(
         bark.uv_transforms[slot::BASE_COLOR],
@@ -406,16 +414,21 @@ fn composed_stage_cooks_instancer_cage_skin_and_openpbr() {
     let bound = bark.textures[slot::BASE_COLOR].texture;
     assert_eq!(
         bound,
-        AssetId::from_name("u/texture/World/Looks/Bark/base_color")
+        AssetId::from_name(
+            &MaterialName::new(MaterialBase::Path("/World/Looks/Bark".into()))
+                .texture("u", "base_color")
+        )
     );
     let model = ModelInfo::parse(&blob(&a, "u", 0)).unwrap();
     assert_eq!(
         model.materials,
-        [AssetId::from_name("u/material/World/Looks/Bark")]
+        [AssetId::from_name(
+            &MaterialName::new(MaterialBase::Path("/World/Looks/Bark".into())).entry("u")
+        )]
     );
 
     // The prototype is a model of its own; the visible instances are its placements.
-    let (tree, _) = triangles(&a, "u/Tree/mesh");
+    let (tree, _) = triangles(&a, &ModelName::source("Tree").mesh("u"));
     let close = |a: [f32; 3], b: [f32; 3]| (0..3).all(|k| (a[k] - b[k]).abs() < 1e-3);
     assert!(
         close(tree.header.bounds.max, [0.1, 3.0, 0.0]),
@@ -423,31 +436,35 @@ fn composed_stage_cooks_instancer_cage_skin_and_openpbr() {
         tree.header.bounds
     );
     let want = openusd_placements(&d.join("stage.usda"));
+    let tree = AssetId::from_name(&ModelName::source("Tree").entry("u"));
+    let whole = AssetId::from_name(&ModelName::WHOLE.entry("u"));
     let mut placed = Vec::new();
+    let mut stage = Vec::new();
     for e in a
         .entries()
         .iter()
         .filter(|e| e.class == Class::InstancePage as u16)
     {
         assert!(a.name(e).starts_with("u/instances/"));
-        let blobs = a.blobs(e);
-        let read = |b: &orr_pack::Blob| {
-            let mut v = vec![0; b.raw_len as usize];
-            a.read(b, &mut v).unwrap();
-            v
-        };
-        let (head, bytes) = (read(&blobs[0]), read(&blobs[1]));
+        let (head, bytes) = (entry_blob(&a, e, 0), entry_blob(&a, e, 1));
         let info = orr_pack::instance::InstancePageInfo::parse(&head).unwrap();
-        assert_eq!(info.prototypes[0].model, AssetId::from_name("u/Tree"));
         let h = info.header;
         let half_step = DVec3::from(h.step.map(|s| f64::from(s) / 2.0));
         let (cell, records) = orr_pack::instance::decode(&head, &bytes).unwrap();
-        for (_, m) in records {
+        for (proto, m) in records {
             let p = m.translation.as_dvec3() + DVec3::from(cell.map(f64::from)) * 256.0;
+            let model = info.prototypes[usize::from(proto)].model;
+            if model == whole {
+                stage.push((p, m.matrix3));
+                continue;
+            }
+            assert_eq!(model, tree);
             let axes = [0, 1, 2].map(|c| m.matrix3.col(c).as_dvec3());
             placed.push((p, axes, half_step));
         }
     }
+    // What no instancer places stands once where the stage puts it, at the origin.
+    assert_eq!(stage, [(DVec3::ZERO, orr_math::Mat3::IDENTITY)]);
     assert_eq!(placed.len(), 2, "the invisible id is dropped");
     assert_eq!(want.len(), 2);
     for (t, q, s) in want {
@@ -473,9 +490,12 @@ fn composed_stage_cooks_instancer_cage_skin_and_openpbr() {
     }
 
     // The skinned mesh is its SkelRoot's model, in bind space, with the skeleton and clip.
-    let hero = ModelInfo::parse(&blob(&a, "u/Hero", 0)).unwrap();
-    assert_eq!(hero.header.skeleton, AssetId::from_name("u/Hero/skeleton"));
-    let (_, body) = triangles(&a, "u/Hero/mesh");
+    let hero = ModelInfo::parse(&blob(&a, &ModelName::source("Hero").entry("u"), 0)).unwrap();
+    assert_eq!(
+        hero.header.skeleton,
+        AssetId::from_name(&ModelName::source("Hero").skeleton("u"))
+    );
+    let (_, body) = triangles(&a, &ModelName::source("Hero").mesh("u"));
     let mut corners: Vec<[i32; 3]> = body
         .iter()
         .flat_map(|t| t.0)
@@ -483,14 +503,18 @@ fn composed_stage_cooks_instancer_cage_skin_and_openpbr() {
         .collect();
     corners.sort_unstable();
     assert_eq!(corners, [[0, 0, 0], [0, 2000, 0], [100, 0, 0]]);
-    let skin = material(&a, "u/material/World/Looks/Skin");
+    let skin = material(
+        &a,
+        &MaterialName::new(MaterialBase::Path("/World/Looks/Skin".into())).entry("u"),
+    );
     assert_eq!(skin.base_color, [0.5, 0.25, 0.125]);
     assert_eq!(skin.specular_roughness, 0.4);
-    let skeleton = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+    let skeleton =
+        SkeletonInfo::parse(&blob(&a, &ModelName::source("Hero").skeleton("u"), 0)).unwrap();
     assert_eq!(skeleton.names, ["Root", "Arm"]);
     let clip = Clip::parse(
-        &blob(&a, "u/Hero/clip/Wave", 0),
-        &blob(&a, "u/Hero/clip/Wave", 1),
+        &blob(&a, &ModelName::source("Hero").clip("u", "Wave"), 0),
+        &blob(&a, &ModelName::source("Hero").clip("u", "Wave"), 1),
     )
     .unwrap();
     assert!((clip.header.duration - 1.0).abs() < 1e-6);
@@ -558,23 +582,28 @@ def Xform "World"
     )
     .unwrap();
     let (a, _) = usd(&path, UsdSettings::default()).unwrap();
-    let page = a
+    let proto = AssetId::from_name(&ModelName::source("Proto").entry("u"));
+    let mut copies = Vec::new();
+    for page in a
         .entries()
         .iter()
-        .find(|e| e.class == Class::InstancePage as u16)
-        .unwrap();
-    let bytes = |i: usize| {
-        let b = &a.blobs(page)[i];
-        let mut v = vec![0; b.raw_len as usize];
-        a.read(b, &mut v).unwrap();
-        v
+        .filter(|e| e.class == Class::InstancePage as u16)
+    {
+        let (head, body) = (entry_blob(&a, page, 0), entry_blob(&a, page, 1));
+        let info = orr_pack::instance::InstancePageInfo::parse(&head).unwrap();
+        let (cell, records) = orr_pack::instance::decode(&head, &body).unwrap();
+        for (p, mut m) in records {
+            if info.prototypes[usize::from(p)].model == proto {
+                m.translation += IVec3::from(cell).as_vec3() * 256.0;
+                copies.push(m);
+            }
+        }
+    }
+    let [placed] = copies[..] else {
+        panic!("{copies:?}");
     };
-    let (head, body) = (bytes(0), bytes(1));
-    let (cell, mut records) = orr_pack::instance::decode(&head, &body).unwrap();
-    let mut placed = records.next().unwrap().1;
-    placed.translation += IVec3::from(cell).as_vec3() * 256.0;
     let placed = Mat4::from(placed);
-    let corners = triangles(&a, "u/Proto/mesh").1[0].0;
+    let corners = triangles(&a, &ModelName::source("Proto").mesh("u")).1[0].0;
     for p in [Vec3::ZERO, Vec3::X * 100.0, Vec3::Y * 100.0] {
         // Stage offsets of the mesh, the instancer's parent and the copy; then meters, Y up.
         let s = (p + Vec3::new(100.0, 200.0, 300.0)) / 100.0;
@@ -751,17 +780,18 @@ fn bound_vertices_land_where_the_stage_puts_them() {
         let (a, _) = bound_triangle(name, xform, &rig(binds, &rest), SECOND_JOINT, "").unwrap();
         // One second of linear motion needs nothing past the starting rate.
         let slide = Clip::parse(
-            &blob(&a, "u/Hero/clip/Slide", 0),
-            &blob(&a, "u/Hero/clip/Slide", 1),
+            &blob(&a, &ModelName::source("Hero").clip("u", "Slide"), 0),
+            &blob(&a, &ModelName::source("Hero").clip("u", "Slide"), 1),
         )
         .unwrap();
         assert_eq!(slide.header.frame_count, 31, "{name}");
-        let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+        let sk =
+            SkeletonInfo::parse(&blob(&a, &ModelName::source("Hero").skeleton("u"), 0)).unwrap();
         let (mut model, mut palette) = (vec![Affine3::IDENTITY; 2], vec![Affine3::IDENTITY; 2]);
         sk.model_pose(&sk.rest, &mut model);
         sk.palette(&model, &mut palette);
         // The mesh and its palettes stand in the skeleton's space, at its origin.
-        let posed = triangles(&a, "u/Hero/mesh").1[0]
+        let posed = triangles(&a, &ModelName::source("Hero").mesh("u")).1[0]
             .0
             .map(|p| palette[1].transform_point3(p.into()) + sk.origin.as_vec3());
         for p in [Vec3::ZERO, Vec3::X, Vec3::new(0.0, 1.0, 1.0)] {
@@ -799,12 +829,12 @@ fn a_clip_keeps_a_zero_scale_keys_rotation_on_a_joint_past_a_gap() {
         }}"#
     );
     let (a, _) = bound_triangle("usd-zero-scale", "", &skeleton, SECOND_JOINT, "").unwrap();
-    let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+    let sk = SkeletonInfo::parse(&blob(&a, &ModelName::source("Hero").skeleton("u"), 0)).unwrap();
     assert_eq!(sk.parents[1], 0);
     assert_eq!(sk.rest[1].scale, [-1.0, 1.0, 1.0]);
     let clip = Clip::parse(
-        &blob(&a, "u/Hero/clip/Vanish", 0),
-        &blob(&a, "u/Hero/clip/Vanish", 1),
+        &blob(&a, &ModelName::source("Hero").clip("u", "Vanish"), 0),
+        &blob(&a, &ModelName::source("Hero").clip("u", "Vanish"), 1),
     )
     .unwrap();
     let want = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
@@ -839,7 +869,7 @@ fn bad_skin_attributes_read_as_openusd_reads_them() {
     ] {
         let (a, _) =
             bound_triangle("usd-typed-bind", "", &skeleton, SECOND_JOINT, attribute).unwrap();
-        let corners = triangles(&a, "u/Hero/mesh").1[0].0;
+        let corners = triangles(&a, &ModelName::source("Hero").mesh("u")).1[0].0;
         assert!(
             corners
                 .iter()
@@ -907,20 +937,23 @@ def Xform "World"
     )
     .unwrap();
     let (a, _) = usd(&path, UsdSettings::default()).unwrap();
-    assert!(a.find(AssetId::from_name("u/Tile/mesh")).is_some());
-    assert!(a.find(AssetId::from_name("u/Tile/baked/0")).is_none());
+    assert!(
+        a.find(AssetId::from_name(&ModelName::source("Tile").mesh("u")))
+            .is_some()
+    );
+    assert!(
+        a.find(AssetId::from_name(
+            &ModelName::source("Tile").with(Derived::Baked(0)).entry("u")
+        ))
+        .is_none()
+    );
     let page = a
         .entries()
         .iter()
         .find(|e| e.class == Class::InstancePage as u16)
         .unwrap();
-    let bytes = |i: usize| {
-        let b = &a.blobs(page)[i];
-        let mut v = vec![0; b.raw_len as usize];
-        a.read(b, &mut v).unwrap();
-        v
-    };
-    let (_, records) = orr_pack::instance::decode(&bytes(0), &bytes(1)).unwrap();
+    let (head, body) = (entry_blob(&a, page, 0), entry_blob(&a, page, 1));
+    let (_, records) = orr_pack::instance::decode(&head, &body).unwrap();
     let got: Vec<Mat4> = records.map(|(_, m)| m.into()).collect();
     let stretch = Vec3::new(2.0, 1.0, 1.0);
     let turn = |axis: Vec3| Quat::from_axis_angle(axis, std::f32::consts::FRAC_PI_4);
@@ -991,12 +1024,26 @@ def Xform "World"
     )
     .unwrap();
     let (a, _) = usd(&path, UsdSettings::default()).unwrap();
-    assert!(a.find(AssetId::from_name("u/Kept/mesh")).is_some());
-    assert!(a.find(AssetId::from_name("u/Kept/baked/1/mesh")).is_some());
-    assert!(a.find(AssetId::from_name("u/Flat/mesh")).is_none());
+    assert!(
+        a.find(AssetId::from_name(&ModelName::source("Kept").mesh("u")))
+            .is_some()
+    );
+    assert!(
+        a.find(AssetId::from_name(
+            &ModelName::source("Kept").with(Derived::Baked(1)).mesh("u")
+        ))
+        .is_some()
+    );
+    assert!(
+        a.find(AssetId::from_name(&ModelName::source("Flat").mesh("u")))
+            .is_none()
+    );
     let two = 2.0f32.to_bits();
     let flat = [[0, 0, 0], [two, 0, 0], [0, two, 0]];
-    for mesh in ["u/Kept/baked/0/mesh", "u/Flat/baked/0/mesh"] {
+    for mesh in [
+        &ModelName::source("Kept").with(Derived::Baked(0)).mesh("u"),
+        &ModelName::source("Flat").with(Derived::Baked(0)).mesh("u"),
+    ] {
         assert_eq!(triangle_set(&a, mesh), [flat], "{mesh}");
         let info = MeshInfo::parse(&blob(&a, mesh, 0)).unwrap();
         let p = &info.pages[0];
@@ -1348,7 +1395,10 @@ def Xform "World"
         )
         .unwrap();
         let (a, _) = usd(&path, UsdSettings::default()).unwrap();
-        let m = material(&a, "u/material/World/Looks/M");
+        let m = material(
+            &a,
+            &MaterialName::new(MaterialBase::Path("/World/Looks/M".into())).entry("u"),
+        );
         a.find(m.textures[slot::NORMAL].texture)
             .unwrap()
             .content_hash
@@ -2033,8 +2083,12 @@ fn usd_cages_cook_the_surface_of_the_same_cage_built_in_memory() {
     assert_eq!(model.header.mesh, AssetId::from_name("u/mesh"));
     assert_eq!(model.header.subd, AssetId::from_name("u/subd"));
     let (la, lb) = (
-        AssetId::from_name("u/material/World/Looks/A"),
-        AssetId::from_name("u/material/World/Looks/B"),
+        AssetId::from_name(
+            &MaterialName::new(MaterialBase::Path("/World/Looks/A".into())).entry("u"),
+        ),
+        AssetId::from_name(
+            &MaterialName::new(MaterialBase::Path("/World/Looks/B".into())).entry("u"),
+        ),
     );
     assert_eq!(model.materials, [la, la, lb]);
 
@@ -2087,8 +2141,14 @@ fn usd_cages_cook_the_surface_of_the_same_cage_built_in_memory() {
     let (b, _) = cook_one(Source::Subd {
         cage,
         materials: vec![
-            material(&a, "u/material/World/Looks/A"),
-            material(&a, "u/material/World/Looks/B"),
+            material(
+                &a,
+                &MaterialName::new(MaterialBase::Path("/World/Looks/A".into())).entry("u"),
+            ),
+            material(
+                &a,
+                &MaterialName::new(MaterialBase::Path("/World/Looks/B".into())).entry("u"),
+            ),
         ],
         settings: Default::default(),
     })
@@ -2185,8 +2245,14 @@ fn usd_cages_carry_primvars_by_their_interpolation_as_the_same_cage_built_in_mem
     let (b, _) = cook_one(Source::Subd {
         cage,
         materials: vec![
-            material(&a, "u/material/Looks/M"),
-            material(&a, "u/material/Looks/N"),
+            material(
+                &a,
+                &MaterialName::new(MaterialBase::Path("/Looks/M".into())).entry("u"),
+            ),
+            material(
+                &a,
+                &MaterialName::new(MaterialBase::Path("/Looks/N".into())).entry("u"),
+            ),
         ],
         settings: Default::default(),
     })
@@ -2203,4 +2269,296 @@ fn usd_cages_carry_primvars_by_their_interpolation_as_the_same_cage_built_in_mem
     // The faces of `M` read all four channels and those of `N` read 1 in the fourth.
     assert!(usd.iter().any(|s| s.3[3] == 1.0));
     assert!(usd.iter().any(|s| s.3[3] < 0.9));
+}
+
+/// Two collections that overlap make four partitions, each on pages of its own: what neither
+/// holds, what one holds, the other, and both. An instancer's copies follow the instancer's
+/// membership, and a group carries its prim's attributes with their types. A moving prim heads
+/// a rig in each partition whose meshes it moves, each listed as posed under a name of its
+/// own, and copies hung from it are on pages the consumer places. With a selection, each
+/// selected model stands once where its prim does, on its prim's partition's pages.
+#[test]
+fn collections_split_a_stage_into_partitions() {
+    use orr_cook::{GroupSpec, NodeSelect};
+    use orr_math::{IVec3, Mat4, Vec3};
+    use orr_pack::instance::InstancePageInfo;
+    use orr_pack::layout::{AttributeValue, LayoutInfo};
+    use orr_pack::names::{self, ModelBase};
+
+    let d = dir("usd-collections");
+    let path = d.join("stage.usda");
+    let tri = |name: &str, x: i32| {
+        format!(
+            r#"    def Mesh "{name}"
+    {{
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        point3f[] points = [({x}, 0, 0), ({x}, 1, 0), ({x}, 0, 1)]
+        uniform token subdivisionScheme = "none"
+    }}
+"#
+        )
+    };
+    let stage = format!(
+        r#"#usda 1.0
+(
+    metersPerUnit = 0.01
+    upAxis = "Z"
+)
+
+class "Protos"
+{{
+{flame}}}
+
+def Xform "World"
+{{
+{base}{night}{candle}
+    def Xform "Both"
+    {{
+        double3 xformOp:translate = (0, 20, 7)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+{both}    }}
+
+    def PointInstancer "Flames"
+    {{
+        rel prototypes = [</Protos/Flame>]
+        int[] protoIndices = [0, 0]
+        point3f[] positions = [(10, 0, 0), (20, 0, 0)]
+    }}
+
+    def Xform "Spinner"
+    {{
+        double3 xformOp:translate.timeSamples = {{ 0: (0, 0, 0), 10: (0, 5, 0) }}
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+{day}{lamp}
+        def PointInstancer "Sparks"
+        {{
+            rel prototypes = [</Protos/Flame>]
+            int[] protoIndices = [0, 0, 0]
+            point3f[] positions = [(0, 1, 0), (0, 2, 0), (0, 3, 0)]
+        }}
+    }}
+}}
+
+def Scope "Layers"
+{{
+    def Scope "Night" (
+        prepend apiSchemas = ["CollectionAPI:members"]
+    )
+    {{
+        rel collection:members:includes = [</World/Night>, </World/Both>, </World/Spinner/Lamp>]
+        token dataLayer:initialState = "activated"
+        int dataLayer:order = 2
+        token[] dataLayer:tags = ["street", "lamp"]
+        int2 dataLayer:cell = (3, -4)
+        float other = 1
+    }}
+
+    def Scope "Candles" (
+        prepend apiSchemas = ["CollectionAPI:members"]
+    )
+    {{
+        rel collection:members:includes = [
+            </World/Candle>, </World/Both>, </World/Flames>, </World/Spinner/Sparks>
+        ]
+    }}
+}}
+"#,
+        flame = tri("Flame", 0),
+        base = tri("Base", 1),
+        night = tri("Night", 2),
+        candle = tri("Candle", 3),
+        both = tri("Shape", 4),
+        day = tri("Day", 5),
+        lamp = tri("Lamp", 6),
+    );
+    std::fs::write(&path, stage).unwrap();
+    let group = |prim: &str, attributes: &[&str]| GroupSpec {
+        prim: prim.into(),
+        collection: "members".into(),
+        attributes: attributes.iter().map(|&a| a.into()).collect(),
+    };
+    let settings = UsdSettings {
+        groups: vec![
+            group("/Layers/Night", &["dataLayer"]),
+            group("/Layers/Candles", &[]),
+        ],
+        ..UsdSettings::default()
+    };
+    let (a, _) = usd(&path, settings.clone()).unwrap();
+    let info = LayoutInfo::parse(&blob(&a, &names::layout("u"), 0)).unwrap();
+
+    let names: Vec<&str> = info.groups.iter().map(|g| g.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "/Layers/Night.collection:members",
+            "/Layers/Candles.collection:members"
+        ]
+    );
+    let night: Vec<(&str, &AttributeValue)> = info.groups[0]
+        .attributes
+        .iter()
+        .map(|at| (at.name.as_str(), &at.value))
+        .collect();
+    assert_eq!(night.len(), 4, "only the named namespace: {night:?}");
+    assert!(night.contains(&(
+        "dataLayer:initialState",
+        &AttributeValue::Token("activated".into())
+    )));
+    assert!(night.contains(&("dataLayer:order", &AttributeValue::Int(2))));
+    assert!(night.contains(&(
+        "dataLayer:tags",
+        &AttributeValue::TokenArray(vec!["street".into(), "lamp".into()])
+    )));
+    assert!(night.contains(&("dataLayer:cell", &AttributeValue::Int2([3, -4]))));
+    assert!(info.groups[1].attributes.is_empty());
+
+    // Per partition, by its groups: the models its sources' pages place, with their copies.
+    let model = |p: Option<u32>| match p {
+        None => AssetId::from_name(&ModelName::WHOLE.entry("u")),
+        Some(p) => AssetId::from_name(&ModelName::new(ModelBase::Partition(p)).entry("u")),
+    };
+    let flame = AssetId::from_name(&ModelName::source("Flame").entry("u"));
+    let pages: Vec<(AssetId, InstancePageInfo)> = a
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::InstancePage as u16)
+        .map(|e| {
+            (
+                e.id,
+                InstancePageInfo::parse(&entry_blob(&a, e, 0)).unwrap(),
+            )
+        })
+        .collect();
+    let mut seen_pages = Vec::new();
+    let mut by_groups = std::collections::BTreeMap::new();
+    let mut hung = Vec::new();
+    let spinner = ModelName::source("Spinner");
+    for (p, part) in info.partitions.iter().enumerate() {
+        let mut placed: Vec<(AssetId, u16)> = Vec::new();
+        for (id, info) in &pages {
+            let plain = part.sources.contains(&info.header.source);
+            if plain || part.posed_sources.contains(&info.header.source) {
+                seen_pages.push(*id);
+            }
+            if plain {
+                assert_eq!(info.header.frame_skeleton, AssetId::NONE);
+                placed.extend(info.prototypes.iter().map(|q| (q.model, q.records)));
+            } else if part.posed_sources.contains(&info.header.source) {
+                let rig = spinner.with(Derived::Partition(p as u32)).skeleton("u");
+                assert_eq!(info.header.frame_skeleton, AssetId::from_name(&rig));
+                hung.extend(
+                    info.prototypes
+                        .iter()
+                        .map(|q| (part.groups.clone(), q.model, q.records)),
+                );
+            }
+        }
+        placed.sort();
+        let whole = model((p != 0).then_some(p as u32));
+        let rig = match p {
+            0 => spinner.clone(),
+            p => spinner.with(Derived::Partition(p as u32)),
+        };
+        let posed = vec![AssetId::from_name(&rig.entry("u"))];
+        let moved = matches!(part.groups.as_slice(), [] | [0]);
+        assert_eq!(
+            part.posed,
+            if moved { posed } else { Vec::new() },
+            "{:?}",
+            part.groups
+        );
+        by_groups.insert(part.groups.clone(), (whole, placed));
+    }
+    assert_eq!(
+        hung,
+        [(vec![1], flame, 3)],
+        "copies hung from the rig are posed"
+    );
+    let only = |m: AssetId| vec![(m, 1)];
+    let (whole, placed) = &by_groups[&vec![]];
+    assert_eq!(placed, &only(*whole));
+    assert_eq!(*whole, model(None));
+    assert_eq!(by_groups[&vec![0]].1, only(by_groups[&vec![0]].0));
+    assert_eq!(by_groups[&vec![0, 1]].1, only(by_groups[&vec![0, 1]].0));
+    let (candles, placed) = &by_groups[&vec![1]];
+    let mut want = vec![(*candles, 1), (flame, 2)];
+    want.sort();
+    assert_eq!(
+        placed, &want,
+        "the instancer's copies follow its membership"
+    );
+    assert_eq!(by_groups.len(), 4);
+
+    let mut all: Vec<AssetId> = pages.iter().map(|p| p.0).collect();
+    all.sort();
+    seen_pages.sort();
+    assert_eq!(seen_pages, all, "every page in exactly one partition");
+
+    let select = |node: &str| NodeSelect { node: node.into() };
+    let selecting = UsdSettings {
+        models: vec![select("Both"), select("Spinner")],
+        ..settings
+    };
+    let (a, _) = usd(&path, selecting).unwrap();
+    let info = LayoutInfo::parse(&blob(&a, &names::layout("u"), 0)).unwrap();
+    let both = ModelName::source("Both");
+    let ids = [both.clone(), spinner].map(|m| AssetId::from_name(&m.entry("u")));
+    // Per copy of a selected model: its partition's groups, whether its page is posed, the
+    // skeleton it hangs from and where it stands.
+    let mut copies = Vec::new();
+    for page in a
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::InstancePage as u16)
+    {
+        let (head, body) = (entry_blob(&a, page, 0), entry_blob(&a, page, 1));
+        let page = InstancePageInfo::parse(&head).unwrap();
+        let source = page.header.source;
+        let part = info
+            .partitions
+            .iter()
+            .find(|p| p.sources.contains(&source) || p.posed_sources.contains(&source));
+        let part = part.expect("every page in a partition");
+        let (cell, records) = orr_pack::instance::decode(&head, &body).unwrap();
+        for (k, mut m) in records {
+            let model = page.prototypes[usize::from(k)].model;
+            if let Some(i) = ids.iter().position(|&id| id == model) {
+                m.translation += IVec3::from(cell).as_vec3() * 256.0;
+                let posed = part.posed_sources.contains(&source);
+                let frame = page.header.frame_skeleton;
+                copies.push((i, part.groups.clone(), posed, frame, Mat4::from(m)));
+            }
+        }
+    }
+    copies.sort_by_key(|c| c.0);
+    let [
+        (0, groups, false, AssetId::NONE, placed),
+        (1, hung, true, frame, _),
+    ] = &copies[..]
+    else {
+        panic!("one copy of each selected model: {copies:?}");
+    };
+    assert_eq!(groups, &[0, 1], "Both stands in what both groups hold");
+    assert_eq!(hung, &Vec::<u32>::new());
+    let rig = ModelName::source("/World/Spinner").skeleton("u");
+    assert_eq!(
+        *frame,
+        AssetId::from_name(&rig),
+        "Spinner hangs from its own xform's rig"
+    );
+    let corners = triangles(&a, &both.mesh("u")).1[0].0;
+    for p in [Vec3::ZERO, Vec3::Y, Vec3::Z] {
+        // The mesh's points, then Both's offset; then meters, Y up.
+        let s = (p + Vec3::new(4.0, 0.0, 0.0) + Vec3::new(0.0, 20.0, 7.0)) / 100.0;
+        let want = Vec3::new(s.x, s.z, -s.y);
+        assert!(
+            corners
+                .iter()
+                .any(|&c| placed.transform_point3(c.into()).abs_diff_eq(want, 1e-3)),
+            "{want} not reached: {:?}",
+            corners.map(|c| placed.transform_point3(c.into()))
+        );
+    }
 }

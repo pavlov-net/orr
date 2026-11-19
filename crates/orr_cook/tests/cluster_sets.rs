@@ -15,6 +15,7 @@ use orr_pack::mesh::{
     ClusterSet, ClusterSets, MeshHeader, NO_RANK, SET_LEAF, Section, SurfaceClass, in_cut,
     oct_decode,
 };
+use orr_pack::names::ModelName;
 use orr_pack::{Archive, AssetId, Span, Target};
 
 fn cook(assets: Vec<AssetSpec>) -> Archive {
@@ -506,7 +507,7 @@ fn sections_carry_their_class_and_shape_and_clusters_their_class() {
         ),
         mesh("many", grid(18, 18), many_sections, none()),
     ]);
-    let section = |name: &str| load(&a, &format!("{name}/mesh")).info.sections[0];
+    let section = |name: &str| load(&a, &ModelName::WHOLE.mesh(name)).info.sections[0];
 
     let flags = section("glass_cube").flags;
     assert_eq!(
@@ -523,7 +524,7 @@ fn sections_carry_their_class_and_shape_and_clusters_their_class() {
     // Every triangle of a cube of a caster section is flat, none of a sphere; other sections
     // keep no count. Flat triangles come before alpha-tested ones.
     let flat = |name: &str| -> (u32, u32) {
-        let d = load(&a, &format!("{name}/mesh"));
+        let d = load(&a, &ModelName::WHOLE.mesh(name));
         d.clusters.iter().fold((0, 0), |(f, t), c| {
             let r = &c.record;
             assert!(r.flat_triangles <= r.alpha_first);

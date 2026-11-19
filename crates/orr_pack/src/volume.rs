@@ -25,7 +25,7 @@
 use bytemuck::{Pod, Zeroable};
 use half::f16;
 
-use crate::blob::{put_table, read, table};
+use crate::blob::{put_table, read, table, text};
 use crate::instance::morton;
 use crate::texture::vk;
 use crate::{Aabb, Error, Result, Span};
@@ -333,12 +333,7 @@ impl VolumeInfo {
             if !matches!(g.vk_format, vk::R8_UNORM | vk::R16_SFLOAT) {
                 return Err(malformed("volume grid format"));
             }
-            let at = g.name.first as usize;
-            let name = at
-                .checked_add(g.name.count as usize)
-                .and_then(|end| name_bytes.get(at..end))
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .ok_or_else(|| malformed("volume grid name"))?;
+            let name = text(&name_bytes, g.name).ok_or_else(|| malformed("volume grid name"))?;
             names.push(name.to_owned());
             let first = g.bricks.first as usize;
             let own = first

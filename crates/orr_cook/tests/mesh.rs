@@ -12,6 +12,7 @@ use orr_math::{Mat4, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{self, MeshInfo, PageView, Section};
 use orr_pack::model::ModelInfo;
+use orr_pack::names::ModelName;
 use orr_pack::{Archive, AssetId, Class, Span, Target};
 
 fn dir(name: &str) -> PathBuf {
@@ -475,7 +476,9 @@ fn meshes_of_any_extent_store_a_shared_edge_alike() {
     let a = Archive::from_memory(bytes).unwrap();
     // The points of a mesh at its least (`side` -1) or greatest (1) x, as bits.
     let edge = |name: &str, side: f32| {
-        let e = a.find(AssetId::from_name(&format!("{name}/mesh"))).unwrap();
+        let e = a
+            .find(AssetId::from_name(&ModelName::WHOLE.mesh(name)))
+            .unwrap();
         let blobs = a.blobs(e);
         let info = MeshInfo::parse(&read_blob(&a, &blobs[0])).unwrap();
         let mut points = Vec::new();

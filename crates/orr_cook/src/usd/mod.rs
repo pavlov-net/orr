@@ -16,23 +16,25 @@
 //! Models, every one in scene units and axes; a model with a skeleton stands in the skeleton's
 //! space, at its origin in the model's ([`crate::skin::RigSpace`]), and its copies take it:
 //! - Each `SkelRoot` is a model named after it, in scene space (bind space), of the skinned
-//!   meshes under it (those with joint influences and a bound skeleton), cooked as
-//!   `<asset>/<root>/skeleton` with clips `<asset>/<root>/clip/<animation>`. `schemas.dox` makes
-//!   each `skel:skeleton` binding a skeleton instance of its own, so with several under a root
-//!   each is a model `<root>/<binding prim's path under it>`, whichever skeleton it binds. Its
+//!   meshes under it (those with joint influences and a bound skeleton), with its skeleton and
+//!   clips per animation. `schemas.dox` makes each `skel:skeleton` binding a skeleton instance of
+//!   its own, so with several under a root each is a model of the root's derived by the binding
+//!   prim's path under it ([`Derived::Binding`]), whichever skeleton it binds. Its
 //!   other meshes are static and cook with the rest of the stage, as do meshes outside a
 //!   `SkelRoot`, whose bindings mean nothing. A prototype's skinned meshes make it such a model,
-//!   its other meshes on a still joint, a binding past the first a model
-//!   `<prototype>/<binding prim's path under it>` placed with it, and what a sampled xform moves
-//!   among its other meshes a model `<prototype>/moved` placed with it. One skeleton serves every
+//!   its other meshes on a still joint, a binding past the first a model of the prototype's
+//!   derived by the binding prim's path under it placed with it, and what a sampled xform moves
+//!   among its other meshes a model [`Derived::Moved`] placed with it. One skeleton serves every
 //!   copy, and its pages hold only that model's copies, which a palette per copy poses. A
 //!   skeleton outside the prototype is seen from the first copy, following the common space
 //!   UsdSkel's scene index defines: that copy stands at the skeleton's world pose, and the others
 //!   stand off from it as they do from the first.
 //! - What moves by an xform sampled over time, where a sample differs from the first: every mesh
 //!   drawn under such a prim. In the rest of the stage each rig of them is a model of its own in
-//!   scene space, named after its first joint (after its path, or `node<i>` for its node, if
-//!   another model has the name or it would be `mesh`), unless it is all the stage holds; a selected model or a prototype keeps its own, with one
+//!   scene space, named after its first joint (after its path, or its node, if a model other
+//!   than a rig of that joint has the name), unless it is all its partition's rest holds; one
+//!   prim heads a rig in each partition whose rest it moves, named for a partition held by a
+//!   group by [`Derived::Partition`]. A selected model or a prototype keeps its own, with one
 //!   skeleton. Prims become joints as glTF nodes do ([`crate::skin`]), and a rig cooks as rigid
 //!   parts, one per joint, part 0 on a still joint, unless a subdivision cage in it takes its
 //!   joints by skinning. Its one clip is `xform`. Every clip of the stage, this one and each
@@ -67,7 +69,8 @@
 //!   stays where the time read puts it, with a warning: its copies would need a frame per copy
 //!   of the outer prototype.
 //! - Each prototype of a `PointInstancer` is a model named after its root prim (after its path
-//!   if another model has the name). The root's own transform is part of the model, as is
+//!   if another model has the name, and [`Derived::Prototype`] of that if one has the path too).
+//!   The root's own transform is part of the model, as is
 //!   what each prim under it adds, up to any prim that resets the transform stack. Only the
 //!   prototype's own subtree decides what is hidden, and a prototype with nothing to draw
 //!   places nothing. The instancer's `positions`, `orientations` (`orientationsf` where its
@@ -79,17 +82,22 @@
 //!   prototype is placed by each copy of it. Prims under an instancer are cooked only as
 //!   prototypes; one elsewhere that is defined also draws where it stands. A transform that
 //!   collapses an axis is not a placement: the prototype is cooked once per such linear
-//!   transform with it applied, as model `<model>/baked/<k>`, placed by translation alone. A
+//!   transform with it applied, as a model [`Derived::Baked`] of it, placed by translation alone. A
 //!   displacement is a world length, so one that bakes into a mesh makes any transform that
 //!   changes lengths no placement of it either. Moving copies of such a mesh follow the same
 //!   rule while what stretches them stands still between samples ([`crate::import::kept_lengths`]):
-//!   each stretch cooks its own `<model>/baked/<k>`, and the rows move that rigidly. One that
+//!   each stretch cooks its own baked model, and the rows move that rigidly. One that
 //!   changes between samples has no mesh to go into, as only run-time displacement keeps a length
 //!   through it: those copies stay on the model, with a warning, and the height stretches.
-//! - Without [`UsdSettings::models`], the rest of the stage is one model, in scene space.
+//! - Without [`UsdSettings::models`], the rest of the stage is one model per partition
+//!   ([`UsdSettings::groups`]), in scene space. Every other model in scene space that no
+//!   instancer places belongs to a partition too: a `SkelRoot`'s model to its prim's, a rig's
+//!   to the partition whose rest it moves.
 //!   With it, each prim whose name contains a pattern (and has no selected ancestor) is a
-//!   model holding its subtree, framed by the prim; meshes outside every model are not
-//!   cooked.
+//!   model holding its subtree, framed by the prim, and placed once where the prim stands, in
+//!   the prim's partition, as an instancer places a prototype: what moves the prim, at or above
+//!   it, is a rig its copy hangs from, and a transform that is no placement bakes a model
+//!   beside the selected one. Meshes outside every model are not cooked.
 //!
 //! Meshes are [`mesh`] lists. A mesh with a `subdivisionScheme` other than `none` (USD's
 //! fallback is `catmullClark`) is a subdivision cage: [`Subdivision::Hull`] cooks its
@@ -100,10 +108,11 @@
 //! the tessellator by their interpolation ([`mesh::CageBuilder`]).
 //! Faces take the material of their `GeomSubset` of family `materialBind`, else of the
 //! mesh: the direct binding `material:binding:full`, else `material:binding`, of the prim or
-//! its nearest ancestor (collection bindings are not read). Materials map as [`crate::shading`] lists and are named `<asset>/material/<path>`
-//! by their prim path (without the leading `/`), `default` for unbound faces; faces of a
-//! `doubleSided` mesh take a double-sided copy, `<path>/double_sided`. Meshes that differ in
-//! what they hold for a material's primvar readers take a copy each, `<path>/primvars/<k>`.
+//! its nearest ancestor (collection bindings are not read). Materials map as [`crate::shading`]
+//! lists and are named by their prim path ([`MaterialBase::Path`]), [`MaterialBase::Default`] for
+//! unbound faces; faces of a `doubleSided` mesh take a double-sided copy
+//! ([`Variant::DoubleSided`]). Meshes that differ in what they hold for a material's primvar
+//! readers take a copy each ([`Variant::Primvars`]).
 
 mod mesh;
 mod read;
@@ -116,10 +125,13 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use openusd::usd::PathRule;
 use openusd::{sdf, usd};
 use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, DVec4};
 use orr_pack::instance::MotionRow;
+use orr_pack::layout::{Attribute, AttributeValue, Group};
 use orr_pack::material::Material;
+use orr_pack::names::{Derived, MaterialBase, MaterialName, ModelBase, ModelName, Variant};
 use orr_pack::skeleton::{NO_PARENT, SkeletonInfo, Trs};
 use serde::Deserialize;
 
@@ -166,6 +178,22 @@ pub struct UsdSettings {
     /// The mesh primvar of uv set 1; without it meshes carry one uv set.
     pub uv1: Option<String>,
     pub clips: ClipSettings,
+    /// Collections whose members cook into partitions of their own, in the layout
+    /// ([`orr_pack::layout`]): group `k` of the layout is `groups[k]`.
+    pub groups: Vec<GroupSpec>,
+}
+
+/// A collection that makes a group of the layout.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupSpec {
+    /// Absolute path of the prim that applies the collection, such as `/World/Layers/Night`.
+    pub prim: String,
+    /// The collection's instance name: `members` for `collection:members`.
+    pub collection: String,
+    /// Namespaces of the prim's authored attributes the group carries, such as `dataLayer`.
+    #[serde(default)]
+    pub attributes: Vec<String>,
 }
 
 impl Default for UsdSettings {
@@ -183,6 +211,7 @@ impl Default for UsdSettings {
             uv: "st".into(),
             uv1: None,
             clips: ClipSettings::default(),
+            groups: Vec::new(),
         }
     }
 }
@@ -299,6 +328,73 @@ const IMAGEABLE: &[&str] = &[
     "Xform",
 ];
 
+/// A group attribute's value, its numbers as [`read::integers`] and [`read::numbers`] read
+/// them; `None` for a value of no attribute value type.
+fn attribute_value(v: sdf::Value) -> Option<AttributeValue> {
+    use AttributeValue as A;
+    use sdf::Value as V;
+    fn elements<const N: usize>(v: &sdf::Value) -> Option<Vec<[f64; N]>> {
+        Some(read::numbers(v)?.as_chunks::<N>().0.to_vec())
+    }
+    fn element<const N: usize>(v: &sdf::Value) -> Option<[f64; N]> {
+        read::numbers(v)?.try_into().ok()
+    }
+    // USD's integer vectors are of `int`, which an `f64` holds exactly.
+    fn ints<const N: usize>(v: &sdf::Value) -> Option<Vec<[i32; N]>> {
+        let wide = elements::<N>(v)?;
+        Some(wide.into_iter().map(|e| e.map(|x| x as i32)).collect())
+    }
+    fn quats(v: &sdf::Value) -> Option<Vec<DQuat>> {
+        Some(elements::<4>(v)?.iter().map(|q| read::quat(q)).collect())
+    }
+    let one = |v: Option<Vec<f64>>| v.map(|v| v[0]);
+    Some(match &v {
+        V::Bool(b) => A::Bool(*b),
+        V::BoolVec(b) => A::BoolArray(b.clone()),
+        V::Uchar(_) | V::Int(_) | V::Uint(_) | V::Int64(_) => A::Int(read::integers(&v)?[0]),
+        V::UcharVec(_) | V::IntVec(_) | V::UintVec(_) | V::Int64Vec(_) => {
+            A::IntArray(read::integers(&v)?)
+        }
+        V::Uint64(u) => A::Uint64(*u),
+        V::Uint64Vec(u) => A::Uint64Array(u.clone()),
+        V::Half(_) | V::Float(_) | V::Double(_) => A::Float(one(read::numbers(&v))?),
+        V::TimeCode(t) => A::Float(t.value()),
+        V::HalfVec(_) | V::FloatVec(_) | V::DoubleVec(_) => A::FloatArray(read::numbers(&v)?),
+        V::TimeCodeVec(t) => A::FloatArray(t.iter().map(|t| t.value()).collect()),
+        V::Vec2h(_) | V::Vec2f(_) | V::Vec2d(_) => A::Float2(element(&v)?),
+        V::Vec3h(_) | V::Vec3f(_) | V::Vec3d(_) => A::Float3(element(&v)?),
+        V::Vec4h(_) | V::Vec4f(_) | V::Vec4d(_) => A::Float4(element(&v)?),
+        V::Vec2hVec(_) | V::Vec2fVec(_) | V::Vec2dVec(_) => A::Float2Array(elements(&v)?),
+        V::Vec3hVec(_) | V::Vec3fVec(_) | V::Vec3dVec(_) => A::Float3Array(elements(&v)?),
+        V::Vec4hVec(_) | V::Vec4fVec(_) | V::Vec4dVec(_) => A::Float4Array(elements(&v)?),
+        V::Vec2i(_) => A::Int2(ints(&v)?[0]),
+        V::Vec3i(_) => A::Int3(ints(&v)?[0]),
+        V::Vec4i(_) => A::Int4(ints(&v)?[0]),
+        V::Vec2iVec(_) => A::Int2Array(ints(&v)?),
+        V::Vec3iVec(_) => A::Int3Array(ints(&v)?),
+        V::Vec4iVec(_) => A::Int4Array(ints(&v)?),
+        V::Quath(_) | V::Quatf(_) | V::Quatd(_) => A::Quat(quats(&v)?[0]),
+        V::QuathVec(_) | V::QuatfVec(_) | V::QuatdVec(_) => A::QuatArray(quats(&v)?),
+        V::Matrix2d(m) => A::Matrix2(m.0),
+        V::Matrix3d(m) => A::Matrix3(m.0),
+        V::Matrix4d(m) => A::Matrix4(m.0),
+        V::Matrix2dVec(m) => A::Matrix2Array(m.iter().map(|m| m.0).collect()),
+        V::Matrix3dVec(m) => A::Matrix3Array(m.iter().map(|m| m.0).collect()),
+        V::Matrix4dVec(m) => A::Matrix4Array(m.iter().map(|m| m.0).collect()),
+        V::String(t) => A::String(t.clone()),
+        V::StringVec(t) => A::StringArray(t.clone()),
+        V::Token(t) => A::Token(t.as_str().to_owned()),
+        V::TokenVec(t) => A::TokenArray(t.iter().map(|t| t.as_str().to_owned()).collect()),
+        V::AssetPath(a) => A::Asset(a.authored_path.clone()),
+        V::AssetPathVec(a) => A::AssetArray(a.iter().map(|a| a.authored_path.clone()).collect()),
+        V::PathExpression(e) => A::PathExpression(e.to_string()),
+        V::PathExpressionVec(e) => {
+            A::PathExpressionArray(e.iter().map(ToString::to_string).collect())
+        }
+        _ => return None,
+    })
+}
+
 /// One prim of the traversal.
 struct Node {
     prim: usd::Prim,
@@ -326,7 +422,9 @@ struct Node {
 
 /// One model being assembled.
 struct Building {
-    name: Option<String>,
+    /// [`ModelName::WHOLE`] for the part of the stage no instancer places that partition 0
+    /// holds, [`ModelBase::Partition`] for another partition's.
+    name: ModelName,
     /// The node that frames the model, in scene units and axes; scene space without one.
     frame: Option<usize>,
     /// Holds skinned meshes, in bind space.
@@ -342,15 +440,26 @@ struct Building {
     rig_skeleton: Option<usize>,
     /// Bind position per joint of a model of rigid parts.
     pivots: Option<Vec<[f32; 3]>>,
+    /// [`SceneModel::partition`].
+    partition: Option<usize>,
+    /// The top prim of the rig the model was made for, out of the rest of the stage.
+    rig_top: Option<usize>,
     welder: Welder,
     cage: CageBuilder,
 }
 
 impl Building {
-    fn new(name: Option<String>, frame: Option<usize>, root: Option<usize>) -> Self {
+    fn new(
+        name: ModelName,
+        frame: Option<usize>,
+        root: Option<usize>,
+        partition: Option<usize>,
+    ) -> Self {
         Self {
             name,
             frame,
+            partition,
+            rig_top: None,
             skinned: root.is_some(),
             root,
             prototype: None,
@@ -361,6 +470,15 @@ impl Building {
             welder: Welder::default(),
             cage: CageBuilder::default(),
         }
+    }
+
+    /// The model of the part of the stage no instancer places that partition `p` holds.
+    fn rest(p: usize) -> Self {
+        let name = match p {
+            0 => ModelName::WHOLE,
+            p => ModelName::new(ModelBase::Partition(p as u32)),
+        };
+        Self::new(name, None, None, Some(p))
     }
 }
 
@@ -511,10 +629,17 @@ struct Placer<'a> {
     above: &'a mut Vec<usize>,
     /// The joint they hang from.
     frame: Option<RigJoint>,
+    /// The partition of the instancer placed from the stage.
+    partition: usize,
 }
 
 /// The joint of a rig: the model that holds the rig, and the joint.
 type RigJoint = (usize, u16);
+
+/// Whether model `m` is named by `base` or derives from a model it names.
+fn taken(m: &Building, base: &ModelBase) -> bool {
+    m.name.base() == base
+}
 
 /// Gives model `m` its `k`th baked model, which holds its meshes with `linear` applied.
 fn bake_model(
@@ -525,17 +650,70 @@ fn bake_model(
     linear: DMat4,
 ) {
     holders[m].push((models.len(), linear));
-    let name = models[m].name.clone().unwrap_or_default();
+    let name = models[m].name.with(Derived::Baked(k as u32));
     let (prototype, skel_root) = (models[m].prototype, models[m].root);
-    let first_copy = models[m].first_copy;
-    let baked = models.push_mut(Building::new(Some(format!("{name}/baked/{k}")), None, None));
+    let (first_copy, partition) = (models[m].first_copy, models[m].partition);
+    let baked = models.push_mut(Building::new(name, models[m].frame, None, partition));
     baked.prototype = prototype;
     baked.root = skel_root;
     baked.first_copy = first_copy;
 }
 
-/// Placements of a model, and the joint they hang from.
-type FramedCopies = (Option<RigJoint>, Vec<Placed>, Option<Arc<InstanceMotion>>);
+/// Where copies of a model go: the joint they hang from and the partition of
+/// [`Importer::partitions`] that holds them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Dest {
+    frame: Option<RigJoint>,
+    partition: usize,
+}
+
+/// Placements of a model, and how they move over time.
+struct Copies {
+    dest: Dest,
+    placed: Vec<Placed>,
+    motion: Option<Arc<InstanceMotion>>,
+}
+
+/// Moving copies of `model`, which instancer `instancer` places.
+struct Animated {
+    model: usize,
+    instancer: usize,
+    dest: Dest,
+    placed: Vec<Placed>,
+    motion: Arc<InstanceMotion>,
+}
+
+/// The baked models of the stage's models ([`bake_model`]): one per model, joint and linear
+/// transform, whichever partitions hold their copies.
+#[derive(Default)]
+struct Bakes {
+    of: HashMap<(usize, Option<RigJoint>, [u64; 16]), usize>,
+    /// Per model, how many it has.
+    count: HashMap<usize, usize>,
+}
+
+impl Bakes {
+    /// Model `m`'s baked model for copies hanging from `frame` that take `linear`.
+    fn model(
+        &mut self,
+        models: &mut Vec<Building>,
+        holders: &mut [Vec<(usize, DMat4)>],
+        m: usize,
+        frame: Option<RigJoint>,
+        linear: DMat4,
+    ) -> usize {
+        let Self { of, count } = self;
+        // Adding zero turns -0.0 into 0.0, as `placements` tells transforms apart.
+        let key = linear.to_cols_array().map(|x| (x + 0.0).to_bits());
+        *of.entry((m, frame, key)).or_insert_with(|| {
+            let k = count.entry(m).or_default();
+            let baked = models.len();
+            bake_model(models, holders, m, *k, linear);
+            *k += 1;
+            baked
+        })
+    }
+}
 
 /// One prototype of the stage.
 #[derive(Clone)]
@@ -562,12 +740,11 @@ struct Instancing {
     prototypes: HashMap<usize, Prototype>,
     /// Instancers by their nodes.
     instancers: HashMap<usize, Rc<Instancer>>,
-    /// Placements per model and the joint they hang from.
-    copies: BTreeMap<(usize, Option<RigJoint>), Vec<DMat4>>,
+    /// Placements per model and where they go.
+    copies: BTreeMap<(usize, Dest), Vec<DMat4>>,
     /// What placing them warned of.
     warnings: Vec<String>,
-    /// Animated copies per model.
-    animated: Vec<(usize, usize, FramedCopies)>,
+    animated: Vec<Animated>,
     /// Meshes the prototypes draw, with their models.
     meshes: Vec<(usize, usize)>,
     /// How the skinned ones among them bind a skeleton.
@@ -620,6 +797,12 @@ struct Importer<'s> {
     networks: HashMap<String, Rc<Shading>>,
     /// Scene materials so far by material prim path and double-sided.
     copies_of: HashMap<(String, bool), usize>,
+    /// The layout's groups, and its partitions by the ascending groups that hold them, the
+    /// first held by none.
+    groups: Vec<Group>,
+    partitions: Vec<Vec<u32>>,
+    /// Per node, its partition.
+    partition_of: Vec<usize>,
     warnings: Vec<String>,
 }
 
@@ -683,6 +866,9 @@ impl<'s> Importer<'s> {
             networks: HashMap::new(),
             object_frames: HashMap::new(),
             copies_of: HashMap::new(),
+            groups: Vec::new(),
+            partitions: Vec::new(),
+            partition_of: Vec::new(),
         })
     }
 
@@ -804,6 +990,7 @@ impl<'s> Importer<'s> {
 
     fn run(&mut self) -> Result<Scene, String> {
         self.traverse()?;
+        self.find_partitions()?;
         self.find_motions()?;
         self.find_timeline()?;
         let n = self.nodes.len();
@@ -831,11 +1018,13 @@ impl<'s> Importer<'s> {
             sites.sort_unstable();
             sites.dedup();
             for &site in &sites {
+                let name = ModelName::source(self.nodes[i].name.as_str());
                 let name = match sites.len() {
-                    1 => self.nodes[i].name.clone(),
-                    _ => format!("{}/{}", self.nodes[i].name, self.site_name(i, site)),
+                    1 => name,
+                    _ => name.with(Derived::Binding(self.site_name(i, site).into())),
                 };
-                models.push(Building::new(Some(name), None, Some(i)));
+                let p = self.partition_of[i];
+                models.push(Building::new(name, None, Some(i), Some(p)));
                 let m = models.len() - 1;
                 held.iter()
                     .filter(|h| h.1.site == site)
@@ -874,25 +1063,51 @@ impl<'s> Importer<'s> {
         let mut rigs: HashMap<usize, skel::PrimRig> = HashMap::new();
         let mut rig_skeletons = Vec::new();
         let mut rig_of: HashMap<usize, usize> = HashMap::new();
-        let hung: Vec<usize> = instancers.iter().copied().filter(|i| moved(i)).collect();
+        // Each selected model stands once where its prim does, a copy of the model.
+        let selected: Vec<(usize, usize)> = (0..models.len())
+            .filter_map(|m| Some((m, models[m].frame?)))
+            .collect();
+        let hung: Vec<usize> = instancers
+            .iter()
+            .copied()
+            .chain(selected.iter().map(|s| s.1))
+            .filter(|i| moved(i))
+            .collect();
         let mut held: Vec<Vec<usize>> = vec![Vec::new(); models.len()];
         meshes.iter().for_each(|&(i, o)| held[o].push(i));
         // Copies stand in scene space, so what moves them joins the rest of the stage. A
-        // selection has none of that: each takes a model of its own.
-        let stage_model = models.iter().position(|m| m.name.is_none());
+        // selection has none of that: each instancer or selected prim takes a model of its own.
+        let selecting = !self.settings.models.is_empty();
+        let mut rest: HashMap<u32, usize> = (0..models.len())
+            .filter_map(|m| Some((models[m].name.partition()?, m)))
+            .collect();
         for &i in &hung {
-            match stage_model {
-                Some(m) => held[m].push(i),
+            let p = self.partition_of[i];
+            let m = match rest.get(&(p as u32)) {
+                Some(&m) => m,
                 None => {
-                    let path = self.nodes[i].prim.path().as_str().trim_start_matches('/');
-                    models.push(Building::new(Some(path.to_string()), None, None));
-                    holders.push(vec![(models.len() - 1, DMat4::IDENTITY)]);
-                    held.push(vec![i]);
+                    let b = match selecting {
+                        false => Building::rest(p),
+                        true => {
+                            let path = ModelName::source(self.nodes[i].prim.path().as_str());
+                            Building::new(path, None, None, Some(p))
+                        }
+                    };
+                    let m = models.len();
+                    models.push(b);
+                    holders.push(vec![(m, DMat4::IDENTITY)]);
+                    held.push(Vec::new());
+                    if !selecting {
+                        rest.insert(p as u32, m);
+                    }
+                    m
                 }
-            }
+            };
+            held[m].push(i);
         }
+        // A selected model's own rig waits for its baked models, as a prototype's does.
         for (o, held) in held.iter().enumerate() {
-            if models[o].skinned || !held.iter().any(moved) {
+            if models[o].skinned || models[o].frame.is_some() || !held.iter().any(moved) {
                 continue;
             }
             self.rig_model(
@@ -924,8 +1139,23 @@ impl<'s> Importer<'s> {
                 instancing: &mut instancing,
                 above: &mut Vec::new(),
                 frame,
+                partition: self.partition_of[i],
             };
             self.place(i, to_scene, place)?;
+        }
+        // A selected model holds its prim's space as `root` turns the stage's.
+        for &(m, f) in &selected {
+            let (to_scene, frame) = match rig_of.get(&f) {
+                Some(&h) => {
+                    let (joint, to_bind) = self.attach(&rigs[&h], &models[h], f)?;
+                    (to_bind, Some((h, joint)))
+                }
+                None => (self.nodes[f].world, None),
+            };
+            let partition = self.partition_of[f];
+            let key = (m, Dest { frame, partition });
+            let copy = to_scene * self.root.inverse();
+            instancing.copies.entry(key).or_default().push(copy);
         }
         // An instancer that holds still warned of its samples already, the placed one among them.
         let heard: std::collections::HashSet<String> = self.warnings.iter().cloned().collect();
@@ -948,72 +1178,83 @@ impl<'s> Importer<'s> {
             let displaced = bound_here
                 .materials()
                 .any(|m| self.materials[m].textures.displacement.is_some());
-            let settings = || self.mesh_settings(models[o].name.as_deref());
+            let settings = || self.mesh_settings(&models[o].name);
             if !as_cage && displaced && settings().displace_static.is_some() {
                 baking.insert(o);
             }
             bindings.push((bound_here, as_cage));
         }
 
-        // Per instanced model its placements by the joint they hang from.
-        let mut placed: HashMap<usize, Vec<FramedCopies>> = HashMap::new();
-        let mut baked_of: HashMap<usize, usize> = HashMap::new();
-        for ((m, frame), transforms) in instancing.copies {
-            let name = models[m].name.clone().unwrap_or_default();
-            let (direct, baked) =
-                placements(&transforms, baking.contains(&m)).map_err(|e| format!("{name}: {e}"))?;
-            placed.entry(m).or_default().push((frame, direct, None));
+        // Per instanced model its placements by where they go.
+        let mut placed: HashMap<usize, Vec<Copies>> = HashMap::new();
+        let mut bakes = Bakes::default();
+        for ((m, dest), transforms) in instancing.copies {
+            let (direct, baked) = placements(&transforms, baking.contains(&m))
+                .map_err(|e| format!("{}: {e}", models[m].name))?;
+            placed.entry(m).or_default().push(Copies {
+                dest,
+                placed: direct,
+                motion: None,
+            });
             for (linear, copies) in baked {
-                let k = baked_of.entry(m).or_default();
-                placed.insert(models.len(), vec![(frame, copies, None)]);
-                bake_model(&mut models, &mut holders, m, *k, linear);
-                *k += 1;
+                let b = bakes.model(&mut models, &mut holders, m, dest.frame, linear);
+                placed.entry(b).or_default().push(Copies {
+                    dest,
+                    placed: copies,
+                    motion: None,
+                });
             }
         }
-        for (m, ins, list) in instancing.animated {
-            let (frame, copies, Some(motion)) = list else {
-                continue;
-            };
+        for a in instancing.animated {
+            let (m, dest) = (a.model, a.dest);
             if !baking.contains(&m) {
-                let list = (frame, copies, Some(motion));
-                placed.entry(m).or_default().push(list);
+                placed.entry(m).or_default().push(Copies {
+                    dest,
+                    placed: a.placed,
+                    motion: Some(a.motion),
+                });
                 continue;
             }
-            let kept = kept_lengths(&copies, &motion);
+            let kept = kept_lengths(&a.placed, &a.motion);
             if kept.stretched {
-                let name = models[m].name.clone().unwrap_or_default();
-                let r = self.reader(&self.nodes[ins].prim);
+                let r = self.reader(&self.nodes[a.instancer].prim);
                 self.warnings.push(format!(
-                    "{}: a copy's scale changes over time, so the height baked into {name} \
+                    "{}: a copy's scale changes over time, so the height baked into {} \
                      stretches with it, not a world length",
-                    r.path()
+                    r.path(),
+                    models[m].name
                 ));
             }
-            let list = match kept.direct {
-                Some((copies, motion)) => (frame, copies, Some(motion)),
-                None => (frame, Vec::new(), None),
-            };
-            placed.entry(m).or_default().push(list);
+            let (direct, motion) = kept.direct.unzip();
+            placed.entry(m).or_default().push(Copies {
+                dest,
+                placed: direct.unwrap_or_default(),
+                motion,
+            });
             for (linear, copies, motion) in kept.baked {
-                let k = baked_of.entry(m).or_default();
-                placed.insert(models.len(), vec![(frame, copies, Some(motion))]);
-                bake_model(&mut models, &mut holders, m, *k, linear);
-                *k += 1;
+                let b = bakes.model(&mut models, &mut holders, m, dest.frame, linear);
+                placed.entry(b).or_default().push(Copies {
+                    dest,
+                    placed: copies,
+                    motion: Some(motion),
+                });
             }
         }
-        // Models that bake them hold all of a prototype's copies.
+        // Models that bake them hold all of a prototype's copies; a selected model stays.
         for (&m, lists) in &placed {
-            if baked_of.contains_key(&m) && lists.iter().all(|l| l.1.is_empty()) {
+            let framed = models[m].frame.is_some();
+            if !framed && bakes.count.contains_key(&m) && lists.iter().all(|l| l.placed.is_empty())
+            {
                 holders[m].retain(|h| h.0 != m);
             }
         }
-
         bound.extend(instancing.bound);
-        // The prototypes' rigs, which their copies carry on their pages.
+        // The rigs of prototypes and selected models, which their copies carry on their pages.
         let mut held: Vec<Vec<usize>> = vec![Vec::new(); models.len()];
         meshes.iter().for_each(|&(i, o)| held[o].push(i));
         for (o, held) in held.iter().enumerate() {
-            if models[o].prototype.is_none() || models[o].skinned || !held.iter().any(moved) {
+            let copied = models[o].prototype.is_some() || models[o].frame.is_some();
+            if !copied || models[o].skinned || !held.iter().any(moved) {
                 continue;
             }
             self.rig_model(
@@ -1029,9 +1270,10 @@ impl<'s> Importer<'s> {
             )?;
         }
         // One skeleton per model that skins, from what its meshes bind: its prim path, the
-        // skeleton and its space, the root's node, the prims that bind it and the name its
-        // entries go under.
-        let mut skels: Vec<(String, skel::Skel, RigSpace, usize, Vec<usize>, String)> = Vec::new();
+        // skeleton and its space, the root's node, the prims that bind it and the model whose
+        // skeleton it is.
+        let mut skels: Vec<(String, skel::Skel, RigSpace, usize, Vec<usize>, ModelName)> =
+            Vec::new();
         for m in 0..models.len() {
             if !models[m].skinned || models[m].rig_skeleton.is_some() {
                 continue;
@@ -1064,9 +1306,9 @@ impl<'s> Importer<'s> {
                 // A baked copy keeps its bind pose: the skeleton takes the transform.
                 let space = built.settle(linear);
                 let root = models[h].root.expect("skeletal roots have prims");
-                let prefix = models[h].name.clone().unwrap_or_default();
+                let model = models[h].name.clone();
                 let path = path.as_str().to_string();
-                skels.push((path, built, space, root, sites.clone(), prefix));
+                skels.push((path, built, space, root, sites.clone(), model));
                 models[h].skinned = true;
                 models[h].skeleton = Some(skels.len() - 1);
             }
@@ -1333,38 +1575,40 @@ impl<'s> Importer<'s> {
         for (mi, b) in models.into_iter().enumerate() {
             let copies = placed.remove(&mi);
             // Models that bake them hold all of a prototype's copies.
-            if copies
-                .as_ref()
-                .is_some_and(|c| c.iter().all(|l| l.1.is_empty()))
+            if b.frame.is_none()
+                && copies
+                    .as_ref()
+                    .is_some_and(|c| c.iter().all(|l| l.placed.is_empty()))
             {
                 continue;
             }
             // The rest of the stage, a skeletal root with no skinned mesh or a prototype may be
             // empty.
             let rig = b.rig_skeleton.is_some();
-            if (b.name.is_none() || b.skinned || b.prototype.is_some() || rig)
+            if (b.name.partition().is_some() || b.skinned || b.prototype.is_some() || rig)
                 && b.welder.groups.values().all(Vec::is_empty)
                 && b.cage.is_empty()
             {
                 continue;
             }
-            if let Some(n) = &b.name
-                && !names.insert(n.clone())
-            {
-                return Err(format!("two models are named {n:?}"));
+            if !names.insert(b.name.clone()) {
+                return Err(format!("two models are named {:?}", b.name.to_string()));
             }
-            if let (Some(n), Some(copies)) = (&b.name, copies) {
-                for (frame, placed, motion) in copies.into_iter().filter(|l| !l.1.is_empty()) {
-                    instance_out.push(PlacedModel {
-                        model: n.clone(),
-                        placed,
-                        alone: frame.is_some() || b.skeleton.is_some() || motion.is_some(),
-                        motion,
-                        frame: frame.map(|(m, joint)| {
-                            (rig_skeleton[m].expect("a rig has a skeleton"), joint)
-                        }),
-                    });
-                }
+            for c in copies
+                .into_iter()
+                .flatten()
+                .filter(|c| !c.placed.is_empty())
+            {
+                let frame = c.dest.frame;
+                instance_out.push(PlacedModel {
+                    model: b.name.clone(),
+                    placed: c.placed,
+                    alone: frame.is_some() || b.skeleton.is_some() || c.motion.is_some(),
+                    motion: c.motion,
+                    frame: frame
+                        .map(|(m, joint)| (rig_skeleton[m].expect("a rig has a skeleton"), joint)),
+                    partition: c.dest.partition,
+                });
             }
             out.push(self.model(b)?);
         }
@@ -1372,10 +1616,10 @@ impl<'s> Importer<'s> {
             return Err("the stage has no triangles".into());
         }
         let mut skeletons = Vec::with_capacity(skels.len());
-        for (path, sk, space, root, sites, prefix) in skels {
+        for (path, sk, space, root, sites, model) in skels {
             let clips = self.clips(&path, (&sk, &space), root, &sites)?;
             skeletons.push(SceneSkeleton {
-                prefix,
+                model,
                 info: sk.info,
                 space,
                 clips,
@@ -1389,26 +1633,26 @@ impl<'s> Importer<'s> {
             skeletons,
             clips: self.settings.clips.clone(),
             instances: instance_out,
+            groups: std::mem::take(&mut self.groups),
+            partitions: std::mem::take(&mut self.partitions),
             files: self.reads.borrow().inputs(),
             warnings: std::mem::take(&mut self.warnings),
         })
     }
 
-    /// Mesh settings of the model named `name`.
-    fn mesh_settings(&self, name: Option<&str>) -> MeshSettings {
+    /// Mesh settings of model `name`.
+    fn mesh_settings(&self, name: &ModelName) -> MeshSettings {
         let mut s = self.settings.mesh.clone();
-        patch::apply_matching(
-            &self.settings.mesh_overrides,
-            name.unwrap_or_default(),
-            &mut s,
-            MeshPatch::apply,
-        );
+        let overrides = &self.settings.mesh_overrides;
+        if !overrides.is_empty() {
+            patch::apply_matching(overrides, &name.to_string(), &mut s, MeshPatch::apply);
+        }
         s
     }
 
     /// A built model's mesh, one section per scene material.
     fn model(&mut self, b: Building) -> Result<SceneModel, String> {
-        let settings = self.mesh_settings(b.name.as_deref());
+        let settings = self.mesh_settings(&b.name);
         let w = b.welder;
         let mut indices = Vec::new();
         let mut sections = Vec::new();
@@ -1460,13 +1704,13 @@ impl<'s> Importer<'s> {
             }
         });
         if sections.is_empty() && subd.is_none() {
-            return Err(match &b.name {
-                Some(n) => format!("model {n} has no triangles"),
-                None => "the stage has no triangles".into(),
+            return Err(match b.name.partition() {
+                None => format!("model {} has no triangles", b.name),
+                Some(_) => "the stage has no triangles".into(),
             });
         }
         Ok(SceneModel {
-            node: b.name,
+            name: b.name,
             subd,
             mesh: MeshSource::Data(Box::new(MeshData {
                 positions: w.positions,
@@ -1495,6 +1739,7 @@ impl<'s> Importer<'s> {
             skeleton: b.skeleton,
             settings,
             materials: slots,
+            partition: b.partition,
         })
     }
 
@@ -1524,7 +1769,8 @@ impl<'s> Importer<'s> {
         }
         let no_skin = |_: usize| None;
         let mut cages = std::collections::HashSet::new();
-        for &i in held.iter().filter(|&&i| self.nodes[i].ty == "Mesh") {
+        // A selected prim it hangs may be a mesh, of the selected model.
+        for &(i, _) in meshes.iter().filter(|h| h.1 == o) {
             let facts = MeshFacts::read(&self.reader(&self.nodes[i].prim))?;
             if !facts.polygonal && self.settings.subdivision == Subdivision::Cage {
                 cages.insert(i);
@@ -1548,17 +1794,25 @@ impl<'s> Importer<'s> {
             let m = if one || whole {
                 o
             } else {
+                // A prim heads a rig in each partition whose rest it moves: those rigs share a
+                // name, told apart by partition, which no other model takes.
                 let top = &self.nodes[rig.top];
-                let path = top.prim.path().as_str().trim_start_matches('/');
-                // `mesh` is the entry of the whole stage's mesh.
-                let free = |s: &&str| {
-                    *s != "mesh" && !models.iter().any(|m| m.name.as_deref() == Some(*s))
+                let free = |s: &ModelName| {
+                    let other = |m: &Building| taken(m, s.base()) && m.rig_top != Some(rig.top);
+                    !models.iter().any(other)
                 };
-                let name = [top.name.as_str(), path]
+                let name = [top.name.as_str(), top.prim.path().as_str()]
+                    .map(ModelName::source)
                     .into_iter()
                     .find(free)
-                    .map_or_else(|| format!("node{}", rig.top), str::to_string);
-                models.push(Building::new(Some(name), None, None));
+                    .unwrap_or_else(|| ModelName::new(ModelBase::Node(rig.top as u32)));
+                let partition = models[o].partition;
+                let name = match partition {
+                    Some(p) if p != 0 => name.with(Derived::Partition(p as u32)),
+                    _ => name,
+                };
+                let b = models.push_mut(Building::new(name, None, None, partition));
+                b.rig_top = Some(rig.top);
                 holders.push(vec![(models.len() - 1, DMat4::IDENTITY)]);
                 let m = models.len() - 1;
                 moved.extend(rig.meshes.iter().map(|&i| (i, m)));
@@ -1584,7 +1838,7 @@ impl<'s> Importer<'s> {
                     built.space.channels(&built.info, &mut c.channels);
                 }
                 skeletons.push(SceneSkeleton {
-                    prefix: models[h].name.clone().unwrap_or_default(),
+                    model: models[h].name.clone(),
                     info: built.info.clone(),
                     space: built.space,
                     clips: clip
@@ -1881,6 +2135,79 @@ impl<'s> Importer<'s> {
         Ok(self.root * m)
     }
 
+    /// The layout's groups from [`UsdSettings::groups`], and each node's partition: the set of
+    /// groups whose collection includes its prim, as UsdCollectionAPI's membership rules say.
+    fn find_partitions(&mut self) -> Result<(), String> {
+        let mut queries = Vec::with_capacity(self.settings.groups.len());
+        for g in &self.settings.groups {
+            let fail =
+                |e: openusd::Error| format!("group {}.collection:{}: {e}", g.prim, g.collection);
+            let &node = self
+                .by_path
+                .get(g.prim.as_str())
+                .ok_or_else(|| format!("group prim {} is not on the stage", g.prim))?;
+            let prim = &self.nodes[node].prim;
+            let collection = usd::CollectionAPI::get_instance(prim, g.collection.as_str())
+                .map_err(fail)?
+                .ok_or_else(|| format!("{} does not apply collection:{}", g.prim, g.collection))?;
+            queries.push(collection.compute_membership_query().map_err(fail)?);
+            let mut attributes = Vec::new();
+            let r = self.reader(prim);
+            for ns in &g.attributes {
+                for a in prim.authored_attributes_in_namespace(ns).map_err(fail)? {
+                    let Some(value) = r.value(a.name())? else {
+                        continue;
+                    };
+                    let value = attribute_value(value).ok_or_else(|| {
+                        format!("{}.{}: no attribute value type holds it", g.prim, a.name())
+                    })?;
+                    attributes.push(Attribute {
+                        name: a.name().to_owned(),
+                        value,
+                    });
+                }
+            }
+            self.groups.push(Group {
+                name: format!("{}.collection:{}", g.prim, g.collection),
+                attributes,
+            });
+        }
+        // Each node's membership follows from its own opinion and the rule its parent passes
+        // down, which the pre-order of the nodes holds before it.
+        let root = sdf::Path::abs_root();
+        let seeds: Vec<PathRule> = queries
+            .iter()
+            .map(|q| q.is_path_included_below(&root, PathRule::Exclude).1)
+            .collect();
+        let mut rules: Vec<Vec<PathRule>> = Vec::with_capacity(self.nodes.len());
+        let mut index: HashMap<Vec<u32>, usize> = HashMap::from([(Vec::new(), 0)]);
+        self.partitions = vec![Vec::new()];
+        self.partition_of = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            let above = node.parent.map_or(&seeds, |p| &rules[p]);
+            let mut held = Vec::new();
+            let mut own = Vec::with_capacity(queries.len());
+            for (g, q) in queries.iter().enumerate() {
+                let (included, rule) = q.is_path_included_below(node.prim.path(), above[g]);
+                if included {
+                    held.push(g as u32);
+                }
+                own.push(rule);
+            }
+            rules.push(own);
+            let p = match index.get(&held) {
+                Some(&p) => p,
+                None => {
+                    index.insert(held.clone(), self.partitions.len());
+                    self.partitions.push(held);
+                    self.partitions.len() - 1
+                }
+            };
+            self.partition_of.push(p);
+        }
+        Ok(())
+    }
+
     /// Adds the selected models (or the whole-stage model) for prims no model holds yet.
     fn select_models(
         &self,
@@ -1889,11 +2216,14 @@ impl<'s> Importer<'s> {
     ) -> Result<(), String> {
         let n = self.nodes.len();
         if self.settings.models.is_empty() {
-            let whole = models.len();
-            models.push(Building::new(None, None, None));
+            let mut rest: HashMap<usize, usize> = HashMap::new();
             for (i, o) in owner.iter_mut().enumerate() {
                 if o.is_none() && !self.nodes[i].instanced {
-                    *o = Some(whole);
+                    let p = self.partition_of[i];
+                    *o = Some(*rest.entry(p).or_insert_with(|| {
+                        models.push(Building::rest(p));
+                        models.len() - 1
+                    }));
                 }
             }
             return Ok(());
@@ -1919,14 +2249,12 @@ impl<'s> Importer<'s> {
             if !hit {
                 continue;
             }
-            if models[first..]
-                .iter()
-                .any(|m| m.name.as_deref() == Some(&node.name))
-            {
+            let name = ModelName::source(node.name.as_str());
+            if models[first..].iter().any(|m| m.name == name) {
                 return Err(format!("two selected prims are named {:?}", node.name));
             }
             owner[i] = Some(models.len());
-            models.push(Building::new(Some(node.name.clone()), Some(i), None));
+            models.push(Building::new(name, Some(i), None, None));
         }
         if let Some(s) = matched.iter().position(|m| !m) {
             return Err(format!(
@@ -1949,20 +2277,16 @@ impl<'s> Importer<'s> {
             return Ok(p.clone());
         }
         let node = &self.nodes[root];
-        // Models under a name would meet those of the prototype's own binding prims.
-        let taken = |name: &str| {
-            let under = format!("{name}/");
-            let named = |n: &str| n == name || n.starts_with(&under);
-            models.iter().filter_map(|m| m.name.as_deref()).any(named)
-        };
-        let path = node.prim.path().as_str().trim_start_matches('/');
-        let name = match (taken(&node.name), taken(path)) {
-            (false, _) => node.name.clone(),
-            (_, false) => path.to_string(),
-            _ => format!("{path}/prototype"),
+        // Models derived from a name would meet those of the prototype's own binding prims.
+        let named = ModelName::source(node.name.as_str());
+        let path = ModelName::source(node.prim.path().as_str());
+        let name = match [&named, &path].map(|n| models.iter().any(|m| taken(m, n.base()))) {
+            [false, _] => named,
+            [_, false] => path,
+            _ => path.with(Derived::Prototype),
         };
         let model = models.len();
-        models.push(Building::new(Some(name.clone()), None, None));
+        models.push(Building::new(name.clone(), None, None, None));
         models[model].prototype = Some(root);
         let mut nested = Vec::new();
         let mut also = Vec::new();
@@ -2004,11 +2328,11 @@ impl<'s> Importer<'s> {
                             Some(s) => s.1,
                             None if sites.is_empty() => model,
                             None => {
-                                let name = format!("{name}/{}", self.site_name(root, b.site));
+                                let site = self.site_name(root, b.site).into();
+                                let name = name.with(Derived::Binding(site));
                                 let m = models.len();
-                                models
-                                    .push_mut(Building::new(Some(name), None, None))
-                                    .prototype = Some(root);
+                                let b = Building::new(name, None, None, None);
+                                models.push_mut(b).prototype = Some(root);
                                 also.push(m);
                                 m
                             }
@@ -2040,7 +2364,7 @@ impl<'s> Importer<'s> {
             if !sites.is_empty() && !bound.contains_key(&h.0) && moves(h.0) {
                 h.1 = *rigged.get_or_insert_with(|| {
                     let m = models.len();
-                    let moved = Building::new(Some(format!("{name}/moved")), None, None);
+                    let moved = Building::new(name.with(Derived::Moved), None, None, None);
                     models.push_mut(moved).prototype = Some(root);
                     also.push(m);
                     m
@@ -2064,6 +2388,7 @@ impl<'s> Importer<'s> {
             instancing,
             above,
             frame,
+            partition,
         } = at;
         let r = self.reader(&self.nodes[ins].prim);
         if above.contains(&ins) {
@@ -2101,6 +2426,7 @@ impl<'s> Importer<'s> {
                 instancing: &mut *instancing,
                 above: &mut *above,
                 frame,
+                partition,
             };
             self.place_moving(ins, motion, &instancer, to_scene, at)?;
         }
@@ -2111,7 +2437,7 @@ impl<'s> Importer<'s> {
             let transform = to_scene * local;
             let copied = std::iter::once(&p.model).chain(&p.also);
             for &m in copied.filter(|_| motion.is_none()) {
-                let key = (m, frame);
+                let key = (m, Dest { frame, partition });
                 instancing.copies.entry(key).or_default().push(transform);
                 models[m].first_copy.get_or_insert((ins, transform));
             }
@@ -2122,6 +2448,7 @@ impl<'s> Importer<'s> {
                     instancing: &mut *instancing,
                     above: &mut *above,
                     frame,
+                    partition,
                 };
                 self.place(nested, to_scene, at)?;
             }
@@ -2144,6 +2471,7 @@ impl<'s> Importer<'s> {
             models,
             instancing,
             frame,
+            partition,
             ..
         } = at;
         let right = self.root.inverse();
@@ -2199,8 +2527,13 @@ impl<'s> Importer<'s> {
             let placed: Vec<Placed> = rest.iter().map(record).collect();
             for &m in std::iter::once(&p.model).chain(&p.also) {
                 models[m].first_copy.get_or_insert((ins, rest[0]));
-                let copies = (frame, placed.clone(), Some(Arc::clone(&table)));
-                instancing.animated.push((m, ins, copies));
+                instancing.animated.push(Animated {
+                    model: m,
+                    instancer: ins,
+                    dest: Dest { frame, partition },
+                    placed: placed.clone(),
+                    motion: Arc::clone(&table),
+                });
             }
         }
         Ok(())
@@ -2573,13 +2906,11 @@ impl<'s> Importer<'s> {
     }
 
     /// What names skeleton binding `site` beside others under node `root`: its path under
-    /// `root`, or from the stage's root where it stands elsewhere.
+    /// `root`, or its absolute path, which starts with `/`, where it stands elsewhere.
     fn site_name(&self, root: usize, site: usize) -> &str {
         let path = self.nodes[site].prim.path().as_str();
         let under = path.strip_prefix(self.nodes[root].prim.path().as_str());
-        under
-            .and_then(|p| p.strip_prefix('/'))
-            .unwrap_or_else(|| path.trim_start_matches('/'))
+        under.and_then(|p| p.strip_prefix('/')).unwrap_or(path)
     }
 
     /// Material `m`, or its copy whose object space maps read through `baked`.
@@ -2603,7 +2934,9 @@ impl<'s> Importer<'s> {
             return turned;
         }
         let mut copy = self.materials[m].clone();
-        copy.suffix = format!("{}/object/{}", copy.suffix, self.object_frames.len());
+        copy.name = copy
+            .name
+            .with(Variant::Object(self.object_frames.len() as u32));
         copy.material.object_frame = frame;
         self.materials.push(copy);
         self.frames.push(self.frames[m].clone());
@@ -2981,15 +3314,15 @@ impl<'s> Importer<'s> {
                 };
                 let mapped = shading::map(&s.net, s.surface, s.displacement, &mut host)
                     .map_err(|e| format!("material {p}: {e}"))?;
-                let path = p.as_str().trim_start_matches('/');
+                let path = MaterialName::new(MaterialBase::Path(p.as_str().to_string()));
                 let copy = self
                     .copies_of
-                    .entry((path.to_string(), double_sided))
+                    .entry((p.as_str().to_string(), double_sided))
                     .or_default();
                 *copy += 1;
                 let name = match *copy {
-                    1 => path.to_string(),
-                    k => format!("{path}/primvars/{}", k - 1),
+                    1 => path,
+                    k => path.with(Variant::Primvars((k - 1) as u32)),
                 };
                 (mapped, name)
             }
@@ -3001,7 +3334,7 @@ impl<'s> Importer<'s> {
                     vertex: Vec::new(),
                     warnings: Vec::new(),
                 },
-                "default".to_string(),
+                MaterialName::new(MaterialBase::Default),
             ),
         };
         let prim_name = prim
@@ -3020,14 +3353,13 @@ impl<'s> Importer<'s> {
         let mut frame = self.frame(prim.as_ref(), &mut mapped.material)?;
         frame.vertex = std::mem::take(&mut mapped.vertex);
         shading::fold_stream_scales(&mut mapped.material, &frame.vertex);
-        let suffix = if double_sided {
-            format!("{name}/double_sided")
-        } else {
-            name
+        let name = match double_sided {
+            true => name.with(Variant::DoubleSided),
+            false => name,
         };
         self.warnings.extend(mapped.warnings);
         self.materials.push(SceneMaterial {
-            suffix,
+            name,
             material: mapped.material,
             textures: mapped.textures,
             model: mapped.model,

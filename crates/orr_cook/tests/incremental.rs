@@ -15,6 +15,7 @@ use orr_cook::{
     Source, TextureSettings, Usage,
 };
 use orr_math::{DVec3, Quat, Vec3};
+use orr_pack::names::ModelName;
 use orr_pack::{Archive, ArchiveWriter, AssetId, Class, Target};
 
 fn dir(name: &str) -> PathBuf {
@@ -344,7 +345,9 @@ fn rebuilds_cook_only_what_changed() {
     assert_eq!(names(&settings, Outcome::Cooked), set(&["tex"]));
     assert_eq!(*fresh(MipFilter::Box), *std::fs::read(&file).unwrap());
 
-    // Geometry: the mesh, then what depends on it: the model and the instance pages.
+    // Geometry: the mesh, then what depends on it: the model, the instance pages placing it,
+    // the scene's own at the origin and the scatter's. The layout names instance sources, not
+    // pages, and stays.
     write_bin(&d.join("quad.bin"), 2.0);
     let geometry = cook(MipFilter::Box);
     let cooked = names(&geometry, Outcome::Cooked);
@@ -354,11 +357,18 @@ fn rebuilds_cook_only_what_changed() {
         .cloned()
         .collect();
     assert!(!pages.is_empty());
-    let mut expected = set(&["quad", "quad/mesh"]);
+    let whole = ModelName::WHOLE;
+    let mut expected: BTreeSet<String> = [
+        whole.entry("quad"),
+        whole.mesh("quad"),
+        orr_pack::names::page(&orr_pack::names::instances("quad", 0), [0, 0, 0], 0),
+    ]
+    .into();
+    let quad = expected.len();
     expected.extend(pages);
     assert_eq!(cooked, expected);
     let all_pages = geometry.report.assets[3].entries.len();
-    assert_eq!(cooked.len(), 2 + all_pages);
+    assert_eq!(cooked.len(), quad + all_pages);
     assert_eq!(*fresh(MipFilter::Box), *std::fs::read(&file).unwrap());
 
     // Another quality at the same zstd level cooks every texture anew, and what reads
@@ -741,16 +751,20 @@ fn linked_imports_still_expand_assemblies() {
         .remove(0);
     assert_eq!(*fresh, *std::fs::read(&file).unwrap());
     let a = Archive::open(&file).unwrap();
-    let records: usize = a
-        .entries()
-        .iter()
-        .filter(|e| e.class == Class::InstancePage as u16)
-        .map(|e| {
-            let mut head = vec![0; a.blobs(e)[0].raw_len as usize];
-            a.read(&a.blobs(e)[0], &mut head).unwrap();
-            let info = orr_pack::instance::InstancePageInfo::parse(&head).unwrap();
-            usize::from(info.header.record_count)
-        })
-        .sum();
-    assert_eq!(records, 3 * (1 + 12));
+    let records = |source: &str| -> usize {
+        a.entries()
+            .iter()
+            .filter(|e| e.class == Class::InstancePage as u16)
+            .filter(|e| orr_pack::names::parse_page(a.name(e)).is_some_and(|p| p.0 == source))
+            .map(|e| {
+                let mut head = vec![0; a.blobs(e)[0].raw_len as usize];
+                a.read(&a.blobs(e)[0], &mut head).unwrap();
+                let info = orr_pack::instance::InstancePageInfo::parse(&head).unwrap();
+                usize::from(info.header.record_count)
+            })
+            .sum()
+    };
+    // Each copy of the rack, and the rack the scene itself places at the origin.
+    assert_eq!(records("scatter"), 3 * (1 + 12));
+    assert_eq!(records(&orr_pack::names::instances("rack", 0)), 1 + 12);
 }

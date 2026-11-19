@@ -21,7 +21,7 @@ use orr::orr_pack::mesh::MeshInfo;
 use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
     Budgets, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime,
-    GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource, PoolSize,
+    GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LitView, PackSource, PoolSize,
     Projection, Renderer, RendererDesc, ResidencyClass, SceneDesc, SceneLightingSettings,
     ScreenshotRequest, TextureFilter, TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput,
     ViewTarget,
@@ -346,15 +346,12 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             })
             .expect("instances");
         }
-        w.set_light(
-            LightId(0),
-            Some(&Light::Directional(DirectionalLight {
-                direction_to_light: SUN,
-                illuminance: Vec3::new(100_000.0, 95_000.0, 88_000.0),
-                angular_radius: 0.004_65,
-                disc: DiscProfile::LimbDarkened,
-            })),
-        )
+        w.add_light(&Light::Directional(DirectionalLight {
+            direction_to_light: SUN,
+            illuminance: Vec3::new(100_000.0, 95_000.0, 88_000.0),
+            angular_radius: 0.004_65,
+            disc: DiscProfile::LimbDarkened,
+        }))
         .expect("sun");
         drop(w);
         f.end().expect("end frame");

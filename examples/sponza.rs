@@ -30,10 +30,10 @@ use orr::orr_gpu::{Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, 
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     AutoExposure, Display, DisplayRequest, Exposure, FrameDesc, FrameTime, GroupWriter, HookPass,
-    InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, LocalExposure, MeterWeights,
-    PackSource, Projection, ReferenceSettings, Renderer, RendererDesc, SceneDesc,
-    SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, UiPass, ViewHooks,
-    ViewLighting, ViewOutput, ViewTarget,
+    InstanceFlags, InstancesDesc, Lens, Light, LitView, LocalExposure, MeterWeights, PackSource,
+    Projection, ReferenceSettings, Renderer, RendererDesc, SceneDesc, SceneLightingSettings,
+    ScreenshotRequest, TextureFilter, TransformGroupDesc, UiPass, ViewHooks, ViewLighting,
+    ViewOutput, ViewTarget,
 };
 use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::{Atmosphere, AtmosphereState};
@@ -76,7 +76,6 @@ const CLOTH_TRANSMISSION: f64 = 0.5;
 const CLOTH_SHEEN_ROUGHNESS: f64 = 0.5;
 /// The scene's lowest vertex, m, where the atmosphere's ground plane sits.
 const FLOOR: f64 = -1.012;
-const SUN: LightId = LightId(0);
 /// The sun's default elevation and azimuth, degrees: down the court's long axis from +X,
 /// so the sun reaches the narrow court's floor.
 const SUN_ANGLES: [f32; 2] = [70.0, 70.0];
@@ -313,7 +312,6 @@ fn run(options: &Options) -> Option<Capture> {
         0,
     )
     .expect("atmosphere");
-    sky.set_lights(&[SUN]);
     // The sun is in the sky from the first frame that records it.
     sky.skip_fades();
     let scene = renderer
@@ -362,6 +360,10 @@ fn run(options: &Options) -> Option<Capture> {
         user_tag: 0,
     })
     .expect("instances");
+    let sun_light = w
+        .add_light(&Light::Directional(solar_disc(direction(sun))))
+        .expect("sun");
+    sky.set_lights(&[sun_light]);
     w.set_environment(sky.data());
     w.set_medium(sky.data());
     drop(w);
@@ -480,7 +482,7 @@ fn run(options: &Options) -> Option<Capture> {
         {
             let mut w = f.scene(scene).expect("scene writer");
             w.set_focus(position);
-            w.set_light(SUN, Some(&Light::Directional(solar_disc(direction(sun)))))
+            w.set_light(sun_light, &Light::Directional(solar_disc(direction(sun))))
                 .expect("sun");
         }
         let view = LitView {

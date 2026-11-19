@@ -1050,7 +1050,7 @@ fn a_views_light_feedback_follows_its_lights_as_the_light_tables_grow() {
         "tiles naming the lamp and the sky: {before:?}"
     );
 
-    bed.set_light(LightId(40), Some(lamp(0.0, 30.0)));
+    bed.add_light_at(1, LightId(40), lamp(0.0, 30.0));
     // A dark particle out of sight takes the emissive list's first entry.
     let speck = Particle {
         center: Vec3::new(0.0, -50.0, 0.0),
@@ -1967,8 +1967,8 @@ fn sphere_and_rect_lights_reach_bsdf_rays_through_their_proxies() {
     // frame later a medium proxy that nothing meets moves the light proxies' instances, which
     // the PTLAS made for it writes anew.
     for (from, to) in [(0, 23), (1, 57)] {
-        bed.set_light(LightId(from), None);
-        bed.set_light(LightId(to), Some(spec.lights[from as usize]));
+        bed.set_light(from, None);
+        bed.add_light_at(from, LightId(to), spec.lights[from]);
     }
     render_paths(&mut bed, &paths(reference(1)), 1, 0);
     bed.set_medium_proxy(

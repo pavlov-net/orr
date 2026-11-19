@@ -7,8 +7,8 @@ use std::time::Duration;
 use bytemuck::Zeroable;
 use lighting_suite::shaders::{emit, hotspot_bake, local_probe, nee_probe, tile_probe};
 use lighting_suite::{
-    TestScene, assert_clean, compute_barrier, copy_back, finish, kernels, linear_clamp, pipeline,
-    read, readback, render, texture, upload,
+    TestScene, add_light_at, assert_clean, compute_barrier, copy_back, finish, kernels,
+    linear_clamp, pipeline, read, readback, render, texture, upload,
 };
 use orr_gpu::{Allocation, ComputePipeline, DEFAULT_MEDIUM, GpuPtr, Hazards, Stages};
 use orr_lighting::types::{LocalLight, LocalLights};
@@ -281,9 +281,10 @@ fn sphere_tiles_match_the_density_and_irradiance() {
     let mut scene = TestScene::new(SceneDesc::default());
     let (a, b) = (DVec3::new(0.0, 3.0, 0.0), DVec3::new(5.0, 1.0, -4.0));
     scene.write(|w, _| {
-        w.set_light(
+        add_light_at(
+            w,
             LightId(1),
-            Some(&Light::Sphere {
+            &Light::Sphere {
                 position: a,
                 radius: 0.5,
                 intensity: Vec3::new(100.0, 80.0, 60.0),
@@ -292,19 +293,18 @@ fn sphere_tiles_match_the_density_and_irradiance() {
                     inner: 30f32.to_radians(),
                     outer: 40f32.to_radians(),
                 }),
-            }),
-        )
-        .unwrap();
-        w.set_light(
+            },
+        );
+        add_light_at(
+            w,
             LightId(3),
-            Some(&Light::Sphere {
+            &Light::Sphere {
                 position: b,
                 radius: 0.25,
                 intensity: Vec3::splat(500.0),
                 cone: None,
-            }),
-        )
-        .unwrap();
+            },
+        );
     });
     let mut lighting = scene.lighting();
     // The cap of sphere a ends on a ring boundary.
@@ -333,27 +333,24 @@ fn rect_tiles_match_the_density_and_irradiance() {
     let center = DVec3::new(0.5, 2.0, 0.3);
     let (ex, ey) = (Vec3::new(1.2, 0.0, 0.1), Vec3::new(-0.8 / 12.0, 0.3, 0.8));
     scene.write(|w, _| {
-        w.set_light(
-            LightId(0),
-            Some(&Light::Rect {
-                center,
-                edge_x: ex,
-                edge_y: ey,
-                luminance: Vec3::new(3000.0, 2500.0, 2000.0),
-            }),
-        )
+        w.add_light(&Light::Rect {
+            center,
+            edge_x: ex,
+            edge_y: ey,
+            luminance: Vec3::new(3000.0, 2500.0, 2000.0),
+        })
         .unwrap();
         // Faces away from the receiver: sampled, but it adds no irradiance.
-        w.set_light(
+        add_light_at(
+            w,
             LightId(2),
-            Some(&Light::Rect {
+            &Light::Rect {
                 center: DVec3::new(-1.0, 1.5, -1.0),
                 edge_x: Vec3::new(0.0, 0.0, 0.6),
                 edge_y: Vec3::new(0.6, 0.0, 0.0),
                 luminance: Vec3::splat(500.0),
-            }),
-        )
-        .unwrap();
+            },
+        );
     });
     let mut lighting = scene.lighting();
     let t = tiles(
@@ -770,16 +767,16 @@ fn local_sampler_candidates_match_the_hit_side_density() {
                 &[Affine3::from_translation(Vec3::new(0.0, 2.0, 0.0))],
                 ProducerUpdate::Static,
             );
-            w.set_light(
+            add_light_at(
+                w,
                 LightId(1),
-                Some(&Light::Sphere {
+                &Light::Sphere {
                     position: DVec3::new(0.0, 2.5, 1.5),
                     radius: 0.2,
                     intensity: Vec3::splat(300.0),
                     cone: None,
-                }),
-            )
-            .unwrap();
+                },
+            );
         },
         |c| quads.dispatch(c, &p),
     );
@@ -855,20 +852,21 @@ fn directional_share_matches_the_lights_weights() {
     // LightIds 0, 2, 3, 5, 6 with a sphere at 1, so the directional list skips a slot.
     let ids = [0u32, 2, 3, 5, 6];
     scene.write(|w, _| {
-        for (&id, l) in ids.iter().zip(&lights) {
-            w.set_light(LightId(id), Some(&Light::Directional(*l)))
-                .unwrap();
+        let sphere = Light::Sphere {
+            position: DVec3::new(0.0, 4.0, 0.0),
+            radius: 0.1,
+            intensity: Vec3::splat(50.0),
+            cone: None,
+        };
+        let directional = ids
+            .iter()
+            .zip(&lights)
+            .map(|(&id, l)| (id, Light::Directional(*l)));
+        let mut all: Vec<_> = directional.chain([(1, sphere)]).collect();
+        all.sort_by_key(|&(id, _)| id);
+        for (id, l) in &all {
+            add_light_at(w, LightId(*id), l);
         }
-        w.set_light(
-            LightId(1),
-            Some(&Light::Sphere {
-                position: DVec3::new(0.0, 4.0, 0.0),
-                radius: 0.1,
-                intensity: Vec3::splat(50.0),
-                cone: None,
-            }),
-        )
-        .unwrap();
     });
     let mut lighting = scene.lighting();
     let (rings, sectors, frames, threads) = (4u32, 8u32, 64u32, 1u32 << 16);
@@ -999,39 +997,35 @@ fn selection_probabilities_follow_power_and_sum_to_one() {
                 &[Affine3::IDENTITY, Affine3::IDENTITY],
                 ProducerUpdate::Static,
             );
-            for (id, i) in [(0u32, 100.0f32), (4, 900.0)] {
-                w.set_light(
-                    LightId(id),
-                    Some(&Light::Sphere {
-                        position: DVec3::new(f64::from(id), 3.0, 0.0),
-                        radius: 0.2,
-                        intensity: Vec3::splat(i),
-                        cone: None,
-                    }),
-                )
-                .unwrap();
-            }
-            w.set_light(
-                LightId(2),
-                Some(&Light::Rect {
-                    center: DVec3::new(0.0, 3.0, 2.0),
-                    edge_x: Vec3::new(2.0, 0.0, 0.0),
-                    edge_y: Vec3::new(0.0, 0.0, 0.5),
-                    luminance: Vec3::splat(2000.0),
-                }),
-            )
-            .unwrap();
-            for id in [3u32, 6] {
-                w.set_light(
-                    LightId(id),
-                    Some(&Light::Directional(DirectionalLight {
-                        direction_to_light: Vec3::new(0.2, 1.0, 0.1 * id as f32).normalize(),
-                        illuminance: Vec3::splat(1e4 * id as f32),
-                        angular_radius: 0.01,
-                        disc: DiscProfile::Uniform,
-                    })),
-                )
-                .unwrap();
+            let sphere = |id: u32, i: f32| Light::Sphere {
+                position: DVec3::new(f64::from(id), 3.0, 0.0),
+                radius: 0.2,
+                intensity: Vec3::splat(i),
+                cone: None,
+            };
+            let directional = |id: u32| {
+                Light::Directional(DirectionalLight {
+                    direction_to_light: Vec3::new(0.2, 1.0, 0.1 * id as f32).normalize(),
+                    illuminance: Vec3::splat(1e4 * id as f32),
+                    angular_radius: 0.01,
+                    disc: DiscProfile::Uniform,
+                })
+            };
+            let rect = Light::Rect {
+                center: DVec3::new(0.0, 3.0, 2.0),
+                edge_x: Vec3::new(2.0, 0.0, 0.0),
+                edge_y: Vec3::new(0.0, 0.0, 0.5),
+                luminance: Vec3::splat(2000.0),
+            };
+            // Ids 1 and 5 stay empty.
+            for (id, l) in [
+                (0, sphere(0, 100.0)),
+                (2, rect),
+                (3, directional(3)),
+                (4, sphere(4, 900.0)),
+                (6, directional(6)),
+            ] {
+                add_light_at(w, LightId(id), &l);
             }
         },
         |c| quads.dispatch(c, &p),
@@ -1407,20 +1401,20 @@ fn feed_back(set: &LightSetGpu, counts: &[u32]) {
 fn light_feedback_blends_into_the_selection_and_clears_on_a_reset() {
     let mut scene = TestScene::procedural(SceneDesc::default());
     scene.write(|w, _| {
-        // Light 3 is set and cleared, so the table holds an empty entry for it.
+        // Light 3 is added and removed, so the table holds an empty entry for it.
         for (id, i) in [(0u32, 100.0f32), (1, 900.0), (3, 1.0)] {
-            w.set_light(
+            add_light_at(
+                w,
                 LightId(id),
-                Some(&Light::Sphere {
+                &Light::Sphere {
                     position: DVec3::new(f64::from(id), 3.0, 0.0),
                     radius: 0.2,
                     intensity: Vec3::splat(i),
                     cone: None,
-                }),
-            )
-            .unwrap();
+                },
+            );
         }
-        w.set_light(LightId(3), None).unwrap();
+        w.remove_light(LightId(3)).unwrap();
     });
     assert!(scene.tables.lights >= 4);
     let mut lighting = scene.lighting();
@@ -1514,7 +1508,7 @@ fn grow_tables(in_flight: bool) -> (Vec<Passed>, LightTables, [[f64; 3]; 2]) {
             let id = m.create(&emitting([1.0, 0.6, 0.3], 400.0, 0)).unwrap();
             let above = Affine3::from_translation(Vec3::new(0.0, 2.0, 0.0));
             set_producers(w, &[id; 3], DVec3::ZERO, &[above], ProducerUpdate::Static);
-            w.set_light(LightId(0), Some(&sphere(0))).unwrap();
+            w.add_light(&sphere(0)).unwrap();
         },
         |c| quads.dispatch(c, &p),
     );
@@ -1559,7 +1553,7 @@ fn grow_tables(in_flight: bool) -> (Vec<Passed>, LightTables, [[f64; 3]; 2]) {
         let frame = f.id();
         if let Some(id) = id {
             let mut w = f.scene(scene.id).unwrap();
-            w.set_light(LightId(id), Some(&sphere(id))).unwrap();
+            add_light_at(&mut w, LightId(id), &sphere(id));
             // A producer that emits nothing takes an entry of each table all the same.
             let idle = ProducerDesc {
                 flags: InstanceFlags::RASTER,

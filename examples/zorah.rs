@@ -14,10 +14,26 @@
 //! `.scene.json` and the vk_lod_clusters view in `.cfg`. WASD moves, Q and E sink and rise,
 //! shift moves faster and dragging with the right mouse button looks around. C logs the view as a
 //! `--view` value and appends it to `zorah-views.txt` beside the executable; P probes the pixel
-//! under the pointer and logs the report, appending it to `zorah-probes.txt` there. Headless runs
+//! under the pointer and logs the report, appending it to `zorah-probes.txt` there. H hides and
+//! shows the overlay. Headless runs
 //! render 960 x 540 from the first camera, for 600 frames without `--frames`, and write the
 //! last frame as a PNG; a windowed run needs `--frames` to write one. `--probe x,y` probes that
-//! output pixel on the last frame and logs the report likewise.
+//! output pixel on the last frame and logs the report likewise. `--ev100 EV` fixes the exposure,
+//! which is automatic without it.
+//!
+//! `zorah --archive FILE --asset NAME [--sun ELEVATION,AZIMUTH] [--sun-lux LUX] [--ev100 EV]
+//! ...` mounts an archive cooked elsewhere from the USD stage of the Zorah UE level GreenHouse
+//! (Z up, centimeters), as it is, and places layout `NAME/layout`: each partition whose data
+//! layers all start `activated`, and the partition in no data layer. The cook imports none of
+//! the level's lights, cameras or environment, so the run lights the level by the stage's sun
+//! under `orr_atmosphere`'s sky, linked into orr's kernels as their environment and medium,
+//! starts from the stage's editor camera (key 1) and exposes at EV100 4.5, within the 4 to 5 the
+//! level's post-process volume holds. The sun's angles are in degrees, its azimuth from -Z toward
+//! +X; `--sun-lux` replaces its illuminance, and the stage's color stays. `--stage-sun` and
+//! `--stage-camera` give another level's sun and camera, nine numbers each (see
+//! [`GREENHOUSE_SUN`] and [`GREENHOUSE_CAMERA`]); GreenHouse's are the default.
+//! `--data-layers NAME,...` turns on exactly the named data layers in place of their initial
+//! states.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -25,28 +41,31 @@ use std::time::{Duration, Instant};
 use orr::orr_gpu::{
     Device, Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
 };
+use orr::orr_pack::layout::{AttributeValue, Group};
 use orr::orr_pack::texture::TextureInfo;
-use orr::orr_pack::{Archive, AssetId, Class, Target};
+use orr::orr_pack::{Archive, AssetId, Target, names};
 use orr::{
-    Budgets, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime,
-    InstanceFlags, InstancePageRef, Lens, Light, LightId, LitView, LoadState, PackSource,
+    Budgets, DirectionalLight, DiscProfile, Display, DisplayRequest, Exposure, FrameDesc,
+    FrameTime, InstanceFlags, Layout, Lens, Light, LitView, LoadState, PackSource, PartitionRef,
     Projection, Renderer, RendererDesc, RequestSource, ResidencyClass, ResidencyStats, SceneDesc,
-    SceneLightingSettings, ScreenshotRequest, TextureFilter, UiPass, ViewHooks, ViewLighting,
-    ViewOutput, ViewTarget,
+    SceneLightingSettings, SceneWriter, ScreenshotRequest, TextureFilter, UiPass, ViewHooks,
+    ViewLighting, ViewOutput, ViewTarget,
 };
+use orr_atmosphere::{Atmosphere, AtmosphereState};
 use orr_cook::{
     ArchiveSpec, AssetSpec, CookOptions, GltfLayout, GltfSettings, InputChannels, LodMode,
     Manifest, MeshSettings, Outcome, Source, TextureOverride, TextureRules, TextureSettings, Usage,
 };
 use orr_examples::fetch::TempDir;
 use orr_examples::fly::{Camera, note_view};
+use orr_examples::linked::KERNELS;
 use orr_examples::overlay::Overlay;
 use orr_examples::window::{KeyCode, Window};
 use orr_examples::{
     Capture, Options, Workers, assert_clean, device, enable_reconstruction, entry_head,
     environment_map, fixed_time, init_logging,
 };
-use orr_math::{Affine3, Mat3, Vec3};
+use orr_math::{Affine3, DMat3, DQuat, DVec3, Mat3, Vec3};
 use serde_json::Value;
 
 const HEADLESS_EXTENT: [u32; 2] = [960, 540];
@@ -70,6 +89,45 @@ const WALK_SPEED: f32 = 2.0;
 const NEAR: f32 = 0.02;
 /// Seconds each figure of the readout averages over.
 const READOUT_PERIOD: f64 = 0.5;
+
+/// The GreenHouse stage's `metersPerUnit`.
+const STAGE_METERS_PER_UNIT: f64 = 0.01;
+/// A stage's sun as `--stage-sun` takes it: its `xformOp:orient` as a usda `quatd` writes it
+/// (real, i, j, k), `inputs:intensity` (lux under `inputs:normalize`), `inputs:color` (linear
+/// Rec.709) and `inputs:angle` (degrees across the whole disc). The default is GreenHouse's
+/// `/GreenHouse_Level/DataLayers/DL_Lighting_Sunset/Lights/Sun_LightComponent0`.
+const GREENHOUSE_SUN: [f64; 9] = [
+    -0.044885472868744385,
+    0.0798567118437563,
+    0.4317113446541293,
+    0.8973480455184465,
+    250.0,
+    1.389_656_5,
+    0.801_580_5,
+    0.446_698_28,
+    0.06,
+];
+/// A stage's camera as `--stage-camera` takes it: its `xformOp:translate`, then its
+/// `xformOp:orient` as (real, i, j, k), then `focalLength` and `horizontalAperture`. The
+/// default is GreenHouse's `/GreenHouse_Level/Cameras/EditorPerspective`.
+const GREENHOUSE_CAMERA: [f64; 9] = [
+    35.866_535_186_767_58,
+    -733.939_025_878_906_2,
+    280.789_916_992_187_5,
+    0.7200499111941459,
+    0.6929207240542906,
+    0.02584256996057674,
+    0.02685436916431211,
+    10.4775,
+    20.955,
+];
+/// The EV100 an archive's run exposes at without `--ev100`: the middle of the 4 to 5 the
+/// level's post-process volume holds.
+const STAGE_EV100: f32 = 4.5;
+/// A UE data layer's `dataLayer:initialState` that places its partitions at the start.
+const ACTIVATED: &str = "activated";
+/// The state UE gives a data layer that states none.
+const UNLOADED: &str = "unloaded";
 
 fn main() {
     init_logging();
@@ -110,6 +168,168 @@ fn parse_probe(value: &str) -> [u32; 2] {
         panic!("--probe takes x,y");
     };
     [x, y]
+}
+
+/// Scene space (Y up, meters) from the stage's (Z up, centimeters), as `orr_cook`'s USD import
+/// turns them: +Z becomes +Y and +Y becomes -Z.
+fn stage_to_scene() -> DMat3 {
+    DMat3::from_cols(DVec3::X, DVec3::NEG_Z, DVec3::Y) * STAGE_METERS_PER_UNIT
+}
+
+/// A usda `quatd`, written (real, i, j, k).
+fn usda_quat([real, i, j, k]: [f64; 4]) -> DQuat {
+    DQuat::from_xyzw(i, j, k, real)
+}
+
+/// Nine numbers of `flag`, else `default`.
+fn stage_values(options: &Options, flag: &str, default: [f64; 9]) -> [f64; 9] {
+    options.value(flag).map_or(default, |v| {
+        let v: Vec<f64> = v
+            .split(',')
+            .map(|x| x.trim().parse().expect("a number"))
+            .collect();
+        v.try_into()
+            .unwrap_or_else(|_| panic!("{flag} takes nine numbers"))
+    })
+}
+
+/// The stage's editor camera in scene space.
+fn stage_camera(options: &Options) -> Camera {
+    let [tx, ty, tz, w, i, j, k, focal_length, horizontal_aperture] =
+        stage_values(options, "--stage-camera", GREENHOUSE_CAMERA);
+    let to_scene = stage_to_scene();
+    let eye = to_scene * DVec3::new(tx, ty, tz);
+    // A UsdGeomCamera looks down its local -Z, +Y up.
+    let forward = to_scene * (usda_quat([w, i, j, k]) * DVec3::NEG_Z);
+    // The stage authors no `verticalAperture`: the horizontal field holds, as UE's does, and
+    // the vertical one follows the 16:9 output.
+    let [w, h] = HEADLESS_EXTENT;
+    let tan_x = horizontal_aperture / (2.0 * focal_length);
+    let fov_y = 2.0 * (tan_x * f64::from(h) / f64::from(w)).atan();
+    Camera::looking(
+        "stage",
+        eye.as_vec3(),
+        (eye + forward.normalize()).as_vec3(),
+        fov_y.to_degrees() as f32,
+    )
+}
+
+/// Unit direction to a light at `elevation` and `azimuth` degrees, the azimuth from -Z toward +X.
+fn direction([elevation, azimuth]: [f32; 2]) -> Vec3 {
+    let (e, a) = (elevation.to_radians(), azimuth.to_radians());
+    Vec3::new(e.cos() * a.sin(), e.sin(), -e.cos() * a.cos())
+}
+
+/// `--sun`'s value: `elevation,azimuth` in degrees.
+fn parse_sun(value: &str) -> [f32; 2] {
+    let v: Vec<f32> = value
+        .split(',')
+        .map(|x| x.trim().parse().expect("a --sun angle"))
+        .collect();
+    v.try_into().expect("--sun takes elevation,azimuth")
+}
+
+/// The stage's sun in scene space, turned by `--sun` and scaled by `--sun-lux`.
+fn stage_sun(options: &Options) -> DirectionalLight {
+    let [w, i, j, k, stage_lux, r, g, b, angle] =
+        stage_values(options, "--stage-sun", GREENHOUSE_SUN);
+    // A UsdLux DistantLight emits down its local -Z, so it lies toward its +Z.
+    let toward = stage_to_scene() * (usda_quat([w, i, j, k]) * DVec3::Z);
+    let direction_to_light = options
+        .value("--sun")
+        .map_or_else(|| toward.normalize().as_vec3(), |v| direction(parse_sun(v)));
+    let lux = options.value("--sun-lux").map_or(stage_lux as f32, |v| {
+        v.parse().expect("--sun-lux takes an illuminance in lux")
+    });
+    DirectionalLight {
+        direction_to_light,
+        illuminance: Vec3::new(r as f32, g as f32, b as f32) * lux,
+        angular_radius: (angle as f32 / 2.0).to_radians(),
+        // UsdLux states no profile over a distant light's disc.
+        disc: DiscProfile::Uniform,
+    }
+}
+
+/// A group's `dataLayer:initialState`, [`UNLOADED`] where it states none.
+fn initial_state(g: &Group) -> &str {
+    let a = g
+        .attributes
+        .iter()
+        .find(|a| a.name == "dataLayer:initialState");
+    match a.map(|a| &a.value) {
+        None => UNLOADED,
+        Some(AttributeValue::Token(t)) => t,
+        Some(v) => panic!("{}: dataLayer:initialState {v:?} is no token", g.name),
+    }
+}
+
+/// The data layer a group's collection belongs to: the prim's name, `DL_Lighting_Night` for
+/// `/Level/DataLayers/DL_Lighting_Night.collection:members`.
+fn layer_name(g: &Group) -> &str {
+    let prim = g.name.split('.').next().unwrap_or(&g.name);
+    prim.rsplit('/').next().unwrap_or(prim)
+}
+
+/// Places the partitions of `layout` whose groups are all on, the partition in no group among
+/// them, and logs each group's state and each partition placed or skipped. A group is on when it
+/// starts [`ACTIVATED`], or, with `--data-layers`, when that list names its layer. The
+/// partitions' posed pages stay unplaced: they need a pose the run has none of.
+fn place_partitions(w: &mut SceneWriter<'_>, layout: &Layout, options: &Options) {
+    let chosen: Option<Vec<&str>> = options
+        .value("--data-layers")
+        .map(|v| v.split(',').map(str::trim).collect());
+    let states: Vec<&str> = layout
+        .groups
+        .iter()
+        .map(|g| match &chosen {
+            Some(on) if on.contains(&layer_name(g)) => ACTIVATED,
+            Some(_) => UNLOADED,
+            None => initial_state(g),
+        })
+        .collect();
+    for (g, state) in layout.groups.iter().zip(&states) {
+        log::info!("group {}: {state}", g.name);
+    }
+    let (mut placed, mut pages, mut posed_pages, mut posed) = (0, 0, 0, 0);
+    for (i, p) in layout.partitions.iter().enumerate() {
+        let groups: Vec<&str> = p
+            .groups
+            .iter()
+            .map(|&g| layout.groups[g as usize].name.as_str())
+            .collect();
+        let place = p.groups.iter().all(|&g| states[g as usize] == ACTIVATED);
+        log::info!(
+            "partition {i} in groups {groups:?}: {} pages, {} posed pages, {} posed models, {} lights, {} decals, {} cameras, {} environment: {}",
+            p.pages.len(),
+            p.posed_pages.len(),
+            p.posed.len(),
+            p.lights.len(),
+            p.decals.len(),
+            p.cameras.len(),
+            if p.environment.is_some() { "an" } else { "no" },
+            if place { "placed" } else { "skipped" },
+        );
+        if !place {
+            continue;
+        }
+        w.add_partition(&PartitionRef {
+            layout,
+            partition: i,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: f32::INFINITY,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .expect("partition");
+        placed += 1;
+        pages += p.pages.len();
+        posed_pages += p.posed_pages.len();
+        posed += p.posed.len();
+    }
+    log::info!(
+        "placed {placed} of {} partitions: {pages} pages; left {posed_pages} posed pages and {posed} posed models unplaced",
+        layout.partitions.len()
+    );
 }
 
 /// What the export's files say beyond the glTF.
@@ -276,17 +496,6 @@ fn cook(export: &Export, pack: &Path) {
     );
 }
 
-/// The archive's instance pages.
-fn page_ids(pack: &Path) -> Vec<AssetId> {
-    let archive = Archive::open(pack).unwrap_or_else(|e| panic!("{}: {e}", pack.display()));
-    archive
-        .entries()
-        .iter()
-        .filter(|e| e.class == Class::InstancePage as u16)
-        .map(|e| e.id)
-        .collect()
-}
-
 /// The renderer's default budgets, with the overrides the environment names.
 fn budgets() -> Budgets {
     let defaults = Budgets::default();
@@ -323,7 +532,7 @@ fn sun(pack: &Path, from_world: Mat3) -> Option<DirectionalLight> {
     // The light's energy is in the map's primaries, a directional light's in Rec.709.
     let primaries = orr_color::Primaries::from_id(info.header.primaries).expect("sky primaries");
     let to_rec709 = primaries.rgb().matrix_to(orr_color::RgbPrimaries::REC709);
-    let illuminance = to_rec709 * orr_math::DVec3::from(light.illuminance.map(f64::from));
+    let illuminance = to_rec709 * DVec3::from(light.illuminance.map(f64::from));
     Some(DirectionalLight {
         direction_to_light: from_world.transpose() * Vec3::from_array(light.direction_to_light),
         illuminance: illuminance.as_vec3(),
@@ -696,29 +905,44 @@ fn memory_line(frame: u64, renderer: &Renderer) -> String {
 /// Runs the example; headless runs and windowed runs with `--out` and `--frames` return their
 /// last frame.
 fn run(options: &Options) -> Option<Capture> {
-    let dir = options
-        .value("--scene")
-        .expect("--scene DIR names the export's directory");
-    let export = read_export(Path::new(dir));
-    let (pack, temp) = match options.value("--pack") {
-        Some(p) => {
-            let p = PathBuf::from(p);
-            if let Some(dir) = p.parent() {
-                std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-            }
-            (p, None)
-        }
-        None => {
-            let temp = TempDir::new("orr-zorah");
-            (temp.0.join("zorah.orr"), Some(temp))
-        }
+    // The glTF export, or `None` for an archive cooked elsewhere.
+    let export = match (options.value("--scene"), options.value("--archive")) {
+        (Some(dir), None) => Some(read_export(Path::new(dir))),
+        (None, Some(_)) => None,
+        _ => panic!("zorah takes one of --scene DIR and --archive FILE --asset NAME"),
     };
-    cook(&export, &pack);
-    if options.has("--cook-only") {
-        return None;
-    }
-    let cameras = export.cameras;
-    // The view: `--view`'s, else the export's camera last jumped to, as flown since.
+    let (pack, temp, asset, cameras) = match &export {
+        Some(export) => {
+            let (pack, temp) = match options.value("--pack") {
+                Some(p) => {
+                    let p = PathBuf::from(p);
+                    if let Some(dir) = p.parent() {
+                        std::fs::create_dir_all(dir)
+                            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+                    }
+                    (p, None)
+                }
+                None => {
+                    let temp = TempDir::new("orr-zorah");
+                    (temp.0.join("zorah.orr"), Some(temp))
+                }
+            };
+            cook(export, &pack);
+            if options.has("--cook-only") {
+                return None;
+            }
+            (pack, temp, SCENE, export.cameras.clone())
+        }
+        None => (
+            PathBuf::from(options.value("--archive").expect("--archive")),
+            None,
+            options
+                .value("--asset")
+                .expect("--asset NAME names the archive's scene source"),
+            vec![stage_camera(options)],
+        ),
+    };
+    // The view: `--view`'s, else the camera last jumped to, as flown since.
     let mut camera = options.value("--view").map_or(cameras[0], Camera::parse);
     let title = |camera: &Camera| format!("orr zorah: {}", camera.name);
 
@@ -729,6 +953,13 @@ fn run(options: &Options) -> Option<Capture> {
     };
     let defaults = RendererDesc::default();
     let desc = RendererDesc {
+        // An archive's run lights the level by the atmosphere's sky, which takes the kernels
+        // that link it as their environment in place of the map.
+        kernels: if export.is_some() {
+            defaults.kernels
+        } else {
+            &KERNELS
+        },
         budgets: budgets(),
         raster_error_pixels: pixels("ZORAH_RASTER_PIXELS", defaults.raster_error_pixels),
         rt_error_pixels: pixels("ZORAH_RT_PIXELS", defaults.rt_error_pixels),
@@ -785,20 +1016,34 @@ fn run(options: &Options) -> Option<Capture> {
     }
     log::info!("mounted in {:.1} s", mounting.elapsed().as_secs_f64());
 
-    let pages: Vec<_> = page_ids(&pack)
-        .into_iter()
-        .map(|id| renderer.instance_page(mount, id).expect("instance page"))
-        .collect();
+    let layout = renderer
+        .layout(mount, AssetId::from_name(&names::layout(asset)))
+        .expect("the scene's layout");
     let scene = renderer
         .create_scene(&SceneDesc::default(), &SceneLightingSettings::default())
         .expect("scene");
     let history = renderer.create_view_history().expect("view history");
     options.wait_for_paths(&mut renderer);
-    // RTX MG looks the map up at `Ry(-rotation)` of the world direction, with `u` from
-    // `atan2(z, x)`, a quarter turn from the cook's `atan2(x, -z) + pi`.
-    let from_world = Mat3::from_rotation_y(-(export.sky_rotation + 90.0).to_radians());
-    let environment = environment_map(&renderer, gpu, mount, SKY, Affine3::from_mat3(from_world));
-    let sun = sun(&pack, from_world);
+    // The export's map and the sun extracted from it, or the atmosphere's sky and the stage's
+    // sun.
+    let (environment, mut sky, sun) = match &export {
+        Some(export) => {
+            // RTX MG looks the map up at `Ry(-rotation)` of the world direction, with `u` from
+            // `atan2(z, x)`, a quarter turn from the cook's `atan2(x, -z) + pi`.
+            let from_world = Mat3::from_rotation_y(-(export.sky_rotation + 90.0).to_radians());
+            let map = environment_map(&renderer, gpu, mount, SKY, Affine3::from_mat3(from_world));
+            (Some(map), None, sun(&pack, from_world))
+        }
+        None => {
+            // The level's atmosphere puts the planet's top at the world origin
+            // (`PlanetTopAtAbsoluteWorldOrigin`).
+            let mut sky = AtmosphereState::new(gpu, &Atmosphere::earth(DVec3::ZERO, Vec3::Y), 0)
+                .expect("atmosphere");
+            // The sun is in the sky from the first frame that records it.
+            sky.skip_fades();
+            (None, Some(sky), Some(stage_sun(options)))
+        }
+    };
     if let Some(s) = &sun {
         let d = s.direction_to_light;
         log::info!(
@@ -821,24 +1066,20 @@ fn run(options: &Options) -> Option<Capture> {
         })
         .expect("begin frame");
     let mut w = f.scene(scene).expect("scene writer");
-    for &page in &pages {
-        w.add_instance_page(&InstancePageRef {
-            page,
-            frame: None,
-            poses: &[],
-            material_sets: &[],
-            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
-            rt_range: f32::INFINITY,
-            animation_range: 0.0,
-            user_tag: 0,
-        })
-        .expect("instance page");
-    }
+    place_partitions(&mut w, &layout, options);
     if let Some(sun) = sun {
-        w.set_light(LightId(0), Some(&Light::Directional(sun)))
-            .expect("sun");
+        let id = w.add_light(&Light::Directional(sun)).expect("sun");
+        if let Some(sky) = sky.as_mut() {
+            sky.set_lights(&[id]);
+        }
     }
-    w.set_environment(environment.gpu());
+    if let Some(map) = &environment {
+        w.set_environment(map.gpu());
+    }
+    if let Some(sky) = &sky {
+        w.set_environment(sky.data());
+        w.set_medium(sky.data());
+    }
     drop(w);
     f.end().expect("end frame");
 
@@ -878,8 +1119,14 @@ fn run(options: &Options) -> Option<Capture> {
         debug_view,
         ..ViewLighting::default()
     };
+    let ev100 = options
+        .value("--ev100")
+        .map(|v| v.parse().expect("--ev100 takes a number"))
+        .or_else(|| export.is_none().then_some(STAGE_EV100));
+    let exposure = ev100.map_or_else(Exposure::default, |ev100| Exposure::Manual { ev100 });
     let capture = options.headless || options.out.is_some();
     let mut overlay = Overlay::new(desc.frames_in_flight);
+    let mut show_overlay = true;
     let mut readout = Readout::new(&renderer);
     let frames = options
         .frames
@@ -983,6 +1230,9 @@ fn run(options: &Options) -> Option<Capture> {
                 if key == KeyCode::KeyP {
                     probe = w.cursor();
                 }
+                if key == KeyCode::KeyH {
+                    show_overlay = !show_overlay;
+                }
             }
             camera.fly(w, WALK_SPEED, dt as f32);
         }
@@ -1040,7 +1290,10 @@ fn run(options: &Options) -> Option<Capture> {
             texture_filter: TextureFilter::Hardware,
             target,
         };
-        let output = ViewOutput::default();
+        let output = ViewOutput {
+            exposure: exposure.clone(),
+            ..ViewOutput::default()
+        };
         if final_frame && let Some(at) = probe_at {
             probe = Some(at);
         }
@@ -1049,10 +1302,15 @@ fn run(options: &Options) -> Option<Capture> {
         }
         f.prepare_view(&view, &lighting, &output)
             .expect("prepare view");
-        f.update_scenes(&mut |_| {}).expect("update scenes");
+        f.update_scenes(&mut |c| {
+            if let Some(sky) = sky.as_mut() {
+                sky.record(c, &[]).expect("sky passes");
+            }
+        })
+        .expect("update scenes");
         let mut ui = |pass: &mut UiPass<'_, '_>| overlay.paint(pass, id);
         let mut hooks = ViewHooks {
-            ui: Some(&mut ui),
+            ui: show_overlay.then_some(&mut ui),
             ..ViewHooks::default()
         };
         f.render_view(&view, &lighting, &output, &mut hooks)
@@ -1105,6 +1363,7 @@ fn run(options: &Options) -> Option<Capture> {
     drop(headless_target);
     drop(held);
     drop(environment);
+    drop(sky);
     end(gpu, display, renderer, window, workers, temp);
     captured
 }

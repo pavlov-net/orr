@@ -15,7 +15,7 @@ public static const uint MIRROR = 1u << 31;
 // Bits of each axis of a grid position that a record's `fine` holds, below those of `pos`.
 public static const uint FINE_BITS = 5;
 
-// Blob 0 header, 216 B. Spans are (byte offset in blob 0, count).
+// Blob 0 header, 232 B. Spans are (byte offset in blob 0, count).
 public struct InstancePageHeader
 {
     public int3 cell;
@@ -36,6 +36,7 @@ public struct InstancePageHeader
     public uint2 motion_start; // the bits of an f64
     public uint motion_window;
     public uint _pad;
+    public uint4 source;
 }
 
 // 20 B.

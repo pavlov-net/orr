@@ -12,6 +12,7 @@ use orr_cook::{
 use orr_math::{Affine3, DAffine3, DMat3, DQuat, DVec3, Mat3, Quat, Vec2, Vec3};
 use orr_pack::instance::{self, InstancePageInfo, InstanceRecord};
 use orr_pack::material::Material;
+use orr_pack::names;
 use orr_pack::{Aabb, AffineRows, Archive, AssetId, Class, Entry, Span, Target};
 
 struct Rng(u64);
@@ -76,10 +77,12 @@ fn read(a: &Archive, e: &Entry, blob: usize) -> Vec<u8> {
     v
 }
 
-fn pages(a: &Archive) -> Vec<&Entry> {
+/// The pages of instance source `source`.
+fn pages<'a>(a: &'a Archive, source: &str) -> Vec<&'a Entry> {
     a.entries()
         .iter()
         .filter(|e| e.class == Class::InstancePage as u16)
+        .filter(|e| names::parse_page(a.name(e)).is_some_and(|p| p.0 == source))
         .collect()
 }
 
@@ -211,7 +214,7 @@ fn fixture_page_decodes_within_its_error_bounds() {
     for e in a.entries() {
         a.verify(e).unwrap();
     }
-    let pages = pages(&a);
+    let pages = pages(&a, "scatter");
     assert_eq!(pages.len(), 1);
     let e = pages[0];
     assert_eq!(a.name(e), "scatter/-3_0_7/0");
@@ -324,14 +327,14 @@ fn cells_split_placements_and_large_cells_split_into_pages() {
         ..Default::default()
     })
     .unwrap();
-    let mut names: Vec<&str> = pages(&a).iter().map(|e| a.name(e)).collect();
+    let mut names: Vec<&str> = pages(&a, "scatter").iter().map(|e| a.name(e)).collect();
     names.sort_unstable();
     assert_eq!(names[..2], ["scatter/-1_-1_0/0", "scatter/-2_-1_0/0"]);
     let split = names.len() - 2;
     assert!(split >= 3);
     assert!((0..split).all(|i| names.contains(&format!("scatter/0_0_0/{i}").as_str())));
     let mut total = 0;
-    for e in pages(&a) {
+    for e in pages(&a, "scatter") {
         let head = read(&a, e, 0);
         let recs = read(&a, e, 1);
         let count = usize::from(InstancePageInfo::parse(&head).unwrap().header.record_count);
@@ -375,7 +378,7 @@ fn joined_pages_decode_exactly() {
         ..Default::default()
     };
     let a = cook_instances(src.clone()).unwrap();
-    let e = pages(&a)[0];
+    let e = pages(&a, "scatter")[0];
     let recs = read(&a, e, 1);
     let (cell, decoded) = instance::decode(&read(&a, e, 0), &recs).unwrap();
     assert_eq!(cell, [0, 0, -1]);
@@ -455,7 +458,7 @@ fn joined_pages_span_a_cell_on_a_step_their_placements_share() {
         ..Default::default()
     })
     .unwrap();
-    let e = pages(&a)[0];
+    let e = pages(&a, "scatter")[0];
     let (cell, decoded) = instance::decode(&read(&a, e, 0), &read(&a, e, 1)).unwrap();
     assert_eq!(cell, [0, 0, -1]);
     let corner = DVec3::new(0.0, 0.0, -256.0);
@@ -529,7 +532,7 @@ fn sheared_placements_take_table_rows_and_the_rest_stay_compact() {
         ..Default::default()
     })
     .unwrap();
-    let e = pages(&a)[0];
+    let e = pages(&a, "scatter")[0];
     let (head, blob) = (read(&a, e, 0), read(&a, e, 1));
     let h = InstancePageInfo::parse(&head).unwrap().header;
     let (records, table) = instance::records(&h, &blob).unwrap();
@@ -589,7 +592,7 @@ fn an_outlying_scale_leaves_the_range_to_the_rest() {
         ..Default::default()
     })
     .unwrap();
-    let e = pages(&a)[0];
+    let e = pages(&a, "scatter")[0];
     let (head, blob) = (read(&a, e, 0), read(&a, e, 1));
     let h = InstancePageInfo::parse(&head).unwrap().header;
     // The finest power-of-two step over the rest's three octaves.
@@ -627,7 +630,7 @@ fn the_page_box_holds_a_copy_its_record_rounds_up() {
         ..Default::default()
     })
     .unwrap();
-    let e = pages(&a)[0];
+    let e = pages(&a, "scatter")[0];
     let (head, blob) = (read(&a, e, 0), read(&a, e, 1));
     let h = InstancePageInfo::parse(&head).unwrap().header;
     let (records, _) = instance::records(&h, &blob).unwrap();
@@ -888,7 +891,7 @@ fn assemblies_place_their_units_through_instance_sources() {
 
         let mut body = 0;
         let mut found: Vec<Vec3> = Vec::new();
-        for e in pages(&a) {
+        for e in pages(&a, "scatter") {
             let head = read(&a, e, 0);
             let page = InstancePageInfo::parse(&head).unwrap();
             let edge = f64::from(ArchiveSpec::DEFAULT_CELL_LOG2).exp2();
@@ -951,7 +954,7 @@ fn assemblies_place_their_units_through_instance_sources() {
         scale: [1.0, 2.0, 1.0],
     };
     let (a, _) = cook_with_report(vec![assembly_model(&path), paint, scatter(uneven)]).unwrap();
-    assert!(pages(&a).iter().any(|e| {
+    assert!(pages(&a, "scatter").iter().any(|e| {
         let h = InstancePageInfo::parse(&read(&a, e, 0)).unwrap().header;
         h.exact_rows(a.blobs(e)[1].raw_len as usize).unwrap() > 0
     }));
@@ -1002,9 +1005,9 @@ fn mesh_asset(name: &str, mesh: MeshInput) -> AssetSpec {
 
 /// Every record of the archive's pages: its prototype's model, its record and its world
 /// transform.
-fn world_records(a: &Archive) -> Vec<(AssetId, InstanceRecord, DAffine3)> {
+fn world_records(a: &Archive, source: &str) -> Vec<(AssetId, InstanceRecord, DAffine3)> {
     let mut out = Vec::new();
-    for e in pages(a) {
+    for e in pages(a, source) {
         let head = read(a, e, 0);
         let info = InstancePageInfo::parse(&head).unwrap();
         let blob = read(a, e, 1);
@@ -1068,9 +1071,9 @@ fn a_ring_of_wedges_meets_across_pages() {
         },
     ])
     .unwrap();
-    assert_eq!(pages(&a).len(), 2);
+    assert_eq!(pages(&a, "ring").len(), 2);
     // Each copy as placed, sorted by its turn: the x axis of turn k points at -22.5 k degrees.
-    let mut placed = world_records(&a);
+    let mut placed = world_records(&a, "ring");
     placed.sort_by_key(|(_, _, m)| {
         let x = m.matrix3.x_axis;
         (((-x.z).atan2(x.x).to_degrees() / 22.5).round() as i64).rem_euclid(16)
@@ -1160,7 +1163,7 @@ fn a_field_of_small_copies_stays_compact() {
         },
     ])
     .unwrap();
-    let e = pages(&a)[0];
+    let e = pages(&a, "field")[0];
     let (head, blob, user) = (read(&a, e, 0), read(&a, e, 1), read(&a, e, 2));
     let h = InstancePageInfo::parse(&head).unwrap().header;
     let (raw, table) = instance::records(&h, &blob).unwrap();

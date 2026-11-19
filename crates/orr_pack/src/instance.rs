@@ -42,7 +42,7 @@ use orr_math::{Affine3, BVec3, DAffine3, DMat3, DQuat, DVec3, DVec4, Mat3, Quat,
 use crate::blob::{put_table, read, table};
 use crate::{Aabb, AffineRows, AssetId, Error, Result, Span};
 
-pub const SCHEMA: u16 = 3;
+pub const SCHEMA: u16 = 4;
 
 /// Records per page.
 pub const MAX_RECORDS: usize = 16_384;
@@ -103,9 +103,11 @@ pub struct InstancePageHeader {
     /// Intervals in a window of rows, the last window up to the end.
     pub motion_window: u32,
     pub _pad: u32,
+    /// The instance source whose page it is.
+    pub source: AssetId,
 }
 
-const _: () = assert!(size_of::<InstancePageHeader>() == 216);
+const _: () = assert!(size_of::<InstancePageHeader>() == 232);
 
 impl InstancePageHeader {
     /// Blobs of [`MotionRow`]s.

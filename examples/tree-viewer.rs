@@ -39,7 +39,7 @@ use orr::orr_pack::skeleton::{NO_PARENT, SkeletonInfo};
 use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
     Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc,
-    LightId, LitView, PackSource, Pose, Projection, Renderer, RendererDesc, SceneDesc,
+    LitView, PackSource, Pose, Projection, Renderer, RendererDesc, SceneDesc,
     SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, ViewHooks,
     ViewLighting, ViewOutput, ViewTarget,
 };
@@ -457,7 +457,6 @@ fn run(options: &Options) -> Option<Capture> {
         ..Atmosphere::earth(DVec3::ZERO, Vec3::Y)
     };
     let mut sky = AtmosphereState::new(gpu, &atmosphere, 0).expect("atmosphere");
-    sky.set_lights(&[LightId(0)]);
     sky.skip_fades();
 
     let scene = renderer
@@ -525,7 +524,7 @@ fn run(options: &Options) -> Option<Capture> {
         })
         .expect("instances");
     }
-    w.set_light(LightId(0), Some(&sun())).expect("sun");
+    sky.set_lights(&[w.add_light(&sun()).expect("sun")]);
     w.set_environment(sky.data());
     w.set_medium(sky.data());
     drop(w);

@@ -40,3 +40,14 @@ pub(crate) fn put_table_aligned<T: NoUninit>(out: &mut Vec<u8>, t: &[T], align: 
         count: t.len() as u32,
     }
 }
+
+/// Records `s` of `t`, `s.first` the first index.
+pub(crate) fn span<T>(t: &[T], s: Span) -> Option<&[T]> {
+    let at = s.first as usize;
+    t.get(at..at.checked_add(s.count as usize)?)
+}
+
+/// The UTF-8 string at byte span `s` of `bytes`.
+pub(crate) fn text(bytes: &[u8], s: Span) -> Option<&str> {
+    std::str::from_utf8(span(bytes, s)?).ok()
+}

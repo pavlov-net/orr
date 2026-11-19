@@ -557,7 +557,7 @@ public float3 material_texel_normal(SurfaceInput i, MaterialGpu* m, uint slot, f
 }
 
 // What the decals over a hit write: per parameter the sum of each decal's value times its
-// share, blended in id order (higher ids over lower), and how much of the surface's own
+// share, blended in (order, id) order, later over earlier, and how much of the surface's own
 // value they cover, 0 to 1.
 public struct DecalLayer
 {
@@ -786,8 +786,8 @@ struct DecalFeedback : IDecalVisit
 }
 
 // The decals over hit `i`, each handed to `v`: those of the bin of world space holding it and
-// the scene's global ones, merged in id order. Texture footprints follow the hit's ray cone onto
-// the triangle's plane, with the view's mip bias at primary hits.
+// the scene's global ones, merged in (order, id) order by their ranks. Texture footprints
+// follow the hit's ray cone onto the triangle's plane, with the view's mip bias at primary hits.
 void surface_decals_each<V : IDecalVisit>(SurfaceInput i, inout V v)
 {
     SceneRoot* s = i.scene;
@@ -817,18 +817,19 @@ void surface_decals_each<V : IDecalVisit>(SurfaceInput i, inout V v)
     uint b = 0;
     while (a < globals || b < count)
     {
-        uint ga = a < globals ? s.decal_refs[a] : 0xffffffff;
-        uint gb = b < count ? s.decal_refs[run + 1 + b] : 0xffffffff;
+        uint ga = a < globals ? s.decal_refs[2 * a] : 0xffffffff;
+        uint gb = b < count ? s.decal_refs[run + 1 + 2 * b] : 0xffffffff;
+        uint id;
         if (ga < gb)
-            a++;
+            id = s.decal_refs[2 * a++ + 1];
         else
-            b++;
-        DecalGpu* dc = s.decals + min(ga, gb);
+            id = s.decal_refs[run + 2 + 2 * b++];
+        DecalGpu* dc = s.decals + id;
         v.decal(i, dc, view_relative(i.cell, i.offset, dc.cell, dc.offset, cell_log2), px, py);
     }
 }
 
-// The decals over hit `i` (`surface_decals_each`) blended in id order.
+// The decals over hit `i` (`surface_decals_each`) blended in (order, id) order.
 public DecalLayer surface_decals(SurfaceInput i)
 {
     return surface_decals(i, false);

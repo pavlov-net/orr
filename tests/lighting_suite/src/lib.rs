@@ -13,9 +13,9 @@ use orr_gpu::{
 };
 use orr_lighting::{SceneLighting, SceneLightingSettings, ScenePass};
 use orr_scene::{
-    EnvironmentData, FrameDesc, FrameTime, LightGpu, LightTables, LoadState, Loading,
-    MaterialWriter, MountId, PackSource, RendererDesc, SceneCompute, SceneDesc, SceneFeatures,
-    SceneId, SceneRoot, SceneWriter, Scenes,
+    EnvironmentData, FrameDesc, FrameTime, Light, LightGpu, LightId, LightTables, LoadState,
+    Loading, MaterialWriter, MountId, PackSource, RendererDesc, SceneCompute, SceneDesc,
+    SceneFeatures, SceneId, SceneRoot, SceneWriter, Scenes,
 };
 
 pub use gpu_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
@@ -379,6 +379,24 @@ impl TestScene {
     /// The scene's light table.
     pub fn lights(&self) -> Vec<LightGpu> {
         read(self.root_value().lights, u64::from(self.tables.lights))
+    }
+}
+
+/// Adds `light` at `id`, at or above the scene's lowest free id. Lights added below it and
+/// removed again in the same frame keep their ids until the frame completes, so the table grows
+/// to `id` and holds the ids below it empty.
+pub fn add_light_at(w: &mut SceneWriter<'_>, id: LightId, light: &Light) {
+    let mut below = Vec::new();
+    loop {
+        let got = w.add_light(light).unwrap();
+        if got == id {
+            break;
+        }
+        assert!(got < id, "{id:?} is held or below the lowest free id");
+        below.push(got);
+    }
+    for b in below {
+        w.remove_light(b).unwrap();
     }
 }
 

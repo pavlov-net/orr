@@ -27,10 +27,11 @@ use orr_lighting::{
 };
 use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
+use orr_pack::names::MaterialName;
 use orr_pack::{AssetId, Span, Target};
 use orr_scene::testing::{FlipError, Image, Pixels, flip, mount_pending};
 use orr_scene::{
-    ClusterTopology, Decal, DecalChannels, DecalId, FrameDesc, FrameTime, GroupWriter, HitGroups,
+    ClusterTopology, Decal, DecalChannels, FrameDesc, FrameTime, GroupWriter, HitGroups,
     HitTableWriter, InstanceFlags, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId,
     MediumProxy, MediumProxyId, ModelId, MountId, Opacity, PackSource, ProducerDesc, ProducerId,
     ProducerUpdate, Projection, RasterView, RendererDesc, SceneCompute, SceneDesc, SceneId,
@@ -2116,7 +2117,10 @@ pub struct Bed {
     /// The scene root of the last frame run.
     last_root: GpuPtr<SceneRoot>,
     last_overlay: Option<TextureIndex>,
-    light_writes: Vec<(LightId, Option<Light>)>,
+    /// The scene id of the light in each of the test's slots; `Spec::lights` fill them from 0.
+    lights: Vec<Option<LightId>>,
+    /// The slot, its light (none: removed) and, for one added past the lowest free id, its id.
+    light_writes: Vec<(usize, Option<Light>, Option<LightId>)>,
     proxy_writes: Vec<(MediumProxyId, Option<MediumProxy>)>,
     scene_compute: Option<SceneComputeHook>,
     /// The pipeline whose hit table every frame's kernel takes in [`BedFrame::hits`].
@@ -2249,13 +2253,14 @@ impl Bed {
                 material: scenes
                     .material(
                         mount,
-                        AssetId::from_name(&format!("{}/material/0", decal.material)),
+                        AssetId::from_name(&MaterialName::index(0).entry(decal.material)),
                     )
                     .unwrap_or_else(|e| panic!("material {}: {e}", decal.material)),
                 channels: DecalChannels::BASE_COLOR,
                 opacity: 1.0,
                 fade_angles: [1.0, 1.4],
                 depth_fade: 0.0,
+                order: 0,
             })
             .collect();
         // The tiled floor shows the feature pack's tiled material, as material set 0.
@@ -2311,15 +2316,17 @@ impl Bed {
             })
             .unwrap();
         w.transforms(particle_group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
-        for (i, l) in spec.lights.iter().enumerate() {
-            w.set_light(LightId(i as u32), Some(l)).unwrap();
-        }
+        let lights = spec
+            .lights
+            .iter()
+            .map(|l| Some(w.add_light(l).unwrap()))
+            .collect();
         if let Some((_, data)) = &environment {
             w.set_environment(data.gpu());
         }
         linked(&mut w);
-        for (i, decal) in decals.iter().enumerate() {
-            w.set_decal(DecalId(i as u32), Some(decal)).unwrap();
+        for decal in &decals {
+            w.add_decal(decal).unwrap();
         }
         if let Some((at, pixels_per_radian)) = spec.focus {
             w.set_focus(at.as_dvec3());
@@ -2371,6 +2378,7 @@ impl Bed {
             last_root: GpuPtr::NULL,
             traced_primary: false,
             last_overlay: None,
+            lights,
             light_writes: Vec::new(),
             proxy_writes: Vec::new(),
             scene_compute: None,
@@ -2896,12 +2904,12 @@ impl Bed {
         }
     }
 
-    /// The first material of the bed's model `model`.
+    /// The first material of the bed's model `model`, a mesh source.
     pub fn material(&self, model: &str) -> MaterialId {
         self.scenes
             .material(
                 self.mount,
-                AssetId::from_name(&format!("{model}/material/0")),
+                AssetId::from_name(&MaterialName::index(0).entry(model)),
             )
             .unwrap_or_else(|e| panic!("material of {model}: {e}"))
     }
@@ -2925,9 +2933,21 @@ impl Bed {
         }
     }
 
-    /// Sets light `id` from the next frame on.
-    pub fn set_light(&mut self, id: LightId, light: Option<Light>) {
-        self.light_writes.push((id, light));
+    /// Sets the light of the test's slot `slot` from the next frame on: adds it to an empty
+    /// slot, changes the one there or, for `None`, removes it.
+    pub fn set_light(&mut self, slot: usize, light: Option<Light>) {
+        self.light_writes.push((slot, light, None));
+    }
+
+    /// Adds `light` to the empty slot `slot` from the next frame on, at `id` (see
+    /// [`crate::add_light_at`]).
+    pub fn add_light_at(&mut self, slot: usize, id: LightId, light: Light) {
+        self.light_writes.push((slot, Some(light), Some(id)));
+    }
+
+    /// The scene id of the light in slot `slot`.
+    pub fn light_id(&self, slot: usize) -> LightId {
+        self.lights[slot].expect("a light in the slot")
     }
 
     /// The froxel volume's depth from the next frame on, m (`SceneRoot::near_range`).
@@ -3039,8 +3059,25 @@ impl Bed {
         };
         if !self.light_writes.is_empty() || !self.proxy_writes.is_empty() {
             let mut w = f.scene(self.scene).unwrap();
-            for (id, l) in self.light_writes.drain(..) {
-                w.set_light(id, l.as_ref()).unwrap();
+            for (slot, l, at) in self.light_writes.drain(..) {
+                if slot >= self.lights.len() {
+                    self.lights.resize(slot + 1, None);
+                }
+                let held = &mut self.lights[slot];
+                match (*held, l, at) {
+                    (_, None, _) => {
+                        if let Some(id) = held.take() {
+                            w.remove_light(id).unwrap();
+                        }
+                    }
+                    (Some(id), Some(l), None) => w.set_light(id, &l).unwrap(),
+                    (None, Some(l), None) => *held = Some(w.add_light(&l).unwrap()),
+                    (None, Some(l), Some(id)) => {
+                        crate::add_light_at(&mut w, id, &l);
+                        *held = Some(id);
+                    }
+                    (Some(_), Some(_), Some(_)) => panic!("slot {slot} holds a light"),
+                }
             }
             for (id, p) in self.proxy_writes.drain(..) {
                 w.set_medium_proxy(id, p.as_ref()).unwrap();

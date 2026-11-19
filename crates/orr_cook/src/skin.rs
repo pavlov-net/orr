@@ -167,6 +167,7 @@ pub(crate) fn animated(doc: &gltf::Document, graph: &Graph) -> Vec<bool> {
 }
 
 /// What one skeleton holds.
+#[derive(Clone)]
 pub(crate) struct Rig {
     /// Per node, whether it is a joint.
     pub(crate) joints: Vec<bool>,

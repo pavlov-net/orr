@@ -23,6 +23,7 @@ use orr_pack::instance::{
 use orr_pack::material::{Material, slot, wrap};
 use orr_pack::mesh::{MeshInfo, PageView};
 use orr_pack::model::ModelInfo;
+use orr_pack::names::{Derived, MaterialBase, MaterialName, ModelName};
 use orr_pack::skeleton::{SkeletonInfo, Trs};
 use orr_pack::texture::TextureInfo;
 use orr_pack::tiles::TextureTiles;
@@ -441,7 +442,8 @@ fn a_prototype_gives_way_to_a_selected_model_of_its_name() {
         ..Default::default()
     };
     let a = cook_at(&dir("prototype-name"), &body, settings).unwrap();
-    assert!(has(&a, "u/P/mesh") && has(&a, "u/I/Protos/P/mesh"));
+    let by_path = ModelName::source("/I/Protos/P");
+    assert!(has(&a, &ModelName::source("P").mesh("u")) && has(&a, &by_path.mesh("u")));
 }
 
 /// `xformable.h`: `!resetXformStack!` makes a prim "not inherit the parent transformation", so a
@@ -470,7 +472,7 @@ fn a_reset_prim_stands_in_the_world_under_a_framed_model() {
     };
     let a = cook_at(&dir("reset-under-frame"), &body, settings).unwrap();
     // In the frame's space, which stands at 10.
-    let lowest = corners(&a, "u/Frame/mesh")
+    let lowest = corners(&a, &ModelName::source("Frame").mesh("u"))
         .iter()
         .map(|c| c.0.x)
         .fold(f32::MAX, f32::min);
@@ -515,7 +517,7 @@ fn orientationsf_wins_unless_its_first_value_is_empty() {
             &format!("orient-{name}"),
             &instancer(&format!("{start}\n    {attrs}")),
         );
-        let m = copies(&a, "u/P")[0];
+        let m = copies(&a, &ModelName::source("P").entry("u"))[0];
         let got = m.transform_vector3(Vec3::X);
         assert!(got.abs_diff_eq(want, 2e-2), "{name}: {got}");
     }
@@ -547,7 +549,10 @@ fn inactive_and_invisible_ids_both_mask() {
             &format!("def PointInstancer \"I\" (\n    {meta}\n)"),
         );
         let a = cook(&format!("mask-{name}"), &body);
-        let got: Vec<i32> = origins(&a, "u/P").iter().map(|o| o[0]).collect();
+        let got: Vec<i32> = origins(&a, &ModelName::source("P").entry("u"))
+            .iter()
+            .map(|o| o[0])
+            .collect();
         assert_eq!(got, want, "{name}");
     }
 }
@@ -598,7 +603,11 @@ fn velocities_extrapolate_from_the_lower_sample_where_they_line_up() {
             at(time),
         )
         .unwrap();
-        assert_eq!(origins(&a, "u/P"), [want], "{name}");
+        assert_eq!(
+            origins(&a, &ModelName::source("P").entry("u")),
+            [want],
+            "{name}"
+        );
     }
 
     // `samplingUtils.cpp` `UsdGeom_GetScales`: "we lock the scale to the last authored value
@@ -613,7 +622,9 @@ fn velocities_extrapolate_from_the_lower_sample_where_they_line_up() {
         at(5.0),
     )
     .unwrap();
-    let scale = copies(&a, "u/P")[0].transform_vector3(Vec3::X).length();
+    let scale = copies(&a, &ModelName::source("P").entry("u"))[0]
+        .transform_vector3(Vec3::X)
+        .length();
     assert!((scale - 1.0).abs() < 1e-3, "{scale}");
 
     // Angular velocities turn the lower sample's orientation, in degrees per second, after it.
@@ -628,7 +639,7 @@ fn velocities_extrapolate_from_the_lower_sample_where_they_line_up() {
         at(5.0),
     )
     .unwrap();
-    let got = copies(&a, "u/P")[0].transform_vector3(Vec3::X);
+    let got = copies(&a, &ModelName::source("P").entry("u"))[0].transform_vector3(Vec3::X);
     assert!(got.abs_diff_eq(Vec3::NEG_Z, 2e-2), "{got}");
 }
 
@@ -652,9 +663,12 @@ def PointInstancer "I"
 }}"#
         ),
     );
-    assert_eq!(origins(&a, "u/P"), [[0, 5000, 0]]);
+    assert_eq!(
+        origins(&a, &ModelName::source("P").entry("u")),
+        [[0, 5000, 0]]
+    );
     assert_eq!(corners(&a, "u/mesh").len(), 3);
-    assert_eq!(corners(&a, "u/P/mesh").len(), 3);
+    assert_eq!(corners(&a, &ModelName::source("P").mesh("u")).len(), 3);
 }
 
 /// PI: place prototypes "under a prim that is a "class" or "over". "class" is recommended": they
@@ -681,7 +695,11 @@ def PointInstancer "I"
 }}"#
             ),
         );
-        assert_eq!(origins(&a, "u/P"), [[0, 5000, 0]], "{specifier}");
+        assert_eq!(
+            origins(&a, &ModelName::source("P").entry("u")),
+            [[0, 5000, 0]],
+            "{specifier}"
+        );
         assert!(!has(&a, "u/mesh"), "{specifier} draws in place");
     }
 }
@@ -716,8 +734,8 @@ fn a_prototype_root_that_resets_the_stack_keeps_only_its_local_transform() {
 }}"#
         ),
     );
-    let m = copies(&a, "u/P")[0];
-    let got: Vec<Vec3> = corners(&a, "u/P/mesh")
+    let m = copies(&a, &ModelName::source("P").entry("u"))[0];
+    let got: Vec<Vec3> = corners(&a, &ModelName::source("P").mesh("u"))
         .iter()
         .map(|c| m.transform_point3(c.0))
         .collect();
@@ -757,7 +775,7 @@ fn nested_instancers_multiply_their_copies() {
         ),
     );
     assert_eq!(
-        origins(&a, "u/P"),
+        origins(&a, &ModelName::source("P").entry("u")),
         [
             [100000, 1000, 0],
             [100000, 2000, 0],
@@ -795,8 +813,11 @@ def PointInstancer "I"
 }}"#
         ),
     );
-    assert_eq!(origins(&a, "u/P"), [[0, 5000, 0]]);
-    assert!(copies(&a, "u/Empty").is_empty());
+    assert_eq!(
+        origins(&a, &ModelName::source("P").entry("u")),
+        [[0, 5000, 0]]
+    );
+    assert!(copies(&a, &ModelName::source("Empty").entry("u")).is_empty());
 }
 
 /// `overview.dox`: "A prim that is Imageable with an authored opinion about its purpose will
@@ -924,7 +945,11 @@ fn skinning_properties_inherit_from_binding_ancestors() {
             INFLUENCES,
         ),
     );
-    assert!(joints_of(&a, "u/Hero/mesh").iter().all(|&j| j == 0));
+    assert!(
+        joints_of(&a, &ModelName::source("Hero").mesh("u"))
+            .iter()
+            .all(|&j| j == 0)
+    );
 
     let a = cook(
         "skel-geom-bind",
@@ -935,14 +960,21 @@ fn skinning_properties_inherit_from_binding_ancestors() {
         ),
     );
     assert!(
-        corners(&a, "u/Hero/mesh")
+        corners(&a, &ModelName::source("Hero").mesh("u"))
             .iter()
             .any(|c| c.0.abs_diff_eq(Vec3::new(8.0, 0.0, 0.0), 1e-3))
     );
 
     let a = cook("skel-influences", &group(api, INFLUENCES, ""));
-    assert!(has(&a, "u/Hero/skeleton"), "the mesh cooks skinned");
-    assert!(joints_of(&a, "u/Hero/mesh").iter().all(|&j| j == 1));
+    assert!(
+        has(&a, &ModelName::source("Hero").skeleton("u")),
+        "the mesh cooks skinned"
+    );
+    assert!(
+        joints_of(&a, &ModelName::source("Hero").mesh("u"))
+            .iter()
+            .all(|&j| j == 1)
+    );
 
     // Without the schema the parent's attributes are not bindings.
     let a = cook(
@@ -953,7 +985,11 @@ fn skinning_properties_inherit_from_binding_ancestors() {
             INFLUENCES,
         ),
     );
-    assert!(joints_of(&a, "u/Hero/mesh").iter().all(|&j| j == 1));
+    assert!(
+        joints_of(&a, &ModelName::source("Hero").mesh("u"))
+            .iter()
+            .all(|&j| j == 1)
+    );
 }
 
 /// A skinned triangle under `SkelRoot` `Hero` at `root`, with `prims` beside the skeleton.
@@ -987,7 +1023,7 @@ fn joint_influences_without_interpolation_are_constant() {
         "skel-unauthored-interpolation",
         &skinned("", "").replace("interpolation = \"constant\"", ""),
     );
-    let joints = joints_of(&a, "u/Hero/mesh");
+    let joints = joints_of(&a, &ModelName::source("Hero").mesh("u"));
     assert_eq!(joints, [1, 1, 1]);
 }
 
@@ -1019,7 +1055,11 @@ fn an_animation_needs_all_three_components_at_the_joint_count() {
         ),
     ] {
         let a = cook(&format!("anim-{name}"), &skinned("", &wave(&attrs)));
-        assert_eq!(has(&a, "u/Hero/clip/Wave"), clip, "{name}");
+        assert_eq!(
+            has(&a, &ModelName::source("Hero").clip("u", "Wave")),
+            clip,
+            "{name}"
+        );
     }
 }
 
@@ -1062,7 +1102,10 @@ fn an_animation_source_inherits_down_to_the_binding_site() {
         ),
     ] {
         let a = cook(&format!("source-{name}"), &format!("{outside}\n{body}"));
-        assert!(has(&a, "u/Hero/clip/Wave"), "{name}");
+        assert!(
+            has(&a, &ModelName::source("Hero").clip("u", "Wave")),
+            "{name}"
+        );
     }
 }
 
@@ -1077,8 +1120,8 @@ fn a_deactivated_animation_source_nullifies_the_binding() {
         "source-inactive",
         &skinned("rel skel:animationSource = </Hero/Wave>", &wave),
     );
-    assert!(!has(&a, "u/Hero/clip/Wave"));
-    assert!(has(&a, "u/Hero/skeleton"));
+    assert!(!has(&a, &ModelName::source("Hero").clip("u", "Wave")));
+    assert!(has(&a, &ModelName::source("Hero").skeleton("u")));
 }
 
 /// `schemas.dox`: "bindings defined on any primitives that do not have a UsdSkelRoot primitive as
@@ -1183,7 +1226,12 @@ fn shaded(name: &str, body: &str, image: &[u8]) -> Archive {
 }
 
 fn material(a: &Archive) -> Material {
-    Material::from_bytes(&blob(a, "u/material/M", 0)).unwrap()
+    Material::from_bytes(&blob(
+        a,
+        &MaterialName::new(MaterialBase::Path("/M".into())).entry("u"),
+        0,
+    ))
+    .unwrap()
 }
 
 /// Red texels of mip 0 of a bound BC4 texture.
@@ -3084,8 +3132,10 @@ fn a_baked_height_holds_under_a_placement_scale() {
                 .map(|c| c.0.z)
                 .fold(f32::MIN, f32::max)
         };
-        assert!((height("u/P/mesh") - 0.25).abs() < 1e-3);
-        assert!((height("u/P/baked/0/mesh") - 0.25).abs() < 1e-3);
+        assert!((height(&ModelName::source("P").mesh("u")) - 0.25).abs() < 1e-3);
+        assert!(
+            (height(&ModelName::source("P").with(Derived::Baked(0)).mesh("u")) - 0.25).abs() < 1e-3
+        );
     }
 }
 
@@ -3644,11 +3694,12 @@ fn a_clip_animates_the_joints_it_names() {
     );
     let a = cook("clip-sparse", &skinned("", &wave));
     let clip = Clip::parse(
-        &blob(&a, "u/Hero/clip/Wave", 0),
-        &blob(&a, "u/Hero/clip/Wave", 1),
+        &blob(&a, &ModelName::source("Hero").clip("u", "Wave"), 0),
+        &blob(&a, &ModelName::source("Hero").clip("u", "Wave"), 1),
     )
     .unwrap();
-    let skeleton = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+    let skeleton =
+        SkeletonInfo::parse(&blob(&a, &ModelName::source("Hero").skeleton("u"), 0)).unwrap();
     let mut pose = vec![Trs::IDENTITY; 2];
     clip.sample(clip.header.duration, &mut pose);
     assert!(Vec3::from(pose[0].translation).abs_diff_eq(Vec3::X, 1e-3));
@@ -3802,11 +3853,16 @@ fn part_corners(a: &Archive, name: &str) -> Vec<(u16, Vec3)> {
     out
 }
 
-/// Clip `clip` of skeleton `model`, and the skeleton's skinning matrices `t` seconds into it.
-fn posed(a: &Archive, model: &str, clip: &str, t: f32) -> (Clip, Vec<Affine3>) {
-    let sk = SkeletonInfo::parse(&blob(a, &format!("{model}/skeleton"), 0)).unwrap();
-    let name = format!("{model}/clip/{clip}");
-    let clip = Clip::parse(&blob(a, &name, 0), &blob(a, &name, 1)).unwrap();
+/// Clip `clip` of model `model`'s skeleton, and the skeleton's skinning matrices `t` seconds
+/// into it.
+fn posed(a: &Archive, model: &ModelName, clip: &str, t: f32) -> (Clip, Vec<Affine3>) {
+    posed_entries(a, &model.skeleton("u"), &model.clip("u", clip), t)
+}
+
+/// [`posed`] by the entry names of the skeleton and the clip.
+fn posed_entries(a: &Archive, skeleton: &str, clip: &str, t: f32) -> (Clip, Vec<Affine3>) {
+    let sk = SkeletonInfo::parse(&blob(a, skeleton, 0)).unwrap();
+    let clip = Clip::parse(&blob(a, clip, 0), &blob(a, clip, 1)).unwrap();
     let mut pose = sk.rest.clone();
     clip.sample(t, &mut pose);
     (clip, palette_of(&sk, &pose))
@@ -3842,19 +3898,19 @@ def Xform "Held"
 }}"#
         ),
     );
-    assert!(!has(&a, "u/skeleton") && !has(&a, "u/Held/skeleton"));
+    assert!(!has(&a, "u/skeleton") && !has(&a, &ModelName::source("Held").skeleton("u")));
     let still = corners(&a, "u/mesh");
     assert!(still.len() == 3 && still.iter().all(|c| c.0.y >= 5.0));
-    let sk = SkeletonInfo::parse(&blob(&a, "u/Spin/skeleton", 0)).unwrap();
+    let sk = SkeletonInfo::parse(&blob(&a, &ModelName::source("Spin").skeleton("u"), 0)).unwrap();
     assert_eq!(sk.names, ["", "Spin"]);
-    let moved = part_corners(&a, "u/Spin/mesh");
+    let moved = part_corners(&a, &ModelName::source("Spin").mesh("u"));
     assert!(
         moved.iter().all(|c| c.0 == 1),
         "the renderer poses no part 0"
     );
     let far = moved.iter().find(|c| c.1.x > 1.5).unwrap().1;
-    let at = |t: f32| posed(&a, "u/Spin", "xform", t).1[1].transform_point3(far);
-    let (clip, _) = posed(&a, "u/Spin", "xform", 0.0);
+    let at = |t: f32| posed(&a, &ModelName::source("Spin"), "xform", t).1[1].transform_point3(far);
+    let (clip, _) = posed(&a, &ModelName::source("Spin"), "xform", 0.0);
     assert!((clip.header.duration - 1.0).abs() < 1e-5);
     assert!(
         at(0.25).abs_diff_eq(Vec3::new(0.0, 0.0, -2.0), 1e-2),
@@ -3892,7 +3948,7 @@ fn clip_settings_are_checked_before_xforms_are_keyed() {
 }
 
 /// The stage holds one timeline, so a rig whose samples start late keeps its place on it, and
-/// two rigs of one name part: a top-level prim's path is that name too.
+/// two rigs of one name part: the second takes its path, which a name never meets.
 #[test]
 fn xform_clips_keep_time_and_rigs_of_one_name_part() {
     let a = cook(
@@ -3921,11 +3977,12 @@ def Xform "Door"
 }}"#
         ),
     );
-    let (clip, half) = posed(&a, "u/node3", "xform", 0.5);
+    let top = ModelName::source("/Door");
+    let (clip, half) = posed(&a, &top, "xform", 0.5);
     assert!((clip.header.duration - 1.0).abs() < 1e-5);
-    let rest = posed(&a, "u/node3", "xform", 0.0).1[1].translation;
+    let rest = posed(&a, &top, "xform", 0.0).1[1].translation;
     assert!(half[1].translation.abs_diff_eq(rest, 1e-4), "still at half");
-    assert!(has(&a, "u/Door/skeleton"));
+    assert!(has(&a, &ModelName::source("Door").skeleton("u")));
 }
 
 /// Every clip and animated page of a stage runs on its one timeline, from the first sample of
@@ -3952,7 +4009,7 @@ fn clips_and_pages_run_on_the_stage_timeline() {
     let a = cook("stage-timeline", &body);
     // Time codes -10 to 10 at 10 a second.
     let root_at = |clip: &str, t: f32| {
-        let name = format!("u/Hero/clip/{clip}");
+        let name = ModelName::source("Hero").clip("u", clip);
         let clip = Clip::parse(&blob(&a, &name, 0), &blob(&a, &name, 1)).unwrap();
         assert!((clip.header.duration - 2.0).abs() < 1e-5, "{name}");
         let mut pose = vec![Trs::IDENTITY; 2];
@@ -4081,17 +4138,17 @@ fn an_xform_above_a_skeleton_moves_its_skin() {
 }}"#
         ),
     );
-    let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+    let sk = SkeletonInfo::parse(&blob(&a, &ModelName::source("Hero").skeleton("u"), 0)).unwrap();
     assert_eq!(sk.names, ["Mover", "Hero", "Rig", "Root", "Arm"]);
     assert_eq!(
         sk.parents[3], 2,
         "a root joint hangs on its skeleton's prim"
     );
-    let joint = usize::from(joints_of(&a, "u/Hero/mesh")[0]);
+    let joint = usize::from(joints_of(&a, &ModelName::source("Hero").mesh("u"))[0]);
     assert_eq!(joint, 4, "joint indices follow the prims above");
-    let (_, start) = posed(&a, "u/Hero", "xform", 0.0);
-    let (_, end) = posed(&a, "u/Hero", "xform", 1.0);
-    for (p, ..) in corners(&a, "u/Hero/mesh") {
+    let (_, start) = posed(&a, &ModelName::source("Hero"), "xform", 0.0);
+    let (_, end) = posed(&a, &ModelName::source("Hero"), "xform", 1.0);
+    for (p, ..) in corners(&a, &ModelName::source("Hero").mesh("u")) {
         let (from, to) = (
             start[joint].transform_point3(p),
             end[joint].transform_point3(p),
@@ -4132,15 +4189,15 @@ fn a_selected_model_keeps_what_moves_in_it() {
 }}"#
     );
     let a = cook_at(&d, &body, settings).unwrap();
-    let sk = SkeletonInfo::parse(&blob(&a, "u/Frame/skeleton", 0)).unwrap();
+    let sk = SkeletonInfo::parse(&blob(&a, &ModelName::source("Frame").skeleton("u"), 0)).unwrap();
     assert_eq!(sk.names, ["", "Door"]);
-    let parts = part_corners(&a, "u/Frame/mesh");
+    let parts = part_corners(&a, &ModelName::source("Frame").mesh("u"));
     assert!(parts.iter().any(|c| c.0 == 0) && parts.iter().any(|c| c.0 == 1));
     assert!(
         parts.iter().all(|c| (c.0 == 1) == (c.1.x >= 2.0)),
         "{parts:?}"
     );
-    let (_, end) = posed(&a, "u/Frame", "xform", 1.0);
+    let (_, end) = posed(&a, &ModelName::source("Frame"), "xform", 1.0);
     let door = parts.iter().find(|c| c.0 == 1).unwrap().1;
     assert!(
         end[1]
@@ -4190,9 +4247,10 @@ fn a_thin_turned_bind_keeps_the_points_off_its_plane() {
 }}"#
             ),
         );
-        let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+        let sk =
+            SkeletonInfo::parse(&blob(&a, &ModelName::source("Hero").skeleton("u"), 0)).unwrap();
         let palette = palette_of(&sk, &sk.rest);
-        let worst = corners(&a, "u/Hero/mesh")
+        let worst = corners(&a, &ModelName::source("Hero").mesh("u"))
             .iter()
             .map(|c| palette[0].transform_point3(c.0).distance(c.0))
             .fold(0.0, f32::max);
@@ -4237,23 +4295,43 @@ fn a_skinned_prototype_is_a_model_placed_per_copy() {
 }}"#
         ),
     );
-    let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+    let sk = SkeletonInfo::parse(&blob(&a, &ModelName::source("Hero").skeleton("u"), 0)).unwrap();
     assert_eq!(sk.names, ["Root", "Arm", ""]);
-    assert_eq!(copies(&a, "u/Hero").len(), 2);
-    let model = ModelInfo::parse(&blob(&a, "u/Hero", 0)).unwrap();
-    assert_eq!(model.header.skeleton, AssetId::from_name("u/Hero/skeleton"));
+    assert_eq!(copies(&a, &ModelName::source("Hero").entry("u")).len(), 2);
+    let model = ModelInfo::parse(&blob(&a, &ModelName::source("Hero").entry("u"), 0)).unwrap();
+    assert_eq!(
+        model.header.skeleton,
+        AssetId::from_name(&ModelName::source("Hero").skeleton("u"))
+    );
     let palette = palette_of(&sk, &sk.rest);
-    let mesh = corners(&a, "u/Hero/mesh");
+    let mesh = corners(&a, &ModelName::source("Hero").mesh("u"));
     assert_eq!(mesh.len(), 6);
-    let joints = joints_of(&a, "u/Hero/mesh");
+    let joints = joints_of(&a, &ModelName::source("Hero").mesh("u"));
     assert!(joints.contains(&1) && joints.contains(&2), "{joints:?}");
     let prop = mesh.iter().find(|c| c.0.x >= 5.0).expect("the prop").0;
     assert!(palette[2].transform_point3(prop).abs_diff_eq(prop, 1e-5));
 
-    let flat = SkeletonInfo::parse(&blob(&a, "u/Hero/baked/0/skeleton", 0)).unwrap();
+    let flat = SkeletonInfo::parse(&blob(
+        &a,
+        &ModelName::source("Hero")
+            .with(Derived::Baked(0))
+            .skeleton("u"),
+        0,
+    ))
+    .unwrap();
     assert_eq!(flat.root.matrix3.y_axis.y, 0.0);
-    assert_eq!(copies(&a, "u/Hero/baked/0").len(), 1);
-    let bound = corners(&a, "u/Hero/baked/0/mesh");
+    assert_eq!(
+        copies(
+            &a,
+            &ModelName::source("Hero").with(Derived::Baked(0)).entry("u")
+        )
+        .len(),
+        1
+    );
+    let bound = corners(
+        &a,
+        &ModelName::source("Hero").with(Derived::Baked(0)).mesh("u"),
+    );
     assert!(
         bound.iter().any(|c| c.0.y > 0.5),
         "the mesh keeps its bind pose"
@@ -4312,13 +4390,13 @@ fn each_skeleton_binding_under_a_root_is_a_model() {
             binding("Three", "Other", "Walk"),
         ),
     );
-    for model in ["One", "Two", "Three"] {
-        let name = format!("u/Crowd/{model}");
-        assert!(has(&a, &format!("{name}/skeleton")), "{model}");
-        assert!(has(&a, &format!("{name}/clip/Walk")), "{model}");
-        assert_eq!(corners(&a, &format!("{name}/mesh")).len(), 3, "{model}");
+    for site in ["One", "Two", "Three"] {
+        let model = ModelName::source("Crowd").with(Derived::Binding(site.into()));
+        assert!(has(&a, &model.skeleton("u")), "{model}");
+        assert!(has(&a, &model.clip("u", "Walk")), "{model}");
+        assert_eq!(corners(&a, &model.mesh("u")).len(), 3, "{model}");
     }
-    assert!(!has(&a, "u/Crowd/skeleton"));
+    assert!(!has(&a, &ModelName::source("Crowd").skeleton("u")));
 }
 
 /// `instancing.dox` asks one bind state of a prototype's copies however they are placed: with
@@ -4355,8 +4433,16 @@ fn a_prototype_whose_copies_all_flatten_stays_skinned() {
 }}"#
         ),
     );
-    assert!(has(&a, "u/Hero/baked/0/clip/Walk"));
-    let joints = joints_of(&a, "u/Hero/baked/0/mesh");
+    assert!(has(
+        &a,
+        &ModelName::source("Hero")
+            .with(Derived::Baked(0))
+            .clip("u", "Walk")
+    ));
+    let joints = joints_of(
+        &a,
+        &ModelName::source("Hero").with(Derived::Baked(0)).mesh("u"),
+    );
     assert!(joints.contains(&1), "{joints:?}");
 }
 
@@ -4408,16 +4494,31 @@ fn what_moves_in_a_skinned_prototype_moves() {
 }}"#
         ),
     );
-    let sk = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+    let sk = SkeletonInfo::parse(&blob(&a, &ModelName::source("Hero").skeleton("u"), 0)).unwrap();
     let n = sk.joint_count();
     let palette = palette_of(&sk, &sk.rest);
     let prop = Vec3::new(5.0, 3.0, 0.0);
     let held = palette[n - 1].transform_point3(prop);
     assert!(held.abs_diff_eq(prop, 1e-5), "{held}");
-    assert_eq!(corners(&a, "u/Hero/mesh").len(), 6);
-    assert!(has(&a, "u/Hero/moved/skeleton"));
-    assert!(has(&a, "u/Hero/moved/clip/xform"));
-    assert_eq!(copies(&a, "u/Hero/moved").len(), 1);
+    assert_eq!(corners(&a, &ModelName::source("Hero").mesh("u")).len(), 6);
+    assert!(has(
+        &a,
+        &ModelName::source("Hero").with(Derived::Moved).skeleton("u")
+    ));
+    assert!(has(
+        &a,
+        &ModelName::source("Hero")
+            .with(Derived::Moved)
+            .clip("u", "xform")
+    ));
+    assert_eq!(
+        copies(
+            &a,
+            &ModelName::source("Hero").with(Derived::Moved).entry("u")
+        )
+        .len(),
+        1
+    );
 }
 
 /// Binding prims that share a name are still instances of their own, and a root drawn in place
@@ -4461,10 +4562,13 @@ def PointInstancer "Crowd"
             binding("B"),
         ),
     );
-    for model in ["u/Hero/A/Geo", "u/Hero/B/Geo", "u/Hero/prototype"] {
-        assert!(has(&a, &format!("{model}/skeleton")), "{model}");
+    let root = ModelName::source("Hero");
+    let prototype = ModelName::source("/Hero");
+    let bound = |site: &str| root.with(Derived::Binding(site.into()));
+    for model in [bound("A/Geo"), bound("B/Geo"), prototype.clone()] {
+        assert!(has(&a, &model.skeleton("u")), "{model}");
     }
-    assert_eq!(copies(&a, "u/Hero/prototype").len(), 1);
+    assert_eq!(copies(&a, &prototype.entry("u")).len(), 1);
 }
 
 /// `xformOp.h` takes any matrix for `xformOp:transform`, so a shear moves like the rest: a joint
@@ -4488,8 +4592,8 @@ fn a_shearing_xform_is_a_joint_local() {
 }}"#
         ),
     );
-    let (_, end) = posed(&a, "u", "xform", 1.0);
-    let (_, middle) = posed(&a, "u", "xform", 0.5);
+    let (_, end) = posed(&a, &ModelName::WHOLE, "xform", 1.0);
+    let (_, middle) = posed(&a, &ModelName::WHOLE, "xform", 0.5);
     let top = Vec3::Y;
     assert!(
         end[1]
@@ -4526,7 +4630,7 @@ fn a_sudden_shear_raises_the_clip_rate() {
 }}"#
         ),
     );
-    let (clip, _) = posed(&a, "u", "xform", 0.0);
+    let (clip, _) = posed(&a, &ModelName::WHOLE, "xform", 0.0);
     let rate = clip.header.sample_rate;
     assert!(rate > 200.0, "{rate} frames a second");
 }
@@ -4590,17 +4694,17 @@ fn a_skeleton_outside_a_prototype_is_seen_from_its_first_copy() {
 }}"#
         ),
     );
-    let sk = SkeletonInfo::parse(&blob(&a, "u/Proto/skeleton", 0)).unwrap();
+    let sk = SkeletonInfo::parse(&blob(&a, &ModelName::source("Proto").skeleton("u"), 0)).unwrap();
     let palette = palette_of(&sk, &sk.rest);
-    let joint = usize::from(joints_of(&a, "u/Proto/mesh")[0]);
+    let joint = usize::from(joints_of(&a, &ModelName::source("Proto").mesh("u"))[0]);
     // The copy stands at x = 1, so the model holds the skeleton's pose 1 m the other way.
     let source = [Vec3::ZERO, Vec3::X, Vec3::Y].map(|p| p - Vec3::X);
-    for (p, ..) in corners(&a, "u/Proto/mesh") {
+    for (p, ..) in corners(&a, &ModelName::source("Proto").mesh("u")) {
         let got = palette[joint].transform_point3(p);
         let hit = source.iter().any(|w| got.abs_diff_eq(*w, 1e-4));
         assert!(hit, "{p} reaches {got}");
     }
-    assert_eq!(copies(&a, "u/Proto").len(), 1);
+    assert_eq!(copies(&a, &ModelName::source("Proto").entry("u")).len(), 1);
 }
 
 /// Per skeleton of `a`, where the first corner of its mesh stands at the start and end of its
@@ -4614,8 +4718,9 @@ fn skinned_travel(a: &Archive) -> Vec<(Vec3, Vec3)> {
     models
         .map(|model| {
             let joint = usize::from(joints_of(a, &format!("{model}/mesh"))[0]);
-            let (_, start) = posed(a, &model, "xform", 0.0);
-            let (_, end) = posed(a, &model, "xform", 1.0);
+            let (skeleton, clip) = (format!("{model}/skeleton"), format!("{model}/clip/xform"));
+            let (_, start) = posed_entries(a, &skeleton, &clip, 0.0);
+            let (_, end) = posed_entries(a, &skeleton, &clip, 1.0);
             let bound = corners(a, &format!("{model}/mesh"))[0].0;
             (
                 start[joint].transform_point3(bound),
@@ -4748,20 +4853,26 @@ def Mesh "Ground"
         3,
         "the ground stays where it is"
     );
-    let sk = SkeletonInfo::parse(&blob(&a, "u/Mover/skeleton", 0)).unwrap();
+    let sk = SkeletonInfo::parse(&blob(&a, &ModelName::source("Mover").skeleton("u"), 0)).unwrap();
     assert_eq!(sk.names, ["", "Mover"]);
-    let (skeleton, joint, at) = hung(&a, "u/Proto");
-    assert_eq!(skeleton, AssetId::from_name("u/Mover/skeleton"));
+    let (skeleton, joint, at) = hung(&a, &ModelName::source("Proto").entry("u"));
+    assert_eq!(
+        skeleton,
+        AssetId::from_name(&ModelName::source("Mover").skeleton("u"))
+    );
     assert_eq!(joint, 1);
     assert_eq!(at.len(), 2);
-    let (_, end) = posed(&a, "u/Mover", "xform", 1.0);
+    let (_, end) = posed(&a, &ModelName::source("Mover"), "xform", 1.0);
     for (x, p) in [1.0, 5.0].into_iter().zip(at) {
         let got = end[joint].transform_point3(p);
         assert!(got.abs_diff_eq(Vec3::new(x, 3.0, 0.0), 1e-3), "{got}");
     }
     // One mesh for both copies, with its own rig.
-    assert!(has(&a, "u/Proto/skeleton"));
-    assert_eq!(part_corners(&a, "u/Proto/mesh").len(), 6);
+    assert!(has(&a, &ModelName::source("Proto").skeleton("u")));
+    assert_eq!(
+        part_corners(&a, &ModelName::source("Proto").mesh("u")).len(),
+        6
+    );
 }
 
 /// `instancing.dox`: copies share the bind state and take "different set of joint transforms". A
@@ -4792,12 +4903,12 @@ fn skinned_copies_under_a_moving_prim_share_their_skeleton() {
         .map(|e| a.name(e))
         .collect();
     assert_eq!(skeletons.len(), 2, "{skeletons:?}");
-    let hero = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+    let hero = SkeletonInfo::parse(&blob(&a, &ModelName::source("Hero").skeleton("u"), 0)).unwrap();
     assert_eq!(hero.names, ["Root", "Arm"]);
-    let (skeleton, joint, at) = hung(&a, "u/Hero");
+    let (skeleton, joint, at) = hung(&a, &ModelName::source("Hero").entry("u"));
     assert_eq!(skeleton, AssetId::from_name("u/skeleton"));
     assert_eq!(at.len(), 2);
-    let (_, end) = posed(&a, "u", "xform", 1.0);
+    let (_, end) = posed(&a, &ModelName::WHOLE, "xform", 1.0);
     let got = end[joint].transform_point3(at[0]);
     assert!(got.abs_diff_eq(at[0] + Vec3::Y * 3.0, 1e-3), "{got}");
 }
@@ -4830,8 +4941,9 @@ def Mesh "Picked"
         ..UsdSettings::default()
     };
     let a = cook_at(&dir("instancer-selected"), &stage, settings).unwrap();
-    let (skeleton, joint, _) = hung(&a, "u/Proto");
-    assert_eq!(skeleton, AssetId::from_name("u/Mover/Crowd/skeleton"));
+    let (skeleton, joint, _) = hung(&a, &ModelName::source("Proto").entry("u"));
+    let crowd = ModelName::source("/Mover/Crowd");
+    assert_eq!(skeleton, AssetId::from_name(&crowd.skeleton("u")));
     assert_eq!(joint, 1);
 }
 
@@ -4858,7 +4970,11 @@ fn ids_past_a_double_stay_apart() {
             _ => stage,
         };
         let a = cook(&format!("ids-wide-{name}"), &stage);
-        assert_eq!(copies(&a, "u/P").len(), 1, "{name}");
+        assert_eq!(
+            copies(&a, &ModelName::source("P").entry("u")).len(),
+            1,
+            "{name}"
+        );
     }
 }
 
@@ -4883,7 +4999,7 @@ fn alignment_on_a_sample_looks_at_the_interval_ahead() {
     )
     .unwrap();
     // Half of a half turn about z: x goes to y.
-    let got = copies(&a, "u/P")[0].transform_vector3(Vec3::X);
+    let got = copies(&a, &ModelName::source("P").entry("u"))[0].transform_vector3(Vec3::X);
     assert!(got.abs_diff_eq(Vec3::Y, 2e-2), "{got}");
 }
 
@@ -4917,7 +5033,10 @@ fn lengths_that_disagree_place_nothing_and_warn() {
             body(attributes)
         );
         let (a, warnings) = cook_with_warnings(&d, &stage, Subdivision::Hull);
-        assert!(copies(&a, "u/P").is_empty(), "{name}");
+        assert!(
+            copies(&a, &ModelName::source("P").entry("u")).is_empty(),
+            "{name}"
+        );
         assert!(
             warnings
                 .iter()
@@ -4936,7 +5055,7 @@ fn lengths_that_disagree_place_nothing_and_warn() {
         ),
         Subdivision::Hull,
     );
-    assert_eq!(copies(&a, "u/P").len(), 2);
+    assert_eq!(copies(&a, &ModelName::source("P").entry("u")).len(), 2);
     assert!(
         warnings
             .iter()
@@ -4963,7 +5082,7 @@ fn samples_of_different_lengths_hold_the_lower() {
         at,
     )
     .unwrap();
-    let placed = transforms_at(&a, "u/P", 0.5);
+    let placed = transforms_at(&a, &ModelName::source("P").entry("u"), 0.5);
     assert_eq!(placed.len(), 1);
     let x = placed[0].transform_point3(Vec3::ZERO).x;
     assert!((x - 1.0).abs() < 1e-3, "{x}");
@@ -5049,7 +5168,7 @@ fn copies_at(a: &Archive, model: &str, t: f64) -> Vec<Vec3> {
 
 #[track_caller]
 fn assert_copies(a: &Archive, t: f64, want: &[[f32; 3]]) {
-    let got = copies_at(a, "u/Proto", t);
+    let got = copies_at(a, &ModelName::source("Proto").entry("u"), t);
     assert_eq!(got.len(), want.len(), "at {t} s: {got:?}");
     for (g, w) in got.iter().zip(want) {
         assert!(g.abs_diff_eq(Vec3::from(*w), 2e-3), "at {t} s: {got:?}");
@@ -5072,7 +5191,7 @@ fn sampled_positions_orientations_and_scales_move_their_copies() {
     assert_copies(&a, 0.0, &[[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]]);
     let turned = -std::f32::consts::FRAC_1_SQRT_2;
     assert_copies(&a, 0.5, &[[turned, 1.0, 0.0], [4.0, 0.0, 1.0]]);
-    let end = transforms_at(&a, "u/Proto", 1.0);
+    let end = transforms_at(&a, &ModelName::source("Proto").entry("u"), 1.0);
     let scaled = end[1].determinant();
     assert!((scaled - 8.0).abs() < 1e-3, "{scaled}");
     assert!(!has(&a, "u/skeleton"));
@@ -5089,7 +5208,7 @@ fn moving_copies_keep_their_precision_far_from_the_instancer() {
     point3f[] positions.timeSamples = { 0: [(3000000, 0, 0)], 10: [(3000000.5, 0, 0)] }"#,
         ),
     );
-    let (cell, m) = placed_at(&a, "u/Proto", 0.25)[0];
+    let (cell, m) = placed_at(&a, &ModelName::source("Proto").entry("u"), 0.25)[0];
     let x = f64::from(cell[0]) * 256.0 + f64::from(m.translation.x);
     assert!((x - 3000000.125).abs() < 1e-3, "{x}");
 }
@@ -5106,8 +5225,11 @@ fn scales_through_zero_flatten_and_hide_their_copies() {
     float3[] scales.timeSamples = { 0: [(1, 1, 1), (1, 1, 1)], 10: [(1, 0, 1), (0, 0, 0)] }"#,
         ),
     );
-    assert_eq!(transforms_at(&a, "u/Proto", 0.5).len(), 2);
-    let at = transforms_at(&a, "u/Proto", 1.0);
+    assert_eq!(
+        transforms_at(&a, &ModelName::source("Proto").entry("u"), 0.5).len(),
+        2
+    );
+    let at = transforms_at(&a, &ModelName::source("Proto").entry("u"), 1.0);
     assert_eq!(at.len(), 1);
     assert!(at[0].determinant() != 0.0);
     assert!(at[0].inverse().is_finite());
@@ -5123,7 +5245,10 @@ fn samples_that_hold_still_stay_on_pages() {
     point3f[] positions.timeSamples = { 0: [(1, 0, 0)], 10: [(1, 0, 0)] }"#,
         ),
     );
-    assert_eq!(origins(&a, "u/Proto"), [[1000, 0, 0]]);
+    assert_eq!(
+        origins(&a, &ModelName::source("Proto").entry("u")),
+        [[1000, 0, 0]]
+    );
     let page = a
         .entries()
         .iter()
@@ -5171,7 +5296,8 @@ fn velocities_carry_positions_from_the_lower_sample() {
     vector3f[] angularVelocities.timeSamples = { 0: [(0, 0, 270)], 10: [(0, 0, 270)] }"#,
         ),
     );
-    let x = transforms_at(&spun, "u/Proto", 0.5)[0].transform_vector3(Vec3::X);
+    let x = transforms_at(&spun, &ModelName::source("Proto").entry("u"), 0.5)[0]
+        .transform_vector3(Vec3::X);
     let want = Vec3::new(135f32.to_radians().cos(), 135f32.to_radians().sin(), 0.0);
     assert!(x.abs_diff_eq(want, 1e-2), "{x}");
 }
@@ -5193,7 +5319,7 @@ fn a_rate_runs_through_samples_and_holds_the_rest() {
     float3[] scales.timeSamples = { 0: [(1, 1, 1)], 4: [(2, 2, 2)], 10: [(3, 3, 3)] }"#,
         ),
     );
-    let at = |t: f32| transforms_at(&a, "u/Proto", f64::from(t))[0];
+    let at = |t: f32| transforms_at(&a, &ModelName::source("Proto").entry("u"), f64::from(t))[0];
     for t in [0.2f32, 0.39, 0.4, 0.75] {
         let x = at(t).transform_point3(Vec3::ZERO).x;
         let want = t + t * t;
@@ -5286,10 +5412,19 @@ fn what_steps_changes_a_copy_at_its_sample() {
     );
     assert_copies(&b, 0.5, &[[0.0, 1.0, 0.0], [5.0, 1.0, 0.0]]);
     assert_copies(&b, 1.0, &[[5.0, 2.0, 0.0]]);
-    assert_eq!(copies_at(&b, "u/Other", 0.5), []);
-    assert_eq!(copies_at(&b, "u/Other", 1.5), [Vec3::new(0.0, 2.0, 0.0)]);
+    assert_eq!(
+        copies_at(&b, &ModelName::source("Other").entry("u"), 0.5),
+        []
+    );
+    assert_eq!(
+        copies_at(&b, &ModelName::source("Other").entry("u"), 1.5),
+        [Vec3::new(0.0, 2.0, 0.0)]
+    );
     assert_copies(&b, 2.5, &[]);
-    assert_eq!(copies_at(&b, "u/Other", 2.5), []);
+    assert_eq!(
+        copies_at(&b, &ModelName::source("Other").entry("u"), 2.5),
+        []
+    );
     assert_copies(&b, 3.0, &[[5.0, 2.0, 0.0], [7.0, 0.0, 0.0]]);
 }
 
@@ -5311,12 +5446,12 @@ fn moving_instances_hang_from_what_moves_them() {
     let stage = moving_crowd("/Mover/Crowd/Proto", &body)
         .replace("point3f[] positions = [(1, 0, 0), (5, 0, 0)]\n", "\n");
     let a = cook("instances-moving-hung", &stage);
-    let (skeleton, joint, _) = hung(&a, "u/Proto");
+    let (skeleton, joint, _) = hung(&a, &ModelName::source("Proto").entry("u"));
     assert_eq!(skeleton, AssetId::from_name("u/skeleton"));
     assert_eq!(joint, 1);
     // The rows stand in the joint's bind space: the joint adds what the prim above moved.
-    let (_, end) = posed(&a, "u", "xform", 1.0);
-    let at = transforms_at(&a, "u/Proto", 1.0);
+    let (_, end) = posed(&a, &ModelName::WHOLE, "xform", 1.0);
+    let at = transforms_at(&a, &ModelName::source("Proto").entry("u"), 1.0);
     let got = end[joint].transform_point3(at[0].transform_point3(Vec3::ZERO));
     assert!(got.abs_diff_eq(Vec3::new(1.0, 5.0, 0.0), 1e-3), "{got}");
 }
@@ -5344,7 +5479,7 @@ fn many_moving_copies_stay_records_of_one_model() {
         .iter()
         .filter(|e| e.class == Class::Model as u16);
     assert_eq!(models.count(), 2, "one per prototype");
-    let at = transforms_at(&a, "u/Proto", 0.5);
+    let at = transforms_at(&a, &ModelName::source("Proto").entry("u"), 0.5);
     assert_eq!(at.len(), n);
     let mut got: Vec<[i32; 3]> = at
         .iter()
@@ -5385,7 +5520,10 @@ fn a_bad_sample_loses_its_instances_there_and_nothing_else() {
         ),
         Subdivision::Hull,
     );
-    assert_eq!(origins(&still, "u/Proto"), Vec::<[i32; 3]>::new());
+    assert_eq!(
+        origins(&still, &ModelName::source("Proto").entry("u")),
+        Vec::<[i32; 3]>::new()
+    );
     assert!(warnings.iter().any(|w| w.contains("protoIndex 5")));
     let (spent, warnings) = cook_with_warnings(
         &d,
@@ -5409,7 +5547,10 @@ fn a_bad_sample_loses_its_instances_there_and_nothing_else() {
         ),
         Subdivision::Hull,
     );
-    assert_eq!(origins(&held, "u/Proto"), [[1000, 0, 0]]);
+    assert_eq!(
+        origins(&held, &ModelName::source("Proto").entry("u")),
+        [[1000, 0, 0]]
+    );
     assert!(warnings.iter().any(|w| w.contains("not finite")));
 }
 
@@ -5457,20 +5598,34 @@ fn a_baked_height_holds_under_a_moving_copy() {
         baking(),
     )
     .unwrap();
-    assert!((height(&a, "u/P/mesh") - 0.25).abs() < 1e-3);
-    assert!((height(&a, "u/P/baked/0/mesh") - 0.25).abs() < 1e-3);
-    let plain = transforms_at(&a, "u/P", 0.5);
-    let scaled = transforms_at(&a, "u/P/baked/0", 0.5);
+    assert!((height(&a, &ModelName::source("P").mesh("u")) - 0.25).abs() < 1e-3);
+    assert!(
+        (height(
+            &a,
+            &ModelName::source("P").with(Derived::Baked(0)).mesh("u")
+        ) - 0.25)
+            .abs()
+            < 1e-3
+    );
+    let plain = transforms_at(&a, &ModelName::source("P").entry("u"), 0.5);
+    let scaled = transforms_at(
+        &a,
+        &ModelName::source("P").with(Derived::Baked(0)).entry("u"),
+        0.5,
+    );
     assert_eq!((plain.len(), scaled.len()), (1, 1));
     let at = scaled[0].transform_point3(Vec3::ZERO);
     assert!(at.abs_diff_eq(Vec3::new(5.0, 1.0, 0.0), 1e-3), "{at}");
     let det = scaled[0].determinant();
     assert!((det - 1.0).abs() < 1e-3, "the rows stretch by {det}");
     // The stretch is in the mesh: a corner stands twice as far out.
-    let far = corners(&a, "u/P/baked/0/mesh")
-        .iter()
-        .map(|c| c.0.x)
-        .fold(f32::MIN, f32::max);
+    let far = corners(
+        &a,
+        &ModelName::source("P").with(Derived::Baked(0)).mesh("u"),
+    )
+    .iter()
+    .map(|c| c.0.x)
+    .fold(f32::MIN, f32::max);
     assert!((far - 2.0).abs() < 1e-3, "{far}");
 
     // A scale that steps at a sample stands in one mesh, then another.
@@ -5485,11 +5640,50 @@ fn a_baked_height_holds_under_a_moving_copy() {
         baking(),
     )
     .unwrap();
-    assert_eq!(transforms_at(&stepped, "u/P/baked/0", 0.5).len(), 1);
-    assert_eq!(transforms_at(&stepped, "u/P/baked/1", 0.5).len(), 0);
-    assert_eq!(transforms_at(&stepped, "u/P/baked/0", 1.5).len(), 0);
-    assert_eq!(transforms_at(&stepped, "u/P/baked/1", 1.5).len(), 1);
-    assert!((height(&stepped, "u/P/baked/1/mesh") - 0.25).abs() < 1e-3);
+    assert_eq!(
+        transforms_at(
+            &stepped,
+            &ModelName::source("P").with(Derived::Baked(0)).entry("u"),
+            0.5
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        transforms_at(
+            &stepped,
+            &ModelName::source("P").with(Derived::Baked(1)).entry("u"),
+            0.5
+        )
+        .len(),
+        0
+    );
+    assert_eq!(
+        transforms_at(
+            &stepped,
+            &ModelName::source("P").with(Derived::Baked(0)).entry("u"),
+            1.5
+        )
+        .len(),
+        0
+    );
+    assert_eq!(
+        transforms_at(
+            &stepped,
+            &ModelName::source("P").with(Derived::Baked(1)).entry("u"),
+            1.5
+        )
+        .len(),
+        1
+    );
+    assert!(
+        (height(
+            &stepped,
+            &ModelName::source("P").with(Derived::Baked(1)).mesh("u")
+        ) - 0.25)
+            .abs()
+            < 1e-3
+    );
 
     // A stretch above the instancer doesn't commute with a turn, so what holds it holds the turn
     // too, and the rows only carry the copy.
@@ -5510,8 +5704,19 @@ fn a_baked_height_holds_under_a_moving_copy() {
 {material}"#
     );
     let stretched = cook_at(&d, &under, baking()).unwrap();
-    assert!((height(&stretched, "u/P/baked/0/mesh") - 0.25).abs() < 1e-3);
-    let at = transforms_at(&stretched, "u/P/baked/0", 0.5);
+    assert!(
+        (height(
+            &stretched,
+            &ModelName::source("P").with(Derived::Baked(0)).mesh("u")
+        ) - 0.25)
+            .abs()
+            < 1e-3
+    );
+    let at = transforms_at(
+        &stretched,
+        &ModelName::source("P").with(Derived::Baked(0)).entry("u"),
+        0.5,
+    );
     let origin = at[0].transform_point3(Vec3::ZERO);
     assert!(
         origin.abs_diff_eq(Vec3::new(2.0, 1.0, 0.0), 1e-3),
@@ -5548,6 +5753,12 @@ fn a_baked_height_holds_under_a_moving_copy() {
     let told = |w: &&String| w.contains("/I") && w.contains("stretches");
     assert!(warnings.iter().any(told), "{warnings:?}");
     let a = Archive::from_memory(cooked.memory.remove(0)).unwrap();
-    assert_eq!(transforms_at(&a, "u/P", 0.5).len(), 1);
-    assert!(!has(&a, "u/P/baked/0/mesh"));
+    assert_eq!(
+        transforms_at(&a, &ModelName::source("P").entry("u"), 0.5).len(),
+        1
+    );
+    assert!(!has(
+        &a,
+        &ModelName::source("P").with(Derived::Baked(0)).mesh("u")
+    ));
 }

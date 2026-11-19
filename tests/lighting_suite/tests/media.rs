@@ -29,7 +29,7 @@ use orr_color::luminance;
 use orr_gpu::{Allocation, Hazards, KernelSet, Stages};
 use orr_lighting::path_may::{MAY_FROXELS, MAY_MEDIUM, MAY_VIEW};
 use orr_lighting::{
-    AERIAL_SIZE, DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, MediaSettings,
+    AERIAL_SIZE, DirectionalLight, DiscProfile, Light, LightingDebugView, MediaSettings,
     ReferenceSettings, ViewLighting,
 };
 use orr_math::{DVec3, Mat3, Quat, Vec2, Vec3};
@@ -427,14 +427,14 @@ fn unshadowed_directional_lights_each_light_the_fog() {
     );
 
     for k in 1..7 {
-        bed.set_light(LightId(k), None);
+        bed.set_light(k, None);
     }
     let shadowed = mean_luminance(&inscatter(&mut bed, false, media, 32));
     let share = (all - shadowed) / 6.0;
     assert!(share > 0.0, "the unshadowed lights add {share}");
     for k in 1..7 {
         for (j, l) in lights.iter().enumerate().skip(1) {
-            bed.set_light(LightId(j as u32), (j != k as usize).then_some(*l));
+            bed.set_light(j, (j != k).then_some(*l));
         }
         let without = mean_luminance(&inscatter(&mut bed, false, media, 32));
         let added = all - without;

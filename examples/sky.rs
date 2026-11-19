@@ -50,9 +50,6 @@ const FOV_Y: f32 = 0.8;
 const EYE: Vec3 = Vec3::new(0.0, 2.0, 12.0);
 const TARGET: Vec3 = Vec3::new(0.0, 5.0, 0.0);
 
-const SUN: LightId = LightId(0);
-const SECOND_SUN: LightId = LightId(1);
-const MOON: LightId = LightId(2);
 /// Degrees per second along the suns' arcs.
 const ARC_RATE: f64 = 0.5;
 /// The moon is drawn this many times its size, with its radiance kept, so it reads at any
@@ -74,9 +71,8 @@ fn dir(elevation: f64, azimuth: f64) -> Vec3 {
     )
 }
 
-/// The lights `degrees` along their arcs: a yellow sun, a dim red sun with a larger disc, and
-/// the moon, lit by both.
-fn lights(degrees: f64, moon_albedo: TextureIndex) -> [DirectionalLight; 3] {
+/// The suns `degrees` along their arcs: a yellow sun and a dim red sun with a larger disc.
+fn suns(degrees: f64) -> [DirectionalLight; 2] {
     let sun = solar_disc(dir(3.0 + 0.4 * degrees, -30.0 + degrees));
     let base = solar_disc(dir(8.0 - 0.1 * degrees, -8.0 + 0.5 * degrees));
     let second = DirectionalLight {
@@ -84,18 +80,17 @@ fn lights(degrees: f64, moon_albedo: TextureIndex) -> [DirectionalLight; 3] {
         angular_radius: 3.0 * base.angular_radius,
         ..base
     };
-    let moon = lunar_disc(
-        dir(28.0, 30.0),
-        moon_albedo,
-        Vec3::Y,
-        &[(SUN, &sun), (SECOND_SUN, &second)],
-    );
-    let moon = DirectionalLight {
+    [sun, second]
+}
+
+/// The moon, lit by `suns` at their ids.
+fn moon(suns: [(LightId, &DirectionalLight); 2], moon_albedo: TextureIndex) -> DirectionalLight {
+    let moon = lunar_disc(dir(28.0, 30.0), moon_albedo, Vec3::Y, &suns);
+    DirectionalLight {
         angular_radius: MOON_SCALE * LUNAR_ANGULAR_RADIUS,
         illuminance: moon.illuminance * MOON_SCALE * MOON_SCALE,
         ..moon
-    };
-    [sun, second, moon]
+    }
 }
 
 /// A small texture of the lunar disc's mean albedo.
@@ -168,7 +163,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         ..Atmosphere::earth(DVec3::ZERO, Vec3::Y)
     };
     let mut sky = AtmosphereState::new(gpu, &atmosphere, 0).expect("atmosphere");
-    sky.set_lights(&[SUN, SECOND_SUN, MOON]);
     let (_moon_texture, moon_albedo) = moon_texture(gpu);
 
     let scene = renderer
@@ -222,6 +216,15 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         })
         .expect("instances");
     }
+    let lit = suns(0.0);
+    let [sun, second] = lit.map(|l| w.add_light(&Light::Directional(l)).expect("sun"));
+    let lit_moon = moon([(sun, &lit[0]), (second, &lit[1])], moon_albedo);
+    let lights = [
+        sun,
+        second,
+        w.add_light(&Light::Directional(lit_moon)).expect("moon"),
+    ];
+    sky.set_lights(&lights);
     w.set_environment(sky.data());
     w.set_medium(sky.data());
     drop(w);
@@ -302,10 +305,10 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         {
             let mut w = f.scene(scene).expect("scene writer");
             w.set_focus(EYE.as_dvec3());
-            let lit = lights(degrees, moon_albedo);
-            for (id, light) in [SUN, SECOND_SUN, MOON].into_iter().zip(lit) {
-                w.set_light(id, Some(&Light::Directional(light)))
-                    .expect("light");
+            let [sun, second] = suns(degrees);
+            let lit_moon = moon([(lights[0], &sun), (lights[1], &second)], moon_albedo);
+            for (id, light) in lights.into_iter().zip([sun, second, lit_moon]) {
+                w.set_light(id, &Light::Directional(light)).expect("light");
             }
         }
         if i == 0 {

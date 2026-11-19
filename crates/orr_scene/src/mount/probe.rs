@@ -24,7 +24,7 @@ fn name(archive: &Archive, id: AssetId) -> Option<String> {
 }
 
 impl Mounts {
-    fn ready(&self) -> impl Iterator<Item = (MountId, &Resident)> {
+    pub(super) fn ready(&self) -> impl Iterator<Item = (MountId, &Resident)> {
         self.entries
             .iter()
             .enumerate()

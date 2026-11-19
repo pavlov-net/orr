@@ -22,6 +22,7 @@ use orr_cook::{
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{self, Cluster, MeshInfo, PageView};
 use orr_pack::model::ModelInfo;
+use orr_pack::names::{Derived, ModelBase, ModelName};
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, AssetId, Class, Target};
 
@@ -563,9 +564,9 @@ fn selected_models_join_on_one_grid() {
         ..Default::default()
     };
     let (a, _) = cook(&path, settings.clone()).unwrap();
-    for name in ["g/rock_a", "g/rock_b"] {
-        assert!(a.find(AssetId::from_name(name)).is_some());
-        let m = mesh_of(&a, &format!("{name}/mesh"), 0);
+    for model in ["rock_a", "rock_b"].map(ModelName::source) {
+        assert!(a.find(AssetId::from_name(&model.entry("g"))).is_some());
+        let m = mesh_of(&a, &model.mesh("g"), 0);
         // The slab alone needs 2^-10 m; the box takes it too.
         assert_eq!(m.info.header.position_exponent, -10);
     }
@@ -587,7 +588,13 @@ fn selected_models_join_on_one_grid() {
     )
     .unwrap();
     let k = |name: &str| mesh_of(&a, name, 0).info.header.position_exponent;
-    assert_eq!((k("g/rock_a/mesh"), k("g/rock_b/mesh")), (-11, -8));
+    assert_eq!(
+        (
+            k(&ModelName::source("rock_a").mesh("g")),
+            k(&ModelName::source("rock_b").mesh("g"))
+        ),
+        (-11, -8)
+    );
 
     for (ta, tb) in [
         (
@@ -1466,26 +1473,59 @@ fn meshes_layout_bakes_collapsed_nodes() {
         ..GltfSettings::default()
     };
     let (a, _) = cook(&path, settings).unwrap();
-    assert!(a.find(AssetId::from_name("g/mesh/0/mesh")).is_none());
-    let flat = mesh_of(&a, "g/mesh/0/baked/0/mesh", 0);
+    assert!(
+        a.find(AssetId::from_name(
+            &ModelName::new(ModelBase::Mesh(0)).mesh("g")
+        ))
+        .is_none()
+    );
+    let flat = mesh_of(
+        &a,
+        &ModelName::new(ModelBase::Mesh(0))
+            .with(Derived::Baked(0))
+            .mesh("g"),
+        0,
+    );
     assert_corners(&flat, [Vec3::ZERO, Vec3::X * 2.0, Vec3::Y * 2.0]);
     assert_normal(&flat, Vec3::NEG_Z);
-    let at = |model, t: Vec3| {
+    let at = |model: &str, t: Vec3| {
         let got = placements(&a, model);
         assert_eq!(got.len(), 1);
         let want = orr_math::Mat4::from_translation(t);
         assert!(got[0].abs_diff_eq(want, 0.01), "{model}: {:?}", got[0]);
     };
-    at("g/mesh/0/baked/0", Vec3::X);
-    let sheared = mesh_of(&a, "g/mesh/0/baked/1/mesh", 0);
+    at(
+        &ModelName::new(ModelBase::Mesh(0))
+            .with(Derived::Baked(0))
+            .entry("g"),
+        Vec3::X,
+    );
+    let sheared = mesh_of(
+        &a,
+        &ModelName::new(ModelBase::Mesh(0))
+            .with(Derived::Baked(1))
+            .mesh("g"),
+        0,
+    );
     assert_corners(&sheared, [Vec3::ZERO, Vec3::X, Vec3::new(1.0, 2.0, 0.0)]);
     assert_normal(&sheared, Vec3::NEG_Z);
-    at("g/mesh/0/baked/1", Vec3::Z * 3.0);
-    at("g/mesh/0/baked/2", Vec3::ZERO);
+    at(
+        &ModelName::new(ModelBase::Mesh(0))
+            .with(Derived::Baked(1))
+            .entry("g"),
+        Vec3::Z * 3.0,
+    );
+    at(
+        &ModelName::new(ModelBase::Mesh(0))
+            .with(Derived::Baked(2))
+            .entry("g"),
+        Vec3::ZERO,
+    );
 }
 
 /// A selected model is in its node's space, which its node's own transform and those above it
-/// do not enter, however they flatten.
+/// do not enter, however they flatten. Where they flatten it, a model baked beside it takes its
+/// one copy.
 #[test]
 fn a_selected_model_needs_no_inverse_of_its_node() {
     use orr_math::Vec3;
@@ -1504,10 +1544,24 @@ fn a_selected_model_needs_no_inverse_of_its_node() {
     };
     let (a, _) = cook(&path, settings).unwrap();
     let source = TRIANGLE.map(Vec3::from);
-    assert_corners(&mesh_of(&a, "g/under/mesh", 0), source);
-    let on = mesh_of(&a, "g/on/mesh", 0);
+    assert_corners(
+        &mesh_of(&a, &ModelName::source("under").mesh("g"), 0),
+        source,
+    );
+    let on = mesh_of(&a, &ModelName::source("on").mesh("g"), 0);
     assert_corners(&on, source);
     assert_corners(&on, source.map(|p| p * 3.0));
+    for node in ["under", "on"] {
+        let name = ModelName::source(node);
+        assert!(placements(&a, &name.entry("g")).is_empty(), "{node}");
+        let baked = name.with(Derived::Baked(0));
+        assert_eq!(placements(&a, &baked.entry("g")).len(), 1, "{node}");
+    }
+    let under = ModelName::source("under").with(Derived::Baked(0));
+    assert_corners(
+        &mesh_of(&a, &under.mesh("g"), 0),
+        source.map(|p| p * Vec3::new(2.0, 2.0, 0.0)),
+    );
 }
 
 /// Rigid meshes on a named joint and on an ancestor no skin names, both flattened at rest:
@@ -1619,7 +1673,8 @@ fn winding_and_normals_agree_on_flat_products() {
     };
     let (a, _) = cook(&path, settings).unwrap();
     for k in 0..count {
-        let c = mesh_of(&a, &format!("g/mesh/0/baked/{k}/mesh"), 0);
+        let model = ModelName::new(ModelBase::Mesh(0)).with(Derived::Baked(k as u32));
+        let c = mesh_of(&a, &model.mesh("g"), 0);
         let [p, q, r] = c.clusters[0].2[0].map(Vec3::from);
         let normal = Vec3::from(c.clusters[0].3[0]);
         assert!((q - p).cross(r - p).dot(normal) > 0.0, "product {k}");
@@ -1708,13 +1763,13 @@ fn gpu_instancing_becomes_instance_pages() {
     let (a, _) = cook(&path, GltfSettings::default()).unwrap();
 
     // The instanced node is a model in its mesh's space; the scene model keeps the rest.
-    let mesh = mesh_of(&a, "g/tree/mesh", 0);
+    let mesh = mesh_of(&a, &ModelName::source("tree").mesh("g"), 0);
     assert_eq!(mesh.info.header.bounds.max, [1.0, 0.0, 1.0]);
     assert_eq!(
         mesh_of(&a, "g/mesh", 0).info.header.bounds.max,
         [8.0, 0.0, 8.0]
     );
-    let model = AssetId::from_name("g/tree");
+    let model = AssetId::from_name(&ModelName::source("tree").entry("g"));
     let pages: Vec<&orr_pack::Entry> = a
         .entries()
         .iter()
@@ -1727,15 +1782,19 @@ fn gpu_instancing_becomes_instance_pages() {
         let blobs = a.blobs(e);
         let head = read(&a, &blobs[0]);
         let info = orr_pack::instance::InstancePageInfo::parse(&head).unwrap();
-        assert_eq!(info.prototypes[0].model, model);
+        assert!(info.prototypes.iter().any(|p| p.model == model));
         let bytes = read(&a, &blobs[1]);
         let (cell, records) = orr_pack::instance::decode(&head, &bytes).unwrap();
         let edge = 256.0;
-        for (_, m) in records {
+        for (p, m) in records {
+            if info.prototypes[usize::from(p)].model != model {
+                continue;
+            }
             let p = m.translation + orr_math::IVec3::from(cell).as_vec3() * edge;
             placed.push((p.to_array(), m.matrix3.x_axis.to_array()));
         }
     }
+    assert_eq!(placed.len(), instances.len());
     placed.sort_by(|a, b| a.0[0].total_cmp(&b.0[0]));
     for ((p, x), (t, r, s)) in placed.iter().zip(&instances) {
         let r = orr_math::Quat::from_array(*r);
@@ -1855,7 +1914,7 @@ fn meshes_layout_places_each_mesh_and_keeps_shears() {
         * orr_math::Mat4::from_quat(q);
     // A mirrored copy is placed as it is, not baked.
     close(
-        &placements(&a, "g/mesh/0"),
+        &placements(&a, &ModelName::new(ModelBase::Mesh(0)).entry("g")),
         &[
             t(orr_math::Vec3::new(5.0, 0.0, 0.0)),
             orr_math::Mat4::from_scale_rotation_translation(
@@ -1867,16 +1926,23 @@ fn meshes_layout_places_each_mesh_and_keeps_shears() {
     );
     // The sheared copy shares the model of the others.
     close(
-        &placements(&a, "g/mesh/1"),
+        &placements(&a, &ModelName::new(ModelBase::Mesh(1)).entry("g")),
         &[
             t(orr_math::Vec3::new(2.0, 3.0, 0.0)),
             t(orr_math::Vec3::new(0.0, 3.0, 7.0)),
             shear,
         ],
     );
-    assert!(a.find(AssetId::from_name("g/mesh/1/baked/0")).is_none());
+    assert!(
+        a.find(AssetId::from_name(
+            &ModelName::new(ModelBase::Mesh(1))
+                .with(Derived::Baked(0))
+                .entry("g")
+        ))
+        .is_none()
+    );
     // Sections in material order, with the second primitive's material first.
-    let plain = mesh_of(&a, "g/mesh/1/mesh", 0);
+    let plain = mesh_of(&a, &ModelName::new(ModelBase::Mesh(1)).mesh("g"), 0);
     assert_eq!(plain.info.sections.len(), 2);
     let tris = |s: u16| {
         plain
@@ -1892,7 +1958,7 @@ fn meshes_layout_places_each_mesh_and_keeps_shears() {
         ModelInfo::parse(&read(&a, &a.blobs(e)[0])).unwrap()
     };
     assert_eq!(
-        model("g/mesh/1").materials,
+        model(&ModelName::new(ModelBase::Mesh(1)).entry("g")).materials,
         [
             AssetId::from_name("g/material/0"),
             AssetId::from_name("g/material/1")
@@ -2179,7 +2245,13 @@ fn morph_targets_cook_at_each_nodes_default_weights() {
     };
     let (a, _) = cook(&path, settings).unwrap();
     let top = |name: &str| mesh_of(&a, name, 0).info.header.bounds.max[1];
-    assert_eq!((top("g/quad_a/mesh"), top("g/quad_b/mesh")), (1.0, 2.0));
+    assert_eq!(
+        (
+            top(&ModelName::source("quad_a").mesh("g")),
+            top(&ModelName::source("quad_b").mesh("g"))
+        ),
+        (1.0, 2.0)
+    );
 }
 
 #[test]

@@ -19,7 +19,7 @@ const VERSIONS: &[(Class, u32)] = &[
     (Class::Texture, 15),
     (Class::Material, 17),
     (Class::Model, 7),
-    (Class::InstancePage, 13),
+    (Class::InstancePage, 14),
     (Class::RasterSet, 4),
     (Class::Skeleton, 5),
     (Class::Clip, 6),
@@ -27,6 +27,7 @@ const VERSIONS: &[(Class, u32)] = &[
     (Class::Subd, 5),
     (Class::Volume, 2),
     (Class::TextureTiles, 1),
+    (Class::Layout, 3),
 ];
 
 /// Cook version of user classes, which the cook stores as given.

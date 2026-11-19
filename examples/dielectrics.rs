@@ -25,7 +25,7 @@ use orr::orr_pack::{AssetId, Target};
 use orr::{
     BoundTexture, ClusterTopology, DirectionalLight, DiscProfile, Display, DisplayRequest,
     FrameDesc, FrameTime, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light,
-    LightId, LitView, MaterialGpu, PackSource, ProducerId, Projection, ReferenceSettings, Renderer,
+    LitView, MaterialGpu, PackSource, ProducerId, Projection, ReferenceSettings, Renderer,
     RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
     TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
@@ -208,15 +208,12 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         Some(&pond.desc(&topology, &water_set, (group, models.len() as u32))),
     )
     .expect("pond");
-    w.set_light(
-        LightId(0),
-        Some(&Light::Directional(DirectionalLight {
-            direction_to_light: SUN,
-            illuminance: SUN_ILLUMINANCE,
-            angular_radius: 0.004_65,
-            disc: DiscProfile::LimbDarkened,
-        })),
-    )
+    w.add_light(&Light::Directional(DirectionalLight {
+        direction_to_light: SUN,
+        illuminance: SUN_ILLUMINANCE,
+        angular_radius: 0.004_65,
+        disc: DiscProfile::LimbDarkened,
+    }))
     .expect("sun");
     w.set_environment(environment.gpu());
     drop(w);

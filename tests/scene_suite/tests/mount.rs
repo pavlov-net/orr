@@ -20,6 +20,7 @@ use orr_pack::instance::InstancePageInfo;
 use orr_pack::material::{Material, TextureBinding, filter, slot, wrap};
 use orr_pack::mesh::{MeshInfo, decode_page, in_cut};
 use orr_pack::model::ModelInfo;
+use orr_pack::names::ModelName;
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, ArchiveWriter, AssetId, BlobIn, Class, Codec, Entry, Span, Target};
 use orr_scene::PageId;
@@ -214,6 +215,28 @@ fn write_pack(name: &str, bytes: &[u8]) -> PathBuf {
     let path = temp(name);
     std::fs::write(&path, bytes).unwrap();
     path
+}
+
+/// Runs one frame of scene `s` after `write` and waits for it: the scene's root.
+fn frame_with(
+    scenes: &mut Scenes,
+    s: SceneId,
+    write: impl FnOnce(&mut SceneWriter<'_>),
+) -> GpuPtr<SceneRoot> {
+    let mut f = scenes
+        .begin_frame(&FrameDesc {
+            time: FrameTime::default(),
+            scenes: &[s],
+            low_latency: None,
+        })
+        .unwrap();
+    write(&mut f.scene(s).unwrap());
+    let mut root = GpuPtr::NULL;
+    f.update_scenes(&mut |c| root = c.root).unwrap();
+    let point = f.end(&[]).unwrap();
+    let render = device().queue(QueueKind::Render).unwrap();
+    render.wait(point, Duration::from_secs(10)).unwrap();
+    root
 }
 
 fn frame(scenes: &mut Scenes) {
@@ -822,7 +845,7 @@ fn a_placement_past_the_devices_partitions_is_refused_and_leaves_the_scene_as_it
             cone: None,
         };
         let root = frame_with(&mut scenes, &mut |w| {
-            let r = w.set_light(LightId(2), Some(&lamp));
+            let r = w.add_light(&lamp);
             assert_matches!(r, Err(Error::Capacity { .. }));
             let untraced = ProducerDesc {
                 flags: InstanceFlags::RASTER,
@@ -845,9 +868,9 @@ fn a_placement_past_the_devices_partitions_is_refused_and_leaves_the_scene_as_it
             disc: DiscProfile::Uniform,
         });
         let root = frame_with(&mut scenes, &mut |w| {
-            w.set_light(LightId(2), Some(&sun)).unwrap();
+            assert_eq!(w.add_light(&sun).unwrap(), LightId(0));
         });
-        assert_eq!(root.light_capacity, 3);
+        assert_eq!(root.light_capacity, 1);
         let rt = scenes.stats().rt;
         assert_eq!((rt.partitions, rt.unplaced), (COPIES, 0));
     }
@@ -1001,7 +1024,7 @@ fn proxies_keep_their_instances_as_a_full_ptlas_trades_their_room() {
             w.set_producer(ProducerId(11), Some(&untraced)).unwrap();
             w.set_medium_proxy(MediumProxyId(0), Some(&proxy(0)))
                 .unwrap();
-            w.set_light(LightId(0), Some(&lamp(0))).unwrap();
+            assert_eq!(w.add_light(&lamp(0)).unwrap(), LightId(0));
             let r = w.set_medium_proxy(MediumProxyId(1), Some(&proxy(1)));
             assert_matches!(r, Err(Error::Capacity { .. }));
         });
@@ -1022,7 +1045,7 @@ fn proxies_keep_their_instances_as_a_full_ptlas_trades_their_room() {
         // A second light takes the instance the producers held in reserve: the medium proxy
         // and the first light each start one instance earlier.
         let mut root = frame_with(&mut scenes, &mut |w| {
-            w.set_light(LightId(1), Some(&lamp(1))).unwrap();
+            assert_eq!(w.add_light(&lamp(1)).unwrap(), LightId(1));
         });
         for _ in 0..2 {
             root = frame_with(&mut scenes, &mut |_| {});
@@ -1038,7 +1061,7 @@ fn proxies_keep_their_instances_as_a_full_ptlas_trades_their_room() {
         // The second light goes and a second medium proxy takes its instance: the first light
         // starts one instance later.
         frame_with(&mut scenes, &mut |w| {
-            w.set_light(LightId(1), None).unwrap();
+            w.remove_light(LightId(1)).unwrap();
         });
         let mut root = frame_with(&mut scenes, &mut |w| {
             w.set_medium_proxy(MediumProxyId(1), Some(&proxy(1)))
@@ -1395,25 +1418,9 @@ fn an_unmount_takes_copies_and_pages_of_its_models_from_a_scene_that_keeps_rende
     let panel = scenes.model(m, AssetId::from_name("kit/panel")).unwrap();
     let page = scenes.instance_page(p, page_id).unwrap();
 
-    let list = [s];
-    let desc = FrameDesc {
-        time: FrameTime::default(),
-        scenes: &list,
-        low_latency: None,
-    };
-    let frame_with = |scenes: &mut Scenes, write: &mut dyn FnMut(&mut SceneWriter<'_>)| {
-        let mut f = scenes.begin_frame(&desc).unwrap();
-        write(&mut f.scene(s).unwrap());
-        let mut root = GpuPtr::NULL;
-        f.update_scenes(&mut |c| root = c.root).unwrap();
-        let point = f.end(&[]).unwrap();
-        let render = device().queue(QueueKind::Render).unwrap();
-        render.wait(point, Duration::from_secs(10)).unwrap();
-        root
-    };
     let (mut copies, mut placed) = (None, None);
     let mut group = None;
-    let root = frame_with(&mut scenes, &mut |w| {
+    let root = frame_with(&mut scenes, s, |w| {
         let g = w
             .create_transform_group(&TransformGroupDesc {
                 count: 2,
@@ -1472,11 +1479,11 @@ fn an_unmount_takes_copies_and_pages_of_its_models_from_a_scene_that_keeps_rende
             start.elapsed() < Duration::from_secs(30),
             "the page's records never landed"
         );
-        frame_with(&mut scenes, &mut |_| {});
+        frame_with(&mut scenes, s, |_| {});
     }
     scenes.unmount(m);
     for _ in 0..3 {
-        frame_with(&mut scenes, &mut |_| {});
+        frame_with(&mut scenes, s, |_| {});
     }
     let (flags, entries) = state(&gpu);
     assert!(flags.iter().all(|&f| f == 0), "copies outlive their model");
@@ -1488,7 +1495,7 @@ fn an_unmount_takes_copies_and_pages_of_its_models_from_a_scene_that_keeps_rende
     let panel = scenes
         .model(again, AssetId::from_name("kit/panel"))
         .unwrap();
-    frame_with(&mut scenes, &mut |w| {
+    frame_with(&mut scenes, s, |w| {
         w.remove(copies);
         w.remove(placed);
         w.add_instances(&InstancesDesc {
@@ -1505,7 +1512,7 @@ fn an_unmount_takes_copies_and_pages_of_its_models_from_a_scene_that_keeps_rende
         })
         .unwrap();
     });
-    frame_with(&mut scenes, &mut |_| {});
+    frame_with(&mut scenes, s, |_| {});
     assert_eq!(state(&gpu).1, 2);
     assert_clean();
 }
@@ -4625,7 +4632,7 @@ fn finer_cached_cuts_build_once_wanted_lock_their_pages_and_leave_after_their_ho
         cuts.into_iter().filter(|c| c.blas != 0).collect()
     };
     let a = Archive::from_memory(Arc::clone(sheet_pack())).unwrap();
-    let me = entry(&a, AssetId::from_name(&format!("{SHEET}/mesh")));
+    let me = entry(&a, AssetId::from_name(&ModelName::WHOLE.mesh(SHEET)));
     let info = MeshInfo::parse(&blob(&a, me, 0)).unwrap();
     let mut records = Vec::new();
     for p in &info.pages {
@@ -6243,5 +6250,252 @@ fn with_neural_textures_off_textures_sample_their_bc_entries() {
             "the normal map reads its BC texels: {g:?} against {want:?}"
         );
     }
+    assert_clean();
+}
+
+/// A cooked layout's partitions place and remove their pages' copies one call each, and a
+/// layout of another mount places its lights and a decal whose material is the first mount's
+/// under ids the scene hands out after the consumer's. That mount going empties them, their ids
+/// held until the partition is removed; the first mount going empties the consumer's decal of
+/// its material.
+#[test]
+fn partitions_place_and_remove_their_content() {
+    use orr_pack::layout::{DecalSource, LayoutInfo, LightSource, Partition};
+    use orr_pack::names::{self, MaterialBase, MaterialName};
+    use orr_scene::{Decal, DecalChannels, DecalGpu, DecalId, LightGpu, PartitionRef};
+
+    let _serial = serial();
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("partitions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let stage = dir.join("stage.usda");
+    let tri = |name: &str, x: i32| {
+        format!(
+            r#"    def Mesh "{name}"
+    {{
+        int[] faceVertexCounts = [3]
+        int[] faceVertexIndices = [0, 1, 2]
+        point3f[] points = [({x}, 0, 0), ({x}, 1, 0), ({x}, 0, 1)]
+        uniform token subdivisionScheme = "none"
+    }}
+"#
+        )
+    };
+    let text = format!(
+        r#"#usda 1.0
+(
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{{
+{base}{night}}}
+
+def Scope "Night" (
+    prepend apiSchemas = ["CollectionAPI:members"]
+)
+{{
+    rel collection:members:includes = </World/Night>
+}}
+"#,
+        base = tri("Base", 1),
+        night = tri("Night", 2),
+    );
+    std::fs::write(&stage, text).unwrap();
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::Memory,
+            vec![AssetSpec {
+                name: "u".into(),
+                source: Source::Usd {
+                    path: stage,
+                    settings: orr_cook::UsdSettings {
+                        groups: vec![orr_cook::GroupSpec {
+                            prim: "/Night".into(),
+                            collection: "members".into(),
+                            attributes: Vec::new(),
+                        }],
+                        ..Default::default()
+                    },
+                },
+            }],
+        )],
+    };
+    let cooked = orr_cook::cook(&manifest, &Default::default())
+        .unwrap()
+        .memory;
+    let material = AssetId::from_name(&MaterialName::new(MaterialBase::Default).entry("u"));
+    let sphere = LightSource::Sphere {
+        position: DVec3::new(0.0, 3.0, 0.0),
+        radius: 0.25,
+        intensity: Vec3::splat(100.0),
+        cone: None,
+    };
+    let rect = LightSource::Rect {
+        center: DVec3::new(0.0, 4.0, 0.0),
+        edge_x: Vec3::X,
+        edge_y: Vec3::Z,
+        luminance: Vec3::splat(50.0),
+    };
+    let decal = DecalSource {
+        center: DVec3::ZERO,
+        rotation: Quat::IDENTITY,
+        half_extent: Vec3::ONE,
+        material,
+        channels: DecalChannels::BASE_COLOR.0,
+        opacity: 1.0,
+        fade_angles: [1.0, 1.5],
+        depth_fade: 0.0,
+        order: 0,
+    };
+    let lit = LayoutInfo {
+        groups: Vec::new(),
+        partitions: vec![Partition {
+            lights: vec![sphere, rect],
+            decals: vec![decal],
+            ..Partition::default()
+        }],
+    };
+    let mut w = ArchiveWriter::create(Target::Memory).unwrap();
+    let bytes = lit.to_bytes();
+    let blob = [BlobIn {
+        mount: true,
+        ..BlobIn::new(&bytes)
+    }];
+    let key = orr_pack::Hash32([0; 32]);
+    w.add(
+        "lit/layout",
+        Class::Layout as u16,
+        orr_pack::layout::SCHEMA,
+        key,
+        &blob,
+    )
+    .unwrap();
+    let lit_pack = w.finish().unwrap().unwrap();
+
+    let mut scenes = Scenes::new(device(), &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let s = scenes.create_scene(&SceneDesc::default()).unwrap();
+    let m = scenes.mount(PackSource::Memory(Arc::clone(&cooked[0])));
+    ready(&mut scenes, m);
+    let l = scenes.mount(PackSource::Memory(lit_pack));
+    ready(&mut scenes, l);
+    let layout = scenes
+        .layout(m, AssetId::from_name(&names::layout("u")))
+        .unwrap();
+    assert_eq!(layout.partitions.len(), 2);
+    let lit = scenes.layout(l, AssetId::from_name("lit/layout")).unwrap();
+    let decal_material = scenes.material(m, material).unwrap();
+
+    let place = |layout, partition| PartitionRef {
+        layout,
+        partition,
+        flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+        rt_range: 100.0,
+        animation_range: 0.0,
+        user_tag: 0,
+    };
+    let consumer = Light::Directional(DirectionalLight {
+        direction_to_light: Vec3::Y,
+        illuminance: Vec3::ONE,
+        angular_radius: 0.01,
+        disc: DiscProfile::Uniform,
+    });
+    let painted = Decal {
+        center: DVec3::new(0.0, 0.0, 2.0),
+        rotation: Quat::IDENTITY,
+        half_extent: Vec3::ONE,
+        material: decal_material,
+        channels: DecalChannels::BASE_COLOR,
+        opacity: 1.0,
+        fade_angles: [1.0, 1.5],
+        depth_fade: 0.0,
+        order: 0,
+    };
+    let mut placed = Vec::new();
+    let mut lit_id = None;
+    let root = frame_with(&mut scenes, s, |w| {
+        assert_eq!(w.add_light(&consumer).unwrap(), LightId(0));
+        assert_eq!(w.add_decal(&painted).unwrap(), DecalId(0));
+        for p in 0..layout.partitions.len() {
+            placed.push(w.add_partition(&place(&layout, p)).unwrap());
+        }
+        lit_id = Some(w.add_partition(&place(&lit, 0)).unwrap());
+        assert_matches!(
+            w.set_light(LightId(3), &consumer),
+            Err(Error::UnknownLight(LightId(3)))
+        );
+    });
+    let lit_id = lit_id.unwrap();
+    let gpu = Gpu(device());
+    let state = |gpu: &Gpu<'_>| {
+        let root: SceneRoot = gpu.value(root);
+        let instances: Vec<orr_scene::InstanceGpu> = gpu.values(root.instances, root.part_base);
+        let lights: Vec<LightGpu> = gpu.values(root.lights, root.light_capacity);
+        let decals: [DecalGpu; 2] = gpu.values(root.decals, 2).try_into().unwrap();
+        let copies = instances.iter().filter(|i| i.flags != 0).count();
+        let kinds: Vec<u32> = lights.iter().take(3).map(|l| l.kind).collect();
+        (copies, kinds, decals.map(|d| d.material))
+    };
+
+    // Each partition places its part of the stage once: two copies.
+    let start = Instant::now();
+    while state(&gpu).0 < 2 {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the partitions' records never landed"
+        );
+        frame_with(&mut scenes, s, |_| {});
+    }
+    let (copies, kinds, decals) = state(&gpu);
+    assert_eq!(copies, 2);
+    assert!(
+        kinds.iter().all(|&k| k != 0),
+        "the consumer's light and, past it, the partition's two: {kinds:?}"
+    );
+    assert_eq!(
+        decals, [decal_material.0; 2],
+        "the consumer's decal, then the partition's, whose material is the other mount's"
+    );
+
+    // A partition removed takes its copy with it.
+    frame_with(&mut scenes, s, |w| w.remove_partition(placed[1]).unwrap());
+    frame_with(&mut scenes, s, |_| {});
+    assert_eq!(state(&gpu).0, 1);
+
+    // The lit mount going empties its partition's lights and decal, whose ids the partition
+    // keeps; the consumer's stay.
+    scenes.unmount(l);
+    for _ in 0..3 {
+        frame_with(&mut scenes, s, |_| {});
+    }
+    let (_, kinds, decals) = state(&gpu);
+    assert_eq!(kinds[1..], [0, 0]);
+    assert_ne!(kinds[0], 0);
+    assert_eq!(decals, [decal_material.0, 0]);
+    frame_with(&mut scenes, s, |w| {
+        let next = w.add_light(&consumer).unwrap();
+        assert_eq!(next, LightId(3), "the emptied ids stay held");
+        w.remove_light(next).unwrap();
+        w.remove_partition(lit_id).unwrap();
+    });
+
+    // Removed, the partition frees its ids once its frame has completed, lowest first.
+    frame_with(&mut scenes, s, |_| {});
+    frame_with(&mut scenes, s, |w| {
+        assert_eq!(w.add_light(&consumer).unwrap(), LightId(1));
+    });
+
+    // The cooked mount going empties the consumer's decal of its material and the copy of
+    // its partition, which the consumer then removes.
+    scenes.unmount(m);
+    for _ in 0..3 {
+        frame_with(&mut scenes, s, |_| {});
+    }
+    let (copies, kinds, decals) = state(&gpu);
+    assert_eq!(copies, 0);
+    assert_eq!(decals, [0, 0]);
+    assert!(kinds[0] != 0 && kinds[1] != 0);
+    frame_with(&mut scenes, s, |w| w.remove_partition(placed[0]).unwrap());
     assert_clean();
 }

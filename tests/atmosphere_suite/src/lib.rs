@@ -34,6 +34,7 @@ use shaders::probe::{MODULE, Root};
 
 pub mod prague;
 
+/// The id a scene hands its first light.
 pub const SUN: LightId = LightId(0);
 
 /// The Earth defaults with its planet top at the origin.
@@ -81,6 +82,7 @@ pub struct Rig {
     pub fades: bool,
     frames: u32,
     frame_id: u64,
+    /// The ids of the last frame's lights.
     lights: Vec<LightId>,
 }
 
@@ -134,7 +136,9 @@ impl Rig {
     }
 
     /// One frame, 1/60 s after the previous one, with exactly `lights` in the light table and
-    /// the focus at `focus`; waits for it and returns the scene root.
+    /// the focus at `focus`; waits for it and returns the scene root. Lights not in the last
+    /// frame's table are added in the order listed, each with the id the scene hands it: the
+    /// lowest free one, as the tests' ids name.
     pub fn frame_lights(
         &mut self,
         lights: &[(LightId, DirectionalLight)],
@@ -156,13 +160,24 @@ impl Rig {
         self.frame_id = f.id();
         {
             let mut w = f.scene(self.scene).unwrap();
-            for id in self.lights.drain(..) {
-                w.set_light(id, None).unwrap();
+            for id in &self.lights {
+                if !lights.iter().any(|(l, _)| l == id) {
+                    w.remove_light(*id).unwrap();
+                }
             }
             for (id, l) in lights {
-                w.set_light(*id, Some(&Light::Directional(*l))).unwrap();
-                self.lights.push(*id);
+                let l = Light::Directional(*l);
+                if self.lights.contains(id) {
+                    w.set_light(*id, &l).unwrap();
+                } else {
+                    assert_eq!(
+                        w.add_light(&l).unwrap(),
+                        *id,
+                        "{id:?} is not the lowest free id"
+                    );
+                }
             }
+            self.lights = lights.iter().map(|(id, _)| *id).collect();
             w.set_focus(focus);
             w.set_environment(self.sky.data());
             w.set_medium(self.sky.data());

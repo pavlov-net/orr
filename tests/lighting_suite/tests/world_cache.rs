@@ -13,7 +13,7 @@ use lighting_suite::{TestScene, assert_clean, finish, pipeline, readback, render
 use orr_color::luminance;
 use orr_gpu::{ComputePipeline, GpuPtr, Hazards, KernelSet, Stages};
 use orr_lighting::{
-    DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, LightingStats, SceneLighting,
+    DirectionalLight, DiscProfile, Light, LightingDebugView, LightingStats, SceneLighting,
     SceneLightingSettings, ViewLighting, WorldCacheSettings,
 };
 use orr_math::{Mat3, Vec3};
@@ -474,9 +474,13 @@ fn sun(illuminance: f32) -> Light {
 fn cells_scale_down_with_the_global_light_and_not_up() {
     let mut cache = Cache::new(settings(6, 30));
     let key = key64(&spread_keys(&cache, 1)[0]);
-    let set =
-        |l: f32| move |w: &mut SceneWriter<'_>| w.set_light(LightId(0), Some(&sun(l))).unwrap();
-    cache.frame(set(100_000.0), &[(key, [8.0, 4.0, 2.0])]);
+    let mut id = None;
+    cache.frame(
+        |w| id = Some(w.add_light(&sun(100_000.0)).unwrap()),
+        &[(key, [8.0, 4.0, 2.0])],
+    );
+    let id = id.unwrap();
+    let set = |l: f32| move |w: &mut SceneWriter<'_>| w.set_light(id, &sun(l)).unwrap();
     let radiance = |cells: &[Cell]| cells.iter().find(|c| c.check != 0).unwrap().radiance;
     let before = radiance(&cache.frame(set(100_000.0), &[]));
     assert_eq!(cache.stats().world_cache.rescale, 1.0);
@@ -646,11 +650,8 @@ fn sunset(bed: &mut Bed, run: &Paths, start: u32, each: &mut dyn FnMut(&mut Bed,
     for i in 1..=steps {
         let t = i as f32 / steps as f32;
         let sun = 100_000.0 * 1e-6f32.powf(t);
-        bed.set_light(
-            LightId(0),
-            (i < steps).then(|| directional(SUN_DIRECTION, sun)),
-        );
-        bed.set_light(LightId(1), Some(directional(MOON_DIRECTION, MOON * t)));
+        bed.set_light(0, (i < steps).then(|| directional(SUN_DIRECTION, sun)));
+        bed.set_light(1, Some(directional(MOON_DIRECTION, MOON * t)));
         render_paths(bed, run, start + i, 1);
         each(bed, start + i);
     }

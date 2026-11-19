@@ -1175,13 +1175,6 @@ impl DenseVegetation {
             ..Atmosphere::earth(DVec3::new(0.0, AIR_FLOOR, 0.0), Vec3::Y)
         };
         let mut sky = AtmosphereState::new(gpu, &atmosphere, 0).expect("atmosphere");
-        // The suns come first, brightest first, so stopping at the limit keeps the lights the
-        // sky folds in.
-        let candidates: Vec<LightId> = (0..lights + textured)
-            .take(MAX_SKY_LIGHTS)
-            .map(LightId)
-            .collect();
-        sky.set_lights(&candidates);
         sky.skip_fades();
         let moon = renderer
             .texture(extras_mount, AssetId::from_name(MOON))
@@ -1399,17 +1392,16 @@ impl DenseVegetation {
                 .expect("particles");
             }
 
-            let sun = LightId(0);
-            for i in 0..lights {
-                let mut light = solar_disc(sun_direction(i));
-                light.illuminance /= (1 + i) as f32;
-                w.set_light(LightId(i), Some(&Light::Directional(light)))
-                    .expect("sun");
-            }
-            for i in 0..textured {
-                w.set_light(
-                    LightId(lights + i),
-                    Some(&Light::Directional(DirectionalLight {
+            let suns: Vec<LightId> = (0..lights)
+                .map(|i| {
+                    let mut light = solar_disc(sun_direction(i));
+                    light.illuminance /= (1 + i) as f32;
+                    w.add_light(&Light::Directional(light)).expect("sun")
+                })
+                .collect();
+            let moons: Vec<LightId> = (0..textured)
+                .map(|i| {
+                    w.add_light(&Light::Directional(DirectionalLight {
                         direction_to_light: moon_direction(i),
                         illuminance: MOON_ILLUMINANCE,
                         angular_radius: MOON_RADIUS,
@@ -1417,16 +1409,25 @@ impl DenseVegetation {
                             albedo: moon,
                             up: Vec3::Y,
                             lit_by: [
-                                if lights > 0 { sun } else { LightId::NONE },
+                                suns.first().copied().unwrap_or(LightId::NONE),
                                 LightId::NONE,
                                 LightId::NONE,
                                 LightId::NONE,
                             ],
                         },
-                    })),
-                )
-                .expect("moon");
-            }
+                    }))
+                    .expect("moon")
+                })
+                .collect();
+            // The suns come first, brightest first, so stopping at the limit keeps the lights
+            // the sky folds in.
+            let candidates: Vec<LightId> = suns
+                .iter()
+                .chain(&moons)
+                .take(MAX_SKY_LIGHTS)
+                .copied()
+                .collect();
+            sky.set_lights(&candidates);
             w.set_environment(sky.data());
             w.set_medium(sky.data());
         }

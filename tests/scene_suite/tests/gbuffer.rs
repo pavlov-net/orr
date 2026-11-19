@@ -35,6 +35,7 @@ use orr_pack::instance::{InstanceRecord, MOTION_WINDOW_BYTES, MotionRow};
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{Cluster, Group, MeshInfo, PageView, decode_page};
 use orr_pack::model::ModelInfo;
+use orr_pack::names::{MaterialName, ModelName};
 use orr_pack::skeleton::{SkeletonInfo, Trs};
 use orr_pack::{Archive, AssetId, Entry, Span, Target};
 use orr_scene::testing::{
@@ -43,7 +44,7 @@ use orr_scene::testing::{
 };
 use orr_scene::{
     AffineRows, BoundTexture, ClusterWork, CopyVariant, CutGpu, DebugLod, Decal, DecalChannels,
-    DecalGpu, DecalId, EditDesc, EditId, EditRef, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
+    DecalGpu, EditDesc, EditId, EditRef, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
     InstanceRange, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, MeshGpu, ModelGpu,
     ModelId, MountId, PackSource, Pose, Projection, RasterGpu, RasterView, RendererDesc,
     SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc,
@@ -1178,7 +1179,7 @@ fn cook() -> Arc<[u8]> {
                     PrototypeSpec {
                         model: "ball".into(),
                         sections: vec![SectionSpec {
-                            material: Some("plain/material/0".into()),
+                            material: Some(MaterialName::index(0).entry("plain")),
                             hidden: false,
                         }],
                         ..PrototypeSpec::default()
@@ -3422,7 +3423,8 @@ fn hit_contexts_report_the_kind_depth_and_cone_of_each_hit() {
     assert_clean();
 }
 
-/// Writes the decal test's two decals: a matte decal larger than a bin under a sticker.
+/// Writes the decal test's two decals: a matte decal larger than a bin under a sticker. The
+/// sticker is added first, so its lower id would put it under: only its order puts it on top.
 fn set_decals(s: &mut SceneWriter<'_>, matte: MaterialId, sticker: MaterialId, wall_z: f64) {
     let decal = |center: DVec3, half_extent: Vec3, rotation: Quat, material, channels| Decal {
         center,
@@ -3433,6 +3435,7 @@ fn set_decals(s: &mut SceneWriter<'_>, matte: MaterialId, sticker: MaterialId, w
         opacity: 1.0,
         fade_angles: [1.0, 1.4],
         depth_fade: 0.0,
+        order: 0,
     };
     let under = decal(
         DVec3::new(0.0, 2.0, wall_z),
@@ -3441,15 +3444,18 @@ fn set_decals(s: &mut SceneWriter<'_>, matte: MaterialId, sticker: MaterialId, w
         matte,
         DecalChannels::ROUGHNESS,
     );
-    let over = decal(
-        DVec3::new(0.4, 1.6, wall_z),
-        Vec3::new(1.2, 1.2, 0.25),
-        Quat::from_rotation_z(0.3),
-        sticker,
-        DecalChannels::BASE_COLOR | DecalChannels::ROUGHNESS,
-    );
-    s.set_decal(DecalId(0), Some(&under)).unwrap();
-    s.set_decal(DecalId(1), Some(&over)).unwrap();
+    let over = Decal {
+        order: 1,
+        ..decal(
+            DVec3::new(0.4, 1.6, wall_z),
+            Vec3::new(1.2, 1.2, 0.25),
+            Quat::from_rotation_z(0.3),
+            sticker,
+            DecalChannels::BASE_COLOR | DecalChannels::ROUGHNESS,
+        )
+    };
+    s.add_decal(&over).unwrap();
+    s.add_decal(&under).unwrap();
 }
 
 /// MikkTSpace's pixel transform, which bakers invert: each corner's normal and tangent placed
@@ -3560,7 +3566,10 @@ fn a_replaced_material_turns_its_normal_map_with_its_own_uv_set() {
     let mut w = World::new(&linked::KERNELS);
     let material = w
         .scenes
-        .material(w.mount, AssetId::from_name("tilted on uv1/material/0"))
+        .material(
+            w.mount,
+            AssetId::from_name(&MaterialName::index(0).entry("tilted on uv1")),
+        )
         .unwrap();
     let [x, y, z] = TILT;
     let item = Item {
@@ -3628,11 +3637,17 @@ fn normal_maps_turn_toward_the_image_up_on_meshes_and_decals() {
 
     let tilted = w
         .scenes
-        .material(w.mount, AssetId::from_name("tilted/material/0"))
+        .material(
+            w.mount,
+            AssetId::from_name(&MaterialName::index(0).entry("tilted")),
+        )
         .unwrap();
     let object = w
         .scenes
-        .material(w.mount, AssetId::from_name("tilted object/material/0"))
+        .material(
+            w.mount,
+            AssetId::from_name(&MaterialName::index(0).entry("tilted object")),
+        )
         .unwrap();
     let wall = Item {
         model: "plain",
@@ -3666,8 +3681,9 @@ fn normal_maps_turn_toward_the_image_up_on_meshes_and_decals() {
                 opacity: 1.0,
                 fade_angles: [2.5, 3.0],
                 depth_fade: 0.0,
+                order: 0,
             };
-            s.set_decal(DecalId(0), Some(&decal)).unwrap();
+            s.add_decal(&decal).unwrap();
         });
         assert!(tilted_pixels(&g, want, |n| n.z < 0.95) > 1000, "decal");
     }
@@ -3677,9 +3693,10 @@ fn normal_maps_turn_toward_the_image_up_on_meshes_and_decals() {
 fn a_decal_on_a_wall_matches_between_the_gbuffer_and_a_mirror_reflection() {
     let _serial = serial();
     let mut w = World::new(&linked::KERNELS);
+    let first = MaterialName::index(0);
     let material = |w: &World, name: &str| {
         w.scenes
-            .material(w.mount, AssetId::from_name(&format!("{name}/material/0")))
+            .material(w.mount, AssetId::from_name(&first.entry(name)))
             .unwrap()
     };
     let (matte, sticker) = (material(&w, "matte"), material(&w, "sticker"));
@@ -5422,7 +5439,7 @@ fn place_page(w: &mut World, asset: &str, x: f32) -> Placed {
     if hung {
         assert_eq!(
             header.frame_skeleton,
-            AssetId::from_name(&format!("{asset}/skeleton")),
+            AssetId::from_name(&ModelName::WHOLE.skeleton(asset)),
             "the page names its skeleton"
         );
     }
@@ -5610,12 +5627,12 @@ fn a_page_s_cooked_material_set_reaches_its_copies_while_the_material_set_tables
     let view = (DVec3::new(0.0, 1.5, 7.0), DVec3::new(0.0, 1.0, 0.0));
     let placed = place_page(&mut w, "dressed", 0.0);
     let away = page_named(&w, "dressed away");
-    let material = |name: &str| {
-        let id = AssetId::from_name(name);
+    let material = |asset: &str, i: u32| {
+        let id = AssetId::from_name(&MaterialName::index(i).entry(asset));
         w.scenes.material(w.mount, id).unwrap()
     };
-    let (coat, lamp) = (material("ball/material/0"), material("ball/material/1"));
-    let worn = material("plain/material/0");
+    let (coat, lamp) = (material("ball", 0), material("ball", 1));
+    let worn = material("plain", 0);
     let mut frame = 0;
     let mut next = |w: &mut World, write: &mut dyn FnMut(&mut SceneWriter<'_>)| {
         frame += 1;
@@ -9850,10 +9867,10 @@ fn worm_rig_of(name: &str) -> (SkeletonInfo, Clip) {
 fn rig_of(name: &str, clip: &str) -> (SkeletonInfo, Clip) {
     let a = Archive::from_memory(Arc::clone(pack())).unwrap();
     let skeleton = a
-        .find(AssetId::from_name(&format!("{name}/skeleton")))
+        .find(AssetId::from_name(&ModelName::WHOLE.skeleton(name)))
         .unwrap();
     let clip = a
-        .find(AssetId::from_name(&format!("{name}/clip/{clip}")))
+        .find(AssetId::from_name(&ModelName::WHOLE.clip(name, clip)))
         .unwrap();
     (
         SkeletonInfo::parse(&blob(&a, skeleton, 0)).unwrap(),
@@ -10793,7 +10810,7 @@ fn skinned_copies_on_a_page_pose_like_copies_placed_by_hand() {
     let hand = place_worms(&mut w, "worm", &by_hand, false);
     let want = shoot_worms(&mut w, &hand, &worm_shot(1), 0.7, 0.45);
     let crowd = place_crowd(&mut w);
-    let mesh = CpuMesh::of("crowd/body");
+    let mesh = CpuMesh::of(&ModelName::source("body").entry("crowd"));
     let start = Instant::now();
     let mut frame = 2;
     let g = loop {
@@ -10861,14 +10878,14 @@ fn shoot_gpu_worms(
         .scenes
         .skeleton(
             w.mount,
-            AssetId::from_name(&format!("{}/skeleton", worms.rig)),
+            AssetId::from_name(&ModelName::WHOLE.skeleton(&worms.rig)),
         )
         .unwrap();
     let clip = w
         .scenes
         .clip(
             w.mount,
-            AssetId::from_name(&format!("{}/clip/{}", worms.rig, worms.clip)),
+            AssetId::from_name(&ModelName::WHOLE.clip(&worms.rig, &worms.clip)),
         )
         .unwrap();
     assert_eq!(skeleton.joint_count, worms.joints);

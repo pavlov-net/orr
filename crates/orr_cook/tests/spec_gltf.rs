@@ -22,6 +22,7 @@ use orr_pack::clip::Clip;
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{self, MeshHeader, MeshInfo, PageView};
 use orr_pack::model::ModelInfo;
+use orr_pack::names::{Derived, MaterialBase, MaterialName, ModelBase, ModelName};
 use orr_pack::skeleton::{SkeletonInfo, Trs};
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, AssetId, Class, Target};
@@ -84,12 +85,12 @@ fn is_bound(m: &Material, s: usize) -> bool {
 }
 
 fn skeleton(a: &Archive) -> SkeletonInfo {
-    skeleton_of(a, "g")
+    skeleton_of(a, &ModelName::WHOLE)
 }
 
 /// The skeleton of model `model`.
-fn skeleton_of(a: &Archive, model: &str) -> SkeletonInfo {
-    let name = format!("{model}/skeleton");
+fn skeleton_of(a: &Archive, model: &ModelName) -> SkeletonInfo {
+    let name = model.skeleton("g");
     let e = a
         .find(AssetId::from_name(&name))
         .unwrap_or_else(|| panic!("no {name}"));
@@ -97,8 +98,8 @@ fn skeleton_of(a: &Archive, model: &str) -> SkeletonInfo {
 }
 
 /// Clip `name` of model `model`.
-fn clip_of(a: &Archive, model: &str, name: &str) -> Clip {
-    let name = format!("{model}/clip/{name}");
+fn clip_of(a: &Archive, model: &ModelName, name: &str) -> Clip {
+    let name = model.clip("g", name);
     let e = a
         .find(AssetId::from_name(&name))
         .unwrap_or_else(|| panic!("no {name}"));
@@ -468,7 +469,11 @@ fn strips_and_fans_are_the_spec_triangles() {
         assert_eq!(vertices(&cooked(&path).0, "g/mesh"), want, "{what}");
         if x_scale > 0.0 {
             let (a, _) = cook(&path, meshes_layout()).unwrap();
-            assert_eq!(vertices(&a, "g/mesh/0/mesh"), want, "{what}, meshes layout");
+            assert_eq!(
+                vertices(&a, &ModelName::new(ModelBase::Mesh(0)).mesh("g")),
+                want,
+                "{what}, meshes layout"
+            );
         }
     }
 }
@@ -507,11 +512,16 @@ fn primitives_without_a_surface_leave_the_rest_to_cook() {
         assert_eq!(warnings.len(), 2, "{what}: {warnings:?}");
         let (a, _) = cook(&path, meshes_layout()).unwrap();
         assert_eq!(
-            triangles(&a, "g/mesh/0/mesh").len(),
+            triangles(&a, &ModelName::new(ModelBase::Mesh(0)).mesh("g")).len(),
             2,
             "{what}, meshes layout"
         );
-        assert!(a.find(AssetId::from_name("g/mesh/1/mesh")).is_none());
+        assert!(
+            a.find(AssetId::from_name(
+                &ModelName::new(ModelBase::Mesh(1)).mesh("g")
+            ))
+            .is_none()
+        );
     }
 
     // A scene with nothing else still cooks, in both layouts, and says what it skipped.
@@ -712,7 +722,10 @@ fn unstated_tangents_are_the_published_mikktspace_ones() {
     let (a, _) = cook(&path, keeping_tangents(GltfLayout::Scene)).unwrap();
     assert_published(&corner_tangents(&a, "g/mesh"));
     let (a, _) = cook(&path, keeping_tangents(GltfLayout::Meshes)).unwrap();
-    assert_published(&corner_tangents(&a, "g/mesh/0/mesh"));
+    assert_published(&corner_tangents(
+        &a,
+        &ModelName::new(ModelBase::Mesh(0)).mesh("g"),
+    ));
 }
 
 /// L1821, on the texture coordinates "associated with the normal texture".
@@ -934,8 +947,15 @@ fn assemblies_keep_the_uv_set_a_material_reads() {
     });
     let (a, report) = cook(&path, settings).unwrap();
     assert!(report.assets[0].warnings.is_empty());
-    assert_published(&corner_tangents(&a, "g/mesh/0/mesh"));
-    let got = per_triangle(&a, "g/mesh/0/mesh", |view, c, t| view.uv(c, t[0], 1));
+    assert_published(&corner_tangents(
+        &a,
+        &ModelName::new(ModelBase::Mesh(0)).mesh("g"),
+    ));
+    let got = per_triangle(
+        &a,
+        &ModelName::new(ModelBase::Mesh(0)).mesh("g"),
+        |view, c, t| view.uv(c, t[0], 1),
+    );
     assert!(
         got.iter()
             .all(|u| uv.iter().any(|w| (u[0] - w[0]).abs() < 1e-3))
@@ -1378,12 +1398,17 @@ fn a_node_scales_a_baked_displacement_in_either_layout() {
     let scene = heights(&a, "g/mesh");
     assert!(scene.iter().all(|z| (z - 1.5).abs() < 1e-3), "{scene:?}");
     let (a, _) = cook(&path, baking(GltfLayout::Meshes, 2.0)).unwrap();
-    let own = heights(&a, "g/mesh/0/mesh");
+    let own = heights(&a, &ModelName::new(ModelBase::Mesh(0)).mesh("g"));
     assert!(own.iter().all(|z| (z - 0.5).abs() < 1e-3), "{own:?}");
 
     let path = displaced_quad("displaced-flat", [2.0, 1.0, 0.0], None);
     let (a, _) = cook(&path, baking(GltfLayout::Meshes, 2.0)).unwrap();
-    let flat = heights(&a, "g/mesh/0/baked/0/mesh");
+    let flat = heights(
+        &a,
+        &ModelName::new(ModelBase::Mesh(0))
+            .with(Derived::Baked(0))
+            .mesh("g"),
+    );
     assert!(flat.iter().all(|z| z.abs() < 1e-3), "{flat:?}");
 }
 
@@ -1638,11 +1663,11 @@ fn a_static_mesh_beside_a_skin_keeps_its_place() {
     assert_has(&still, Vec3::new(5.0, 2.0, 0.0));
     assert_eq!(still.len(), 1);
     assert!(a.find(AssetId::from_name("g/skeleton")).is_none());
-    let sk = skeleton_of(&a, "g/hip");
+    let sk = skeleton_of(&a, &ModelName::source("hip"));
     let mut pose = sk.rest.clone();
     pose[0].translation = [1.0, 0.0, 0.0];
     let posed = palette(&sk, &pose);
-    for (p, j) in skinned_corners_of(&a, "g/hip/mesh") {
+    for (p, j) in skinned_corners_of(&a, &ModelName::source("hip").mesh("g")) {
         let got = posed[j].transform_point3(p);
         assert!(near(got, p + Vec3::X), "{p} on joint {j} reaches {got}");
     }
@@ -1690,9 +1715,9 @@ fn an_animated_node_moves_its_subtree_as_rigid_parts() {
     assert!(a.find(AssetId::from_name("g/skeleton")).is_none());
     assert_eq!(triangles(&a, "g/mesh").len(), 1);
 
-    let sk = skeleton_of(&a, "g/spin");
+    let sk = skeleton_of(&a, &ModelName::source("spin"));
     assert_eq!(sk.names, ["", "spin", "arm"]);
-    let (info, corners) = part_corners(&a, "g/spin/mesh");
+    let (info, corners) = part_corners(&a, &ModelName::source("spin").mesh("g"));
     assert_eq!(info.header.attributes & MeshHeader::SKIN, 0);
     assert_eq!(
         info.parts.iter().map(|p| p.joint).collect::<Vec<_>>(),
@@ -1700,7 +1725,7 @@ fn an_animated_node_moves_its_subtree_as_rigid_parts() {
     );
     assert!(corners.iter().all(|c| c.0 != 0), "a triangle on part 0");
 
-    let clip = clip_of(&a, "g/spin", "go");
+    let clip = clip_of(&a, &ModelName::source("spin"), "go");
     // A joint with no clip channel holds still, and its rest pose places it.
     let rest = palette(&sk, &sk.rest);
     for (part, p) in &corners {
@@ -1734,7 +1759,10 @@ fn one_animation_keeps_time_across_skeletons() {
     let path = dir("animated-time").join("scene.glb");
     animated_scene(&path);
     let (a, _) = cooked(&path);
-    let (spin, far) = (clip_of(&a, "g/spin", "go"), clip_of(&a, "g/far", "go"));
+    let (spin, far) = (
+        clip_of(&a, &ModelName::source("spin"), "go"),
+        clip_of(&a, &ModelName::source("far"), "go"),
+    );
     assert!(
         (spin.header.duration - 3.0).abs() < 1e-5,
         "{:?}",
@@ -1742,7 +1770,7 @@ fn one_animation_keeps_time_across_skeletons() {
     );
     assert!((far.header.duration - 3.0).abs() < 1e-5, "{:?}", far.header);
     // `spin` keys from 1 s to 2 s of the animation's 0 to 3: still at 1 s, and home by 2 s.
-    let sk = skeleton_of(&a, "g/spin");
+    let sk = skeleton_of(&a, &ModelName::source("spin"));
     let x = |t: f32| posed_at(&sk, &spin, t)[1].translation.x;
     assert!(
         x(0.9).abs() < 1e-4 && (x(2.1) - 4.0).abs() < 1e-3,
@@ -1835,7 +1863,7 @@ fn rigid_skeletons_pass_the_joints_a_skin_can_name() {
     assert_eq!(sk.joint_count(), 301);
     let (_, corners) = part_corners(&a, "g/mesh");
     assert!(corners.iter().any(|c| c.0 == 300));
-    let end = posed_at(&sk, &clip_of(&a, "g", "go"), 1.0);
+    let end = posed_at(&sk, &clip_of(&a, &ModelName::WHOLE, "go"), 1.0);
     let (part, p) = corners.iter().find(|c| c.0 == 300).unwrap();
     let got = end[usize::from(*part)].transform_point3(*p);
     assert!(near(got, *p + Vec3::X * 300.0), "{p} reaches {got}");
@@ -1874,11 +1902,16 @@ fn a_selected_model_holds_a_skeleton_of_its_own() {
         ..GltfSettings::default()
     };
     let (a, _) = cook(&path, settings).unwrap();
-    assert!(a.find(AssetId::from_name("g/other/skeleton")).is_none());
-    let sk = skeleton_of(&a, "g/body");
+    assert!(
+        a.find(AssetId::from_name(
+            &ModelName::source("other").skeleton("g")
+        ))
+        .is_none()
+    );
+    let sk = skeleton_of(&a, &ModelName::source("body"));
     assert_eq!(sk.names, ["", "hip"]);
     let rest = palette(&sk, &sk.rest);
-    let corners = skinned_corners_of(&a, "g/body/mesh");
+    let corners = skinned_corners_of(&a, &ModelName::source("body").mesh("g"));
     let still = |p: Vec3| p.y >= 3.0 - 1e-4;
     for (p, j) in corners {
         let got = rest[j].transform_point3(p);
@@ -1916,10 +1949,10 @@ fn a_selected_node_can_be_a_joint_of_its_skin() {
         ..GltfSettings::default()
     };
     let (a, _) = cook(&path, settings).unwrap();
-    let sk = skeleton_of(&a, "g/body");
+    let sk = skeleton_of(&a, &ModelName::source("body"));
     assert_eq!(sk.names, ["body", "hip"]);
     let rest = palette(&sk, &sk.rest);
-    for (p, j) in skinned_corners_of(&a, "g/body/mesh") {
+    for (p, j) in skinned_corners_of(&a, &ModelName::source("body").mesh("g")) {
         let got = rest[j].transform_point3(p);
         assert!(near(got, p), "{p} on joint {j} reaches {got}");
     }
@@ -1944,7 +1977,7 @@ fn a_skin_of_joints_out_of_the_scene_does_not_cook() {
     assert!(e.to_string().contains("not in the scene"), "{e}");
 }
 
-/// A rig takes its first joint's name, unless that is the whole scene's mesh entry.
+/// A rig takes its first joint's name, even one that is the name of the whole scene's mesh entry.
 #[test]
 fn a_rig_named_mesh_leaves_the_scene_its_mesh() {
     let path = dir("rig-name").join("scene.glb");
@@ -1964,7 +1997,10 @@ fn a_rig_named_mesh_leaves_the_scene_its_mesh() {
     );
     let (a, _) = cooked(&path);
     assert_eq!(triangles(&a, "g/mesh").len(), 1);
-    assert_eq!(skeleton_of(&a, "g/node1").names, ["", "mesh"]);
+    assert_eq!(
+        skeleton_of(&a, &ModelName::source("mesh")).names,
+        ["", "mesh"]
+    );
 }
 
 /// `layout` on a skinned scene: the model-per-mesh layout places what stands still, and a skin
@@ -1989,16 +2025,27 @@ fn the_meshes_layout_keeps_what_moves_in_rigs() {
         ..GltfSettings::default()
     };
     let (a, _) = cook(&path, settings).unwrap();
-    assert!(a.find(AssetId::from_name("g/mesh/1")).is_some());
-    assert!(a.find(AssetId::from_name("g/mesh/0")).is_none());
-    assert_eq!(skeleton_of(&a, "g/hip").names, ["hip"]);
+    assert!(
+        a.find(AssetId::from_name(
+            &ModelName::new(ModelBase::Mesh(1)).entry("g")
+        ))
+        .is_some()
+    );
+    assert!(
+        a.find(AssetId::from_name(
+            &ModelName::new(ModelBase::Mesh(0)).entry("g")
+        ))
+        .is_none()
+    );
+    assert_eq!(skeleton_of(&a, &ModelName::source("hip")).names, ["hip"]);
 }
 
 /// `EXT_mesh_gpu_instancing`: an object space transform on the node's world transform, "with
 /// instance transformation applied first". Under an animated node the copies move with it, on a
 /// page hung from its joint. A skinned instanced node is a model placed per instance, posed by one
 /// skeleton, beside a skin of the scene; a scale of zero is no placement, and goes to a skeleton
-/// of its own while the mesh keeps its bind pose.
+/// of its own while the mesh keeps its bind pose. A selected node under an animated node hangs
+/// its one copy from the node's joint in the same way.
 #[test]
 fn instanced_nodes_move_with_rigs_and_skins() {
     let path = dir("instanced").join("scene.glb");
@@ -2026,13 +2073,13 @@ fn instanced_nodes_move_with_rigs_and_skins() {
         ),
     );
     let (a, _) = cooked(&path);
-    let sk = skeleton_of(&a, "g");
+    let sk = skeleton_of(&a, &ModelName::WHOLE);
     assert_eq!(sk.names, ["", "mover"]);
     assert!(
         a.find(AssetId::from_name("g/mesh")).is_none(),
         "nothing is baked"
     );
-    let end = posed_at(&sk, &clip_of(&a, "g", "go"), 1.0);
+    let end = posed_at(&sk, &clip_of(&a, &ModelName::WHOLE, "go"), 1.0);
     let page = a
         .entries()
         .iter()
@@ -2040,7 +2087,8 @@ fn instanced_nodes_move_with_rigs_and_skins() {
             e.class == Class::InstancePage as u16 && {
                 let head = read(&a, &a.blobs(e)[0]);
                 let info = orr_pack::instance::InstancePageInfo::parse(&head).unwrap();
-                info.prototypes[0].model == AssetId::from_name("g/copies")
+                info.prototypes[0].model
+                    == AssetId::from_name(&ModelName::source("copies").entry("g"))
             }
         })
         .expect("the copies' page");
@@ -2060,12 +2108,20 @@ fn instanced_nodes_move_with_rigs_and_skins() {
         "{top:?}"
     );
 
-    let crowd = skeleton_of(&a, "g/crowd");
+    let crowd = skeleton_of(&a, &ModelName::source("crowd"));
     assert_eq!(crowd.names, ["hip"]);
-    assert!(a.find(AssetId::from_name("g/crowd/clip/go")).is_none());
-    let flat = skeleton_of(&a, "g/crowd/baked/0");
+    assert!(
+        a.find(AssetId::from_name(
+            &ModelName::source("crowd").clip("g", "go")
+        ))
+        .is_none()
+    );
+    let flat = skeleton_of(&a, &ModelName::source("crowd").with(Derived::Baked(0)));
     assert_eq!(flat.root.matrix3.y_axis.y, 0.0);
-    let bind = skinned_corners_of(&a, "g/crowd/baked/0/mesh");
+    let bind = skinned_corners_of(
+        &a,
+        &ModelName::source("crowd").with(Derived::Baked(0)).mesh("g"),
+    );
     assert!(bind.iter().any(|c| c.0.y > 0.5), "{bind:?}");
     let pages = a
         .entries()
@@ -2076,6 +2132,76 @@ fn instanced_nodes_move_with_rigs_and_skins() {
         3,
         "each posed or hung model on pages of its own"
     );
+
+    // The joint's rest pose flattens it, so its bind pose is not its rest pose, and the selected
+    // node flattens itself too: its copy bakes in the joint's bind space, not the world's, and
+    // lands where the posed rig puts it.
+    let path = dir("instanced").join("selected.glb");
+    let mut g = Glb::default();
+    let pa = g.floats(&TRIANGLE, "VEC3");
+    let ta = g.floats(&[[0.0f32], [1.0]], "SCALAR");
+    let sa = g.floats(&[[2.0f32, 2.0, 0.0], [2.0, 2.0, 2.0]], "VEC3");
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],
+"nodes":[{{"name":"mover","scale":[2,2,0],"children":[1]}},
+{{"name":"flat","mesh":0,"translation":[0,1,0],"scale":[1,0,1]}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa}}}}}]}}],
+"animations":[{{"name":"go","samplers":[{{"input":{ta},"output":{sa}}}],
+"channels":[{{"sampler":0,"target":{{"node":0,"path":"scale"}}}}]}}]"#
+        ),
+    );
+    let settings = GltfSettings {
+        models: vec![NodeSelect {
+            node: "flat".into(),
+        }],
+        ..GltfSettings::default()
+    };
+    let (a, _) = cook(&path, settings).unwrap();
+    let baked = ModelName::source("flat").with(Derived::Baked(0));
+    let page = a
+        .entries()
+        .iter()
+        .find(|e| {
+            e.class == Class::InstancePage as u16 && {
+                let head = read(&a, &a.blobs(e)[0]);
+                let info = orr_pack::instance::InstancePageInfo::parse(&head).unwrap();
+                info.prototypes[0].model == AssetId::from_name(&baked.entry("g"))
+            }
+        })
+        .expect("the selected model's page");
+    let (head, body) = (read(&a, &a.blobs(page)[0]), read(&a, &a.blobs(page)[1]));
+    let header = orr_pack::instance::InstancePageInfo::parse(&head)
+        .unwrap()
+        .header;
+    let mover = ModelName::source("mover");
+    assert_eq!(
+        header.frame_skeleton,
+        AssetId::from_name(&mover.skeleton("g"))
+    );
+    let (cell, records) = orr_pack::instance::decode(&head, &body).unwrap();
+    let [(_, mut record)] = records.collect::<Vec<_>>()[..] else {
+        panic!("one copy");
+    };
+    record.translation += orr_math::IVec3::from(cell).as_vec3() * 256.0;
+    let record = Mat4::from(record);
+    let sk = skeleton_of(&a, &mover);
+    let corners = part_corners(&a, &baked.mesh("g")).1;
+    for (t, scale) in [(0.0, Vec3::new(2.0, 2.0, 0.0)), (1.0, Vec3::splat(2.0))] {
+        let joint = posed_at(&sk, &clip_of(&a, &mover, "go"), t)[header.frame_joint as usize];
+        let got: Vec<Vec3> = corners
+            .iter()
+            .map(|c| sk.origin.as_vec3() + joint.transform_point3(record.transform_point3(c.1)))
+            .collect();
+        for p in TRIANGLE.map(Vec3::from) {
+            let want = scale * (Vec3::Y + p * Vec3::new(1.0, 0.0, 1.0));
+            assert!(
+                got.iter().any(|&g| near(g, want)),
+                "{t}: {want} not among {got:?}"
+            );
+        }
+    }
 }
 
 /// glTF node names need not be unique, so a rig named after its top node leaves that node's copies
@@ -2102,8 +2228,16 @@ fn a_moving_instanced_node_shares_no_name_with_its_rig() {
         ),
     );
     let (a, _) = cooked(&path);
-    assert!(a.find(AssetId::from_name("g/mover/mesh")).is_some());
-    assert!(a.find(AssetId::from_name("g/node0/mesh")).is_some());
+    assert!(
+        a.find(AssetId::from_name(&ModelName::source("mover").mesh("g")))
+            .is_some()
+    );
+    assert!(
+        a.find(AssetId::from_name(
+            &ModelName::new(ModelBase::Node(0)).mesh("g")
+        ))
+        .is_some()
+    );
 }
 
 /// L895 asks a `matrix` to decompose, but a file that shears still states where its mesh stands:
@@ -2240,7 +2374,9 @@ fn skins_sharing_a_joint_keep_their_inverse_binds() {
     );
     let (a, _) = cooked(&path);
     let sk = skeleton(&a);
-    let e = a.find(AssetId::from_name("g/clip/walk")).unwrap();
+    let e = a
+        .find(AssetId::from_name(&ModelName::WHOLE.clip("g", "walk")))
+        .unwrap();
     let blobs = a.blobs(e);
     let clip = Clip::parse(&read(&a, &blobs[0]), &read(&a, &blobs[1])).unwrap();
     let mut pose = sk.rest.clone();
@@ -2478,7 +2614,10 @@ fn chained_decimal_translations_meet_the_join_grid() {
         ..GltfSettings::default()
     };
     let (a, _) = cook(&path, settings).unwrap();
-    assert!(a.find(AssetId::from_name("g/tile/mesh")).is_some());
+    assert!(
+        a.find(AssetId::from_name(&ModelName::source("tile").mesh("g")))
+            .is_some()
+    );
 }
 
 /// Only a surface takes a skin: a skinned mesh of lines leaves the meshes layout open, and asks
@@ -2504,7 +2643,10 @@ fn a_skin_without_a_surface_binds_nothing() {
     assert!(a.find(AssetId::from_name("g/skeleton")).is_none());
     assert_eq!(triangles(&a, "g/mesh").len(), 2);
     let (a, _) = cook(&path, meshes_layout()).unwrap();
-    assert_eq!(triangles(&a, "g/mesh/1/mesh").len(), 2);
+    assert_eq!(
+        triangles(&a, &ModelName::new(ModelBase::Mesh(1)).mesh("g")).len(),
+        2
+    );
 }
 
 /// A joint's rotation without length reads as no rotation, as it does in the node's transform.
@@ -2676,7 +2818,7 @@ fn a_rig_under_a_mirror_winds_as_a_static_mesh_and_poses_unmirrored() {
     );
     let (a, _) = cooked(&path);
     let sk = skeleton(&a);
-    let clip = clip_of(&a, "g", "go");
+    let clip = clip_of(&a, &ModelName::WHOLE, "go");
     for posed in [palette(&sk, &sk.rest), posed_at(&sk, &clip, 1.0)] {
         for p in &posed {
             assert!(
@@ -2734,18 +2876,72 @@ fn a_joined_rig_keeps_to_a_grid_coarser_than_a_meter() {
         ..GltfSettings::default()
     };
     let (a, _) = cook(&path, settings).unwrap();
-    let sk = skeleton_of(&a, "g/tile");
+    let sk = skeleton_of(&a, &ModelName::source("tile"));
     let on_grid = |x: f32| x / 2.0 == (x / 2.0).round();
     assert!(
         sk.origin.to_array().iter().all(|&x| on_grid(x as f32)),
         "{}",
         sk.origin
     );
-    let (_, corners) = part_corners(&a, "g/tile/mesh");
+    let (_, corners) = part_corners(&a, &ModelName::source("tile").mesh("g"));
     for (_, p) in corners {
         assert!(
             p.to_array().into_iter().all(on_grid),
             "a vertex off the grid: {p}"
         );
+    }
+}
+
+/// Node and animation names are free-form strings: names that join to another entry's name
+/// (a model `a/mesh` beside model `a`'s mesh, a model `material/0` beside glTF material 0, clip
+/// `x/clip/c` of model `a` beside clip `c` of model `a/clip/x`) still cook to entries of their own.
+#[test]
+fn free_form_names_cook_to_distinct_entries() {
+    let path = dir("free-form-names").join("scene.glb");
+    let mut g = Glb::default();
+    let pa = g.floats(&TRIANGLE, "VEC3");
+    let ta = g.floats(&[[0.0f32], [1.0]], "SCALAR");
+    let va = g.floats(&[[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0]], "VEC3");
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,2,4,5]}}],
+"nodes":[{{"name":"a","children":[1]}},{{"name":"arm","mesh":0}},
+{{"name":"a/clip/x","children":[3]}},{{"name":"leg","mesh":0}},
+{{"name":"a/mesh","mesh":0}},{{"name":"material/0","mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa}}},"material":0}}]}}],
+"materials":[{{}}],
+"animations":[{{"name":"x/clip/c","samplers":[{{"input":{ta},"output":{va}}}],
+"channels":[{{"sampler":0,"target":{{"node":1,"path":"translation"}}}}]}},
+{{"name":"c","samplers":[{{"input":{ta},"output":{va}}}],
+"channels":[{{"sampler":0,"target":{{"node":3,"path":"translation"}}}}]}}]"#
+        ),
+    );
+    let settings = GltfSettings {
+        models: vec![NodeSelect { node: "a".into() }],
+        ..GltfSettings::default()
+    };
+    let (a, _) = cook(&path, settings).unwrap();
+    let [model, clipped, meshed, material] =
+        ["a", "a/clip/x", "a/mesh", "material/0"].map(ModelName::source);
+    let want = [
+        (model.entry("g"), Class::Model),
+        (model.mesh("g"), Class::Mesh),
+        (model.clip("g", "x/clip/c"), Class::Clip),
+        (clipped.entry("g"), Class::Model),
+        (clipped.clip("g", "c"), Class::Clip),
+        (meshed.entry("g"), Class::Model),
+        (meshed.mesh("g"), Class::Mesh),
+        (material.entry("g"), Class::Model),
+        (
+            MaterialName::new(MaterialBase::Index(0)).entry("g"),
+            Class::Material,
+        ),
+    ];
+    for (name, class) in want {
+        let e = a
+            .find(AssetId::from_name(&name))
+            .unwrap_or_else(|| panic!("no {name}"));
+        assert_eq!(e.class, class as u16, "{name}");
     }
 }

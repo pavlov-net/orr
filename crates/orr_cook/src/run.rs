@@ -25,10 +25,12 @@ use std::thread::Scope;
 use std::time::Instant;
 
 use ctt::Quality;
-use orr_math::{DVec3, Vec2, Vec3, Vec4};
+use orr_math::{DVec3, Mat3, Vec2, Vec3, Vec4};
 
+use orr_pack::layout::{self, LayoutInfo};
 use orr_pack::material::{Material, slot};
 use orr_pack::model::{ModelHeader, ModelInfo};
+use orr_pack::names::{self, Derived, MaterialName, ModelName, Variant};
 use orr_pack::texture::TextureInfo;
 use orr_pack::tiles::TextureTiles;
 use orr_pack::{
@@ -38,7 +40,7 @@ use orr_pack::{
 use crate::assembly::{self, Assembly};
 use crate::cache::Cache;
 use crate::decoded::Decoded;
-use crate::import::{PlacedModel, Scene};
+use crate::import::{Placed, PlacedModel, Scene};
 use crate::instances::{self, Catalog, ModelFacts, PageFrame};
 use crate::key::{self, Key};
 use crate::mesh::maps::{
@@ -65,8 +67,8 @@ use crate::texture::neural::{self, NeuralJob};
 use crate::texture::{self, Img, Wrap};
 use crate::volume::{self, VolumeReport};
 use crate::{
-    CookOptions, Cooked, Error, GltfSettings, Instances, Linear, Manifest, MeshSettings, Placement,
-    PrototypeSpec, Result, Source, TextureSettings, UsdSettings, mount,
+    AssetSpec, CookOptions, Cooked, Error, GltfSettings, Instances, Linear, Manifest, MeshSettings,
+    Placement, PrototypeSpec, Result, Source, TextureSettings, UsdSettings, mount,
 };
 
 /// Each of the [`DECODED_CACHES`] caches of decoded data holds up to this part of the working
@@ -601,7 +603,7 @@ impl<'m, 's> Run<'m, 's> {
         &mut self,
         a: usize,
         index: usize,
-        asset: &'m crate::AssetSpec,
+        asset: &'m AssetSpec,
         previous: &HashMap<Hash32, Record>,
     ) -> Result<()> {
         let name = asset.name.as_str();
@@ -821,9 +823,9 @@ impl<'m, 's> Run<'m, 's> {
                 let e = &arc.entries()[entries[0]];
                 (arc.name(e).to_owned(), e.class)
             })?;
-            // Instance pages are named `<source>/<cell>/<page>`; the unit is the source.
+            // The unit of an instance page is its source.
             if class == Class::InstancePage as u16
-                && let Some(source) = name.rsplitn(3, '/').nth(2)
+                && let Some((source, ..)) = names::parse_page(&name)
             {
                 name = source.to_owned();
             }
@@ -901,7 +903,9 @@ impl<'m, 's> Run<'m, 's> {
         let (entries, mesh, origin, texture) = self.with_archive(a, &from, |arc| {
             let mut entries = entries.unwrap_or_else(|| (0..arc.entries().len()).collect());
             if class == Class::InstancePage as u16 {
-                entries.sort_by_key(|&e| instances::page_order(&name, arc.name(&arc.entries()[e])));
+                entries.sort_by_cached_key(|&e| {
+                    instances::page_order(&name, arc.name(&arc.entries()[e]))
+                });
             }
             let e = &arc.entries()[entries[0]];
             let mesh = match Class::from_u16(class) {
@@ -1110,17 +1114,14 @@ impl<'m, 's> Run<'m, 's> {
             assemblies: imported.assemblies,
             warnings: imported.warnings,
         });
+        let record = (a, self.records[a].len() - 1);
         for (k, src) in imported.instances.into_iter().enumerate() {
-            let base = format!("{}/instances", self.assets[asset].name);
             self.instances.push(PendingInstances {
                 archive: a,
                 asset,
-                name: match k {
-                    0 => base,
-                    k => format!("{base}/{k}"),
-                },
+                name: names::instances(&self.assets[asset].name, k),
                 src: Cow::Owned(src),
-                record: Some((a, self.records[a].len() - 1)),
+                record: Some(record),
             });
         }
     }
@@ -1143,7 +1144,7 @@ impl<'m, 's> Run<'m, 's> {
         let mut first_library: HashMap<AssetId, (usize, Material)> = HashMap::new();
         for p in &meshes {
             for (i, m) in p.materials.iter().enumerate() {
-                let id = AssetId::from_name(&format!("{}/material/{i}", p.name));
+                let id = AssetId::from_name(&MaterialName::index(i as u32).entry(p.name));
                 library.insert((p.archive, id), *m);
                 let first = first_library.entry(id).or_insert((p.archive, *m));
                 if p.archive < first.0 {
@@ -2033,7 +2034,7 @@ fn assembly_report(a: &Assembly, entries: &[report::EntryReport]) -> AssemblyRep
         copies[p.unit as usize] += 1;
     }
     for (unit, copies) in a.units.iter().zip(copies) {
-        let mesh = format!("{}/mesh", unit.model);
+        let mesh = names::mesh(&unit.model);
         let stored = entries
             .iter()
             .find(|e| e.name == mesh)
@@ -2140,15 +2141,6 @@ fn import(name: &str, path: &Path, kind: ImportKind<'_>, shared: &Shared) -> Res
     plan_scene(name, scene, rules, memo, shared.quality)
 }
 
-/// The entry name of material `suffix` of asset `name`.
-fn material_name(name: &str, suffix: &str) -> String {
-    if suffix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{name}/material/{suffix}")
-    }
-}
-
 /// Plans an imported scene's units: the skeletons and clips, the packed textures, the
 /// materials, and a mesh and a model per model.
 fn plan_scene(
@@ -2164,11 +2156,7 @@ fn plan_scene(
     src.snap_rigs();
     let reaches = src.reaches();
     for (sk, reach) in std::mem::take(&mut src.skeletons).into_iter().zip(reaches) {
-        let prefix = match sk.prefix.as_str() {
-            "" => name.to_string(),
-            p => format!("{name}/{p}"),
-        };
-        let skeleton_name = format!("{prefix}/skeleton");
+        let skeleton_name = sk.model.skeleton(name);
         let bytes = sk.info.to_bytes();
         let key = Key::new(Class::Skeleton, &skeleton_name)
             .bytes(&bytes)
@@ -2186,7 +2174,7 @@ fn plan_scene(
         for (clip_name, source) in sk.clips {
             let mut clip = crate::skin::resample(&sk.info, &source, &reach, &src.clips);
             clip.header.skeleton = skeleton.0;
-            let clip_name = format!("{prefix}/clip/{clip_name}");
+            let clip_name = sk.model.clip(name, &clip_name);
             let (head, samples) = clip.to_bytes();
             let key = Key::new(Class::Clip, &clip_name)
                 .bytes(&head)
@@ -2320,13 +2308,13 @@ fn plan_scene(
             |r| packer.color_peak(r),
             |r| packer.input_range(r),
         );
-        warnings.extend(dropped.map(|d| format!("material {}: {d}", m.suffix)));
-        packer.material(&m.suffix, &mut cooked, &textures)?;
+        let entry = m.name.entry(name);
+        warnings.extend(dropped.map(|d| format!("material {entry}: {d}")));
+        packer.material(&m.name, &mut cooked, &textures)?;
         if let Some(back) = m.back {
-            let back = material_name(name, &src.materials[back].suffix);
-            cooked.back = AssetId::from_name(&back);
+            cooked.back = AssetId::from_name(&src.materials[back].name.entry(name));
         }
-        let unit = material_unit(material_name(name, &m.suffix), &cooked);
+        let unit = material_unit(entry, &cooked);
         materials.push((AssetId::from_name(&unit.name), unit.key, cooked));
         units.push(unit);
     }
@@ -2375,11 +2363,15 @@ fn plan_scene(
     // geometry holds.
     let mut baked: HashMap<usize, (AssetId, Hash32)> = HashMap::new();
     let mut assemblies = Vec::new();
+    let mut posed = vec![Vec::new(); src.partitions.len()];
+    // Copies of these take palettes or part poses from their consumer.
+    let skeletal: HashSet<ModelName> = src
+        .models
+        .iter()
+        .filter(|m| m.skeleton.is_some())
+        .map(|m| m.name.clone())
+        .collect();
     for model in src.models {
-        let model_name = match &model.node {
-            None => name.to_string(),
-            Some(n) => format!("{name}/{n}"),
-        };
         let mut mesh = model.mesh;
         let mut deps = Vec::new();
         let mut model_materials = Vec::with_capacity(model.materials.len());
@@ -2391,8 +2383,8 @@ fn plan_scene(
             deps.extend(sec.maps.units().map(str::to_string));
             model_materials.push(if bakes_displacement(&model.settings, &sec.maps) {
                 *baked.entry(mi).or_insert_with(|| {
-                    let suffix = &src.materials[mi].suffix;
-                    let unit = static_material_unit(&material_name(name, suffix), &materials[mi].2);
+                    let unbaked = src.materials[mi].name.with(Variant::Static).entry(name);
+                    let unit = static_material_unit(unbaked, &materials[mi].2);
                     let id = (AssetId::from_name(&unit.name), unit.key);
                     units.push(unit);
                     id
@@ -2407,7 +2399,7 @@ fn plan_scene(
             .skeleton
             .map_or((AssetId::NONE, None), |s| skeletons[s]);
         let mesh = (!mesh.sections().is_empty()).then(|| MeshPart {
-            name: format!("{model_name}/mesh"),
+            name: model.name.mesh(name),
             mesh,
             settings: model.settings,
             deps,
@@ -2419,28 +2411,84 @@ fn plan_scene(
                     .map(|&mi| (materials[mi].0, materials[mi].1)),
             );
             SubdPart {
-                name: format!("{model_name}/subd"),
+                name: model.name.subd(name),
                 cage: c.cage,
                 materials: c.materials.iter().map(|&mi| materials[mi].2).collect(),
                 settings: c.settings,
             }
         });
-        let (model, assembly) = model_units(model_name, mesh, subd, &model_materials, skeleton)?;
-        units.extend(model);
+        let (model_unit, assembly) =
+            model_units(name, &model.name, mesh, subd, &model_materials, skeleton)?;
+        // A model in scene space that no instancer places, such as a partition's part of the
+        // scene, stands once at the origin, on its partition's pages, which place its assembly's
+        // units with it; with a skeleton, its consumer poses it.
+        if let Some(p) = model.partition
+            && model_unit.iter().any(|u| u.class == Class::Model as u16)
+        {
+            match model.skeleton {
+                None => src.instances.push(PlacedModel {
+                    model: model.name.clone(),
+                    placed: vec![Placed {
+                        position: DVec3::ZERO,
+                        linear: Mat3::IDENTITY,
+                    }],
+                    frame: None,
+                    alone: false,
+                    motion: None,
+                    partition: p,
+                }),
+                Some(_) => posed[p].push(AssetId::from_name(&model.name.entry(name))),
+            }
+        }
+        units.extend(model_unit);
         assemblies.extend(assembly);
     }
-    let (alone, shared): (Vec<_>, Vec<_>) = src.instances.iter().partition(|m| m.alone);
-    let mut instances = scene_instances(name, &shared);
-    for m in alone {
-        let mut pages = scene_instances(name, &[m]);
-        for src in &mut pages {
-            src.frame = m.frame.map(|(skeleton, joint)| PageFrame {
-                skeleton: skeleton_names[skeleton].clone(),
-                joint: u32::from(joint),
-            });
-            src.motion.clone_from(&m.motion);
-        }
-        instances.extend(pages);
+    let mut placed: Vec<Vec<&PlacedModel>> = vec![Vec::new(); src.partitions.len()];
+    for m in &src.instances {
+        placed[m.partition].push(m);
+    }
+    let mut instances = Vec::new();
+    let mut partitions = Vec::with_capacity(src.partitions.len());
+    for ((groups, models), posed) in src.partitions.into_iter().zip(placed).zip(posed) {
+        let first = instances.len();
+        let (alone, shared): (Vec<_>, Vec<_>) = models.into_iter().partition(|m| m.alone);
+        // Pages of a model with a skeleton or that hang from a joint are the consumer's to place.
+        let (posed_alone, plain): (Vec<_>, Vec<_>) = alone
+            .into_iter()
+            .partition(|m| m.frame.is_some() || skeletal.contains(&m.model));
+        let alone_pages = |m: &PlacedModel| {
+            let mut pages = scene_instances(name, &[m]);
+            for src in &mut pages {
+                src.frame = m.frame.map(|(skeleton, joint)| PageFrame {
+                    skeleton: skeleton_names[skeleton].clone(),
+                    joint: u32::from(joint),
+                });
+                src.motion.clone_from(&m.motion);
+            }
+            pages
+        };
+        instances.extend(scene_instances(name, &shared));
+        instances.extend(plain.into_iter().flat_map(alone_pages));
+        let plain_end = instances.len();
+        instances.extend(posed_alone.into_iter().flat_map(alone_pages));
+        let ids = |k: std::ops::Range<usize>| {
+            k.map(|k| AssetId::from_name(&names::instances(name, k)))
+                .collect()
+        };
+        partitions.push(layout::Partition {
+            groups,
+            sources: ids(first..plain_end),
+            posed_sources: ids(plain_end..instances.len()),
+            posed,
+            ..layout::Partition::default()
+        });
+    }
+    if !partitions.is_empty() {
+        let info = LayoutInfo {
+            groups: src.groups,
+            partitions,
+        };
+        units.push(layout_unit(names::layout(name), &info));
     }
     let images = Arc::new(src.images);
     for job in jobs {
@@ -2464,6 +2512,18 @@ fn plan_scene(
     })
 }
 
+/// Layout `name` of a scene source.
+fn layout_unit(name: String, info: &LayoutInfo) -> NewUnit<'static> {
+    let bytes = info.to_bytes();
+    let key = Key::new(Class::Layout, &name).bytes(&bytes).finish();
+    let working_set = bytes.len() as u64;
+    let work = Work::Blobs {
+        schema: layout::SCHEMA,
+        blobs: vec![(bytes, true)],
+    };
+    NewUnit::leaf(&name, Class::Layout as u16, key, working_set, work)
+}
+
 /// The instance sources of a scene's instanced models: one prototype per model, a placement
 /// per instance, and a source per 65536 models, the most a source's prototype index names.
 fn scene_instances(name: &str, models: &[&PlacedModel]) -> Vec<Instances> {
@@ -2473,7 +2533,7 @@ fn scene_instances(name: &str, models: &[&PlacedModel]) -> Vec<Instances> {
             let mut src = Instances::default();
             for (p, m) in chunk.iter().enumerate() {
                 src.prototypes.push(PrototypeSpec {
-                    model: format!("{name}/{}", m.model),
+                    model: m.model.entry(name),
                     ..PrototypeSpec::default()
                 });
                 src.records.extend(m.placed.iter().map(|q| Placement {
@@ -2496,9 +2556,9 @@ fn bakes_displacement(settings: &MeshSettings, maps: &MapSpec) -> bool {
             .is_some_and(|d| d.texture.is_some())
 }
 
-/// Material `name`'s variant for statically displaced sections, `<name>/static`: without
+/// Material `m`'s [`Variant::Static`] entry `name`, for statically displaced sections: without
 /// its displacement, which the geometry holds.
-fn static_material_unit(name: &str, m: &Material) -> NewUnit<'static> {
+fn static_material_unit(name: String, m: &Material) -> NewUnit<'static> {
     let mut m = *m;
     m.textures[slot::DISPLACEMENT] = bytemuck::Zeroable::zeroed();
     m.textures[slot::DISPLACEMENT_U] = bytemuck::Zeroable::zeroed();
@@ -2509,7 +2569,7 @@ fn static_material_unit(name: &str, m: &Material) -> NewUnit<'static> {
     m.displacement_min = 0.0;
     m.displacement_max = 0.0;
     m.displacement_world = 0;
-    material_unit(format!("{name}/static"), &m)
+    material_unit(name, &m)
 }
 
 /// A section of `indices` drawn with `m`, whose back is `back` where it has one of its own,
@@ -2643,7 +2703,6 @@ fn mesh_units(
         )));
     }
     let mut units = Vec::new();
-    let mesh_name = format!("{name}/mesh");
     let mut sections = Vec::new();
     let mut materials_out = Vec::new();
     let mut deps = Vec::new();
@@ -2656,9 +2715,12 @@ fn mesh_units(
             textures,
         );
         deps.extend(section.maps.units().map(str::to_string));
-        let mut unit = material_unit(format!("{name}/material/{i}"), m);
+        let mut unit = material_unit(MaterialName::index(i as u32).entry(name), m);
         if bakes_displacement(settings, &section.maps) {
-            let baked = static_material_unit(&unit.name, m);
+            let unbaked = MaterialName::index(i as u32)
+                .with(Variant::Static)
+                .entry(name);
+            let baked = static_material_unit(unbaked, m);
             units.push(std::mem::replace(&mut unit, baked));
         }
         materials_out.push((AssetId::from_name(&unit.name), unit.key));
@@ -2706,13 +2768,14 @@ fn mesh_units(
         min_exponent: None,
     };
     let part = MeshPart {
-        name: mesh_name,
+        name: ModelName::WHOLE.mesh(name),
         mesh: MeshSource::Data(Box::new(mesh)),
         settings: settings.clone(),
         deps,
     };
     let (model, assembly) = model_units(
-        name.into(),
+        name,
+        &ModelName::WHOLE,
         Some(part),
         None,
         &materials_out,
@@ -2739,17 +2802,19 @@ struct SubdPart {
     settings: SubdSettings,
 }
 
-/// The mesh and cage units of a model and the model unit, with these materials (id and key,
-/// mesh sections then cage sections) and skeleton (id and key). With assemblies, also a mesh
-/// and a model per repeated unit, and the assembly placing them; the model's mesh then
-/// holds the rest.
+/// The mesh and cage units of model `model` of source `asset` and the model unit, with these
+/// materials (id and key, mesh sections then cage sections) and skeleton (id and key). With
+/// assemblies, also a mesh and a model per repeated unit, and the assembly placing them; the
+/// model's mesh then holds the rest.
 fn model_units(
-    model_name: String,
+    asset: &str,
+    model: &ModelName,
     mut mesh: Option<MeshPart>,
     subd: Option<SubdPart>,
     materials: &[(AssetId, Hash32)],
     skeleton: (AssetId, Option<Hash32>),
 ) -> Result<(Vec<NewUnit<'static>>, Option<Assembly>)> {
+    let model_name = model.entry(asset);
     let mut units = Vec::new();
     let mut found = None;
     // The split reads a checked mesh and compares tangents; other meshes get both when they
@@ -2772,7 +2837,8 @@ fn model_units(
         let source_triangles = part.mesh.triangles();
         let mut list = Vec::with_capacity(split.units.len());
         for (i, (mesh, sections)) in split.units.into_iter().enumerate() {
-            let name = format!("{model_name}/unit/{i}");
+            let unit = model.with(Derived::Unit(i as u32));
+            let name = unit.entry(asset);
             let unit_materials: Vec<_> = sections
                 .iter()
                 .map(|&s| materials[usize::from(s)])
@@ -2791,7 +2857,7 @@ fn model_units(
             deps.sort_unstable();
             deps.dedup();
             let unit_mesh = MeshPart {
-                name: format!("{name}/mesh"),
+                name: unit.mesh(asset),
                 mesh: MeshSource::Data(Box::new(mesh)),
                 settings: part.settings.clone(),
                 deps,
@@ -2895,12 +2961,12 @@ fn subd_units(
     let mut units = Vec::new();
     let mut ids = Vec::new();
     for (i, m) in materials.iter().enumerate() {
-        let unit = material_unit(format!("{name}/material/{i}"), m);
+        let unit = material_unit(MaterialName::index(i as u32).entry(name), m);
         ids.push((AssetId::from_name(&unit.name), unit.key));
         units.push(unit);
     }
     let part = SubdPart {
-        name: format!("{name}/subd"),
+        name: ModelName::WHOLE.subd(name),
         cage: CageData {
             cage: cage.clone(),
             skin: None,

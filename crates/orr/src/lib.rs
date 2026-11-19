@@ -65,14 +65,15 @@ pub use orr_scene::{
     ClipRef, ClusterTopology, Cone, ConsumerMarker, CopyVariant, Decal, DecalChannels, DecalId,
     DepthOfField, DetailStats, DirectionalLight, DiscProfile, EditDesc, EditId, EditRef,
     EnvironmentData, ExposureState, Focus, FrameStats, FrameTime, Glare, GroupWriter,
-    InstanceFlags, InstancePage, InstancePageRef, InstanceRange, InstancesDesc, JobResult, Lens,
-    LensDistortion, Light, LightId, LoadState, Loading, MaterialGpu, MaterialId, MaterialWriter,
-    MediumData, MeshPipelineId, MeshStages, ModelId, MountId, NeuralTextures, Opacity, OpaqueHook,
-    OpaquePass, OriginPolicy, PackSource, PageId, PipelineId, PoolSize, Pose, ProducerBatch,
-    ProducerDesc, ProducerId, ProducerStats, ProducerUpdate, Projection, RasterGpu, ReloadReport,
-    RendererDesc, RequestSource, ResidencyClass, ResidencyStats, RtStats, SceneCompute, SceneDesc,
-    SceneId, SceneMemory, SceneRoot, SkeletonRef, SkinStats, SkinnedDesc, SkinnedPageRef, SkyStats,
-    Span, TextureFilter, TextureSamplerGpu, TextureStreamGpu, TransformGroupDesc, TransformGroupId,
+    InstanceFlags, InstancePage, InstancePageRef, InstanceRange, InstancesDesc, JobResult, Layout,
+    LayoutEnvironment, Lens, LensDistortion, Light, LightId, LoadState, Loading, MaterialGpu,
+    MaterialId, MaterialWriter, MediumData, MeshPipelineId, MeshStages, ModelId, MountId,
+    NeuralTextures, Opacity, OpaqueHook, OpaquePass, OriginPolicy, PackSource, PageId, Partition,
+    PartitionId, PartitionRef, PipelineId, PoolSize, Pose, ProducerBatch, ProducerDesc, ProducerId,
+    ProducerStats, ProducerUpdate, Projection, RasterGpu, ReloadReport, RendererDesc,
+    RequestSource, ResidencyClass, ResidencyStats, RtStats, SceneCompute, SceneDesc, SceneId,
+    SceneMemory, SceneRoot, SkeletonRef, SkinStats, SkinnedDesc, SkinnedPageRef, SkyStats, Span,
+    TextureFilter, TextureSamplerGpu, TextureStreamGpu, TransformGroupDesc, TransformGroupId,
     TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId, ViewStep, WorldPos, abi,
     binding_sampler, material_flags, orr_gpu, orr_pack,
 };
@@ -975,6 +976,12 @@ impl Renderer {
 
     pub fn material(&self, m: MountId, id: orr_pack::AssetId) -> Result<MaterialId> {
         Ok(self.scenes.material(m, id)?)
+    }
+
+    /// Layout `id` of ready mount `m`, resolved: its pages in `m`, its posed models, decal
+    /// materials and environment textures in `m` and then in the other ready mounts.
+    pub fn layout(&self, m: MountId, id: orr_pack::AssetId) -> Result<Layout> {
+        Ok(self.scenes.layout(m, id)?)
     }
 
     /// Wants every streamed unit of `model` resident from the next frame on, `cell_distance`

@@ -41,8 +41,7 @@ const WARM_FRAMES: u32 = 32;
 /// Frames of the step response before and after a light comes on.
 const STEP_BEFORE: u32 = 16;
 const STEP_AFTER: u32 = 96;
-/// The step response's light: a slot the scene leaves free, between the objects.
-const STEP_LIGHT: LightId = LightId(1);
+/// The step response's light, between the objects.
 const STEP_POSITION: DVec3 = DVec3::new(-0.3, 1.8, 2.2);
 /// Candela: about a third of the sun's illuminance on the ground below it.
 const STEP_INTENSITY: f32 = 1.2e5;
@@ -54,6 +53,8 @@ struct Bench {
     history: ViewHistoryId,
     frame: u64,
     extent: [u32; 2],
+    /// The step response's light while it is on.
+    step_light: Option<LightId>,
     _workers: Workers,
     renderer: Renderer,
 }
@@ -88,6 +89,7 @@ impl Bench {
             history,
             frame,
             extent,
+            step_light: None,
             _workers: workers,
             renderer,
         }
@@ -109,16 +111,21 @@ impl Bench {
         let id = f.id();
         let mut writer = f.scene(self.showcase.scene).expect("scene writer");
         writer.set_focus(eye.as_dvec3());
-        if let Some(on) = shot.step_light {
-            let light = Light::Sphere {
-                position: STEP_POSITION,
-                radius: 0.1,
-                intensity: Vec3::splat(STEP_INTENSITY),
-                cone: None,
-            };
-            writer
-                .set_light(STEP_LIGHT, on.then_some(&light))
-                .expect("step light");
+        match shot.step_light {
+            Some(true) => {
+                let light = Light::Sphere {
+                    position: STEP_POSITION,
+                    radius: 0.1,
+                    intensity: Vec3::splat(STEP_INTENSITY),
+                    cone: None,
+                };
+                self.step_light = Some(writer.add_light(&light).expect("step light"));
+            }
+            Some(false) => {
+                let id = self.step_light.take().expect("the step light is on");
+                writer.remove_light(id).expect("step light");
+            }
+            None => {}
         }
         drop(writer);
         let output = ViewOutput {

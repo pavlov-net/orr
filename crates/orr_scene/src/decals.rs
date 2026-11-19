@@ -8,8 +8,7 @@ use crate::world::WorldPos;
 use crate::{DecalBinGpu, DecalGpu};
 
 /// A decal of a scene: its entry in the scene's decal table, which holds every entry up to
-/// the highest id set. Where decals overlap,
-/// higher ids are written over lower ones.
+/// the highest id handed out.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DecalId(pub u32);
 
@@ -37,7 +36,8 @@ impl std::ops::BitOr for DecalChannels {
 /// hit. The box's local x and y span the material's uv (u along +x, v down +y over [0, 1]);
 /// it projects along its local -z onto surfaces facing +z. Its blend mask is `opacity` times
 /// the material's opacity: `geometry_opacity` times its opacity texture, else its base color
-/// alpha.
+/// alpha. Where decals overlap, those of higher `order` are written over those of lower, and
+/// of equal orders those of higher ids.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Decal {
     pub center: DVec3,
@@ -53,6 +53,7 @@ pub struct Decal {
     /// The share of the half depth over which the decal fades out toward the box's z faces;
     /// 0 for none.
     pub depth_fade: f32,
+    pub order: i32,
 }
 
 /// Bins are 2^4 = 16 m cubes, or world cells where those are smaller.
@@ -89,14 +90,31 @@ pub(crate) fn decal_gpu(decal: &Decal, cell_log2: u32) -> DecalGpu {
     }
 }
 
-/// Where a decal is listed: the bins its box touches, or the global list.
+/// Where a decal is listed, what orders it among the others and its material, by which an
+/// unmount finds the decals that name its mount.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Listing {
+pub(crate) struct Listing {
+    pub(crate) reach: Reach,
+    pub(crate) order: i32,
+    pub(crate) material: MaterialId,
+}
+
+/// The bins a decal's box touches, or the global list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reach {
     Bins { lo: IVec3, hi: IVec3 },
     Global,
 }
 
 pub(crate) fn listing(decal: &Decal, cell_log2: u32) -> Listing {
+    Listing {
+        reach: reach(decal, cell_log2),
+        order: decal.order,
+        material: decal.material,
+    }
+}
+
+fn reach(decal: &Decal, cell_log2: u32) -> Reach {
     let r = Mat3::from_quat(decal.rotation.normalize());
     let h = decal.half_extent.as_dvec3();
     let reach = DVec3::new(
@@ -109,9 +127,9 @@ pub(crate) fn listing(decal: &Decal, cell_log2: u32) -> Listing {
     let hi = ((decal.center + reach) / edge).floor().as_ivec3();
     let n = (hi - lo + IVec3::ONE).as_i64vec3();
     if n.x * n.y * n.z > i64::from(MAX_BINS) {
-        Listing::Global
+        Reach::Global
     } else {
-        Listing::Bins { lo, hi }
+        Reach::Bins { lo, hi }
     }
 }
 
@@ -122,8 +140,10 @@ fn hash(bin: IVec3, slots: u32) -> u32 {
         & (slots - 1)
 }
 
-/// The bin table and run list of `decals` (by id): the global decals' ids first, then per
-/// bin a count followed by its decals' ids, ascending.
+/// The bin table and run list of `decals` (by id). Each list names a decal by its rank in
+/// (order, id) order and its id, a pair of words, ascending by rank, which kernels merge the
+/// global list and a bin's by: the global decals first, then per bin a count followed by its
+/// decals.
 pub(crate) struct Bins {
     pub(crate) slots: Vec<DecalBinGpu>,
     pub(crate) refs: Vec<u32>,
@@ -131,24 +151,30 @@ pub(crate) struct Bins {
 }
 
 pub(crate) fn build_bins(decals: &[Option<Listing>]) -> Bins {
+    let mut ranked: Vec<(i32, u32, Reach)> = decals
+        .iter()
+        .enumerate()
+        .filter_map(|(id, l)| l.map(|l| (l.order, id as u32, l.reach)))
+        .collect();
+    ranked.sort_unstable_by_key(|r| (r.0, r.1));
     let mut refs: Vec<u32> = Vec::new();
     let mut by_bin: std::collections::BTreeMap<[i32; 3], Vec<u32>> = Default::default();
-    for (id, l) in decals.iter().enumerate() {
-        match l {
-            Some(Listing::Global) => refs.push(id as u32),
-            Some(Listing::Bins { lo, hi }) => {
+    for (rank, &(_, id, reach)) in ranked.iter().enumerate() {
+        let entry = [rank as u32, id];
+        match reach {
+            Reach::Global => refs.extend(entry),
+            Reach::Bins { lo, hi } => {
                 for z in lo.z..=hi.z {
                     for y in lo.y..=hi.y {
                         for x in lo.x..=hi.x {
-                            by_bin.entry([x, y, z]).or_default().push(id as u32);
+                            by_bin.entry([x, y, z]).or_default().extend(entry);
                         }
                     }
                 }
             }
-            None => {}
         }
     }
-    let globals = refs.len() as u32;
+    let globals = refs.len() as u32 / 2;
     let count = if by_bin.is_empty() {
         0
     } else {
@@ -170,7 +196,7 @@ pub(crate) fn build_bins(decals: &[Option<Listing>]) -> Bins {
             bin,
             first: refs.len() as u32,
         };
-        refs.push(ids.len() as u32);
+        refs.push(ids.len() as u32 / 2);
         refs.extend(ids);
     }
     Bins {
@@ -184,7 +210,7 @@ pub(crate) fn build_bins(decals: &[Option<Listing>]) -> Bins {
 mod tests {
     use super::*;
 
-    fn decal(center: DVec3, half: Vec3, rotation: Quat) -> Decal {
+    fn decal(center: DVec3, half: Vec3, rotation: Quat, order: i32) -> Decal {
         Decal {
             center,
             rotation,
@@ -194,13 +220,16 @@ mod tests {
             opacity: 1.0,
             fade_angles: [1.0, 1.5],
             depth_fade: 0.0,
+            order,
         }
     }
 
-    /// The decals listed for the bin holding `p`, as a kernel finds them.
+    /// The decals listed for the bin holding `p`, in the order `surface_decals_each` merges
+    /// the global list and the bin's into.
     fn listed(b: &Bins, p: DVec3) -> Vec<u32> {
         let bin = (p / f64::from(1u32 << BIN_LOG2)).floor().as_ivec3();
-        let mut ids: Vec<u32> = b.refs[..b.globals as usize].to_vec();
+        let globals = &b.refs[..2 * b.globals as usize];
+        let mut run: &[u32] = &[];
         let n = b.slots.len() as u32;
         if n > 0 {
             let mut at = hash(bin, n);
@@ -210,20 +239,27 @@ mod tests {
                     break;
                 }
                 if s.bin == bin.to_array() {
-                    let run = s.first as usize;
-                    let count = b.refs[run] as usize;
-                    ids.extend(&b.refs[run + 1..run + 1 + count]);
+                    let first = s.first as usize;
+                    run = &b.refs[first + 1..first + 1 + 2 * b.refs[first] as usize];
                     break;
                 }
                 at = (at + 1) & (n - 1);
             }
         }
-        ids.sort_unstable();
+        let (mut a, mut c) = (globals.chunks(2).peekable(), run.chunks(2).peekable());
+        let mut ids = Vec::new();
+        loop {
+            let ra = a.peek().map_or(u32::MAX, |e| e[0]);
+            let rc = c.peek().map_or(u32::MAX, |e| e[0]);
+            let next = if ra < rc { a.next() } else { c.next() };
+            let Some(e) = next else { break };
+            ids.push(e[1]);
+        }
         ids
     }
 
     #[test]
-    fn every_point_inside_a_decal_finds_it_in_its_bin() {
+    fn every_point_inside_a_decal_finds_it_in_its_bin_in_order() {
         let mut x = 0x2545_f491u32;
         let mut next = || {
             x ^= x << 13;
@@ -245,20 +281,20 @@ mod tests {
                 next() as f32 * 6.0,
                 next() as f32 * 6.0,
             );
-            decals.push(decal(c, half, q));
+            decals.push(decal(c, half, q, i % 7 - 3));
         }
         let listings: Vec<Option<Listing>> = decals.iter().map(|d| Some(listing(d, 8))).collect();
-        assert!(listings.contains(&Some(Listing::Global)));
+        assert!(listings.iter().flatten().any(|l| l.reach == Reach::Global));
         let bins = build_bins(&listings);
         for (id, d) in decals.iter().enumerate() {
             let r = Mat3::from_quat(d.rotation).as_dmat3();
             for _ in 0..20 {
                 let local = DVec3::new(next(), next(), next()) * 2.0 - 1.0;
                 let p = d.center + r * (local * d.half_extent.as_dvec3());
-                assert!(
-                    listed(&bins, p).contains(&(id as u32)),
-                    "decal {id} missing at {p}"
-                );
+                let ids = listed(&bins, p);
+                assert!(ids.contains(&(id as u32)), "decal {id} missing at {p}");
+                let key = |&i: &u32| (decals[i as usize].order, i);
+                assert!(ids.is_sorted_by_key(key), "decals out of order at {p}");
             }
         }
     }

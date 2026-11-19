@@ -282,7 +282,7 @@ pub(crate) fn cook(
                 blobs.push(BlobIn::new(bytemuck::cast_slice(rows)));
             }
             w.add(
-                &format!("{name}/{}_{}_{}/{page}", cell[0], cell[1], cell[2]),
+                &orr_pack::names::page(name, *cell, page as u32),
                 Class::InstancePage as u16,
                 instance::SCHEMA,
                 key,
@@ -471,11 +471,8 @@ fn morton(cell: [i32; 3]) -> u128 {
 
 /// Commit order of an instance source's pages: cells in Morton order, then page index.
 pub(crate) fn page_order(source: &str, page: &str) -> Option<(u128, u32)> {
-    let rest = page.strip_prefix(source)?.strip_prefix('/')?;
-    let (cell, index) = rest.split_once('/')?;
-    let mut it = cell.split('_').map(str::parse::<i32>);
-    let c = [it.next()?.ok()?, it.next()?.ok()?, it.next()?.ok()?];
-    Some((morton(c), index.parse().ok()?))
+    let (of, cell, index) = orr_pack::names::parse_page(page)?;
+    (of == source).then(|| (morton(cell), index))
 }
 
 /// The records of one cell in pages of at most [`MAX_RECORDS`]: Morton-prefix cells of the
@@ -593,6 +590,7 @@ fn build_page(
         motion_start: 0.0,
         motion_window: 1,
         _pad: 0,
+        source: AssetId::from_name(name),
     };
     let mut forms: Vec<Form> = members
         .iter()

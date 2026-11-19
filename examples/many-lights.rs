@@ -18,9 +18,9 @@ use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     Cone, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime,
-    GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource,
-    Projection, Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest,
-    TextureFilter, TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LitView, PackSource, Projection,
+    Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
+    TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshSettings, Source};
 use orr_examples::mesh::MeshBuilder;
@@ -245,13 +245,8 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         user_tag: 0,
     })
     .expect("instances");
-    for (i, light) in directional
-        .into_iter()
-        .map(Light::Directional)
-        .chain(local)
-        .enumerate()
-    {
-        w.set_light(LightId(i as u32), Some(&light)).expect("light");
+    for light in directional.into_iter().map(Light::Directional).chain(local) {
+        w.add_light(&light).expect("light");
     }
     drop(w);
     f.end().expect("end frame");

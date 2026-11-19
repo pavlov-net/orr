@@ -494,7 +494,7 @@ public struct SceneRoot
     public uint2* skin_work;         // this frame's skinning work items: skinned copy, mesh cluster
     public DecalGpu* decals;         // by DecalId
     public DecalBinGpu* decal_bins;  // `decal_bin_slots` entries
-    public uint* decal_refs;         // the global decals' ids, then each bin's run
+    public uint* decal_refs;         // the global decals' (rank, id) pairs, then each bin's run
     public uint decal_globals;       // decals too large for bins, listed first in `decal_refs`
     public uint decal_bin_slots;     // a power of two; 0 without binned decals
     public uint decal_bin_log2;      // bins are 2^decal_bin_log2 m cubes on the world cell grid

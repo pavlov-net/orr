@@ -59,6 +59,7 @@ mod medium_proxy;
 pub mod memory;
 mod mount;
 mod neural;
+mod partition;
 mod pattern;
 mod pipelines;
 mod probe;
@@ -109,6 +110,7 @@ pub use medium_proxy::{MediumProxy, MediumProxyId, ProxyDensity, VolumeRef};
 pub use memory::{ClasPages, PoolFill, SceneMemory, WindowFill};
 pub use mount::{ClipRef, InstancePage, LoadState, MountId, PackSource, PageId, SkeletonRef};
 pub use neural::NeuralTextures;
+pub use partition::{Layout, LayoutEnvironment, Partition, PartitionId, PartitionRef};
 pub use pipelines::{MeshPipelineId, MeshStages, PipelineId, ReloadReport};
 pub use probe::{
     PixelProbe, PlanOutcome, ProbeSettings, ProbeTap, ProbeTile, ProbeView, UnitState, UnitStatus,
@@ -233,6 +235,15 @@ pub enum Error {
     UnknownEdit(EditId),
     #[error("{0:?} does not exist")]
     UnknownPage(PageId),
+    #[error("the layout has no partition {0}")]
+    UnknownPartition(usize),
+    #[error("{0:?} does not exist")]
+    UnknownPlacedPartition(PartitionId),
+    /// The scene did not hand the light id out, or it was removed.
+    #[error("{0:?} does not exist")]
+    UnknownLight(LightId),
+    #[error("{0:?} does not exist")]
+    UnknownDecal(DecalId),
     /// A material's back is of another surface id than its own, and neither linked surface
     /// type has `ISurface.other_side`: hit shaders made for one type shade no triangle of two.
     #[error(

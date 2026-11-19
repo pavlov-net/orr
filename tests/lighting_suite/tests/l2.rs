@@ -45,9 +45,8 @@ fn scene_with(
 ) -> TestScene {
     let mut scene = TestScene::linked(SceneDesc::default(), kernels, data);
     scene.write(|w, _| {
-        for (i, l) in lights.iter().enumerate() {
-            w.set_light(LightId(i as u32), Some(&Light::Directional(*l)))
-                .unwrap();
+        for l in lights {
+            w.add_light(&Light::Directional(*l)).unwrap();
         }
     });
     scene
@@ -382,9 +381,8 @@ fn discs(lights: &[DirectionalLight], focus: [f32; 3]) -> Discs {
     let probe = pipeline(&textured_probe::MODULE, "main");
     scene.frame(
         |w, _| {
-            for (i, l) in lights.iter().enumerate() {
-                w.set_light(LightId(i as u32), Some(&Light::Directional(*l)))
-                    .unwrap();
+            for l in lights {
+                w.add_light(&Light::Directional(*l)).unwrap();
             }
         },
         |c| {

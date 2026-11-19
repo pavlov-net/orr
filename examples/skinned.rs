@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use orr::orr_gpu::{QueueKind, SpecData, TimelinePoint};
 use orr::orr_pack::material::Material;
+use orr::orr_pack::names::ModelName;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens,
@@ -98,10 +99,10 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .unwrap_or_else(|e| panic!("model {name}: {e}"))
     });
     let skeleton = renderer
-        .skeleton(mount, id(&format!("{CREATURE}/skeleton")))
+        .skeleton(mount, id(&ModelName::WHOLE.skeleton(CREATURE)))
         .expect("skeleton");
     let clip = renderer
-        .clip(mount, id(&format!("{CREATURE}/clip/wave")))
+        .clip(mount, id(&ModelName::WHOLE.clip(CREATURE, "wave")))
         .expect("clip");
     assert_eq!(skeleton.joint_count, joints);
 

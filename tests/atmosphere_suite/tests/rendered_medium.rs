@@ -19,11 +19,10 @@ use orr_atmosphere::reference::{
 };
 use orr_atmosphere::spectrum::SOLAR_ILLUMINANCE;
 use orr_atmosphere::{Atmosphere, AtmosphereState};
-use orr_lighting::{Light, LightId, LightingDebugView, ViewLighting};
+use orr_lighting::{Light, LightingDebugView, ViewLighting};
 use orr_math::{DVec3, Mat3, Quat, Vec2, Vec3};
 use orr_scene::RendererDesc;
 
-const SUN: LightId = LightId(0);
 const EYE: Vec3 = Vec3::new(0.0, 2.0, 0.0);
 /// A little above the horizon, so the direct view of every surface stays above the ground.
 const VIEW: Vec3 = Vec3::new(0.0, 0.03, -1.0);
@@ -62,12 +61,12 @@ fn bed(atmosphere: &Atmosphere, copies: Vec<Item>) -> Bed {
         ..RendererDesc::default()
     };
     let mut sky = AtmosphereState::new(device(), atmosphere, 0).unwrap();
-    sky.set_lights(&[SUN]);
     sky.set_multiple_scattering(false);
     let mut bed = Bed::with_linked(spec, &renderer, 200_000.0, |w| {
         w.set_medium(sky.data());
         w.set_environment(sky.data());
     });
+    sky.set_lights(&[bed.light_id(0)]);
     bed.set_near_range(NEAR_RANGE);
     bed.set_scene_compute(Box::new(move |cx| {
         sky.skip_fades();
@@ -123,7 +122,7 @@ fn check(
     paths.settings = settings;
     for (elevation, azimuth) in LIGHTS {
         let sun = dir(elevation, azimuth);
-        bed.set_light(SUN, Some(Light::Directional(solar_disc(sun.as_vec3()))));
+        bed.set_light(0, Some(Light::Directional(solar_disc(sun.as_vec3()))));
         let image = bed.accumulate(8, 3, &mut |list, f| paths.record(list, f));
         for (i, &at) in points.iter().enumerate() {
             let at = at.round();

@@ -28,6 +28,7 @@ use orr_math::{Affine3, Mat3, Mat4, Quat, Vec3, Vec4};
 use orr_pack::clip::Clip;
 use orr_pack::mesh::{self, Cluster, MeshHeader, MeshInfo, PageView};
 use orr_pack::model::ModelInfo;
+use orr_pack::names::{Derived, ModelName};
 use orr_pack::skeleton::{NO_PARENT, SkeletonInfo, Trs};
 use orr_pack::{Archive, AssetId, Class, Target};
 
@@ -228,10 +229,14 @@ impl Cooked {
     }
 
     fn entry(&self, suffix: &str) -> &orr_pack::Entry {
-        let id = AssetId::from_name(&format!("{}{suffix}", self.name));
+        self.named(&format!("{}{suffix}", self.name))
+    }
+
+    fn named(&self, name: &str) -> &orr_pack::Entry {
+        let id = AssetId::from_name(name);
         self.archive
             .find(id)
-            .unwrap_or_else(|| panic!("no entry {}{suffix}", self.name))
+            .unwrap_or_else(|| panic!("no entry {name}"))
     }
 
     fn skeleton(&self) -> SkeletonInfo {
@@ -475,7 +480,7 @@ fn check(path: &Path, name: &str, settings: GltfSettings) -> (Cooked, Errors) {
     let model = ModelInfo::parse(&cooked.blob(cooked.entry(""), 0)).unwrap();
     assert_eq!(
         model.header.skeleton,
-        AssetId::from_name(&format!("{name}/skeleton"))
+        AssetId::from_name(&ModelName::WHOLE.skeleton(name))
     );
     let mesh_e = cooked.entry("/mesh");
     let info = MeshInfo::parse(&cooked.blob(mesh_e, 0)).unwrap();
@@ -1015,10 +1020,10 @@ fn a_far_rig_that_flattens_after_model_space_poses_to_its_own_rounding() {
     const NEAR: f64 = 4e-5;
     let path = flattened_far_glb("far-flat");
     let cooked = cook(&path, "far-flat", GltfSettings::default());
-    let model = "/body/baked/0";
-    let e = cooked.entry(&format!("{model}/skeleton"));
+    let model = ModelName::source("body").with(Derived::Baked(0));
+    let e = cooked.named(&model.skeleton(&cooked.name));
     let skel = SkeletonInfo::parse(&cooked.blob(e, 0)).unwrap();
-    let mesh_e = cooked.entry(&format!("{model}/mesh"));
+    let mesh_e = cooked.named(&model.mesh(&cooked.name));
     let info = MeshInfo::parse(&cooked.blob(mesh_e, 0)).unwrap();
     let mut vertices: Vec<(Vec3, usize)> = Vec::new();
     for p in &info.pages {
@@ -1043,7 +1048,7 @@ fn a_far_rig_that_flattens_after_model_space_poses_to_its_own_rounding() {
         .iter()
         .map(|v| v.position.as_dvec3())
         .collect();
-    let e = cooked.entry(&format!("{model}/clip/go"));
+    let e = cooked.named(&model.clip(&cooked.name, "go"));
     let clip = Clip::parse(&cooked.blob(e, 0), &cooked.blob(e, 1)).unwrap();
     let n = skel.joint_count();
     let mut locals = vec![Trs::IDENTITY; n];

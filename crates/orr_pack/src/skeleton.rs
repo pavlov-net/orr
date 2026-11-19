@@ -15,7 +15,7 @@
 use bytemuck::{Pod, Zeroable};
 use orr_math::{Affine3, DVec3, Mat3, Quat, Vec3};
 
-use crate::blob::{put_table, read, table};
+use crate::blob::{put_table, read, table, text};
 use crate::{AffineRows, Error, Result, Span};
 
 pub const SCHEMA: u16 = 2;
@@ -159,11 +159,9 @@ impl SkeletonInfo {
         let names = table::<Span>(blob, h.names)?
             .into_iter()
             .map(|s| {
-                let bytes = (s.first as usize)
-                    .checked_add(s.count as usize)
-                    .and_then(|end| blob.get(s.first as usize..end))
-                    .ok_or(Error::Malformed("joint name outside its blob"))?;
-                String::from_utf8(bytes.to_vec()).map_err(|_| Error::Malformed("joint name"))
+                text(blob, s)
+                    .map(str::to_owned)
+                    .ok_or(Error::Malformed("joint name"))
             })
             .collect::<Result<_>>()?;
         Ok(Self {

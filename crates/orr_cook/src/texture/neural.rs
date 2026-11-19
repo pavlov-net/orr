@@ -103,11 +103,11 @@ fn channels(job: &TextureJob) -> Option<(u8, u8)> {
     }
 }
 
-/// The set of a material's textures (`jobs` in slot order, opacity left out); `None` when
-/// none can join.
+/// The set `name` of a material's textures (`jobs` in slot order, opacity left out); `None`
+/// when none can join.
 pub(super) fn plan(
     asset: &str,
-    suffix: &str,
+    name: String,
     jobs: &[&TextureJob],
     settings: &NeuralSettings,
 ) -> Result<Option<NeuralJob>> {
@@ -138,7 +138,6 @@ pub(super) fn plan(
     if members.is_empty() {
         return Ok(None);
     }
-    let name = format!("{asset}/neural/{suffix}");
     let fail = |message: String| Error::Texture {
         asset: asset.into(),
         message,
@@ -354,7 +353,7 @@ impl NeuralJob {
             }
         }
 
-        let latents_name = format!("{}/latents", self.name);
+        let latents_name = orr_pack::names::latents(&self.name);
         let latents = super::layout(
             vk::A4R4G4B4_UNORM_PACK16,
             [out.latent_size[0], out.latent_size[1]],
@@ -427,7 +426,7 @@ pub(crate) fn add(w: &mut ArchiveWriter, name: &str, key: Hash32, set: &NeuralBu
         key,
         &blobs,
     )?;
-    super::add(w, &format!("{name}/latents"), key, &set.latents)?;
+    super::add(w, &orr_pack::names::latents(name), key, &set.latents)?;
     Ok(())
 }
 

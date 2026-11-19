@@ -1,5 +1,5 @@
 //! Example lights for a planet's sky. They are plain [`DirectionalLight`] values: the scene
-//! takes them through `SceneWriter::set_light`, and the atmosphere folds in whichever are
+//! takes them through `SceneWriter::add_light`, and the atmosphere folds in whichever are
 //! among its candidates.
 
 use std::f64::consts::PI;

@@ -529,7 +529,7 @@ pub struct Scenes {
 }
 
 /// Puts `value` in the first free entry of `slots` and returns its index.
-fn insert<T>(slots: &mut Vec<Option<T>>, value: T) -> u32 {
+pub(crate) fn insert<T>(slots: &mut Vec<Option<T>>, value: T) -> u32 {
     match slots.iter().position(Option::is_none) {
         Some(i) => {
             slots[i] = Some(value);
@@ -772,7 +772,8 @@ impl Scenes {
     /// every frame submitted so far has completed. Copies of its models and their edits in every
     /// scene are gone from the next frame, placed by hand, on pages or as subdivision copies, and
     /// their [`InstanceRange`]s stay the consumer's; a subdivision copy's [`ProducerId`] names
-    /// nothing until it is set again.
+    /// nothing until it is set again. So are the decals of its materials and the lights and
+    /// decals of partitions placed from its layouts, whose ids stay with their holders.
     pub fn unmount(&mut self, m: MountId) {
         let frame = self.core.next_frame - 1;
         let core = &mut self.core;
@@ -781,8 +782,13 @@ impl Scenes {
             let protos = core.mounts.page_prototypes(page);
             protos.is_ok_and(|p| p.iter().any(|q| gone.contains(&q.model.0)))
         };
+        let materials: FxHashSet<u32> = core
+            .mounts
+            .resident(m)
+            .map_or_default(|r| r.materials.values().map(|id| id.0).collect());
         for scene in core.scenes.iter().flatten() {
             scene.empty_copies(&gone, holds, frame, &core.seq);
+            scene.empty_mount(m, &materials, &core.seq);
         }
         for page in core.mounts.pages_of(m) {
             core.land_page(page, 0);
@@ -1048,6 +1054,12 @@ impl Scenes {
     /// The cooked material `id` of mount `m`, for consumer data and [`MaterialWriter`] edits.
     pub fn material(&self, m: MountId, id: AssetId) -> Result<MaterialId> {
         self.core.mounts.lookup(m, id, |r| &r.materials)
+    }
+
+    /// Layout `id` of ready mount `m`, resolved: its pages in `m`, its posed models, decal
+    /// materials and environment textures in `m` and then in the other ready mounts.
+    pub fn layout(&self, m: MountId, id: AssetId) -> Result<crate::Layout> {
+        self.core.mounts.layout(m, id)
     }
 
     /// Wants every streamed unit of `model` resident from the next step 1 on, `cell_distance`
@@ -1454,6 +1466,8 @@ impl Scenes {
                     cpu.producers_removed.push((frame, first, count));
                 }
             }
+            cpu.light_ids.retire(completed);
+            cpu.decal_ids.retire(completed);
             cpu.retired.retain(|(frame, _)| *frame > completed);
             cpu.groups_removed.retain(|(frame, _)| *frame > completed);
             let sets = &scene.tables.page_sets;

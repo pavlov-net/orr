@@ -33,7 +33,8 @@ public struct DecalGpu
 }
 
 // One slot of the bin table: a bin of world space and the index in `SceneRoot.decal_refs` of
-// its run, a count followed by that many decal ids in ascending order.
+// its run, a count followed by that many (rank, decal id) pairs ascending by rank, a decal's
+// place in (order, id) order.
 public struct DecalBinGpu
 {
     public int3 bin;

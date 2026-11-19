@@ -17,6 +17,7 @@ use orr_cook::{
     MipFilter, Source, TextureOverride, TextureRules, TextureSettings, Usage, UsdSettings,
 };
 use orr_pack::material::{Material, slot};
+use orr_pack::names::{MaterialBase, MaterialName};
 use orr_pack::texture::{mip_size, vk};
 use orr_pack::{Archive, AssetId, Target};
 use texels::{decode, mips, read_blob, write_glb};
@@ -185,7 +186,10 @@ def Xform "World"
         path,
         settings: UsdSettings::default(),
     });
-    let m = material(&a, "u/material/World/Looks/M");
+    let m = material(
+        &a,
+        &MaterialName::new(MaterialBase::Path("/World/Looks/M".into())).entry("u"),
+    );
     (a, m, report)
 }
 

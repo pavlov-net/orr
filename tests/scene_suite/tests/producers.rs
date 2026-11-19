@@ -3422,8 +3422,9 @@ fn arm_palette(angle: f32) -> [Affine3; 2] {
 #[test]
 fn a_skinned_cage_poses_before_it_dices_and_moves_from_last_frames_pose() {
     let mut s = CageScene::new(2.0);
-    let model = s.model("arm/Arm");
-    let (info, pages) = cage_entry("arm/Arm/subd");
+    let arm = orr_pack::names::ModelName::source("Arm");
+    let model = s.model(&arm.entry("arm"));
+    let (info, pages) = cage_entry(&arm.subd("arm"));
     assert!(!info.skin.is_empty(), "the arm cooks its skin");
     let (eye, target) = (Vec3::new(1.5, 1.4, 3.0), Vec3::new(0.0, 1.2, 0.0));
     let mut ids = (TransformGroupId(0), TransformGroupId(0));

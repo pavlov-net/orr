@@ -404,8 +404,8 @@ fn mount_pack(r: &mut Renderer, pack: &Arc<[u8]>, frame: &mut u32) -> MountId {
     mount
 }
 
-/// Places `pack`'s floor and box, a sun and the focus in `scene`.
-fn place_floor_and_box(f: &orr::Frame<'_>, scene: SceneId, models: [orr::ModelId; 2]) {
+/// Places `pack`'s floor and box, a sun and the focus in `scene`; returns the sun's id.
+fn place_floor_and_box(f: &orr::Frame<'_>, scene: SceneId, models: [orr::ModelId; 2]) -> LightId {
     let mut s = f.scene(scene).unwrap();
     let group = s
         .create_transform_group(&TransformGroupDesc {
@@ -433,8 +433,9 @@ fn place_floor_and_box(f: &orr::Frame<'_>, scene: SceneId, models: [orr::ModelId
         })
         .unwrap();
     }
-    s.set_light(LightId(0), Some(&sun())).unwrap();
+    let sun = s.add_light(&sun()).unwrap();
     s.set_focus(DVec3::ZERO);
+    sun
 }
 
 /// The light of [`place_floor_and_box`], the scene's only one.
@@ -1437,7 +1438,7 @@ fn ray_reconstruction_resets_on_the_frame_pre_exposure_steps() {
             display: None,
         })
         .unwrap();
-    place_floor_and_box(&f, scene, models);
+    let mut lit = Some(place_floor_and_box(&f, scene, models));
     wait(f.end().unwrap());
 
     let exposure = |shot: &Shot| match shot.manual {
@@ -1465,11 +1466,18 @@ fn ray_reconstruction_resets_on_the_frame_pre_exposure_steps() {
                     next_pre_exposure.insert(t.frame, t.pre_exposure);
                 }
                 ids.push(f.id());
-                let light = shot.lit.then(sun);
-                f.scene(scene)
-                    .unwrap()
-                    .set_light(LightId(0), light.as_ref())
-                    .unwrap();
+                {
+                    let mut s = f.scene(scene).unwrap();
+                    match (lit, shot.lit) {
+                        (Some(id), true) => s.set_light(id, &sun()).unwrap(),
+                        (None, true) => lit = Some(s.add_light(&sun()).unwrap()),
+                        (Some(id), false) => {
+                            s.remove_light(id).unwrap();
+                            lit = None;
+                        }
+                        (None, false) => {}
+                    }
+                }
                 f.update_scenes(&mut |_| {}).unwrap();
                 f.render_view(
                     &LitView {

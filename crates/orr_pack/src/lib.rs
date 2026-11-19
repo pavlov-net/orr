@@ -12,9 +12,11 @@ pub mod clip;
 mod codec;
 mod format;
 pub mod instance;
+pub mod layout;
 pub mod material;
 pub mod mesh;
 pub mod model;
+pub mod names;
 pub mod neural;
 pub mod raster;
 pub mod skeleton;
@@ -169,6 +171,7 @@ pub enum Class {
     Subd = 10,
     Volume = 11,
     TextureTiles = 12,
+    Layout = 13,
 }
 
 /// Current schema of each built-in class whose format this crate defines.
@@ -185,11 +188,12 @@ const SCHEMAS: &[(Class, u16)] = &[
     (Class::Subd, subd::SCHEMA),
     (Class::Volume, volume::SCHEMA),
     (Class::TextureTiles, tiles::SCHEMA),
+    (Class::Layout, layout::SCHEMA),
 ];
 
 impl Class {
     pub const USER_FIRST: u16 = 0x8000;
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Mesh,
         Self::Texture,
         Self::Material,
@@ -202,6 +206,7 @@ impl Class {
         Self::Subd,
         Self::Volume,
         Self::TextureTiles,
+        Self::Layout,
     ];
 
     pub fn from_u16(v: u16) -> Option<Self> {
@@ -222,6 +227,7 @@ impl Class {
             Self::Subd => "subd",
             Self::Volume => "volume",
             Self::TextureTiles => "texture-tiles",
+            Self::Layout => "layout",
         }
     }
 

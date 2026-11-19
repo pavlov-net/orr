@@ -9,8 +9,8 @@ use orr::orr_gpu::Device;
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    FrameDesc, GroupWriter, InstanceFlags, InstancesDesc, Light, LightId, PackSource, Renderer,
-    SceneDesc, SceneId, SceneLightingSettings, TransformGroupDesc,
+    FrameDesc, GroupWriter, InstanceFlags, InstancesDesc, Light, PackSource, Renderer, SceneDesc,
+    SceneId, SceneLightingSettings, TransformGroupDesc,
 };
 use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::{Atmosphere, AtmosphereState};
@@ -67,7 +67,6 @@ impl Showcase {
             ..Atmosphere::earth(DVec3::ZERO, Vec3::Y)
         };
         let mut sky = AtmosphereState::new(gpu, &atmosphere, 0).expect("atmosphere");
-        sky.set_lights(&[LightId(0)]);
         sky.skip_fades();
 
         frame += 1;
@@ -105,7 +104,7 @@ impl Showcase {
             })
             .expect("instances");
         }
-        w.set_light(LightId(0), Some(&sun())).expect("sun");
+        sky.set_lights(&[w.add_light(&sun()).expect("sun")]);
         w.set_environment(sky.data());
         w.set_medium(sky.data());
         drop(w);

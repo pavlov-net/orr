@@ -9,6 +9,7 @@ use orr_math::{DMat3, DMat4, DQuat, DVec3, Mat3, Mat4, Vec3};
 use orr_pack::Aabb;
 use orr_pack::instance::MotionRow;
 use orr_pack::material::{Material, slot};
+use orr_pack::names::{MaterialName, ModelName};
 use orr_pack::skeleton::SkeletonInfo;
 use serde::Deserialize;
 
@@ -24,8 +25,8 @@ use crate::texture::material::{ImageFile, MaterialTextures};
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeSelect {
-    /// A node whose name contains this becomes model `<asset>/<node name>`, unless an
-    /// ancestor already did.
+    /// A node whose name contains this becomes a model named after it, unless an ancestor
+    /// already did.
     pub node: String,
 }
 
@@ -53,6 +54,11 @@ pub(crate) struct Scene {
     /// How the skeletons' clips are resampled.
     pub(crate) clips: ClipSettings,
     pub(crate) instances: Vec<PlacedModel>,
+    /// The source's groups, and its partitions by the ascending groups that hold them: the
+    /// layout ([`orr_pack::layout`]) a scene source cooks. No partitions: the source cooks no
+    /// layout.
+    pub(crate) groups: Vec<orr_pack::layout::Group>,
+    pub(crate) partitions: Vec<Vec<u32>>,
     /// Every file read.
     pub(crate) files: Vec<Input>,
     pub(crate) warnings: Vec<String>,
@@ -126,10 +132,7 @@ impl Scene {
             let Some((s, joint)) = copies.frame else {
                 continue;
             };
-            let model = self
-                .models
-                .iter()
-                .find(|m| m.node.as_ref() == Some(&copies.model));
+            let model = self.models.iter().find(|m| m.name == copies.model);
             let model = model.expect("copies place a model of the scene");
             let ib = binds[s][usize::from(joint)] * self.skeletons[s].space.to_bind_space();
             // A model with a skeleton stands at its origin.
@@ -350,7 +353,7 @@ impl SceneModel {
 
 /// The placements of one model that share pages.
 pub(crate) struct PlacedModel {
-    pub(crate) model: String,
+    pub(crate) model: ModelName,
     /// Of the model's space, which pages take its skeleton's origin into: in scene space, or the
     /// bind space of `frame`'s joint where its skeleton's origin places it in model space.
     pub(crate) placed: Vec<Placed>,
@@ -361,6 +364,8 @@ pub(crate) struct PlacedModel {
     pub(crate) alone: bool,
     /// How the placements move over time, in their order.
     pub(crate) motion: Option<Arc<InstanceMotion>>,
+    /// Index into [`Scene::partitions`].
+    pub(crate) partition: usize,
 }
 
 /// One placement: position and a linear transform that [`collapses`] passes.
@@ -371,9 +376,8 @@ pub(crate) struct Placed {
 }
 
 pub(crate) struct SceneSkeleton {
-    /// Entry names `<asset>/<prefix>/skeleton` and `<asset>/<prefix>/clip/<clip>`; an empty
-    /// prefix leaves its part out.
-    pub(crate) prefix: String,
+    /// The model whose skeleton and clips it is.
+    pub(crate) model: ModelName,
     pub(crate) info: SkeletonInfo,
     /// Where its spaces stand in its models'.
     pub(crate) space: RigSpace,
@@ -382,8 +386,7 @@ pub(crate) struct SceneSkeleton {
 }
 
 pub(crate) struct SceneModel {
-    /// The selected node's name; `None` for the whole scene.
-    pub(crate) node: Option<String>,
+    pub(crate) name: ModelName,
     /// A mesh without sections cooks no mesh entry.
     pub(crate) mesh: MeshSource,
     pub(crate) subd: Option<SceneSubd>,
@@ -392,6 +395,10 @@ pub(crate) struct SceneModel {
     pub(crate) settings: MeshSettings,
     /// Index into [`Scene::materials`] per mesh section.
     pub(crate) materials: Vec<usize>,
+    /// Index into [`Scene::partitions`] of the partition that holds a model in scene space that
+    /// no instancer places: that of the prim or node that roots it. None for a model that
+    /// [`Scene::instances`] place, a selected one among them.
+    pub(crate) partition: Option<usize>,
 }
 
 /// A model's subdivision cage.
@@ -404,9 +411,7 @@ pub(crate) struct SceneSubd {
 
 #[derive(Clone)]
 pub(crate) struct SceneMaterial {
-    /// Entry name suffix: `<asset>/material/<suffix>`, textures under
-    /// `<asset>/texture/<suffix>/`; empty names the material `<asset>` itself.
-    pub(crate) suffix: String,
+    pub(crate) name: MaterialName,
     pub(crate) material: Material,
     pub(crate) textures: MaterialTextures,
     /// What the source states `material` and `textures` in, which the cook converts to OpenPBR

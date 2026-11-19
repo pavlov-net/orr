@@ -1,6 +1,6 @@
 //! A scene's GPU tables, its CPU bookkeeping and the writer consumers fill it through.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -18,7 +18,7 @@ use crate::lights::{
 use crate::material::{MaterialId, MaterialTable};
 use crate::medium_proxy::{MediumProxy, MediumProxyId, proxy_gpu};
 use crate::memory::{RangeAllocator, UploadWindow};
-use crate::mount::{InstancePage, ModelRow, Mounts, PageId, PagePrototype};
+use crate::mount::{InstancePage, ModelRow, MountId, Mounts, PageId, PagePrototype};
 use crate::producer::{self, Opacity, Producer, ProducerDesc, ProducerId, ProducerUpdate};
 use crate::producer_blocks::ClusterBlocks;
 use crate::ptlas::{CopyRuns, Ptlas, run_class};
@@ -880,8 +880,13 @@ pub(crate) struct SceneCpu {
     /// traversal tests what they saw, the tessellator's edge factors what last frame's first
     /// saw.
     pub(crate) seen_by: Vec<LastView>,
-    /// Where each decal is listed, by `DecalId`.
+    /// Where each decal is listed, by `DecalId`; none for an id that holds no decal.
     pub(crate) decals: Vec<Option<Listing>>,
+    /// The ids of the light and decal tables the scene handed out.
+    pub(crate) light_ids: Ids,
+    pub(crate) decal_ids: Ids,
+    /// Placed partitions, by `PartitionId`.
+    pub(crate) partitions: Vec<Option<crate::partition::PlacedPartition>>,
     /// The bin table and run list the frame's kernels read, each written whole when a decal
     /// has changed, and the slots and words they hold room for.
     pub(crate) decal_bins: Allocation<DecalBinGpu>,
@@ -923,6 +928,57 @@ pub(crate) struct Scene {
     pub(crate) cpu: Mutex<SceneCpu>,
     /// Set while a writer for this scene is alive.
     pub(crate) writing: AtomicBool,
+}
+
+/// The ids a scene hands out of one of its tables, lowest free first: the PTLAS takes a proxy
+/// instance for every light id up to the highest, so ids stay compact.
+#[derive(Default)]
+pub(crate) struct Ids {
+    /// By id, whether it is handed out.
+    held: Vec<bool>,
+    /// Ids below `held.len()` free to hand out.
+    free: BTreeSet<u32>,
+    /// Ids removed in a frame, free once that frame has completed.
+    removed: Vec<(u64, u32)>,
+}
+
+impl Ids {
+    /// The id handed out next.
+    fn next(&self) -> u32 {
+        self.free.first().copied().unwrap_or(self.held.len() as u32)
+    }
+
+    /// Hands out `id`, which [`Self::next`] named.
+    fn take(&mut self, id: u32) {
+        if id as usize == self.held.len() {
+            self.held.push(true);
+        } else {
+            self.free.remove(&id);
+            self.held[id as usize] = true;
+        }
+    }
+
+    fn holds(&self, id: u32) -> bool {
+        self.held.get(id as usize).is_some_and(|&h| h)
+    }
+
+    /// Takes back `id`, removed in `frame`.
+    fn remove(&mut self, id: u32, frame: u64) {
+        self.held[id as usize] = false;
+        self.removed.push((frame, id));
+    }
+
+    /// Frees the ids removed in frames at or before `completed`.
+    pub(crate) fn retire(&mut self, completed: u64) {
+        let free = &mut self.free;
+        self.removed.retain(|&(frame, id)| {
+            let done = frame <= completed;
+            if done {
+                free.insert(id);
+            }
+            !done
+        });
+    }
 }
 
 /// 32-bit words in `bytes`.
@@ -1702,6 +1758,50 @@ impl Scene {
         }
     }
 
+    /// Zeroes light `id` from the frame of `seq` on; its holder keeps the id.
+    pub(crate) fn empty_light(&self, cpu: &mut SceneCpu, id: LightId, seq: u64) {
+        let at = self.tables.lights.entry(id.0).address().0;
+        cpu.records
+            .push(Record::fill(seq, at, words(size_of::<LightGpu>()), 0));
+        cpu.lights.set(id.0, None);
+        cpu.ptlas.set_light(id.0, false);
+    }
+
+    /// Zeroes decal `id` from the frame of `seq` on; its holder keeps the id.
+    pub(crate) fn empty_decal(&self, cpu: &mut SceneCpu, id: DecalId, seq: u64) {
+        let at = self.tables.decals.entry(id.0).address().0;
+        cpu.records
+            .push(Record::fill(seq, at, words(size_of::<DecalGpu>()), 0));
+        cpu.decals[id.0 as usize] = None;
+        cpu.decals_changed = true;
+    }
+
+    /// Empties what names mount `m`, which is about to go: every decal of one of its
+    /// `materials`, and the lights and decals of the partitions placed from its layouts. Their
+    /// holders keep the ids.
+    pub(crate) fn empty_mount(&self, m: MountId, materials: &FxHashSet<u32>, seq: &AtomicU64) {
+        let cpu = &mut *self.cpu.lock().unwrap();
+        let mut lights = Vec::new();
+        let mut held = FxHashSet::default();
+        for p in cpu.partitions.iter().flatten().filter(|p| p.mount == m) {
+            lights.extend_from_slice(&p.lights);
+            held.extend(p.decals.iter().map(|d| d.0));
+        }
+        let decals: Vec<DecalId> = (0..cpu.decals.len() as u32)
+            .filter(|&id| {
+                cpu.decals[id as usize]
+                    .is_some_and(|l| held.contains(&id) || materials.contains(&l.material.0))
+            })
+            .map(DecalId)
+            .collect();
+        for id in lights {
+            self.empty_light(cpu, id, seq.fetch_add(1, Ordering::Relaxed));
+        }
+        for id in decals {
+            self.empty_decal(cpu, id, seq.fetch_add(1, Ordering::Relaxed));
+        }
+    }
+
     /// Empties every copy of `gone`, whose memory is about to go: placed by hand, or on a page
     /// `holds` says names one of them. Their ranges stay with their owners.
     pub(crate) fn empty_copies(
@@ -2047,6 +2147,9 @@ impl Scene {
                 skin_frame: None,
                 seen_by: Vec::new(),
                 decals: Vec::new(),
+                light_ids: Ids::default(),
+                decal_ids: Ids::default(),
+                partitions: Vec::new(),
                 decal_bins: device.gpu_malloc(dl, 1, "decal bins")?,
                 decal_refs: device.gpu_malloc(dl, 1, "decal runs")?,
                 decals_changed: false,
@@ -3649,28 +3752,53 @@ impl<'f> SceneWriter<'f> {
         Ok(())
     }
 
-    /// Sets or clears light `id`, from this frame on. An id is the light's entry in the
-    /// scene's light table, which grows to hold the highest id set. A sphere of non-zero radius
-    /// and a rect also stand in the scene's ray tracing as a proxy that only the BSDF rays of
-    /// paths meet, weighed against light sampling, and the device's PTLAS takes an instance in
-    /// its global partition for every id up to the highest with a proxy: a set past what it
-    /// takes beside what else is in use fails. Camera, lens, shadow and G-buffer rays do not
-    /// see a proxy, so a light casts no shadow and has no body in the image; a lamp the camera
-    /// sees is an emissive instance.
-    pub fn set_light(&mut self, id: LightId, light: Option<&Light>) -> Result<()> {
+    /// Adds `light` from this frame on, under the lowest id the scene holds free: its entry in
+    /// the scene's light table, which grows to hold the highest id handed out. A sphere of
+    /// non-zero radius and a rect also stand in the scene's ray tracing as a proxy that only
+    /// the BSDF rays of paths meet, weighed against light sampling, and the device's PTLAS
+    /// takes an instance in its global partition for every id up to the highest with a proxy:
+    /// an add or set past what it takes beside what else is in use fails, leaving the scene as
+    /// it was. Camera, lens, shadow and G-buffer rays do not see a proxy, so a light casts no
+    /// shadow and has no body in the image; a lamp the camera sees is an emissive instance.
+    pub fn add_light(&mut self, light: &Light) -> Result<LightId> {
+        let id = LightId(self.scene.cpu.lock().unwrap().light_ids.next());
+        self.put_light(id, light)?;
+        self.scene.cpu.lock().unwrap().light_ids.take(id.0);
+        Ok(id)
+    }
+
+    /// Sets light `id`, which [`Self::add_light`] handed out, to `light` from this frame on.
+    pub fn set_light(&mut self, id: LightId, light: &Light) -> Result<()> {
+        if !self.scene.cpu.lock().unwrap().light_ids.holds(id.0) {
+            return Err(Error::UnknownLight(id));
+        }
+        self.put_light(id, light)
+    }
+
+    /// Removes light `id` from this frame on; the scene hands its id out again once this frame
+    /// has completed.
+    pub fn remove_light(&mut self, id: LightId) -> Result<()> {
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
+        if !cpu.light_ids.holds(id.0) {
+            return Err(Error::UnknownLight(id));
+        }
+        let seq = self.next_seq();
+        self.scene.empty_light(cpu, id, seq);
+        cpu.light_ids.remove(id.0, self.frame);
+        Ok(())
+    }
+
+    fn put_light(&mut self, id: LightId, light: &Light) -> Result<()> {
         let proxied = matches!(
             light,
-            Some(Light::Sphere { radius, .. }) if *radius > 0.0
-        ) || matches!(light, Some(Light::Rect { .. }));
+            Light::Sphere { radius, .. } if *radius > 0.0
+        ) || matches!(light, Light::Rect { .. });
         let table = &self.scene.tables.lights;
         let held = table.capacity();
         let entries = if id.0 < held {
             held
-        } else if light.is_some() {
-            grown_to_hold("lights", held, id.0, table.limit())?
         } else {
-            // An id past the table holds no light to clear.
-            return Ok(());
+            grown_to_hold("lights", held, id.0, table.limit())?
         };
         // Window room, then the PTLAS's, then the table's memory, each before anything
         // changes: a set that finds one missing leaves the scene as it was, and an id the PTLAS
@@ -3686,35 +3814,57 @@ impl<'f> SceneWriter<'f> {
         }
         table.grow(room, entries);
         cpu.ptlas.set_light(id.0, proxied);
-        cpu.lights.set(id.0, light);
-        let origin = cpu.origin_cell;
-        out[0] = light.map_or_else(LightGpu::zeroed, |l| light_gpu(l, origin, self.cell_log2));
+        cpu.lights.set(id.0, Some(light));
+        out[0] = light_gpu(light, cpu.origin_cell, self.cell_log2);
         cpu.records
             .push(Record::values(self.next_seq(), table.entry(id.0), src, 1));
         Ok(())
     }
 
-    /// Sets or clears decal `id`, from this frame on. An id is the decal's entry in the
-    /// scene's decal table, which grows to hold the highest id set.
-    pub fn set_decal(&mut self, id: DecalId, decal: Option<&Decal>) -> Result<()> {
+    /// Adds `decal` from this frame on, under the lowest id the scene holds free: its entry in
+    /// the scene's decal table, which grows to hold the highest id handed out.
+    pub fn add_decal(&mut self, decal: &Decal) -> Result<DecalId> {
+        let id = DecalId(self.scene.cpu.lock().unwrap().decal_ids.next());
+        self.put_decal(id, decal)?;
+        self.scene.cpu.lock().unwrap().decal_ids.take(id.0);
+        Ok(id)
+    }
+
+    /// Sets decal `id`, which [`Self::add_decal`] handed out, to `decal` from this frame on.
+    pub fn set_decal(&mut self, id: DecalId, decal: &Decal) -> Result<()> {
+        if !self.scene.cpu.lock().unwrap().decal_ids.holds(id.0) {
+            return Err(Error::UnknownDecal(id));
+        }
+        self.put_decal(id, decal)
+    }
+
+    /// Removes decal `id` from this frame on; the scene hands its id out again once this frame
+    /// has completed.
+    pub fn remove_decal(&mut self, id: DecalId) -> Result<()> {
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
+        if !cpu.decal_ids.holds(id.0) {
+            return Err(Error::UnknownDecal(id));
+        }
+        let seq = self.next_seq();
+        self.scene.empty_decal(cpu, id, seq);
+        cpu.decal_ids.remove(id.0, self.frame);
+        Ok(())
+    }
+
+    fn put_decal(&mut self, id: DecalId, decal: &Decal) -> Result<()> {
         let table = &self.scene.tables.decals;
         let held = table.capacity();
-        // An id past the table holds no decal to clear.
         if id.0 >= held {
-            if decal.is_none() {
-                return Ok(());
-            }
             let entries = grown_to_hold("decals", held, id.0, table.limit())?;
             table.reserve(self.device, entries)?;
         }
-        let record = decal.map_or_else(DecalGpu::zeroed, |d| decal_gpu(d, self.cell_log2));
-        let copy = self.staged(table.entry(id.0), &record)?;
+        let copy = self.staged(table.entry(id.0), &decal_gpu(decal, self.cell_log2))?;
         let cpu = &mut *self.scene.cpu.lock().unwrap();
         let at = id.0 as usize;
         if at >= cpu.decals.len() {
             cpu.decals.resize(at + 1, None);
         }
-        cpu.decals[at] = decal.map(|d| listing(d, self.cell_log2));
+        cpu.decals[at] = Some(listing(decal, self.cell_log2));
         cpu.decals_changed = true;
         cpu.records.push(copy);
         Ok(())
@@ -3739,7 +3889,7 @@ impl<'f> SceneWriter<'f> {
             // An id past the table holds no proxy to clear.
             return Ok(());
         };
-        // As `set_light` takes its room.
+        // As `add_light` takes its room.
         let record = proxy.map_or_else(MediumProxyGpu::zeroed, |p| proxy_gpu(p, self.cell_log2));
         let src = self.window.put(self.device, &record)?;
         let cpu = &mut *self.scene.cpu.lock().unwrap();

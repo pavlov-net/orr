@@ -17,7 +17,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::blob::{put_table, read, table};
+use crate::blob::{put_table, read, table, text};
 use crate::texture::FormatInfo;
 use crate::{Error, Result, Span};
 
@@ -148,12 +148,7 @@ impl RasterSetInfo {
             if l.tile_size == 0 || l.lod_count == 0 || l.lod_count > 24 || l.reduction > 3 {
                 return Err(Error::Malformed("raster layer"));
             }
-            let at = l.name.first as usize;
-            let name = at
-                .checked_add(l.name.count as usize)
-                .and_then(|end| name_bytes.get(at..end))
-                .and_then(|b| std::str::from_utf8(b).ok())
-                .ok_or(Error::Malformed("raster layer name"))?;
+            let name = text(&name_bytes, l.name).ok_or(Error::Malformed("raster layer name"))?;
             names.push(name.to_owned());
         }
         for (i, t) in tiles.iter().enumerate() {
