@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 /// The Slang release orr builds with. The check is exact: the committed bindings are for this
 /// release.
 // renovate: datasource=github-releases depName=shader-slang/slang
-pub(crate) const SLANG_VERSION: &str = "2026.22";
+pub(crate) const SLANG_VERSION: &str = "2026.22.1";
 
 pub(crate) enum Missing {
     /// `ORR_SLANGC` is set but is not the absolute path of an existing file.

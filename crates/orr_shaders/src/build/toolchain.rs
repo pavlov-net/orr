@@ -1,6 +1,6 @@
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use super::Error;
 use super::locate::{self, Missing, SLANG_VERSION};
@@ -14,6 +14,7 @@ pub(super) const SLANGC_OPTIONS: &[&str] = &[
     "2026",
     "-validate-uniformity",
     "-restrictive-capability-check",
+    "-validate-with-downstream-compiler",
     "-target",
     "spirv",
     "-profile",
@@ -49,7 +50,6 @@ pub(super) fn load() -> Result<Arc<Library>, Error> {
             searched_from: start,
         },
     })?;
-    enable_spirv_validation();
     load_library(&library_path(locate::release_dir(&slangc)))
 }
 
@@ -62,20 +62,6 @@ pub(super) fn load_library(path: &Path) -> Result<Arc<Library>, Error> {
     check_version(path, &lib.build_tag())?;
     Ok(lib)
 }
-
-/// Slang runs its bundled SPIR-V validator only when `SLANG_RUN_SPIRV_VALIDATION` is set.
-fn enable_spirv_validation() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        if env::var_os(VALIDATION_VAR).is_none_or(|v| v != "1") {
-            // SAFETY: runs once, before any Slang library in this process compiles, and
-            // build scripts read no environment concurrently with locating the toolchain.
-            unsafe { env::set_var(VALIDATION_VAR, "1") };
-        }
-    });
-}
-
-const VALIDATION_VAR: &str = "SLANG_RUN_SPIRV_VALIDATION";
 
 fn library_path(release: &Path) -> PathBuf {
     if cfg!(windows) {

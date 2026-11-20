@@ -1,8 +1,8 @@
 // A large layered ground surface, for the stage caps on linked code: a pair of sets picked from a
 // control texture's 2x2 texels, blended by height with a sward and a snow layer and a three-plane
 // cliff projection, each set three textures read with three hex-bombed taps, then macro color,
-// canopy, cavity and wetness. It loops over its layers and taps: unrolled, its stages are about
-// twice the caps.
+// canopy, cavity and wetness. It unrolls the taps but loops over its layers: with the layers
+// unrolled too, its stages are over the caps.
 module strata;
 
 import orr_scene.surface;
@@ -132,6 +132,7 @@ SetRead bombed(SetRef r, UvFootprint f, MaterialGpu* m)
     hex_vertices(f.uv * r.tiling, v, w);
     SetRead sum = zero_read();
     float total = 0.0;
+    [ForceUnroll]
     for (uint k = 0; k < TAPS; k++)
     {
         SetRead t = tap(r, f, m, v[k]);

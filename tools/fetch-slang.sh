@@ -64,7 +64,7 @@
 set -euo pipefail
 
 # renovate: datasource=github-releases depName=shader-slang/slang
-slang_version=2026.22
+slang_version=2026.22.1
 # renovate: datasource=git-refs depName=adobe/openpbr-bsdf packageName=https://github.com/adobe/openpbr-bsdf branch=main
 openpbr_commit=c91aad1d1ce1693e803f039d7c92c2965c4eb013
 # renovate: datasource=github-releases depName=g-truc/glm
@@ -105,26 +105,26 @@ case "$(uname -s)" in
     case "${SLANG_ASSET:-default}" in
       default)
         asset=slang-$slang_version-linux-x86_64.tar.gz
-        # renovate: datasource=github-release-attachments depName=shader-slang/slang digestVersion=v2026.22
-        sum=a877b75c6ec515f5d8bf66ea4bae4f0a5ba85050b9540c2046670285808347e6 ;;
+        # renovate: datasource=github-release-attachments depName=shader-slang/slang digestVersion=v2026.22.1
+        sum=37156099ebaabf62cd92522eba55eb93b8663e65ea3be618ce015d9a8edda6bc ;;
       glibc-2.28)
         asset=slang-$slang_version-linux-x86_64-glibc-2.28.tar.gz
-        # renovate: datasource=github-release-attachments depName=shader-slang/slang digestVersion=v2026.22
-        sum=35c765d20b69f6217b02848cdb82a5216bf03990044a8991ceb0b89a198a80fb ;;
+        # renovate: datasource=github-release-attachments depName=shader-slang/slang digestVersion=v2026.22.1
+        sum=0c0e243ac15b7878237e6854313f45c791408227d5bc634f3ad1ac487edbfaf5 ;;
       *) echo "unknown SLANG_ASSET '$SLANG_ASSET' (default or glibc-2.28)" >&2; exit 1 ;;
     esac ;;
   Darwin)
     case "$(uname -m)" in
       arm64)
         asset=slang-$slang_version-macos-aarch64.tar.gz
-        # renovate: datasource=github-release-attachments depName=shader-slang/slang digestVersion=v2026.22
-        sum=885b5bd9a79a1ae81fdb92212f5f7c785001f870d45c39f9bb5df01339db3fea ;;
+        # renovate: datasource=github-release-attachments depName=shader-slang/slang digestVersion=v2026.22.1
+        sum=1d5370a07be409b94685ea4bd84b7bd191313a6b1fae8795f451009bc0dc3fd7 ;;
       *) echo "unsupported macOS architecture $(uname -m) (Apple silicon only)" >&2; exit 1 ;;
     esac ;;
   MINGW*|MSYS*|CYGWIN*)
     asset=slang-$slang_version-windows-x86_64.zip
-    # renovate: datasource=github-release-attachments depName=shader-slang/slang digestVersion=v2026.22
-    sum=dd0c4a86bd44cdb7e9cf712af0c8ebf2fff1bba19fa5e3c128ff87384e8ff17b ;;
+    # renovate: datasource=github-release-attachments depName=shader-slang/slang digestVersion=v2026.22.1
+    sum=e72344f7b0323cec8b039c534caaf4680e7ba629489fc796ea4c7f7adb7deb68 ;;
   *) echo "unsupported host $(uname -s)" >&2; exit 1 ;;
 esac
 
