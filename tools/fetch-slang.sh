@@ -22,6 +22,12 @@
 #                    CIE standard illuminant D65 at 1 nm (CIE, CC BY-SA 4.0,
 #                    doi:10.25039/CIE.DS.hjfjmt59), checked against its sha256, which the
 #                    committed D65 samples of the glare weights are checked against
+#   babelcolor/CC_Avg30_spectrum_CGATS.txt
+#                    BabelColor's average ColorChecker reflectance spectra of 2012-04-13
+#                    (https://babelcolor.com/colorchecker-2.htm), checked against its sha256,
+#                    which the rendered ColorChecker is checked against. BabelColor's terms let
+#                    others link to its data but not copy it without consent, so it isn't
+#                    committed.
 #   sky/pragueskymodel/
 #                    PetrVevoda/pragueskymodel at a pinned commit (its solar radiance table)
 #   sky/prague/PragueSkyModelGround.dat
@@ -52,7 +58,8 @@
 # with it. It can't update ntc_windows_zip and ntc_windows_sum, because the zip's name doesn't
 # carry the release tag: an RTXNTC pull request needs both set by hand from the new release.
 # The reference data (the Bruneton sky, the Prague sky model and its dataset, the glTF sample,
-# CIE D65, the GT7 sample and the smoke volume) is fixed and isn't tracked.
+# CIE D65, the ColorChecker spectra, the GT7 sample and the smoke volume) is fixed and isn't
+# tracked.
 #
 # Some SDKs come only from NVIDIA's developer site, which Renovate can't watch. Check these by
 # hand:
@@ -89,6 +96,7 @@ ntc_windows_zip=RTXNTC_windows_x64_v0.10.1b.zip
 ntc_windows_sum=ce87104df62184fd035b4b56fe6ffea870faf82da86295ec5ee6b1909aed9eed
 sky_commit=34f14e745cff948f4ca3157d1b62a445ffa7286f
 d65_sum=e76f210bffff3d552ef7113025da5f325d5dfec200dd4b878b1a2f3a507032cb
+color_checker_sum=f3326175369912b86e49918e13ddd3928f0937e84b16b49b6f2a1a272772b077
 gt7_sum=94df7e7e310b9423ebb5aaaa29416f376ebbae66e0948fb259f8688314b29822
 prague_commit=2385c912e9051c1258013ff8c3ce2e19e10fb917
 prague_ground_id=1IflyFZTJxC_N298yXq_2GK4ycIsVJZk6
@@ -242,6 +250,17 @@ if [ "${ORR_VALIDATION_DATA:-0}" = 1 ]; then
     echo "$d65_sum  $d65.part" | sha256sum -c --quiet -
     mv "$d65.part" "$d65"
     echo "CIE D65 in $d65"
+  fi
+  checker="$tools/babelcolor/CC_Avg30_spectrum_CGATS.txt"
+  if echo "$color_checker_sum  $checker" | sha256sum -c --quiet - 2>/dev/null; then
+    echo "ColorChecker spectra already in $checker"
+  else
+    mkdir -p "$(dirname "$checker")"
+    curl -fsSL --retry 3 -o "$checker.part" \
+      https://babelcolor.com/index_htm_files/CC_Avg30_spectrum_CGATS.txt
+    echo "$color_checker_sum  $checker.part" | sha256sum -c --quiet -
+    mv "$checker.part" "$checker"
+    echo "ColorChecker spectra in $checker"
   fi
   fetch_commit https://github.com/PetrVevoda/pragueskymodel "$prague_commit" "$tools/sky/pragueskymodel"
   ground="$tools/sky/prague/PragueSkyModelGround.dat"
