@@ -1,8 +1,8 @@
 //! Tonemap and compose on the GPU against the same Slang on the CPU target, for SDR, PQ and
-//! scRGB backbuffers.
+//! scRGB backbuffers, and compose against BT.2111's PQ code values.
 
 use half::f16;
-use orr_color::{pq_decode, pq_encode, srgb_decode};
+use orr_color::{Primaries, pq_decode, pq_encode, srgb_decode};
 use orr_output::{
     ComposePass, ComposeRoot, ComposeSource, DisplayHeadroom, DisplayInfo, DisplayRequest,
     Gt7Curve, Gt7Params, OutputFormat, OutputKernels, OutputRoots, ResolvedDisplay, TonemapPass,
@@ -317,5 +317,112 @@ fn sdr_pq_and_scrgb_match_cpu_target() {
         "EDR gray at 1e3 x paper white: {top:?}"
     );
 
+    assert_clean();
+}
+
+/// Paper white of BT.2111's 58% bars: 75% HLG at the 1000 cd/m2 reference.
+const BT2111_WHITE_NITS: f32 = 203.15;
+
+/// ITU-R BT.2111-3, Table 4 (PQ full range, 10 bits): each bar as display-linear color in its
+/// primaries, 1.0 at `BT2111_WHITE_NITS`, and its code values. The 100% bar is at 10000 cd/m2.
+const BT2111_PQ_BARS: [(Primaries, [f32; 3], [u32; 3]); 15] = [
+    (
+        Primaries::Rec2020,
+        [10000.0 / BT2111_WHITE_NITS; 3],
+        [1023; 3],
+    ),
+    (Primaries::Rec2020, [1.0, 1.0, 1.0], [594, 594, 594]),
+    (Primaries::Rec2020, [1.0, 1.0, 0.0], [594, 594, 0]),
+    (Primaries::Rec2020, [0.0, 1.0, 1.0], [0, 594, 594]),
+    (Primaries::Rec2020, [0.0, 1.0, 0.0], [0, 594, 0]),
+    (Primaries::Rec2020, [1.0, 0.0, 1.0], [594, 0, 594]),
+    (Primaries::Rec2020, [1.0, 0.0, 0.0], [594, 0, 0]),
+    (Primaries::Rec2020, [0.0, 0.0, 1.0], [0, 0, 594]),
+    (Primaries::Rec2020, [0.0; 3], [0; 3]),
+    (Primaries::Rec709, [1.0, 1.0, 0.0], [589, 593, 370]),
+    (Primaries::Rec709, [0.0, 1.0, 1.0], [491, 586, 592]),
+    (Primaries::Rec709, [0.0, 1.0, 0.0], [479, 585, 355]),
+    (Primaries::Rec709, [1.0, 0.0, 1.0], [552, 348, 584]),
+    (Primaries::Rec709, [1.0, 0.0, 0.0], [545, 335, 225]),
+    (Primaries::Rec709, [0.0, 0.0, 1.0], [296, 201, 582]),
+];
+
+/// Compose writes BT.2111's PQ bars, Rec.2020 and BT.709 ones, as its code values: the PQ
+/// curve, the full range and the primaries a display-linear source states. f32 PQ math puts
+/// one code within 0.02 of a rounding boundary, so codes may differ by one.
+#[test]
+fn bt2111_pq_bars_compose_to_their_code_values() {
+    let gpu = device();
+    let display = ResolvedDisplay {
+        encoding: OutputFormat::Hdr10Pq,
+        paper_white_nits: BT2111_WHITE_NITS,
+        signal_white_nits: BT2111_WHITE_NITS,
+        peak_nits: 10000.0,
+        black_nits: 0.0,
+    };
+    let kernels = OutputKernels::new(gpu).unwrap();
+    for primaries in [Primaries::Rec2020, Primaries::Rec709] {
+        let bars: Vec<_> = BT2111_PQ_BARS.iter().filter(|b| b.0 == primaries).collect();
+        let extent = [bars.len() as u32, 1];
+        let texture = |format, usage, name| {
+            let desc = TextureDesc::d2(format, extent[0], 1, usage);
+            gpu.create_texture(&desc, TextureMemory::Dedicated, name)
+                .unwrap()
+        };
+        let source = texture(Format::Rgba32Float, TextureUsage::SAMPLED, "bars");
+        let backbuffer = texture(
+            Format::A2b10g10r10Unorm,
+            TextureUsage::STORAGE,
+            "backbuffer",
+        );
+        let mut upload = gpu
+            .gpu_malloc::<[f32; 4]>(MemoryKind::Upload, bars.len() as u64, "bars upload")
+            .unwrap();
+        for (t, b) in upload.as_mut_slice().unwrap().iter_mut().zip(&bars) {
+            *t = [b.1[0], b.1[1], b.1[2], 1.0];
+        }
+        let slots = [
+            gpu.alloc_image_slot().unwrap(),
+            gpu.alloc_image_slot().unwrap(),
+        ];
+        let view = ViewDesc::default();
+        let source_index = gpu.write_sampled(slots[0], &source, &view);
+        let target = gpu.write_storage(slots[1], &backbuffer, &view);
+        let queue = gpu.queue(QueueKind::Render).unwrap();
+        let mut list = queue.command_list().unwrap();
+        list.discard(&source);
+        list.discard(&backbuffer);
+        let whole = TextureRegion::whole_mip(source.desc(), 0);
+        list.copy_to_texture(&source, &whole, upload.gpu().cast());
+        list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
+        let mut root = ComposeRoot::new(gpu).unwrap();
+        kernels.compose(
+            &mut list,
+            &mut root,
+            &ComposePass {
+                source: ComposeSource::Linear(source_index, primaries),
+                ui: None,
+                target,
+                extent,
+                display: &display,
+            },
+        );
+        let point = queue.submit(vec![list], &[]).unwrap();
+        wait(point);
+        for slot in slots {
+            gpu.free_image_slot(slot, point);
+        }
+        let texels = read_texture(&backbuffer, &whole);
+        for (t, b) in texels.as_chunks::<4>().0.iter().zip(&bars) {
+            let v = u32::from_le_bytes(*t);
+            let got = [0, 10, 20].map(|shift| (v >> shift) & 0x3ff);
+            assert!(
+                (0..3).all(|c| got[c].abs_diff(b.2[c]) <= 1),
+                "{primaries:?} bar {:?}: codes {got:?}, BT.2111 {:?}",
+                b.1,
+                b.2
+            );
+        }
+    }
     assert_clean();
 }

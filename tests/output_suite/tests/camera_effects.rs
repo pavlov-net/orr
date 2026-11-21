@@ -1179,10 +1179,16 @@ mod glare {
         for _ in 0..3 {
             telemetry = h.frame(1.0, out, Some(display));
         }
+        let to_rec2020 = display
+            .primaries()
+            .rgb()
+            .matrix_to(orr_color::RgbPrimaries::REC2020);
         let rec2020 = h
             .display_linear()
             .iter()
-            .map(|p| orr_color::rec709_to_rec2020([p[0], p[1], p[2]].map(f64::from)).to_array())
+            .map(|p| {
+                (to_rec2020 * orr_math::DVec3::from([p[0], p[1], p[2]].map(f64::from))).to_array()
+            })
             .collect();
         let exposure = f64::from(orr_output::exposure_from_ev100(telemetry.adapted_ev100));
         (rec2020, exposure, f64::from(telemetry.pre_exposure))
