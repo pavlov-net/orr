@@ -27,7 +27,9 @@
 //! scatter anisotropy, the subsurface radius fields and the surface id have no ratified glTF
 //! source and come from `MaterialPatch`.
 //!
-//! glTF's factors are linear Rec.709 and convert to the linear Rec.2020 of `Material`.
+//! glTF's factors are linear Rec.709 and convert to the linear Rec.2020 of `Material`. Its images
+//! are sRGB Rec.709, so a color image that reads below 0, or a texture override that gives one
+//! other primaries, fails the cook.
 //!
 //! The fields above hold glTF's model until the cook converts them to OpenPBR's
 //! (`ShadingModel::Gltf`), once the textures' facts are known. What each choice gives up, beside

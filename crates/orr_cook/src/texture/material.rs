@@ -109,6 +109,9 @@ pub struct TextureRules {
 pub struct TextureOverride {
     pub max_size: Option<u32>,
     pub atlas_grid: Option<[u16; 2]>,
+    /// Primaries of the matching images' color texels, which take the texels as they are, in
+    /// place of what the image's rules say. glTF images are sRGB Rec.709, so on one any other
+    /// primaries fail the cook.
     pub primaries: Option<Primaries>,
     pub bc_split: Option<bool>,
     /// The source channel each material input reads from the matching images, where they
