@@ -132,7 +132,9 @@ fn usd(
 
 def Xform "World"
 {{
-    def Mesh "Quad"
+    def Mesh "Quad" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
     {{
         int[] faceVertexCounts = [4]
         int[] faceVertexIndices = [0, 1, 2, 3]

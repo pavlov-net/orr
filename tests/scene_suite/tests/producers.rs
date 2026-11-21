@@ -2152,7 +2152,9 @@ def Xform "World"
             uniform matrix4d[] restTransforms = [((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)), ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 1, 0, 1))]
         }
 
-        def Mesh "Body"
+        def Mesh "Body" (
+            prepend apiSchemas = ["MaterialBindingAPI", "SkelBindingAPI"]
+        )
         {
             uniform token subdivisionScheme = "catmullClark"
             int[] faceVertexCounts = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
