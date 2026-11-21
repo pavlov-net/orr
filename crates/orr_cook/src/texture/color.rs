@@ -148,7 +148,7 @@ impl Space {
         gamut: Gamut::REC709,
     };
 
-    /// `rgb` in this space as the linear Rec.709 of material fields.
+    /// `rgb` in this space as linear Rec.709, the space of a shading network's colors.
     pub(crate) fn to_rec709(self, rgb: [f32; 3]) -> [f32; 3] {
         let linear = DVec3::from(rgb.map(|v| f64::from(self.transfer.decode(v))));
         (self.gamut.matrix_to(RgbPrimaries::REC709) * linear)

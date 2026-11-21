@@ -75,8 +75,11 @@ fn dir(elevation: f64, azimuth: f64) -> Vec3 {
 fn suns(degrees: f64) -> [DirectionalLight; 2] {
     let sun = solar_disc(dir(3.0 + 0.4 * degrees, -30.0 + degrees));
     let base = solar_disc(dir(8.0 - 0.1 * degrees, -8.0 + 0.5 * degrees));
+    // The tint multiplies the sun's Rec.709 color, the space the examples state colors in.
+    let to_rec709 = orr_color::RgbPrimaries::REC2020.matrix_to(orr_color::RgbPrimaries::REC709);
+    let tinted = (to_rec709 * base.illuminance.as_dvec3()).as_vec3() * Vec3::new(0.30, 0.13, 0.06);
     let second = DirectionalLight {
-        illuminance: base.illuminance * orr_examples::rec2020([0.30, 0.13, 0.06]),
+        illuminance: orr_examples::rec2020(tinted),
         angular_radius: 3.0 * base.angular_radius,
         ..base
     };

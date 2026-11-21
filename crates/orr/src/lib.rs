@@ -280,7 +280,8 @@ pub struct RenderedView {
     pub reconstruction: Option<ReconstructionMode>,
     /// RGBA16F linear Rec.2020 pre-exposed radiance at the output extent, as ray
     /// reconstruction, or lighting without it, `hooks.scene_referred` and motion blur left it.
-    /// With a `display_linear` hook it holds that hook's source instead.
+    /// With a `display_linear` hook it holds that hook's source instead: tonemap's output, in
+    /// `linear_primaries`.
     pub radiance: TextureIndex,
     /// RGBA16F display-linear color in `linear_primaries`, 1.0 = paper white, at the output
     /// extent; `NONE` when the view stopped after exposure.
