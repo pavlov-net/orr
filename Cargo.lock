@@ -2319,6 +2319,7 @@ dependencies = [
  "half",
  "logos",
  "lz4_flex",
+ "memmap2",
  "num-traits",
  "regex-lite",
  "rustc-hash",

@@ -33,7 +33,7 @@ meshopt.workspace = true
 mimalloc = { version = "=0.1.52", default-features = false }
 moxcms = "0.9"
 # Exact pins: no stable API before 1.0, and their composition and schema logic shape cooked meshes.
-openusd = "=0.9.0"
+openusd = { version = "=0.9.0", features = ["mmap"] }
 openusd-schemas = { version = "=0.9.0", features = ["geom", "lux", "media", "physics", "proc", "shade", "skel", "vol"] }
 orr_math.workspace = true
 percent-encoding = "2.3"

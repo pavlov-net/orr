@@ -413,6 +413,8 @@ pub(crate) enum Layer {
 
 pub(crate) enum ImageData {
     Bytes(Vec<u8>),
+    /// A view of bytes something else holds, such as a mapped package's entry.
+    Shared(openusd::ar::SharedBuffer),
     /// A file, read when needed. [`image_facts`] reads it first and records its hash and
     /// length, which guard the later reads.
     File {
@@ -456,6 +458,7 @@ impl ImageFile {
     fn bytes(&self) -> Result<Cow<'_, [u8]>> {
         match &self.data {
             ImageData::Bytes(b) => Ok(Cow::Borrowed(b)),
+            ImageData::Shared(b) => Ok(Cow::Borrowed(b)),
             ImageData::File {
                 path,
                 read: Some((hash, _)),
@@ -480,6 +483,7 @@ impl ImageFile {
     fn len(&self) -> u64 {
         match &self.data {
             ImageData::Bytes(b) => b.len() as u64,
+            ImageData::Shared(b) => b.len() as u64,
             ImageData::File { read, .. } => read.map_or_default(|r| r.1),
             ImageData::Unread(_) | ImageData::Solid(_) | ImageData::Tiles(_) => 0,
         }
@@ -644,6 +648,7 @@ pub(crate) fn image_facts(
             let file = &images[i];
             let (bytes, hash, read) = match &file.data {
                 ImageData::Bytes(b) => (Cow::Borrowed(b.as_slice()), Hash32::of(b), None),
+                ImageData::Shared(b) => (Cow::Borrowed(&b[..]), Hash32::of(b), None),
                 ImageData::File { path, layer, .. } => match memo.read(path) {
                     Ok((bytes, hash)) => {
                         let read = Some((hash, bytes.len() as u64));

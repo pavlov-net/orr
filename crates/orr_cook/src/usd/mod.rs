@@ -116,11 +116,12 @@
 //! mesh: the `Material` `ComputeBoundMaterial` resolves for the `full` purpose, through direct
 //! and collection bindings, `bindMaterialAs` and the binding's target, counting bindings on
 //! prims without `MaterialBindingAPI` as USD does by default, which one warning of the stage
-//! counts; a binding to another type of prim binds nothing, with a warning. Materials map as
-//! [`crate::shading`] lists and are named by their prim path ([`MaterialBase::Path`]),
-//! [`MaterialBase::Default`] for unbound faces; faces of a `doubleSided` mesh take a
-//! double-sided copy ([`Variant::DoubleSided`]). Meshes that differ in what they hold for a
-//! material's primvar readers take a copy each ([`Variant::Primvars`]).
+//! counts; a binding to another type of prim, and a collection binding to a collection not
+//! applied, bind nothing, with a warning. Materials map as [`crate::shading`] lists and are
+//! named by their prim path ([`MaterialBase::Path`]), [`MaterialBase::Default`] for unbound
+//! faces; faces of a `doubleSided` mesh take a double-sided copy ([`Variant::DoubleSided`]).
+//! Meshes that differ in what they hold for a material's primvar readers take a copy each
+//! ([`Variant::Primvars`]).
 
 mod lux;
 mod mesh;
@@ -162,7 +163,7 @@ use crate::shading;
 use crate::shading_model::ShadingModel;
 use crate::skin::{self, Channel, ClipSettings, ClipSource, Rig, RigSpace, Rigging};
 use crate::subd::SubdSettings;
-use crate::texture::material::{ImageData, ImageFile, ImageTile, TextureRules};
+use crate::texture::material::{ImageData, ImageFile, ImageTile, Layer, TextureRules};
 use crate::texture::tiles::udim_cell;
 use crate::{Error, Result};
 
@@ -803,6 +804,8 @@ struct Importer<'s> {
     binding_cache: usd_shade::BindingCache,
     /// The prims that bind a material without `MaterialBindingAPI`, which warn together.
     unapplied: std::collections::BTreeSet<String>,
+    /// The prims whose collection bindings were checked.
+    checked: std::collections::HashSet<String>,
     /// The color spaces of the prims read so far.
     spaces: usd::ColorSpaceCache,
     /// The skinnable prims of the `SkelRoot` nodes populated so far.
@@ -878,6 +881,7 @@ impl<'s> Importer<'s> {
             partition_of: Vec::new(),
             binding_cache: usd_shade::BindingCache::default(),
             unapplied: std::collections::BTreeSet::new(),
+            checked: std::collections::HashSet::new(),
             spaces: usd::ColorSpaceCache::default(),
             skel_cache: RefCell::default(),
             skel_warnings: RefCell::default(),
@@ -3189,6 +3193,13 @@ impl<'s> Importer<'s> {
     fn bound_material(&mut self, prim: &usd::Prim) -> Result<Option<sdf::Path>, String> {
         let path = prim.path().as_str();
         let fail = |e: openusd::Error| format!("{path} material binding: {e}");
+        for p in prim.ancestors() {
+            // A prim checked before was checked with all of its ancestors.
+            if !self.checked.insert(p.path().as_str().to_string()) {
+                break;
+            }
+            self.check_collection_bindings(&p)?;
+        }
         let api = usd_shade::MaterialBindingAPI::from_prim_unchecked(prim.clone());
         let resolved = api.resolve_binding(usd_shade::tokens::FULL, true, &mut self.binding_cache);
         let Some(resolved) = resolved.map_err(fail)? else {
@@ -3209,6 +3220,34 @@ impl<'s> Importer<'s> {
                 Ok(None)
             }
         }
+    }
+
+    /// Warns of the collection bindings `prim` states for the `full` purpose that bind nothing:
+    /// those that target no collection and material, and those that target no applied
+    /// collection.
+    fn check_collection_bindings(&mut self, prim: &usd::Prim) -> Result<(), String> {
+        let fail = |e: openusd::Error| format!("{} material binding: {e}", prim.path().as_str());
+        let api = usd_shade::MaterialBindingAPI::from_prim_unchecked(prim.clone());
+        for purpose in [usd_shade::tokens::ALL_PURPOSE, usd_shade::tokens::FULL] {
+            for rel in api.collection_binding_rels(purpose).map_err(fail)? {
+                let binding = usd_shade::CollectionBinding::new(rel.clone()).map_err(fail)?;
+                let missing = match &binding {
+                    None => "targets no collection and material",
+                    Some(b) if b.collection().map_err(fail)?.is_none() => {
+                        "targets no applied collection"
+                    }
+                    Some(_) => continue,
+                };
+                let targets = rel.targets().map_err(fail)?;
+                let targets: Vec<String> = targets.iter().map(ToString::to_string).collect();
+                self.warnings.push(format!(
+                    "{}: {missing} ({}), so it binds nothing",
+                    rel.path(),
+                    targets.join(", ")
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The scene materials mesh prim `i` binds.
@@ -3276,14 +3315,24 @@ impl<'s> Importer<'s> {
             if let Some(&i) = image_of.get(&key) {
                 return i;
             }
-            let read = |name: String, resolved: &str| match Recorder::new(Rc::clone(&reads))
-                .read(resolved)
-            {
-                Ok(bytes) => ImageFile {
-                    name,
-                    data: ImageData::Bytes(bytes),
-                },
-                Err(e) => ImageFile::unread(name, e.to_string()),
+            // A file of its own is read when the cook needs it, as every importer's is; an entry
+            // of a package is a view of the mapped package.
+            let read = |name: String, resolved: &str| {
+                if !ar::is_package_relative_path(resolved) {
+                    let data = ImageData::File {
+                        path: resolved.into(),
+                        read: None,
+                        layer: Layer::Whole,
+                    };
+                    return ImageFile { name, data };
+                }
+                match Recorder::new(Rc::clone(&reads)).read(resolved) {
+                    Ok(bytes) => ImageFile {
+                        name,
+                        data: ImageData::Shared(bytes),
+                    },
+                    Err(e) => ImageFile::unread(name, e.to_string()),
+                }
             };
             let tiles = a
                 .resolved_path()

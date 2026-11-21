@@ -1245,6 +1245,291 @@ fn a_binding_without_skel_binding_api_binds_nothing() {
     assert!(has(&a, "u/mesh"), "the mesh cooks static");
 }
 
+/// Materials `A`, `B` and `C`, and the materials a cook of `stage` beside them makes, by path, with
+/// `default` for faces bound to none, and its warnings.
+fn bound_by(name: &str, stage: &str) -> (Vec<&'static str>, Vec<String>) {
+    let surface = |m: &str| {
+        format!(
+            "def Material \"{m}\"\n{{\n    token outputs:surface.connect = </{m}/S.outputs:surface>\n    \
+             def Shader \"S\"\n    {{\n        uniform token info:id = \"UsdPreviewSurface\"\n        \
+             token outputs:surface\n    }}\n}}\n"
+        )
+    };
+    let body = format!(
+        "{}{}{}{}",
+        surface("A"),
+        surface("B"),
+        surface("C"),
+        stage.replace("TRI", TRIANGLE)
+    );
+    let (a, warnings) = cook_with_warnings(&dir(name), &body, Subdivision::Hull);
+    let named = |m: &MaterialBase| has(&a, &MaterialName::new(m.clone()).entry("u"));
+    let mut out: Vec<&str> = ["/A", "/B", "/C"]
+        .into_iter()
+        .filter(|p| named(&MaterialBase::Path((*p).into())))
+        .collect();
+    if named(&MaterialBase::Default) {
+        out.push("default");
+    }
+    (out, warnings)
+}
+
+/// `materialBindingAPI.h`, Bound Material Resolution: a collection binding targets a collection
+/// and a material, and binds the material to the collection's members. Each row's material is
+/// the one USD 26.05's `ComputeBoundMaterial` gives `/W/M`.
+#[test]
+fn collection_bindings_bind_their_members() {
+    let stage = |collection: &str| {
+        r#"def Xform "W" (
+    prepend apiSchemas = ["MaterialBindingAPI", "CollectionAPI:c"]
+)
+{
+    COLLECTION
+    rel material:binding:collection:c = [</W.collection:c>, </B>]
+    def Mesh "M"
+    {
+        TRI
+    }
+}"#
+        .replace("COLLECTION", collection)
+    };
+    let rows: &[(&str, &str, &[&str])] = &[
+        ("includes", "rel collection:c:includes = </W>", &["/B"]),
+        (
+            "excludes",
+            "rel collection:c:includes = </W>\n    rel collection:c:excludes = </W/M>",
+            &["default"],
+        ),
+        (
+            "explicit-only",
+            "uniform token collection:c:expansionRule = \"explicitOnly\"\n    \
+             rel collection:c:includes = </W>",
+            &["default"],
+        ),
+        (
+            "include-root",
+            "uniform bool collection:c:includeRoot = 1",
+            &["/B"],
+        ),
+        (
+            "expression",
+            "uniform pathExpression collection:c:membershipExpression = \"/W/M\"",
+            &["/B"],
+        ),
+        (
+            "expression-elsewhere",
+            "uniform pathExpression collection:c:membershipExpression = \"/W/N\"",
+            &["default"],
+        ),
+    ];
+    for (name, collection, want) in rows {
+        let (got, _) = bound_by(&format!("collection-{name}"), &stage(collection));
+        assert_eq!(got, *want, "{name}");
+    }
+}
+
+/// `materialBindingAPI.h`: at one prim a collection binding that holds the prim beats the direct
+/// binding; down namespace the nearer binding wins unless the farther one is
+/// `strongerThanDescendants`; of several collection bindings on a prim the first in property
+/// order wins. Each row's materials are what USD 26.05's `ComputeBoundMaterial` gives.
+#[test]
+fn collection_bindings_take_their_place_in_resolution() {
+    let api = "prepend apiSchemas = [\"MaterialBindingAPI\", \"CollectionAPI:c\"]";
+    let ancestor = |strength: &str| {
+        format!(
+            r#"def Xform "W" (
+    {api}
+)
+{{
+    rel collection:c:includes = </W>
+    rel material:binding:collection:c = [</W.collection:c>, </B>]{strength}
+    def Mesh "M" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {{
+        TRI
+        rel material:binding = </A>
+    }}
+}}"#
+        )
+    };
+    let stronger = " (\n        bindMaterialAs = \"strongerThanDescendants\"\n    )";
+    let ordered = |names: [&str; 2], order: &str| {
+        format!(
+            r#"def Xform "W" (
+    {api}
+)
+{{
+    {order}
+    rel collection:c:includes = </W>
+    rel material:binding:collection:{} = [</W.collection:c>, </B>]
+    rel material:binding:collection:{} = [</W.collection:c>, </C>]
+    def Mesh "M"
+    {{
+        TRI
+    }}
+}}"#,
+            names[0], names[1]
+        )
+    };
+    let reorder = "reorder properties = [\"material:binding:collection:zeta\", \"material:binding:collection:alpha\"]";
+    let rows: Vec<(&str, String, &[&str])> = vec![
+        (
+            "same-prim",
+            format!(
+                r#"def Mesh "M" (
+    {api}
+)
+{{
+    TRI
+    rel collection:c:includes = </M>
+    rel material:binding = </A>
+    rel material:binding:collection:c = [</M.collection:c>, </B>]
+}}"#
+            ),
+            &["/B"],
+        ),
+        ("ancestor", ancestor(""), &["/A"]),
+        ("stronger-ancestor", ancestor(stronger), &["/B"]),
+        (
+            "stronger-direct-ancestor",
+            format!(
+                r#"def Xform "W" (
+    prepend apiSchemas = ["MaterialBindingAPI"]
+)
+{{
+    rel material:binding = </A>{stronger}
+    def Mesh "M" (
+        {api}
+    )
+    {{
+        TRI
+        rel collection:c:includes = </W/M>
+        rel material:binding:collection:c = [</W/M.collection:c>, </B>]
+    }}
+}}"#
+            ),
+            &["/A"],
+        ),
+        ("by-name", ordered(["zeta", "alpha"], ""), &["/C"]),
+        (
+            "by-property-order",
+            ordered(["alpha", "zeta"], reorder),
+            &["/C"],
+        ),
+        (
+            "collection-elsewhere",
+            r#"def Scope "Sets" (
+    prepend apiSchemas = ["CollectionAPI:c"]
+)
+{
+    rel collection:c:includes = </W/M>
+}
+def Xform "W" (
+    prepend apiSchemas = ["MaterialBindingAPI"]
+)
+{
+    rel material:binding:collection:c = [</Sets.collection:c>, </B>]
+    def Mesh "M"
+    {
+        TRI
+    }
+}"#
+            .to_string(),
+            &["/B"],
+        ),
+    ];
+    for (name, body, want) in rows {
+        let (got, _) = bound_by(&format!("collection-{name}"), &body);
+        assert_eq!(got, want, "{name}");
+    }
+}
+
+/// A `materialBind` subset is a prim like any other to a collection: one that holds the subset
+/// alone binds its faces and leaves the mesh's, and one that holds the mesh holds the subset too.
+/// A binding to a collection that is not there or not applied binds nothing, and one to a
+/// material that is not there binds the default material, as USD 26.05's `ComputeBoundMaterial`
+/// gives them; both warn.
+#[test]
+fn collection_bindings_reach_subsets_and_warn_of_what_is_missing() {
+    let subset = |includes: &str| {
+        r#"def Xform "W" (
+    prepend apiSchemas = ["MaterialBindingAPI", "CollectionAPI:c"]
+)
+{
+    rel collection:c:includes = INCLUDES
+    rel material:binding:collection:c = [</W.collection:c>, </B>]
+    def Mesh "M"
+    {
+        TRI
+        def GeomSubset "S"
+        {
+            uniform token elementType = "face"
+            uniform token familyName = "materialBind"
+            int[] indices = [0]
+        }
+    }
+}"#
+        .replace("INCLUDES", includes)
+    };
+    assert_eq!(
+        bound_by("collection-subset", &subset("</W/M/S>")).0,
+        ["/B", "default"]
+    );
+    assert_eq!(
+        bound_by("collection-subset-mesh", &subset("</W/M>")).0,
+        ["/B"]
+    );
+
+    let bad = |api: &str, targets: &str| {
+        r#"def Xform "W" (
+    prepend apiSchemas = API
+)
+{
+    rel collection:c:includes = </W>
+    rel material:binding = </A>
+    rel material:binding:collection:c = TARGETS
+    def Mesh "M"
+    {
+        TRI
+    }
+}"#
+        .replace("API", api)
+        .replace("TARGETS", targets)
+    };
+    let applied = r#"["MaterialBindingAPI", "CollectionAPI:c"]"#;
+    for (name, api, targets, want, warning) in [
+        (
+            "gone",
+            applied,
+            "[</W.collection:gone>, </B>]",
+            &["/A"][..],
+            "/W.collection:gone",
+        ),
+        (
+            "unapplied",
+            r#"["MaterialBindingAPI"]"#,
+            "[</W.collection:c>, </B>]",
+            &["/A"],
+            "/W.collection:c",
+        ),
+        (
+            "no-material",
+            applied,
+            "[</W.collection:c>, </Gone>]",
+            &["default"],
+            "/Gone",
+        ),
+    ] {
+        let (got, warnings) = bound_by(&format!("collection-{name}"), &bad(api, targets));
+        assert_eq!(got, want, "{name}");
+        assert!(
+            warnings.iter().any(|w| w.contains(warning)),
+            "{name}: {warnings:?}"
+        );
+    }
+}
+
 /// `materialBindingAPI.h`: a binding's `bindMaterialAs` is `weakerThanDescendants` when not
 /// authored, and `strongerThanDescendants` makes an ancestor's binding win over the bindings
 /// below it, a `materialBind` subset's among them.

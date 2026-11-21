@@ -15,7 +15,7 @@ use orr_pack::Hash32;
 
 use super::VariantSelection;
 use crate::shading;
-use crate::state::{Input, hash_path};
+use crate::state::{Input, hash_file, hash_path};
 use crate::texture::tiles::UDIM_TILES;
 
 /// Identifier of the session layer that carries the manifest's variant selections.
@@ -32,7 +32,8 @@ pub(super) struct Reads {
     pub(super) session: String,
 }
 
-/// The default resolver, recording every file it serves and serving the session layer.
+/// The default resolver, serving files from read-only mappings of them, recording every file it
+/// serves and serving the session layer.
 pub(super) struct Recorder {
     inner: ar::DefaultResolver,
     reads: Rc<RefCell<Reads>>,
@@ -40,10 +41,11 @@ pub(super) struct Recorder {
 
 impl Recorder {
     pub(super) fn new(reads: Rc<RefCell<Reads>>) -> Self {
-        Self {
-            inner: ar::DefaultResolver::new(),
-            reads,
-        }
+        // SAFETY: the cook never writes its sources. Another program that rewrites one in place
+        // while the cook runs breaks the promise; on Windows a mapped file is opened with write
+        // sharing denied, which refuses that program's open, and elsewhere nothing stops it.
+        let inner = unsafe { ar::DefaultResolver::new().map_files() };
+        Self { inner, reads }
     }
 
     /// `asset_path` as a path of a file: a bare one stays bare until a file appears beside the
@@ -87,12 +89,13 @@ impl Recorder {
         id
     }
 
-    /// Reads an asset (an image) by its resolved path, recording its file, which is watched for
-    /// a change when it can't be read.
-    pub(super) fn read(&self, resolved: &str) -> io::Result<Vec<u8>> {
+    /// The bytes of an asset (an image) by its resolved path, as a view of the mapped file that
+    /// holds them, recording its file, which is watched for a change when it can't be read.
+    pub(super) fn read(&self, resolved: &str) -> io::Result<ar::SharedBuffer> {
         let read = self
             .open_asset(&ar::ResolvedPath::new(resolved))
-            .and_then(|mut asset| asset.read_all());
+            .and_then(ar::Asset::into_buffer)
+            .map(ar::AssetBuffer::into_shared);
         if read.is_err() {
             let file = outer(Path::new(resolved));
             self.reads.borrow_mut().absent.insert(file);
@@ -146,19 +149,22 @@ impl Resolver for Recorder {
             return Ok(Box::new(io::Cursor::new(text)));
         }
         let file = outer(resolved);
-        let bytes = self.inner.open_asset(resolved)?.read_all()?;
+        let asset = self.inner.open_asset(resolved)?;
         let whole = file.as_path() == &**resolved;
-        if let std::collections::btree_map::Entry::Vacant(e) =
-            self.reads.borrow_mut().files.entry(file)
-        {
-            let hash = if whole {
-                Hash32::of(&bytes)
-            } else {
-                Hash32::of(&std::fs::read(e.key())?)
-            };
+        let mut reads = self.reads.borrow_mut();
+        let std::collections::btree_map::Entry::Vacant(e) = reads.files.entry(file) else {
+            return Ok(asset);
+        };
+        if !whole {
+            // A package's entry is hashed by the package's whole file.
+            let hash = hash_file(e.key()).map_err(io::Error::other)?;
             e.insert(hash);
+            return Ok(asset);
         }
-        Ok(Box::new(io::Cursor::new(bytes)))
+        // The hash is of the bytes served, which a file that is not mapped is read into.
+        let buffer = asset.into_buffer()?;
+        e.insert(Hash32::of(&buffer));
+        Ok(Box::new(io::Cursor::new(buffer)))
     }
 
     fn is_context_dependent_path(&self, asset_path: &str) -> bool {
