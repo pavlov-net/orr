@@ -75,7 +75,7 @@ fn at(rho: f64) -> f64 {
 /// pixels `pitch_um` across.
 pub fn encircled_rgb(radius: f64, f_number: f64, pitch_um: f64) -> [f64; 3] {
     let mut out = [0.0; 3];
-    for &(lambda, w) in &SPECTRAL_WEIGHTS {
+    for &(lambda, w) in SPECTRAL_WEIGHTS.iter() {
         let e = at(radius * pitch_um / (lambda * f_number));
         for c in 0..3 {
             out[c] += w[c] * e;

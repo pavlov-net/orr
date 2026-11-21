@@ -81,7 +81,7 @@ fn glare_fft(out_dir: &Path) {
     println!("cargo::rerun-if-changed=build");
     let kernel = fft::Kernel::compute(
         &psf::Diaphragm::new(psf::BLADES),
-        &spectral_weights::SPECTRAL_WEIGHTS,
+        &*spectral_weights::SPECTRAL_WEIGHTS,
         psf::REFERENCE_PITCH_UM,
     );
     let bytes: Vec<u8> = kernel

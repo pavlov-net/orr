@@ -1,5 +1,6 @@
 //! Color for orr: RGB primaries and the matrices between them and CIE XYZ, chromaticities,
-//! luminance, and the sRGB, PQ and HLG transfer functions.
+//! the CIE 1931 color matching functions, luminance, and the sRGB, PQ and HLG transfer
+//! functions.
 //!
 //! orr renders in linear Rec.2020. Matrices are [`DMat3`](orr_math::DMat3)s derived in f64
 //! from the chromaticities and act on linear RGB as `m * rgb`:
@@ -21,12 +22,14 @@
 #![forbid(unsafe_code)]
 
 mod chromaticity;
+mod cmf;
 mod luminance;
 mod primaries;
 mod srgb8;
 mod transfer;
 
 pub use chromaticity::{Chromaticity, cat16_rec2020, cie_xyz, delta_uv_1976, uv_1976};
+pub use cmf::{CIE_1931_CMF, CIE_1931_CMF_FIRST_NM, CIE_1931_CMF_STEP_NM};
 pub use luminance::{LUMINOUS_EFFICACY, luminance};
 pub use primaries::{Primaries, RgbPrimaries, rec709_to_rec2020};
 pub use srgb8::{srgb8_decode, srgb8_decode_fixed, srgb8_encode, srgb8_encode_fixed};

@@ -21,7 +21,7 @@
 #   cie/CIE_std_illum_D65.csv
 #                    CIE standard illuminant D65 at 1 nm (CIE, CC BY-SA 4.0,
 #                    doi:10.25039/CIE.DS.hjfjmt59), checked against its sha256, which the
-#                    committed glare weights are checked against
+#                    committed D65 samples of the glare weights are checked against
 #   sky/pragueskymodel/
 #                    PetrVevoda/pragueskymodel at a pinned commit (its solar radiance table)
 #   sky/prague/PragueSkyModelGround.dat

@@ -14,7 +14,7 @@ use std::sync::LazyLock;
 use orr_color::{LUMINOUS_EFFICACY, RgbPrimaries};
 use orr_math::DVec3;
 
-use crate::spectrum_data::{COLOR_MATCHING, OZONE_CROSS_SECTION, SOLAR_IRRADIANCE};
+use crate::spectrum_data::{OZONE_CROSS_SECTION, SOLAR_IRRADIANCE};
 
 /// Wavelength groups in the LUT passes; each is `BINS / SPECTRAL_GROUPS` adjacent 10 nm bins.
 pub const SPECTRAL_GROUPS: usize = 12;
@@ -36,6 +36,20 @@ const _: () = assert!(
 
 const FIRST_NM: f64 = 360.0;
 const BIN_NM: f64 = 10.0;
+
+/// CIE 1931 2-degree x, y and z at each bin's first wavelength: every other 5 nm row.
+const COLOR_MATCHING: [[f64; 3]; BINS] = {
+    use orr_color::{CIE_1931_CMF, CIE_1931_CMF_FIRST_NM, CIE_1931_CMF_STEP_NM};
+    assert!(CIE_1931_CMF_FIRST_NM == FIRST_NM && 2.0 * CIE_1931_CMF_STEP_NM == BIN_NM);
+    let mut out = [[0.0; 3]; BINS];
+    let mut i = 0;
+    while i < BINS {
+        out[i] = CIE_1931_CMF[2 * i];
+        i += 1;
+    }
+    out
+};
+
 /// Rayleigh scattering of Earth's sea-level air at 1 um, 1/m (scales as lambda^-4).
 const RAYLEIGH_1UM: f64 = 1.24062e-6;
 

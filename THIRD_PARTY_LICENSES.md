@@ -9,12 +9,12 @@ CIE 2019, CIE standard illuminant D65, International Commission on Illumination 
 Vienna, Austria. DOI: [10.25039/CIE.DS.hjfjmt59](https://doi.org/10.25039/CIE.DS.hjfjmt59).
 Licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
 
-`crates/orr_output/build/spectral_weights.rs` is adapted from this data and is offered
-under the same license: sampled every 5 nm from 360 to 830 nm, multiplied by the CIE 1931
-color matching functions, converted to Rec.2020 and normalized per channel.
+`crates/orr_output/build/d65.in` is adapted from this data and is offered under the same
+license: sampled every 5 nm from 360 to 830 nm.
 
-`crates/orr_output/src/glare_tables.rs` and the glare FFT table generated at build time
-are computed from that file.
+`crates/orr_output/build/spectral_weights.rs` computes spectral weights from that file and
+the CIE 1931 color matching functions, and `crates/orr_output/src/glare_tables.rs` and the
+glare FFT table generated at build time are computed from those weights.
 
 ## NormalTangentMirrorTest
 
@@ -68,9 +68,9 @@ leaves that API out.
 
 ## Precomputed Atmospheric Scattering
 
-`crates/orr_atmosphere/src/spectrum_data.rs` holds measured spectra and the CIE 1931 color
-matching functions, and `crates/orr_output/build/spectral_weights.rs` the color matching
-functions, from <https://github.com/ebruneton/precomputed_atmospheric_scattering> at commit
+`crates/orr_atmosphere/src/spectrum_data.rs` holds measured spectra, and
+`crates/orr_color/src/cmf.rs` the CIE 1931 color matching functions, from
+<https://github.com/ebruneton/precomputed_atmospheric_scattering> at commit
 `34f14e745cff948f4ca3157d1b62a445ffa7286f`.
 
 > Copyright (c) 2017 Eric Bruneton

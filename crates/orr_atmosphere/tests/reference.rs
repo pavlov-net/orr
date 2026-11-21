@@ -70,12 +70,13 @@ fn committed_spectrum_data_matches_the_fetched_files() {
         spectrum_data::OZONE_CROSS_SECTION,
         "ozone"
     );
-    // Rows of (wavelength, x, y, z) every 5 nm from 360 nm; the bins take every other row.
+    // Rows of (wavelength, x, y, z) every 5 nm from 360 nm.
     let cie = cpp_array(&constants, "CIE_2_DEG_COLOR_MATCHING_FUNCTIONS[380]");
-    for (i, c) in spectrum_data::COLOR_MATCHING.iter().enumerate() {
-        let row = &cie[8 * i..8 * i + 4];
-        assert_eq!(row[0], 360.0 + 10.0 * i as f64);
-        assert_eq!(&row[1..], c, "color matching at {} nm", row[0]);
+    assert_eq!(cie.len(), 4 * orr_color::CIE_1931_CMF.len());
+    for (i, (row, c)) in cie.chunks(4).zip(&orr_color::CIE_1931_CMF).enumerate() {
+        let nm = orr_color::CIE_1931_CMF_FIRST_NM + orr_color::CIE_1931_CMF_STEP_NM * i as f64;
+        assert_eq!(row[0], nm, "color matching row {i}");
+        assert_eq!(&row[1..], c, "color matching at {nm} nm");
     }
 }
 

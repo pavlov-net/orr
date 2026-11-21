@@ -1,8 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use orr_color::RgbPrimaries;
-
 use super::pyramid::{self, Plane};
+use super::spectral_weights::{D65, SPECTRAL_WEIGHTS};
 use super::{TABLES, encircled_rgb, fft, fft_kernel, fit, psf};
 
 /// `ORR_BLESS=1` rewrites orr_output's `src/glare_tables.rs`.
@@ -14,15 +13,32 @@ fn the_committed_glare_tables_match_the_fit() {
     );
 }
 
-/// Skipped when `tools/fetch-slang.sh` has not fetched the files (`ORR_VALIDATION_DATA=1`).
+/// Skipped when `tools/fetch-slang.sh` has not fetched the file (`ORR_VALIDATION_DATA=1`).
 #[test]
 #[allow(clippy::print_stderr)]
-fn the_spectral_weights_match_the_fetched_files() {
-    let path = "../../crates/orr_output/build/spectral_weights.rs";
-    let committed = include_str!("../../../../crates/orr_output/build/spectral_weights.rs");
-    match spectral_weights_source(committed) {
-        Some(generated) => check_or_bless(path, &generated),
-        None => eprintln!("skipped: D65 or the color matching functions not fetched"),
+fn the_d65_samples_match_the_fetched_file() {
+    let Some(tools) = tools_dir() else {
+        eprintln!("skipped: .tools not found");
+        return;
+    };
+    let Ok(csv) = std::fs::read_to_string(tools.join("cie/CIE_std_illum_D65.csv")) else {
+        eprintln!("skipped: D65 not fetched");
+        return;
+    };
+    let fetched: Vec<(f64, f64)> = csv
+        .lines()
+        .filter_map(|l| {
+            let (nm, v) = l.split_once(',')?;
+            Some((nm.trim().parse().ok()?, v.trim().parse().ok()?))
+        })
+        .collect();
+    for (&(lambda, _), &d65) in SPECTRAL_WEIGHTS.iter().zip(&D65) {
+        let nm = (lambda * 1000.0).round();
+        let &(_, want) = fetched
+            .iter()
+            .find(|&&(n, _)| n == nm)
+            .unwrap_or_else(|| panic!("D65 has no {nm} nm"));
+        assert_eq!(d65, want, "D65 at {nm} nm");
     }
 }
 
@@ -144,10 +160,10 @@ fn check_or_bless(path: &str, generated: &str) {
     );
 }
 
-/// The text of orr_output's `build/spectral_weights.rs` with the header `committed` has, when
-/// `tools/fetch-slang.sh` has fetched the files it comes from (`ORR_VALIDATION_DATA=1`).
-fn spectral_weights_source(committed: &str) -> Option<String> {
-    let tools = std::env::var_os("ORR_TOOLS")
+/// The `.tools` directory `tools/fetch-slang.sh` fills: `ORR_TOOLS`, else the nearest above
+/// this package.
+fn tools_dir() -> Option<PathBuf> {
+    std::env::var_os("ORR_TOOLS")
         .filter(|t| !t.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
@@ -155,56 +171,5 @@ fn spectral_weights_source(committed: &str) -> Option<String> {
                 .ancestors()
                 .map(|d| d.join(".tools"))
                 .find(|d| d.is_dir())
-        })?;
-    let constants = std::fs::read_to_string(
-        tools.join("precomputed_atmospheric_scattering/atmosphere/constants.h"),
-    )
-    .ok()?;
-    let d65 = std::fs::read_to_string(tools.join("cie/CIE_std_illum_D65.csv")).ok()?;
-    let start = constants
-        .find("CIE_2_DEG_COLOR_MATCHING_FUNCTIONS[380]")
-        .unwrap();
-    let open = start + constants[start..].find('{').unwrap();
-    let close = open + constants[open..].find('}').unwrap();
-    // Rows of (wavelength, x, y, z) every 5 nm from 360 nm.
-    let cie: Vec<f64> = constants[open + 1..close]
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().unwrap())
-        .collect();
-    let illuminant: Vec<(f64, f64)> = d65
-        .lines()
-        .filter_map(|l| {
-            let (nm, v) = l.split_once(',')?;
-            Some((nm.trim().parse().ok()?, v.trim().parse().ok()?))
         })
-        .collect();
-    let to_rec2020 = RgbPrimaries::REC2020.xyz_to_rgb();
-    let rows: Vec<(f64, [f64; 3])> = cie
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|r| {
-            let &(_, s) = illuminant
-                .iter()
-                .find(|&&(nm, _)| nm == r[0])
-                .unwrap_or_else(|| panic!("D65 has no {} nm", r[0]));
-            let rgb = to_rec2020.mul_vec3([r[1], r[2], r[3]].into()).to_array();
-            (r[0] / 1000.0, rgb.map(|c| c * s))
-        })
-        .collect();
-    let sums = [0, 1, 2].map(|c| rows.iter().map(|r| r.1[c]).sum::<f64>());
-    let table = "#[rustfmt::skip]\n";
-    let mut s = committed[..committed.find(table).unwrap()].to_owned();
-    s.push_str(table);
-    s.push_str(&format!(
-        "pub const SPECTRAL_WEIGHTS: [(f64, [f64; 3]); {}] = [\n",
-        rows.len()
-    ));
-    for (lambda, w) in rows {
-        let w = [0, 1, 2].map(|c| w[c] / sums[c]);
-        s.push_str(&format!("    ({lambda:?}, {w:?}),\n"));
-    }
-    s.push_str("];\n");
-    Some(s)
 }

@@ -1,6 +1,6 @@
 [package]
 name = "orr_color"
-description = "Color for orr: primaries, RGB and XYZ matrices, luminance and transfer functions, in Rust and Slang."
+description = "Color for orr: primaries, RGB and XYZ matrices, the CIE 1931 color matching functions, luminance and transfer functions, in Rust and Slang."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

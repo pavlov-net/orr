@@ -37,6 +37,7 @@ exr = { version = "1.74", default-features = false }
 moxcms = "0.9"
 
 [build-dependencies]
+orr_color.workspace = true
 cc = { workspace = true, optional = true }
 orr_shaders = { workspace = true, features = ["build"] }
 
