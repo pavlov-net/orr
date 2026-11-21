@@ -2286,8 +2286,10 @@ impl<'a> Packer<'a> {
             };
             return Ok(());
         }
-        // Texels read in their texture's primaries, and a slot's value past 0..1 with them.
+        // Texels read in their texture's primaries, and a slot's value past 0..1 with them; a
+        // radius scale's stands as stated, as its texels do.
         let outside = match primaries {
+            _ if s == slot::SUBSURFACE_RADIUS_SCALE => r.outside,
             Primaries::Rec709 => r.outside,
             p => {
                 let [x, y, z, w] = r.outside;
