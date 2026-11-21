@@ -532,6 +532,12 @@ fn inactive_and_invisible_ids_both_mask() {
     for (name, meta, attrs, want) in [
         ("inactive", "inactiveIds = [ 0 ]", "", vec![2000, 3000]),
         (
+            "prepend",
+            "prepend inactiveIds = [ 0 ]",
+            "",
+            vec![2000, 3000],
+        ),
+        (
             "union",
             "inactiveIds = [ 0 ]",
             "int64[] invisibleIds = [2]",

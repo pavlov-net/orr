@@ -421,7 +421,7 @@ impl Skel {
             None => None,
         };
         let geom_bind = match bind {
-            Some(openusd::sdf::Value::Matrix4d(m)) => matrix(&m.0),
+            Some(openusd::vt::Value::Matrix4d(m)) => matrix(&m.0),
             _ => DMat4::IDENTITY,
         };
         Ok((influences, self.to_bind * geom_bind))

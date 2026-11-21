@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use openusd::{sdf, usd};
+use openusd::{sdf, usd, vt};
 
 use super::read::{PrimReader, numbers};
 use crate::shading::{self, Input, Network, Node, Unit};
@@ -150,7 +150,7 @@ impl Builder<'_> {
             let input = match connections.into_iter().next() {
                 Some(t) => self.source(&t)?,
                 None => match reader.value(&full)? {
-                    Some(sdf::Value::AssetPath(a)) if a.asset_path().is_empty() => continue,
+                    Some(vt::Value::AssetPath(a)) if a.asset_path().is_empty() => continue,
                     Some(v) => self.value(&reader, &full, v)?,
                     None => continue,
                 },
@@ -166,16 +166,16 @@ impl Builder<'_> {
         &mut self,
         reader: &PrimReader<'_>,
         name: &str,
-        v: sdf::Value,
+        v: vt::Value,
     ) -> Result<Input, String> {
         Ok(match v {
-            sdf::Value::AssetPath(a) => Input::Image {
+            vt::Value::AssetPath(a) => Input::Image {
                 image: (self.load)(&a),
                 color_space: reader.metadata_token(name, "colorSpace"),
                 unit: Unit::Unstated,
             },
-            sdf::Value::Token(t) => Input::Text(t.as_str().to_string()),
-            sdf::Value::String(s) => Input::Text(s),
+            vt::Value::Token(t) => Input::Text(t.as_str().to_string()),
+            vt::Value::String(s) => Input::Text(s),
             v => Input::Value(
                 numbers(&v)
                     .ok_or_else(|| format!("{} {name}: unsupported value", reader.path()))?

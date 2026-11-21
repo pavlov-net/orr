@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use openusd::ar::Resolver;
-use openusd::{ar, sdf, usd};
+use openusd::{ar, sdf, usd, vt};
 use orr_math::{DMat4, DQuat, DVec3};
 use orr_pack::Hash32;
 
@@ -249,9 +249,9 @@ pub(super) fn session_layer(variants: &[VariantSelection]) -> Result<String, Str
 
 /// Every number of a value, flattened: vectors by component, quaternions as stored
 /// (w, x, y, z), matrices row by row.
-pub(super) fn numbers(v: &sdf::Value) -> Option<Vec<f64>> {
+pub(super) fn numbers(v: &vt::Value) -> Option<Vec<f64>> {
     use openusd::gf::f16;
-    use sdf::Value as V;
+    use vt::Value as V;
     fn cast<T: bytemuck::Pod, S: bytemuck::Pod + Into<f64>>(v: &[T]) -> Vec<f64> {
         bytemuck::cast_slice::<T, S>(v)
             .iter()
@@ -325,8 +325,8 @@ pub(super) fn numbers(v: &sdf::Value) -> Option<Vec<f64>> {
 }
 
 /// Every integer of a value, as stored: an id past 2^53 does not survive an `f64`.
-pub(super) fn integers(v: &sdf::Value) -> Option<Vec<i64>> {
-    use sdf::Value as V;
+pub(super) fn integers(v: &vt::Value) -> Option<Vec<i64>> {
+    use vt::Value as V;
     Some(match v {
         V::Uchar(x) => vec![i64::from(*x)],
         V::UcharVec(x) => x.iter().map(|&x| i64::from(x)).collect(),
@@ -343,8 +343,8 @@ pub(super) fn integers(v: &sdf::Value) -> Option<Vec<i64>> {
 }
 
 /// The numbers in one element of an array value; `None` for a value that is no array.
-fn element_width(v: &sdf::Value) -> Option<usize> {
-    use sdf::Value as V;
+fn element_width(v: &vt::Value) -> Option<usize> {
+    use vt::Value as V;
     match v {
         V::BoolVec(_)
         | V::UcharVec(_)
@@ -392,10 +392,10 @@ impl PrimReader<'_> {
         self.prim.path().as_str()
     }
 
-    pub(super) fn value(&self, name: &str) -> Result<Option<sdf::Value>, String> {
+    pub(super) fn value(&self, name: &str) -> Result<Option<vt::Value>, String> {
         self.prim
             .attribute(name)
-            .get_at::<sdf::Value>(self.time)
+            .get_at::<vt::Value>(self.time)
             .map_err(|e| format!("{} {name}: {e}", self.path()))
     }
 
@@ -419,28 +419,28 @@ impl PrimReader<'_> {
 
     pub(super) fn token(&self, name: &str) -> Result<Option<String>, String> {
         Ok(match self.value(name)? {
-            Some(sdf::Value::Token(t)) => Some(t.as_str().to_string()),
-            Some(sdf::Value::String(s)) => Some(s),
+            Some(vt::Value::Token(t)) => Some(t.as_str().to_string()),
+            Some(vt::Value::String(s)) => Some(s),
             _ => None,
         })
     }
 
     pub(super) fn tokens(&self, name: &str) -> Result<Vec<String>, String> {
         Ok(match self.value(name)? {
-            Some(sdf::Value::TokenVec(t)) => t.iter().map(|t| t.as_str().to_string()).collect(),
-            Some(sdf::Value::StringVec(s)) => s,
+            Some(vt::Value::TokenVec(t)) => t.iter().map(|t| t.as_str().to_string()).collect(),
+            Some(vt::Value::StringVec(s)) => s,
             _ => Vec::new(),
         })
     }
 
     pub(super) fn metadata_token(&self, name: &str, key: &str) -> Option<String> {
         let a = self.prim.attribute(name);
-        a.get_metadata::<sdf::Value>(key)
+        a.metadata::<vt::Value>(key)
             .ok()
             .flatten()
             .and_then(|v| match v {
-                sdf::Value::Token(t) => Some(t.as_str().to_string()),
-                sdf::Value::String(s) => Some(s),
+                vt::Value::Token(t) => Some(t.as_str().to_string()),
+                vt::Value::String(s) => Some(s),
                 _ => None,
             })
     }
@@ -707,7 +707,7 @@ impl PrimReader<'_> {
     }
 
     /// The numbers of one element of attribute `name` holding `value`, if it holds numbers.
-    fn stride(&self, name: &str, value: &sdf::Value) -> Option<usize> {
+    fn stride(&self, name: &str, value: &vt::Value) -> Option<usize> {
         let width = element_width(value).or_else(|| numbers(value).map(|v| v.len()))?;
         Some(width * self.element_size(name))
     }
@@ -722,7 +722,7 @@ impl PrimReader<'_> {
     pub(super) fn element_size(&self, name: &str) -> usize {
         self.prim
             .attribute(name)
-            .get_metadata::<sdf::Value>("elementSize")
+            .metadata::<vt::Value>("elementSize")
             .ok()
             .flatten()
             .and_then(|v| numbers(&v))

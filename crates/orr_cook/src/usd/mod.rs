@@ -129,7 +129,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use openusd::usd::PathRule;
-use openusd::{sdf, usd};
+use openusd::{sdf, usd, vt};
 use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, DVec4};
 use orr_pack::instance::MotionRow;
 use orr_pack::layout::{Attribute, AttributeValue, Group, LightSource};
@@ -333,21 +333,21 @@ const IMAGEABLE: &[&str] = &[
 
 /// A group attribute's value, its numbers as [`read::integers`] and [`read::numbers`] read
 /// them; `None` for a value of no attribute value type.
-fn attribute_value(v: sdf::Value) -> Option<AttributeValue> {
+fn attribute_value(v: vt::Value) -> Option<AttributeValue> {
     use AttributeValue as A;
-    use sdf::Value as V;
-    fn elements<const N: usize>(v: &sdf::Value) -> Option<Vec<[f64; N]>> {
+    use vt::Value as V;
+    fn elements<const N: usize>(v: &vt::Value) -> Option<Vec<[f64; N]>> {
         Some(read::numbers(v)?.as_chunks::<N>().0.to_vec())
     }
-    fn element<const N: usize>(v: &sdf::Value) -> Option<[f64; N]> {
+    fn element<const N: usize>(v: &vt::Value) -> Option<[f64; N]> {
         read::numbers(v)?.try_into().ok()
     }
     // USD's integer vectors are of `int`, which an `f64` holds exactly.
-    fn ints<const N: usize>(v: &sdf::Value) -> Option<Vec<[i32; N]>> {
+    fn ints<const N: usize>(v: &vt::Value) -> Option<Vec<[i32; N]>> {
         let wide = elements::<N>(v)?;
         Some(wide.into_iter().map(|e| e.map(|x| x as i32)).collect())
     }
-    fn quats(v: &sdf::Value) -> Option<Vec<DQuat>> {
+    fn quats(v: &vt::Value) -> Option<Vec<DQuat>> {
         Some(elements::<4>(v)?.iter().map(|q| read::quat(q)).collect())
     }
     let one = |v: Option<Vec<f64>>| v.map(|v| v[0]);
@@ -831,7 +831,7 @@ impl<'s> Importer<'s> {
             let prim = stage.prim(v.prim.as_str()).map_err(|e| e.to_string())?;
             let chosen = prim
                 .variant_sets()
-                .get_all_variant_selections()
+                .selections()
                 .map_err(|e| e.to_string())?;
             if !chosen
                 .iter()
@@ -891,8 +891,8 @@ impl<'s> Importer<'s> {
     fn stage_to_scene(&self) -> Result<DMat4, String> {
         let up = self.stage.stage_metadata("upAxis");
         let up = match up.map_err(|e| e.to_string())? {
-            Some(sdf::Value::Token(t)) => t.as_str().to_string(),
-            Some(sdf::Value::String(s)) => s,
+            Some(vt::Value::Token(t)) => t.as_str().to_string(),
+            Some(vt::Value::String(s)) => s,
             _ => "Y".into(),
         };
         let axis = match up.as_str() {
@@ -2208,10 +2208,10 @@ impl<'s> Importer<'s> {
                 .get(g.prim.as_str())
                 .ok_or_else(|| format!("group prim {} is not on the stage", g.prim))?;
             let prim = &self.nodes[node].prim;
-            let collection = usd::CollectionAPI::get_instance(prim, g.collection.as_str())
+            let collection = usd::CollectionAPI::from_prim(prim, g.collection.as_str())
                 .map_err(fail)?
                 .ok_or_else(|| format!("{} does not apply collection:{}", g.prim, g.collection))?;
-            queries.push(collection.compute_membership_query().map_err(fail)?);
+            queries.push(collection.membership_query().map_err(fail)?);
             let mut attributes = Vec::new();
             let r = self.reader(prim);
             for ns in &g.attributes {
@@ -2238,7 +2238,7 @@ impl<'s> Importer<'s> {
         let root = sdf::Path::abs_root();
         let seeds: Vec<PathRule> = queries
             .iter()
-            .map(|q| q.is_path_included_below(&root, PathRule::Exclude).1)
+            .map(|q| q.is_included_below(&root, PathRule::Exclude).1)
             .collect();
         let mut rules: Vec<Vec<PathRule>> = Vec::with_capacity(self.nodes.len());
         let mut index: HashMap<Vec<u32>, usize> = HashMap::from([(Vec::new(), 0)]);
@@ -2249,7 +2249,7 @@ impl<'s> Importer<'s> {
             let mut held = Vec::new();
             let mut own = Vec::with_capacity(queries.len());
             for (g, q) in queries.iter().enumerate() {
-                let (included, rule) = q.is_path_included_below(node.prim.path(), above[g]);
+                let (included, rule) = q.is_included_below(node.prim.path(), above[g]);
                 if included {
                     held.push(g as u32);
                 }
@@ -2718,14 +2718,11 @@ impl<'s> Importer<'s> {
             .collect();
         let inactive = node
             .prim
-            .get_metadata::<sdf::Value>("inactiveIds")
+            .metadata::<vt::Value>("inactiveIds")
             .map_err(|e| format!("{path} inactiveIds: {e}"))?;
-        // A crate file holds a list op; text gives a plain list its own type.
         match inactive {
-            Some(sdf::Value::Int64ListOp(op)) => masked.extend(op.flatten()),
-            Some(v) => masked.extend(
-                read::integers(&v).ok_or_else(|| format!("{path} inactiveIds: not integers"))?,
-            ),
+            Some(vt::Value::Int64ListOp(op)) => masked.extend(op.flatten()),
+            Some(_) => return Err(format!("{path} inactiveIds: not an int64 list op")),
             None => {}
         }
         // An attribute of another length than `protoIndices` leaves nothing to place at this time.

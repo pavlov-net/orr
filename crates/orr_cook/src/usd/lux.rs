@@ -1,10 +1,10 @@
 //! UsdLux lights as layout light records ([`LightSource`]), in scene space.
 //!
-//! Every value converts as the UsdLux schema of OpenUSD v26.05 defines it, the release whose
-//! schemas `openusd` 0.8.0 carries: `pxr/usd/usdLux/schema.usda` (cited by its class and
-//! attribute) and `overview.dox`, with the `hdEmbree` delegate, which `overview.dox` names as
-//! the reference implementation, where the text leaves a formula's details to it. An attribute
-//! not authored takes the fallback that class states.
+//! Every value converts as the UsdLux schema of OpenUSD v26.05 defines it:
+//! `pxr/usd/usdLux/schema.usda` (cited by its class and attribute) and `overview.dox`, with the
+//! `hdEmbree` delegate, which `overview.dox` names as the reference implementation, where the
+//! text leaves a formula's details to it. An attribute not authored takes the fallback that class
+//! states.
 //!
 //! - Emission is `L = intensity · 2^exposure · color / sizeFactor` (LightAPI `inputs:intensity`,
 //!   `inputs:exposure`, `inputs:color`), luminance in nits, where `sizeFactor` is 1 without
@@ -34,7 +34,7 @@
 //! color, distance and falloff, a DistantLight without shadows, the non-physical
 //! `inputs:diffuse` and `inputs:specular`, and an input whose time samples change.
 
-use openusd::sdf;
+use openusd::vt;
 use orr_math::{DMat3, DMat4, DVec3};
 use orr_pack::layout::{LightSource, ShapingSource};
 
@@ -71,7 +71,7 @@ const RECORD_EPSILON: f64 = 4.0 * f32::EPSILON as f64;
 
 /// Light input `name` at the import's time; one whose samples change over time fails, as the
 /// record holds one value.
-fn input(r: &PrimReader<'_>, name: &str) -> Result<Option<sdf::Value>, String> {
+fn input(r: &PrimReader<'_>, name: &str) -> Result<Option<vt::Value>, String> {
     if r.varies(name)? {
         return Err(format!(
             "{} {name}: a light input sampled over time is not cooked",
@@ -102,7 +102,7 @@ fn triple(r: &PrimReader<'_>, name: &str, fallback: [f64; 3]) -> Result<DVec3, S
 fn flag(r: &PrimReader<'_>, name: &str, fallback: bool) -> Result<bool, String> {
     match input(r, name)? {
         None => Ok(fallback),
-        Some(sdf::Value::Bool(b)) => Ok(b),
+        Some(vt::Value::Bool(b)) => Ok(b),
         Some(_) => Err(format!("{} {name}: not a bool", r.path())),
     }
 }
