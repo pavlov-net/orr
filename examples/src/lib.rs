@@ -408,6 +408,48 @@ impl Capture {
     }
 }
 
+/// A display-linear Rec.709 RGBA image, 1.0 at paper white, rows top to bottom.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinearCapture {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<[f32; 4]>,
+}
+
+impl LinearCapture {
+    /// A capture of tightly packed Rgba16Float texels read back from an image.
+    pub fn from_rgba16f(extent: [u32; 2], texels: &Allocation<[u16; 4]>) -> Self {
+        let rgba = texels
+            .as_slice()
+            .expect("readback")
+            .iter()
+            .map(|t| t.map(|h| half::f16::from_bits(h).to_f32()))
+            .collect();
+        LinearCapture {
+            width: extent[0],
+            height: extent[1],
+            rgba,
+        }
+    }
+
+    /// The image encoded as opaque 8-bit sRGB.
+    pub fn srgb8(&self) -> Capture {
+        let rgba8 = self
+            .rgba
+            .iter()
+            .flat_map(|p| {
+                let [r, g, b, _] = p.map(orr_color::srgb8_encode);
+                [r, g, b, 255]
+            })
+            .collect();
+        Capture {
+            width: self.width,
+            height: self.height,
+            rgba8,
+        }
+    }
+}
+
 /// Linear Rec.709 `c`, the space the examples state their colors in, as the linear Rec.2020 the
 /// renderer takes.
 pub fn rec2020(c: impl Into<orr_math::Vec3>) -> orr_math::Vec3 {

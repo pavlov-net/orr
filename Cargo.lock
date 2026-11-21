@@ -2477,6 +2477,7 @@ dependencies = [
  "bytemuck",
  "egui",
  "env_logger",
+ "half",
  "log",
  "orr",
  "orr_atmosphere",

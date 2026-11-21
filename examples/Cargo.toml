@@ -30,6 +30,7 @@ orr_shaders.workspace = true
 orr_atmosphere.workspace = true
 bytemuck.workspace = true
 env_logger.workspace = true
+half.workspace = true
 log.workspace = true
 png.workspace = true
 # Downloads scenes published online.

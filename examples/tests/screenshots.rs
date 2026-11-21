@@ -58,7 +58,8 @@ use orr_examples::linked::KERNELS;
 use orr_examples::mesh::MeshBuilder;
 use orr_examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
 use orr_examples::{
-    Capture, Options, Workers, assert_clean, device, enable_reconstruction, fixed_time, mount_at,
+    Capture, LinearCapture, Options, Workers, assert_clean, device, enable_reconstruction,
+    fixed_time, mount_at,
 };
 use orr_math::camera::rh::view;
 use orr_math::{Affine3, DVec3, Quat, Vec3};
@@ -103,6 +104,36 @@ fn image(c: Capture) -> Image {
         height: c.height,
         pixels: Pixels::Rgba8(c.rgba8),
     }
+}
+
+/// `native` and `upscaled` as 8-bit sRGB images that quantize their difference rather than each
+/// image: native's codes round as a capture's do, and upscaled's are native's plus 255 times the
+/// difference of their encodings, rounded. Two values under half a code apart then give the same
+/// code wherever they sit between codes, and wider differences survive.
+fn quantized_difference(native: &LinearCapture, upscaled: &LinearCapture) -> (Image, Image) {
+    assert_eq!(
+        (native.width, native.height),
+        (upscaled.width, upscaled.height)
+    );
+    // Clamped as `srgb8_encode` clamps, NaN to 0.
+    let encode = |c: f32| orr_color::srgb_encode(f64::from(if c > 0.0 { c.min(1.0) } else { 0.0 }));
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for (n, u) in native.rgba.iter().zip(&upscaled.rgba) {
+        for c in 0..3 {
+            let code = orr_color::srgb8_encode(n[c]);
+            let step = (255.0 * (encode(u[c]) - encode(n[c]))).round();
+            a.push(code);
+            b.push((f64::from(code) + step) as u8);
+        }
+        a.push(255);
+        b.push(255);
+    }
+    let image = |pixels| Image {
+        width: native.width,
+        height: native.height,
+        pixels: Pixels::Rgba8(pixels),
+    };
+    (image(a), image(b))
 }
 
 fn compare(name: &str, c: Capture) {
@@ -259,15 +290,18 @@ fn super_resolution_matches_the_native_render() {
         let preset = sr.preset.expect("NGX's log names the applied SR preset");
         log::info!("SR preset {preset}");
     }
-    let error = flip(
-        &image(native.capture.expect("native capture")),
-        &image(sr.capture.expect("SR capture")),
+    let (native, sr) = quantized_difference(
+        &native.capture.expect("native capture"),
+        &sr.capture.expect("SR capture"),
     );
+    let error = flip(&native, &sr);
     log::info!("upscaled at Quality: FLIP {error:?} against the native render");
-    // DLSS: measured mean 0.0086 and p99 0.141 (preset K); the jitter sign flipped gives
-    // 0.0118 and 0.189. MetalFX (Apple M5): 0.0090 and 0.149.
+    // DLSS: measured mean 0.0064 and p99 0.140 (preset K); the jitter sign flipped gives
+    // 0.0096 and 0.184. MetalFX (Apple M5) gives 0.0090 and 0.149 with each image rounded to
+    // 8 bits on its own; its mean bound comes from that comparison.
+    let mean_bound = if cfg!(metalfx) { 0.010 } else { 0.008 };
     assert!(
-        error.mean <= 0.010 && error.p99 <= 0.16,
+        error.mean <= mean_bound && error.p99 <= 0.16,
         "SR against native: {error:?}"
     );
     assert_clean();

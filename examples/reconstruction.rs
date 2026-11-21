@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use orr::orr_gpu::{
     Format, Hazards, MemoryKind, OutputFormat, QueueKind, SpecData, Stages, TextureDesc,
-    TextureUsage, TimelinePoint,
+    TextureRegion, TextureUsage, TimelinePoint,
 };
 #[cfg(dlss)]
 use orr::orr_output::orr_dlss::raw::Ngx;
@@ -49,11 +49,11 @@ use orr::{
 use orr_examples::linked::KERNELS;
 use orr_examples::overlay::Overlay;
 use orr_examples::scene::{FOV_Y, SUN, Showcase, TARGET, orbit_eye};
-use orr_examples::shaders::{capture, sun_shadow};
+use orr_examples::shaders::sun_shadow;
 use orr_examples::window::{KeyCode, Window};
 use orr_examples::{
-    Capture, LensSwitches, Options, PlatformBackend, Workers, assert_clean, device, fixed_time,
-    platform_backend,
+    LensSwitches, LinearCapture, Options, PlatformBackend, Workers, assert_clean, device,
+    fixed_time, platform_backend,
 };
 use orr_math::camera::rh::view;
 use orr_math::{UVec2, Vec2, Vec3};
@@ -74,7 +74,7 @@ pub(crate) fn main() {
         }
         if let Some(c) = run.and_then(|run| run.capture) {
             let path = options.out_path("reconstruction-sr");
-            c.save_png(&path);
+            c.srgb8().save_png(&path);
             log::info!("wrote {}", path.display());
         }
     } else {
@@ -345,7 +345,7 @@ const SR_SKY: [f32; 3] = [0.18, 0.24, 0.34];
 /// What a `--sr` run showed.
 pub(crate) struct SrRun {
     /// The last frame of a headless run.
-    pub capture: Option<Capture>,
+    pub capture: Option<LinearCapture>,
     /// The SR preset NGX applied, from its log; `None` with `--native` or off DLSS.
     pub preset: Option<char>,
 }
@@ -458,19 +458,13 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
     let shade = renderer
         .compute_pipeline(&sun_shadow::MODULE, "main", SpecData::default())
         .expect("shade pipeline");
-    let encode = renderer
-        .compute_pipeline(&capture::MODULE, "main", SpecData::default())
-        .expect("capture pipeline");
     let slots = u64::from(desc.frames_in_flight);
     let mut roots = gpu
         .gpu_malloc::<sun_shadow::Root>(MemoryKind::Upload, slots, "reconstruction sr roots")
         .expect("roots");
-    let mut capture_root = gpu
-        .gpu_malloc::<capture::Root>(MemoryKind::Upload, 1, "reconstruction sr capture root")
-        .expect("capture root");
     let pixels = u64::from(SR_HEADLESS_EXTENT[0] * SR_HEADLESS_EXTENT[1]);
     let readback = options.headless.then(|| {
-        gpu.gpu_malloc::<u32>(MemoryKind::Readback, pixels, "reconstruction sr capture")
+        gpu.gpu_malloc::<[u16; 4]>(MemoryKind::Readback, pixels, "reconstruction sr capture")
             .expect("readback")
     });
 
@@ -579,7 +573,7 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
             sun: [SUN.x, SUN.y, SUN.z, SR_SUN_ILLUMINANCE],
             sky: [SR_SKY[0], SR_SKY[1], SR_SKY[2], 1.0],
         };
-        let (shade, encode) = (f.pipeline(shade), f.pipeline(encode));
+        let shade = f.pipeline(shade);
         let list = f.list().expect("frame list");
         if fresh {
             list.discard(target.texture());
@@ -622,27 +616,21 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
                 )
                 .expect("SR evaluate");
                 list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
-                out.sampled
+                out
             }
-            None => target.sampled,
+            None => target,
         };
         if let Some(out) = readback.as_ref().filter(|_| final_frame) {
-            capture_root.as_mut_slice().expect("capture root")[0] = capture::Root {
-                pixels: out.gpu(),
-                source: shown,
-                width: extent[0],
-                height: extent[1],
-                pad0: 0,
-                pad1: 0,
-            };
-            list.dispatch(
-                encode,
-                capture_root.gpu(),
-                [extent[0].div_ceil(8), extent[1].div_ceil(8), 1],
+            let texture = shown.texture();
+            list.copy_from_texture(
+                out.gpu().cast(),
+                texture,
+                &TextureRegion::whole_mip(texture.desc(), 0),
             );
-            list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+            list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
         }
-        f.compose(shown, orr::Primaries::Rec709).expect("compose");
+        f.compose(shown.sampled, orr::Primaries::Rec709)
+            .expect("compose");
         last = Some(f.end().expect("end frame"));
     }
 
@@ -657,7 +645,7 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
     }
     let capture = readback
         .filter(|_| last.is_some())
-        .map(|out| Capture::from_readback(SR_HEADLESS_EXTENT, &out));
+        .map(|out| LinearCapture::from_rgba16f(SR_HEADLESS_EXTENT, &out));
     drop(sr);
     drop(showcase);
     drop(display);
