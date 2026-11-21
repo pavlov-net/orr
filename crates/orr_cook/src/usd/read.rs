@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use openusd::ar::Resolver;
-use openusd::{ar, gf, usd, vt};
+use openusd::{ar, gf, sdf, usd, vt};
 use openusd_schemas::geom::{self, Interpolation, XformableExt};
 use orr_math::{DMat4, DQuat, DVec3};
 use orr_pack::Hash32;
@@ -465,6 +465,45 @@ impl PrimReader<'_> {
             })
     }
 
+    /// Takes the colors in `values`, the numbers of `value` of attribute `name`, to linear Rec.709
+    /// from the space [`Self::color_space`] resolves, where the attribute's role is a color: AOUSD
+    /// core 14.4.2 gives a prim's space to "all color attributes", primvars among them. A space
+    /// that names no conversion ("data", "raw", "identity") leaves them as they stand, and so does
+    /// one the cook doesn't know, with a warning in `warnings`.
+    pub(super) fn colors_to_rec709(
+        &self,
+        name: &str,
+        value: &vt::Value,
+        values: &mut [f64],
+        warnings: &mut Vec<String>,
+    ) -> Result<(), String> {
+        let role = self.prim.attribute(name).role();
+        let role = role.map_err(|e| format!("{} {name}: {e}", self.path()))?;
+        if role != Some(sdf::Role::Color) {
+            return Ok(());
+        }
+        let space = self.color_space(name)?;
+        let Some(c) = ImageColor::named(&space) else {
+            warnings.push(format!(
+                "{} {name}: color space {space} reads as data",
+                self.path()
+            ));
+            return Ok(());
+        };
+        let ImageColor::Named(s) = c else {
+            return Ok(());
+        };
+        let convert = s.rec709_converter();
+        let tuple = element_width(value).unwrap_or(values.len());
+        for v in values.chunks_exact_mut(tuple) {
+            let rgb = convert([v[0], v[1], v[2]].map(|x| x as f32));
+            for (o, x) in v.iter_mut().zip(rgb) {
+                *o = f64::from(x);
+            }
+        }
+        Ok(())
+    }
+
     /// This reader at `time` instead.
     pub(super) fn at(&self, time: f64) -> PrimReader<'_> {
         PrimReader {
@@ -738,19 +777,29 @@ impl PrimReader<'_> {
         }
     }
 
-    /// Primvar `name` as its elements stand, each as wide as its type and `elementSize` make it.
-    /// A last element the array falls short of holds no value.
-    pub(super) fn wide_primvar(&self, name: &str) -> Result<Option<Primvar>, String> {
+    /// Primvar `name` as its elements stand, each as wide as its type and `elementSize` make it,
+    /// its colors in linear Rec.709 ([`Self::colors_to_rec709`]). A last element the array falls
+    /// short of holds no value.
+    pub(super) fn wide_primvar(
+        &self,
+        name: &str,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<Primvar>, String> {
         let Some(primvar) = self.geom_primvar(name)? else {
             return Ok(None);
         };
-        let Some(value) = self.value(primvar.attribute().name())? else {
+        let full = primvar.attribute().name();
+        let Some(value) = self.value(full)? else {
             return Ok(None);
         };
         let Some(width) = self.stride(&primvar, &value)? else {
             return Ok(None);
         };
-        Ok(self.elements(name, width, None)?.map(|(p, _)| p))
+        let Some((mut held, _)) = self.elements(name, width, None)? else {
+            return Ok(None);
+        };
+        self.colors_to_rec709(full, &value, &mut held.values, warnings)?;
+        Ok(Some(held))
     }
 
     /// The numbers of one element of `primvar` holding `value`, if it holds numbers.
@@ -782,10 +831,16 @@ impl PrimReader<'_> {
             .ok_or_else(|| format!("{} {name}: elementSize {size}", self.path()))
     }
 
-    /// Primvar `name` as a value for the whole prim, whatever the width of its elements. One
-    /// that holds no numbers, or whose index misses its values, gives a reader nothing. The stream
-    /// makes room for `reach` times its largest value.
-    pub(super) fn whole_primvar(&self, name: &str, reach: f64) -> Result<shading::Primvar, String> {
+    /// Primvar `name` as a value for the whole prim, whatever the width of its elements, its
+    /// colors in linear Rec.709 ([`Self::colors_to_rec709`]). One that holds no numbers, or whose
+    /// index misses its values, gives a reader nothing. The stream makes room for `reach` times
+    /// its largest value.
+    pub(super) fn whole_primvar(
+        &self,
+        name: &str,
+        reach: f64,
+        warnings: &mut Vec<String>,
+    ) -> Result<shading::Primvar, String> {
         let Some(primvar) = self.geom_primvar(name)? else {
             return Ok(shading::Primvar::Missing);
         };
@@ -793,9 +848,10 @@ impl PrimReader<'_> {
         let Some(value) = self.value(full)? else {
             return Ok(shading::Primvar::Missing);
         };
-        let Some(values) = numbers(&value).filter(|v| !v.is_empty()) else {
+        let Some(mut values) = numbers(&value).filter(|v| !v.is_empty()) else {
             return Ok(shading::Primvar::Missing);
         };
+        self.colors_to_rec709(full, &value, &mut values, warnings)?;
         let width = self.stride(&primvar, &value)?.unwrap_or(values.len());
         let fail = |e: openusd::Error| format!("{} {full}: {e}", self.path());
         if primvar.interpolation().map_err(fail)? != Interpolation::Constant {

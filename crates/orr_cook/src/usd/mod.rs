@@ -534,6 +534,16 @@ struct Assembly<'a> {
 /// can pass it. A power of two more leaves every mantissa as it is.
 const CAGE_COLOR_REACH: f64 = 2.0;
 
+/// Adds to `warnings` those of `new` it doesn't hold: a primvar's reads give the same ones for
+/// each material and mesh that read it.
+fn warn_once(warnings: &mut Vec<String>, new: Vec<String>) {
+    for w in new {
+        if !warnings.contains(&w) {
+            warnings.push(w);
+        }
+    }
+}
+
 /// `UsdTimeCode::SafeStep`: past rounding at any time code a stage holds.
 const SAFE_STEP: f64 = f64::EPSILON * 1e7;
 
@@ -1421,7 +1431,9 @@ impl<'s> Importer<'s> {
                 }
                 for read in &frame.vertex {
                     if !read_primvars.contains_key(&read.name) {
-                        let held = r.wide_primvar(&read.name)?;
+                        let mut warnings = Vec::new();
+                        let held = r.wide_primvar(&read.name, &mut warnings)?;
+                        warn_once(&mut self.warnings, warnings);
                         if let Some(p) = held.as_ref().filter(|p| p.width() > 4) {
                             self.warnings.push(format!(
                                 "{path}: primvar {} is {} wide; a reader takes the first 4",
@@ -3450,7 +3462,12 @@ impl<'s> Importer<'s> {
 
     /// What mesh prim `mesh` holds for primvar `name`, as `FindPrimvarWithInheritance` finds it:
     /// its own, else the nearest ancestor's that is constant.
-    fn primvar(&self, mesh: usize, name: &str) -> Result<shading::Primvar, String> {
+    fn primvar(
+        &self,
+        mesh: usize,
+        name: &str,
+        warnings: &mut Vec<String>,
+    ) -> Result<shading::Primvar, String> {
         let set = self.settings.uv_sets().position(|s| s == name);
         let prim = &self.nodes[mesh].prim;
         let facts = MeshFacts::read(&self.reader(prim))?;
@@ -3467,7 +3484,10 @@ impl<'s> Importer<'s> {
         };
         let owner = found.attribute().prim();
         Ok(
-            match (self.reader(&owner).whole_primvar(name, reach)?, set) {
+            match (
+                self.reader(&owner).whole_primvar(name, reach, warnings)?,
+                set,
+            ) {
                 (shading::Primvar::Missing, _) => shading::Primvar::Missing,
                 (_, Some(set)) if owner.path() == prim.path() => shading::Primvar::Uv(set as u8),
                 (held, _) => held,
@@ -3493,9 +3513,11 @@ impl<'s> Importer<'s> {
     ) -> Result<usize, String> {
         let shaded = prim.as_ref().map(|p| self.network(p)).transpose()?;
         let mut reads = Vec::new();
+        let mut warnings = Vec::new();
         for name in shaded.iter().flat_map(|s| &s.reads) {
-            reads.push((name.clone(), self.primvar(mesh, name)?));
+            reads.push((name.clone(), self.primvar(mesh, name, &mut warnings)?));
         }
+        warn_once(&mut self.warnings, warnings);
         let key = (
             prim.as_ref().map(|p| p.as_str().to_string()),
             double_sided,

@@ -150,10 +150,16 @@ impl Space {
 
     /// `rgb` in this space as linear Rec.709, the space of a shading network's colors.
     pub(crate) fn to_rec709(self, rgb: [f32; 3]) -> [f32; 3] {
-        let linear = DVec3::from(rgb.map(|v| f64::from(self.transfer.decode(v))));
-        (self.gamut.matrix_to(RgbPrimaries::REC709) * linear)
-            .as_vec3()
-            .to_array()
+        self.rec709_converter()(rgb)
+    }
+
+    /// [`Self::to_rec709`] for many colors, its matrix made once.
+    pub(crate) fn rec709_converter(self) -> impl Fn([f32; 3]) -> [f32; 3] {
+        let m = self.gamut.matrix_to(RgbPrimaries::REC709);
+        move |rgb| {
+            let linear = DVec3::from(rgb.map(|v| f64::from(self.transfer.decode(v))));
+            (m * linear).as_vec3().to_array()
+        }
     }
 }
 

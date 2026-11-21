@@ -1789,6 +1789,56 @@ fn shader_colors_convert_from_the_space_they_are_in() {
     );
 }
 
+/// AOUSD core 1.0.1 14.4.2: `colorSpace:name` "will set the source color space for all color
+/// attributes" of the prim, which its `displayColor` primvar is. A constant one reads like any
+/// shader color; a varying one reaches the vertex color stream in linear Rec.709, where half
+/// floats keep what the ACEScg green gamut puts below 0.
+#[test]
+fn primvar_colors_convert_from_the_space_they_are_in() {
+    use orr_color::RgbPrimaries as P;
+    let ap1 = |p: P, c: [f64; 3]| (P::ACES_CG.matrix_to(p) * orr_math::DVec3::from(c)).as_vec3();
+    let reader = r#"def Shader "C"
+    {
+        uniform token info:id = "UsdPrimvarReader_float3"
+        string inputs:varname = "displayColor"
+        float3 outputs:result
+    }"#;
+    let body = |primvar: &str| {
+        previewed(
+            "color3f inputs:diffuseColor.connect = </M/C.outputs:result>",
+            reader,
+            &format!("uniform token colorSpace:name = \"lin_ap1_scene\"\n    {primvar}"),
+        )
+        .replace(
+            "def Mesh \"Tri\"\n{",
+            "def Mesh \"Tri\" (\n    prepend apiSchemas = [\"ColorSpaceAPI\"]\n)\n{",
+        )
+    };
+
+    let c = [0.5, 0.25, 0.125];
+    let constant = body("color3f[] primvars:displayColor = [(0.5, 0.25, 0.125)]");
+    let base = material(&cook("primvar-space-constant", &constant)).base_color;
+    assert!(
+        Vec3::from(base).abs_diff_eq(ap1(P::REC2020, c), 1e-5),
+        "{base:?}"
+    );
+
+    let colors = [[0.5, 0.25, 0.125], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let varying = body(
+        "color3f[] primvars:displayColor = [(0.5, 0.25, 0.125), (0, 1, 0), (0, 0, 1)] (
+        interpolation = \"vertex\"
+    )",
+    );
+    let got = vertex_colors(&cook("primvar-space-varying", &varying));
+    assert_eq!(got.len(), 3);
+    for c in colors {
+        let want = ap1(P::REC709, c);
+        let held = |g: &&[f32; 4]| Vec3::from_slice(&g[..3]).abs_diff_eq(want, 2e-3);
+        assert!(got.iter().any(|g| held(&g)), "{want:?} in {got:?}");
+    }
+    assert!(got.iter().flatten().any(|&x| x < 0.0), "{got:?}");
+}
+
 /// UsdUVTexture `scale` multiplies each channel of the texture's value. The material's color
 /// tints texels channel by channel in their primaries, so it keeps the scale of each channel where
 /// the texels hold the file's channels, and the texels take it where a matrix mixes them.
