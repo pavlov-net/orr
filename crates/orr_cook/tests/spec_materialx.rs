@@ -842,10 +842,17 @@ fn documents_map_as_the_clauses_say() {
         },
         Row {
             clause: "Nodes convert: \"additional channels are populated with 0, aside from the \
-                     fourth channel which is populated with 1\"",
+                     fourth channel which is populated with 1\", in the channels the image holds",
             body: r#"<image name="v2" type="vector2">
-                  <input name="file" type="filename" value="v.png"/></image>
+                  <input name="file" type="filename" value="flat.png"/></image>
                 <convert name="c" type="color3"><input name="in" type="vector2" nodename="v2"/>
+                  </convert>
+                <image name="w" type="color3">
+                  <input name="file" type="filename" value="flat.png"
+                         colorspace="lin_rec2020_scene"/></image>
+                <convert name="w2" type="vector2"><input name="in" type="color3" nodename="w"/>
+                  </convert>
+                <convert name="w3" type="color3"><input name="in" type="vector2" nodename="w2"/>
                   </convert>
                 <convert name="c4" type="color4"><input name="in" type="color3" nodename="i"/>
                   </convert>
@@ -854,10 +861,14 @@ fn documents_map_as_the_clauses_say() {
                 <extract name="a" type="float"><input name="in" type="color4" nodename="c4"/>
                   <input name="index" type="integer" value="3"/></extract>"#,
             inputs: r#"<input name="base_color" type="color3" nodename="c"/>
+                <input name="coat_color" type="color3" nodename="w3"/>
                 <input name="specular_roughness" type="float" nodename="a"/>"#,
+            // The uniform images fold into the fields. A color taken through a vector reads its
+            // channels with none of its primaries, as the vector image's do.
             check: |m| {
-                bound(m, slot::BASE_COLOR)
-                    && m.base_color == [1.0, 1.0, 0.0]
+                let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|c| close(a[c], b[c]));
+                near(m.base_color, rec2020([0.2, 0.4, 0.0]))
+                    && near(m.coat_color, rec2020([0.2, 0.4, 0.0]))
                     && m.specular_roughness == 1.0
                     && !bound(m, slot::ROUGHNESS)
             },

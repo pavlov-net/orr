@@ -170,6 +170,25 @@ pub(crate) enum ImageColor {
     UsdAuto,
     /// What a plain file states.
     File,
+    /// The channels of what rules `File` or `UsdAuto` read: their curve, and none of their
+    /// primaries or profile ([`Self::channels`]).
+    Channels(Stated),
+}
+
+/// Rules that read what a file states.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) enum Stated {
+    UsdAuto,
+    File,
+}
+
+impl Stated {
+    fn rules(self) -> ImageColor {
+        match self {
+            Self::UsdAuto => ImageColor::UsdAuto,
+            Self::File => ImageColor::File,
+        }
+    }
 }
 
 impl ImageColor {
@@ -210,6 +229,20 @@ impl ImageColor {
         }
     }
 
+    /// These rules' channels, as an input that reads a color's channels as numbers takes them:
+    /// with the curve, but read in Rec.709 primaries, as they stand.
+    pub(crate) fn channels(self) -> Self {
+        match self {
+            Self::Named(s) => Self::Named(Space {
+                gamut: Gamut::REC709,
+                ..s
+            }),
+            Self::UsdAuto => Self::Channels(Stated::UsdAuto),
+            Self::File => Self::Channels(Stated::File),
+            rules @ (Self::Data | Self::Gltf | Self::Channels(_)) => rules,
+        }
+    }
+
     fn transfer(self, f: &FileColor) -> Transfer {
         let unstated = if f.numeric {
             Transfer::Linear
@@ -221,6 +254,7 @@ impl ImageColor {
             Self::Named(s) => s.transfer,
             Self::Gltf => unstated,
             Self::File => f.transfer.unwrap_or(unstated),
+            Self::Channels(stated) => stated.rules().transfer(f),
             Self::UsdAuto => match f.transfer {
                 // Hio's reading of a gamma hint, as a file's gamma: near 1/2.2 is sRGB and near 1
                 // is linear.
@@ -237,11 +271,16 @@ impl ImageColor {
         matches!(self, Self::File | Self::UsdAuto)
     }
 
+    /// Whether these rules read the range a file's signal states.
+    fn reads_range(self) -> bool {
+        self.honors_file() || matches!(self, Self::Channels(_))
+    }
+
     fn gamut(self, f: &FileColor) -> Gamut {
         match self {
             Self::Named(s) => s.gamut,
             Self::File | Self::UsdAuto => f.gamut.unwrap_or(Gamut::REC709),
-            Self::Data | Self::Gltf => Gamut::REC709,
+            Self::Data | Self::Gltf | Self::Channels(_) => Gamut::REC709,
         }
     }
 
@@ -249,7 +288,7 @@ impl ImageColor {
     /// state, and no primaries.
     pub(crate) fn decode(self, f: &FileColor) -> Decode {
         Decode {
-            narrow: f.narrow.filter(|_| self.honors_file()),
+            narrow: f.narrow.filter(|_| self.reads_range()),
             transfer: self.transfer(f),
         }
     }

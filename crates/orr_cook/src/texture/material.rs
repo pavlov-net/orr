@@ -138,6 +138,22 @@ pub(crate) enum ImageRules {
     MaterialX,
 }
 
+/// Factor `f` of color slot `s` times `by`, a value in `primaries`, as the record multiplies
+/// them: a radius scale's channel by channel as they stand, and a color's in those primaries
+/// (`material_tint`). Rec.2020 multiplies directly, so its factors stay exact.
+fn tinted(f: [f32; 3], by: [f32; 3], s: usize, primaries: Primaries) -> [f32; 3] {
+    match primaries {
+        _ if s == slot::SUBSURFACE_RADIUS_SCALE => std::array::from_fn(|c| f[c] * by[c]),
+        Primaries::Rec2020 => std::array::from_fn(|c| f[c] * by[c]),
+        p => {
+            let (rec2020, p) = (RgbPrimaries::REC2020, p.rgb());
+            let f = rec2020.matrix_to(p) * DVec3::from(f.map(f64::from));
+            let product = f * DVec3::from(by.map(f64::from));
+            (p.matrix_to(rec2020) * product).as_vec3().to_array()
+        }
+    }
+}
+
 /// A read of an image and the first material that reads it so.
 type NamedRead<'m> = (TexRef, &'m str);
 
@@ -2246,8 +2262,9 @@ impl<'a> Packer<'a> {
             slot::COAT_COLOR => ("coat_color", |m| &mut m.coat_color),
             _ => ("subsurface_color", |m| &mut m.subsurface_color),
         };
-        let (read, _, gamut) = self.color_read(r);
         let primaries = self.slot_primaries(r);
+        let r = &self.factored(r, s, primaries, color(m));
+        let (read, _, gamut) = self.color_read(r);
         let hdr = s == slot::EMISSION && self.past_one(r);
         let top = if hdr { f32::INFINITY } else { 1.0 };
         let held = (0..3).all(|c| {
@@ -2269,21 +2286,7 @@ impl<'a> Packer<'a> {
             }
             let texel = texel.map(|v| self.held(r, v, top));
             let target = color(m);
-            // As the record reads them: a radius scale's texels multiply as they stand, and a
-            // color's tint its Rec.2020 factor in their primaries (`material_tint`). Rec.2020
-            // multiplies directly, so its factors stay exact.
-            *target = match primaries {
-                _ if s == slot::SUBSURFACE_RADIUS_SCALE => {
-                    std::array::from_fn(|c| target[c] * texel[c])
-                }
-                Primaries::Rec2020 => std::array::from_fn(|c| target[c] * texel[c]),
-                p => {
-                    let (rec2020, p) = (RgbPrimaries::REC2020, p.rgb());
-                    let f = rec2020.matrix_to(p) * DVec3::from(target.map(f64::from));
-                    let product = f * DVec3::from(texel.map(f64::from));
-                    (p.matrix_to(rec2020) * product).as_vec3().to_array()
-                }
-            };
+            *target = tinted(*target, texel, s, primaries);
             return Ok(());
         }
         // Texels read in their texture's primaries, and a slot's value past 0..1 with them; a
@@ -2322,6 +2325,44 @@ impl<'a> Packer<'a> {
         })?;
         bind(m, s, id, 0, r);
         Ok(())
+    }
+
+    /// Color input `r` of slot `s`, whose texels read in `primaries`, with the scale and bias of
+    /// each channel its remap states divided between its texels and `factor`. The factor tints
+    /// the texels channel by channel in their primaries (`material_tint`), so where they hold the
+    /// file's channels as they stand, unmixed by a matrix or profile, it takes each channel's own
+    /// scale and leaves the texels their full range; a bias stays in the texels, which store
+    /// 0..1, and the factor holds what a channel reaches past 1. Elsewhere a channel of the
+    /// factor scales a mix of the file's channels, so it takes one scale, the most any channel
+    /// reaches past 1, and the texels the rest.
+    fn factored(
+        &self,
+        r: &TexRef,
+        s: usize,
+        primaries: Primaries,
+        factor: &mut [f32; 3],
+    ) -> TexRef {
+        let Some(map) = r.remap else {
+            return *r;
+        };
+        let unmixed = s == slot::SUBSURFACE_RADIUS_SCALE
+            || self.each(r).iter().all(|t| {
+                let (read, p, gamut) = self.color_read(t);
+                read.icc.is_none() && gamut.is_none() && p == primaries
+            });
+        let reach = |[a, b]: [f32; 2]| a.max(a + b).max(1.0);
+        let (remap, scale) = if unmixed && map.iter().all(|m| m[0] == 0.0) {
+            (None, map.map(|m| m[1]))
+        } else if unmixed {
+            let peak = map.map(reach);
+            let remap = std::array::from_fn(|c| map[c].map(|v| v / peak[c]));
+            (Some(remap), peak)
+        } else {
+            let peak = map.into_iter().map(reach).fold(1.0, f32::max);
+            (Some(map.map(|m| m.map(|v| v / peak))), [peak; 3])
+        };
+        *factor = tinted(*factor, scale, s, primaries);
+        TexRef { remap, ..*r }
     }
 
     /// A one-channel texture of the reference's channel times `scale`.

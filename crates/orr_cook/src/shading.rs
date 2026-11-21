@@ -62,15 +62,21 @@
 //! dispersion or `transmission_color` under a depth above 0 reads where a path enters the medium.
 //! A texture value multiplies the field, which takes the reader's scale
 //! (`UsdUVTexture` `scale`; 1 otherwise); a bias folds scale and bias into the texels
-//! ([`TexRef::remap`]) and leaves the field 1, or for a color what it reaches past 1. Normals
-//! read `scale * t + bias` per axis; a pair of the form `s (2 t - 1)` is the tangent-space
-//! encoding at strength `s`. A `normalmap` decodes the reader's `v` as `2 v - 1`, where such a
+//! ([`TexRef::remap`]) and leaves the field 1, or for a color what each channel reaches past 1.
+//! The field tints a color's texels channel by channel in their primaries, so a color's scale
+//! that differs between its channels stays in the field only where the texels hold the file's
+//! channels unmixed; where a matrix or profile mixes them it folds into the texels too, and the
+//! field holds the most any channel reaches past 1, the same in each. Normals read
+//! `scale * t + bias` per axis; a pair of the form `s (2 t - 1)` is the tangent-space encoding at
+//! strength `s`. A `normalmap` decodes the reader's `v` as `2 v - 1`, where such a
 //! pair with `s` other than 0 is the encoding stated, not a second decode. Both hold as far as the
 //! image's format can hold what they state. A `convert` copies its input's first channels, reads
 //! 0 in a channel past them, or 1 in the fourth, and copies a scalar to every channel, which only
 //! a constant can: a slot reads each channel of a texture from its own, and the vertex color
-//! stream's channels as they stand. Coordinate nodes set each slot's `Material::uv_transforms`,
-//! conjugated by the flip of t between st and the cook's top-left uvs.
+//! stream's channels as they stand. On a texture it acts on the reader's channels, as a pick
+//! does, and what it fills is a scale of 0 plus the fill. Coordinate nodes set each
+//! slot's `Material::uv_transforms`, conjugated by the flip of t between st and the cook's
+//! top-left uvs.
 //!
 //! A value that states a [`Unit`] converts to meters or degrees. Without one, `transmission_depth`
 //! and `subsurface_radius` are in centimeters and `thin_film_thickness` in micrometers, as OpenPBR
@@ -102,7 +108,8 @@
 //! else as `auto`. A MaterialX image of a color type reads as its `colorspace` names;
 //! [`crate::texture::color`] has what each rule does. An unknown `colorspace` warns and reads as
 //! "data". A channel picked from a color image takes the space's curve and none of its primaries:
-//! a renderer working in the document's space would read the channel as it stands.
+//! a renderer working in the document's space would read the channel as it stands. So do the
+//! channels a `convert` takes through a type that isn't a color.
 //!
 //! A network's colors are linear Rec.709, which MaterialX and UsdShade values convert to from
 //! their spaces and which primvars and fallbacks hold; the mapped material holds them in linear
@@ -1089,11 +1096,14 @@ impl Mapper<'_, '_> {
         };
         let (mut at, mut output) = (n, output.to_string());
         let mut nonzero = false;
+        // Whether the chain takes a color's channels through a type that isn't a color.
+        let mut numbers = false;
         loop {
             let node = self.node(at);
             if node.kind == "convert" {
                 let from = self.converted_width(at, &node.in_ty)?;
                 nonzero |= node.ty == "boolean";
+                numbers |= !is_color(&node.ty) || !is_color(&node.in_ty);
                 for r in &mut map {
                     if let Reads::Channel(c) = *r {
                         *r = converted(from, c);
@@ -1174,6 +1184,9 @@ impl Mapper<'_, '_> {
                     Ok(Value::Texture(t))
                 }
                 _ if in_place => {
+                    if numbers {
+                        t.color = t.color.channels();
+                    }
                     for (c, r) in map.iter().enumerate() {
                         if let Reads::Constant(k) = *r {
                             t.scale[c] = 0.0;
@@ -1654,17 +1667,13 @@ impl Mapper<'_, '_> {
                         self.node(n).name
                     ));
                 }
-                let (r, value) = if t.bias[..3].iter().any(|&b| b != 0.0) {
-                    // Texels store 0..1, so the field holds what the input reaches past that.
-                    let peak = [0, 1, 2].map(|c| t.bias[c].max(t.bias[c] + t.scale[c]).max(1.0));
-                    let remap = [0, 1, 2].map(|c| [t.bias[c] / peak[c], t.scale[c] / peak[c]]);
-                    let r = TexRef {
-                        remap: Some(remap),
-                        ..t.tex_ref()
-                    };
-                    (r, peak)
+                let gray = t.scale[1] == t.scale[0] && t.scale[2] == t.scale[0];
+                // The texture's cook divides a scale or bias of each channel between the texels
+                // and the field, as the texels' primaries allow.
+                let (r, value) = if gray && t.bias[..3].iter().all(|&b| b == 0.0) {
+                    (t.tex_ref(), [t.scale[0]; 3])
                 } else {
-                    (t.tex_ref(), [t.scale[0], t.scale[1], t.scale[2]])
+                    (t.remapped([0, 1, 2]), [1.0; 3])
                 };
                 *field(&mut self.material) = value;
                 *slot(&mut self.textures) = Some(r);
@@ -2013,12 +2022,16 @@ impl Mapper<'_, '_> {
         Ok(())
     }
 
-    /// Whether `node` gives a texture through what [`Self::tangent_texture`] reads.
-    fn gives_texture(&self, node: usize) -> bool {
-        matches!(
-            self.node(node).kind.as_str(),
-            "image" | "tiledimage" | "convert"
-        )
+    /// Whether `node` gives a texture through what [`Self::tangent_texture`] reads: an image, or
+    /// `convert` nodes of one.
+    fn gives_texture(&self, mut node: usize) -> bool {
+        while self.node(node).kind == "convert" {
+            match self.source(node, "in") {
+                Some(Input::Connect { node: up, .. }) => node = *up,
+                _ => return false,
+            }
+        }
+        matches!(self.node(node).kind.as_str(), "image" | "tiledimage")
     }
 
     /// Binds slot `s` to the direction texture output `output` of `node` gives, as `what` reads
@@ -2081,6 +2094,12 @@ impl Mapper<'_, '_> {
             ));
             return Ok(());
         }
+        // The mesh's tangent that stands in for a turn the material can't hold is the one of the
+        // uv set the turned `tangent` node names.
+        if let Some(tangent) = tangent {
+            let index = self.float(tangent, "index", 0.0)?;
+            self.follow(tangent, frame, index);
+        }
         let normal = ["geometry_normal", "geometry_coat_normal"][frame];
         let surface_normal = |this: &Self, a: usize| {
             this.node(a).kind == "normal" && this.text(a, "space") == Some("world")
@@ -2124,10 +2143,9 @@ impl Mapper<'_, '_> {
             ));
             return Ok(());
         }
-        if let Some(tangent) = tangent {
-            let index = self.float(tangent, "index", 0.0)?;
-            self.follow(tangent, frame, index);
-        } else if let Some((node, output)) = turned {
+        if tangent.is_none()
+            && let Some((node, output)) = turned
+        {
             let what = format!("{name} input in");
             if !self.tangent_texture(node, &output, s, &what)? {
                 self.warnings.push(format!(

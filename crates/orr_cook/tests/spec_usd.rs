@@ -1789,6 +1789,49 @@ fn shader_colors_convert_from_the_space_they_are_in() {
     );
 }
 
+/// UsdUVTexture `scale` multiplies each channel of the texture's value. The material's color
+/// tints texels channel by channel in their primaries, so it keeps the scale of each channel where
+/// the texels hold the file's channels, and the texels take it where a matrix mixes them.
+#[test]
+fn a_color_scale_of_each_channel_reads_in_the_files_channels() {
+    use orr_color::RgbPrimaries as P;
+    let scale = [1.0, 0.5, 0.25];
+    let body = |space: &str| {
+        let inputs = format!(
+            r#"float4 inputs:scale = (1, 0.5, 0.25, 1)
+        token inputs:sourceColorSpace = "{space}"
+        token inputs:wrapS = "repeat"
+        token inputs:wrapT = "repeat""#
+        );
+        previewed(
+            "color3f inputs:diffuseColor.connect = </M/T.outputs:rgb>",
+            &format!("{}\n{READER}", texture("T", &inputs)),
+            ST,
+        )
+    };
+    let close = |got: [f32; 3], want: [f64; 3]| {
+        Vec3::from(got).abs_diff_eq(orr_math::DVec3::from(want).as_vec3(), 1e-5)
+    };
+    let rec709 = material(&shaded("scale-rec709", &body("sRGB"), &gradient()));
+    assert_ne!(rec709.textures[slot::BASE_COLOR].texture, AssetId::NONE);
+    let want = P::REC709.matrix_to(P::REC2020) * orr_math::DVec3::from(scale);
+    assert!(
+        close(rec709.base_color, want.to_array()),
+        "{:?}",
+        rec709.base_color
+    );
+    // A uniform image folds into the color.
+    let flat = png(4, 4, |_, _| [51, 102, 153, 255]);
+    let ap1 = material(&shaded("scale-ap1", &body("lin_ap1_scene"), &flat));
+    let texel = orr_math::DVec3::new(0.2, 0.4 * 0.5, 0.6 * 0.25);
+    let want = P::ACES_CG.matrix_to(P::REC2020) * texel;
+    assert!(
+        close(ap1.base_color, want.to_array()),
+        "{:?}",
+        ap1.base_color
+    );
+}
+
 /// The binding of `diffuseColor` reading texture `T`, with `inputs` on the texture.
 fn diffuse_binding(name: &str, inputs: &str, image: &[u8]) -> orr_pack::material::TextureBinding {
     let body = previewed(
