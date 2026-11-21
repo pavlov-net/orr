@@ -47,8 +47,8 @@ public struct GuideRoot
     // This frame's layer memory (`traced_tiles`); null for none.
     public LayerGuide* layers;
     public StorageImageIndex radiance;          // RGBA16F, written only for a GUIDE_* debug view
-    public StorageImageIndex diffuse_albedo;    // RGBA8
-    public StorageImageIndex specular_albedo;   // RGBA8
+    public StorageImageIndex diffuse_albedo;    // RGBA16F
+    public StorageImageIndex specular_albedo;   // RGBA16F
     public StorageImageIndex normal_roughness;  // RGBA16F
     public StorageImageIndex specular_motion;   // RG16F
     public StorageImageIndex depth;             // R32F

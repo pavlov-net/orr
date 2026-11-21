@@ -806,13 +806,15 @@ fn render_view_runs_ray_reconstruction() {
         "against the converged image: noisy {noisy:?}, still {denoised_error:?}, \
          moving {moving:?}, averaged in the hook {summed:?}"
     );
-    // DLSS: measured mean 0.0464 still and 0.0547 moving, and one path per pixel without ray
-    // reconstruction 0.138. MetalFX (Apple M5): 0.0683 still and 0.0685 moving, against 0.138
-    // for one path per pixel. The rest of the error is the fireflies in the converged image.
+    // DLSS: measured mean 0.0463-0.0466 still and 0.0544-0.0548 moving, and one path per pixel
+    // without ray reconstruction 0.138; the bounds sit three run-to-run spreads (0.0004) above
+    // the largest. MetalFX (Apple M5), with 8-bit albedo guides: 0.0683 still and 0.0685 moving,
+    // against 0.138 for one path per pixel. The rest of the error is the fireflies in the
+    // converged image.
     let (still_bound, moving_bound) = if cfg!(metalfx) {
         (0.071, 0.071)
     } else {
-        (0.052, 0.055)
+        (0.048, 0.056)
     };
     assert!(
         denoised_error.mean < still_bound,

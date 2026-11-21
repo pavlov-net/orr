@@ -83,8 +83,8 @@ fn static_inputs(render: [u32; 2], overlay: Option<([u32; 4], [f32; 4])>) -> [Ve
     for y in 0..render[1] {
         for x in 0..render[0] {
             let a = PALETTE[((x / 64 + y / 64) % 4) as usize];
-            diffuse.extend(a.map(|v| (v * 255.0).round() as u8));
-            diffuse.push(255);
+            diffuse.extend(a);
+            diffuse.push(1.0);
         }
     }
     let mut over = vec![0.0f32; px * 4];
@@ -100,8 +100,8 @@ fn static_inputs(render: [u32; 2], overlay: Option<([u32; 4], [f32; 4])>) -> [Ve
         0.5f32.to_le_bytes().repeat(px),
         vec![0; px * 4],
         vec![0; px * 4],
-        diffuse,
-        [10u8, 10, 10, 255].repeat(px),
+        f16_bytes(&diffuse),
+        f16_bytes(&[0.04, 0.04, 0.04, 1.0]).repeat(px),
         f16_bytes(&[0.0, 0.0, 1.0, 0.5]).repeat(px),
         f16_bytes(&over),
     ]
@@ -118,8 +118,8 @@ fn targets(
         color: gpu.image(render, vk::Format::R16G16B16A16_SFLOAT),
         depth: gpu.image(render, vk::Format::R32_SFLOAT),
         motion: gpu.image(render, vk::Format::R16G16_SFLOAT),
-        diffuse: gpu.image(render, vk::Format::R8G8B8A8_UNORM),
-        specular: gpu.image(render, vk::Format::R8G8B8A8_UNORM),
+        diffuse: gpu.image(render, vk::Format::R16G16B16A16_SFLOAT),
+        specular: gpu.image(render, vk::Format::R16G16B16A16_SFLOAT),
         normals: gpu.image(render, vk::Format::R16G16B16A16_SFLOAT),
         specular_motion: gpu.image(render, vk::Format::R16G16_SFLOAT),
         overlay: gpu.image(render, vk::Format::R16G16B16A16_SFLOAT),
@@ -402,8 +402,8 @@ fn run_on_orr(
         Format::R32Float,
         Format::Rg16Float,
         Format::Rg16Float,
-        Format::Rgba8Unorm,
-        Format::Rgba8Unorm,
+        Format::Rgba16Float,
+        Format::Rgba16Float,
         Format::Rgba16Float,
         Format::Rgba16Float,
     ]

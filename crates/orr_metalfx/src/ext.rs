@@ -129,8 +129,8 @@ mod tests {
             desc.setColorTextureFormat(MTLPixelFormat::RGBA16Float);
             desc.setDepthTextureFormat(MTLPixelFormat::R32Float);
             desc.setMotionTextureFormat(MTLPixelFormat::RG16Float);
-            desc.setDiffuseAlbedoTextureFormat(MTLPixelFormat::RGBA8Unorm);
-            desc.setSpecularAlbedoTextureFormat(MTLPixelFormat::RGBA8Unorm);
+            desc.setDiffuseAlbedoTextureFormat(MTLPixelFormat::RGBA16Float);
+            desc.setSpecularAlbedoTextureFormat(MTLPixelFormat::RGBA16Float);
             desc.setNormalTextureFormat(MTLPixelFormat::RGBA16Float);
             desc.setRoughnessTextureFormat(MTLPixelFormat::R16Float);
             desc.setOutputTextureFormat(MTLPixelFormat::RGBA16Float);

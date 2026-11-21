@@ -652,8 +652,8 @@ impl LightingView {
         let guide = |name, format| ArenaRequest::texture(name, d2(format), TO_RECONSTRUCTION);
         let mut requests = vec![
             ArenaRequest::texture(RADIANCE, d2(Format::Rgba16Float), radiance),
-            guide(DIFFUSE_ALBEDO, Format::Rgba8Unorm),
-            guide(SPECULAR_ALBEDO, Format::Rgba8Unorm),
+            guide(DIFFUSE_ALBEDO, Format::Rgba16Float),
+            guide(SPECULAR_ALBEDO, Format::Rgba16Float),
             guide(NORMAL_ROUGHNESS, Format::Rgba16Float),
             guide(SPECULAR_MOTION, Format::Rg16Float),
             ArenaRequest::texture(RR_DEPTH, d2(Format::R32Float), surface),
@@ -815,12 +815,12 @@ impl LightingView {
         self.targets.radiance.storage(0)
     }
 
-    /// RGBA8 unorm, not sRGB: diffuse albedo, subsurface included; 0.5 on sky pixels.
+    /// RGBA16F: diffuse albedo, subsurface included; 0.5 on sky pixels.
     pub fn diffuse_albedo(&self) -> &Texture {
         self.targets.diffuse_albedo.texture()
     }
 
-    /// RGBA8 unorm, not sRGB: specular albedo; 0 on sky pixels.
+    /// RGBA16F: specular albedo; 0 on sky pixels.
     pub fn specular_albedo(&self) -> &Texture {
         self.targets.specular_albedo.texture()
     }

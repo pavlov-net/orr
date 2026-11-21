@@ -32,9 +32,9 @@ fn rec2020(c: [f32; 3]) -> Vec3 {
     Vec3::from(lighting_suite::bed::rec2020(c))
 }
 
-/// Within one 8-bit step and `slack` of `want` in every channel.
+/// Within half a step of the RGBA16F guides below 1, and `slack`, of `want` in every channel.
 fn near(got: Vec3, want: Vec3, slack: f32) -> bool {
-    (got - want).abs().max_element() <= 1.0 / 255.0 + slack
+    (got - want).abs().max_element() <= 2f32.powi(-12) + slack
 }
 
 const UP_NORMAL: f32 = 1e-3;
