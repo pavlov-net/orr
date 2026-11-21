@@ -159,7 +159,7 @@ pub(super) fn main() {
             &mut list,
             &mut roots[(frame % u64::from(FRAMES_IN_FLIGHT)) as usize],
             &ComposePass {
-                source: ComposeSource::Linear(linear.as_ref().unwrap().index),
+                source: ComposeSource::Linear(linear.as_ref().unwrap().index, resolved.primaries()),
                 ui: None,
                 target,
                 extent,

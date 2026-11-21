@@ -1,4 +1,4 @@
-use orr_color::{EDR_REFERENCE_NITS, PQ_MAX_NITS, RgbPrimaries, SCRGB_WHITE_NITS};
+use orr_color::{EDR_REFERENCE_NITS, PQ_MAX_NITS, Primaries, RgbPrimaries, SCRGB_WHITE_NITS};
 use orr_scene::orr_gpu::{HdrMetadata, OutputFormat, PresentMode};
 use orr_window::DisplayInfo;
 
@@ -161,6 +161,15 @@ impl DisplayRequest {
 }
 
 impl ResolvedDisplay {
+    /// The primaries of display-linear color for this display: Rec.2020 for PQ, Rec.709 for
+    /// SDR and scRGB.
+    pub fn primaries(&self) -> Primaries {
+        match self.encoding {
+            OutputFormat::Hdr10Pq => Primaries::Rec2020,
+            OutputFormat::Sdr | OutputFormat::ScRgb => Primaries::Rec709,
+        }
+    }
+
     /// Mastering metadata for HDR encodings: Rec.2020 primaries, D65, the resolved peak and
     /// black at their signal levels, MaxCLL at the peak, MaxFALL unknown. `None` for SDR.
     pub(crate) fn hdr_metadata(&self) -> Option<HdrMetadata> {
@@ -193,7 +202,7 @@ pub enum CalibrationPattern {
     Black { nits: f32 },
 }
 
-/// Pattern levels in display-linear units: linear Rec.709, 1.0 = paper white.
+/// Pattern levels of gray in display-linear units, 1.0 = paper white.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PatternLevels {
     pub patch: f32,

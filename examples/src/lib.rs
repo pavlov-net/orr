@@ -383,15 +383,10 @@ impl Capture {
     /// A display screenshot (linear, relative to paper white) encoded as sRGB.
     pub fn from_screenshot(shot: &Screenshot) -> Self {
         let rgba8 = shot
-            .rgba
-            .iter()
-            .enumerate()
-            .map(|(k, &v)| {
-                if k % 4 == 3 {
-                    (f64::from(v.clamp(0.0, 1.0)) * 255.0).round() as u8
-                } else {
-                    orr_color::srgb8_encode(v)
-                }
+            .pixels_in(orr_color::Primaries::Rec709)
+            .flat_map(|p| {
+                let [r, g, b] = p.map(|c| orr_color::srgb8_encode(c as f32));
+                [r, g, b, 255]
             })
             .collect();
         Capture {

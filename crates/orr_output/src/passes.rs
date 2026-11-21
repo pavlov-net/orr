@@ -337,7 +337,7 @@ impl OutputView {
             size,
             rgba: Vec::new(),
             scene_referred: primaries.is_some(),
-            primaries: primaries.unwrap_or(Primaries::Rec709),
+            primaries: primaries.unwrap_or_else(|| display.primaries()),
             paper_white_nits: display.signal_white_nits,
             hdr: display.encoding != OutputFormat::Sdr,
         };
@@ -421,11 +421,13 @@ pub struct HookInputsPass {
     /// orr's frame id.
     pub frame: u64,
     pub hooks: Hooks,
+    /// The primaries of the view's display-linear image ([`ResolvedDisplay::primaries`]).
+    pub display_primaries: Primaries,
 }
 
-/// Tonemapping one image: pre-exposed linear Rec.2020 radiance in, display-linear Rec.709
-/// (1.0 = paper white) out, at the exposure and white balance the view's adapt pass wrote
-/// with the same [`OutputRoots`].
+/// Tonemapping one image: pre-exposed linear Rec.2020 radiance in, display-linear color in
+/// [`ResolvedDisplay::primaries`] (1.0 = paper white) out, at the exposure and white balance
+/// the view's adapt pass wrote with the same [`OutputRoots`].
 #[derive(Clone, Copy, Debug)]
 pub struct TonemapPass<'a> {
     /// Radiance, read at each output texel.
@@ -452,8 +454,9 @@ pub struct TonemapPass<'a> {
 /// What compose reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComposeSource {
-    /// Display-linear Rec.709, 1.0 = paper white, as tonemap writes it.
-    Linear(TextureIndex),
+    /// Display-linear color, 1.0 = paper white, in the given primaries, which compose converts
+    /// to [`ResolvedDisplay::primaries`]. Tonemap writes it in those already.
+    Linear(TextureIndex, Primaries),
     /// An image already in the display's encoding: the UI-free backbuffer or an interpolated
     /// frame. Texels with no UI over them are copied unchanged.
     Encoded(TextureIndex),
@@ -462,8 +465,8 @@ pub enum ComposeSource {
 }
 
 /// Encoding an image for the display, with the UI layer blended over it in extended sRGB
-/// relative to paper white: `ui + (1 - ui.a) * srgb_encode(linear)`. SDR is exactly egui's
-/// gamma blending; HDR keeps the UI's SDR look at paper white.
+/// Rec.709 relative to paper white: `ui + (1 - ui.a) * srgb_encode(linear)`. SDR is exactly
+/// egui's gamma blending; HDR keeps the UI's SDR look at paper white.
 ///
 /// Compose writes the UI-free backbuffer from tonemap's output (`ui: None`); compose-UI
 /// blends the frame's UI layer over each presented image (`Encoded`), or over black for a
@@ -480,8 +483,8 @@ pub struct ComposePass<'a> {
 }
 
 /// A display capture (`ScreenshotRequest::Display`): compose's result as display-linear
-/// Rec.709 floats, 1.0 = paper white, holding what the display shows (each encoding's clamp,
-/// no quantization).
+/// floats in [`ResolvedDisplay::primaries`], 1.0 = paper white, holding what the display shows
+/// (each encoding's clamp, no quantization).
 #[derive(Clone, Copy, Debug)]
 pub struct CapturePass<'a> {
     /// Tonemap's output, or the encoded backbuffer; `Black` for a UI-only frame.
@@ -545,7 +548,7 @@ impl ComposeKernel {
             ..compose_root(pass.source, pass.ui, pass.extent, pass.display)
         };
         let name = match pass.source {
-            ComposeSource::Linear(_) => "compose",
+            ComposeSource::Linear(..) => "compose",
             _ => "compose_ui",
         };
         list.begin_pass(name, false);
@@ -652,6 +655,7 @@ impl OutputKernels {
         };
         let inputs = HookInputs {
             hooks: pass.hooks,
+            display_primaries: pass.display_primaries,
             depth: depth.sampled(),
             motion: motion.sampled(),
             extent: pass.extent,
@@ -1051,7 +1055,7 @@ impl OutputKernels {
             grade_g: row(o.grade.matrix[1]),
             grade_b: row(o.grade.matrix[2]),
             grade_scale: o.grade.exposure_ev.exp2(),
-            sdr: u32::from(d.encoding == OutputFormat::Sdr),
+            encoding: encoding_id(d.encoding),
             debug,
             pattern_patch: pattern.map_or_default(|p| p.patch),
             pattern_surround: pattern.map_or_default(|p| p.surround),
@@ -1182,17 +1186,11 @@ fn compose_root(
     extent: [u32; 2],
     display: &ResolvedDisplay,
 ) -> compose::Root {
-    // ENCODING_* in display.slang.
-    let encoding = match display.encoding {
-        OutputFormat::Sdr => 0,
-        OutputFormat::Hdr10Pq => 1,
-        OutputFormat::ScRgb => 2,
-    };
     // SOURCE_* in compose.slang.
-    let (source, source_kind) = match source {
-        ComposeSource::Linear(t) => (t, 0),
-        ComposeSource::Encoded(t) => (t, 1),
-        ComposeSource::Black => (TextureIndex::NONE, 2),
+    let (source, source_kind, primaries) = match source {
+        ComposeSource::Linear(t, p) => (t, 0, p),
+        ComposeSource::Encoded(t) => (t, 1, display.primaries()),
+        ComposeSource::Black => (TextureIndex::NONE, 2, display.primaries()),
     };
     compose::Root {
         capture: GpuPtr::NULL,
@@ -1203,12 +1201,21 @@ fn compose_root(
         width: extent[0],
         height: extent[1],
         source_kind,
-        encoding,
+        encoding: encoding_id(display.encoding),
         signal_white_nits: display.signal_white_nits,
         rec709: 0,
+        source_primaries: u32::from(primaries.id()),
         _pad0: 0,
         _pad1: 0,
-        _pad2: 0,
+    }
+}
+
+/// `ENCODING_*` of `format` in display.slang.
+fn encoding_id(format: OutputFormat) -> u32 {
+    match format {
+        OutputFormat::Sdr => 0,
+        OutputFormat::Hdr10Pq => 1,
+        OutputFormat::ScRgb => 2,
     }
 }
 

@@ -360,7 +360,7 @@ impl Harness {
                         &mut list,
                         &mut self.output,
                         &CapturePass {
-                            source: ComposeSource::Linear(self.linear_index),
+                            source: ComposeSource::Linear(self.linear_index, display.primaries()),
                             ui: None,
                             extent: self.extent,
                             display,

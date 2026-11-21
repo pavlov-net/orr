@@ -144,7 +144,7 @@ fn run(display: &ResolvedDisplay, format: Format) -> Vec<u8> {
         &mut list,
         &mut compose_root,
         &ComposePass {
-            source: ComposeSource::Linear(linear_index),
+            source: ComposeSource::Linear(linear_index, display.primaries()),
             ui: None,
             target: backbuffer_store,
             extent,
@@ -167,8 +167,7 @@ fn reference(display: &ResolvedDisplay) -> Vec<[f32; 3]> {
         display.peak_nits,
         display.paper_white_nits,
     );
-    let sdr = display.encoding == OutputFormat::Sdr;
-    let linear: Vec<[f32; 3]> = gt7_display_linear(&curve, &ramp(), sdr)
+    let linear: Vec<[f32; 3]> = gt7_display_linear(&curve, &ramp(), display.encoding)
         .into_iter()
         .map(|c| c.map(|v| f16::from_f32(v).to_f32()))
         .collect();
@@ -177,8 +176,8 @@ fn reference(display: &ResolvedDisplay) -> Vec<[f32; 3]> {
 
 /// How far a channel may differ in nits, as a fraction of the texel's brightest channel,
 /// where code values do not bound it. Channels near zero in saturated colors come out of
-/// cancellations: GT7's ICtCp step in f32 and Rec.709 to Rec.2020 in compose, which turns
-/// one RGBA16F step of the brightest Rec.709 channel (2^-11 of it) into up to 1e-3 of it.
+/// cancellations in GT7's ICtCp step in f32, and for SDR and scRGB in its Rec.2020 to Rec.709
+/// conversion.
 const NITS_TOLERANCE: f64 = 1e-3;
 
 /// Checks every channel of `got` (signal times `scale`) against `reference` (signal):

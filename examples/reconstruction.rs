@@ -642,7 +642,7 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
             );
             list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
         }
-        f.compose(shown).expect("compose");
+        f.compose(shown, orr::Primaries::Rec709).expect("compose");
         last = Some(f.end().expect("end frame"));
     }
 

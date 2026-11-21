@@ -14,11 +14,11 @@ export __extern_cpp void orr_gt7_tonemap(Gt7Curve* curve, float* rgb, float* out
     }
 }
 
-export __extern_cpp void orr_gt7_display_linear(Gt7Curve* curve, float* rgb, float* out, uint count, uint sdr)
+export __extern_cpp void orr_gt7_display_linear(Gt7Curve* curve, float* rgb, float* out, uint count, uint encoding)
 {
     for (uint i = 0; i < count; i++)
     {
-        float3 o = gt7_display_linear(float3(rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2]), *curve, sdr != 0);
+        float3 o = gt7_display_linear(float3(rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2]), *curve, encoding);
         out[3 * i] = o.x;
         out[3 * i + 1] = o.y;
         out[3 * i + 2] = o.z;

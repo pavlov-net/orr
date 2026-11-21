@@ -282,9 +282,12 @@ pub struct RenderedView {
     /// reconstruction, or lighting without it, `hooks.scene_referred` and motion blur left it.
     /// With a `display_linear` hook it holds that hook's source instead.
     pub radiance: TextureIndex,
-    /// RGBA16F display-linear Rec.709, 1.0 = paper white, at the output extent; `NONE`
-    /// when the view stopped after exposure.
+    /// RGBA16F display-linear color in `linear_primaries`, 1.0 = paper white, at the output
+    /// extent; `NONE` when the view stopped after exposure.
     pub linear: TextureIndex,
+    /// The primaries of `linear`: the display's ([`orr_output::ResolvedDisplay::primaries`])
+    /// for `ViewTarget::Display`, Rec.709 for other targets, which tonemap for SDR.
+    pub linear_primaries: Primaries,
 }
 
 /// The renderer: scenes, their lighting, their views' histories and the frame.
@@ -560,13 +563,15 @@ impl Output {
         )
     }
 
-    /// Records compose of the display-linear `source` into `frame`'s backbuffer.
+    /// Records compose of the display-linear `source`, in `primaries`, into `frame`'s
+    /// backbuffer.
     fn compose(
         &mut self,
         list: &mut CommandList<'_>,
         id: u64,
         frame: &mut DisplayFrame<'_>,
         source: TextureIndex,
+        primaries: Primaries,
     ) {
         let target = frame.backbuffer(list);
         let n = self.compose.len() as u64;
@@ -574,7 +579,7 @@ impl Output {
             list,
             &mut self.compose[(id % n) as usize],
             &ComposePass {
-                source: ComposeSource::Linear(source),
+                source: ComposeSource::Linear(source, primaries),
                 ui: None,
                 target,
                 extent: frame.extent,
@@ -1791,6 +1796,7 @@ impl<'a> Frame<'a> {
                 jitter,
                 frame: id,
                 hooks: set,
+                display_primaries: resolved.primaries(),
             },
             field.as_deref_mut(),
         )?;
@@ -1871,6 +1877,7 @@ impl<'a> Frame<'a> {
                 reconstruction,
                 radiance: chain.rr_output,
                 linear: TextureIndex::NONE,
+                linear_primaries: resolved.primaries(),
                 compiling: false,
                 exact_paths,
             });
@@ -1922,6 +1929,7 @@ impl<'a> Frame<'a> {
             reconstruction,
             radiance: chain.rr_output,
             linear: chain.linear,
+            linear_primaries: resolved.primaries(),
             compiling: false,
             exact_paths,
         })
@@ -2028,6 +2036,7 @@ impl<'a> Frame<'a> {
                 jitter: desc.jitter.to_array(),
                 frame: id,
                 hooks: set,
+                display_primaries: resolved.primaries(),
             },
             field.as_deref_mut(),
         )?;
@@ -2080,6 +2089,7 @@ impl<'a> Frame<'a> {
             } else {
                 TextureIndex::NONE
             },
+            linear_primaries: resolved.primaries(),
         })
     }
 
@@ -2159,7 +2169,8 @@ impl<'a> Frame<'a> {
             None,
         );
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        output.compose(list, id, &mut frame, sampled);
+        let primaries = frame.display.primaries();
+        output.compose(list, id, &mut frame, sampled, primaries);
         Ok(())
     }
 
@@ -2181,13 +2192,13 @@ impl<'a> Frame<'a> {
         }
     }
 
-    /// Encodes `linear`, display-linear Rec.709 with 1.0 at paper white, into the display
-    /// at the frame's resolved display, for a view the consumer shaded itself. The image
+    /// Encodes `linear`, display-linear color in `primaries` with 1.0 at paper white, into the
+    /// display at the frame's resolved display, for a view the consumer shaded itself. The image
     /// covers the window's extent; texels past its edge repeat the last row and column.
     /// Records into [`Frame::output_list`] after a barrier, so the image may be written
     /// just before in either list. Does nothing without a display or while its window has
     /// no area.
-    pub fn compose(&mut self, linear: TextureIndex) -> Result<()> {
+    pub fn compose(&mut self, linear: TextureIndex, primaries: Primaries) -> Result<()> {
         let Some(display) = self.display.as_deref_mut() else {
             return Ok(());
         };
@@ -2197,7 +2208,7 @@ impl<'a> Frame<'a> {
             return Ok(());
         };
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-        self.output.compose(list, id, &mut frame, linear);
+        self.output.compose(list, id, &mut frame, linear, primaries);
         Ok(())
     }
 
@@ -2299,7 +2310,7 @@ fn finish_view(
         list,
         &mut state.compose[(id % n) as usize],
         &ComposePass {
-            source: ComposeSource::Linear(linear),
+            source: ComposeSource::Linear(linear, display.primaries()),
             ui: None,
             target: store,
             extent,
@@ -2311,7 +2322,7 @@ fn finish_view(
             list,
             &mut state.output,
             &CapturePass {
-                source: ComposeSource::Linear(linear),
+                source: ComposeSource::Linear(linear, display.primaries()),
                 ui: ui.filter(|_| include_ui),
                 extent,
                 display,

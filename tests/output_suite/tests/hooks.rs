@@ -268,6 +268,7 @@ impl View {
                     jitter: JITTER,
                     frame: self.frame,
                     hooks,
+                    display_primaries: self.display.primaries(),
                 },
                 field.as_deref_mut(),
             )

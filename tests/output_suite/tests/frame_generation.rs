@@ -252,7 +252,7 @@ fn frame_generation_presents_generated_images_before_each_frame() {
             [extent[0].div_ceil(8), extent[1].div_ceil(8), 1],
         );
         list.end_pass();
-        f.compose(t.color_sampled).unwrap();
+        f.compose(t.color_sampled, orr::Primaries::Rec709).unwrap();
         let view = ViewDesc {
             scene: SceneId(0),
             history: ViewHistoryId(0),
@@ -596,7 +596,7 @@ mod lens_distortion {
                 list,
                 &mut self.compose,
                 &ComposePass {
-                    source: ComposeSource::Linear(self.linear.sampled),
+                    source: ComposeSource::Linear(self.linear.sampled, self.display.primaries()),
                     ui: None,
                     target: target.storage,
                     extent: OUT,

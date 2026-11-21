@@ -1,7 +1,7 @@
 // Compose and compose-UI: an image into the target encoding, with the UI layer blended over
-// it in extended sRGB relative to paper white (egui's gamma blending in SDR). Screenshot
-// capture: the same result as display-linear Rec.709 floats, or the scene-referred radiance in
-// cd/m2.
+// it in extended sRGB Rec.709 relative to paper white (egui's gamma blending in SDR). Screenshot
+// capture: the same result as display-linear floats in the encoding's primaries, or the
+// scene-referred radiance in cd/m2.
 #include "orr_root.h"
 import orr_shaders.abi;
 import orr_color.primaries;
@@ -31,9 +31,10 @@ struct Root
     float signal_white_nits;
     // `scene_referred` converts to Rec.709.
     uint rec709;
+    // PRIMARIES_* of a linear `source`.
+    uint source_primaries;
     uint _pad0;
     uint _pad1;
-    uint _pad2;
 }
 ORR_ROOT(Root);
 
@@ -79,10 +80,14 @@ void main(uint3 id: SV_DispatchThreadID)
         }
         linear = root.source_kind == SOURCE_ENCODED
             ? decode_display(texel.rgb, root.encoding, root.signal_white_nits)
-            : texel.rgb;
+            : display_from(texel.rgb, root.source_primaries, root.encoding);
     }
     if (any(ui != 0.0))
-        linear = srgb_decode(ui.rgb + (1.0 - ui.a) * srgb_encode(linear));
+    {
+        float3 rec709 = root.encoding == ENCODING_PQ ? mul(REC2020_TO_REC709, linear) : linear;
+        rec709 = srgb_decode(ui.rgb + (1.0 - ui.a) * srgb_encode(rec709));
+        linear = display_from(rec709, PRIMARIES_REC709, root.encoding);
+    }
     write(id.xy, linear);
 }
 

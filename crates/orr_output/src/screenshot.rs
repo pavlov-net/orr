@@ -4,13 +4,14 @@ use std::fs::File;
 use std::io::{self, BufWriter};
 use std::path::Path;
 
-use orr_color::{Chromaticity, PQ_MAX_NITS, Primaries, RgbPrimaries, pq_encode, srgb8_encode};
+use orr_color::{Chromaticity, PQ_MAX_NITS, Primaries, pq_encode, srgb8_encode};
 use orr_math::DVec3;
 
 /// A capture of one view, made in the frame that asks for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScreenshotRequest {
-    /// What the display shows: display-linear Rec.709, 1.0 = paper white.
+    /// What the display shows: display-linear color in the display's primaries
+    /// ([`crate::ResolvedDisplay::primaries`]), 1.0 = paper white.
     Display { include_ui: bool },
     /// After `hooks.scene_referred`, before camera effects: absolute luminance in cd/m2,
     /// linear Rec.2020, or Rec.709 with `rec709`. EXR only.
@@ -39,12 +40,14 @@ pub struct Screenshot {
 const MAX_CLL_PERCENTILE: f64 = 0.9999;
 
 impl Screenshot {
-    fn pixels(&self) -> impl Iterator<Item = [f32; 3]> + '_ {
+    /// Each pixel's RGB, converted from [`Self::primaries`] to `primaries`.
+    pub fn pixels_in(&self, primaries: Primaries) -> impl Iterator<Item = [f64; 3]> + '_ {
+        let m = self.primaries.rgb().matrix_to(primaries.rgb());
         self.rgba
             .as_chunks::<4>()
             .0
             .iter()
-            .map(|p| [p[0], p[1], p[2]])
+            .map(move |p| (m * DVec3::from([p[0], p[1], p[2]].map(f64::from))).to_array())
     }
 
     fn display_only(&self, what: &str) -> io::Result<()> {
@@ -61,7 +64,10 @@ impl Screenshot {
     /// scene-referred capture.
     pub fn save_png_srgb(&self, path: &Path) -> io::Result<()> {
         self.display_only("sRGB PNG")?;
-        let data: Vec<u8> = self.pixels().flat_map(|p| p.map(srgb8_encode)).collect();
+        let data: Vec<u8> = self
+            .pixels_in(Primaries::Rec709)
+            .flat_map(|p| p.map(|c| srgb8_encode(c as f32)))
+            .collect();
         let mut encoder = self.png_encoder(path, png::BitDepth::Eight, None)?;
         encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
         let mut writer = encoder.write_header().map_err(io::Error::other)?;
@@ -75,13 +81,9 @@ impl Screenshot {
     pub fn save_png_pq(&self, path: &Path) -> io::Result<()> {
         self.display_only("PQ PNG")?;
         let pw = f64::from(self.paper_white_nits);
-        let to_rec2020 = self.primaries.rgb().matrix_to(RgbPrimaries::REC2020);
         let nits: Vec<[f64; 3]> = self
-            .pixels()
-            .map(|p| {
-                let rec2020 = to_rec2020 * DVec3::from(p.map(f64::from));
-                rec2020.to_array().map(|c| (c * pw).clamp(0.0, PQ_MAX_NITS))
-            })
+            .pixels_in(Primaries::Rec2020)
+            .map(|p| p.map(|c| (c * pw).clamp(0.0, PQ_MAX_NITS)))
             .collect();
         let data: Vec<u8> = nits
             .iter()

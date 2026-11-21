@@ -7,7 +7,7 @@ use orr_scene::orr_gpu::{
 };
 use orr_scene::{ArenaRequest, Span, ViewConstants, ViewStep};
 
-use crate::Result;
+use crate::{Primaries, Result};
 
 /// One run of a consumer hook. A screen warp reads `source` and writes `image`; an overlay
 /// depth-tests against `depth` in its own shader.
@@ -33,6 +33,9 @@ pub struct HookPass<'a, 'q> {
     pub view: GpuPtr<ViewConstants>,
     /// Render pixels: each render sample sits at its pixel center minus the jitter.
     pub jitter: [f32; 2],
+    /// The primaries of `image`'s linear color: Rec.2020 for `SceneReferred`, the display's
+    /// ([`crate::ResolvedDisplay::primaries`]) for `DisplayLinear`.
+    pub primaries: Primaries,
 }
 
 /// Where a hook runs in a view's output chain.
@@ -240,6 +243,7 @@ pub fn hook_requests(extent: [u32; 2]) -> Vec<ArenaRequest> {
 #[derive(Clone, Copy, Debug)]
 pub struct HookInputs {
     pub(crate) hooks: Hooks,
+    pub(crate) display_primaries: Primaries,
     pub(crate) depth: TextureIndex,
     pub(crate) motion: TextureIndex,
     pub(crate) extent: [u32; 2],
@@ -260,17 +264,17 @@ impl HookInputs {
         field: Option<&mut DistortionField>,
         hook: &mut dyn FnMut(&mut HookPass<'_, '_>),
     ) {
-        let (image, source) = match point {
+        let (image, source, primaries) = match point {
             HookPoint::SceneReferred => {
                 debug_assert!(self.hooks.scene_referred, "no scene_referred source copied");
-                (chain.rr_output_store, chain.linear)
+                (chain.rr_output_store, chain.linear, Primaries::Rec2020)
             }
             HookPoint::DisplayLinear => {
                 debug_assert!(
                     self.hooks.display_linear,
                     "no display_linear source written"
                 );
-                (chain.linear_store, chain.rr_output)
+                (chain.linear_store, chain.rr_output, self.display_primaries)
             }
         };
         let (distortion, distortion_source) = match &field {
@@ -290,6 +294,7 @@ impl HookInputs {
             extent: self.extent,
             view: self.view,
             jitter: self.jitter,
+            primaries,
         };
         hook(&mut pass);
         let written = pass.distortion_written;

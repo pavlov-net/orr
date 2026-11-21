@@ -82,7 +82,7 @@ impl Default for PostQuality {
 pub enum OutputDebug {
     #[default]
     None,
-    /// Exposed and graded radiance converted to Rec.709, without GT7.
+    /// Exposed and graded radiance in the display's primaries, without GT7.
     Linear,
     /// A calibration pattern in place of the view.
     Pattern(CalibrationPattern),

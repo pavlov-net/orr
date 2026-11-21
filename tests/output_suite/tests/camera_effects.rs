@@ -1611,7 +1611,18 @@ mod glare {
             settle(&mut h, &nits, &out, &sdr());
             let sdr_reach = reach(&h.display_linear(), 512, [256, 256], 0.99);
             settle(&mut h, &nits, &out, &hdr);
-            let hdr_reach = reach(&h.display_linear(), 512, [256, 256], 1.0);
+            // PQ's display-linear image is in Rec.2020; reach reads Rec.709 green, as in SDR.
+            let to_rec709 =
+                orr_color::RgbPrimaries::REC2020.matrix_to(orr_color::RgbPrimaries::REC709);
+            let image: Vec<[f32; 4]> = h
+                .display_linear()
+                .iter()
+                .map(|p| {
+                    let c = to_rec709 * orr_math::DVec3::from([p[0], p[1], p[2]].map(f64::from));
+                    [c.x as f32, c.y as f32, c.z as f32, p[3]]
+                })
+                .collect();
+            let hdr_reach = reach(&image, 512, [256, 256], 1.0);
             log::info!(
                 "{method:?} halo reach: SDR clip {sdr_reach} px, HDR 250 nits {hdr_reach} px"
             );

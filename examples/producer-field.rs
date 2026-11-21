@@ -397,7 +397,8 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
         }
         list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
-        f.compose(target.sampled).expect("compose");
+        f.compose(target.sampled, orr::Primaries::Rec709)
+            .expect("compose");
         last = Some(f.end().expect("end frame"));
     }
 

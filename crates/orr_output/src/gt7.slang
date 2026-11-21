@@ -6,6 +6,7 @@ module gt7;
 import orr_color.gamut;
 import orr_color.ictcp;
 import orr_color.primaries;
+import orr_output.display;
 
 // Nits of frame-buffer value 1.0.
 public static const float GT7_REFERENCE_NITS = 100.0;
@@ -63,11 +64,12 @@ public float3 gt7_tonemap(float3 rec2020, Gt7Curve c)
     return c.output_scale * min(lerp(skewed, scaled, c.blend_ratio), c.peak);
 }
 
-// Exposed linear Rec.2020 (1.0 = paper white) to display-linear Rec.709 (1.0 = paper white,
-// up to the peak over paper white). SDR gamut-compresses and clamps to [0, 1]; HDR keeps
-// colors outside Rec.709 as negative components.
-public float3 gt7_display_linear(float3 exposed, Gt7Curve c, bool sdr)
+// Exposed linear Rec.2020 (1.0 = paper white) to display-linear color for `encoding` (1.0 =
+// paper white, up to the peak over paper white): Rec.2020 for PQ, Rec.709 otherwise. SDR
+// gamut-compresses and clamps to [0, 1]; scRGB keeps colors outside Rec.709 as negative
+// components.
+public float3 gt7_display_linear(float3 exposed, Gt7Curve c, uint encoding)
 {
-    float3 rgb = mul(REC2020_TO_REC709, gt7_tonemap(exposed / c.output_scale, c));
-    return sdr ? saturate(gamut_compress(rgb)) : rgb;
+    float3 rgb = display_from_rec2020(gt7_tonemap(exposed / c.output_scale, c), encoding);
+    return encoding == ENCODING_SDR ? saturate(gamut_compress(rgb)) : rgb;
 }

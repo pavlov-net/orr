@@ -1,7 +1,7 @@
-// Pre-exposed linear Rec.2020 radiance to display-linear Rec.709: the lens's distortion and
-// chromatic aberration as the gather's sample positions, the view's adapted exposure, its
-// glare, its local exposure, its white balance, the grade, then GT7, or one of the debug
-// views. With lens distortion on it also composes the lens's map into frame generation's
+// Pre-exposed linear Rec.2020 radiance to display-linear color in the encoding's primaries
+// (`orr_output.display`): the lens's distortion and chromatic aberration as the gather's sample
+// positions, the view's adapted exposure, its glare, its local exposure, its white balance, the
+// grade, then GT7, or one of the debug views. With lens distortion on it also composes the lens's map into frame generation's
 // distortion field.
 #include "orr_root.h"
 import orr_shaders.abi;
@@ -9,6 +9,7 @@ import orr_color.luminance;
 import orr_color.primaries;
 import orr_scene.view;
 import orr_output.exposure;
+import orr_output.display;
 import orr_output.gt7;
 import orr_output.tent;
 import orr_output.glare_lens;
@@ -27,7 +28,8 @@ public struct TonemapConstants
     public float4 grade_b;
     // 2^grade exposure.
     public float grade_scale;
-    public uint sdr;
+    // ENCODING_* of the display.
+    public uint encoding;
     public uint debug;
     // Calibration pattern levels, display-linear.
     public float pattern_patch;
@@ -171,7 +173,7 @@ float local_exposure(TonemapConstants* k, float2 p, float3 radiance, float pre_e
     return exp2(-k.local_strength * (base - pivot.x));
 }
 
-// Stops from MID_GRAY as color: blue below, green at mid gray, red above, saturating at
+// Stops from MID_GRAY as Rec.709 color: blue below, green at mid gray, red above, saturating at
 // six stops, with each whole stop a step darker at its top.
 float3 heatmap(float exposed_luminance)
 {
@@ -200,7 +202,7 @@ void main(uint3 id: SV_DispatchThreadID)
     if (k.debug == DEBUG_PATTERN)
     {
         c = float3(in_patch(id.xy) ? k.pattern_patch : k.pattern_surround);
-        if (k.sdr != 0)
+        if (k.encoding == ENCODING_SDR)
             c = saturate(c);
     }
     else
@@ -262,15 +264,18 @@ void main(uint3 id: SV_DispatchThreadID)
                                                dot(k.grade_g.xyz, balanced),
                                                dot(k.grade_b.xyz, balanced));
         if (k.debug == DEBUG_EXPOSURE_HEATMAP)
-            c = heatmap(luminance_rec2020(exposed) * local);
+        {
+            float3 rec709 = heatmap(luminance_rec2020(exposed) * local);
+            c = display_from(rec709, PRIMARIES_REC709, k.encoding);
+        }
         else if (k.debug == DEBUG_LINEAR)
         {
-            c = mul(REC2020_TO_REC709, graded);
-            if (k.sdr != 0)
+            c = display_from_rec2020(graded, k.encoding);
+            if (k.encoding == ENCODING_SDR)
                 c = saturate(c);
         }
         else
-            c = gt7_display_linear(graded, k.curve, k.sdr != 0);
+            c = gt7_display_linear(graded, k.curve, k.encoding);
     }
     root.target.get<RWTexture2D<float4>>()[id.xy] = float4(c, 1.0);
     if (k.distortion == 0 && root.hook_source.index != IMAGE_NONE)

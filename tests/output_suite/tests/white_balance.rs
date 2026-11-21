@@ -1,9 +1,7 @@
 //! Auto white balance on the GPU against the CPU model of adapt's white point and CAT16.
 
-use std::sync::LazyLock;
-
 use orr_color::{Chromaticity, RgbPrimaries, cat16_rec2020};
-use orr_math::{DMat3, DVec2, DVec3};
+use orr_math::{DVec2, DVec3};
 use orr_output::{
     AutoWhiteBalance, DisplayRequest, Exposure, ExposureTelemetry, MeterWeights, OutputDebug,
     OutputFormat, ResolvedDisplay, ViewOutput, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV,
@@ -66,10 +64,9 @@ fn xy(v: [f32; 2]) -> [f64; 2] {
     v.map(f64::from)
 }
 
-/// The XYZ of a display-linear Rec.709 texel.
-fn shown_xyz(p: [f32; 4]) -> DVec3 {
-    static TO_XYZ: LazyLock<DMat3> = LazyLock::new(|| RgbPrimaries::REC709.rgb_to_xyz());
-    *TO_XYZ * DVec3::from([p[0], p[1], p[2]].map(f64::from))
+/// The XYZ of a display-linear texel on `display`.
+fn shown_xyz(p: [f32; 4], display: &ResolvedDisplay) -> DVec3 {
+    display.primaries().rgb().rgb_to_xyz() * DVec3::from([p[0], p[1], p[2]].map(f64::from))
 }
 
 fn no_sky() -> SkyStats {
@@ -94,7 +91,7 @@ fn tungsten_lit_gray_shows_as_d65() {
         let white = xy(t.white_point_xy);
         assert!(distance(white, model) < 5e-4, "{white:?} against {model:?}");
         for p in h.display_linear() {
-            let shown = xy_from_xyz(shown_xyz(p));
+            let shown = xy_from_xyz(shown_xyz(p, &display));
             assert!(distance(shown, d65()) < 0.005, "shown at {shown:?}");
         }
     }
@@ -218,7 +215,7 @@ fn white_point_and_correction_match_the_cpu_model() {
     for (p, (nits, color)) in image.iter().zip(&pixels) {
         let exposed = color.map(|c| f64::from(c * nits) * s);
         let want = to_xyz * (m * DVec3::from(exposed));
-        let shown = shown_xyz(*p);
+        let shown = shown_xyz(*p, &display);
         for c in 0..3 {
             assert!(
                 (shown[c] - want[c]).abs() <= 2e-3 * want[1],

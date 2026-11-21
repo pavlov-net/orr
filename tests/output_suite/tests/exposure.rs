@@ -1,6 +1,6 @@
 //! Auto and manual exposure on the GPU against CPU models of the meter and adapt.
 
-use orr_color::Chromaticity;
+use orr_color::{Chromaticity, rec709_to_rec2020};
 use orr_output::{
     AutoExposure, CalibrationPattern, DisplayRequest, Exposure, ExposureTelemetry, Grade, MID_GRAY,
     MeterWeights, OutputDebug, OutputFormat, Physiological, ViewOutput, ev100_from_exposure,
@@ -521,7 +521,8 @@ fn debug_views() {
     let nits = 100.0f32;
     h.set_image(&vec![nits; h.pixels()]);
     let display = DisplayRequest::default().resolve(&[OutputFormat::Hdr10Pq], None, false);
-    // Half a stop above mid gray: an eighth of the way from green to red, at 85%.
+    // Half a stop above mid gray: an eighth of the way from green to red, at 85%, in Rec.709,
+    // which PQ shows in Rec.2020.
     let ev100 = ev100_from_exposure(MID_GRAY * 0.5f32.exp2() / nits);
     let heatmap = ViewOutput {
         exposure: Exposure::Manual { ev100 },
@@ -529,7 +530,9 @@ fn debug_views() {
         ..ViewOutput::default()
     };
     h.frame(1.0, &heatmap, Some(&display));
-    let expected = [0.85 / 12.0, 0.85 * (1.0 - 0.9 / 12.0), 0.0];
+    let expected = rec709_to_rec2020([0.85 / 12.0, 0.85 * (1.0 - 0.9 / 12.0), 0.0])
+        .as_vec3()
+        .to_array();
     for p in h.display_linear() {
         for c in 0..3 {
             assert!(

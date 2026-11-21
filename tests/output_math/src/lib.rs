@@ -23,7 +23,7 @@ mod ffi {
             rgb: *const f32,
             out: *mut f32,
             count: u32,
-            sdr: u32,
+            encoding: u32,
         );
         pub(crate) fn orr_encode_display(
             rgb: *const f32,
@@ -58,8 +58,12 @@ pub fn gt7_tonemap(curve: &Gt7Curve, rgb: &[[f32; 3]]) -> Vec<[f32; 3]> {
 }
 
 /// `gt7_display_linear` on the Slang CPU target: exposed linear Rec.2020 to display-linear
-/// Rec.709.
-pub fn gt7_display_linear(curve: &Gt7Curve, rgb: &[[f32; 3]], sdr: bool) -> Vec<[f32; 3]> {
+/// color for `format`.
+pub fn gt7_display_linear(
+    curve: &Gt7Curve,
+    rgb: &[[f32; 3]],
+    format: OutputFormat,
+) -> Vec<[f32; 3]> {
     let mut out = vec![[0.0; 3]; rgb.len()];
     // SAFETY: as in `gt7_tonemap`.
     unsafe {
@@ -68,7 +72,7 @@ pub fn gt7_display_linear(curve: &Gt7Curve, rgb: &[[f32; 3]], sdr: bool) -> Vec<
             rgb.as_ptr().cast(),
             out.as_mut_ptr().cast(),
             count(rgb),
-            u32::from(sdr),
+            encoding_id(format),
         );
     }
     out
@@ -80,12 +84,7 @@ pub fn encode_display(
     format: OutputFormat,
     signal_white_nits: f32,
 ) -> Vec<[f32; 3]> {
-    // ENCODING_* in display.slang.
-    let encoding = match format {
-        OutputFormat::Sdr => 0,
-        OutputFormat::Hdr10Pq => 1,
-        OutputFormat::ScRgb => 2,
-    };
+    let encoding = encoding_id(format);
     let mut out = vec![[0.0; 3]; rgb.len()];
     // SAFETY: `rgb` and `out` hold `count` triples of f32.
     unsafe {
@@ -119,6 +118,15 @@ pub fn gt7_reference(peak_nits: Option<f32>, wide: bool, rgb: &[[f32; 3]]) -> Ve
         );
     }
     out
+}
+
+/// `ENCODING_*` of `format` in display.slang.
+fn encoding_id(format: OutputFormat) -> u32 {
+    match format {
+        OutputFormat::Sdr => 0,
+        OutputFormat::Hdr10Pq => 1,
+        OutputFormat::ScRgb => 2,
+    }
 }
 
 fn count(rgb: &[[f32; 3]]) -> u32 {

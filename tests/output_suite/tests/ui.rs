@@ -13,8 +13,8 @@ use egui::{
 };
 use half::f16;
 use orr_color::{
-    RgbPrimaries, SCRGB_WHITE_NITS, pq_decode, pq_encode, rec709_to_rec2020, srgb_decode,
-    srgb_encode,
+    Primaries, RgbPrimaries, SCRGB_WHITE_NITS, pq_decode, pq_encode, rec709_to_rec2020,
+    srgb_decode, srgb_encode,
 };
 use orr_egui::Painter;
 use orr_math::{DMat3, DVec3};
@@ -147,16 +147,13 @@ fn signals(bytes: &[u8], format: Format) -> Vec<[f64; 4]> {
     }
 }
 
-/// The f64 model of `decode_display` and `encode_display` (`display.slang`).
+/// The f64 model of `decode_display` and `encode_display` (`display.slang`), on display-linear
+/// color in `d`'s primaries.
 fn decode(signal: [f64; 3], d: &ResolvedDisplay) -> [f64; 3] {
     let white = f64::from(d.signal_white_nits);
     match d.encoding {
         OutputFormat::Sdr => signal.map(srgb_decode),
-        OutputFormat::Hdr10Pq => {
-            static M: LazyLock<DMat3> =
-                LazyLock::new(|| RgbPrimaries::REC2020.matrix_to(RgbPrimaries::REC709));
-            (*M * DVec3::from(signal.map(pq_decode)) / white).to_array()
-        }
+        OutputFormat::Hdr10Pq => signal.map(|v| pq_decode(v) / white),
         OutputFormat::ScRgb => signal.map(|v| v * SCRGB_WHITE_NITS / white),
     }
 }
@@ -165,10 +162,26 @@ fn encode(linear: [f64; 3], d: &ResolvedDisplay) -> [f64; 3] {
     let white = f64::from(d.signal_white_nits);
     match d.encoding {
         OutputFormat::Sdr => linear.map(|v| srgb_encode(v.clamp(0.0, 1.0))),
-        OutputFormat::Hdr10Pq => rec709_to_rec2020(linear)
-            .to_array()
-            .map(|v| pq_encode(v * white)),
+        OutputFormat::Hdr10Pq => linear.map(|v| pq_encode(v * white)),
         OutputFormat::ScRgb => linear.map(|v| v * white / SCRGB_WHITE_NITS),
+    }
+}
+
+/// Display-linear Rec.709 `c` in `d`'s primaries.
+fn from_rec709(c: [f64; 3], d: &ResolvedDisplay) -> [f64; 3] {
+    match d.primaries() {
+        Primaries::Rec2020 => rec709_to_rec2020(c).to_array(),
+        _ => c,
+    }
+}
+
+/// Display-linear `c` in `d`'s primaries in Rec.709.
+fn to_rec709(c: [f64; 3], d: &ResolvedDisplay) -> [f64; 3] {
+    static M: LazyLock<DMat3> =
+        LazyLock::new(|| RgbPrimaries::REC2020.matrix_to(RgbPrimaries::REC709));
+    match d.primaries() {
+        Primaries::Rec2020 => (*M * DVec3::from(c)).to_array(),
+        _ => c,
     }
 }
 
@@ -348,7 +361,7 @@ fn assert_same_look(images: &[Vec<[f64; 4]>]) {
     let sdr = &displays[0].0;
     for (i, (d, _)) in displays.iter().enumerate().skip(1) {
         for (p, (got, s)) in images[i].iter().zip(&images[0]).enumerate() {
-            let want = encode(decode([s[0], s[1], s[2]], sdr), d);
+            let want = encode(from_rec709(decode([s[0], s[1], s[2]], sdr), d), d);
             let got = [got[0], got[1], got[2]];
             assert!(
                 matches(got, want, d),
@@ -679,7 +692,11 @@ fn compose_ui_matches_model() {
         kernels.compose(
             &mut list,
             &mut roots[0],
-            &pass(ComposeSource::Linear(source.sampled), None, &backbuffer),
+            &pass(
+                ComposeSource::Linear(source.sampled, Primaries::Rec709),
+                None,
+                &backbuffer,
+            ),
         );
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         let ui_index = Some(layer.index());
@@ -700,7 +717,7 @@ fn compose_ui_matches_model() {
         // Display screenshots with UI: over tonemap's output, over the backbuffer (frame 1)
         // and over black (frame 2).
         for (frame, source) in [
-            ComposeSource::Linear(source.sampled),
+            ComposeSource::Linear(source.sampled, Primaries::Rec709),
             ComposeSource::Encoded(backbuffer.sampled),
             ComposeSource::Black,
         ]
@@ -728,9 +745,10 @@ fn compose_ui_matches_model() {
         for i in 0..n {
             let u = ui[i].map(|c| f64::from(c) / 255.0);
             let over = |under: [f64; 3]| {
+                let under = to_rec709(under, &display);
                 let blended =
                     [0, 1, 2].map(|c| srgb_decode(u[c] + (1.0 - u[3]) * srgb_encode(under[c])));
-                encode(blended, &display)
+                encode(from_rec709(blended, &display), &display)
             };
             if ui[i] == [0; 4] {
                 assert_eq!(
@@ -749,7 +767,10 @@ fn compose_ui_matches_model() {
                 );
             }
             let under = linear[i].map(|v| f16::from_bits(v).to_f64());
-            let want = decode(over([under[0], under[1], under[2]]), &display);
+            let want = decode(
+                over(from_rec709([under[0], under[1], under[2]], &display)),
+                &display,
+            );
             let g = &shots[0].rgba[4 * i..4 * i + 4];
             assert!(
                 capture_matches(g, want),

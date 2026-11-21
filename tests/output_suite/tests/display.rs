@@ -102,7 +102,7 @@ mod windowed {
                     &mut list,
                     root,
                     &ComposePass {
-                        source: ComposeSource::Linear(self.linear.1),
+                        source: ComposeSource::Linear(self.linear.1, f.display.primaries()),
                         ui: None,
                         target,
                         extent: f.extent,

@@ -134,7 +134,8 @@ impl SunShade {
             list.dispatch(encode, self.capture_root.gpu(), groups);
             list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
         }
-        f.compose(target.sampled).expect("compose");
+        f.compose(target.sampled, orr::Primaries::Rec709)
+            .expect("compose");
     }
 
     /// The final frame's capture, once its work has finished.
