@@ -1907,10 +1907,12 @@ fn gltf_materials_cook_their_canonical_channel_set() {
             "roughness is folded into its texture"
         );
         assert_eq!(m.geometry_opacity, 1.0);
-        let want = 2.0 * orr_color::srgb_decode(128.0 / 255.0) as f32;
-        assert!((m.emission_color[1] - want).abs() < 1e-4);
-        assert_eq!(m.emission_color[0], 2.0);
-        assert_eq!(m.emission_color[2], 0.0);
+        let half = orr_color::srgb_decode(128.0 / 255.0);
+        let want = orr_color::rec709_to_rec2020([2.0, 2.0 * half, 0.0]);
+        for c in 0..3 {
+            let e = f64::from(m.emission_color[c]);
+            assert!((e - want[c]).abs() < 1e-4, "{:?}", m.emission_color);
+        }
     }
     for s in 0..slot::COUNT {
         assert_eq!(m0.textures[s], m1.textures[s], "slot {s} is shared");
@@ -1990,7 +1992,7 @@ fn a_constant_color_folds_into_its_factor_in_the_image_primaries() {
     let (rec709, p3) = (RgbPrimaries::REC709, RgbPrimaries::DISPLAY_P3);
     let factor = rec709.matrix_to(p3) * orr_math::DVec3::new(2.0, 1.0, 0.5);
     let texel = texel.map(|c| orr_color::srgb_decode(f64::from(c) / 255.0));
-    let want = p3.matrix_to(rec709) * (factor * orr_math::DVec3::from(texel));
+    let want = p3.matrix_to(RgbPrimaries::REC2020) * (factor * orr_math::DVec3::from(texel));
     for c in 0..3 {
         assert!(
             (f64::from(m.emission_color[c]) - want[c]).abs() < 1e-4,

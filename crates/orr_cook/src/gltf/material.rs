@@ -27,6 +27,8 @@
 //! scatter anisotropy, the subsurface radius fields and the surface id have no ratified glTF
 //! source and come from `MaterialPatch`.
 //!
+//! glTF's factors are linear Rec.709 and convert to the linear Rec.2020 of `Material`.
+//!
 //! The fields above hold glTF's model until the cook converts them to OpenPBR's
 //! (`ShadingModel::Gltf`), once the textures' facts are known. What each choice gives up, beside
 //! what Blender's glTF importer (glTF-Blender-IO) makes of it in a Principled BSDF:
@@ -181,6 +183,7 @@ pub(super) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
         out.displacement_min = offset.min(offset + scale);
         out.displacement_max = offset.max(offset + scale);
     }
+    crate::shading_model::colors_to_rec2020(&mut out);
     out
 }
 

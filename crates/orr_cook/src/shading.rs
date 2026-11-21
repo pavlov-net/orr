@@ -94,6 +94,10 @@
 //! [`crate::texture::color`] has what each rule does. An unknown `colorspace` warns and reads as
 //! "data". A channel picked from a color image takes the space's curve and none of its primaries:
 //! a renderer working in the document's space would read the channel as it stands.
+//!
+//! A network's colors are linear Rec.709, which MaterialX and UsdShade values convert to from
+//! their spaces and which primvars and fallbacks hold; the mapped material holds them in linear
+//! Rec.2020.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
@@ -656,6 +660,7 @@ pub(crate) fn map(
     if let Some(d) = displacement {
         m.displacement(d)?;
     }
+    crate::shading_model::colors_to_rec2020(&mut m.material);
     Ok(Mapped {
         material: m.material,
         textures: m.textures,

@@ -496,6 +496,14 @@ fn plume() -> AssetSpec {
     }
 }
 
+/// Linear Rec.709 `c`, the space the bed's materials state their colors in, as the linear
+/// Rec.2020 a material holds.
+pub fn rec2020(c: [f32; 3]) -> [f32; 3] {
+    orr_color::rec709_to_rec2020(Vec3::from(c))
+        .as_vec3()
+        .to_array()
+}
+
 /// The water box's transmission color over 1 m in the linear Rec.2020 the kernels work in.
 pub fn water_transmission() -> [f64; 3] {
     let color = WATER_SIGMA.map(|s| f64::from(-s).exp());
@@ -516,17 +524,16 @@ pub struct DenseInterior {
 impl DenseInterior {
     fn material(&self, glass: Material) -> Material {
         Material {
-            transmission_color: self.sigma_t.map(|s| (-s * self.depth).exp()),
+            transmission_color: rec2020(self.sigma_t.map(|s| (-s * self.depth).exp())),
             transmission_depth: self.depth,
-            transmission_scatter: self.sigma_s.map(|s| s * self.depth),
+            transmission_scatter: rec2020(self.sigma_s.map(|s| s * self.depth)),
             transmission_scatter_anisotropy: self.anisotropy,
             specular_ior: self.ior,
             ..glass
         }
     }
 
-    /// Extinction and single-scattering albedo in linear Rec.2020, as the cook converts the
-    /// material's colors.
+    /// Extinction and single-scattering albedo in linear Rec.2020, as the material states them.
     pub fn rec2020(&self) -> (DVec3, DVec3) {
         use orr_color::rec709_to_rec2020;
         let d = f64::from(self.depth);
@@ -1044,13 +1051,13 @@ fn cook() -> Arc<[u8]> {
     quadrant_emitter.textures[slot::EMISSION].texture = AssetId::from_name("quadrants");
     let coated_emitter = Material {
         coat_weight: 1.0,
-        coat_color: [0.4, 0.6, 1.0],
+        coat_color: rec2020([0.4, 0.6, 1.0]),
         fuzz_weight: 1.0,
         fuzz_color: [1.0; 3],
         ..emitter
     };
     let mut leaf = Material {
-        base_color: [0.2, 0.6, 0.15],
+        base_color: rec2020([0.2, 0.6, 0.15]),
         alpha_mode: Material::MASK,
         alpha_cutoff: 0.5,
         double_sided: 1,
@@ -1058,9 +1065,9 @@ fn cook() -> Arc<[u8]> {
     };
     let linked_leaf = move |surface| Material { surface, ..leaf };
     let sheet = Material {
-        base_color: [0.3, 0.6, 0.2],
+        base_color: rec2020([0.3, 0.6, 0.2]),
         subsurface_weight: 1.0,
-        subsurface_color: [0.4, 0.8, 0.3],
+        subsurface_color: rec2020([0.4, 0.8, 0.3]),
         specular_roughness: 0.5,
         thin_walled: 1,
         double_sided: 1,
@@ -1083,9 +1090,9 @@ fn cook() -> Arc<[u8]> {
         ..glass
     };
     let skin = Material {
-        base_color: [0.9, 0.6, 0.5],
+        base_color: rec2020([0.9, 0.6, 0.5]),
         subsurface_weight: 1.0,
-        subsurface_color: [0.9, 0.6, 0.5],
+        subsurface_color: rec2020([0.9, 0.6, 0.5]),
         subsurface_radius: 0.05,
         subsurface_radius_scale: [1.0, 0.4, 0.2],
         ..Material::default()
@@ -1093,7 +1100,7 @@ fn cook() -> Arc<[u8]> {
     let white = diffuse([0.73; 3]);
     let grass_blade = Material {
         double_sided: 1,
-        ..diffuse([0.3, 0.6, 0.2])
+        ..diffuse(rec2020([0.3, 0.6, 0.2]))
     };
     let mirror = Material {
         base_color: [1.0; 3],
@@ -1274,13 +1281,13 @@ fn cook() -> Arc<[u8]> {
     });
     let water = Material {
         specular_ior: 1.33,
-        transmission_color: WATER_SIGMA.map(|s| (-s).exp()),
+        transmission_color: rec2020(WATER_SIGMA.map(|s| (-s).exp())),
         transmission_depth: 1.0,
         ..glass
     };
     let turbid = Material {
-        transmission_color: TURBID_SIGMA_T.map(|s| (-s).exp()),
-        transmission_scatter: TURBID_SIGMA_S,
+        transmission_color: rec2020(TURBID_SIGMA_T.map(|s| (-s).exp())),
+        transmission_scatter: rec2020(TURBID_SIGMA_S),
         ..water
     };
     let veil = Material {
@@ -1371,11 +1378,11 @@ fn cook() -> Arc<[u8]> {
                     LAYERED_SPHERE,
                     mesh(|b| b.sphere(0, 24, 1.0)),
                     vec![Material {
-                        base_color: [0.7, 0.1, 0.1],
+                        base_color: rec2020([0.7, 0.1, 0.1]),
                         coat_weight: 1.0,
                         coat_roughness: 0.1,
                         fuzz_weight: 0.5,
-                        fuzz_color: [0.9, 0.9, 1.0],
+                        fuzz_color: rec2020([0.9, 0.9, 1.0]),
                         thin_film_weight: 1.0,
                         thin_film_thickness: 0.4,
                         ..Material::default()
@@ -1386,8 +1393,8 @@ fn cook() -> Arc<[u8]> {
                     cornell,
                     vec![
                         white,
-                        diffuse([0.63, 0.065, 0.05]),
-                        diffuse([0.14, 0.45, 0.091]),
+                        diffuse(rec2020([0.63, 0.065, 0.05])),
+                        diffuse(rec2020([0.14, 0.45, 0.091])),
                     ],
                 ),
                 model(
@@ -1646,7 +1653,7 @@ fn cook() -> Arc<[u8]> {
                     mesh(|b| b.sphere(0, 48, 1.0)),
                     vec![Material {
                         coat_weight: 1.0,
-                        coat_color: [1.0, 0.5, 0.3],
+                        coat_color: rec2020([1.0, 0.5, 0.3]),
                         ..JADE.material(glass)
                     }],
                 ),

@@ -2219,7 +2219,7 @@ impl<'a> Packer<'a> {
 
     /// A color texture whose value multiplies the material color of slot `s` (base color,
     /// emission or subsurface color); a constant image folds into that color, multiplied in
-    /// the image's primaries.
+    /// the image's primaries, or channel by channel for the subsurface radius scale.
     fn color(
         &mut self,
         material: &MaterialName,
@@ -2269,14 +2269,19 @@ impl<'a> Packer<'a> {
             }
             let texel = texel.map(|v| self.held(r, v, top));
             let target = color(m);
-            // Rec.709 multiplies directly, so its factors stay exact.
+            // As the record reads them: a radius scale's texels multiply as they stand, and a
+            // color's tint its Rec.2020 factor in their primaries (`material_tint`). Rec.2020
+            // multiplies directly, so its factors stay exact.
             *target = match primaries {
-                Primaries::Rec709 => std::array::from_fn(|c| target[c] * texel[c]),
+                _ if s == slot::SUBSURFACE_RADIUS_SCALE => {
+                    std::array::from_fn(|c| target[c] * texel[c])
+                }
+                Primaries::Rec2020 => std::array::from_fn(|c| target[c] * texel[c]),
                 p => {
-                    let (rec709, p) = (RgbPrimaries::REC709, p.rgb());
-                    let f = rec709.matrix_to(p) * DVec3::from(target.map(f64::from));
+                    let (rec2020, p) = (RgbPrimaries::REC2020, p.rgb());
+                    let f = rec2020.matrix_to(p) * DVec3::from(target.map(f64::from));
                     let product = f * DVec3::from(texel.map(f64::from));
-                    (p.matrix_to(rec709) * product).as_vec3().to_array()
+                    (p.matrix_to(rec2020) * product).as_vec3().to_array()
                 }
             };
             return Ok(());

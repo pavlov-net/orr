@@ -78,6 +78,22 @@ fn cook_stage(
     Ok(Archive::from_memory(cooked.memory.remove(0)).unwrap())
 }
 
+/// Linear Rec.709 `c`, the space of a stage that states none, as the linear Rec.2020 of a cooked
+/// material.
+fn rec2020(c: [f32; 3]) -> [f32; 3] {
+    orr_color::rec709_to_rec2020(c.map(f64::from))
+        .as_vec3()
+        .to_array()
+}
+
+/// A cooked material's linear Rec.2020 `c` in linear Rec.709, where a stage states it.
+fn rec709(c: [f32; 3]) -> [f32; 3] {
+    let m = orr_color::RgbPrimaries::REC2020.matrix_to(orr_color::RgbPrimaries::REC709);
+    (m * orr_math::DVec3::from(c.map(f64::from)))
+        .as_vec3()
+        .to_array()
+}
+
 fn cook(name: &str, body: &str) -> Archive {
     cook_at(&dir(name), body, UsdSettings::default()).unwrap_or_else(|e| panic!("{name}: {e}"))
 }
@@ -1752,6 +1768,26 @@ fn gradient() -> Vec<u8> {
     png(8, 8, |x, _| [(x * 32) as u8, (x * 32) as u8, 0, 255])
 }
 
+/// `UsdColorSpaceAPI` (`pxr/usd/usd/schema.usda`): a color value is in its attribute's own
+/// `colorSpace`, else in its prim's or an ancestor's `colorSpace:name`, else in linear Rec.709,
+/// and the material holds it in linear Rec.2020.
+#[test]
+fn shader_colors_convert_from_the_space_they_are_in() {
+    use orr_color::RgbPrimaries as P;
+    let c = [0.5, 0.25, 0.125];
+    let inputs = r#"color3f inputs:diffuseColor = (0.5, 0.25, 0.125) (colorSpace = "lin_ap1_scene")
+        color3f inputs:emissiveColor = (0.5, 0.25, 0.125)"#;
+    let m = material(&cook("shader-color-spaces", &previewed(inputs, "", "")));
+    let want = |p: P| (p.matrix_to(P::REC2020) * orr_math::DVec3::from(c)).as_vec3();
+    let close = |got: [f32; 3], want: Vec3| Vec3::from(got).abs_diff_eq(want, 1e-5);
+    assert!(close(m.base_color, want(P::ACES_CG)), "{:?}", m.base_color);
+    assert!(
+        close(m.emission_color, want(P::REC709)),
+        "{:?}",
+        m.emission_color
+    );
+}
+
 /// The binding of `diffuseColor` reading texture `T`, with `inputs` on the texture.
 fn diffuse_binding(name: &str, inputs: &str, image: &[u8]) -> orr_pack::material::TextureBinding {
     let body = previewed(
@@ -1846,7 +1882,7 @@ fn black_reads_transparent_black_through_the_reader() {
     );
     // The field holds what the reader reaches past 1.
     for (c, want) in [0.25, 0.5, 0.75].into_iter().enumerate() {
-        let got = m.base_color[c] * b.outside[c];
+        let got = rec709(m.base_color)[c] * b.outside[c];
         assert!((got - want).abs() < 1e-5, "channel {c}: {got}");
     }
 
@@ -2417,7 +2453,7 @@ fn a_texture_bias_applies_to_scalar_and_color_inputs() {
     );
     let a = shaded("bias-color", &body, &png(8, 8, |_, _| [255, 255, 255, 255]));
     let m = material(&a);
-    for (got, want) in m.base_color.iter().zip([0.75, 0.5, 1.0]) {
+    for (got, want) in rec709(m.base_color).iter().zip([0.75, 0.5, 1.0]) {
         assert!((got - want).abs() < 1e-3, "{:?}", m.base_color);
     }
 
@@ -3205,10 +3241,8 @@ fn a_texture_that_can_not_be_read_reads_its_fallback() {
 
     let m = unread(FALLBACK, DIFFUSE, None);
     assert_eq!(m.textures[slot::BASE_COLOR].texture, AssetId::NONE);
-    assert!(
-        near(m.base_color[0], 0.25) && near(m.base_color[2], 0.75),
-        "{m:?}"
-    );
+    let base = rec709(m.base_color);
+    assert!(near(base[0], 0.25) && near(base[2], 0.75), "{m:?}");
 
     // A file that resolves and doesn't decode can't be read either.
     let m = unread(FALLBACK, ROUGH, Some(b"not an image"));
@@ -3233,7 +3267,7 @@ fn a_texture_that_can_not_be_read_reads_its_fallback() {
         "\n"
     );
     let m = unread(&srgb, DIFFUSE, None);
-    assert!(near(m.base_color[0], 0.25), "{m:?}");
+    assert!(near(rec709(m.base_color)[0], 0.25), "{m:?}");
 
     let m = unread("", DIFFUSE, None);
     assert_eq!(m.base_color, [0.0; 3], "the fallback's default");
@@ -4111,7 +4145,7 @@ fn constant_primvar_readers_feed_inputs() {
             "color3f[] primvars:displayColor = [(0.25, 0.5, 0.75)]",
         ),
     );
-    assert_eq!(material(&a).base_color, [0.25, 0.5, 0.75]);
+    assert_eq!(material(&a).base_color, rec2020([0.25, 0.5, 0.75]));
 
     let a = cook(
         "reader-fallback",
@@ -4121,7 +4155,7 @@ fn constant_primvar_readers_feed_inputs() {
             "",
         ),
     );
-    assert_eq!(material(&a).base_color, [0.5, 0.5, 0.25]);
+    assert_eq!(material(&a).base_color, rec2020([0.5, 0.5, 0.25]));
 
     // An index picks its element whichever values it leaves out; one that misses them, or a
     // primvar of no numbers, is the fallback.
@@ -4148,7 +4182,7 @@ fn constant_primvar_readers_feed_inputs() {
             &format!("reader-{name}"),
             &previewed(base, &fallback, &primvar),
         );
-        assert_eq!(material(&a).base_color, want, "{name}");
+        assert_eq!(material(&a).base_color, rec2020(want), "{name}");
     }
 
     // Two meshes of one material with different values take a material each.
@@ -4179,7 +4213,8 @@ def Mesh "Other"
                 .base_color
         })
         .collect();
-    assert!(colors.contains(&[1.0, 0.0, 0.0]) && colors.contains(&[0.0, 1.0, 0.0]));
+    let (red, green) = (rec2020([1.0, 0.0, 0.0]), rec2020([0.0, 1.0, 0.0]));
+    assert!(colors.contains(&red) && colors.contains(&green));
 }
 
 /// A joint an animation does not list holds its rest transform.

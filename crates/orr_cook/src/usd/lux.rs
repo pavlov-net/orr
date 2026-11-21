@@ -28,8 +28,9 @@
 //! - `ShapingAPI` shapes a sphere, point or rect light around its −Z axis as
 //!   `orr_pack::layout::ShapingSource` states, `inputs:shaping:cone:softness` clamped to
 //!   [0, 1] and an `inputs:shaping:focus` below 0 ignored, as the schema says.
-//! - Colors are in the color space `UsdColorSpaceAPI` assigns them (`pxr/usd/usd/schema.usda`):
-//!   linear Rec.709 where none is, the space layout records take.
+//! - `inputs:color` and `inputs:shaping:focusTint` are in the color space `UsdColorSpaceAPI`
+//!   resolves for them ([`PrimReader::color`]) and convert to the linear Rec.2020 layout records
+//!   take; the color temperature's color multiplies in linear Rec.709, the space it is in.
 //!
 //! What a light states that the scene has no term for fails the import, naming the prim: other
 //! light types, light filters and linking, IES profiles, rect textures, ShadowAPI's shadow
@@ -37,6 +38,7 @@
 //! `inputs:diffuse` and `inputs:specular`, and an input whose time samples change.
 
 use openusd::{usd, vt};
+use orr_color::rec709_to_rec2020;
 use orr_math::{DMat3, DMat4, DVec3, Vec3};
 use orr_pack::layout::{LightSource, ShapingSource};
 
@@ -119,15 +121,6 @@ fn uniform_scale(l: DMat3) -> Option<f64> {
         .then(|| s2.sqrt())
 }
 
-/// The color space `inputs:color` is in, where one is assigned: on the attribute, else by
-/// `UsdColorSpaceAPI` on the prim or its nearest ancestor that applies it.
-fn color_space(r: &PrimReader<'_>) -> Result<Option<String>, String> {
-    let attr = r.prim.attribute("inputs:color");
-    let name = usd::ColorSpaceAPI::compute_attribute_name(&attr, None);
-    let name = name.map_err(|e| format!("{} inputs:color: {e}", r.path()))?;
-    Ok(name.map(|n| n.as_str().to_owned()))
-}
-
 /// Light `r`, a prim of light type `ty`, whose space `to_scene` takes to scene space.
 pub(super) fn light(r: &PrimReader<'_>, ty: &str, to_scene: DMat4) -> Result<LightSource, String> {
     let path = r.path();
@@ -141,14 +134,7 @@ pub(super) fn light(r: &PrimReader<'_>, ty: &str, to_scene: DMat4) -> Result<Lig
     // LightAPI `inputs:intensity`, `inputs:exposure`, `inputs:color`.
     let intensity = number(r, "inputs:intensity")?;
     let exposure = number(r, "inputs:exposure")?;
-    let color = triple(r, "inputs:color")?;
-    if let Some(space) = color_space(r)?
-        && space != "lin_rec709_scene"
-    {
-        return fail(&format!(
-            "inputs:color in color space {space}, not linear Rec.709"
-        ));
-    }
+    let color = r.color("inputs:color", triple(r, "inputs:color")?)?;
     // LightAPI `inputs:enableColorTemperature`, `inputs:colorTemperature`: "the computed result
     // multiplies against the color attribute".
     let color = match flag(r, "inputs:enableColorTemperature")? {
@@ -156,7 +142,7 @@ pub(super) fn light(r: &PrimReader<'_>, ty: &str, to_scene: DMat4) -> Result<Lig
         false => color,
     };
     let normalize = flag(r, "inputs:normalize")?;
-    let emitted = color * (intensity * exposure.exp2());
+    let emitted = rec709_to_rec2020(color) * (intensity * exposure.exp2());
     // ShadowAPI `inputs:shadow:enable`.
     let shadows = bool_input(r, "inputs:shadow:enable")?.unwrap_or(true);
     let l = DMat3::from_mat4(to_scene);
@@ -284,7 +270,11 @@ fn shaping(r: &PrimReader<'_>, axis: DVec3) -> Result<Option<ShapingSource>, Str
         cone_angle: number(r, "inputs:shaping:cone:angle")?.to_radians() as f32,
         cone_softness: number(r, "inputs:shaping:cone:softness")?.clamp(0.0, 1.0) as f32,
         focus: focus.max(0.0) as f32,
-        focus_tint: triple(r, "inputs:shaping:focusTint")?.as_vec3(),
+        focus_tint: rec709_to_rec2020(r.color(
+            "inputs:shaping:focusTint",
+            triple(r, "inputs:shaping:focusTint")?,
+        )?)
+        .as_vec3(),
     }))
 }
 

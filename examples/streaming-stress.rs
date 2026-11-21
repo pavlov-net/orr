@@ -348,7 +348,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         }
         w.add_light(&Light::Directional(DirectionalLight {
             direction_to_light: SUN,
-            illuminance: Vec3::new(100_000.0, 95_000.0, 88_000.0),
+            illuminance: orr_examples::rec2020([100_000.0, 95_000.0, 88_000.0]),
             angular_radius: 0.004_65,
             disc: DiscProfile::LimbDarkened,
         }))

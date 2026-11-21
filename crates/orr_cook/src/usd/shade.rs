@@ -13,8 +13,9 @@ use openusd_schemas::shade::{
     self, Connectable, ConnectableContext, ProducerFilter, ShadingAttribute,
 };
 
-use super::read::{PrimReader, numbers};
+use super::read::{self, PrimReader, numbers};
 use crate::shading::{self, Input, Network, Node, Unit};
+use crate::texture::color::ImageColor;
 
 /// The render context whose terminals a material outputs first.
 const MTLX: &str = "mtlx";
@@ -200,7 +201,9 @@ impl Builder<'_> {
         Ok(n)
     }
 
-    /// The value `v` of `attr`, which `reader` reads.
+    /// An authored input value; a color's in linear Rec.709 from the space
+    /// [`PrimReader::color_space`] resolves, or as it stands, with a warning, where the cook
+    /// doesn't know that space.
     fn value(
         &mut self,
         reader: &PrimReader<'_>,
@@ -220,14 +223,26 @@ impl Builder<'_> {
             }
             vt::Value::Token(t) => Input::Text(t.as_str().to_string()),
             vt::Value::String(s) => Input::Text(s),
-            v => Input::Value(
-                numbers(&v)
-                    .ok_or_else(|| format!("{} {name}: unsupported value", reader.path()))?
-                    .into_iter()
-                    .map(|x| x as f32)
-                    .collect(),
-                Unit::Unstated,
-            ),
+            v => {
+                let mut v = numbers(&v)
+                    .ok_or_else(|| format!("{} {name}: unsupported value", reader.path()))?;
+                let role = attr.role();
+                let role = role.map_err(|e| format!("{} {name}: {e}", reader.path()))?;
+                if let (Some(sdf::Role::Color), [r, g, b, ..]) = (role, &v[..]) {
+                    let space = reader.color_space(name)?;
+                    match ImageColor::named(&space) {
+                        Some(c) => {
+                            let rgb = read::to_rec709(c, orr_math::DVec3::new(*r, *g, *b));
+                            v[..3].copy_from_slice(&rgb.to_array());
+                        }
+                        None => self.warnings.push(format!(
+                            "{} {name}: color space {space} reads as data",
+                            reader.path()
+                        )),
+                    }
+                }
+                Input::Value(v.into_iter().map(|x| x as f32).collect(), Unit::Unstated)
+            }
         })
     }
 }

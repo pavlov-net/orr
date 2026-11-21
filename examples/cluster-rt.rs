@@ -250,12 +250,12 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
 /// The model and the ground, cooked into an in-memory pack.
 fn cook() -> Arc<[u8]> {
     let knot = Material {
-        base_color: [0.75, 0.42, 0.18],
+        base_color: orr_examples::rec2020([0.75, 0.42, 0.18]).to_array(),
         specular_roughness: 0.4,
         ..Material::default()
     };
     let mut card = Material {
-        base_color: [0.3, 0.62, 0.22],
+        base_color: orr_examples::rec2020([0.3, 0.62, 0.22]).to_array(),
         alpha_mode: Material::MASK,
         alpha_cutoff: 0.5,
         double_sided: 1,
@@ -263,7 +263,7 @@ fn cook() -> Arc<[u8]> {
     };
     card.textures[slot::OPACITY].texture = AssetId::from_name(RINGS);
     let ground = Material {
-        base_color: [0.55, 0.55, 0.52],
+        base_color: orr_examples::rec2020([0.55, 0.55, 0.52]).to_array(),
         specular_roughness: 0.8,
         ..Material::default()
     };

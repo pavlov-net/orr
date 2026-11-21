@@ -28,7 +28,7 @@ use orr_math::{DMat3, DVec3};
 use self::medium::{COMPONENTS, Columns, Densities, Leg, Profile, Ray};
 use self::phase::{FogPhase, Rng};
 use crate::Atmosphere;
-use crate::block::{ozone_peak, rec2020};
+use crate::block::ozone_peak;
 use crate::spectrum::{self, Bands, rgb_at};
 
 static REC2020_TO_XYZ: LazyLock<DMat3> = LazyLock::new(|| RgbPrimaries::REC2020.rgb_to_xyz());
@@ -184,9 +184,9 @@ impl Reference {
         aerosol_factor: impl Fn(usize) -> f64,
     ) -> Vec<Chan> {
         let a = &self.atmosphere;
-        let ground = rec2020(a.ground_albedo);
+        let ground = a.ground_albedo.as_dvec3().to_array();
         let (fog_ext, fog_albedo) = a.height_fog.map_or((0.0, [0.0; 3]), |f| {
-            (f64::from(f.density), rec2020(f.albedo))
+            (f64::from(f.density), f.albedo.as_dvec3().to_array())
         });
         let ozone_peak = ozone_peak(a);
         Vec::from_fn(N, |k| {

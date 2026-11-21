@@ -164,9 +164,13 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         specular_roughness: 0.02,
         specular_ior: 1.333,
         transmission_weight: 1.0,
-        transmission_color: [0.62, 0.86, 0.9],
+        transmission_color: orr_examples::rec2020([0.62, 0.86, 0.9]).to_array(),
         transmission_depth: 1.5,
-        transmission_scatter: if turbid { [0.9, 1.1, 1.1] } else { [0.0; 3] },
+        transmission_scatter: if turbid {
+            orr_examples::rec2020([0.9, 1.1, 1.1]).to_array()
+        } else {
+            [0.0; 3]
+        },
         ..Material::default()
     };
     let water = f
@@ -210,7 +214,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     .expect("pond");
     w.add_light(&Light::Directional(DirectionalLight {
         direction_to_light: SUN,
-        illuminance: SUN_ILLUMINANCE,
+        illuminance: orr_examples::rec2020(SUN_ILLUMINANCE),
         angular_radius: 0.004_65,
         disc: DiscProfile::LimbDarkened,
     }))
@@ -362,12 +366,12 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
 /// objects, cooked with the sky into an in-memory pack.
 fn cook() -> Arc<[u8]> {
     let ground = Material {
-        base_color: [0.48, 0.45, 0.4],
+        base_color: orr_examples::rec2020([0.48, 0.45, 0.4]).to_array(),
         specular_roughness: 0.8,
         ..Material::default()
     };
     let tiles = Material {
-        base_color: [0.55, 0.75, 0.78],
+        base_color: orr_examples::rec2020([0.55, 0.75, 0.78]).to_array(),
         specular_roughness: 0.35,
         ..Material::default()
     };
@@ -384,15 +388,15 @@ fn cook() -> Arc<[u8]> {
         ..Material::default()
     };
     let amber = Material {
-        transmission_color: [0.95, 0.55, 0.15],
+        transmission_color: orr_examples::rec2020([0.95, 0.55, 0.15]).to_array(),
         transmission_depth: 0.2,
         ..glass
     };
     let jade = Material {
         specular_roughness: 0.15,
-        transmission_color: [0.35, 0.7, 0.45],
+        transmission_color: orr_examples::rec2020([0.35, 0.7, 0.45]).to_array(),
         transmission_depth: 0.1,
-        transmission_scatter: [0.5, 0.3, 0.45],
+        transmission_scatter: orr_examples::rec2020([0.5, 0.3, 0.45]).to_array(),
         transmission_scatter_anisotropy: 0.3,
         ..glass
     };

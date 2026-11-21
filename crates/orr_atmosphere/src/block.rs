@@ -17,11 +17,6 @@ const _: () = assert!(
     "the shaders hold MAX_GROUP_PASSES passes"
 );
 
-/// A linear Rec.709 color in linear Rec.2020.
-pub(crate) fn rec2020(c: Vec3) -> [f64; 3] {
-    orr_color::rec709_to_rec2020(c).to_array()
-}
-
 fn xyz(v: [f64; 3]) -> [f32; 4] {
     [v[0] as f32, v[1] as f32, v[2] as f32, 0.0]
 }
@@ -74,8 +69,10 @@ pub(crate) fn groups(a: &Atmosphere) -> [AtmosphereGroups; PASSES] {
     let ssa = f64::from(a.aerosol.single_scattering_albedo);
     let density = f64::from(a.rayleigh.density);
     let ozone = ozone_peak(a);
-    let ground = rec2020(a.ground_albedo);
-    let fog = a.height_fog.map_or_default(|f| rec2020(f.albedo));
+    let ground = a.ground_albedo.as_dvec3().to_array();
+    let fog = a
+        .height_fog
+        .map_or_default(|f| f.albedo.as_dvec3().to_array());
     std::array::from_fn(|p| {
         let per = |f: &dyn Fn(usize) -> f64| xyz(std::array::from_fn(|j| f(3 * p + j)));
         AtmosphereGroups {
@@ -117,7 +114,9 @@ pub(crate) fn medium(a: &Atmosphere, out: &mut AtmosphereGpu) {
         aod * RGB.aerosol_factor(c, alpha) * f64::from(a.aerosol.single_scattering_albedo)
     });
     out.ozone = band(&|c| RGB.ozone_cross_section[c] * ozone);
-    out.fog_albedo = xyz(a.height_fog.map_or_default(|f| rec2020(f.albedo)));
+    out.fog_albedo = xyz(a
+        .height_fog
+        .map_or_default(|f| f.albedo.as_dvec3().to_array()));
     out.planet_radius = a.planet_radius;
     out.top_radius = a.top_radius;
     out.rayleigh_scale = a.rayleigh.scale_height;

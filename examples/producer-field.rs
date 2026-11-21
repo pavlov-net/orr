@@ -158,12 +158,12 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     let (soil, blades, water_material) = {
         let mut mats = f.materials();
         let soil = Material {
-            base_color: [0.42, 0.36, 0.26],
+            base_color: orr_examples::rec2020([0.42, 0.36, 0.26]).to_array(),
             specular_roughness: 0.9,
             ..Material::default()
         };
         let grass = Material {
-            base_color: [0.32, 0.58, 0.2],
+            base_color: orr_examples::rec2020([0.32, 0.58, 0.2]).to_array(),
             specular_roughness: 0.6,
             double_sided: 1,
             ..Material::default()

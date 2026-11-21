@@ -353,7 +353,7 @@ fn rig(
 /// The ground, `half` m to each side, cooked into an in-memory pack.
 fn cook_surroundings(half: f32) -> Arc<[u8]> {
     let soil = Material {
-        base_color: SOIL,
+        base_color: orr_examples::rec2020(SOIL).to_array(),
         specular_roughness: 0.9,
         ..Material::default()
     };
@@ -453,7 +453,7 @@ fn run(options: &Options) -> Option<Capture> {
         .model(mounts[1], AssetId::from_name(GROUND))
         .expect("ground model");
     let atmosphere = Atmosphere {
-        ground_albedo: Vec3::from(SOIL),
+        ground_albedo: orr_examples::rec2020(SOIL),
         ..Atmosphere::earth(DVec3::ZERO, Vec3::Y)
     };
     let mut sky = AtmosphereState::new(gpu, &atmosphere, 0).expect("atmosphere");

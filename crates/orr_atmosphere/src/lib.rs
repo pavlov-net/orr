@@ -59,7 +59,7 @@ pub struct Atmosphere {
     pub planet_radius: f32,
     /// Radius of the top of the atmosphere, m.
     pub top_radius: f32,
-    /// Ground albedo of the virtual planet below the horizon, linear Rec.709.
+    /// Ground albedo of the virtual planet below the horizon, linear Rec.2020.
     pub ground_albedo: Vec3,
     pub rayleigh: Rayleigh,
     pub aerosol: Aerosol,
@@ -202,7 +202,7 @@ pub struct HeightFog {
     pub falloff_height: f32,
     /// Altitude above the ground plane where the extinction is `density`, m.
     pub base_height: f32,
-    /// Single-scattering albedo, linear Rec.709.
+    /// Single-scattering albedo, linear Rec.2020.
     pub albedo: Vec3,
     /// Mean droplet diameter, um; the phase fit covers 5 to 50.
     pub droplet_diameter: f32,

@@ -12,7 +12,7 @@ use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
 use orr_atmosphere::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE};
 use orr_atmosphere::{Atmosphere, FoldGpu, MAX_FOLDED_LIGHTS, SKY_VIEW_SIZE};
-use orr_color::{RgbPrimaries, luminance};
+use orr_color::luminance;
 use orr_lighting::ENVIRONMENT_SIZE;
 use orr_math::{DVec3, Vec3};
 use orr_scene::testing::{assert_clean, read_buffer};
@@ -479,10 +479,8 @@ fn textured_candidate_folds_its_disc_integral() {
     let textured = lut(&rig);
     let states = rig.lighting.as_ref().unwrap().directional_states();
     let integral = read_buffer(states, 2)[1].integral;
-    let rec709 = RgbPrimaries::REC2020.matrix_to(RgbPrimaries::REC709)
-        * DVec3::from(integral.map(f64::from));
     let uniform = DirectionalLight {
-        illuminance: rec709.as_vec3(),
+        illuminance: Vec3::from_array(integral),
         disc: DiscProfile::Uniform,
         ..moon
     };

@@ -408,7 +408,7 @@ fn documents_map_as_the_clauses_say() {
             inputs: BASE_I,
             check: |m| {
                 !bound(m, slot::BASE_COLOR)
-                    && [0.25, 0.5, 0.75]
+                    && rec2020([0.25, 0.5, 0.75])
                         .iter()
                         .zip(m.base_color)
                         .all(|(a, b)| close(*a, b))
@@ -1905,8 +1905,8 @@ fn a_fallback_stands_only_until_the_include_appears() {
         orr_cook::cook(&manifest, &Default::default()).unwrap();
         material(&Archive::open(&out).unwrap()).base_color
     };
-    assert_eq!(cook_file(), [1.0, 0.0, 0.0]);
-    assert_eq!(cook_file(), [1.0, 0.0, 0.0], "the record links");
+    assert_eq!(cook_file(), rec2020([1.0, 0.0, 0.0]));
+    assert_eq!(cook_file(), rec2020([1.0, 0.0, 0.0]), "the record links");
     std::fs::write(
         d.join("late.mtlx"),
         r#"<?xml version="1.0"?><materialx version="1.39">
@@ -1914,7 +1914,7 @@ fn a_fallback_stands_only_until_the_include_appears() {
             <input name="value" type="color3" value="0, 1, 0"/></constant></materialx>"#,
     )
     .unwrap();
-    assert_eq!(cook_file(), [0.0, 1.0, 0.0]);
+    assert_eq!(cook_file(), rec2020([0.0, 1.0, 0.0]));
 }
 
 /// Runs a cook that a cycle could keep from ending.
@@ -2196,7 +2196,7 @@ fn a_backsurfaceshader_is_a_material_of_the_back() {
     let mut v = vec![0; a.blobs(e)[0].raw_len as usize];
     a.read(&a.blobs(e)[0], &mut v).unwrap();
     let back = Material::from_bytes(&v).unwrap();
-    assert_eq!(back.base_color, [0.25, 0.5, 0.75]);
+    assert_eq!(back.base_color, rec2020([0.25, 0.5, 0.75]));
     assert_eq!(back.double_sided, 1);
 
     let (a, _) = cook(&doc, "Same").unwrap();
@@ -2272,7 +2272,7 @@ fn a_back_takes_the_class_of_its_front() {
     assert_eq!(back.thin_walled, 1);
     assert_eq!(back.geometry_opacity, 1.0);
     assert_eq!(back.alpha_mode, front.alpha_mode);
-    assert_eq!(back.base_color, [0.25, 0.5, 0.75]);
+    assert_eq!(back.base_color, rec2020([0.25, 0.5, 0.75]));
     // A thin wall bounds no interior, so the back keeps its own IOR.
     assert_eq!(back.specular_ior, 1.5);
 
@@ -2326,6 +2326,13 @@ fn image_node(ty: &str, file: &str, attrs: &str) -> String {
     format!(
         r#"<image name="i" type="{ty}"><input name="file" type="filename" value="{file}" {attrs}/></image>"#
     )
+}
+
+/// Linear Rec.709 `c`, a shading network's space, as the linear Rec.2020 of a cooked material.
+fn rec2020(c: [f32; 3]) -> [f32; 3] {
+    orr_color::rec709_to_rec2020(c.map(f64::from))
+        .as_vec3()
+        .to_array()
 }
 
 fn near(a: f32, b: f32) -> bool {
@@ -2452,7 +2459,8 @@ fn named_spaces_stand_over_what_the_file_states() {
 /// Spec L184: "implementations are expected to translate those color values", and L331's working
 /// space is "the default color space for all image inputs and color values". So 0.5 under an
 /// sRGB name reads 0.214, a document in ACEScg converts what it doesn't mark, and
-/// "data" (L381) converts nothing.
+/// "data" (L381) converts nothing: the value stands as a shading network's linear Rec.709, as a
+/// "data" image's texels do.
 #[test]
 fn color_values_read_in_their_space() {
     let (a, _) = cook_body(
@@ -2479,12 +2487,12 @@ fn color_values_read_in_their_space() {
     );
     let (a, _) = cook(&doc, "M").unwrap();
     let m = material(&a);
-    // By the published ACEScg to linear Rec.709 matrix.
-    let want = [0.6867, 0.2188, 0.0999];
+    // By the published ACEScg to linear Rec.709 matrix, in the material's Rec.2020.
+    let want = rec2020([0.6867, 0.2188, 0.0999]);
     assert!(
         m.base_color.iter().zip(want).all(|(c, w)| near(*c, w)),
         "{:?}",
         m.base_color
     );
-    assert_eq!(m.specular_color, [0.5, 0.25, 0.125]);
+    assert_eq!(m.specular_color, rec2020([0.5, 0.25, 0.125]));
 }

@@ -5,7 +5,6 @@ use orr_gpu::TextureIndex;
 use orr_math::{DVec3, IVec3, Vec3};
 
 use crate::LightGpu;
-use crate::material::rec2020;
 use crate::world::{WorldPos, render_position};
 
 /// A light of one scene: its entry in the scene's light table, which grows to hold the highest
@@ -33,10 +32,9 @@ pub struct LightTables {
     pub producer_clusters: u32,
 }
 
-/// A light. Colors are linear Rec.709 and convert to Rec.2020 when written. A point, sphere or
-/// rect light without `shadows` lights what lies behind other surfaces as if they were not
-/// there: only next-event estimation carries it, no ray meets its body, and no shadow ray is
-/// traced toward it.
+/// A light. Colors are linear Rec.2020. A point, sphere or rect light without `shadows` lights
+/// what lies behind other surfaces as if they were not there: only next-event estimation carries
+/// it, no ray meets its body, and no shadow ray is traced toward it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Light {
     Directional(DirectionalLight),
@@ -151,7 +149,7 @@ pub(crate) fn light_gpu(light: &Light, origin_cell: IVec3, cell_log2: u32) -> Li
             g.kind = LIGHT_DIRECTIONAL;
             g.radius = d.angular_radius;
             g.direction = d.direction_to_light.normalize().to_array();
-            g.color = rec2020(d.illuminance);
+            g.color = d.illuminance.to_array();
             match d.disc {
                 DiscProfile::Uniform => g.disc = 0,
                 DiscProfile::LimbDarkened => g.disc = 1,
@@ -172,7 +170,7 @@ pub(crate) fn light_gpu(light: &Light, origin_cell: IVec3, cell_log2: u32) -> Li
         } => {
             place(position);
             g.kind = LIGHT_POINT;
-            g.color = rec2020(intensity);
+            g.color = intensity.to_array();
             g.flags = if shadows { 0 } else { LIGHT_UNSHADOWED };
             shaping
         }
@@ -186,7 +184,7 @@ pub(crate) fn light_gpu(light: &Light, origin_cell: IVec3, cell_log2: u32) -> Li
             place(position);
             g.kind = LIGHT_SPHERE;
             g.radius = radius;
-            g.color = rec2020(intensity);
+            g.color = intensity.to_array();
             g.flags = if shadows { 0 } else { LIGHT_UNSHADOWED };
             shaping
         }
@@ -202,7 +200,7 @@ pub(crate) fn light_gpu(light: &Light, origin_cell: IVec3, cell_log2: u32) -> Li
             g.kind = LIGHT_RECT;
             g.edge_x = edge_x.to_array();
             g.edge_y = edge_y.to_array();
-            g.color = rec2020(luminance);
+            g.color = luminance.to_array();
             g.flags = if shadows { 0 } else { LIGHT_UNSHADOWED };
             shaping
         }
@@ -213,7 +211,7 @@ pub(crate) fn light_gpu(light: &Light, origin_cell: IVec3, cell_log2: u32) -> Li
             g.cone_angle = s.cone_angle;
             g.cone_start = s.cone_angle * (1.0 - s.cone_softness);
             g.focus = s.focus;
-            g.focus_tint = rec2020(s.focus_tint);
+            g.focus_tint = s.focus_tint.to_array();
         }
         // No direction lies past π off an axis, and a cone of no smooth span scales none.
         None if g.kind != LIGHT_DIRECTIONAL => {

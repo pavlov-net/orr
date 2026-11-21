@@ -445,10 +445,10 @@ impl Blades {
     /// The blades' material: thin and translucent, shaded by `BladeSurface`.
     pub fn material() -> Material {
         Material {
-            base_color: [0.25, 0.45, 0.15],
+            base_color: crate::rec2020([0.25, 0.45, 0.15]).to_array(),
             specular_roughness: 0.6,
             subsurface_weight: 0.5,
-            subsurface_color: [0.25, 0.45, 0.15],
+            subsurface_color: crate::rec2020([0.25, 0.45, 0.15]).to_array(),
             double_sided: 1,
             thin_walled: 1,
             surface: linked::surface::BLADES,

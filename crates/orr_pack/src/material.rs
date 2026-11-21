@@ -5,7 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::mesh::SurfaceClass;
 use crate::{AssetId, Error, Result};
 
-pub const SCHEMA: u16 = 4;
+pub const SCHEMA: u16 = 5;
 
 /// Roughness below which a lobe carries light on as a caustic instead of scattering it.
 pub const CHAIN_ROUGHNESS: f32 = 0.1;
@@ -62,7 +62,7 @@ pub mod filter {
     pub const ONE_MIP: u8 = 1 << 3;
 }
 
-/// OpenPBR 1.1.2 parameters of one material, as authored: colors linear Rec.709, lengths
+/// OpenPBR 1.1.2 parameters of one material, as authored: colors linear Rec.2020, lengths
 /// in world space meters, thin-film thickness in nanometers, emission luminance in nits, angles
 /// in radians. The displacement fields are the exception: lengths in mesh space, unless
 /// [`Self::displacement_world`] says otherwise.

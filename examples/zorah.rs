@@ -496,10 +496,10 @@ fn sun(pack: &Path, from_world: Mat3) -> Option<DirectionalLight> {
     let head = entry_head(&archive, AssetId::from_name(SKY)).expect("the sky's header");
     let info = TextureInfo::parse(&head).expect("the sky's header");
     let light = info.lights.first()?;
-    // The light's energy is in the map's primaries, a directional light's in Rec.709.
+    // The light's energy is in the map's primaries, a directional light's in Rec.2020.
     let primaries = info.header.color_primaries().expect("sky primaries");
-    let to_rec709 = primaries.rgb().matrix_to(orr_color::RgbPrimaries::REC709);
-    let illuminance = to_rec709 * DVec3::from(light.illuminance.map(f64::from));
+    let to_rec2020 = primaries.rgb().matrix_to(orr_color::RgbPrimaries::REC2020);
+    let illuminance = to_rec2020 * DVec3::from(light.illuminance.map(f64::from));
     Some(DirectionalLight {
         direction_to_light: from_world.transpose() * Vec3::from_array(light.direction_to_light),
         illuminance: illuminance.as_vec3(),

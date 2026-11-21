@@ -459,9 +459,6 @@ fn lights_move_with_the_render_origin() {
         );
         assert_eq!((l[0].kind, l[1].kind, l[2].kind), (2, 3, 1));
         assert_eq!(l[2].position, [0.0; 3]);
-        // Rec.709 red in Rec.2020.
-        let rec709_red = orr_color::rec709_to_rec2020(DVec3::X).as_vec3();
-        assert!(Vec3::from(l[0].color).abs_diff_eq(rec709_red, 1e-6));
     };
     // The lights are written against the old origin and the focus moves in the same frame.
     let root = run_frame(&mut scenes, s, |w| {

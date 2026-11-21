@@ -54,6 +54,13 @@ fn cook(path: &Path, settings: GltfSettings) -> orr_cook::Result<(Archive, orr_c
     Ok((a, cooked.report))
 }
 
+/// glTF's linear Rec.709 `c` as the linear Rec.2020 of a cooked material.
+fn rec2020(c: [f32; 3]) -> [f32; 3] {
+    orr_color::rec709_to_rec2020(c.map(f64::from))
+        .as_vec3()
+        .to_array()
+}
+
 fn read(a: &Archive, b: &orr_pack::Blob) -> Vec<u8> {
     let mut v = vec![0; b.raw_len as usize];
     a.read(b, &mut v).unwrap();
@@ -464,11 +471,11 @@ fn material_extensions_map_to_openpbr() {
             lacquer.fuzz_color,
             lacquer.fuzz_roughness
         ),
-        (1.0, [0.5, 0.25, 0.1], 0.4)
+        (1.0, rec2020([0.5, 0.25, 0.1]), 0.4)
     );
     assert_eq!(
         (lacquer.specular_weight, lacquer.specular_color),
-        (0.6, [1.0, 0.9, 0.8])
+        (0.6, rec2020([1.0, 0.9, 0.8]))
     );
     assert_eq!(lacquer.specular_ior, 1.7);
     assert_eq!(
@@ -483,7 +490,7 @@ fn material_extensions_map_to_openpbr() {
     assert_eq!(glass.transmission_weight, 0.9);
     assert_eq!(
         (glass.transmission_color, glass.transmission_depth),
-        ([0.9, 0.5, 0.2], 0.5)
+        (rec2020([0.9, 0.5, 0.2]), 0.5)
     );
     assert_eq!(glass.thin_walled, 0);
     assert_eq!(
@@ -499,7 +506,7 @@ fn material_extensions_map_to_openpbr() {
     let leaf = m(3);
     assert_eq!(
         (leaf.subsurface_weight, leaf.subsurface_color),
-        (0.4, [0.3, 0.8, 0.2])
+        (0.4, rec2020([0.3, 0.8, 0.2]))
     );
     assert_eq!(
         (leaf.surface, leaf.subsurface_radius, leaf.thin_walled),

@@ -65,6 +65,17 @@ fn meshes_layout() -> GltfSettings {
     }
 }
 
+/// glTF's linear Rec.709 `c` as the linear Rec.2020 of a cooked material.
+fn rec2020(c: [f32; 3]) -> [f32; 3] {
+    orr_color::rec709_to_rec2020(c.map(f64::from))
+        .as_vec3()
+        .to_array()
+}
+
+fn near3(a: [f32; 3], b: [f32; 3]) -> bool {
+    (0..3).all(|c| (a[c] - b[c]).abs() < 1e-6)
+}
+
 fn read(a: &Archive, b: &orr_pack::Blob) -> Vec<u8> {
     let mut v = vec![0; b.raw_len as usize];
     a.read(b, &mut v).unwrap();
@@ -1116,8 +1127,13 @@ fn specular_past_1_moves_into_the_weight_and_the_coat_darkens_nothing() {
         "",
     );
     let m = material_of(&cooked(&path).0);
-    assert_eq!(m.specular_weight, 2.0);
-    assert_eq!(m.specular_color, [1.0, 0.5, 0.125]);
+    assert!(
+        (m.specular_weight - 2.0).abs() < 1e-6,
+        "{}",
+        m.specular_weight
+    );
+    let tint = rec2020([1.0, 0.5, 0.125]);
+    assert!(near3(m.specular_color, tint), "{:?}", m.specular_color);
     assert_eq!((m.coat_ior, m.coat_darkening), (1.5, 0.0));
 }
 
@@ -1137,7 +1153,7 @@ fn the_base_color_tints_thin_transmission_and_a_volume_keeps_its_own() {
     let (a, report) = cooked(&path);
     let m = material_of(&a);
     assert_eq!(m.thin_walled, 1);
-    assert_eq!(m.transmission_color, m.base_color);
+    assert!(near3(m.transmission_color, m.base_color), "{m:?}");
     let tint = m.textures[slot::TRANSMISSION_COLOR];
     let base = m.textures[slot::BASE_COLOR];
     assert!(is_bound(&m, slot::TRANSMISSION_COLOR));
@@ -1159,7 +1175,7 @@ fn the_base_color_tints_thin_transmission_and_a_volume_keeps_its_own() {
     let (a, report) = cooked(&path);
     let m = material_of(&a);
     assert_eq!(m.thin_walled, 0);
-    assert_eq!(m.transmission_color, [0.9, 0.8, 0.7]);
+    assert_eq!(m.transmission_color, rec2020([0.9, 0.8, 0.7]));
     assert!(!is_bound(&m, slot::TRANSMISSION_COLOR));
     assert_eq!(
         report.assets[0].warnings.len(),

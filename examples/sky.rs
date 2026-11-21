@@ -76,7 +76,7 @@ fn suns(degrees: f64) -> [DirectionalLight; 2] {
     let sun = solar_disc(dir(3.0 + 0.4 * degrees, -30.0 + degrees));
     let base = solar_disc(dir(8.0 - 0.1 * degrees, -8.0 + 0.5 * degrees));
     let second = DirectionalLight {
-        illuminance: base.illuminance * Vec3::new(0.30, 0.13, 0.06),
+        illuminance: base.illuminance * orr_examples::rec2020([0.30, 0.13, 0.06]),
         angular_radius: 3.0 * base.angular_radius,
         ..base
     };
@@ -374,23 +374,23 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
 /// and the ground with the towers.
 fn cook() -> Arc<[u8]> {
     let stone = Material {
-        base_color: [0.55, 0.52, 0.47],
+        base_color: orr_examples::rec2020([0.55, 0.52, 0.47]).to_array(),
         specular_roughness: 0.7,
         ..Material::default()
     };
     let metal = Material {
-        base_color: [0.9, 0.86, 0.8],
+        base_color: orr_examples::rec2020([0.9, 0.86, 0.8]).to_array(),
         metalness: 1.0,
         specular_roughness: 0.2,
         ..Material::default()
     };
     let ground = Material {
-        base_color: [0.16, 0.2, 0.12],
+        base_color: orr_examples::rec2020([0.16, 0.2, 0.12]).to_array(),
         specular_roughness: 0.9,
         ..Material::default()
     };
     let tower = Material {
-        base_color: [0.5, 0.5, 0.52],
+        base_color: orr_examples::rec2020([0.5, 0.5, 0.52]).to_array(),
         specular_roughness: 0.8,
         ..Material::default()
     };

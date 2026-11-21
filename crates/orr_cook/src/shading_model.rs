@@ -1,7 +1,15 @@
 //! Materials that sources state in another shading model, as the OpenPBR parameters a cooked
 //! [`Material`] holds. Every renderer reads one model; what a conversion gives up is listed with
 //! the importer's mapping (`gltf::material`, `shading`).
+//!
+//! glTF states its arithmetic per channel in linear Rec.709, and the shading networks read
+//! UsdPreviewSurface's values there too, so the conversions take a channel's largest value and a
+//! product of colors in linear Rec.709, though the fields hold linear Rec.2020.
 
+use std::sync::LazyLock;
+
+use orr_color::{RgbPrimaries, rec709_to_rec2020};
+use orr_math::{DMat3, DVec3};
 use orr_pack::material::{Material, slot};
 
 use crate::texture::material::{MaterialTextures, TexRef};
@@ -67,6 +75,37 @@ fn max3(c: [f32; 3]) -> f32 {
     c.into_iter().fold(0.0, f32::max)
 }
 
+/// Linear Rec.709 `c` in linear Rec.2020.
+fn rec2020(c: [f32; 3]) -> [f32; 3] {
+    rec709_to_rec2020(c.map(f64::from)).as_vec3().to_array()
+}
+
+/// Linear Rec.2020 `c` in linear Rec.709.
+fn rec709(c: [f32; 3]) -> [f32; 3] {
+    static MATRIX: LazyLock<DMat3> =
+        LazyLock::new(|| RgbPrimaries::REC2020.matrix_to(RgbPrimaries::REC709));
+    (*MATRIX * DVec3::from(c.map(f64::from)))
+        .as_vec3()
+        .to_array()
+}
+
+/// Takes the color fields of `m` from linear Rec.709, the space glTF's factors and the shading
+/// networks' values are in, to the linear Rec.2020 of a cooked [`Material`].
+pub(crate) fn colors_to_rec2020(m: &mut Material) {
+    for c in [
+        &mut m.base_color,
+        &mut m.specular_color,
+        &mut m.emission_color,
+        &mut m.transmission_color,
+        &mut m.transmission_scatter,
+        &mut m.subsurface_color,
+        &mut m.coat_color,
+        &mut m.fuzz_color,
+    ] {
+        *c = rec2020(*c);
+    }
+}
+
 /// F0 of a dielectric of relative IOR `ior`.
 fn f0_of(ior: f32) -> f32 {
     ((ior - 1.0) / (ior + 1.0)).powi(2)
@@ -77,7 +116,7 @@ fn f0_of(ior: f32) -> f32 {
 /// becomes the surface tint OpenPBR's transmission color is at depth 0.
 fn gltf(m: &mut Material, t: &mut MaterialTextures) -> Option<String> {
     // The texels of `specularColorTexture` read 0..1: the factor holds the rest.
-    let c = max3(m.specular_color);
+    let c = max3(rec709(m.specular_color));
     if c > 1.0 {
         m.specular_weight *= c;
         m.specular_color = m.specular_color.map(|v| v / c);
@@ -97,8 +136,9 @@ fn gltf(m: &mut Material, t: &mut MaterialTextures) -> Option<String> {
                 .to_string()
         });
     }
-    let base = m.base_color.map(|v| v * m.base_weight);
-    m.transmission_color = std::array::from_fn(|i| m.transmission_color[i] * base[i]);
+    let base = rec709(m.base_color).map(|v| v * m.base_weight);
+    let color = rec709(m.transmission_color);
+    m.transmission_color = rec2020(std::array::from_fn(|i| color[i] * base[i]));
     if let Some(r) = t.base_color {
         t.more.insert(slot::TRANSMISSION_COLOR, Some(r));
     }
@@ -143,7 +183,7 @@ fn stated_f0(
         .copied()
         .flatten()
         .map_or(1.0, |r| peak(&r));
-    let largest = max3(m.specular_color) * texels;
+    let largest = max3(rec709(m.specular_color)) * texels;
     if largest <= 0.0 {
         m.specular_weight = 0.0;
         return;

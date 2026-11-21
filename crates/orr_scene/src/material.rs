@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::{Pod, Zeroable};
-use orr_color::{Primaries, rec709_to_rec2020};
+use orr_color::Primaries;
 use orr_gpu::{
     AddressMode, Allocation, Device, Filter, GpuPtr, MemoryKind, MemoryPriority, SamplerDesc,
     SamplerIndex, TextureIndex,
@@ -153,11 +153,6 @@ fn binding_modes(b: &TextureBinding, t: &BoundTexture) -> u32 {
         | u32::from(b.vertex_complement) << VERTEX_COMPLEMENT_SHIFT
 }
 
-/// A linear Rec.709 color in linear Rec.2020.
-pub(crate) fn rec2020(c: impl Into<orr_math::Vec3>) -> [f32; 3] {
-    rec709_to_rec2020(c.into()).as_vec3().to_array()
-}
-
 impl MaterialGpu {
     /// The lobes a scene's material table gives the record where no surface type links
     /// (`lobes`): those its own weights give it.
@@ -165,9 +160,8 @@ impl MaterialGpu {
         record_lobes(self, &[0])
     }
 
-    /// The record of a cooked material whose slots read `textures`. Colors convert from Rec.709
-    /// to Rec.2020, and a color slot's factor multiplies its texels in the texture's primaries;
-    /// the flags follow the parameters.
+    /// The record of a cooked material whose slots read `textures`. A color slot's factor
+    /// multiplies its texels in the texture's primaries; the flags follow the parameters.
     pub fn new(m: &Material, textures: &[BoundTexture; slot::COUNT]) -> Self {
         use material_flags as f;
         let bound = |s: usize| textures[s].index != TextureIndex::NONE;
@@ -222,23 +216,23 @@ impl MaterialGpu {
             f::MORE_TEXTURES,
         );
         Self {
-            base_color: rec2020(m.base_color),
+            base_color: m.base_color,
             base_weight: m.base_weight,
-            specular_color: rec2020(m.specular_color),
+            specular_color: m.specular_color,
             specular_weight: m.specular_weight,
-            emission_color: rec2020(m.emission_color),
+            emission_color: m.emission_color,
             emission_luminance: m.emission_luminance,
-            transmission_color: rec2020(m.transmission_color),
+            transmission_color: m.transmission_color,
             transmission_depth: m.transmission_depth,
-            transmission_scatter: rec2020(m.transmission_scatter),
+            transmission_scatter: m.transmission_scatter,
             transmission_scatter_anisotropy: m.transmission_scatter_anisotropy,
-            subsurface_color: rec2020(m.subsurface_color),
+            subsurface_color: m.subsurface_color,
             subsurface_weight: m.subsurface_weight,
             subsurface_radius_scale: m.subsurface_radius_scale,
             subsurface_radius: m.subsurface_radius,
-            coat_color: rec2020(m.coat_color),
+            coat_color: m.coat_color,
             coat_weight: m.coat_weight,
-            fuzz_color: rec2020(m.fuzz_color),
+            fuzz_color: m.fuzz_color,
             fuzz_weight: m.fuzz_weight,
             specular_roughness: m.specular_roughness,
             specular_ior: m.specular_ior,
@@ -763,10 +757,5 @@ mod tests {
         m.textures[slot::NORMAL].filter = 0xff;
         let stray = MaterialGpu::new(&m, &textures);
         assert_eq!(stray.samplers[slot::NORMAL].modes & TILED, 0);
-        let white = record(&Material {
-            base_color: [1.0; 3],
-            ..base
-        });
-        assert!(white.base_color.iter().all(|c| (c - 1.0).abs() < 1e-6));
     }
 }

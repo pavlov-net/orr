@@ -509,7 +509,7 @@ fn composed_stage_cooks_instancer_cage_skin_and_openpbr() {
         &a,
         &MaterialName::new(MaterialBase::Path("/World/Looks/Skin".into())).entry("u"),
     );
-    assert_eq!(skin.base_color, [0.5, 0.25, 0.125]);
+    assert_eq!(skin.base_color, rec2020([0.5, 0.25, 0.125]));
     assert_eq!(skin.specular_roughness, 0.4);
     let skeleton =
         SkeletonInfo::parse(&blob(&a, &ModelName::source("Hero").skeleton("u"), 0)).unwrap();
@@ -1705,7 +1705,7 @@ fn materialx_documents_map_one_material() {
     std::fs::write(&doc, MTLX).unwrap();
     let (a, _) = materialx(&doc, "M_wood").unwrap();
     let m = material(&a, "u");
-    assert_eq!(m.base_color, [0.5, 0.25, 0.125]);
+    assert_eq!(m.base_color, rec2020([0.5, 0.25, 0.125]));
     assert_eq!(m.coat_weight, 0.25);
     assert_eq!(m.thin_walled, 1);
     // Roughness (red) and metalness (blue) of one image share one two-channel texture.
@@ -2578,10 +2578,14 @@ def Scope "Layers"
 /// its disc π r²; lights emit along their −Z axis; a DistantLight's `angle` is a diameter in
 /// degrees; `ShapingAPI` takes its fallbacks where applied; a normalized sphere of radius 0 is
 /// the point every larger one is from afar; `colorTemperature` is white at 6500 K; ShadowAPI's
-/// `shadow:enable` turns shadows off. Invisible lights are not cooked,
+/// `shadow:enable` turns shadows off. Colors convert to linear Rec.2020 from the space
+/// `UsdColorSpaceAPI` resolves for them (`pxr/usd/usd/schema.usda`): an attribute's own
+/// `colorSpace` over its prim's or an ancestor's `colorSpace:name`. Invisible lights are not
+/// cooked,
 /// a light in a group lands in its partition, and a prototype's light lands once per copy.
 #[test]
 fn usd_lights_cook_into_layout_records_as_usdlux_defines_them() {
+    use orr_color::RgbPrimaries;
     use orr_cook::GroupSpec;
     use orr_math::Vec3;
     use orr_pack::layout::{LayoutInfo, LightSource, ShapingSource};
@@ -2626,7 +2630,8 @@ fn usd_lights_cook_into_layout_records_as_usdlux_defines_them() {
             [10, 20, 30],
             r#""ShapingAPI""#,
             "            float inputs:radius = 10\n            float inputs:intensity = 400\n            \
-             bool inputs:normalize = 1\n            color3f inputs:color = (1, 0.5, 0.25)\n            \
+             bool inputs:normalize = 1\n            \
+             color3f inputs:color = (1, 0.5, 0.25) (colorSpace = \"lin_rec709_scene\")\n            \
              float inputs:shaping:cone:angle = 40\n            float inputs:shaping:cone:softness = 1.5\n            \
              float inputs:shaping:focus = 2\n            color3f inputs:shaping:focusTint = (0.1, 0.2, 0.3)\n",
         ),
@@ -2720,8 +2725,11 @@ def Xform "World"
         uniform token subdivisionScheme = "none"
     }}
 
-    def Xform "Rig"
+    def Xform "Rig" (
+        prepend apiSchemas = ["ColorSpaceAPI"]
+    )
     {{
+        uniform token colorSpace:name = "lin_ap1_scene"
         double3 xformOp:translate = (100, -50, 200)
         double3 xformOp:rotateXYZ = (30, 0, 90)
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
@@ -2763,7 +2771,13 @@ def Scope "Night" (
         * DMat4::from_rotation_x(30f64.to_radians());
     let at = |p: [f64; 3]| rig.transform_point3(DVec3::from_array(p));
     let axis = rig.transform_vector3(DVec3::NEG_Z).normalize().as_vec3();
-    let rgb = |c: [f64; 3], k: f64| (DVec3::from_array(c) * k).as_vec3();
+    // The rig's lights are in ACEScg, and the spot's color in linear Rec.709.
+    let rec2020 = |from: RgbPrimaries| from.matrix_to(RgbPrimaries::REC2020);
+    let (ap1, rec709) = (
+        rec2020(RgbPrimaries::ACES_CG),
+        rec2020(RgbPrimaries::REC709),
+    );
+    let rgb = |c: [f64; 3], k: f64| (ap1 * DVec3::from_array(c) * k).as_vec3();
     let deg = |x: f64| x.to_radians() as f32;
     let shaped = |cone: f64, softness: f32, focus: f32, tint: Vec3| ShapingSource {
         axis,
@@ -2796,8 +2810,11 @@ def Scope "Night" (
         LightSource::Sphere {
             position: at([10.0, 20.0, 30.0]),
             radius: 0.1,
-            intensity: rgb([1.0, 0.5, 0.25], 400.0 / (4.0 * PI * 0.01) * PI * 0.01),
-            shaping: Some(shaped(40.0, 1.0, 2.0, Vec3::new(0.1, 0.2, 0.3))),
+            intensity: (rec709
+                * DVec3::new(1.0, 0.5, 0.25)
+                * (400.0 / (4.0 * PI * 0.01) * PI * 0.01))
+                .as_vec3(),
+            shaping: Some(shaped(40.0, 1.0, 2.0, rgb([0.1, 0.2, 0.3], 1.0))),
             shadows: true,
         },
         // Surfaces cast no shadow from it, and its fallback colorTemperature, 6500 K, is white.
@@ -2890,6 +2907,14 @@ want {want:#?}"
         intensity,
         Vec3::splat((PI * 0.005f64.powi(2)) as f32)
     ));
+}
+
+/// Linear Rec.709 `c`, the space a stage or document states, as the linear Rec.2020 of a cooked
+/// material.
+fn rec2020(c: [f32; 3]) -> [f32; 3] {
+    orr_color::rec709_to_rec2020(c.map(f64::from))
+        .as_vec3()
+        .to_array()
 }
 
 fn close(a: orr_math::Vec3, b: orr_math::Vec3) -> bool {

@@ -81,7 +81,7 @@ fn block_height(i: i32, j: i32) -> f32 {
 
 /// A lamp color from a warm to a cool white by `t` in [0, 1].
 fn lamp_color(t: f32) -> Vec3 {
-    Vec3::new(1.0, 0.72, 0.42).lerp(Vec3::new(0.8, 0.9, 1.0), t)
+    orr_examples::rec2020(Vec3::new(1.0, 0.72, 0.42).lerp(Vec3::new(0.8, 0.9, 1.0), t))
 }
 
 /// Every local light of the square: sphere lamps along the streets, spotlights on the
@@ -156,19 +156,19 @@ fn directional_lights() -> [DirectionalLight; 3] {
     [
         DirectionalLight {
             direction_to_light: Vec3::new(0.3, 0.6, -0.74).normalize(),
-            illuminance: Vec3::new(0.25, 0.26, 0.3),
+            illuminance: orr_examples::rec2020([0.25, 0.26, 0.3]),
             angular_radius: 0.0045,
             disc: DiscProfile::Uniform,
         },
         DirectionalLight {
             direction_to_light: Vec3::new(-0.5, 0.3, 0.8).normalize(),
-            illuminance: Vec3::new(0.02, 0.03, 0.08),
+            illuminance: orr_examples::rec2020([0.02, 0.03, 0.08]),
             angular_radius: 0.3,
             disc: DiscProfile::Uniform,
         },
         DirectionalLight {
             direction_to_light: Vec3::new(0.8, 0.2, 0.4).normalize(),
-            illuminance: Vec3::new(0.06, 0.03, 0.02),
+            illuminance: orr_examples::rec2020([0.06, 0.03, 0.02]),
             angular_radius: 0.3,
             disc: DiscProfile::Uniform,
         },
@@ -381,24 +381,24 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
 /// The ground, the buildings, the lamp posts and the signs, cooked into an in-memory pack.
 fn cook() -> Arc<[u8]> {
     let ground = Material {
-        base_color: [0.35, 0.34, 0.32],
+        base_color: orr_examples::rec2020([0.35, 0.34, 0.32]).to_array(),
         specular_roughness: 0.55,
         ..Material::default()
     };
     let wall = Material {
-        base_color: [0.6, 0.55, 0.5],
+        base_color: orr_examples::rec2020([0.6, 0.55, 0.5]).to_array(),
         specular_roughness: 0.8,
         ..Material::default()
     };
     let post = Material {
-        base_color: [0.1, 0.1, 0.11],
+        base_color: orr_examples::rec2020([0.1, 0.1, 0.11]).to_array(),
         metalness: 1.0,
         specular_roughness: 0.35,
         ..Material::default()
     };
     let sign = |color: [f32; 3]| Material {
         base_color: [0.05, 0.05, 0.05],
-        emission_color: color,
+        emission_color: orr_examples::rec2020(color).to_array(),
         emission_luminance: 60.0,
         ..Material::default()
     };

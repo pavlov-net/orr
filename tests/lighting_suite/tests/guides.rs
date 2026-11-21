@@ -27,9 +27,9 @@ fn rgb(p: [f32; 4]) -> Vec3 {
     Vec3::new(p[0], p[1], p[2])
 }
 
-/// A material color as the G-buffer holds it: Rec.709 converted to Rec.2020.
+/// A material color of the bed, stated in linear Rec.709, as the G-buffer holds it.
 fn rec2020(c: [f32; 3]) -> Vec3 {
-    orr_color::rec709_to_rec2020(Vec3::from(c)).as_vec3()
+    Vec3::from(lighting_suite::bed::rec2020(c))
 }
 
 /// Within one 8-bit step and `slack` of `want` in every channel.

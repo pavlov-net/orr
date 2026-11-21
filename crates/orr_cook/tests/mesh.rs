@@ -243,11 +243,17 @@ fn check_fixture(scale: f32, translation: [f32; 3], k: i32) -> usize {
             Material::from_bytes(&read_blob(&a, &a.blobs(e)[0])).unwrap()
         })
         .collect();
-    assert_eq!(mats[0].base_color, [0.8, 0.2, 0.2]);
+    // glTF's linear Rec.709 factors, in the material's linear Rec.2020.
+    let rec2020 = |c: [f32; 3]| {
+        orr_color::rec709_to_rec2020(c.map(f64::from))
+            .as_vec3()
+            .to_array()
+    };
+    assert_eq!(mats[0].base_color, rec2020([0.8, 0.2, 0.2]));
     assert_eq!((mats[0].metalness, mats[0].specular_roughness), (0.25, 0.6));
     assert_eq!(
         (mats[0].emission_color, mats[0].emission_luminance),
-        ([1.0, 0.5, 0.0], 4.0)
+        (rec2020([1.0, 0.5, 0.0]), 4.0)
     );
     assert_eq!(
         (

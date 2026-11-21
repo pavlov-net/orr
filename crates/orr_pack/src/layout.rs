@@ -18,7 +18,7 @@ use orr_math::{DQuat, DVec3, Quat, Vec3};
 use crate::blob::{put_table, read, span, table, text};
 use crate::{AssetId, Error, Result, Span};
 
-pub const SCHEMA: u16 = 4;
+pub const SCHEMA: u16 = 5;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
@@ -403,7 +403,7 @@ pub struct Group {
     pub attributes: Vec<Attribute>,
 }
 
-/// A light, in world space (meters, Y up), colors linear Rec.709, as `orr_scene`'s `Light`
+/// A light, in world space (meters, Y up), colors linear Rec.2020, as `orr_scene`'s `Light`
 /// takes it. Surfaces cast no shadow from a point, sphere or rect light without `shadows`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LightSource {
@@ -488,7 +488,8 @@ pub struct CameraSource {
     pub focus_distance: f32,
 }
 
-/// An environment map: `texture` looked up at `rotation` of a world direction, times `color`.
+/// An environment map: `texture` looked up at `rotation` of a world direction, times `color`,
+/// linear Rec.2020.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EnvironmentSource {
     pub texture: AssetId,

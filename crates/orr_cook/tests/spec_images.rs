@@ -493,7 +493,8 @@ fn one_channel_files_fill_as_their_importer_says() {
     let gray = 128.0 / 255.0;
 
     let (_, m) = materialx(&d, "flat.png", "color3", base);
-    assert_eq!(m.base_color, [gray, 0.0, 0.0]);
+    let want = [gray, 0.0, 0.0];
+    assert!(near3(rec709(m.base_color), want), "{:?}", m.base_color);
 
     let (a, m) = materialx(&d, "ramp.png", "color3", base);
     let (_, texels) = stored(&a, &m, slot::BASE_COLOR, 8);
@@ -506,7 +507,8 @@ fn one_channel_files_fill_as_their_importer_says() {
     let two = image::GrayAlphaImage::from_fn(8, 8, |_, _| image::LumaA([128, 64]));
     two.save(d.join("two.png")).unwrap();
     let (_, m) = materialx(&d, "two.png", "color3", base);
-    assert_eq!(m.base_color, [gray, 64.0 / 255.0, 0.0]);
+    let want = [gray, 64.0 / 255.0, 0.0];
+    assert!(near3(rec709(m.base_color), want), "{:?}", m.base_color);
 
     let (_, m, _) = usd(
         &d,
@@ -550,7 +552,12 @@ fn few_channel_containers_read_as_their_importer_says() {
             "{file}: {r} {g} {b}"
         );
         let (_, m) = materialx(&d, file, "color3", base);
-        assert_eq!(m.base_color[1..], [0.0, 0.0], "{file}");
+        let [_, g, b] = rec709(m.base_color);
+        assert!(
+            g.abs() < 1e-6 && b.abs() < 1e-6,
+            "{file}: {:?}",
+            m.base_color
+        );
     }
 
     std::fs::write(
@@ -1002,6 +1009,19 @@ fn converted(
     (from.matrix_to(to) * rgb).as_vec3().to_array()
 }
 
+/// A cooked material's linear Rec.2020 `rgb` in linear Rec.709, the space of the files here.
+fn rec709(rgb: [f32; 3]) -> [f32; 3] {
+    converted(
+        orr_color::RgbPrimaries::REC2020,
+        orr_color::RgbPrimaries::REC709,
+        rgb,
+    )
+}
+
+fn near3(a: [f32; 3], b: [f32; 3]) -> bool {
+    (0..3).all(|c| (a[c] - b[c]).abs() < 1e-6)
+}
+
 /// `rgb` in `primaries` as linear Rec.2020.
 fn in_rec2020(primaries: orr_color::RgbPrimaries, rgb: [f32; 3]) -> [f32; 3] {
     converted(primaries, orr_color::RgbPrimaries::REC2020, rgb)
@@ -1128,8 +1148,9 @@ fn an_environment_below_zero_converts_to_rec2020() {
     assert_eq!(cooked([0.3, 1.0, 0.0]).0, 0);
 }
 
-/// The rule above of a material's color inputs: texels and constants convert alike, a constant's
-/// factor is still Rec.709, and a remap that reaches below 0 counts as what the input reads.
+/// The rule above of a material's color inputs: texels and constants convert alike, a constant
+/// folds into its factor, which is Rec.2020, and a remap that reaches below 0 counts as what the
+/// input reads.
 #[test]
 fn material_colors_below_zero_convert_to_rec2020() {
     use orr_color::RgbPrimaries as P;
@@ -1146,7 +1167,7 @@ fn material_colors_below_zero_convert_to_rec2020() {
     write("flat.exr", flat_exr(BELOW, |_, _| {}));
     let (_, m, report) = usd(&d, "flat.exr", surface, "rgb", "");
     assert_eq!(m.textures[slot::BASE_COLOR].texture, AssetId::NONE);
-    close(m.base_color, BELOW);
+    close(m.base_color, in_rec2020(P::REC709, BELOW));
     assert_eq!(clip_warnings(&report), 0);
 
     // A stored constant reads through its remap before anything clamps it.
@@ -1154,13 +1175,13 @@ fn material_colors_below_zero_convert_to_rec2020() {
                 float4 inputs:bias = (-0.5, 0, 0, 0)"#;
     write("remapped.png", tagged::flat_rgb([51, 255, 0], &[]));
     let (_, m, report) = usd(&d, "remapped.png", surface, "rgb", remapped);
-    close(m.base_color, BELOW);
+    close(m.base_color, in_rec2020(P::REC709, BELOW));
     assert_eq!(clip_warnings(&report), 0);
 
     write("past.exr", flat_exr([-1.0, 1.0, 0.0], |_, _| {}));
     let (_, m, report) = usd(&d, "past.exr", surface, "rgb", "");
     let held = in_rec2020(P::REC709, [-1.0, 1.0, 0.0]).map(|v| v.clamp(0.0, 1.0));
-    close(m.base_color, converted(P::REC2020, P::REC709, held));
+    close(m.base_color, held);
     assert_eq!(clip_warnings(&report), 1);
 
     // Negative infinity has no color to convert, and clips in the primaries the file states.

@@ -74,6 +74,14 @@ fn reference(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Linear Rec.709 `c`, the space the scenes here state their material colors in, as the linear
+/// Rec.2020 a material holds.
+fn rec2020(c: [f32; 3]) -> [f32; 3] {
+    orr_color::rec709_to_rec2020(Vec3::from(c))
+        .as_vec3()
+        .to_array()
+}
+
 // --- CPU decoder of the G-buffer words -------------------------------------------------------
 
 fn srgb_decode(v: f32) -> f32 {
@@ -861,7 +869,7 @@ fn slab_corners() -> [Vec3; 4] {
     ]
 }
 
-/// A saturated red base color factor on a saturated green texture (sRGB bytes), whose models
+/// A saturated Rec.709 red base color factor on a saturated green texture (sRGB bytes), whose models
 /// tag the texture with each primaries.
 const TINT_FACTOR: [f32; 3] = [0.9, 0.05, 0.05];
 const TINT_TEXEL: [u8; 3] = [40, 230, 60];
@@ -989,20 +997,20 @@ fn cook() -> Arc<[u8]> {
     tilted_keeping_uv1.textures[slot::BASE_COLOR].texture = id("tex/albedo");
     tilted_keeping_uv1.textures[slot::BASE_COLOR].uv_set = 1;
     let coat = Material {
-        base_color: [0.1, 0.25, 0.8],
+        base_color: rec2020([0.1, 0.25, 0.8]),
         specular_roughness: 0.4,
         coat_weight: 0.8,
         coat_roughness: 0.1,
         ..Material::default()
     };
     let lamp = Material {
-        base_color: [0.9, 0.5, 0.2],
-        emission_color: [1.0, 0.6, 0.3],
+        base_color: rec2020([0.9, 0.5, 0.2]),
+        emission_color: rec2020([1.0, 0.6, 0.3]),
         emission_luminance: 40.0,
         ..Material::default()
     };
     let mut leaf = Material {
-        base_color: [0.2, 0.6, 0.15],
+        base_color: rec2020([0.2, 0.6, 0.15]),
         alpha_mode: Material::MASK,
         alpha_cutoff: 0.5,
         double_sided: 1,
@@ -1010,13 +1018,13 @@ fn cook() -> Arc<[u8]> {
     };
     leaf.textures[slot::OPACITY].texture = id("tex/holes");
     let metal = Material {
-        base_color: [0.9, 0.8, 0.6],
+        base_color: rec2020([0.9, 0.8, 0.6]),
         metalness: 1.0,
         specular_roughness: 0.25,
         ..Material::default()
     };
     let card = Material {
-        base_color: [0.8, 0.3, 0.3],
+        base_color: rec2020([0.8, 0.3, 0.3]),
         alpha_mode: Material::MASK,
         geometry_opacity: 0.0,
         alpha_cutoff: 0.5,
@@ -1024,7 +1032,7 @@ fn cook() -> Arc<[u8]> {
         ..Material::default()
     };
     let plain = Material {
-        base_color: [0.8, 0.3, 0.3],
+        base_color: rec2020([0.8, 0.3, 0.3]),
         ..Material::default()
     };
     let probe = Material {
@@ -1090,7 +1098,7 @@ fn cook() -> Arc<[u8]> {
             },
         });
         let mut m = Material {
-            base_color: TINT_FACTOR,
+            base_color: rec2020(TINT_FACTOR),
             ..Material::default()
         };
         m.textures[slot::BASE_COLOR].texture = id(&tex);
@@ -13896,7 +13904,7 @@ fn vertex_colors_multiply_the_slots_that_read_them() {
     let _guard = serial();
     let d = device();
     let mut m = Material {
-        base_color: [0.5, 0.5, 0.25],
+        base_color: rec2020([0.5, 0.5, 0.25]),
         metalness: 0.5,
         ..Material::default()
     };
@@ -13909,11 +13917,6 @@ fn vertex_colors_multiply_the_slots_that_read_them() {
     let record = |m: &Material| MaterialGpu::new(m, &[BoundTexture::NONE; slot::COUNT]);
     let vertex = [0.5, 0.25, 1.0, 0.75];
     let out = surface_params(d, &[record(&m), record(&plain)], |_| {}, vertex);
-    let rec2020 = |c: [f32; 3]| {
-        orr_color::rec709_to_rec2020(Vec3::from(c))
-            .as_vec3()
-            .to_array()
-    };
     let want = rec2020([0.25, 0.125, 0.25]);
     let near = |(a, b): (&f32, &f32)| (a - b).abs() < 1e-5;
     assert!(

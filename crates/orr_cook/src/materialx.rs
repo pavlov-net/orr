@@ -5,9 +5,10 @@
 //! one output ignores), or inside a node graph by `interfacename`. File values take the
 //! `fileprefix` of their nearest scope and resolve against the directory of their document.
 //! Images and values of color types read in their `colorspace`, inherited likewise, so that the
-//! document's working space is the last scope, and "data" where no scope names one: values
-//! convert here to the linear Rec.709 of [`Material`], images when
-//! they cook. A name that isn't a known space warns and reads as "data".
+//! document's working space is the last scope, and "data" where no scope names one. Values
+//! convert here to linear Rec.709, the space of a shading network's colors, which the mapped
+//! [`Material`] holds in linear Rec.2020; images convert when they cook. A name that isn't a
+//! known space warns and reads as "data".
 //! A standalone material has no mesh, so each texture keeps its uv set (0 or 1) and transform
 //! in its slot; geometric properties name `st`, `UV0` or a `geompropdef` of a texcoord.
 //!

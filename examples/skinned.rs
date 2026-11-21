@@ -306,7 +306,7 @@ fn cook() -> Arc<[u8]> {
     let path: PathBuf = dir.join("tentacle.glb");
     creature::write_glb(&path, 36, 16, 0.22, [0.75, 0.32, 0.42]);
     let soil = Material {
-        base_color: [0.42, 0.38, 0.3],
+        base_color: orr_examples::rec2020([0.42, 0.38, 0.3]).to_array(),
         specular_roughness: 0.9,
         ..Material::default()
     };

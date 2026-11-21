@@ -51,7 +51,7 @@ pub struct Partition {
 }
 
 /// An environment map of a layout: `map` looked up at `rotation` of a world direction, times
-/// `color`.
+/// `color`, linear Rec.2020.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LayoutEnvironment {
     pub map: TextureIndex,

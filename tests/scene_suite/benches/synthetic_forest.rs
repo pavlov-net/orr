@@ -434,15 +434,22 @@ fn leaf_mask() -> PathBuf {
     path
 }
 
+/// Linear Rec.709 `c`, as the forest states its colors, in the linear Rec.2020 a material holds.
+fn rec2020(c: [f32; 3]) -> [f32; 3] {
+    orr_color::rec709_to_rec2020(Vec3::from(c))
+        .as_vec3()
+        .to_array()
+}
+
 fn cook() -> Arc<[u8]> {
     let started = Instant::now();
     let bark = Material {
-        base_color: [0.35, 0.27, 0.2],
+        base_color: rec2020([0.35, 0.27, 0.2]),
         specular_roughness: 0.8,
         ..Material::default()
     };
     let mut leaf = Material {
-        base_color: [0.18, 0.4, 0.12],
+        base_color: rec2020([0.18, 0.4, 0.12]),
         alpha_mode: Material::MASK,
         alpha_cutoff: 0.5,
         double_sided: 1,
@@ -450,12 +457,12 @@ fn cook() -> Arc<[u8]> {
     };
     leaf.textures[slot::OPACITY].texture = AssetId::from_name("tex/leaf");
     let blade = Material {
-        base_color: [0.25, 0.45, 0.15],
+        base_color: rec2020([0.25, 0.45, 0.15]),
         double_sided: 1,
         ..Material::default()
     };
     let soil = Material {
-        base_color: [0.3, 0.25, 0.18],
+        base_color: rec2020([0.3, 0.25, 0.18]),
         specular_roughness: 0.9,
         ..Material::default()
     };

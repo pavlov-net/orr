@@ -631,12 +631,12 @@ fn cook(settings: &Settings) -> Arc<[u8]> {
     ];
     if settings.synthetic {
         let bark = Material {
-            base_color: [0.35, 0.27, 0.2],
+            base_color: crate::rec2020([0.35, 0.27, 0.2]).to_array(),
             specular_roughness: 0.8,
             ..Material::default()
         };
         let mut leaves = Material {
-            base_color: [0.18, 0.4, 0.12],
+            base_color: crate::rec2020([0.18, 0.4, 0.12]).to_array(),
             alpha_mode: Material::MASK,
             alpha_cutoff: 0.5,
             double_sided: 1,
@@ -644,7 +644,7 @@ fn cook(settings: &Settings) -> Arc<[u8]> {
         };
         leaves.textures[slot::OPACITY].texture = AssetId::from_name(LEAF);
         let crown = Material {
-            base_color: [0.16, 0.36, 0.11],
+            base_color: crate::rec2020([0.16, 0.36, 0.11]).to_array(),
             specular_roughness: 0.9,
             ..Material::default()
         };
@@ -1171,7 +1171,7 @@ impl DenseVegetation {
             )
             .expect("particle pipeline");
         let atmosphere = Atmosphere {
-            ground_albedo: Vec3::from(SOIL),
+            ground_albedo: crate::rec2020(SOIL),
             ..Atmosphere::earth(DVec3::new(0.0, AIR_FLOOR, 0.0), Vec3::Y)
         };
         let mut sky = AtmosphereState::new(gpu, &atmosphere, 0).expect("atmosphere");
@@ -1195,14 +1195,14 @@ impl DenseVegetation {
             let mut create = |m: Material| mats.create(&material(m)).expect("material");
             (
                 create(Material {
-                    base_color: SOIL,
+                    base_color: crate::rec2020(SOIL).to_array(),
                     specular_roughness: 0.9,
                     ..Material::default()
                 }),
                 create(match blade_field {
                     Some(_) => Blades::material(),
                     None => Material {
-                        base_color: [0.25, 0.45, 0.15],
+                        base_color: crate::rec2020([0.25, 0.45, 0.15]).to_array(),
                         specular_roughness: 0.6,
                         double_sided: 1,
                         ..Material::default()
@@ -1217,7 +1217,7 @@ impl DenseVegetation {
                 }),
                 create(Material {
                     base_color: [0.1; 3],
-                    emission_color: [1.0, 0.8, 0.35],
+                    emission_color: crate::rec2020([1.0, 0.8, 0.35]).to_array(),
                     emission_luminance: 4000.0,
                     ..Material::default()
                 }),

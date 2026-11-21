@@ -63,7 +63,7 @@ impl Showcase {
                 .unwrap_or_else(|e| panic!("model {name}: {e}"))
         });
         let atmosphere = Atmosphere {
-            ground_albedo: Vec3::from(GROUND_COLOR),
+            ground_albedo: crate::rec2020(GROUND_COLOR),
             ..Atmosphere::earth(DVec3::ZERO, Vec3::Y)
         };
         let mut sky = AtmosphereState::new(gpu, &atmosphere, 0).expect("atmosphere");
@@ -126,13 +126,13 @@ pub fn orbit_eye(angle: f64) -> Vec3 {
 /// The objects and the ground, cooked into an in-memory pack.
 fn cook() -> Arc<[u8]> {
     let gold = Material {
-        base_color: [1.0, 0.77, 0.34],
+        base_color: crate::rec2020([1.0, 0.77, 0.34]).to_array(),
         metalness: 1.0,
         specular_roughness: 0.25,
         ..Material::default()
     };
     let glossy = Material {
-        base_color: [0.6, 0.05, 0.04],
+        base_color: crate::rec2020([0.6, 0.05, 0.04]).to_array(),
         specular_roughness: 0.12,
         ..Material::default()
     };
@@ -143,19 +143,19 @@ fn cook() -> Arc<[u8]> {
         ..Material::default()
     };
     let block = Material {
-        base_color: [0.8, 0.8, 0.78],
+        base_color: crate::rec2020([0.8, 0.8, 0.78]).to_array(),
         specular_roughness: 0.6,
         ..Material::default()
     };
     let glow = Material {
         base_color: [0.1, 0.1, 0.1],
-        emission_color: [1.0, 0.55, 0.25],
+        emission_color: crate::rec2020([1.0, 0.55, 0.25]).to_array(),
         emission_luminance: 20_000.0,
         double_sided: 1,
         ..Material::default()
     };
     let ground = Material {
-        base_color: GROUND_COLOR,
+        base_color: crate::rec2020(GROUND_COLOR).to_array(),
         specular_roughness: 0.75,
         ..Material::default()
     };

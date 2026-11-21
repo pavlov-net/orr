@@ -8,14 +8,15 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use openusd::ar::Resolver;
-use openusd::{ar, usd, vt};
+use openusd::{ar, gf, usd, vt};
 use openusd_schemas::geom::{self, Interpolation, XformableExt};
-use orr_math::{DMat4, DQuat};
+use orr_math::{DMat4, DQuat, DVec3};
 use orr_pack::Hash32;
 
 use super::VariantSelection;
 use crate::shading;
 use crate::state::{Input, hash_file, hash_path};
+use crate::texture::color::ImageColor;
 use crate::texture::tiles::UDIM_TILES;
 
 /// Identifier of the session layer that carries the manifest's variant selections.
@@ -393,6 +394,14 @@ pub(super) fn quat(wxyz: &[f64]) -> DQuat {
     DQuat::from_xyzw(wxyz[1], wxyz[2], wxyz[3], wxyz[0])
 }
 
+/// `rgb` in `space` as linear Rec.709; a space that names no conversion leaves it as it stands.
+pub(super) fn to_rec709(space: ImageColor, rgb: DVec3) -> DVec3 {
+    match space {
+        ImageColor::Named(s) => DVec3::from(s.to_rec709(rgb.as_vec3().to_array()).map(f64::from)),
+        _ => rgb,
+    }
+}
+
 /// Reads attributes of one prim at one time.
 pub(super) struct PrimReader<'a> {
     pub(super) prim: &'a usd::Prim,
@@ -426,6 +435,34 @@ impl PrimReader<'_> {
             Some(vt::Value::String(s)) => Some(s),
             _ => None,
         })
+    }
+
+    /// The color space `UsdColorSpaceAPI` resolves for color attribute `name`: its own
+    /// `colorSpace`, else its prim's or the nearest ancestor's `colorSpace:name`, else linear
+    /// Rec.709 (`pxr/usd/usd/schema.usda`).
+    pub(super) fn color_space(&self, name: &str) -> Result<String, String> {
+        let attr = self.prim.attribute(name);
+        let space = usd::ColorSpaceAPI::compute_attribute_name(&attr, None)
+            .map_err(|e| format!("{} {name}: {e}", self.path()))?;
+        Ok(space.map_or_else(
+            || gf::color_space_names::LINEAR_REC709.to_string(),
+            |s| s.as_str().to_string(),
+        ))
+    }
+
+    /// `rgb`, a value of color attribute `name` in the space [`Self::color_space`] resolves, as
+    /// linear Rec.709. A space that names no conversion ("data", "raw", "identity") leaves it as
+    /// it stands, and one the cook doesn't know fails.
+    pub(super) fn color(&self, name: &str, rgb: DVec3) -> Result<DVec3, String> {
+        let space = self.color_space(name)?;
+        ImageColor::named(&space)
+            .map(|c| to_rec709(c, rgb))
+            .ok_or_else(|| {
+                format!(
+                    "{} {name}: color space {space} is not one the cook converts",
+                    self.path()
+                )
+            })
     }
 
     /// This reader at `time` instead.

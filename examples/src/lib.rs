@@ -413,6 +413,12 @@ impl Capture {
     }
 }
 
+/// Linear Rec.709 `c`, the space the examples state their colors in, as the linear Rec.2020 the
+/// renderer takes.
+pub fn rec2020(c: impl Into<orr_math::Vec3>) -> orr_math::Vec3 {
+    orr_color::rec709_to_rec2020(c.into()).as_vec3()
+}
+
 /// Writes an 8-bit grayscale PNG of `f` over an `n` x `n` grid of unit coordinates to
 /// `path`, for the cook to read.
 pub fn gray_png(path: &Path, n: u32, f: impl Fn(f32, f32) -> u8) {

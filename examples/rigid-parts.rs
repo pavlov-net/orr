@@ -343,17 +343,17 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
 /// branch `b`, with its leaves, part `b + 1`, pivoted where it leaves the trunk's axis.
 fn cook() -> Arc<[u8]> {
     let bark = Material {
-        base_color: [0.36, 0.26, 0.18],
+        base_color: orr_examples::rec2020([0.36, 0.26, 0.18]).to_array(),
         specular_roughness: 0.8,
         ..Material::default()
     };
     let leaves = Material {
-        base_color: [0.22, 0.48, 0.16],
+        base_color: orr_examples::rec2020([0.22, 0.48, 0.16]).to_array(),
         specular_roughness: 0.6,
         ..Material::default()
     };
     let soil = Material {
-        base_color: [0.42, 0.38, 0.3],
+        base_color: orr_examples::rec2020([0.42, 0.38, 0.3]).to_array(),
         specular_roughness: 0.9,
         ..Material::default()
     };

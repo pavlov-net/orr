@@ -22,7 +22,7 @@ const ROLO_5_DEG: f64 = 0.30;
 const NEAR_RANGE: f64 = 256.0;
 
 fn rec2020(light: &DirectionalLight) -> [f64; 3] {
-    orr_color::rec709_to_rec2020(light.illuminance).to_array()
+    light.illuminance.as_dvec3().to_array()
 }
 
 /// The sun direction that puts a moon at `moon` at 5 deg phase: 5 deg off the point opposite
