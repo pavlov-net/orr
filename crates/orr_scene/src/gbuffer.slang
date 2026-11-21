@@ -201,6 +201,21 @@ float3 from_rgb8(uint v)
     return srgb_decode(float3(unpack_unorm8(v), unpack_unorm8(v >> 8), unpack_unorm8(v >> 16)));
 }
 
+// The base color: 10 bits of each channel's cube root. Saturated 8-bit Rec.709 colors put
+// their minor Rec.2020 channels in the darks, where the root's steps are fine enough that no
+// two levels of such a color share a code.
+uint base_color_code(float3 c)
+{
+    uint3 q = uint3(round(pow(saturate(c), 1.0 / 3.0) * 1023.0));
+    return q.x | (q.y << 10) | (q.z << 20);
+}
+
+float3 base_color_from_code(uint v)
+{
+    float3 r = float3(uint3(v, v >> 10, v >> 20) & 1023) / 1023.0;
+    return r * r * r;
+}
+
 // 8 bits of t = (n - 1) / (n + 1), sqrt(F0) from air with its sign, over every IOR: Fresnel
 // reaches 1 toward both 0 and infinity. Codes 16 to 201 hold IOR 1 to 3, finest, and the rest
 // IOR 0 to 1 and 3 up. The steps put IOR 1.5, the usual default, exactly on code 90.
@@ -308,7 +323,7 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
             flags |= GBUFFER_LAYERS;
     }
     GBufferWords w;
-    w.a.x = rgb8(p.base_color) | (roughness_code(p.specular_roughness) << 24);
+    w.a.x = base_color_code(p.base_color);
     w.a.y = oct_encode_snorm16(s.normal);
     w.a.z = pack_rgb9e5(max(p.emission, 0.0));
     uint exponent = weight_exponent(p.specular_weight);
@@ -316,7 +331,7 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
     float3 sc = srgb_encode(saturate(p.specular_color));
     uint3 s7 = uint3(round(sc * 127.0));
     w.b.x = s7.x | (s7.y << 7) | (s7.z << 14) | (raster_error_code(s.raster_error) << 21) | (exponent << 26);
-    w.b.y = (oct_encode_snorm8(s.geometric_normal) & 0xffff) | (pack_unorm8(p.diffuse_roughness) << 16);
+    w.b.y = (oct_encode_snorm8(s.geometric_normal) & 0xffff) | (pack_unorm8(p.diffuse_roughness) << 16) | (roughness_code(p.specular_roughness) << 24);
     w.x = uint4(0);
     w.y = uint4(0);
     if ((flags & GBUFFER_EXTENDED) != 0)
@@ -346,8 +361,8 @@ public GSurface decode_gsurface(GBufferWords w)
     BsdfParams p;
     uint flags = w.a.w >> 24;
     s.flags = flags;
-    p.base_color = from_rgb8(w.a.x);
-    p.specular_roughness = roughness_from_code(w.a.x >> 24);
+    p.base_color = base_color_from_code(w.a.x);
+    p.specular_roughness = roughness_from_code(w.b.y >> 24);
     s.normal = oct_decode_snorm16(w.a.y);
     p.emission = unpack_rgb9e5(w.a.z);
     p.metalness = unpack_unorm8(w.a.w);

@@ -96,8 +96,16 @@ fn byte(w: u32, at: u32) -> f32 {
     ((w >> at) & 255) as f32 / 255.0
 }
 
-fn rgb8(w: u32) -> Vec3 {
-    Vec3::new(byte(w, 0), byte(w, 8), byte(w, 16)).map(srgb_decode)
+/// The base color: 10 bits of each channel's cube root.
+fn base_color(w: u32) -> Vec3 {
+    let root = |at: u32| ((w >> at) & 1023) as f32 / 1023.0;
+    Vec3::new(root(0), root(10), root(20)).map(|r| r * r * r)
+}
+
+/// `v` stored as a base color channel and read back.
+fn base_channel(v: f32) -> f32 {
+    let r = (v.clamp(0.0, 1.0).cbrt() * 1023.0).round() / 1023.0;
+    r * r * r
 }
 
 fn oct_unwrap(x: f32, y: f32) -> Vec3 {
@@ -173,8 +181,8 @@ struct Core {
 fn decode_core(a: [u32; 4], b: [u32; 2]) -> Core {
     let e = (b[0] >> 21) & 31;
     Core {
-        base_color: rgb8(a[0]),
-        roughness: byte(a[0], 24).powi(2),
+        base_color: base_color(a[0]),
+        roughness: byte(b[1], 24).powi(2),
         normal: oct16(a[1]),
         emission: rgb9e5(a[2]),
         metalness: byte(a[3], 0),
@@ -263,10 +271,25 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
         2..=4 => 0.02 + 0.08 * u,
         _ => u,
     };
+    // Ramps over every level of saturated 8-bit Rec.709 colors, whose minor Rec.2020 channels
+    // sit in the darks.
+    const RAMPS: [[f32; 3]; 4] = [
+        [1.0, 0.0, 0.0],
+        [1.0, 0.5, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ];
+    let ramp = |i: usize| {
+        let level = orr_color::srgb8_decode((i % 256) as u8);
+        rec2020(RAMPS[i / 256].map(|c| c * level))
+    };
     let cases: Vec<codec::Case> = Vec::from_fn(N, |i| {
         let kind = i % 4; // plain, subsurface, thin subsurface, coat and fuzz
         let mut c: codec::Case = bytemuck::Zeroable::zeroed();
         c.base_color = arr(rng.rgb());
+        if i < 256 * RAMPS.len() {
+            c.base_color = ramp(i);
+        }
         c.roughness = ggx(rng.next(), i);
         c.normal = arr(rng.unit());
         c.metalness = rng.next();
@@ -432,9 +455,9 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
 
         // Each field within its encoding's precision.
         close3(
-            srgb3(g.base_color),
-            srgb3(c.base_color),
-            step8,
+            g.base_color.map(f32::cbrt),
+            c.base_color.map(|v| v.clamp(0.0, 1.0).cbrt()),
+            0.5 / 1023.0 + 1e-6,
             "base color",
             i,
         );
@@ -639,6 +662,19 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
                 0.5 / 255.0 + 1e-6,
                 "subsurface color",
                 i,
+            );
+        }
+    }
+    // Every level of each ramp stays distinct.
+    let decoded = decoded.as_slice().unwrap();
+    for i in 1..256 * RAMPS.len() {
+        if i % 256 != 0 {
+            assert_ne!(
+                decoded[i - 1].base_color,
+                decoded[i].base_color,
+                "ramp {} merges level {} into the one below",
+                i / 256,
+                i % 256
             );
         }
     }
@@ -1854,7 +1890,7 @@ fn each_gbuffer_channel_matches_its_reference() {
     let channels: [(&str, Channel<'_>); 9] = [
         (
             "base_color",
-            Box::new(|i| [byte(g.a[i][0], 0), byte(g.a[i][0], 8), byte(g.a[i][0], 16)]),
+            Box::new(|i| arr(core(i).base_color.map(srgb_encode))),
         ),
         (
             "normal",
@@ -1996,7 +2032,7 @@ fn a_stochastic_view_changes_magnified_texels_by_frame_and_averages_near_hardwar
     // texel per pixel.
     let eye = Vec3::new(0.05, 0.25, 0.05);
     let target = Vec3::ZERO;
-    let base = |g: &Frame, i: usize| [0, 8, 16].map(|s| byte(g.a[i][0], s));
+    let base = |g: &Frame, i: usize| arr(decode_core(g.a[i], g.b[i]).base_color.map(srgb_encode));
     let hardware = render(&mut w, &placed, eye, target, &[], true, 1);
     w.texture_filter = TextureFilter::Stochastic;
     let pixels = hardware.ids.len();
@@ -3764,12 +3800,13 @@ fn a_decal_on_a_wall_matches_between_the_gbuffer_and_a_mirror_reflection() {
         let j = (height - 1 - y) * width + x;
         assert_eq!(d.ids[j], 1, "pixel {j}: the mirrored camera sees the wall");
         let core = decode_core(d.a[j], d.b[j]);
+        // Both as the G-buffer stores them, the base color shown in sRGB, the roughness as its
+        // root.
         let got = Vec3::new(c.context[1][0], c.context[1][1], c.context[1][2]);
-        reflected[i] = arr(got.map(srgb_encode));
-        seen[i] = [byte(d.a[j][0], 0), byte(d.a[j][0], 8), byte(d.a[j][0], 16)];
-        // Both in the G-buffer's code, the root of the roughness.
+        reflected[i] = arr(got.map(|v| srgb_encode(base_channel(v))));
+        seen[i] = arr(core.base_color.map(srgb_encode));
         reflected_roughness[i] = [c.context[1][3].sqrt(); 3];
-        seen_roughness[i] = [byte(d.a[j][0], 24); 3];
+        seen_roughness[i] = [byte(d.b[j][1], 24); 3];
         for (k, rgb) in [reflected[i], seen[i]].into_iter().enumerate() {
             if rgb[2] > rgb[0] + 0.3 {
                 stickered[k] += 1;

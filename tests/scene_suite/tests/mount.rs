@@ -6093,9 +6093,15 @@ fn the_resolve_writes_the_color_a_neural_set_decodes() {
             &TextureRegion::whole_mip(view.gbuf_a.desc(), 0),
         );
         let a: Vec<[u32; 4]> = bytemuck::pod_collect_to_vec(&bytes);
+        // The base color word holds 10 bits of each channel's cube root.
         let got: Vec<[f32; 3]> = a
             .iter()
-            .map(|w| [0, 8, 16].map(|s| ((w[0] >> s) & 255) as f32 / 255.0))
+            .map(|w| {
+                [0, 10, 20].map(|s| {
+                    let r = f64::from((w[0] >> s) & 1023) / 1023.0;
+                    srgb_encode(r * r * r) as f32
+                })
+            })
             .collect();
         let d: Vec<f32> = got
             .iter()
