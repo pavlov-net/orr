@@ -31,11 +31,14 @@
 //! - `inputs:color` and `inputs:shaping:focusTint` are in the color space `UsdColorSpaceAPI`
 //!   resolves for them ([`PrimReader::color`]) and convert to the linear Rec.2020 layout records
 //!   take; the color temperature's color multiplies in linear Rec.709, the space it is in.
+//! - A `Mesh` with `LightAPI` (`MeshLightAPI`) is no record: its faces emit as their bound
+//!   materials do, which is the light where its terms leave that glow as it is ([`mesh_light`]).
 //!
 //! What a light states that the scene has no term for fails the import, naming the prim: other
 //! light types, light filters and linking, IES profiles, rect textures, ShadowAPI's shadow
 //! color, distance and falloff, a DistantLight without shadows, the non-physical
-//! `inputs:diffuse` and `inputs:specular`, and an input whose time samples change.
+//! `inputs:diffuse` and `inputs:specular`, an input whose time samples change, and a mesh light
+//! that shows light rays other than the glow of its faces.
 
 use openusd::{usd, vt};
 use orr_color::rec709_to_rec2020;
@@ -131,18 +134,8 @@ pub(super) fn light(r: &PrimReader<'_>, ty: &str, to_scene: DMat4) -> Result<Lig
         ));
     }
     unsupported(r)?;
-    // LightAPI `inputs:intensity`, `inputs:exposure`, `inputs:color`.
-    let intensity = number(r, "inputs:intensity")?;
-    let exposure = number(r, "inputs:exposure")?;
-    let color = r.color("inputs:color", triple(r, "inputs:color")?)?;
-    // LightAPI `inputs:enableColorTemperature`, `inputs:colorTemperature`: "the computed result
-    // multiplies against the color attribute".
-    let color = match flag(r, "inputs:enableColorTemperature")? {
-        true => color * temperature_color(number(r, "inputs:colorTemperature")?),
-        false => color,
-    };
     let normalize = flag(r, "inputs:normalize")?;
-    let emitted = rec709_to_rec2020(color) * (intensity * exposure.exp2());
+    let emitted = emission(r)?;
     // ShadowAPI `inputs:shadow:enable`.
     let shadows = bool_input(r, "inputs:shadow:enable")?.unwrap_or(true);
     let l = DMat3::from_mat4(to_scene);
@@ -239,6 +232,86 @@ pub(super) fn light(r: &PrimReader<'_>, ty: &str, to_scene: DMat4) -> Result<Lig
             })
         }
     }
+}
+
+/// `intensity · 2^exposure · color`, `color` multiplied by its temperature's where that is
+/// enabled.
+fn emission(r: &PrimReader<'_>) -> Result<DVec3, String> {
+    // LightAPI `inputs:intensity`, `inputs:exposure`, `inputs:color`.
+    let intensity = number(r, "inputs:intensity")?;
+    let exposure = number(r, "inputs:exposure")?;
+    let color = r.color("inputs:color", triple(r, "inputs:color")?)?;
+    // LightAPI `inputs:enableColorTemperature`, `inputs:colorTemperature`: "the computed result
+    // multiplies against the color attribute".
+    let color = match flag(r, "inputs:enableColorTemperature")? {
+        true => color * temperature_color(number(r, "inputs:colorTemperature")?),
+        false => color,
+    };
+    Ok(rec709_to_rec2020(color) * (intensity * exposure.exp2()))
+}
+
+/// Checks mesh light `r`, a `Mesh` with `LightAPI` (which `MeshLightAPI` applies), whose
+/// emission is its faces' materials': it cooks where the light's terms leave the glow of its
+/// bound material as it is.
+///
+/// LightAPI `light:materialSyncMode` (`materialGlowTintsLight` under `MeshLightAPI`,
+/// `noMaterialResponse` otherwise): with `materialGlowTintsLight` "all primary and secondary
+/// rays see the emissive/glow response as dictated by the bound Material while the base color
+/// seen by light rays (which is then modulated by all of the other LightAPI controls) is the
+/// multiplication of the color feeding the emission/glow input of the Material [...] with the
+/// scalar or pattern input to *inputs:color*". The scene's emitters show light rays what other
+/// rays see, so only a light whose terms multiply that glow by 1 cooks: `intensity · 2^exposure
+/// · color` (and its temperature's color) of 1, without `inputs:normalize`, ShapingAPI or
+/// shadows turned off. Where no face's material `glows`, light rays see none of the light's
+/// terms, as no rays do. The other modes give light rays the light's own color, which differs
+/// from what the bound Material shows.
+pub(super) fn mesh_light(r: &PrimReader<'_>, glows: bool) -> Result<(), String> {
+    let path = r.path();
+    let fail = |what: &str| Err(format!("{path}: {what}"));
+    let mode = r.token("light:materialSyncMode")?;
+    let mode = mode.ok_or_else(|| format!("{path} light:materialSyncMode: no value"))?;
+    match mode.as_str() {
+        "materialGlowTintsLight" => {}
+        "noMaterialResponse" => {
+            return fail(
+                "a mesh light of light:materialSyncMode noMaterialResponse is not cooked: its \
+                 faces show the light's own emission and no response of their material",
+            );
+        }
+        _ => {
+            return fail(&format!(
+                "a mesh light of light:materialSyncMode {mode} is not cooked: its light rays see \
+                 the light's own color, not the glow its faces show"
+            ));
+        }
+    }
+    if !glows {
+        return Ok(());
+    }
+    unsupported(r)?;
+    if flag(r, "inputs:normalize")? {
+        return fail(
+            "a mesh light's inputs:normalize is not cooked: it divides what light rays see by \
+             the surface area of each copy",
+        );
+    }
+    let tint = emission(r)?;
+    if (tint - DVec3::ONE).abs().max_element() > RECORD_EPSILON {
+        return fail(&format!(
+            "a mesh light that multiplies its material's glow by {tint} for light rays is not \
+             cooked: other rays see the glow as it is"
+        ));
+    }
+    if r.prim
+        .has_api_schema("ShapingAPI")
+        .map_err(|e| e.to_string())?
+    {
+        return fail("ShapingAPI on a mesh light is not cooked");
+    }
+    if bool_input(r, "inputs:shadow:enable")? == Some(false) {
+        return fail("a mesh light surfaces cast no shadow from is not cooked");
+    }
+    Ok(())
 }
 
 /// The color `inputs:colorTemperature` multiplies `inputs:color` by, white at 6500 K.

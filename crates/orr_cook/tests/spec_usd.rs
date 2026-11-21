@@ -1,8 +1,9 @@
 //! USD behavior clause by clause. Each row cites the text it holds the importer to:
 //! `xformOp.h`, `xformable.h`, `mesh.h`, `primvar.h`, `pointBased.h`, `pointInstancer.h` (PI),
 //! `overview.dox` and `schema.usda` in usdGeom, `bindingAPI.h`, `cache.h` and `schemas.dox` in
-//! usdSkel, `materialBindingAPI.h` and `connectableAPI.h` in usdShade, the AOUSD core spec, and
-//! `spec_usdpreviewsurface.rst` (PS), all as OpenUSD's `release` branch has them.
+//! usdSkel, `materialBindingAPI.h` and `connectableAPI.h` in usdShade, `schema.usda` in usdLux, the
+//! AOUSD core spec, and `spec_usdpreviewsurface.rst` (PS), all as OpenUSD's `release` branch has
+//! them.
 
 #[allow(dead_code)]
 #[path = "common/tagged.rs"]
@@ -6354,4 +6355,169 @@ fn a_baked_height_holds_under_a_moving_copy() {
         &a,
         &ModelName::source("P").with(Derived::Baked(0)).mesh("u")
     ));
+}
+
+/// usdLux `schema.usda`: `MeshLightAPI` applies `LightAPI` and overrides `light:materialSyncMode`
+/// to `materialGlowTintsLight` (`LightAPI`'s own fallback is `noMaterialResponse`), under which
+/// "all primary and secondary rays see the emissive/glow response as dictated by the bound
+/// Material while the base color seen by light rays (which is then modulated by all of the other
+/// LightAPI controls) is the multiplication of the color feeding the emission/glow input of the
+/// Material [...] with the scalar or pattern input to *inputs:color*". A mesh light whose terms
+/// multiply the glow by 1 is its material as it is, with no light record; one that shows light
+/// rays anything else fails by name, as the scene's emitters show light rays what other rays see.
+#[test]
+fn a_mesh_light_cooks_where_light_rays_see_the_glow_of_its_material() {
+    use orr_pack::layout::LayoutInfo;
+    let stage = |api: &str, bound: bool, inputs: &str| {
+        let binding = if bound {
+            "rel material:binding = </M>"
+        } else {
+            ""
+        };
+        let apis = match api {
+            "" => r#""MaterialBindingAPI""#.to_string(),
+            api => format!(r#""MaterialBindingAPI", "{api}""#),
+        };
+        format!(
+            r#"def Mesh "Tri" (
+    prepend apiSchemas = [{apis}]
+)
+{{
+    {TRIANGLE}
+    {binding}
+    {inputs}
+}}
+
+def Material "M"
+{{
+    token outputs:surface.connect = </M/S.outputs:surface>
+
+    def Shader "S"
+    {{
+        uniform token info:id = "UsdPreviewSurface"
+        color3f inputs:emissiveColor = (0.5, 1, 2)
+        token outputs:surface
+    }}
+}}"#
+        )
+    };
+    let unlit = cook("mesh-light-unlit", &stage("", true, ""));
+    let glow = blob(
+        &unlit,
+        &MaterialName::new(MaterialBase::Path("/M".into())).entry("u"),
+        0,
+    );
+    for (name, api, bound, inputs) in [
+        ("fallbacks", "MeshLightAPI", true, ""),
+        (
+            "exposure-undoes-intensity",
+            "MeshLightAPI",
+            true,
+            "float inputs:intensity = 2\n    float inputs:exposure = -1",
+        ),
+        // "the default value of 6500 will always result in white".
+        (
+            "white-temperature",
+            "MeshLightAPI",
+            true,
+            "bool inputs:enableColorTemperature = 1",
+        ),
+    ] {
+        let a = cook(&format!("mesh-light-{name}"), &stage(api, bound, inputs));
+        let m = MaterialName::new(MaterialBase::Path("/M".into())).entry("u");
+        assert_eq!(blob(&a, &m, 0), glow, "{name}");
+        let layout = LayoutInfo::parse(&blob(&a, &orr_pack::names::layout("u"), 0)).unwrap();
+        let lights = layout
+            .partitions
+            .iter()
+            .map(|p| p.lights.len())
+            .sum::<usize>();
+        assert_eq!(lights, 0, "{name}");
+    }
+    // A material that doesn't glow tints nothing: light rays see the 0 every other ray sees.
+    let dark = stage("MeshLightAPI", true, "float inputs:intensity = 5")
+        .replace("color3f inputs:emissiveColor = (0.5, 1, 2)", "");
+    let a = cook("mesh-light-dark", &dark);
+    let layout = LayoutInfo::parse(&blob(&a, &orr_pack::names::layout("u"), 0)).unwrap();
+    assert!(layout.partitions.iter().all(|p| p.lights.is_empty()));
+    for (name, api, bound, inputs, says) in [
+        (
+            "intensity",
+            "MeshLightAPI",
+            true,
+            "float inputs:intensity = 2",
+            "multiplies its material's glow",
+        ),
+        (
+            "color",
+            "MeshLightAPI",
+            true,
+            "color3f inputs:color = (1, 0.5, 1)",
+            "multiplies its material's glow",
+        ),
+        (
+            "normalize",
+            "MeshLightAPI",
+            true,
+            "bool inputs:normalize = 1",
+            "inputs:normalize",
+        ),
+        (
+            "independent",
+            "MeshLightAPI",
+            true,
+            "uniform token light:materialSyncMode = \"independent\"",
+            "light:materialSyncMode independent",
+        ),
+        (
+            "light-api",
+            "LightAPI",
+            true,
+            "",
+            "light:materialSyncMode noMaterialResponse",
+        ),
+        ("unbound", "MeshLightAPI", false, "", "no Material binds"),
+    ] {
+        let d = dir(&format!("mesh-light-{name}"));
+        let Err(e) = cook_at(&d, &stage(api, bound, inputs), UsdSettings::default()) else {
+            panic!("{name}: cooked");
+        };
+        let e = e.to_string();
+        assert!(e.contains("/Tri") && e.contains(says), "{name}: {e}");
+    }
+}
+
+/// A drawn `Volume` warns by name, as no layout record places a volume or gives it a medium; an
+/// invisible one is not drawn.
+#[test]
+fn a_drawn_volume_warns_that_it_is_not_cooked() {
+    let stage = format!(
+        r#"def Mesh "Tri"
+{{
+    {TRIANGLE}
+}}
+
+def Volume "Smoke"
+{{
+    rel field:density = </Smoke/Density>
+
+    def OpenVDBAsset "Density"
+    {{
+        asset filePath = @smoke.vdb@
+        token fieldName = "density"
+    }}
+}}
+
+def Volume "Hidden"
+{{
+    token visibility = "invisible"
+}}"#
+    );
+    let (_, warnings) = cook_with_warnings(&dir("volume-warns"), &stage, Subdivision::Hull);
+    let told = |p: &str| {
+        warnings
+            .iter()
+            .any(|w| w.contains(p) && w.contains("Volume"))
+    };
+    assert!(told("/Smoke") && !told("/Hidden"), "{warnings:?}");
 }

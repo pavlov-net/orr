@@ -1,7 +1,8 @@
 //! USD import (`.usda`, `.usdc`, `.usdz`) through `openusd`: the composed stage's meshes as
 //! one mesh per model, the UsdShade materials they bind, `PointInstancer`s as instance
 //! records, with UsdSkel a skeleton and its clips ([`skel`]), and its UsdLux lights as layout
-//! light records of their partitions ([`lux`]), a prototype's once per still copy.
+//! light records of their partitions ([`lux`]), a prototype's once per still copy, but for mesh
+//! lights, whose faces' materials emit. `Volume` prims are not cooked: each drawn one warns.
 //!
 //! The stage composes its references, payloads (all loaded) and variants, with the
 //! selections of [`UsdSettings::variants`] in a session layer; any composition error fails
@@ -121,7 +122,7 @@
 //! named by their prim path ([`MaterialBase::Path`]), [`MaterialBase::Default`] for unbound
 //! faces; faces of a `doubleSided` mesh take a double-sided copy ([`Variant::DoubleSided`]).
 //! Meshes that differ in what they hold for a material's primvar readers take a copy each
-//! ([`Variant::Primvars`]).
+//! ([`Variant::Primvars`]). A mesh light with a face bound to no `Material` fails the import.
 
 mod lux;
 mod mesh;
@@ -285,6 +286,14 @@ impl Timeline {
     pub(super) fn span(&self) -> (f64, f64) {
         (0.0, self.seconds(self.last))
     }
+}
+
+/// The warning of a drawn `Volume` prim, which no layout record can place or give a medium.
+fn volume_dropped(prim: &usd::Prim) -> String {
+    format!(
+        "{}: Volume prims are not cooked, as the layout holds no volume placement or medium",
+        prim.path().as_str()
+    )
 }
 
 /// A joint's inverse bind from its bind pose: the identity where that collapses an axis, which
@@ -715,7 +724,7 @@ struct Prototype {
     also: Vec<usize>,
     /// Instancers in its subtree, each placed by every copy of it.
     nested: Vec<usize>,
-    /// Lights it draws, outside its instancers.
+    /// Lights it draws other than meshes, outside its instancers.
     lights: Vec<usize>,
 }
 
@@ -1015,6 +1024,11 @@ impl<'s> Importer<'s> {
         self.find_partitions()?;
         self.find_motions()?;
         self.find_timeline()?;
+        for node in &self.nodes {
+            if node.ty == "Volume" && !node.instanced && !node.shown.hidden() {
+                self.warnings.push(volume_dropped(&node.prim));
+            }
+        }
         let n = self.nodes.len();
         let mut models: Vec<Building> = Vec::new();
         let mut owner: Vec<Option<usize>> = vec![None; n];
@@ -1379,6 +1393,17 @@ impl<'s> Importer<'s> {
             let mut used = faces.clone();
             used.sort_unstable();
             used.dedup();
+            if lux::is_light(&prim)? {
+                let glows = used.iter().any(|&m| self.materials[m].material.emits());
+                lux::mesh_light(&r, glows)?;
+                // `light:materialSyncMode` says what a mesh light's rays see only of a bound
+                // Material.
+                if used.iter().any(|&m| self.is_default(m)) {
+                    return Err(format!(
+                        "{path}: a mesh light with faces no Material binds is not cooked"
+                    ));
+                }
+            }
             let r = self.reader(&prim);
             let mut primvars: HashMap<String, Option<Primvar>> = HashMap::new();
             let mut read_primvars: HashMap<String, Option<Primvar>> = HashMap::new();
@@ -2139,13 +2164,15 @@ impl<'s> Importer<'s> {
         false
     }
 
-    /// The lights of the stage, per partition: those it draws outside the instancers', and the
-    /// copies of those its instancers' prototypes draw, `placed`.
+    /// The light records of the stage, per partition: of the lights other than meshes it draws
+    /// outside the instancers, and of the copies of those its instancers' prototypes draw,
+    /// `placed`.
     fn lights(&self, placed: &[(usize, DMat4, usize)]) -> Result<Vec<Vec<LightSource>>, String> {
         let mut out = vec![Vec::new(); self.partitions.len()];
         let mut found = Vec::new();
         for (i, node) in self.nodes.iter().enumerate() {
-            if !lux::is_light(&node.prim)? {
+            // A mesh light's faces emit, wherever the mesh goes.
+            if node.ty == "Mesh" || !lux::is_light(&node.prim)? {
                 continue;
             }
             if node.instanced || node.shown.hidden() {
@@ -2402,8 +2429,11 @@ impl<'s> Importer<'s> {
                 k = at.end;
                 continue;
             }
-            if drawn && lux::is_light(&at.prim)? {
+            if drawn && at.ty != "Mesh" && lux::is_light(&at.prim)? {
                 lights.push(k);
+            }
+            if drawn && at.ty == "Volume" {
+                instancing.warnings.push(volume_dropped(&at.prim));
             }
             if at.ty == "Mesh" && drawn {
                 let skel_root = self.skel_root(k);
@@ -3443,6 +3473,14 @@ impl<'s> Importer<'s> {
                 (held, _) => held,
             },
         )
+    }
+
+    /// Whether scene material `m` is the default material, which faces bound to no `Material`
+    /// take.
+    fn is_default(&self, m: usize) -> bool {
+        let default = MaterialName::new(MaterialBase::Default);
+        let name = &self.materials[m].name;
+        *name == default || *name == default.with(Variant::DoubleSided)
     }
 
     /// The scene material of a material prim (`None`: the default material) on mesh prim
