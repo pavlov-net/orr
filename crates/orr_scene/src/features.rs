@@ -373,8 +373,7 @@ mod tests {
     /// test for it, and by nothing a plain record holds.
     #[test]
     fn a_record_shows_the_surface_features_its_flags_and_samplers_name() {
-        let plain = SceneFeatures::NONE;
-        assert_eq!(record(|_| {}), plain);
+        assert_eq!(record(|_| {}), SceneFeatures::NONE);
         let vertex = record(|m| m.flags = f::VERTEX);
         assert_eq!(vertex, SceneFeatures::VERTEX_COLORS);
         let tiled = record(|m| m.samplers[3].modes = TILED);
@@ -384,50 +383,59 @@ mod tests {
         assert!(!thin.contains(SceneFeatures::INTERIORS));
         let solid = record(|m| m.flags = f::DIELECTRIC);
         assert!(!solid.contains(SceneFeatures::THIN_DIELECTRICS));
-        // A plain scene rules every surface feature out; each one found sets its bit alone.
-        const DEFINED: u32 = 0b1_1111_1111_1110_1111;
-        assert_eq!(plain.surface_may(), !DEFINED);
-        assert_eq!(vertex.surface_may(), !DEFINED | 1);
-        assert_eq!(tiled.surface_may(), !DEFINED | 1 << 1);
-        assert_eq!(thin.surface_may() & DEFINED, 1 << 9);
-        let scene = SceneFeatures::DECALS | SceneFeatures::PRODUCERS | SceneFeatures::STRANDS;
-        assert_eq!(scene.surface_may() & DEFINED, 0b0110_1000);
-        assert_eq!(SceneFeatures::SKINNING.surface_may() & DEFINED, 1 << 7);
-        assert_eq!(
-            SceneFeatures::COATED_EMITTERS.surface_may() & DEFINED,
-            1 << 8
-        );
+        // Which surface a record's weights are shaded by, and of what kind.
+        let shading = |r: SceneFeatures| {
+            let kinds = SceneFeatures::LINKED_SURFACES
+                | SceneFeatures::EMISSION_FACTORS
+                | SceneFeatures::LINKED_EMISSION_FACTORS
+                | SceneFeatures::LOBE_FACTORS
+                | SceneFeatures::LINKED_LOBE_FACTORS
+                | SceneFeatures::LINKED_TRANSMISSION_FACTORS;
+            SceneFeatures(r.0 & kinds.0)
+        };
         // An emission factor is the standard surface's emitter, and on a record of a linked type
         // that may leave a hit to it, its type's.
         let emits = record(|m| m.emission_luminance = 2.0);
-        assert_eq!(emits.surface_may() & DEFINED, 1 << 12);
+        assert_eq!(shading(emits), SceneFeatures::EMISSION_FACTORS);
         assert!(emits.contains(SceneFeatures::EMISSIVE));
         let linked = record(|m| {
             m.emission_luminance = 2.0;
             m.surface = 1;
         });
-        assert_eq!(linked.surface_may() & DEFINED, 1 << 11 | 1 << 13);
+        assert_eq!(
+            shading(linked),
+            SceneFeatures::LINKED_SURFACES | SceneFeatures::LINKED_EMISSION_FACTORS
+        );
         // So is a coat, fuzz, thin film or subsurface the record's weights give it.
         let coated = record(|m| m.coat_weight = 1.0);
-        assert_eq!(coated.surface_may() & DEFINED, 1 << 14);
+        assert_eq!(shading(coated), SceneFeatures::LOBE_FACTORS);
         let skin = record(|m| {
             m.subsurface_weight = 1.0;
             m.surface = 1;
         });
-        assert_eq!(skin.surface_may() & DEFINED, 1 << 11 | 1 << 15);
+        assert_eq!(
+            shading(skin),
+            SceneFeatures::LINKED_SURFACES | SceneFeatures::LINKED_LOBE_FACTORS
+        );
         // An id nothing links is the standard surface's.
         let unlinked = record(|m| {
             m.subsurface_weight = 1.0;
             m.surface = 2;
         });
-        assert_eq!(unlinked.surface_may() & DEFINED, 1 << 11 | 1 << 14);
+        assert_eq!(
+            shading(unlinked),
+            SceneFeatures::LINKED_SURFACES | SceneFeatures::LOBE_FACTORS
+        );
         // A linked record's transmission shows where its type leaves hits to the standard
         // surface, which may be dielectrics.
         let glass = record(|m| {
             m.transmission_weight = 1.0;
             m.surface = 1;
         });
-        assert_eq!(glass.surface_may() & DEFINED, 1 << 11 | 1 << 16);
+        assert_eq!(
+            shading(glass),
+            SceneFeatures::LINKED_SURFACES | SceneFeatures::LINKED_TRANSMISSION_FACTORS
+        );
     }
 
     /// An emitter's light passes a coat or fuzz only while a record emits and a record has
