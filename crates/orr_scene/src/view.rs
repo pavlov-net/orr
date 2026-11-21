@@ -10,6 +10,7 @@ use orr_pack::AffineRows;
 
 use crate::arena::ViewArena;
 use crate::capacity::Capacity;
+use crate::memory::SlotFrames;
 use crate::raster::{VISIBLE_CLUSTER_LIMIT, ViewLists, ViewTargets};
 use crate::world::WorldPos;
 use crate::{GBufferGpu, RasterGpu, SceneId};
@@ -278,7 +279,7 @@ pub(crate) struct ViewHistory {
     /// Per frame in flight, the visible clusters its render wanted, and the frame that
     /// rendered into each slot.
     pub(crate) readback: Allocation<u32>,
-    pub(crate) rendered: Vec<Option<u64>>,
+    pub(crate) rendered: SlotFrames,
     /// Pixel probes recorded into frames not yet read.
     pub(crate) probes: Vec<crate::probe::PendingProbe>,
 }
@@ -299,7 +300,7 @@ impl ViewHistory {
             visible: Capacity::new(VISIBLE_CLUSTER_LIMIT),
             lists_retry: 0,
             draws: Vec::new(),
-            rendered: vec![None; readback.len() as usize],
+            rendered: SlotFrames::new(readback.len() as u32),
             readback,
             probes: Vec::new(),
         }

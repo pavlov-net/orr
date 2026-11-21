@@ -8,8 +8,9 @@
 //! transforms and, on an edit's copies, last frame's rest positions, so motion follows both.
 //! The frame's instantiated CLAS and BLAS land in blocks sized for the clusters the copies ask
 //! for, from `SceneDesc::skinned_clusters` up: past the room, the copies nearest the focus take
-//! it and the farthest are refused until the room has grown to what they asked. Frames run in
-//! order on the render queue, so a frame's builds never overlap the traces of the frame before.
+//! it and the farthest are refused until the room has grown to what the frames that skinned
+//! them asked, as their counters read back. Frames run in order on the render queue, so a
+//! frame's builds never overlap the traces of the frame before.
 
 use orr_gpu::{
     Allocation, BlasLimits, ClusterLimits, ClusterVertexFormat, CommandList, Device, DispatchArgs,
@@ -18,7 +19,7 @@ use orr_gpu::{
 };
 
 use crate::accel::{self, MeshInput};
-use crate::memory::UploadWindow;
+use crate::memory::{SlotFrames, UploadWindow};
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::scene::{InstanceFlags, ModelId, TransformGroupId};
 use crate::shaders::skin::{self, SkinFrameGpu, SkinRoot};
@@ -244,11 +245,13 @@ pub(crate) struct SkinFrame {
     instantiate_records: GpuAddress,
     blas_records: GpuAddress,
     readback: Allocation<u32>,
+    /// The frame whose counters each slot of `readback` holds.
+    written: SlotFrames,
     _memory: Allocation<u8>,
     /// The clusters and copies a frame skins at most, the most sections a skinned mesh has, and
     /// the frames in flight.
     clusters: u32,
-    /// The most clusters a frame's copies asked for, as the frames read back said.
+    /// The most clusters a frame's copies asked for, as the frames that skinned read back.
     asked: u32,
     copies: u32,
     sections: u32,
@@ -289,6 +292,7 @@ impl SkinFrame {
         let clusters = clusters.max(self.clusters);
         let mut next = Self::new(device, clusters, copies, sections, self.fif)?;
         std::mem::swap(&mut next.readback, &mut self.readback);
+        std::mem::swap(&mut next.written, &mut self.written);
         next.asked = self.asked;
         *self = next;
         Ok(())
@@ -390,9 +394,10 @@ impl SkinFrame {
             blas_records: at(blas_records_at).address(),
             readback: device.gpu_malloc(
                 MemoryKind::Readback,
-                SKIN_COUNTERS * u64::from(fif.max(1)),
+                SKIN_COUNTERS * u64::from(fif),
                 "skin counts readback",
             )?,
+            written: SlotFrames::new(fif),
             record,
             instantiate,
             blas,
@@ -406,11 +411,11 @@ impl SkinFrame {
         })
     }
 
-    /// Records the frame's skinning of `entries` skinned copies of the scene at `scene`,
-    /// and the copy of its counters into readback slot `slot`.
+    /// Records frame `frame`'s skinning of `entries` skinned copies of the scene at `scene`,
+    /// and the copy of its counters into its readback slot.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record(
-        &self,
+        &mut self,
         device: &Device,
         window: &UploadWindow,
         list: &mut CommandList<'_>,
@@ -420,7 +425,7 @@ impl SkinFrame {
         focus: Option<([i32; 4], [f32; 4])>,
         error_pixels: f32,
         entries: u32,
-        slot: usize,
+        frame: u64,
     ) -> Result<()> {
         let (focus_cell, focus_offset) = focus.unwrap_or(([0; 4], [0.0; 4]));
         let root = window.put_root(
@@ -496,11 +501,12 @@ impl SkinFrame {
         list.copy(
             self.readback
                 .gpu()
-                .offset(SKIN_COUNTERS * slot as u64)
+                .offset(SKIN_COUNTERS * self.written.slot(frame) as u64)
                 .cast(),
             self.counters.cast(),
             4 * SKIN_COUNTERS,
         );
+        self.written.set(frame);
         list.end_pass();
         list.barrier(
             Stages::COMPUTE | Stages::TRANSFER,
@@ -510,12 +516,11 @@ impl SkinFrame {
         Ok(())
     }
 
-    /// The figures of readback slot `slot`, whose frame is done, and takes what its copies asked
-    /// for, which [`Self::follow_asked`] grows the room to.
-    pub(crate) fn figures(&mut self, slot: usize) -> SkinStats {
-        let Some(c) = self.readback.as_slice() else {
-            return SkinStats::default();
-        };
+    /// The figures of `frame`, which has completed, and takes what its copies asked for, which
+    /// [`Self::follow_asked`] grows the room to; None when it skinned nothing here.
+    pub(crate) fn figures(&mut self, frame: u64) -> Option<SkinStats> {
+        let slot = self.written.get(frame)?;
+        let c = self.readback.as_slice().expect("readback is mapped");
         let c = &c[slot * SKIN_COUNTERS as usize..];
         let figures = SkinStats {
             clusters: c[SKIN_WORK as usize],
@@ -524,6 +529,6 @@ impl SkinFrame {
             refused: c[SKIN_REFUSED as usize],
         };
         self.asked = self.asked.max(figures.asked);
-        figures
+        Some(figures)
     }
 }

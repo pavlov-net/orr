@@ -23,7 +23,7 @@ use orr_gpu::{
 };
 
 use crate::material::MaterialId;
-use crate::memory::UploadWindow;
+use crate::memory::{SlotFrames, UploadWindow};
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::scene::{InstanceFlags, ModelId, TransformGroupId};
 use crate::shaders::producer_build::{self, BuildRoot, ProducerBuildGpu};
@@ -1305,17 +1305,17 @@ pub(crate) struct Readback {
     /// What `producer_figures.slang` `sum` writes.
     sums: Allocation<ProducerFigures>,
     slots: Allocation<ProducerFigures>,
-    /// Per slot, whether a frame has copied into it.
-    copied: Vec<bool>,
+    /// The frame whose sums each slot holds.
+    copied: SlotFrames,
 }
 
 impl Readback {
     pub(crate) fn new(device: &Device, fif: u32) -> Result<Self> {
-        let slots = u64::from(fif.max(1));
+        let slots = u64::from(fif);
         Ok(Self {
             sums: device.gpu_malloc(MemoryKind::DeviceLocal, 1, "producer figures")?,
             slots: device.gpu_malloc(MemoryKind::Readback, slots, "producer figures readback")?,
-            copied: vec![false; slots as usize],
+            copied: SlotFrames::new(fif),
         })
     }
 
@@ -1341,20 +1341,18 @@ impl Readback {
         Ok(())
     }
 
-    /// Records the copy of the sums into slot `slot`, whose frame before has completed.
-    pub(crate) fn copy(&mut self, list: &mut CommandList<'_>, slot: usize) {
-        let to = self.slots.gpu().offset(slot as u64);
+    /// Records frame `frame`'s copy of the sums into its slot, whose frame before has completed.
+    pub(crate) fn copy(&mut self, list: &mut CommandList<'_>, frame: u64) {
+        let to = self.slots.gpu().offset(self.copied.slot(frame) as u64);
         let bytes = size_of::<ProducerFigures>() as u64;
         list.copy(to.cast(), self.sums.gpu().cast(), bytes);
-        self.copied[slot] = true;
+        self.copied.set(frame);
     }
 
-    /// The figures of slot `slot`: none before a frame has copied into it.
-    pub(crate) fn figures(&self, slot: usize) -> (ProducerStats, TessellationStats) {
-        let Some(f) = self.slots.as_slice().filter(|_| self.copied[slot]) else {
-            return Default::default();
-        };
-        let f = f[slot];
+    /// The figures of `frame`, which has completed; None when it copied none here.
+    pub(crate) fn figures(&self, frame: u64) -> Option<(ProducerStats, TessellationStats)> {
+        let slot = self.copied.get(frame)?;
+        let f = self.slots.as_slice().expect("readback is mapped")[slot];
         let producers = ProducerStats {
             entries: f.entries,
             clusters: f.clusters,
@@ -1380,6 +1378,6 @@ impl Readback {
             welded: f.welded,
             lowest_rate_scale: f.lowest_rate_scale,
         };
-        (producers, tessellation)
+        Some((producers, tessellation))
     }
 }

@@ -26,7 +26,7 @@ use orr_gpu::{
 use orr_math::IVec3;
 use rustc_hash::FxHashMap;
 
-use crate::memory::UploadWindow;
+use crate::memory::{SlotFrames, UploadWindow};
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::scene::SceneDesc;
 use crate::shaders::ptlas::{PartitionGpu, PendingGpu, PtlasGpu, PtlasRoot, TranslateJob};
@@ -487,8 +487,9 @@ pub(crate) struct Ptlas {
     kept: Kept,
     /// What the builds before kept, until the next build has carried it into `kept`.
     carried: Option<Kept>,
-    /// Counters copied back, one block per frame in flight; made with the first storage.
-    readback: Option<Allocation<[u32; COUNTERS]>>,
+    /// Counters copied back, one block per frame in flight, and the frame each block holds;
+    /// made with the first storage.
+    readback: Option<(Allocation<[u32; COUNTERS]>, SlotFrames)>,
     storage: Option<Storage>,
     /// The next build replaces the storage of a build before: it writes every instance anew,
     /// as mandatory work.
@@ -1016,11 +1017,8 @@ impl Ptlas {
             self.layout = layout;
         }
         if self.readback.is_none() {
-            self.readback = Some(device.gpu_malloc(
-                MemoryKind::Readback,
-                u64::from(fif.max(1)),
-                "PTLAS stats",
-            )?);
+            let blocks = device.gpu_malloc(MemoryKind::Readback, u64::from(fif), "PTLAS stats")?;
+            self.readback = Some((blocks, SlotFrames::new(fif)));
         }
         let s = self.storage.as_ref().expect("made above");
         Ok(Some(Tlas(s.tlas.gpu().address().0)))
@@ -1139,10 +1137,11 @@ impl Ptlas {
             .collect()
     }
 
-    /// The figures of the frame that used readback slot `slot`.
-    pub(crate) fn figures(&self, slot: usize) -> Option<PtlasFigures> {
+    /// The figures of `frame`, which has completed; None when it built nothing here.
+    pub(crate) fn figures(&self, frame: u64) -> Option<PtlasFigures> {
         let s = self.storage.as_ref()?;
-        let c = self.readback.as_ref()?.as_slice()?.get(slot)?;
+        let (blocks, written) = self.readback.as_ref()?;
+        let c = &blocks.as_slice().expect("readback is mapped")[written.get(frame)?];
         let slots = 4 * u64::from(self.slot_table.capacity());
         let tables = self.partition_table.size() + slots + self.kept.bytes();
         Some(PtlasFigures {
@@ -1298,13 +1297,14 @@ impl Ptlas {
                 src: if built { tlas } else { GpuAddress(0) },
             },
         );
-        let readback = self.readback.as_ref().expect("made with the storage");
-        let at = readback.gpu().offset(f.slot as u64);
+        let (blocks, written) = self.readback.as_mut().expect("made with the storage");
+        let at = blocks.gpu().offset(written.slot(f.frame) as u64);
         list.copy(
             at.cast(),
             self.kept.counters.gpu().cast(),
             4 * COUNTERS as u64,
         );
+        written.set(f.frame);
         list.end_pass();
         if let Some(s) = self.storage.as_mut() {
             s.built = true;
@@ -1328,8 +1328,6 @@ pub(crate) struct FrameInputs {
     pub(crate) budget: u32,
     /// The BLAS medium and light proxies trace; 0 while the scene has none.
     pub(crate) proxy_blas: GpuAddress,
-    /// The frame's readback slot.
-    pub(crate) slot: usize,
     pub(crate) frame: u64,
 }
 

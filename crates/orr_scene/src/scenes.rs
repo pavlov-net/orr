@@ -1380,40 +1380,44 @@ impl Scenes {
                 .flat_map(|p| self.device.pass_results(*p).unwrap_or_default())
                 .collect();
             let slot = (f.id % u64::from(core.fif)) as usize;
+            // A scene's readers may have been made, or its id taken by a new scene, after `f`
+            // recorded: each answers only for the frames that wrote its readback.
             for id in &f.traced {
                 let Ok(scene) = core.scene(*id) else { continue };
-                if let Some(figures) = scene.cpu.lock().unwrap().ptlas.figures(slot) {
+                if let Some(figures) = scene.cpu.lock().unwrap().ptlas.figures(f.id) {
                     f.stats.rt.add(&figures);
                 }
             }
             let mut feedback = PageFeedback::default();
+            // A frame no scene's cuts traversed read nothing, so it says nothing of what one
+            // wants.
+            let mut sampled = false;
             for id in &f.updated {
                 let Ok(scene) = core.scene(*id) else { continue };
                 let mut cpu = scene.cpu.lock().unwrap();
-                if let Some(r) = &cpu.producer_readback {
-                    let (producers, tessellation) = r.figures(slot);
+                if let Some((producers, tessellation)) =
+                    cpu.producer_readback.as_ref().and_then(|r| r.figures(f.id))
+                {
                     f.stats.producers.add(&producers);
                     f.stats.tessellation.add(&tessellation);
                 }
-                if let Some(cuts) = &mut cpu.cuts {
-                    cuts.figures(slot, &mut f.stats.cuts);
-                    cuts.feedback(slot, &mut feedback);
-                    cuts.observe(slot);
+                if let Some(cuts) = &mut cpu.cuts
+                    && let Some(scale) = cuts.read(f.id, &mut f.stats.cuts, &mut feedback)
+                {
+                    sampled = true;
                     let rt = &mut f.stats.detail.rt_scale;
-                    *rt = rt.max(cuts.rt_scale(slot));
+                    *rt = rt.max(scale);
                 }
-                if let Some(skin) = &mut cpu.skin_frame {
-                    f.stats.skin.add(&skin.figures(slot));
+                if let Some(skin) = cpu.skin_frame.as_mut().and_then(|s| s.figures(f.id)) {
+                    f.stats.skin.add(&skin);
                 }
             }
             for h in core.histories.iter_mut().flatten() {
-                if h.rendered[slot] == Some(f.id) {
+                if let Some(slot) = h.rendered.get(f.id) {
                     let wanted = h.readback.as_slice().expect("readback is mapped")[slot];
                     h.visible.observe(wanted);
                 }
             }
-            // A frame that updated no scene read nothing, so it says nothing of what one wants.
-            let sampled = !f.updated.is_empty();
             if sampled {
                 core.mounts.streaming.begin_sample();
             }
@@ -1526,7 +1530,7 @@ impl Scenes {
             .histories
             .iter()
             .flatten()
-            .filter(|h| h.rendered[(last % u64::from(core.fif)) as usize] == Some(last))
+            .filter(|h| h.rendered.get(last).is_some())
             .filter_map(|h| h.previous)
             .map(|v| u64::from(v.render_extent.x) * u64::from(v.render_extent.y))
             .sum();
@@ -2521,8 +2525,8 @@ impl<'a> Frame<'a> {
         list.end_pass();
         list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         for &(id, root, _, focus, ..) in &roots {
-            let cpu = core.scene(id)?.cpu.lock().unwrap();
-            let Some(skin) = &cpu.skin_frame else {
+            let cpu = &mut *core.scene(id)?.cpu.lock().unwrap();
+            let Some(skin) = &mut cpu.skin_frame else {
                 continue;
             };
             let focus = focus.map(|(f, ppr)| {
@@ -2539,7 +2543,7 @@ impl<'a> Frame<'a> {
                 focus,
                 core.raster_error_pixels * core.detail_scales().0,
                 cpu.skinned_high_water,
-                (self.id % u64::from(core.fif)) as usize,
+                self.id,
             )?;
         }
         drop(animate);
@@ -2574,7 +2578,7 @@ impl<'a> Frame<'a> {
                 slots: cpu.ptlas.high_water,
                 passes: hierarchy.depth,
                 parted_edits: core.mounts.has_parted_edit(),
-                slot: (self.id % u64::from(core.fif)) as usize,
+                frame: self.id,
             };
             let cuts = cpu.cuts.as_mut().expect("made with the root");
             cuts.record(
@@ -2635,7 +2639,6 @@ impl<'a> Frame<'a> {
                     producers: scene.tables.producers.capacity(),
                     budget: core.budgets.ptlas_rebuilt,
                     proxy_blas,
-                    slot: (self.id % u64::from(core.fif)) as usize,
                     frame: self.id,
                 };
                 let kernels = &core.ptlas;
@@ -3110,11 +3113,11 @@ impl<'a> Frame<'a> {
         )?;
         drop(record);
         let raster = draws[0];
-        let slot = (self.id % u64::from(core.fif)) as usize;
+        let slot = history.rendered.slot(self.id);
         let wanted = history.readback.gpu().offset(slot as u64);
         list.copy(wanted.cast(), targets.counts().cast(), 4);
         list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
-        history.rendered[slot] = Some(self.id);
+        history.rendered.set(self.id);
         let (gbuf_a, gbuf_b, gbuf_x, gbuf_y) = targets.gbuffer_textures();
         let out = RasterView {
             view: constants,
@@ -3410,7 +3413,6 @@ fn record_producers(
     pipelines: &Pipelines,
     frame: u64,
 ) -> Result<()> {
-    let slot = (frame % u64::from(core.fif)) as usize;
     let mut scenes = Vec::with_capacity(listed.len());
     for &id in listed {
         let scene = core.scene(id)?;
@@ -3524,7 +3526,7 @@ fn record_producers(
         list.end_pass();
         list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
         for (readback, _) in summed {
-            readback.copy(list, slot);
+            readback.copy(list, frame);
         }
     }
     list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());

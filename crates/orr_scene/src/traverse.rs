@@ -38,7 +38,7 @@ use orr_gpu::{
 
 use crate::capacity::Capacity;
 use crate::detail::{Detail, Sample};
-use crate::memory::UploadWindow;
+use crate::memory::{SlotFrames, UploadWindow};
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::shaders::feedback::{self, FeedbackRoot};
 use crate::shaders::traverse::{self, TraverseRoot};
@@ -582,6 +582,8 @@ pub(crate) struct Cuts {
     /// Per frame in flight: counters, touched entries, then kept requests, as the frame that
     /// used the slot last sized them.
     readback: Vec<Allocation<u32>>,
+    /// The frame that used each slot of `readback` last.
+    written: SlotFrames,
     updates: u64,
     /// The scale of the gathered cuts' threshold over the configured one, which the memory
     /// scale serves first, and what each frame in flight ran with.
@@ -623,8 +625,7 @@ pub(crate) struct CutInputs {
     pub(crate) passes: u32,
     /// A copy of an edit may gather one BLAS per animated part.
     pub(crate) parted_edits: bool,
-    /// The frame's readback slot.
-    pub(crate) slot: usize,
+    pub(crate) frame: u64,
 }
 
 impl Cuts {
@@ -710,7 +711,7 @@ impl Cuts {
             bytes: rt.bytes,
             words,
         };
-        let readback = (0..fif.max(1))
+        let readback = (0..fif)
             .map(|_| readback(device, &sizes, words))
             .collect::<Result<_>>()?;
         Ok(Self {
@@ -739,9 +740,10 @@ impl Cuts {
             errors_unset: true,
             feedback,
             readback,
+            written: SlotFrames::new(fif),
             updates: 0,
             gather: Detail::new(),
-            ran: vec![ran; fif.max(1) as usize],
+            ran: vec![ran; fif as usize],
         })
     }
 
@@ -754,9 +756,26 @@ impl Cuts {
         self.gpu.candidate_capacity
     }
 
+    /// Reads `frame`, which has completed: adds its traversal figures to `stats` and what it
+    /// read and wanted to `out`, takes what it wanted of the queues, the candidate cut and the
+    /// tables of the built cuts, and returns the scale its gathered cuts ran at past its memory
+    /// scale. None when it traversed nothing here.
+    pub(crate) fn read(
+        &mut self,
+        frame: u64,
+        stats: &mut CutStats,
+        out: &mut PageFeedback,
+    ) -> Option<f32> {
+        let slot = self.written.get(frame)?;
+        self.figures(slot, stats);
+        self.feedback(slot, out);
+        self.observe(slot);
+        Some(self.ran[slot].rt_scale)
+    }
+
     /// Takes what the frame that used readback slot `slot` wanted of the queues, the
     /// candidate cut and the tables of the built cuts.
-    pub(crate) fn observe(&mut self, slot: usize) {
+    fn observe(&mut self, slot: usize) {
         let data = self.readback(slot);
         let (queue, candidates) = (data[CUT_QUEUE_PEAK], data[CUT_CANDIDATES]);
         let sheddable = data[CUT_SHEDDABLE] != 0;
@@ -787,10 +806,10 @@ impl Cuts {
         });
     }
 
-    /// The scale the gathered cuts of the frame that used readback slot `slot` ran at past its
-    /// memory scale.
-    pub(crate) fn rt_scale(&self, slot: usize) -> f32 {
-        self.ran[slot].rt_scale
+    /// The scale the gathered cuts of `frame` ran at past its memory scale, while its slot holds
+    /// it; None when it traversed nothing here.
+    pub(crate) fn rt_scale(&self, frame: u64) -> Option<f32> {
+        Some(self.ran[self.written.get(frame)?].rt_scale)
     }
 
     /// Gives the merged cuts an entry for each of `models` entries of the model table, before
@@ -977,7 +996,7 @@ impl Cuts {
     }
 
     /// The traversal figures of the frame that used readback slot `slot`.
-    pub(crate) fn figures(&self, slot: usize, stats: &mut CutStats) {
+    fn figures(&self, slot: usize, stats: &mut CutStats) {
         let data = self.readback(slot);
         let ran = self.ran[slot];
         stats.add(&data[..COUNTERS], &ran.sizes, ran.bytes);
@@ -985,7 +1004,7 @@ impl Cuts {
     }
 
     /// Adds what the frame that used readback slot `slot` read and wanted to `out`.
-    pub(crate) fn feedback(&self, slot: usize, out: &mut PageFeedback) {
+    fn feedback(&self, slot: usize, out: &mut PageFeedback) {
         let data = self.readback(slot);
         let words = self.ran[slot].words as usize;
         let touched = &data[COUNTERS..][..words];
@@ -1022,12 +1041,13 @@ impl Cuts {
             flags |= TRAVERSE_ERRORS;
         }
         let words = self.sizes.feedback_words();
+        let slot = self.written.slot(f.frame);
         // The frame that used the slot before has completed and been read.
-        if self.ran[f.slot].words != words {
-            self.readback[f.slot] = readback(device, &self.sizes, words)?;
+        if self.ran[slot].words != words {
+            self.readback[slot] = readback(device, &self.sizes, words)?;
         }
         let rt_scale = (self.gather.scale() / f.visible_scale).max(1.0);
-        self.ran[f.slot] = Ran {
+        self.ran[slot] = Ran {
             scale: f.visible_scale * rt_scale,
             rt_scale,
             sizes: self.rt.sizes,
@@ -1180,7 +1200,7 @@ impl Cuts {
         } else {
             step(list);
         }
-        let at = self.readback[f.slot].gpu();
+        let at = self.readback[slot].gpu();
         let words = u64::from(words);
         list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
         list.copy(at.cast(), self.counters.cast(), 4 * COUNTERS as u64);
@@ -1200,6 +1220,7 @@ impl Cuts {
         }
         list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
         list.end_pass();
+        self.written.set(f.frame);
         self.updates += 1;
         self.errors_unset = false;
         Ok(())

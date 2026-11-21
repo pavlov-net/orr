@@ -1,5 +1,5 @@
-//! Sub-allocation: index ranges in fixed tables, the per-frame upload windows and the
-//! frames' preprocess memory.
+//! Sub-allocation: index ranges in fixed tables, the per-frame upload windows, the frames'
+//! preprocess memory and which frame wrote each readback slot.
 
 use std::alloc::Layout;
 use std::cmp::Reverse;
@@ -1010,6 +1010,34 @@ impl PreprocessArenas {
         }
         self.outgrown.clear();
         Ok(())
+    }
+}
+
+/// Per readback slot, one per frame in flight, the frame that wrote it last. Frame N writes
+/// slot N mod slots; readback memory holds whatever it held until a frame writes it, so a
+/// frame's results are read only from a slot it wrote.
+pub(crate) struct SlotFrames(Vec<Option<u64>>);
+
+impl SlotFrames {
+    pub(crate) fn new(slots: u32) -> Self {
+        Self(vec![None; slots as usize])
+    }
+
+    /// The slot `frame` writes.
+    pub(crate) fn slot(&self, frame: u64) -> usize {
+        (frame % self.0.len() as u64) as usize
+    }
+
+    /// Notes that `frame` has recorded the writes of its slot.
+    pub(crate) fn set(&mut self, frame: u64) {
+        let slot = self.slot(frame);
+        self.0[slot] = Some(frame);
+    }
+
+    /// The slot holding what `frame` wrote; None when it wrote none.
+    pub(crate) fn get(&self, frame: u64) -> Option<usize> {
+        let slot = self.slot(frame);
+        (self.0[slot] == Some(frame)).then_some(slot)
     }
 }
 

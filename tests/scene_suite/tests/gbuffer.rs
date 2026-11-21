@@ -51,7 +51,9 @@ use orr_scene::{
     SkinnedGpu, SkinnedPageRef, SlotCutGpu, SlotStateGpu, TextureFilter, TransformGroupDesc,
     TransformGroupId, ViewDesc, ViewHistoryId,
 };
-use orr_scene::{Budgets, InstancePageRef, PageId, PixelProbe, PoolSize, RequestSource};
+use orr_scene::{
+    Budgets, CutStats, InstancePageRef, PageId, PixelProbe, PoolSize, RequestSource, SkinStats,
+};
 use scene_suite::shaders::{
     codec, fracture, grid, pose, skin_pose, stretch, surface_at, surface_params, trace,
     triangle_at, triangle_point,
@@ -10645,6 +10647,149 @@ fn an_unmount_takes_a_skinned_page_and_its_motion_from_the_scene() {
         frame(&mut scenes, &mut |_| {});
     }
     assert_eq!(state(), [0, 0, 1], "only the palette stays");
+    assert_clean();
+}
+
+/// A frame in flight reads nothing of a scene made after it: while a gate holds frame N, which
+/// updated a scene, that scene is destroyed and a new one takes its id, whose first frame makes
+/// its cuts and the skinning of a skinned page. Frame N reports no cut or skin figures of it, and
+/// the skinning room does not grow on what frame N read. A read of a slot frame N did not write
+/// shows in its cut figures always, and in the skinning room only where that memory is not zero.
+#[test]
+fn a_frame_in_flight_reads_nothing_of_a_scene_made_after_it() {
+    let _serial = serial();
+    let manifest = Manifest {
+        archives: vec![
+            ArchiveSpec::new(
+                Target::Memory,
+                vec![AssetSpec {
+                    name: "worm".into(),
+                    source: Source::Gltf {
+                        path: worm_glb(),
+                        settings: GltfSettings {
+                            mesh: MeshSettings {
+                                deformation_bound: 1.0,
+                                ..MeshSettings::default()
+                            },
+                            ..GltfSettings::default()
+                        },
+                    },
+                }],
+            ),
+            ArchiveSpec::new(
+                Target::Memory,
+                vec![AssetSpec {
+                    name: "paced crowd".into(),
+                    source: Source::Instances(paced_crowd()),
+                }],
+            ),
+        ],
+    };
+    let mut packs = orr_cook::cook(&manifest, &Default::default())
+        .unwrap()
+        .memory;
+    let (pages, models) = (packs.remove(1), packs.remove(0));
+    let archive = Archive::from_memory(Arc::clone(&pages)).unwrap();
+    let is_page = |e: &&Entry| e.class == orr_pack::Class::InstancePage as u16;
+    let entry = archive.entries().iter().find(is_page).expect("the page");
+
+    let mut scenes = Scenes::new(device(), &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let mounted = |scenes: &mut Scenes, pack| {
+        let m = scenes.mount(PackSource::Memory(pack));
+        let desc = FrameDesc {
+            time: time(0),
+            scenes: &[],
+            low_latency: None,
+        };
+        while mount_pending(scenes, m) {
+            scenes.begin_frame(&desc).unwrap().end(&[]).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_matches!(scenes.mount_state(m), LoadState::Ready);
+        m
+    };
+    mounted(&mut scenes, models);
+    let pack = mounted(&mut scenes, pages);
+    let page = scenes.instance_page(pack, entry.id).unwrap();
+
+    // Each frame's root, as the frame's scene compute sees it.
+    let roots = device()
+        .gpu_malloc::<SceneRoot>(MemoryKind::Readback, 2, "test roots")
+        .unwrap();
+    let copy_root = |c: &mut SceneCompute<'_, '_>, i: u64| {
+        c.cmd
+            .barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
+        let bytes = size_of::<SceneRoot>() as u64;
+        c.cmd
+            .copy(roots.gpu().offset(i).cast(), c.root.cast(), bytes);
+        c.cmd
+            .barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
+    };
+    let gate = std::mem::DropGuard::new(device().create_host_timeline("gate").unwrap(), |g| {
+        if g.value() < 2 {
+            g.signal(2);
+        }
+    });
+    let gone = scenes.create_scene(&SceneDesc::default()).unwrap();
+    let list = [gone];
+    let desc = FrameDesc {
+        time: time(0),
+        scenes: &list,
+        low_latency: None,
+    };
+    let f = scenes.begin_frame(&desc).unwrap();
+    let held = f.id();
+    f.end(&[gate.point(1)]).unwrap();
+    scenes.destroy_scene(gone);
+    let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
+    assert_eq!(scene, gone, "the new scene takes the id");
+
+    // The new scene's first frame makes its cuts and its skinning, while frame N is held.
+    let mut f = scenes.begin_frame(&desc).unwrap();
+    {
+        let mut s = f.scene(scene).unwrap();
+        let palette = s
+            .create_transform_group(&TransformGroupDesc {
+                count: CROWD.len() as u32 * worm_rig().0.joint_count() as u32,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            })
+            .unwrap();
+        s.add_skinned_page(&SkinnedPageRef {
+            frame: None,
+            page,
+            palette,
+            palette_first: 0,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 100.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    }
+    f.update_scenes(&mut |c| copy_root(c, 0)).unwrap();
+    f.end(&[gate.point(2)]).unwrap();
+
+    // The next frame reads frame N alone, the frame after it still held, and follows what it
+    // read.
+    gate.signal(1);
+    let mut f = scenes.begin_frame(&desc).unwrap();
+    f.update_scenes(&mut |c| copy_root(c, 1)).unwrap();
+    let last = f.end(&[]).unwrap();
+    let stats = scenes.stats();
+    assert_eq!(stats.frame, held);
+    assert_eq!(stats.cuts, CutStats::default());
+    assert_eq!(stats.skin, SkinStats::default());
+    gate.signal(2);
+    wait(last);
+    let [made, next] = roots.as_slice().unwrap() else {
+        unreachable!()
+    };
+    assert_ne!(made.skin_work, GpuPtr::NULL, "the new scene skins");
+    assert_eq!(next.skin_work, made.skin_work, "the skinning room grew");
+    wait(scenes.begin_frame(&desc).unwrap().end(&[]).unwrap());
+    drop(gate);
     assert_clean();
 }
 

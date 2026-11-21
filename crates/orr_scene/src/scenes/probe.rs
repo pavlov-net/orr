@@ -34,7 +34,8 @@ impl Frame<'_> {
     /// Records a probe of render pixel `pixel` of `view`, a view this frame's
     /// [`Frame::raster_view`] rendered, before its render enters a step past
     /// [`crate::ViewStep::Transparency`], which may take the memory of the visibility buffer and
-    /// the G-buffer. [`Scenes::probes`] returns it once the frame has completed.
+    /// the G-buffer. [`Scenes::probes`] returns it once the frame has completed. Fails with
+    /// [`Error::NotListed`] for a view of a scene the frame does not list.
     pub fn probe(&mut self, view: &RasterView, pixel: [u32; 2]) -> Result<()> {
         self.ensure_updated()?;
         let device = self.device;
@@ -46,11 +47,15 @@ impl Frame<'_> {
             .and_then(Option::as_ref)
             .and_then(|h| h.previous)
             .ok_or(Error::UnknownViewHistory(view.history))?;
-        let slot = (frame % u64::from(core.fif)) as usize;
         let (focus, rt_scale) = {
             let cpu = core.scene(desc.scene)?.cpu.lock().unwrap();
             let focus = cpu.focus.map(|f| (f, cpu.pixels_per_radian));
-            (focus, cpu.cuts.as_ref().map_or(1.0, |c| c.rt_scale(slot)))
+            let rt_scale = cpu
+                .cuts
+                .as_ref()
+                .and_then(|c| c.rt_scale(frame))
+                .ok_or(Error::NotListed(desc.scene))?;
+            (focus, rt_scale)
         };
         let memory_scale = core.memory.scale();
         let (visible_scale, hidden_scale) = core.detail_scales();
