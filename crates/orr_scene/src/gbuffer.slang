@@ -444,55 +444,6 @@ public GSurface decode_gsurface(GBufferWords w)
     return s;
 }
 
-// `PackedSurface.flags`.
-// A ray hit's surface: `geometric_normal` holds the triangle's normal, which turns toward the ray
-// that reached it, and the ids are the hit's. Else the G-buffer's: `b`'s word holds the normal
-// and the ids are the visible triangle's.
-public static const uint SURFACE_HIT = 1 << 0;
-
-// A resolved opaque surface as a path vertex holds it between the shaders of one vertex: the
-// G-buffer's words, so a vertex past the first shades at the G-buffer's precision, and what a
-// vertex keeps beside them. The G-buffer's surface keeps its emission pre-exposed in `a`; a hit's
-// is `emission`, in nits, whose range has no ceiling.
-public struct PackedSurface
-{
-    public float3 position;         // render space, the depth offset applied
-    public float origin_error;      // m: what the ray origin offset must cover
-    public uint4 a;
-    public uint2 b;
-    public uint geometric_normal;   // `oct_encode_snorm16`, with SURFACE_HIT
-    public float depth_offset;      // m along the ray that reached the surface
-    public uint4 x;
-    public uint4 y;
-    public uint instance;           // a hit's PTLAS instance index, else the visible triangle's instance slot
-    public uint cluster;            // a hit's cluster id, else the visible triangle's mesh cluster
-    public uint primitive;
-    public uint material;
-    public float2 barycentrics;
-    public uint emission;           // a hit's, `pack_rgbe`
-    public uint flags;              // SURFACE_*
-}
-
-// Whether `ps` may hold a coat, fuzz, thin film or subsurface weight: its words are extended. One
-// that is not unpacks with none of them.
-public bool surface_lobed(PackedSurface ps)
-{
-    return ((ps.a.w >> 24) & GBUFFER_EXTENDED) != 0;
-}
-
-// What `ps`'s words hold, its position and material; the shading normal as stored, not leaned.
-// The visible triangle is left 0: a hit's ids are not a `GSurface`'s.
-public GSurface unpack_surface(PackedSurface ps)
-{
-    GBufferWords w = { ps.a, ps.b, ps.x, ps.y };
-    GSurface s = decode_gsurface(w);
-    if ((ps.flags & SURFACE_HIT) != 0)
-        s.geometric_normal = oct_decode_snorm16(ps.geometric_normal);
-    s.position = ps.position;
-    s.material = ps.material;
-    return s;
-}
-
 // The origin policy of `s`: ORIGIN_*.
 public uint gsurface_origin(GSurface s)
 {

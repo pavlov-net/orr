@@ -362,30 +362,16 @@ PathVertex vertex_on(ViewConstants* v, GSurface g, float origin_error, float dep
     return x;
 }
 
-// `vertex_on` with the shading normal leaned toward the ray's origin where a normal map tilts it
-// away, and with `hit` the geometric normal facing the ray.
-PathVertex facing_vertex(ViewConstants* v, GSurface g, float origin_error, float depth_offset, float3 dir, bool hit)
-{
-    PathVertex x = vertex_on(v, g, origin_error, depth_offset, dir);
-    x.surface.normal = lean_normal(x.surface.normal, x.view);
-    if (hit && dot(x.surface.geometric_normal, x.view) < 0.0)
-        x.surface.geometric_normal = -x.surface.geometric_normal;
-    return x;
-}
-
 // The vertex of a resolved hit of a ray along `dir`, whose frame the hit turned toward the ray
 // on a back face: the shading normal leaned toward the ray's origin where a normal map tilts it
 // away, and the geometric normal facing it.
 public PathVertex hit_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
 {
-    return facing_vertex(v, sh.surface, sh.geometric_error, sh.depth_offset, dir, true);
-}
-
-// The vertex of packed surface `ps`, reached along `dir`: a hit's as `hit_vertex` makes it, and
-// the G-buffer's as `gbuffer_vertex` does, `dir` from the eye.
-public PathVertex surface_vertex(ViewConstants* v, PackedSurface ps, float3 dir)
-{
-    return facing_vertex(v, unpack_surface(ps), ps.origin_error, ps.depth_offset, dir, (ps.flags & SURFACE_HIT) != 0);
+    PathVertex x = vertex_on(v, sh.surface, sh.geometric_error, sh.depth_offset, dir);
+    x.surface.normal = lean_normal(x.surface.normal, x.view);
+    if (dot(x.surface.geometric_normal, x.view) < 0.0)
+        x.surface.geometric_normal = -x.surface.geometric_normal;
+    return x;
 }
 
 // The error of the cut ray tracing holds for slot copy `copy`, in render space; 0 when the
