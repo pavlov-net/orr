@@ -2674,7 +2674,6 @@ name = "output_math"
 version = "0.0.1"
 dependencies = [
  "cc",
- "orr_color",
  "orr_output",
  "orr_shaders",
 ]

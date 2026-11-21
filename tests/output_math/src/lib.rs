@@ -36,10 +36,6 @@ mod ffi {
         pub(crate) fn orr_luminance_from_ev100(e: f32) -> f32;
         pub(crate) fn orr_exposure_from_ev100(e: f32) -> f32;
         pub(crate) fn orr_ev100_from_exposure(s: f32) -> f32;
-        pub(crate) fn orr_srgb_encode(x: f32) -> f32;
-        pub(crate) fn orr_srgb_decode(x: f32) -> f32;
-        pub(crate) fn orr_pq_encode(nits: f32) -> f32;
-        pub(crate) fn orr_pq_decode(signal: f32) -> f32;
         pub(crate) fn gt7_reference_f32(peak_nits: f32, rgb: *const f32, out: *mut f32, count: u32);
         pub(crate) fn gt7_reference_f64(peak_nits: f32, rgb: *const f32, out: *mut f32, count: u32);
     }
@@ -143,8 +139,4 @@ scalar! {
     luminance_from_ev100 => orr_luminance_from_ev100,
     exposure_from_ev100 => orr_exposure_from_ev100,
     ev100_from_exposure => orr_ev100_from_exposure,
-    srgb_encode => orr_srgb_encode,
-    srgb_decode => orr_srgb_decode,
-    pq_encode => orr_pq_encode,
-    pq_decode => orr_pq_decode,
 }

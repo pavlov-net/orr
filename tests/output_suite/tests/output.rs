@@ -21,21 +21,26 @@ const EV100: f32 = 12.0;
 
 /// Linear Rec.2020 hues, one per row: gray, the Rec.2020 primaries and secondaries, the
 /// Rec.709 red and a warm tone.
-const HUES: [[f32; 3]; 8] = [
-    [1.0, 1.0, 1.0],
-    [1.0, 0.0, 0.0],
-    [0.0, 1.0, 0.0],
-    [0.0, 0.0, 1.0],
-    [0.0, 1.0, 1.0],
-    [1.0, 0.0, 1.0],
-    [0.627, 0.069, 0.016],
-    [1.0, 0.6, 0.4],
-];
+fn hues() -> [[f32; 3]; 8] {
+    let rec709_red = orr_color::rec709_to_rec2020([1.0, 0.0, 0.0])
+        .as_vec3()
+        .to_array();
+    [
+        [1.0, 1.0, 1.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 1.0],
+        [1.0, 0.0, 1.0],
+        rec709_red,
+        [1.0, 0.6, 0.4],
+    ]
+}
 
 /// Exposed values, row by row: 0, then log-spaced from 1e-4 to 1e3 times paper white.
 fn ramp() -> Vec<[f32; 3]> {
     let mut out = Vec::new();
-    for hue in HUES {
+    for hue in hues() {
         for i in 0..WIDTH {
             let x = if i == 0 {
                 0.0
@@ -51,7 +56,7 @@ fn ramp() -> Vec<[f32; 3]> {
 /// Runs tonemap and compose over the ramp into a backbuffer of `format`; returns its texels.
 fn run(display: &ResolvedDisplay, format: Format) -> Vec<u8> {
     let gpu = device();
-    let height = HUES.len() as u32;
+    let height = hues().len() as u32;
     // Lit two stops brighter than the manual exposure, so tonemap scales by a quarter.
     let pre_exposure = 4.0 * exposure_from_ev100(EV100);
     let radiance: Vec<[f32; 4]> = ramp()
