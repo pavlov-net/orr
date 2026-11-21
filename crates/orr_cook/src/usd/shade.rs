@@ -88,14 +88,16 @@ pub(super) fn network(
     })
 }
 
-/// The output type of a node definition whose id ends in `suffix`. An `extract` id names the type
-/// it reads, where other ids name the type they give.
-fn output_type<'s>(kind: &str, suffix: &'s str) -> &'s str {
+/// The output type of a node definition whose id ends in `suffix`, and the type a `convert` reads.
+/// An `extract` id names the type it reads, where other ids name the type they give, and a
+/// `convert` id names both, as `ND_convert_color4_color3`.
+fn types<'s>(kind: &str, suffix: &'s str) -> (&'s str, &'s str) {
     match (kind, suffix) {
-        ("extract", "matrix33") => "vector3",
-        ("extract", "matrix44") => "vector4",
-        ("extract", _) => "float",
-        _ => suffix,
+        ("extract", "matrix33") => ("vector3", ""),
+        ("extract", "matrix44") => ("vector4", ""),
+        ("extract", _) => ("float", ""),
+        ("convert", s) => s.split_once('_').map_or((s, ""), |(from, to)| (to, from)),
+        _ => (suffix, ""),
     }
 }
 
@@ -141,17 +143,17 @@ impl Builder<'_> {
             .ok_or_else(|| format!("{path}: shader without info:id"))?;
         let id = id.as_str();
         let kind = shading::category(id).to_string();
-        let ty = id
+        let (ty, in_ty) = id
             .strip_prefix("ND_")
             .and_then(|r| r.strip_prefix(kind.as_str()))
             .and_then(|r| r.strip_prefix('_'))
-            .map_or_default(|suffix| output_type(&kind, suffix))
-            .to_string();
+            .map_or_default(|suffix| types(&kind, suffix));
         let n = self.net.nodes.len();
         self.net.nodes.push(Node {
             name: path.clone(),
+            ty: ty.to_string(),
+            in_ty: in_ty.to_string(),
             kind,
-            ty,
             inputs: BTreeMap::new(),
         });
         self.by_prim.insert(path.clone(), n);

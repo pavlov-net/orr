@@ -3135,6 +3135,49 @@ fn a_matrix_row_extracts_through_node_definition_ids() {
     assert!(near(m.specular_roughness, 0.6), "{}", m.specular_roughness);
 }
 
+/// A `convert` id names the type it reads and the type it gives, as `ND_convert_color4_color3`,
+/// and the type read picks what an unconnected `in` holds: `ND_convert_color3_vector4` reads the
+/// color (0, 0, 0), whose fourth channel "is populated with 1".
+#[test]
+fn a_convert_reads_the_types_its_definition_id_names() {
+    let inputs = "color3f inputs:base_color.connect = </M/C.outputs:out>
+        float inputs:specular_roughness.connect = </M/E.outputs:out>";
+    let prims = format!(
+        r#"{}
+    def Shader "I"
+    {{
+        uniform token info:id = "ND_image_color4"
+        asset inputs:file = @tex.png@
+        color4f outputs:out
+    }}
+    def Shader "C"
+    {{
+        uniform token info:id = "ND_convert_color4_color3"
+        color4f inputs:in.connect = </M/I.outputs:out>
+        color3f outputs:out
+    }}
+    def Shader "V"
+    {{
+        uniform token info:id = "ND_convert_color3_vector4"
+        float4 outputs:out
+    }}
+    def Shader "E"
+    {{
+        uniform token info:id = "ND_extract_vector4"
+        float4 inputs:in.connect = </M/V.outputs:out>
+        int inputs:index = 3
+        float outputs:out
+    }}"#,
+        open_pbr(inputs)
+    );
+    let surface = "token outputs:mtlx:surface.connect = </M/S.outputs:out>";
+    let body = mtlx_material(surface, &prims);
+    let image = png(4, 4, |x, y| [(x * 60) as u8, (y * 60) as u8, 100, 255]);
+    let m = material(&cook_centimeters("convert-ids", &body, &image));
+    assert_ne!(m.textures[slot::BASE_COLOR].texture, AssetId::NONE);
+    assert_eq!(m.specular_roughness, 1.0);
+}
+
 /// OpenPBR Metadata: "If no unit is given, the length is assumed to be in centimeters", and
 /// `thin_film_thickness` "is always in micrometers". A stage's `metersPerUnit` is the unit of its
 /// geometry, not of these parameters.

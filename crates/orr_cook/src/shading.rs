@@ -10,12 +10,17 @@
 //!   does, and a `normalmap` `space` of `object` in either states directions in the mesh's space,
 //!   which turn with what places it and with a transform an importer bakes into the mesh
 //!   ([`Material::object_frame`]), but not with a skin's joints, which warns.
-//!   `geometry_tangent` and `geometry_coat_tangent` take a
-//!   `tangent` node, the mesh's, or a texture of a direction in the tangent plane; any other warns
-//!   and reads the mesh's. The base and the coat each follow the uv set the `index` of their
-//!   `tangent` nodes names. Mesh tangents hold one of the two, and a coat on another set takes its
-//!   tangent from the triangle's uvs. A `geometry_opacity` below 1 or textured blends, as the
-//!   linear presence weight OpenPBR defines.
+//!   `geometry_tangent` and `geometry_coat_tangent` take, past `normalize` nodes, a `tangent`
+//!   node, the mesh's, a texture of a direction in the tangent plane, or a `rotate3d` of either
+//!   about the normal the layer shades with by a constant multiple of 90 degrees, which sets the
+//!   layer's rotation; any other warns and reads the mesh's. That normal is what `geometry_normal` or
+//!   `geometry_coat_normal` reads, by default a `normal` node in `world` space. `rotate3d` turns
+//!   the same way about the normal everywhere, where the rotation turns toward the bitangent,
+//!   which mirrored uvs flip, so a turn by another angle warns too: a turn and its opposite name
+//!   one line only at multiples of 90 degrees. The base and the coat each follow the uv set the
+//!   `index` of their `tangent` nodes names. Mesh tangents hold one of the two, and a coat on
+//!   another set takes its tangent from the triangle's uvs. A `geometry_opacity` below 1 or
+//!   textured blends, as the linear presence weight OpenPBR defines.
 //! - `UsdPreviewSurface`, mapped like glTF metallic-roughness: `diffuseColor` is
 //!   `base_color`, `metallic`, `roughness`, `ior` and `emissiveColor` (read as nits) their
 //!   fields, `clearcoat` and `clearcoatRoughness` the coat at `ior`, and `normal` and
@@ -39,7 +44,8 @@
 //! An input is a constant, or reads a texture through these nodes: MaterialX `image` and
 //! `tiledimage` (with `texcoord`, `geompropvalue` and `place2d` on their coordinates,
 //! `extract`, `separate2`, `separate3` or `separate4` picking a channel, `extract` a row of a
-//! constant matrix, `normalmap` under `geometry_normal`), and `UsdUVTexture` (with
+//! constant matrix, `convert` between scalar, vector and color types, `normalmap` under
+//! `geometry_normal`), and `UsdUVTexture` (with
 //! `UsdPrimvarReader_float2` and `UsdTransform2d` on `st`, whose default is the constant
 //! (0, 0)). `constant` and `dot` nodes
 //! pass on what they read to MaterialX nodes. A primvar reader, or a `geompropvalue` or `geomcolor`
@@ -59,8 +65,11 @@
 //! ([`TexRef::remap`]) and leaves the field 1, or for a color what it reaches past 1. Normals
 //! read `scale * t + bias` per axis; a pair of the form `s (2 t - 1)` is the tangent-space
 //! encoding at strength `s`. A `normalmap` decodes the reader's `v` as `2 v - 1`, where such a
-//! pair is the encoding stated, not a second decode. Both hold as far as the image's format can
-//! hold what they state. Coordinate nodes set each slot's `Material::uv_transforms`,
+//! pair with `s` other than 0 is the encoding stated, not a second decode. Both hold as far as the
+//! image's format can hold what they state. A `convert` copies its input's first channels, reads
+//! 0 in a channel past them, or 1 in the fourth, and copies a scalar to every channel, which only
+//! a constant can: a slot reads each channel of a texture from its own, and the vertex color
+//! stream's channels as they stand. Coordinate nodes set each slot's `Material::uv_transforms`,
 //! conjugated by the flip of t between st and the cook's top-left uvs.
 //!
 //! A value that states a [`Unit`] converts to meters or degrees. Without one, `transmission_depth`
@@ -125,6 +134,9 @@ pub(crate) struct Node {
     pub(crate) kind: String,
     /// MaterialX output type (`float`, `color3`); empty for UsdShade nodes.
     pub(crate) ty: String,
+    /// The MaterialX type of a `convert` node's input `in`, which with [`Self::ty`] picks its
+    /// definition; empty for other nodes.
+    pub(crate) in_ty: String,
     pub(crate) inputs: BTreeMap<String, Input>,
 }
 
@@ -193,6 +205,39 @@ fn is_pick(node: &Node) -> bool {
 /// float channel.
 fn gives_row(node: &Node) -> bool {
     node.kind == "extract" && matches!(node.ty.as_str(), "vector3" | "vector4")
+}
+
+/// The channel an output of a pick names: `separate` nodes' `outr` and `outx`, `UsdUVTexture`'s
+/// `r`.
+fn output_channel(out: &str) -> Option<u8> {
+    match out {
+        "outr" | "outx" | "r" => Some(0),
+        "outg" | "outy" | "g" => Some(1),
+        "outb" | "outz" | "b" => Some(2),
+        "outa" | "outw" | "a" => Some(3),
+        _ => None,
+    }
+}
+
+/// What a channel of a value reads.
+#[derive(Copy, Clone, PartialEq)]
+enum Reads {
+    /// A channel of the input.
+    Channel(usize),
+    Constant(f32),
+}
+
+/// What channel `c` of a `convert` of an input of `from` channels reads. Nodes `convert`: a
+/// scalar is copied "to all channels of the output"; of a vector or color the first channels are
+/// copied, and "additional channels are populated with 0, aside from the fourth channel which is
+/// populated with 1".
+fn converted(from: usize, c: usize) -> Reads {
+    match c {
+        _ if from == 1 => Reads::Channel(0),
+        c if c < from => Reads::Channel(c),
+        3 => Reads::Constant(1.0),
+        _ => Reads::Constant(0.0),
+    }
 }
 
 /// What `input` reads past `constant` and `dot` nodes, which pass a value on unchanged. A ring
@@ -399,10 +444,14 @@ pub(crate) fn category(id: &str) -> &str {
         "separate2",
         "separate3",
         "separate4",
+        "normalize",
         "texcoord",
         "constant",
+        "rotate3d",
+        "convert",
         "extract",
         "place2d",
+        "normal",
         "image",
         "dot",
     ];
@@ -488,7 +537,7 @@ impl Tex {
     /// [`Self::tex_ref`] under a `normalmap`.
     fn normalmap_ref(&self) -> TexRef {
         let axis = |c: usize| match (self.bias[c], self.scale[c]) {
-            (b, s) if b == -0.5 * s => [b, s],
+            (b, s) if b == -0.5 * s && s != 0.0 => [b, s],
             (b, s) => [2.0 * b - 1.0, 2.0 * s],
         };
         TexRef {
@@ -926,13 +975,6 @@ impl Mapper<'_, '_> {
     /// The value output `output` of node `n` gives.
     fn connected(&mut self, n: usize, output: &str) -> Result<Value, String> {
         let node = &self.net.nodes[n];
-        let channel = |out: &str| match out {
-            "outr" | "outx" | "r" => Some(0),
-            "outg" | "outy" | "g" => Some(1),
-            "outb" | "outz" | "b" => Some(2),
-            "outa" | "outw" | "a" => Some(3),
-            _ => None,
-        };
         match node.kind.as_str() {
             "image" | "tiledimage" => {
                 let mut t = self.image(n)?;
@@ -957,67 +999,18 @@ impl Mapper<'_, '_> {
                 t.channels = match output {
                     "rgb" => Channels::Rgb,
                     o => Channels::One(
-                        channel(o).ok_or_else(|| format!("{}: no output {o}", node.name))?,
+                        output_channel(o).ok_or_else(|| format!("{}: no output {o}", node.name))?,
                     ),
                 };
                 Ok(Value::Texture(t))
             }
-            "extract" | "separate2" | "separate3" | "separate4" => {
+            "extract" | "separate2" | "separate3" | "separate4" | "convert" => {
                 if node.kind == "extract"
                     && let Some(row) = self.matrix_row(n)?
                 {
                     return Ok(row);
                 }
-                let c = match node.kind.as_str() {
-                    "extract" => {
-                        let width = self.components(n)?;
-                        let index = self.float(n, "index", 0.0)?;
-                        if index.fract() != 0.0 || !(0.0..width as f32).contains(&index) {
-                            return Err(format!(
-                                "{}: index {index} of a stream of {width} channels",
-                                node.name
-                            ));
-                        }
-                        index as u8
-                    }
-                    kind => {
-                        let width = match kind {
-                            "separate2" => 2,
-                            "separate3" => 3,
-                            _ => 4,
-                        };
-                        channel(output)
-                            .filter(|c| *c < width)
-                            .ok_or_else(|| format!("{}: no output {output}", node.name))?
-                    }
-                };
-                let name = node.name.clone();
-                // A picked channel holds none to pick, though a matrix's row holds several.
-                // Refusing it here keeps a chain of picks from recursing.
-                if let Some(Input::Connect { node, .. }) = self.source(n, "in")
-                    && is_pick(self.node(*node))
-                    && !gives_row(self.node(*node))
-                {
-                    return Err(format!("{name}: picks channel {c} of a single channel"));
-                }
-                match self.value(n, "in")? {
-                    Some(Value::Texture(mut t)) if t.channels == Channels::Rgb => {
-                        t.channels = Channels::One(c);
-                        Ok(Value::Texture(t))
-                    }
-                    Some(Value::Constant(v, unit)) => Ok(Value::Constant(
-                        vec![v.get(usize::from(c)).copied().unwrap_or(0.0)],
-                        unit,
-                    )),
-                    Some(Value::Vertex { first, width }) if c < width => Ok(Value::Vertex {
-                        first: first + c,
-                        width: 1,
-                    }),
-                    None => Ok(Value::Constant(vec![0.0], Unit::Unstated)),
-                    _ => Err(format!(
-                        "{name}: picks channel {c} of nothing a texture holds"
-                    )),
-                }
+                self.channels(n, output)
             }
             k if k.starts_with("UsdPrimvarReader_") => {
                 let name = self.text(n, "varname").unwrap_or_default().to_string();
@@ -1054,6 +1047,187 @@ impl Mapper<'_, '_> {
                 "node {} ({k}) is not a constant, image or texture channel pick",
                 node.name
             )),
+        }
+    }
+
+    /// The channel of its input that pick node `n` gives on `output`.
+    fn picked(&self, n: usize, output: &str) -> Result<usize, String> {
+        let node = self.node(n);
+        let width = match node.kind.as_str() {
+            "extract" => {
+                let width = self.components(n)?;
+                let index = self.float(n, "index", 0.0)?;
+                if index.fract() != 0.0 || !(0.0..width as f32).contains(&index) {
+                    return Err(format!(
+                        "{}: index {index} of a stream of {width} channels",
+                        node.name
+                    ));
+                }
+                return Ok(index as usize);
+            }
+            "separate2" => 2,
+            "separate3" => 3,
+            _ => 4,
+        };
+        output_channel(output)
+            .map(usize::from)
+            .filter(|c| *c < width)
+            .ok_or_else(|| format!("{}: no output {output}", node.name))
+    }
+
+    /// Output `output` of `n`, a channel pick or a `convert`, and of the chain of them feeding it,
+    /// which compose into one map from the channels of the chain's output to those of what feeds
+    /// it, or to constants. Walking the chain rather than recursing along it keeps a long one off
+    /// the stack.
+    fn channels(&mut self, n: usize, output: &str) -> Result<Value, String> {
+        let name = self.node(n).name.clone();
+        let mut map: Vec<Reads> = match self.node(n).kind.as_str() {
+            "convert" => (0..self.converted_width(n, &self.node(n).ty)?)
+                .map(Reads::Channel)
+                .collect(),
+            _ => vec![Reads::Channel(0)],
+        };
+        let (mut at, mut output) = (n, output.to_string());
+        let mut nonzero = false;
+        loop {
+            let node = self.node(at);
+            if node.kind == "convert" {
+                let from = self.converted_width(at, &node.in_ty)?;
+                nonzero |= node.ty == "boolean";
+                for r in &mut map {
+                    if let Reads::Channel(c) = *r {
+                        *r = converted(from, c);
+                    }
+                }
+            } else {
+                let c = self.picked(at, &output)?;
+                for r in &mut map {
+                    if let Reads::Channel(_) = r {
+                        *r = Reads::Channel(c);
+                    }
+                }
+            }
+            let Some(Input::Connect {
+                node: up,
+                output: up_output,
+            }) = self.source(at, "in")
+            else {
+                break;
+            };
+            let up_node = self.node(*up);
+            if up_node.kind != "convert" && (!is_pick(up_node) || gives_row(up_node)) {
+                break;
+            }
+            // A picked channel holds none to pick, though a matrix's row holds several.
+            if is_pick(up_node) && is_pick(self.node(at)) {
+                return Err(format!(
+                    "{}: picks a channel of a single channel",
+                    self.node(at).name
+                ));
+            }
+            (at, output) = (*up, up_output.clone());
+        }
+        let boolean = |v: Vec<f32>| -> Vec<f32> {
+            if nonzero {
+                v.into_iter()
+                    .map(|x| f32::from(u8::from(x != 0.0)))
+                    .collect()
+            } else {
+                v
+            }
+        };
+        let read = |v: &[f32], r: &Reads| match *r {
+            Reads::Channel(c) => v.get(c).copied().unwrap_or(0.0),
+            Reads::Constant(k) => k,
+        };
+        // Constants alone read nothing of the input.
+        if map.iter().all(|r| matches!(r, Reads::Constant(_))) {
+            let v = map.iter().map(|r| read(&[], r)).collect();
+            return Ok(Value::Constant(boolean(v), Unit::Unstated));
+        }
+        // Whether each channel reads its own channel of the input, or a constant.
+        let in_place = map
+            .iter()
+            .enumerate()
+            .all(|(i, r)| matches!(*r, Reads::Constant(_)) || *r == Reads::Channel(i));
+        let copies = || {
+            format!(
+                "{name}: copies a channel of a texture to others, which a slot reads only from \
+                 their own"
+            )
+        };
+        match self.value(at, "in")? {
+            None => {
+                let v = map.iter().map(|r| read(&[], r)).collect();
+                Ok(Value::Constant(boolean(v), Unit::Unstated))
+            }
+            Some(Value::Constant(v, unit)) => {
+                let v = map.iter().map(|r| read(&v, r)).collect();
+                Ok(Value::Constant(boolean(v), unit))
+            }
+            Some(_) if nonzero => Err(format!(
+                "{name}: a boolean of a value that varies over the surface"
+            )),
+            Some(Value::Texture(mut t)) if t.channels == Channels::Rgb => match map[..] {
+                [Reads::Channel(c)] => {
+                    t.channels = Channels::One(c as u8);
+                    Ok(Value::Texture(t))
+                }
+                _ if in_place => {
+                    for (c, r) in map.iter().enumerate() {
+                        if let Reads::Constant(k) = *r {
+                            t.scale[c] = 0.0;
+                            t.bias[c] = k;
+                        }
+                    }
+                    Ok(Value::Texture(t))
+                }
+                _ => Err(copies()),
+            },
+            // A scalar's convert reads it in every channel, so a single one is the scalar.
+            Some(Value::Texture(t))
+                if map[..] == [Reads::Channel(0)] && self.node(at).kind == "convert" =>
+            {
+                Ok(Value::Texture(t))
+            }
+            Some(Value::Texture(_)) if map.len() == 1 => Err(format!(
+                "{name}: picks a channel of nothing a texture holds"
+            )),
+            Some(Value::Texture(_)) => Err(copies()),
+            Some(Value::Vertex { first, width }) => match map[..] {
+                [Reads::Channel(c)] if c < usize::from(width) => Ok(Value::Vertex {
+                    first: first + c as u8,
+                    width: 1,
+                }),
+                _ if map.iter().enumerate().all(|(i, r)| *r == Reads::Channel(i))
+                    && map.len() <= usize::from(width) =>
+                {
+                    Ok(Value::Vertex {
+                        first,
+                        width: map.len() as u8,
+                    })
+                }
+                _ => Err(format!(
+                    "{name}: reads the vertex color stream other than as its channels stand"
+                )),
+            },
+        }
+    }
+
+    /// The channels of MaterialX type `ty` on `convert` node `n`.
+    fn converted_width(&self, n: usize, ty: &str) -> Result<usize, String> {
+        match ty {
+            "float" | "integer" | "boolean" => Ok(1),
+            "vector2" => Ok(2),
+            "color3" | "vector3" => Ok(3),
+            "color4" | "vector4" => Ok(4),
+            _ => {
+                let node = self.node(n);
+                Err(format!(
+                    "{}: converts {} to {}, which no input reads",
+                    node.name, node.in_ty, node.ty
+                ))
+            }
         }
     }
 
@@ -1719,8 +1893,15 @@ impl Mapper<'_, '_> {
             &mut m.subsurface_radius
         })?;
         self.film_thickness(n)?;
-        if let Some(v) = self.number(n, "geometry_thin_walled")? {
-            self.material.thin_walled = u8::from(v[0] != 0.0);
+        match self.value(n, "geometry_thin_walled")? {
+            None => {}
+            Some(Value::Constant(v, _)) => self.material.thin_walled = u8::from(v[0] != 0.0),
+            Some(_) => {
+                return Err(format!(
+                    "{}: input geometry_thin_walled must be a constant",
+                    self.node(n).name
+                ));
+            }
         }
         if self.textures.opacity.is_some()
             || self.material.geometry_opacity < 1.0
@@ -1742,9 +1923,10 @@ impl Mapper<'_, '_> {
         Ok(())
     }
 
-    /// The normal map of input `name` of `n`, from a `normalmap` node. A 1.38 `space` of `object`
-    /// sets `object` in [`Material::object_normals`]: as in the library's upgrade of it, the node
-    /// reads `2 in - 1` and no tangent frame or `scale` has a part.
+    /// The normal map of input `name` of `n`, from a `normalmap` node past `normalize` nodes
+    /// ([`Self::direction`]). A 1.38 `space` of `object` sets `object` in
+    /// [`Material::object_normals`]: as in the library's upgrade of it, the node reads `2 in - 1`
+    /// and no tangent frame or `scale` has a part.
     fn normal_input(
         &mut self,
         n: usize,
@@ -1752,7 +1934,7 @@ impl Mapper<'_, '_> {
         object: u8,
         frame: usize,
     ) -> Result<Option<(TexRef, [f32; 2])>, String> {
-        match self.source(n, name) {
+        match self.direction(n, name) {
             None => Ok(None),
             Some(Input::Connect { node, .. }) if self.node(*node).kind == "normalmap" => {
                 let map = *node;
@@ -1777,9 +1959,23 @@ impl Mapper<'_, '_> {
         }
     }
 
-    /// Tangent input `name` of `n`: a `tangent` node is the mesh's own in its `index`'s uv set
-    /// for layer `frame`, and a texture a direction in the tangent plane. Anything else stands
-    /// for no frame a mesh holds.
+    /// What input `name` of `n` reads past `constant`, `dot` and `normalize` nodes, for an input
+    /// that reads a direction alone: Nodes `normalize` keeps a vector's direction. An unconnected
+    /// `normalize` reads its default, the zero vector.
+    fn direction<'n>(&'n self, n: usize, name: &str) -> Option<&'n Input> {
+        let mut input = self.source(n, name)?;
+        while let Input::Connect { node, .. } = input
+            && self.node(*node).kind == "normalize"
+        {
+            input = self.source(*node, "in").unwrap_or(&ZERO);
+        }
+        Some(input)
+    }
+
+    /// Tangent input `name` of `n` for layer `frame`: a `tangent` node is the mesh's own in its
+    /// `index`'s uv set, a texture a direction in the tangent plane that binds slot `s`, and a
+    /// `rotate3d` of either about the layer's normal that one turned ([`Self::rotated_tangent`]).
+    /// Anything else stands for no frame a mesh holds.
     fn tangent_input(
         &mut self,
         n: usize,
@@ -1787,30 +1983,163 @@ impl Mapper<'_, '_> {
         s: usize,
         frame: usize,
     ) -> Result<(), String> {
-        let source = match self.source(n, name) {
+        let source = match self.direction(n, name) {
             None => return Ok(()),
-            Some(Input::Connect { node, .. }) => Some(*node),
+            Some(Input::Connect { node, output }) => Some((*node, output.clone())),
             Some(_) => None,
         };
-        if let Some(node) = source.filter(|&node| self.node(node).kind == "tangent") {
-            let index = self.float(node, "index", 0.0)?;
-            self.follow(node, frame, index);
+        if let Some((node, output)) = source {
+            match self.node(node).kind.as_str() {
+                "tangent" => {
+                    let index = self.float(node, "index", 0.0)?;
+                    self.follow(node, frame, index);
+                    return Ok(());
+                }
+                "rotate3d" => return self.rotated_tangent(n, node, s, frame),
+                _ => {
+                    let what = format!("{} input {name}", self.node(n).name);
+                    if self.tangent_texture(node, &output, s, &what)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let warning = format!(
+            "{}: {name} is neither a tangent node nor a texture; the mesh's tangent stands in for \
+             it",
+            self.node(n).name
+        );
+        self.warnings.push(warning);
+        Ok(())
+    }
+
+    /// Whether `node` gives a texture through what [`Self::tangent_texture`] reads.
+    fn gives_texture(&self, node: usize) -> bool {
+        matches!(
+            self.node(node).kind.as_str(),
+            "image" | "tiledimage" | "convert"
+        )
+    }
+
+    /// Binds slot `s` to the direction texture output `output` of `node` gives, as `what` reads
+    /// it; false where it gives no texture of a direction.
+    fn tangent_texture(
+        &mut self,
+        node: usize,
+        output: &str,
+        s: usize,
+        what: &str,
+    ) -> Result<bool, String> {
+        if !self.gives_texture(node) {
+            return Ok(false);
+        }
+        match self.connected(node, output) {
+            Ok(Value::Texture(t)) if t.channels == Channels::Rgb => {
+                self.textures.more.insert(s, Some(t.remapped([0, 1, 2])));
+                Ok(true)
+            }
+            Ok(_) => Ok(false),
+            Err(e) => Err(format!("{what}: {e}")),
+        }
+    }
+
+    /// Sets the material's rotation of layer `frame`'s tangent that `rotate3d` node `r` on surface
+    /// `n` states, reading what it turns as [`Self::tangent_input`] reads a tangent, a texture
+    /// into slot `s`. Where the material holds no such rotation it warns, and the mesh's tangent
+    /// stands in.
+    ///
+    /// Nodes `rotate3d` turns `in` about `axis` by `amount` degrees, and the library's
+    /// implementation, `v cos a + (v x axis) sin a + ...`, turns it clockwise seen from the
+    /// axis's tip. The layer's BSDF reads the tangent's direction across its normal, so with
+    /// `axis` the normal the layer shades with, the direction is `in` turned toward `-(N x T)`.
+    /// The material's rotation turns toward the bitangent, which is `N x T` or, where the uvs
+    /// mirror, `-(N x T)`: the two agree whatever the mirroring only where a turn and its opposite
+    /// name one line, at multiples of 90 degrees, and the BSDF's anisotropy reads a line.
+    fn rotated_tangent(
+        &mut self,
+        n: usize,
+        r: usize,
+        s: usize,
+        frame: usize,
+    ) -> Result<(), String> {
+        let name = self.node(r).name.clone();
+        let turned = match self.direction(r, "in") {
+            Some(Input::Connect { node, output }) => Some((*node, output.clone())),
+            _ => None,
+        };
+        let tangent = turned
+            .as_ref()
+            .map(|(node, _)| *node)
+            .filter(|&node| self.node(node).kind == "tangent");
+        let texture = turned
+            .as_ref()
+            .is_some_and(|(node, _)| self.gives_texture(*node));
+        if tangent.is_none() && !texture {
+            self.warnings.push(format!(
+                "{name}: turns neither a tangent node nor a texture; the mesh's tangent stands in \
+                 for it"
+            ));
             return Ok(());
         }
-        let texture = source
-            .is_some_and(|node| matches!(self.node(node).kind.as_str(), "image" | "tiledimage"));
-        match texture.then(|| self.value(n, name)).transpose()?.flatten() {
-            Some(Value::Texture(t)) if t.channels == Channels::Rgb => {
-                self.textures.more.insert(s, Some(t.remapped([0, 1, 2])));
+        let normal = ["geometry_normal", "geometry_coat_normal"][frame];
+        let surface_normal = |this: &Self, a: usize| {
+            this.node(a).kind == "normal" && this.text(a, "space") == Some("world")
+        };
+        // The surface's shading normal is the normal its input reads, by default `Nworld`.
+        let about_normal = match (self.direction(r, "axis"), self.direction(n, normal)) {
+            (
+                Some(Input::Connect { node: a, output }),
+                Some(Input::Connect { node, output: o }),
+            ) => a == node && output == o,
+            (Some(Input::Connect { node: a, .. }), None) => surface_normal(self, *a),
+            _ => false,
+        };
+        if !about_normal {
+            self.warnings.push(format!(
+                "{name}: turns the tangent about an axis other than the normal the layer shades \
+                 with; the mesh's tangent stands in for it"
+            ));
+            return Ok(());
+        }
+        // A connection brings a value here unchecked against the unit type the input declares.
+        let degrees = match self.value(r, "amount")? {
+            None => 0.0,
+            Some(Value::Constant(_, Unit::Distance(_))) => {
+                return Err(format!("{name} input amount: an angle in a unit of length"));
             }
-            _ => {
-                let warning = format!(
-                    "{}: {name} is neither a tangent node nor a texture; the mesh's tangent \
-                     stands in for it",
-                    self.node(n).name
-                );
-                self.warnings.push(warning);
+            Some(Value::Constant(v, unit)) => unit.scene(v[0]),
+            Some(_) => {
+                self.warnings.push(format!(
+                    "{name}: turns the tangent by an angle that varies over the surface, which \
+                     turns the other way where the uvs mirror; the mesh's tangent stands in for it"
+                ));
+                return Ok(());
             }
+        };
+        if degrees % 90.0 != 0.0 {
+            self.warnings.push(format!(
+                "{name}: turns the tangent by {degrees} degrees, which turns the other way where \
+                 the uvs mirror and which the material holds only at multiples of 90; the mesh's \
+                 tangent stands in for it"
+            ));
+            return Ok(());
+        }
+        if let Some(tangent) = tangent {
+            let index = self.float(tangent, "index", 0.0)?;
+            self.follow(tangent, frame, index);
+        } else if let Some((node, output)) = turned {
+            let what = format!("{name} input in");
+            if !self.tangent_texture(node, &output, s, &what)? {
+                self.warnings.push(format!(
+                    "{name}: turns no texture of a direction; the mesh's tangent stands in for it"
+                ));
+                return Ok(());
+            }
+        }
+        let rotation = -f64::from(degrees).to_radians() as f32 + 0.0;
+        match frame {
+            BASE => self.material.specular_rotation = rotation,
+            _ => self.material.coat_rotation = rotation,
         }
         Ok(())
     }

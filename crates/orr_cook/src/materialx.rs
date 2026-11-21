@@ -102,6 +102,7 @@ const UNITS: &[(&str, &str, f64)] = &[
 /// expects the scene's unit of that type.
 const DECLARED: &[(&str, &str, &str)] = &[
     ("place2d", "rotate", "angle"),
+    ("rotate3d", "amount", "angle"),
     ("tiledimage", "realworldimagesize", "distance"),
     ("tiledimage", "realworldtilesize", "distance"),
 ];
@@ -831,14 +832,33 @@ fn network(
         .iter()
         .map(|(graph, e, _)| {
             let name = e.attribute("name").unwrap_or_default();
+            let kind = e.tag_name().name();
+            let in_ty = if kind == "convert" {
+                let input = first_named(*e)
+                    .find(|c| c.tag_name().name() == "input" && c.attribute("name") == Some("in"));
+                match (input, e.attribute("nodedef")) {
+                    (Some(i), _) => i.attribute("type").unwrap_or_default(),
+                    // A library definition names the type it reads and the type it gives.
+                    (None, Some(def)) => def
+                        .strip_prefix("ND_convert_")
+                        .and_then(|r| r.split_once('_'))
+                        .map_or("", |(from, _)| from),
+                    // Without either, the library takes the first definition of the output
+                    // type, which reads a scalar.
+                    (None, None) => "float",
+                }
+            } else {
+                ""
+            };
             Node {
                 name: if graph.is_empty() {
                     name.to_string()
                 } else {
                     format!("{graph}/{name}")
                 },
-                kind: e.tag_name().name().to_string(),
+                kind: kind.to_string(),
                 ty: e.attribute("type").unwrap_or_default().to_string(),
+                in_ty: in_ty.to_string(),
                 inputs: BTreeMap::new(),
             }
         })

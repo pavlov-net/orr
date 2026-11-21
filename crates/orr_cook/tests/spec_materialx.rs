@@ -822,6 +822,130 @@ fn documents_map_as_the_clauses_say() {
             check: |m| m.tangent_set() == 1,
         },
         Row {
+            clause: "Nodes convert: \"if N is larger than M\", the first channels; a color4 and a \
+                     vector4 image give their rgb",
+            body: r#"<image name="c4" type="color4">
+                  <input name="file" type="filename" value="v.png"/></image>
+                <convert name="c" type="color3"><input name="in" type="color4" nodename="c4"/>
+                  </convert>
+                <image name="v4" type="vector4">
+                  <input name="file" type="filename" value="v.png"/></image>
+                <convert name="v" type="vector3"><input name="in" type="vector4" nodename="v4"/>
+                  </convert>
+                <normalmap name="n" type="vector3"><input name="in" type="vector3" nodename="v"/>
+                  </normalmap>"#,
+            inputs: r#"<input name="base_color" type="color3" nodename="c"/>
+                <input name="geometry_normal" type="vector3" nodename="n"/>"#,
+            check: |m| {
+                bound(m, slot::BASE_COLOR) && m.base_color == [1.0; 3] && bound(m, slot::NORMAL)
+            },
+        },
+        Row {
+            clause: "Nodes convert: \"additional channels are populated with 0, aside from the \
+                     fourth channel which is populated with 1\"",
+            body: r#"<image name="v2" type="vector2">
+                  <input name="file" type="filename" value="v.png"/></image>
+                <convert name="c" type="color3"><input name="in" type="vector2" nodename="v2"/>
+                  </convert>
+                <convert name="c4" type="color4"><input name="in" type="color3" nodename="i"/>
+                  </convert>
+                <image name="i" type="color3">
+                  <input name="file" type="filename" value="flat.png"/></image>
+                <extract name="a" type="float"><input name="in" type="color4" nodename="c4"/>
+                  <input name="index" type="integer" value="3"/></extract>"#,
+            inputs: r#"<input name="base_color" type="color3" nodename="c"/>
+                <input name="specular_roughness" type="float" nodename="a"/>"#,
+            check: |m| {
+                bound(m, slot::BASE_COLOR)
+                    && m.base_color == [1.0, 1.0, 0.0]
+                    && m.specular_roughness == 1.0
+                    && !bound(m, slot::ROUGHNESS)
+            },
+        },
+        Row {
+            clause: "Nodes convert: a scalar is copied \"to all channels of the output\", and an \
+                     integer is a boolean \"true for any non-zero input value\"",
+            body: r#"<constant name="v" type="vector3">
+                  <input name="value" type="vector3" value="0.1, 0.2, 0.3"/></constant>
+                <extract name="z" type="float"><input name="in" type="vector3" nodename="v"/>
+                  <input name="index" type="integer" value="2"/></extract>
+                <convert name="b" type="vector3"><input name="in" type="float" nodename="z"/>
+                  </convert>
+                <extract name="y" type="float"><input name="in" type="vector3" nodename="b"/>
+                  <input name="index" type="integer" value="1"/></extract>
+                <convert name="c" type="color3"><input name="in" type="float" value="0.25"/>
+                  </convert>
+                <convert name="t" type="boolean"><input name="in" type="integer" value="2"/>
+                  </convert>"#,
+            inputs: r#"<input name="specular_roughness" type="float" nodename="y"/>
+                <input name="base_color" type="color3" nodename="c"/>
+                <input name="geometry_thin_walled" type="boolean" nodename="t"/>"#,
+            check: |m| {
+                close(m.specular_roughness, 0.3) && m.base_color == [0.25; 3] && m.thin_walled == 1
+            },
+        },
+        Row {
+            clause: "Nodes rotate3d: `amount` in degrees, turning clockwise down `axis`; about the \
+                     shading normal, -90 is a quarter turn toward the bitangent",
+            body: r#"<tangent name="t" type="vector3">
+                  <input name="space" type="string" value="world"/>
+                  <input name="index" type="integer" value="1"/></tangent>
+                <normalize name="tn" type="vector3"><input name="in" type="vector3" nodename="t"/>
+                  </normalize>
+                <normal name="n" type="vector3"><input name="space" type="string" value="world"/>
+                  </normal>
+                <normalize name="nn" type="vector3"><input name="in" type="vector3" nodename="n"/>
+                  </normalize>
+                <rotate3d name="r" type="vector3"><input name="in" type="vector3" nodename="tn"/>
+                  <input name="amount" type="float" value="-90"/>
+                  <input name="axis" type="vector3" nodename="nn"/></rotate3d>
+                <normalize name="o" type="vector3"><input name="in" type="vector3" nodename="r"/>
+                  </normalize>"#,
+            inputs: r#"<input name="specular_roughness_anisotropy" type="float" value="0.5"/>
+                <input name="geometry_tangent" type="vector3" nodename="o"/>"#,
+            check: |m| {
+                close(m.specular_rotation, std::f32::consts::FRAC_PI_2) && m.tangent_set() == 1
+            },
+        },
+        Row {
+            clause: "Nodes rotate3d: the coat turns about the normal map its normal reads",
+            body: r#"<image name="i" type="vector3">
+                  <input name="file" type="filename" value="v.png"/></image>
+                <normalmap name="c" type="vector3"><input name="in" type="vector3" nodename="i"/>
+                  </normalmap>
+                <tangent name="t" type="vector3"><input name="space" type="string" value="world"/>
+                  </tangent>
+                <rotate3d name="r" type="vector3"><input name="in" type="vector3" nodename="t"/>
+                  <input name="amount" type="float" value="180"/>
+                  <input name="axis" type="vector3" nodename="c"/></rotate3d>"#,
+            inputs: r#"<input name="coat_roughness_anisotropy" type="float" value="0.5"/>
+                <input name="geometry_coat_normal" type="vector3" nodename="c"/>
+                <input name="geometry_coat_tangent" type="vector3" nodename="r"/>"#,
+            check: |m| {
+                close(m.coat_rotation, -std::f32::consts::PI)
+                    && m.specular_rotation == 0.0
+                    && bound(m, slot::COAT_NORMAL)
+            },
+        },
+        Row {
+            clause: "Nodes rotate3d: a texture of a direction turns as the mesh's tangent does, \
+                     through a convert",
+            body: r#"<image name="i" type="color3">
+                  <input name="file" type="filename" value="v.png"/></image>
+                <convert name="c" type="vector3"><input name="in" type="color3" nodename="i"/>
+                  </convert>
+                <normal name="n" type="vector3"><input name="space" type="string" value="world"/>
+                  </normal>
+                <rotate3d name="r" type="vector3"><input name="in" type="vector3" nodename="c"/>
+                  <input name="amount" type="float" value="90"/>
+                  <input name="axis" type="vector3" nodename="n"/></rotate3d>"#,
+            inputs: r#"<input name="specular_roughness_anisotropy" type="float" value="0.5"/>
+                <input name="geometry_tangent" type="vector3" nodename="r"/>"#,
+            check: |m| {
+                close(m.specular_rotation, -std::f32::consts::FRAC_PI_2) && bound(m, slot::TANGENT)
+            },
+        },
+        Row {
             clause: "Nodes geomcolor: `index`, a color of its own; `out` defaults to zero",
             body: r#"<geomcolor name="c" type="color3">
                   <input name="index" type="integer" value="1"/></geomcolor>"#,
@@ -1073,6 +1197,14 @@ fn invalid_documents_fail() {
             BASE_I,
         ),
         (
+            "Nodes convert: a float texture copied to every channel, which no slot reads",
+            format!(
+                r#"{FLOAT}<convert name="c" type="color3">
+                  <input name="in" type="float" nodename="i"/></convert>"#
+            ),
+            r#"<input name="base_color" type="color3" nodename="c"/>"#,
+        ),
+        (
             "OpenPBR transmission_depth: a distance, not an angle",
             String::new(),
             r#"<input name="transmission_depth" type="float" value="5" unit="degree"/>"#,
@@ -1084,6 +1216,50 @@ fn invalid_documents_fail() {
         .map(|r| r.0)
         .collect();
     assert!(cooked.is_empty(), "{cooked:#?}");
+}
+
+/// Nodes `rotate3d` turns about its axis the same way wherever the uvs mirror, where the
+/// material's rotation turns toward the bitangent: the two name one line only at multiples of
+/// 90 degrees and about the normal the layer shades with. Other turns warn and read the mesh's
+/// tangent.
+#[test]
+fn a_tangent_turn_the_material_cannot_hold_warns() {
+    let turn = |amount: &str, axis: &str| {
+        format!(
+            r#"<image name="i" type="vector3">
+              <input name="file" type="filename" value="v.png"/></image>
+            <normalmap name="m" type="vector3"><input name="in" type="vector3" nodename="i"/>
+              </normalmap>
+            <normal name="n" type="vector3"><input name="space" type="string" value="world"/>
+              </normal>
+            <tangent name="t" type="vector3"/>
+            <rotate3d name="r" type="vector3"><input name="in" type="vector3" nodename="t"/>
+              <input name="amount" type="float" value="{amount}"/>
+              <input name="axis" type="vector3" nodename="{axis}"/></rotate3d>"#
+        )
+    };
+    let inputs = r#"<input name="specular_roughness_anisotropy" type="float" value="0.5"/>
+        <input name="geometry_normal" type="vector3" nodename="m"/>
+        <input name="geometry_tangent" type="vector3" nodename="r"/>"#;
+    let (a, report) = cook_body(&turn("90", "m"), inputs).unwrap();
+    assert!(
+        report.assets[0].warnings.is_empty(),
+        "{:?}",
+        report.assets[0].warnings
+    );
+    assert!(close(
+        material(&a).specular_rotation,
+        -std::f32::consts::FRAC_PI_2
+    ));
+    for (amount, axis) in [("45", "m"), ("90", "n")] {
+        let (a, report) = cook_body(&turn(amount, axis), inputs).unwrap();
+        let warnings = &report.assets[0].warnings;
+        assert!(
+            warnings.iter().any(|w| w.contains("r: turns")),
+            "{amount} {axis}: {warnings:?}"
+        );
+        assert_eq!(material(&a).specular_rotation, 0.0);
+    }
 }
 
 /// A document in `d` of a material whose `displacementshader` is node `D` of `body`.
