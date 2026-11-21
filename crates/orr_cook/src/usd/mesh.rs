@@ -15,7 +15,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use orr_math::{DMat3, DMat4, DVec3, Vec2, Vec4};
 use orr_pack::subd::Influence as SkinInfluence;
 
-use super::read::{Interp, PrimReader, Primvar};
+use openusd_schemas::geom::{
+    self, FaceVaryingLinearInterpolation, GprimSchema, InterpolateBoundary, Interpolation,
+    MeshSchema, Orientation, PointBasedSchema, SubdivisionScheme, TriangleSubdivisionRule,
+};
+
+use super::read::{PrimReader, Primvar};
 use crate::import::normal_matrix;
 use crate::mesh::tangents;
 use crate::shading::VertexRead;
@@ -33,7 +38,7 @@ pub(super) struct MeshPrim {
     uvs1: Option<Primvar>,
     left_handed: bool,
     holes: Vec<usize>,
-    scheme: String,
+    scheme: SubdivisionScheme,
     creases: Vec<Crease>,
     corners: Vec<Corner>,
     boundary: Boundary,
@@ -51,46 +56,66 @@ pub(super) struct MeshFacts {
 impl MeshFacts {
     pub(super) fn read(r: &PrimReader<'_>) -> Result<Self, String> {
         Ok(Self {
-            polygonal: polygonal(&scheme(r)?),
+            polygonal: polygonal(scheme(r)?),
             double_sided: double_sided(r)?,
         })
     }
 }
 
-fn scheme(r: &PrimReader<'_>) -> Result<String, String> {
-    Ok(r.token("subdivisionScheme")?
-        .unwrap_or_else(|| "catmullClark".into()))
+/// The mesh view of a prim of type `Mesh`.
+fn view(r: &PrimReader<'_>) -> geom::Mesh {
+    geom::Mesh::from_prim_unchecked(r.prim.clone())
 }
 
-fn polygonal(scheme: &str) -> bool {
-    matches!(scheme, "none" | "bilinear")
+/// The value `get` read, its schema fallback where a block leaves none.
+fn or_fallback<T: Default>(
+    r: &PrimReader<'_>,
+    get: openusd::Result<Option<T>>,
+) -> Result<T, String> {
+    let held = get.map_err(|e| format!("{}: {e}", r.path()))?;
+    Ok(held.unwrap_or_default())
+}
+
+fn scheme(r: &PrimReader<'_>) -> Result<SubdivisionScheme, String> {
+    or_fallback(r, view(r).subdivision_scheme())
+}
+
+fn polygonal(scheme: SubdivisionScheme) -> bool {
+    matches!(
+        scheme,
+        SubdivisionScheme::None | SubdivisionScheme::Bilinear
+    )
 }
 
 fn double_sided(r: &PrimReader<'_>) -> Result<bool, String> {
-    Ok(r.numbers("doubleSided")?.is_some_and(|v| v[0] != 0.0))
+    or_fallback(r, view(r).double_sided())
 }
 
 impl MeshPrim {
     /// `uv` and `uv1` name the primvars of uv sets 0 and 1.
     pub(super) fn read(r: &PrimReader<'_>, uv: &str, uv1: Option<&str>) -> Result<Self, String> {
         let path = r.path();
-        let points: Vec<DVec3> = r
-            .numbers("points")?
+        let mesh = view(r);
+        let ints = |held: openusd::Result<Option<Vec<i32>>>, name: &str| {
+            let held = held.map_err(|e| format!("{path} {name}: {e}"))?;
+            Ok::<_, String>(held.unwrap_or_default())
+        };
+        let points: Vec<DVec3> = mesh
+            .points_at(r.time)
+            .map_err(|e| format!("{path} points: {e}"))?
             .ok_or_else(|| format!("{path}: no points"))?
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|&p| DVec3::from_array(p))
+            .into_iter()
+            .map(|p| DVec3::from_array(<[f32; 3]>::from(p).map(f64::from)))
             .collect();
-        let usize_list = |name: &str| -> Result<Vec<usize>, String> {
-            r.ints(name)?
-                .unwrap_or_default()
-                .into_iter()
+        let usize_list = |held: Vec<i32>, name: &str| -> Result<Vec<usize>, String> {
+            held.into_iter()
                 .map(|i| usize::try_from(i).map_err(|_| format!("{path} {name}: {i}")))
                 .collect()
         };
-        let counts = usize_list("faceVertexCounts")?;
-        let indices = usize_list("faceVertexIndices")?;
+        let counts = ints(mesh.face_vertex_counts_at(r.time), "faceVertexCounts")?;
+        let counts = usize_list(counts, "faceVertexCounts")?;
+        let indices = ints(mesh.face_vertex_indices_at(r.time), "faceVertexIndices")?;
+        let indices = usize_list(indices, "faceVertexIndices")?;
         if counts.iter().sum::<usize>() != indices.len() {
             return Err(format!(
                 "{path}: face counts do not add up to the index count"
@@ -102,17 +127,19 @@ impl MeshPrim {
                 points.len()
             ));
         }
-        let index = |i: i64, what: &str| {
+        let index = |i: i32, what: &str| {
             u32::try_from(i)
                 .ok()
                 .filter(|&i| (i as usize) < points.len())
                 .ok_or_else(|| format!("{path} {what}: point {i}"))
         };
         let mut creases = Vec::new();
-        let chain = r.ints("creaseIndices")?.unwrap_or_default();
-        let lengths = r.ints("creaseLengths")?.unwrap_or_default();
-        let sharp = r.numbers("creaseSharpnesses")?.unwrap_or_default();
-        let edges: i64 = lengths.iter().map(|&l| (l - 1).max(0)).sum();
+        let chain = ints(mesh.crease_indices_at(r.time), "creaseIndices")?;
+        let lengths = ints(mesh.crease_lengths_at(r.time), "creaseLengths")?;
+        let sharp = mesh.crease_sharpnesses_at(r.time);
+        let sharp = sharp.map_err(|e| format!("{path} creaseSharpnesses: {e}"))?;
+        let sharp = sharp.unwrap_or_default();
+        let edges: i64 = lengths.iter().map(|&l| i64::from(l - 1).max(0)).sum();
         let per_edge = sharp.len() as i64 == edges && sharp.len() != lengths.len();
         if !per_edge && sharp.len() != lengths.len() {
             return Err(format!(
@@ -133,14 +160,16 @@ impl MeshPrim {
                         index(pair[0], "creaseIndices")?,
                         index(pair[1], "creaseIndices")?,
                     ],
-                    sharpness: sharp[if per_edge { edge } else { c }] as f32,
+                    sharpness: sharp[if per_edge { edge } else { c }],
                 });
                 edge += 1;
             }
             at += len;
         }
-        let corner_points = r.ints("cornerIndices")?.unwrap_or_default();
-        let corner_sharp = r.numbers("cornerSharpnesses")?.unwrap_or_default();
+        let corner_points = ints(mesh.corner_indices_at(r.time), "cornerIndices")?;
+        let corner_sharp = mesh.corner_sharpnesses_at(r.time);
+        let corner_sharp = corner_sharp.map_err(|e| format!("{path} cornerSharpnesses: {e}"))?;
+        let corner_sharp = corner_sharp.unwrap_or_default();
         if corner_points.len() != corner_sharp.len() {
             return Err(format!(
                 "{path}: corner indices and sharpnesses differ in count"
@@ -152,30 +181,25 @@ impl MeshPrim {
             .map(|(&p, &s)| {
                 Ok(Corner {
                     point: index(p, "cornerIndices")?,
-                    sharpness: s as f32,
+                    sharpness: s,
                 })
             })
             .collect::<Result<_, String>>()?;
-        let boundary = match r.token("interpolateBoundary")?.as_deref() {
-            Some("none") => Boundary::None,
-            Some("edgeOnly") => Boundary::Edges,
-            Some("edgeAndCorner") | None => Boundary::EdgesAndCorners,
-            Some(t) => return Err(format!("{path}: interpolateBoundary {t}")),
+        let boundary = match or_fallback(r, mesh.interpolate_boundary_at(r.time))? {
+            InterpolateBoundary::None => Boundary::None,
+            InterpolateBoundary::EdgeOnly => Boundary::Edges,
+            InterpolateBoundary::EdgeAndCorner => Boundary::EdgesAndCorners,
         };
-        let uv_linear = match r.token("faceVaryingLinearInterpolation")?.as_deref() {
-            Some("none") => UvLinear::None,
-            Some("cornersOnly") => UvLinear::CornersOnly,
-            Some("cornersPlus1") | None => UvLinear::CornersPlus1,
-            Some("cornersPlus2") => UvLinear::CornersPlus2,
-            Some("boundaries") => UvLinear::Boundaries,
-            Some("all") => UvLinear::All,
-            Some(t) => return Err(format!("{path}: faceVaryingLinearInterpolation {t}")),
+        let uv_linear = match or_fallback(r, mesh.face_varying_linear_interpolation_at(r.time))? {
+            FaceVaryingLinearInterpolation::None => UvLinear::None,
+            FaceVaryingLinearInterpolation::CornersOnly => UvLinear::CornersOnly,
+            FaceVaryingLinearInterpolation::CornersPlus1 => UvLinear::CornersPlus1,
+            FaceVaryingLinearInterpolation::CornersPlus2 => UvLinear::CornersPlus2,
+            FaceVaryingLinearInterpolation::Boundaries => UvLinear::Boundaries,
+            FaceVaryingLinearInterpolation::All => UvLinear::All,
         };
-        let smooth_triangles = match r.token("triangleSubdivisionRule")?.as_deref() {
-            Some("smooth") => true,
-            Some("catmullClark") | None => false,
-            Some(t) => return Err(format!("{path}: triangleSubdivisionRule {t}")),
-        };
+        let smooth_triangles = or_fallback(r, mesh.triangle_subdivision_rule_at(r.time))?
+            == TriangleSubdivisionRule::Smooth;
         Ok(Self {
             creases,
             corners,
@@ -191,24 +215,27 @@ impl MeshPrim {
                 Some(name) => r.primvar(name, 2, None)?,
                 None => None,
             },
-            left_handed: r.token("orientation")?.as_deref() == Some("leftHanded"),
-            holes: usize_list("holeIndices")?,
+            left_handed: or_fallback(r, mesh.orientation())? == Orientation::LeftHanded,
+            holes: usize_list(
+                ints(mesh.hole_indices_at(r.time), "holeIndices")?,
+                "holeIndices",
+            )?,
             scheme: scheme(r)?,
         })
     }
 
     /// Whether its surface is its faces, which no scheme smooths.
     pub(super) fn polygonal(&self) -> bool {
-        polygonal(&self.scheme)
+        polygonal(self.scheme)
     }
 
     /// How many elements a primvar of interpolation `interp` holds over it.
-    pub(super) fn domain(&self, interp: Interp) -> usize {
+    pub(super) fn domain(&self, interp: Interpolation) -> usize {
         match interp {
-            Interp::Constant => 1,
-            Interp::Uniform => self.counts.len(),
-            Interp::Vertex | Interp::Varying => self.points.len(),
-            Interp::FaceVarying => self.indices.len(),
+            Interpolation::Constant => 1,
+            Interpolation::Uniform => self.counts.len(),
+            Interpolation::Vertex | Interpolation::Varying => self.points.len(),
+            Interpolation::FaceVarying => self.indices.len(),
         }
     }
 }
@@ -469,8 +496,8 @@ impl CageBasis {
     /// doesn't hold reads its fallback, which is linear.
     fn of(held: Option<&Primvar>) -> Self {
         match held.map(|p| p.interp) {
-            Some(Interp::Vertex) => Self::Surface,
-            Some(Interp::FaceVarying) => Self::Own,
+            Some(Interpolation::Vertex) => Self::Surface,
+            Some(Interpolation::FaceVarying) => Self::Own,
             _ => Self::Linear,
         }
     }
@@ -629,10 +656,10 @@ impl CageBuilder {
         at: &Placing<'_>,
         path: &str,
     ) -> Result<(), String> {
-        if mesh.scheme != "catmullClark" {
+        if mesh.scheme != SubdivisionScheme::CatmullClark {
             return Err(format!(
                 "{path}: subdivision scheme {}; cages cook as Catmull-Clark",
-                mesh.scheme
+                mesh.scheme.as_token()
             ));
         }
         let rules = (mesh.boundary, mesh.uv_linear, mesh.smooth_triangles);
@@ -850,10 +877,13 @@ fn corner_values<T>(
         for (k, &point) in (corner..).zip(&mesh.indices[corner..corner + count]) {
             let v = p.at(point, face, k);
             let element = match (p.interp, &p.indices) {
-                (Interp::FaceVarying, Some(ix)) => ix.get(k).map_or(usize::MAX, |&i| i as usize),
-                (Interp::FaceVarying, None) | (Interp::Vertex | Interp::Varying, _) => point,
-                (Interp::Uniform, _) => usize::MAX - face,
-                (Interp::Constant, _) => usize::MAX,
+                (Interpolation::FaceVarying, Some(ix)) => {
+                    ix.get(k).map_or(usize::MAX, |&i| i as usize)
+                }
+                (Interpolation::FaceVarying, None)
+                | (Interpolation::Vertex | Interpolation::Varying, _) => point,
+                (Interpolation::Uniform, _) => usize::MAX - face,
+                (Interpolation::Constant, _) => usize::MAX,
             };
             let bits = v.map(|v| std::array::from_fn(|i| v.get(i).map_or_default(|x| x.to_bits())));
             let key = (element, bits);

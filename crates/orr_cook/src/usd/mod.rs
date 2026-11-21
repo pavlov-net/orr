@@ -5,21 +5,26 @@
 //!
 //! The stage composes its references, payloads (all loaded) and variants, with the
 //! selections of [`UsdSettings::variants`] in a session layer; any composition error fails
-//! the import. Values are read at [`UsdSettings::time`]. The stage's `upAxis` and
-//! `metersPerUnit` (0.01 when unauthored, as USD's) turn stage space into scene space (Y
-//! up, meters), and `metersPerUnit` is the length unit of displacements. Inactive prims (and their
-//! subtrees) are not read, and prims under a `class` or `over` are read only as prototypes. An
-//! Imageable prim that is `invisible`, or has an effective purpose of `guide` or `proxy`, is not
-//! drawn: invisibility holds for the subtree, and a prim takes the purpose of the nearest
-//! Imageable prim at or above it that authors one.
-//! Instanceable prims are expanded.
+//! the import. It knows the schemas of `openusd_schemas`, which give unauthored attributes their
+//! fallbacks and say which types derive from which. Values are read at [`UsdSettings::time`].
+//! The stage's `upAxis` and `metersPerUnit` (0.01 when unauthored, as USD's) turn stage space
+//! into scene space (Y up, meters), and `metersPerUnit` is the length unit of displacements. A
+//! prim's transform is its `UsdGeomXformable` op stack; a prim that is not Xformable has none.
+//! Inactive prims (and their subtrees) are not read, and prims under a `class` or `over` are
+//! read only as prototypes. An Imageable prim that is `invisible`, or has an effective purpose
+//! of `guide` or `proxy`, or of `render` under a `renderVisibility` of `invisible`
+//! (`UsdGeomVisibilityAPI`), is not drawn: invisibility holds for the subtree, and a prim takes
+//! the purpose (`ComputePurposeInfo`) and render visibility of the nearest Imageable prim at or
+//! above it that authors one. Instanceable prims are expanded.
 //!
 //! Models, every one in scene units and axes; a model with a skeleton stands in the skeleton's
 //! space, at its origin in the model's ([`crate::skin::RigSpace`]), and its copies take it:
 //! - Each `SkelRoot` is a model named after it, in scene space (bind space), of the skinned
-//!   meshes under it (those with joint influences and a bound skeleton), with its skeleton and
-//!   clips per animation. `schemas.dox` makes each `skel:skeleton` binding a skeleton instance of
-//!   its own, so with several under a root each is a model of the root's derived by the binding
+//!   meshes under it (those with joint influences and a bound skeleton, as `UsdSkelCache`
+//!   resolves them through `SkelBindingAPI`; a prim under the root that is not Imageable keeps
+//!   every mesh below it unskinned), with its skeleton and clips per animation. `schemas.dox`
+//!   makes each `skel:skeleton` binding a skeleton instance of its own, so with several under a
+//!   root each is a model of the root's derived by the binding
 //!   prim's path under it ([`Derived::Binding`]), whichever skeleton it binds. Its
 //!   other meshes are static and cook with the rest of the stage, as do meshes outside a
 //!   `SkelRoot`, whose bindings mean nothing. A prototype's skinned meshes make it such a model,
@@ -108,14 +113,15 @@
 //! Its uv sets and the primvars its materials read through the vertex color stream come out of
 //! the tessellator by their interpolation ([`mesh::CageBuilder`]).
 //! Faces take the material of their `GeomSubset` of family `materialBind`, else of the
-//! mesh: the direct binding `material:binding:full`, else `material:binding`, of the prim or
-//! its nearest ancestor (collection bindings are not read). Materials map as [`crate::shading`]
-//! lists and are named by their prim path ([`MaterialBase::Path`]), [`MaterialBase::Default`] for
-//! unbound faces; faces of a `doubleSided` mesh take a double-sided copy
-//! ([`Variant::DoubleSided`]). Meshes that differ in what they hold for a material's primvar
-//! readers take a copy each ([`Variant::Primvars`]).
+//! mesh: the `Material` `ComputeBoundMaterial` resolves for the `full` purpose, through direct
+//! and collection bindings, `bindMaterialAs` and the binding's target, counting bindings on
+//! prims without `MaterialBindingAPI` as USD does by default, which one warning of the stage
+//! counts; a binding to another type of prim binds nothing, with a warning. Materials map as
+//! [`crate::shading`] lists and are named by their prim path ([`MaterialBase::Path`]),
+//! [`MaterialBase::Default`] for unbound faces; faces of a `doubleSided` mesh take a
+//! double-sided copy ([`Variant::DoubleSided`]). Meshes that differ in what they hold for a
+//! material's primvar readers take a copy each ([`Variant::Primvars`]).
 
-mod blackbody;
 mod lux;
 mod mesh;
 mod read;
@@ -129,7 +135,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use openusd::usd::PathRule;
-use openusd::{sdf, usd, vt};
+use openusd::{ar, sdf, tf, usd, vt};
+use openusd_schemas::geom::{
+    self, ImageableExt, ImageableSchema, PointBasedSchema, PointInstancerSchema, Purpose,
+    PurposeVisibility, SubsetSchema, UpAxis, Visibility,
+};
+use openusd_schemas::shade as usd_shade;
+use openusd_schemas::skel as usd_skel;
 use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, DVec4};
 use orr_pack::instance::MotionRow;
 use orr_pack::layout::{Attribute, AttributeValue, Group, LightSource};
@@ -151,7 +163,7 @@ use crate::shading_model::ShadingModel;
 use crate::skin::{self, Channel, ClipSettings, ClipSource, Rig, RigSpace, Rigging};
 use crate::subd::SubdSettings;
 use crate::texture::material::{ImageData, ImageFile, ImageTile, TextureRules};
-use crate::texture::tiles::{UDIM, udim_cell};
+use crate::texture::tiles::udim_cell;
 use crate::{Error, Result};
 
 use mesh::{CageBuilder, FaceFrame, Faces, FrameUvs, MeshFacts, MeshPrim, Placing, Welder};
@@ -283,54 +295,6 @@ fn inverse_bind(m: DMat4) -> DMat4 {
     }
 }
 
-/// Schemas derived from `UsdGeomImageable`; other prims have no visibility or purpose.
-const IMAGEABLE: &[&str] = &[
-    "BasisCurves",
-    "Camera",
-    "Capsule",
-    "Capsule_1",
-    "Cone",
-    "Cube",
-    "Cylinder",
-    "Cylinder_1",
-    "CylinderLight",
-    "DiskLight",
-    "DistantLight",
-    "DomeLight",
-    "DomeLight_1",
-    "Field3DAsset",
-    "GenerativeProcedural",
-    "GeometryLight",
-    "HermiteCurves",
-    "LightFilter",
-    "Mesh",
-    "NurbsCurves",
-    "NurbsPatch",
-    "OpenVDBAsset",
-    "PhysicsDistanceJoint",
-    "PhysicsFixedJoint",
-    "PhysicsJoint",
-    "PhysicsPrismaticJoint",
-    "PhysicsRevoluteJoint",
-    "PhysicsSphericalJoint",
-    "Plane",
-    "PluginLight",
-    "PluginLightFilter",
-    "PointInstancer",
-    "Points",
-    "PortalLight",
-    "RectLight",
-    "Scope",
-    "SkelRoot",
-    "Skeleton",
-    "SpatialAudio",
-    "Sphere",
-    "SphereLight",
-    "TetMesh",
-    "Volume",
-    "Xform",
-];
-
 /// A group attribute's value, its numbers as [`read::integers`] and [`read::numbers`] read
 /// them; `None` for a value of no attribute value type.
 fn attribute_value(v: vt::Value) -> Option<AttributeValue> {
@@ -414,13 +378,35 @@ struct Node {
     name: String,
     /// Under a `PointInstancer`, or a `class` or `over` (or one): cooked only as a prototype.
     instanced: bool,
-    /// The times its xform is sampled at, where they differ; empty for a prim that holds still.
-    times: Vec<f64>,
-    /// Imageable and `invisible`: not drawn with its subtree, but read as a skeleton or
-    /// animation.
+    /// Its transform stack, whose `times` are empty for a prim that holds still.
+    stack: read::Stack,
+    /// What it and the prims above it say of whether it is drawn.
+    shown: Shown,
+}
+
+/// What a prim and the prims above it say of whether it is drawn: `UsdGeomImageable`'s
+/// visibility, purpose and `UsdGeomVisibilityAPI` render visibility, which only Imageable prims
+/// state. A prim that is not drawn may still be read, as a skeleton or animation.
+#[derive(Clone, Copy, Default)]
+struct Shown {
+    /// `invisible` here or above.
     invisible: bool,
-    /// The purpose it authors, if Imageable.
-    purpose: Option<String>,
+    purpose: geom::PurposeInfo,
+    /// The nearest authored `renderVisibility`, which only VisibilityAPI states.
+    render: Option<PurposeVisibility>,
+}
+
+impl Shown {
+    /// Not drawn: invisible, of purpose `guide` or `proxy`, or of purpose `render` with render
+    /// visibility `invisible`.
+    fn hidden(self) -> bool {
+        self.invisible
+            || match self.purpose.purpose {
+                Purpose::Default => false,
+                Purpose::Guide | Purpose::Proxy => true,
+                Purpose::Render => self.render == Some(PurposeVisibility::Invisible),
+            }
+    }
 }
 
 /// One model being assembled.
@@ -487,15 +473,16 @@ impl Building {
 
 /// The scene materials a mesh prim binds.
 struct Bindings {
-    /// Its own, or its nearest ancestor's.
+    /// The mesh's.
     base: usize,
-    /// Each `GeomSubset` that binds faces: its node and material.
-    subsets: Vec<(usize, usize)>,
+    /// Each `GeomSubset` of family `materialBind` that holds faces: its path, the faces it holds and
+    /// their material.
+    subsets: Vec<(String, Vec<i32>, usize)>,
 }
 
 impl Bindings {
     fn materials(&self) -> impl Iterator<Item = usize> {
-        std::iter::once(self.base).chain(self.subsets.iter().map(|s| s.1))
+        std::iter::once(self.base).chain(self.subsets.iter().map(|s| s.2))
     }
 }
 
@@ -513,15 +500,16 @@ struct Frame {
     vertex: Vec<shading::VertexRead>,
 }
 
-/// How a mesh under a `SkelRoot` binds a skeleton: nodes of the prims that say so.
+/// How a mesh under a `SkelRoot` binds a skeleton.
 struct Bound {
     skeleton: sdf::Path,
     /// Where `skel:skeleton` is authored.
     site: usize,
-    joints: Option<usize>,
-    indices: usize,
-    weights: usize,
-    geom_bind: Option<usize>,
+    /// The binding properties it inherits.
+    query: usd_skel::SkinningQuery,
+    /// Its joint indices and weights at the time read, one run for every point or, constant,
+    /// one for all.
+    influences: usd_skel::JointInfluences,
 }
 
 /// The models being assembled, the models their meshes go to and the meshes drawn.
@@ -811,6 +799,16 @@ struct Importer<'s> {
     partitions: Vec<Vec<u32>>,
     /// Per node, its partition.
     partition_of: Vec<usize>,
+    /// Material binding resolutions so far.
+    binding_cache: usd_shade::BindingCache,
+    /// The prims that bind a material without `MaterialBindingAPI`, which warn together.
+    unapplied: std::collections::BTreeSet<String>,
+    /// The color spaces of the prims read so far.
+    spaces: usd::ColorSpaceCache,
+    /// The skinnable prims of the `SkelRoot` nodes populated so far.
+    skel_cache: RefCell<(usd_skel::Cache, std::collections::HashSet<usize>)>,
+    /// What reading skeleton bindings warned of.
+    skel_warnings: RefCell<Vec<String>>,
     warnings: Vec<String>,
 }
 
@@ -820,6 +818,7 @@ impl<'s> Importer<'s> {
         reads.borrow_mut().session = read::session_layer(&settings.variants)?;
         let root = path.to_str().ok_or("the path is not UTF-8")?;
         let stage = usd::Stage::builder()
+            .schema_registry(openusd_schemas::schema_registry())
             .resolver(Recorder::new(Rc::clone(&reads)))
             .session_layer(read::SESSION)
             .open(root)
@@ -877,6 +876,11 @@ impl<'s> Importer<'s> {
             groups: Vec::new(),
             partitions: Vec::new(),
             partition_of: Vec::new(),
+            binding_cache: usd_shade::BindingCache::default(),
+            unapplied: std::collections::BTreeSet::new(),
+            spaces: usd::ColorSpaceCache::default(),
+            skel_cache: RefCell::default(),
+            skel_warnings: RefCell::default(),
         })
     }
 
@@ -889,30 +893,18 @@ impl<'s> Importer<'s> {
 
     /// Scene space from stage space: Y up, meters.
     fn stage_to_scene(&self) -> Result<DMat4, String> {
-        let up = self.stage.stage_metadata("upAxis");
-        let up = match up.map_err(|e| e.to_string())? {
-            Some(vt::Value::Token(t)) => t.as_str().to_string(),
-            Some(vt::Value::String(s)) => s,
-            _ => "Y".into(),
-        };
-        let axis = match up.as_str() {
-            "Y" => DMat4::IDENTITY,
+        let up = geom::stage_up_axis(&self.stage).map_err(|e| format!("upAxis: {e}"))?;
+        let axis = match up {
+            UpAxis::Y => DMat4::IDENTITY,
             // Z up: +Z becomes +Y, +Y becomes -Z.
-            "Z" => DMat4::from_cols(DVec4::X, DVec4::NEG_Z, DVec4::Y, DVec4::W),
-            a => return Err(format!("upAxis {a}")),
+            UpAxis::Z => DMat4::from_cols(DVec4::X, DVec4::NEG_Z, DVec4::Y, DVec4::W),
         };
         Ok(DMat4::from_scale(DVec3::splat(self.meters_per_unit()?)) * axis)
     }
 
     /// The stage's `metersPerUnit`.
     fn meters_per_unit(&self) -> Result<f64, String> {
-        let meters = self
-            .stage
-            .stage_metadata("metersPerUnit")
-            .map_err(|e| e.to_string())?;
-        Ok(meters
-            .and_then(|v| read::numbers(&v))
-            .map_or(0.01, |v| v[0]))
+        geom::stage_meters_per_unit(&self.stage).map_err(|e| format!("metersPerUnit: {e}"))
     }
 
     /// Every prim worth reading, parents first, with its scene transform.
@@ -928,13 +920,13 @@ impl<'s> Importer<'s> {
             if !prim.is_active().map_err(|e| e.to_string())? {
                 continue;
             }
-            let r = self.reader(&prim);
             let up = parent.map(|p| &self.nodes[p]);
             let instanced = !prim.is_defined().map_err(|e| e.to_string())?
                 || prim.is_abstract().map_err(|e| e.to_string())?
                 || up.is_some_and(|p| p.instanced || p.ty == "PointInstancer");
-            let (local, reset) = r.local_transform()?;
-            let times = r.xform_times()?;
+            let xform = read::Stack::read(&prim)?;
+            let (local, reset) = (xform.local(self.time)?, xform.resets());
+            let shown = self.shown(&prim, up.map_or_default(|p| p.shown))?;
             let world = match (parent, reset) {
                 (Some(p), false) => self.nodes[p].world * local,
                 _ => root * local,
@@ -943,9 +935,6 @@ impl<'s> Importer<'s> {
                 .type_name()
                 .map_err(|e| e.to_string())?
                 .map_or_default(|t| t.as_str().to_string());
-            let imageable = IMAGEABLE.contains(&ty.as_str());
-            let invisible = imageable && r.token("visibility")?.as_deref() == Some("invisible");
-            let purpose = if imageable { r.token("purpose")? } else { None };
             let name = prim.path().name().unwrap_or_default().to_string();
             let i = self.nodes.len();
             self.by_path.insert(prim.path().as_str().to_string(), i);
@@ -960,11 +949,10 @@ impl<'s> Importer<'s> {
                 local,
                 reset,
                 ty,
-                times,
                 name,
                 instanced,
-                invisible,
-                purpose,
+                stack: xform,
+                shown,
             });
         }
         for i in (0..self.nodes.len()).rev() {
@@ -980,20 +968,42 @@ impl<'s> Importer<'s> {
         i..self.nodes[i].end
     }
 
-    /// Whether node `n` is not drawn, by what it and the prims above it say up to and with
-    /// `top`, or the stage's root without it.
-    fn hidden(&self, n: usize, top: Option<usize>) -> bool {
-        let mut purpose = None;
-        let mut at = Some(n);
-        while let Some(i) = at {
-            let node = &self.nodes[i];
-            if node.invisible {
-                return true;
-            }
-            purpose = purpose.or(node.purpose.as_deref());
-            at = node.parent.filter(|_| Some(i) != top);
+    /// What `prim`, under a prim that says `parent`, says of whether it is drawn.
+    fn shown(&self, prim: &usd::Prim, parent: Shown) -> Result<Shown, String> {
+        let fail = |e: openusd::Error| format!("{}: {e}", prim.path().as_str());
+        let purpose = geom::Imageable::from_prim_unchecked(prim.clone())
+            .purpose_info_from(parent.purpose)
+            .map_err(fail)?;
+        let Some(ip) = geom::Imageable::from_prim(prim.clone()).map_err(fail)? else {
+            return Ok(Shown { purpose, ..parent });
+        };
+        let visibility = ip.visibility_attr().get_at::<tf::Token>(self.time);
+        let invisible =
+            visibility.map_err(fail)?.as_deref() == Some(Visibility::Invisible.as_token());
+        let render = match ip.purpose_visibility_attr(Purpose::Render).map_err(fail)? {
+            Some(a) if a.has_authored_value().map_err(fail)? => a.get().map_err(fail)?,
+            _ => parent.render,
+        };
+        Ok(Shown {
+            invisible: parent.invisible || invisible,
+            purpose,
+            render,
+        })
+    }
+
+    /// Per node of prototype `root`'s subtree, from `root` on, whether it is drawn by what that
+    /// subtree alone says.
+    fn drawn_in(&self, root: usize) -> Result<Vec<bool>, String> {
+        let mut shown: Vec<Shown> = Vec::with_capacity(self.nodes[root].end - root);
+        for k in self.subtree(root) {
+            let node = &self.nodes[k];
+            let parent = match node.parent.filter(|_| k != root) {
+                Some(p) => shown[p - root],
+                None => Shown::default(),
+            };
+            shown.push(self.shown(&node.prim, parent)?);
         }
-        matches!(purpose, Some("guide" | "proxy"))
+        Ok(shown.iter().map(|s| !s.hidden()).collect())
     }
 
     fn run(&mut self) -> Result<Scene, String> {
@@ -1045,11 +1055,15 @@ impl<'s> Importer<'s> {
 
         // Every mesh of the stage drawn, with the model it goes to.
         let mut meshes: Vec<(usize, usize)> = (0..n)
-            .filter(|&i| self.nodes[i].ty == "Mesh" && !self.hidden(i, None))
+            .filter(|&i| self.nodes[i].ty == "Mesh" && !self.nodes[i].shown.hidden())
             .filter_map(|i| Some((i, owner[i]?)))
             .collect();
         let order: Vec<usize> = (0..n).collect();
-        let animated: Vec<bool> = self.nodes.iter().map(|d| !d.times.is_empty()).collect();
+        let animated: Vec<bool> = self
+            .nodes
+            .iter()
+            .map(|d| !d.stack.times.is_empty())
+            .collect();
         let parents: Vec<Option<usize>> = self
             .nodes
             .iter()
@@ -1059,7 +1073,7 @@ impl<'s> Importer<'s> {
         let instancers: Vec<usize> = (0..n)
             .filter(|&i| {
                 let node = &self.nodes[i];
-                node.ty == "PointInstancer" && !node.instanced && !self.hidden(i, None)
+                node.ty == "PointInstancer" && !node.instanced && !node.shown.hidden()
             })
             .collect();
 
@@ -1448,8 +1462,7 @@ impl<'s> Importer<'s> {
             let rig = rigs.get(&o);
             let (skin, transform, part) = match (bound.get(&i), skeleton, rig) {
                 (Some(b), Some(sk), _) => {
-                    let (s, to_bind) =
-                        sk.binding(&path, &self.skin_source(b), mesh.points.len())?;
+                    let (s, to_bind) = sk.binding(&path, b, mesh.points.len(), self.time)?;
                     (Some(s), to_bind, 0)
                 }
                 (None, Some(sk), _) => {
@@ -1635,6 +1648,24 @@ impl<'s> Importer<'s> {
             });
         }
         skeletons.extend(rig_skeletons);
+        if !self.unapplied.is_empty() {
+            let first: Vec<&str> = self.unapplied.iter().take(5).map(String::as_str).collect();
+            let more = if self.unapplied.len() > first.len() {
+                ", ..."
+            } else {
+                ""
+            };
+            self.warnings.push(format!(
+                "{} prims bind materials without MaterialBindingAPI applied, read as USD reads \
+                 legacy bindings: {}{more}",
+                self.unapplied.len(),
+                first.join(", ")
+            ));
+        }
+        let mut heard = std::collections::HashSet::new();
+        let skel = std::mem::take(&mut *self.skel_warnings.borrow_mut());
+        self.warnings
+            .extend(skel.into_iter().filter(|w| heard.insert(w.clone())));
         Ok(Scene {
             models: out,
             materials: std::mem::take(&mut self.materials),
@@ -1978,21 +2009,20 @@ impl<'s> Importer<'s> {
         let mut channels = Vec::new();
         for &(n, joint) in prims {
             let node = &self.nodes[n];
-            let Some(&last) = node.times.last() else {
+            let Some(&last) = node.stack.times.last() else {
                 continue;
             };
             let mut times = Vec::new();
-            for w in node.times.windows(2) {
+            for w in node.stack.times.windows(2) {
                 let steps = ((w[1] - w[0]) / per_second * rate).ceil().max(1.0) as u32;
                 let at = |k: u32| w[0] + (w[1] - w[0]) * f64::from(k) / f64::from(steps);
                 times.extend((0..steps).map(at));
             }
             times.push(last);
             let path = node.prim.path().as_str();
-            let r = self.reader(&node.prim);
             let mut keys = Vec::with_capacity(times.len());
             for &t in &times {
-                let local = r.at(t).local_transform()?.0;
+                let local = node.stack.local(usd::TimeCode::new(t))?;
                 keys.push(skel::prim_trs(&format!("{path} at {t}"), local)?);
             }
             let timeline = &self.timeline;
@@ -2006,20 +2036,17 @@ impl<'s> Importer<'s> {
     /// Settles the stage's [`Timeline`], over the samples of every moving xform, every instancer
     /// whose instances move and every `SkelAnimation`.
     fn find_timeline(&mut self) -> Result<(), String> {
-        let held = self.nodes.iter().filter(|d| !d.times.is_empty());
+        let held = self.nodes.iter().filter(|d| !d.stack.times.is_empty());
         let mut ends: Vec<(f64, f64)> = held
-            .map(|d| (d.times[0], d.times[d.times.len() - 1]))
+            .map(|d| (d.stack.times[0], d.stack.times[d.stack.times.len() - 1]))
             .collect();
         // An instancer's first interval runs back from its first sample.
         let moved = self.motions.values();
         ends.extend(moved.map(|m| (m.times[1], m.times[m.times.len() - 1])));
         for node in self.nodes.iter().filter(|d| d.ty == "SkelAnimation") {
-            let path = node.prim.path().as_str();
-            for a in skel::ANIMATED {
-                let times = node.prim.attribute(a).time_sample_times();
-                let times = times.map_err(|e| format!("{path} {a}: {e}"))?;
-                ends.extend(times.iter().map(|&t| (t, t)));
-            }
+            let times = skel::anim_query(&node.prim)?.joint_transform_time_samples();
+            let times = times.map_err(|e| format!("{}: {e}", node.prim.path().as_str()))?;
+            ends.extend(times.iter().map(|&t| (t, t)));
         }
         for (first, last) in ends {
             self.timeline.first = self.timeline.first.min(first);
@@ -2100,7 +2127,7 @@ impl<'s> Importer<'s> {
         let mut at = Some(n);
         while let Some(i) = at {
             let node = &self.nodes[i];
-            if !node.times.is_empty() {
+            if !node.stack.times.is_empty() {
                 return true;
             }
             at = node.parent.filter(|_| Some(i) != top && !node.reset);
@@ -2114,17 +2141,10 @@ impl<'s> Importer<'s> {
         let mut out = vec![Vec::new(); self.partitions.len()];
         let mut found = Vec::new();
         for (i, node) in self.nodes.iter().enumerate() {
-            if !lux::LIGHT_TYPES.contains(&node.ty.as_str()) {
-                if let Some(api) = lux::light_api(&node.prim)? {
-                    return Err(format!(
-                        "{}: {api} makes a light of a {}, which is not cooked",
-                        node.prim.path().as_str(),
-                        node.ty
-                    ));
-                }
+            if !lux::is_light(&node.prim)? {
                 continue;
             }
-            if node.instanced || self.hidden(i, None) {
+            if node.instanced || node.shown.hidden() {
                 continue;
             }
             if self.moves(i, None) {
@@ -2354,10 +2374,11 @@ impl<'s> Importer<'s> {
         let mut also = Vec::new();
         // Each skeleton binding met so far, with its model.
         let mut sites: Vec<(usize, usize)> = Vec::new();
+        let drawn_in = self.drawn_in(root)?;
         let mut k = root;
         while k < node.end {
             let at = &self.nodes[k];
-            let drawn = !self.hidden(k, Some(root));
+            let drawn = drawn_in[k - root];
             if at.ty == "PointInstancer" {
                 if drawn {
                     nested.push(k);
@@ -2366,7 +2387,7 @@ impl<'s> Importer<'s> {
                         d.parent.filter(|_| n != root && !d.reset)
                     };
                     let mut above = std::iter::successors(Some(k), up);
-                    if above.any(|n| !self.nodes[n].times.is_empty()) {
+                    if above.any(|n| !self.nodes[n].stack.times.is_empty()) {
                         instancing.warnings.push(format!(
                             "{}: a prim of its prototype moves this instancer, whose copies stay \
                              where the time read puts them",
@@ -2377,7 +2398,7 @@ impl<'s> Importer<'s> {
                 k = at.end;
                 continue;
             }
-            if lux::LIGHT_TYPES.contains(&at.ty.as_str()) && drawn {
+            if drawn && lux::is_light(&at.prim)? {
                 lights.push(k);
             }
             if at.ty == "Mesh" && drawn {
@@ -2418,7 +2439,7 @@ impl<'s> Importer<'s> {
             let (mut at, mut moved) = (Some(mesh), false);
             while let Some(n) = at {
                 let d = &self.nodes[n];
-                moved |= !d.times.is_empty();
+                moved |= !d.stack.times.is_empty();
                 at = d.parent.filter(|_| n != root && !d.reset);
             }
             moved
@@ -2466,7 +2487,9 @@ impl<'s> Importer<'s> {
             None => {
                 // A prototype that is inactive or not there has no copies.
                 let mut protos = Vec::new();
-                for path in r.targets("prototypes")? {
+                let instancer = geom::PointInstancer::from_prim_unchecked(r.prim.clone());
+                let targets = instancer.prototypes_rel().targets();
+                for path in targets.map_err(|e| format!("{} prototypes: {e}", r.path()))? {
                     let root = self.by_path.get(path.as_str()).copied();
                     protos.push(match root {
                         Some(root) => Some((root, self.prototype(root, models, instancing)?)),
@@ -2650,7 +2673,11 @@ impl<'s> Importer<'s> {
         let r = self.reader(&node.prim);
         let r = r.at(time);
         let path = r.path();
-        let index = r.ints("protoIndices")?.unwrap_or_default();
+        let instancer = geom::PointInstancer::from_prim_unchecked(node.prim.clone());
+        let at = usd::TimeCode::new(time);
+        let index = instancer.proto_indices_at(at);
+        let index = index.map_err(|e| format!("{path} protoIndices: {e}"))?;
+        let index = index.unwrap_or_default();
         let count = index.len();
         let around = |name: &str| self.samples_around(&node.prim, name, time);
         // `name` at the sample of `base`, if it stands around the time as `base` does and has one
@@ -2710,21 +2737,9 @@ impl<'s> Importer<'s> {
         let scales = read("scales", around("scales")?, 3)?.filter(|v| !v.lower.is_empty());
         let since = |b: Option<Around>| b.map_or_default(|b| (time - b.sample) / per_second);
         let (moved_for, turned_for) = (since(moved), since(turned));
-        let ids = r.ints("ids")?.filter(|v| !v.is_empty());
-        let mut masked: std::collections::HashSet<i64> = r
-            .ints("invisibleIds")?
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let inactive = node
-            .prim
-            .metadata::<vt::Value>("inactiveIds")
-            .map_err(|e| format!("{path} inactiveIds: {e}"))?;
-        match inactive {
-            Some(vt::Value::Int64ListOp(op)) => masked.extend(op.flatten()),
-            Some(_) => return Err(format!("{path} inactiveIds: not an int64 list op")),
-            None => {}
-        }
+        let ids = instancer
+            .ids_at(at)
+            .map_err(|e| format!("{path} ids: {e}"))?;
         // An attribute of another length than `protoIndices` leaves nothing to place at this time.
         let lengths = [
             (
@@ -2736,7 +2751,8 @@ impl<'s> Importer<'s> {
                 orientations.as_ref().map(|v| v.lower.len() / 4),
             ),
             ("scales", scales.as_ref().map(|v| v.lower.len() / 3)),
-            ("ids", ids.as_ref().map(Vec::len)),
+            // An empty `ids` names no instance, so it masks none (`ComputeMaskAtTime`).
+            ("ids", ids.as_ref().filter(|v| !v.is_empty()).map(Vec::len)),
         ];
         if let Some((name, n)) = lengths
             .iter()
@@ -2747,17 +2763,25 @@ impl<'s> Importer<'s> {
             ));
             return Ok(Vec::new());
         }
-        let known = |&p: &i64| usize::try_from(p).is_ok_and(|p| p < protos);
+        let known = |&p: &i32| usize::try_from(p).is_ok_and(|p| p < protos);
         if let Some(p) = index.iter().find(|p| !known(p)) {
             warnings.push(format!(
                 "{path}: protoIndex {p} of {protos} prototypes; no instances at that sample"
             ));
             return Ok(Vec::new());
         }
+        let inactive = node.prim.metadata::<vt::Value>("inactiveIds");
+        let inactive = inactive.map_err(|e| format!("{path} inactiveIds: {e}"))?;
+        if inactive.is_some_and(|v| !matches!(v, vt::Value::Int64ListOp(_))) {
+            return Err(format!("{path} inactiveIds: not an int64 list op"));
+        }
+        // An instance's id is its index where `ids` holds none.
+        let named = ids.unwrap_or_else(|| (0..count as i64).collect());
+        let mask = instancer.mask_at(at, Some(&named));
+        let mask = mask.map_err(|e| format!("{path} at {time}: {e}"))?;
         let mut out = Vec::with_capacity(count);
         for (i, &p) in index.iter().enumerate() {
-            let id = ids.as_ref().map_or(i as i64, |ids| ids[i]);
-            if masked.contains(&id) {
+            if mask.get(i) == Some(&false) {
                 continue;
             }
             let proto = p as usize;
@@ -2886,7 +2910,9 @@ impl<'s> Importer<'s> {
         let Some(&first) = samples.first() else {
             return Ok(None);
         };
-        let protos = r.targets("prototypes")?.len();
+        let instancer = geom::PointInstancer::from_prim_unchecked(node.prim.clone());
+        let protos = instancer.prototypes_rel().targets();
+        let protos = protos.map_err(|e| format!("{path} prototypes: {e}"))?.len();
         // The first interval runs back from the first sample, which only a rate can move.
         let times: Vec<f64> = std::iter::once(first - 1.0).chain(samples).collect();
         let mut keys = Vec::with_capacity(times.len());
@@ -2971,18 +2997,14 @@ impl<'s> Importer<'s> {
         }))
     }
 
-    /// The attribute orientations come from: `orientationsf`, where its earliest sample (or
-    /// default without samples) is not empty.
+    /// The attribute orientations come from (`UsesOrientationsf`): `orientationsf`, where its
+    /// earliest sample (or default without samples) is not empty.
     fn orientation_attribute(&self, r: &PrimReader<'_>) -> Result<&'static str, String> {
-        let name = "orientationsf";
-        let times = r
-            .prim
-            .attribute(name)
-            .time_sample_times()
-            .map_err(|e| format!("{} {name}: {e}", r.path()))?;
-        let first = times.first().map_or_else(|| f64::from(self.time), |&t| t);
-        let empty = r.at(first).numbers(name)?.is_none_or(|v| v.is_empty());
-        Ok(if empty { "orientations" } else { name })
+        let instancer = geom::PointInstancer::from_prim_unchecked(r.prim.clone());
+        let (f, _) = instancer
+            .uses_orientationsf()
+            .map_err(|e| format!("{}: {e}", r.path()))?;
+        Ok(if f { "orientationsf" } else { "orientations" })
     }
 
     /// What names skeleton binding `site` beside others under node `root`: its path under
@@ -3031,93 +3053,89 @@ impl<'s> Importer<'s> {
             .find(|&i| self.nodes[i].ty == "SkelRoot")
     }
 
-    /// Node `m` or the nearest prim above it, up to `root`, that authors `attribute`; a prim
-    /// above it counts only with `SkelBindingAPI`, as `UsdSkelCache` reads them.
-    fn inherited(&self, m: usize, root: usize, attribute: &str) -> Result<Option<usize>, String> {
-        let mut at = Some(m);
-        while let Some(i) = at {
-            let prim = &self.nodes[i].prim;
-            let fail = |e: openusd::Error| format!("{} {attribute}: {e}", prim.path().as_str());
-            if (i == m || prim.has_api_schema("SkelBindingAPI").map_err(fail)?)
-                && prim
-                    .attribute(attribute)
-                    .has_authored_value()
-                    .map_err(fail)?
-            {
-                return Ok(Some(i));
-            }
-            at = self.nodes[i].parent.filter(|_| i != root);
-        }
-        Ok(None)
-    }
-
-    /// How mesh `m` under `SkelRoot` `root` binds a skeleton, if it has joint influences and
-    /// a bound `Skeleton`.
+    /// How mesh `m` under `SkelRoot` `root` binds a skeleton, as `UsdSkelCache` resolves it: by
+    /// the joint influences and `skel:skeleton` it or the nearest prim above it up to the root
+    /// states through `SkelBindingAPI`, where that names a `Skeleton`.
     fn binding(&self, m: usize, root: usize) -> Result<Option<Bound>, String> {
-        let from = |attribute: &str| self.inherited(m, root, attribute);
-        let (Some(indices), Some(weights)) = (
-            from("primvars:skel:jointIndices")?,
-            from("primvars:skel:jointWeights")?,
-        ) else {
+        let prim = &self.nodes[m].prim;
+        let path = prim.path().as_str();
+        let query = {
+            let (cache, populated) = &mut *self.skel_cache.borrow_mut();
+            if populated.insert(root) {
+                let r = usd_skel::Root::from_prim_unchecked(self.nodes[root].prim.clone());
+                let all = usd::PrimPredicate::ALL;
+                let filled = cache.populate(&r, all);
+                filled.map_err(|e| format!("{}: {e}", self.nodes[root].prim.path().as_str()))?;
+            }
+            cache.skinning_query(prim).cloned()
+        };
+        let Some(query) = query else {
             return Ok(None);
         };
-        let Some((skeleton, site)) = self.bound_skeleton(m)? else {
+        if !query.has_joint_influences() {
+            if query.joint_indices_primvar().is_some() || query.joint_weights_primvar().is_some() {
+                self.skel_warnings.borrow_mut().push(format!(
+                    "{path}: joint influences that are not both constant or both vertex with one \
+                     elementSize bind nothing"
+                ));
+            }
             return Ok(None);
+        }
+        let held = query.joint_influences(self.time);
+        let held = held.map_err(|e| format!("{path} joint influences: {e}"))?;
+        let points = || {
+            let mesh = geom::Mesh::from_prim_unchecked(prim.clone());
+            let points = mesh.points_at(self.time);
+            let points = points.map_err(|e| format!("{path} points: {e}"))?;
+            Ok::<_, String>(points.map_or(0, |p| p.len()))
         };
-        let is_skeleton = self
-            .by_path
-            .get(skeleton.as_str())
-            .is_some_and(|&n| self.nodes[n].ty == "Skeleton");
-        if !is_skeleton {
-            return Ok(None);
-        }
-        Ok(Some(Bound {
-            skeleton,
-            site,
-            joints: from("skel:joints")?,
-            indices,
-            weights,
-            geom_bind: from("primvars:skel:geomBindTransform")?,
-        }))
-    }
-
-    /// The readers of a binding's attributes.
-    fn skin_source(&self, b: &Bound) -> skel::SkinSource<'_> {
-        let reader = |n: usize| self.reader(&self.nodes[n].prim);
-        skel::SkinSource {
-            joints: b.joints.map(reader),
-            indices: reader(b.indices),
-            weights: reader(b.weights),
-            geom_bind: b.geom_bind.map(reader),
-        }
-    }
-
-    /// The skeleton mesh `m` binds and the node that says so: `skel:skeleton` on it or its
-    /// nearest ancestor.
-    fn bound_skeleton(&self, m: usize) -> Result<Option<(sdf::Path, usize)>, String> {
+        let size = query.influences_per_component();
+        let influences = match held {
+            Some(h) if query.is_rigidly_deformed() || h.0.len() == points()? * size => h,
+            // `ComputeJointInfluences` and `ComputeVaryingJointInfluences` give none.
+            _ => {
+                self.skel_warnings.borrow_mut().push(format!(
+                    "{path}: joint influences that hold no value at the time read, or not one run \
+                     of {size} for each point, bind nothing"
+                ));
+                return Ok(None);
+            }
+        };
+        let fail = |e: openusd::Error| format!("{path} skel:skeleton: {e}");
         let mut at = Some(m);
         while let Some(n) = at {
-            let r = self.reader(&self.nodes[n].prim);
-            if let Some(t) = r.targets("skel:skeleton")?.into_iter().next() {
-                return Ok(Some((t, n)));
+            let api = usd_skel::BindingAPI::from_prim(self.nodes[n].prim.clone()).map_err(fail)?;
+            if let Some(api) = api
+                && api.skeleton_rel().has_authored_targets().map_err(fail)?
+            {
+                let skeleton = api.skeleton().map_err(fail)?;
+                let Some(skeleton) =
+                    skeleton.filter(|s| self.by_path.contains_key(s.path().as_str()))
+                else {
+                    return Ok(None);
+                };
+                return Ok(Some(Bound {
+                    skeleton: skeleton.path().clone(),
+                    site: n,
+                    query,
+                    influences,
+                }));
             }
-            at = self.nodes[n].parent;
+            at = self.nodes[n].parent.filter(|_| n != root);
         }
         Ok(None)
     }
 
     /// The animation bound at node `n`: the `skel:animationSource` there or on its nearest
-    /// ancestor that authors one. A target that is deactivated binds nothing.
+    /// ancestor that states one through `SkelBindingAPI`. A target that is deactivated binds
+    /// nothing.
     fn animation_source(&self, n: usize) -> Result<Option<usize>, String> {
-        let mut at = Some(n);
-        while let Some(i) = at {
-            let r = self.reader(&self.nodes[i].prim);
-            if let Some(t) = r.targets("skel:animationSource")?.first() {
-                return Ok(self.by_path.get(t.as_str()).copied());
-            }
-            at = self.nodes[i].parent;
-        }
-        Ok(None)
+        let prim = &self.nodes[n].prim;
+        let api = usd_skel::BindingAPI::from_prim_unchecked(prim.clone());
+        let anim = api.inherited_animation_source();
+        let anim =
+            anim.map_err(|e| format!("{} skel:animationSource: {e}", prim.path().as_str()))?;
+        Ok(anim.and_then(|a| self.by_path.get(a.path().as_str()).copied()))
     }
 
     /// Clips of skeleton `path`: the `skel:animationSource` in force where it is bound (nodes
@@ -3164,49 +3182,64 @@ impl<'s> Importer<'s> {
             .collect())
     }
 
-    /// The material prim bound to prim `i` or its nearest ancestor.
-    fn bound_material(&self, mut at: Option<usize>) -> Result<Option<sdf::Path>, String> {
-        while let Some(n) = at {
-            if let Some(m) = self.direct_binding(&self.nodes[n].prim)? {
-                return Ok(Some(m));
-            }
-            at = self.nodes[n].parent;
+    /// The `Material` bound to `prim` for the `full` purpose, as `ComputeBoundMaterial` resolves
+    /// it with `supportLegacyBindings`, its default: a binding counts on a prim without
+    /// `MaterialBindingAPI`, which the stage's warnings list as USD warns of them. A binding to a
+    /// prim that is no `Material` binds nothing.
+    fn bound_material(&mut self, prim: &usd::Prim) -> Result<Option<sdf::Path>, String> {
+        let path = prim.path().as_str();
+        let fail = |e: openusd::Error| format!("{path} material binding: {e}");
+        let api = usd_shade::MaterialBindingAPI::from_prim_unchecked(prim.clone());
+        let resolved = api.resolve_binding(usd_shade::tokens::FULL, true, &mut self.binding_cache);
+        let Some(resolved) = resolved.map_err(fail)? else {
+            return Ok(None);
+        };
+        let site = resolved.rel().prim();
+        let applied = site.has_api_schema(usd_shade::tokens::MATERIAL_BINDING_API);
+        if !applied.map_err(fail)? {
+            self.unapplied.insert(site.path().as_str().to_string());
         }
-        Ok(None)
-    }
-
-    fn direct_binding(&self, prim: &usd::Prim) -> Result<Option<sdf::Path>, String> {
-        let r = self.reader(prim);
-        for rel in ["material:binding:full", "material:binding"] {
-            if let Some(t) = r.targets(rel)?.into_iter().next() {
-                return Ok(Some(t));
+        let target = resolved.material_path();
+        match resolved.material().map_err(fail)? {
+            Some(_) => Ok(Some(target.clone())),
+            None => {
+                self.warnings.push(format!(
+                    "{path}: binds {target}, which is not a Material; it takes the default material"
+                ));
+                Ok(None)
             }
         }
-        Ok(None)
     }
 
     /// The scene materials mesh prim `i` binds.
     fn bindings(&mut self, i: usize, double_sided: bool) -> Result<Bindings, String> {
-        let base = self.bound_material(Some(i))?;
+        let prim = self.nodes[i].prim.clone();
+        let base = self.bound_material(&prim)?;
         let base = self.material(base, double_sided, i)?;
+        // The mesh's own children, which an instance proxy's are too.
         let subsets: Vec<usize> = self
             .subtree(i)
             .filter(|&k| self.nodes[k].parent == Some(i) && self.nodes[k].ty == "GeomSubset")
             .collect();
         let mut bound = Vec::new();
         for k in subsets {
-            let r = self.reader(&self.nodes[k].prim);
-            if r.token("familyName")?.as_deref() != Some("materialBind")
-                || r.token("elementType")?
-                    .as_deref()
-                    .is_some_and(|e| e != "face")
+            let subset = geom::Subset::from_prim_unchecked(self.nodes[k].prim.clone());
+            let path = subset.path().as_str().to_string();
+            let fail = |e: openusd::Error| format!("{path}: {e}");
+            let family = subset.family_name().map_err(fail)?;
+            let element = subset
+                .element_type_attr()
+                .get::<tf::Token>()
+                .map_err(fail)?;
+            if family.as_deref() != Some(usd_shade::tokens::MATERIAL_BIND)
+                || element.as_deref() != Some(geom::ElementType::Face.as_token())
             {
                 continue;
             }
-            let Some(m) = self.direct_binding(&self.nodes[k].prim)? else {
-                continue;
-            };
-            bound.push((k, self.material(Some(m), double_sided, i)?));
+            let indices = subset.indices_at(self.time).map_err(fail)?;
+            let m = self.bound_material(&subset)?;
+            let m = self.material(m, double_sided, i)?;
+            bound.push((path, indices.unwrap_or_default(), m));
         }
         Ok(Bindings {
             base,
@@ -3217,16 +3250,13 @@ impl<'s> Importer<'s> {
     /// Scene material per face of `mesh`, which binds `bindings`.
     fn face_materials(&self, bindings: &Bindings, mesh: &MeshPrim) -> Result<Vec<usize>, String> {
         let mut faces = vec![bindings.base; mesh.counts.len()];
-        for &(k, m) in &bindings.subsets {
-            let r = self.reader(&self.nodes[k].prim);
-            let path = r.path().to_string();
-            let indices = r.ints("indices")?.unwrap_or_default();
-            for f in indices {
+        for (path, indices, m) in &bindings.subsets {
+            for &f in indices {
                 let slot = usize::try_from(f)
                     .ok()
                     .and_then(|f| faces.get_mut(f))
                     .ok_or_else(|| format!("{path}: face {f} past the mesh"))?;
-                *slot = m;
+                *slot = *m;
             }
         }
         Ok(faces)
@@ -3260,9 +3290,10 @@ impl<'s> Importer<'s> {
                 .and_then(|r| Some(reads.borrow().tiles(r)?.to_vec()));
             let image = match (tiles, a.resolved_path()) {
                 (Some(found), _) => {
+                    let udim = ar::UdimPath::parse(&name).expect("a path with tiles names them");
                     let mut tiles = Vec::with_capacity(found.len());
                     for (n, path) in found {
-                        images.push(read(name.replace(UDIM, &n.to_string()), &path));
+                        images.push(read(udim.tile(n), &path));
                         tiles.push(ImageTile {
                             cell: udim_cell(n),
                             image: images.len() - 1,
@@ -3280,7 +3311,17 @@ impl<'s> Importer<'s> {
             image_of.insert(key, images.len() - 1);
             images.len() - 1
         };
-        let (net, surface, displacement) = shade::network(&self.stage, self.time, p, &mut load)?;
+        let material =
+            usd_shade::Material::get(&self.stage, p.clone()).map_err(|e| e.to_string())?;
+        let material = material.ok_or_else(|| format!("{p} is not a Material"))?;
+        let shaded = shade::network(&material, self.time, &mut load, &mut self.spaces)?;
+        let shade::Shaded {
+            net,
+            surface,
+            displacement,
+            warnings,
+        } = shaded;
+        self.warnings.extend(warnings);
         let reads = net.primvar_reads();
         let s = Rc::new(Shading {
             net,
@@ -3328,28 +3369,31 @@ impl<'s> Importer<'s> {
         Ok(frame)
     }
 
-    /// What mesh prim `mesh` holds for primvar `name`. A constant primvar inherits down
-    /// namespace.
+    /// What mesh prim `mesh` holds for primvar `name`, as `FindPrimvarWithInheritance` finds it:
+    /// its own, else the nearest ancestor's that is constant.
     fn primvar(&self, mesh: usize, name: &str) -> Result<shading::Primvar, String> {
         let set = self.settings.uv_sets().position(|s| s == name);
-        let facts = MeshFacts::read(&self.reader(&self.nodes[mesh].prim))?;
+        let prim = &self.nodes[mesh].prim;
+        let facts = MeshFacts::read(&self.reader(prim))?;
         let cage = !facts.polygonal && self.settings.subdivision == Subdivision::Cage;
         let reach = if cage { CAGE_COLOR_REACH } else { 1.0 };
-        let mut at = Some(mesh);
-        while let Some(i) = at {
-            match (
-                self.reader(&self.nodes[i].prim)
-                    .whole_primvar(name, reach)?,
-                set,
-            ) {
-                (shading::Primvar::Missing, _) => {}
-                (_, Some(set)) if i == mesh => return Ok(shading::Primvar::Uv(set as u8)),
-                (shading::Primvar::Varying { .. }, _) if i != mesh => {}
-                (held, _) => return Ok(held),
+        let api = geom::PrimvarsAPI::from_prim_unchecked(prim.clone());
+        let found = match api.primvar_with_inheritance(name) {
+            Ok(Some(found)) => found,
+            // `GetPrimvar` gives an invalid primvar for a name no primvar has.
+            Ok(None) | Err(openusd_schemas::SchemaError::InvalidPrimvarName { .. }) => {
+                return Ok(shading::Primvar::Missing);
             }
-            at = self.nodes[i].parent;
-        }
-        Ok(shading::Primvar::Missing)
+            Err(e) => return Err(format!("{} primvar {name}: {e}", prim.path().as_str())),
+        };
+        let owner = found.attribute().prim();
+        Ok(
+            match (self.reader(&owner).whole_primvar(name, reach)?, set) {
+                (shading::Primvar::Missing, _) => shading::Primvar::Missing,
+                (_, Some(set)) if owner.path() == prim.path() => shading::Primvar::Uv(set as u8),
+                (held, _) => held,
+            },
+        )
     }
 
     /// The scene material of a material prim (`None`: the default material) on mesh prim

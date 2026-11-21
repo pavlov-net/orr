@@ -1,5 +1,5 @@
 //! Reading a composed stage: the resolver that records every file the stage reads, value
-//! conversions, transforms and primvars.
+//! conversions, transform stacks and primvars.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -8,14 +8,15 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use openusd::ar::Resolver;
-use openusd::{ar, sdf, usd, vt};
-use orr_math::{DMat4, DQuat, DVec3};
+use openusd::{ar, usd, vt};
+use openusd_schemas::geom::{self, Interpolation, XformableExt};
+use orr_math::{DMat4, DQuat};
 use orr_pack::Hash32;
 
 use super::VariantSelection;
 use crate::shading;
 use crate::state::{Input, hash_path};
-use crate::texture::tiles::{UDIM, UDIM_TILES};
+use crate::texture::tiles::UDIM_TILES;
 
 /// Identifier of the session layer that carries the manifest's variant selections.
 pub(super) const SESSION: &str = "orr_cook_session.usda";
@@ -56,28 +57,33 @@ impl Recorder {
             .create_identifier(&format!("./{asset_path}"), anchor)
     }
 
-    /// The identifier of an asset path holding `<UDIM>`, after finding each of its tiles the way
-    /// a path of its own would resolve.
-    fn tiled_identifier(&self, asset_path: &str, anchor: Option<&ar::ResolvedPath>) -> String {
+    /// The identifier of `udim`, the asset path `asset_path`, after finding its tiles as
+    /// `UsdShadeUdimUtils` does, each the way a path of its own would resolve. Where a tile does
+    /// not resolve is where it would appear.
+    fn tiled_identifier(
+        &self,
+        asset_path: &str,
+        udim: &ar::UdimPath,
+        anchor: Option<&ar::ResolvedPath>,
+    ) -> String {
         let id = self.beside(asset_path, anchor);
         if self.reads.borrow().tiles.contains_key(&id) {
             return id;
         }
-        let mut found = Vec::new();
+        let anchored = |tile: &str| self.inner.create_identifier(tile, anchor);
+        let found = udim.resolve_tiles(&self.inner, Some(&anchored));
+        let mut found = found.into_iter().peekable();
+        let mut tiles = Vec::new();
         for n in UDIM_TILES {
-            let tile = asset_path.replace(UDIM, &n.to_string());
-            match self
-                .inner
-                .resolve(&self.inner.create_identifier(&tile, anchor))
-            {
-                Some(r) => found.push((n, r.to_string_lossy().into_owned())),
+            match found.next_if(|t| t.number == n) {
+                Some(t) => tiles.push((n, t.path.to_string_lossy().into_owned())),
                 None => {
-                    let file = outer(Path::new(&self.beside(&tile, anchor)));
+                    let file = outer(Path::new(&self.beside(&udim.tile(n), anchor)));
                     self.reads.borrow_mut().absent.insert(file);
                 }
             }
         }
-        self.reads.borrow_mut().tiles.insert(id.clone(), found);
+        self.reads.borrow_mut().tiles.insert(id.clone(), tiles);
         id
     }
 
@@ -109,8 +115,8 @@ impl Resolver for Recorder {
         if asset_path == SESSION {
             return SESSION.into();
         }
-        if asset_path.contains(UDIM) {
-            return self.tiled_identifier(asset_path, anchor);
+        if let Some(udim) = ar::UdimPath::parse(asset_path) {
+            return self.tiled_identifier(asset_path, &udim, anchor);
         }
         let id = self.inner.create_identifier(asset_path, anchor);
         if !asset_path.is_empty() && self.inner.resolve(&id).is_none() {
@@ -408,15 +414,6 @@ impl PrimReader<'_> {
         }
     }
 
-    pub(super) fn ints(&self, name: &str) -> Result<Option<Vec<i64>>, String> {
-        match self.value(name)? {
-            None => Ok(None),
-            Some(v) => integers(&v)
-                .map(Some)
-                .ok_or_else(|| format!("{} {name}: not integers", self.path())),
-        }
-    }
-
     pub(super) fn token(&self, name: &str) -> Result<Option<String>, String> {
         Ok(match self.value(name)? {
             Some(vt::Value::Token(t)) => Some(t.as_str().to_string()),
@@ -425,39 +422,12 @@ impl PrimReader<'_> {
         })
     }
 
-    pub(super) fn tokens(&self, name: &str) -> Result<Vec<String>, String> {
-        Ok(match self.value(name)? {
-            Some(vt::Value::TokenVec(t)) => t.iter().map(|t| t.as_str().to_string()).collect(),
-            Some(vt::Value::StringVec(s)) => s,
-            _ => Vec::new(),
-        })
-    }
-
-    pub(super) fn metadata_token(&self, name: &str, key: &str) -> Option<String> {
-        let a = self.prim.attribute(name);
-        a.metadata::<vt::Value>(key)
-            .ok()
-            .flatten()
-            .and_then(|v| match v {
-                vt::Value::Token(t) => Some(t.as_str().to_string()),
-                vt::Value::String(s) => Some(s),
-                _ => None,
-            })
-    }
-
     /// This reader at `time` instead.
     pub(super) fn at(&self, time: f64) -> PrimReader<'_> {
         PrimReader {
             prim: self.prim,
             time: usd::TimeCode::new(time),
         }
-    }
-
-    pub(super) fn targets(&self, name: &str) -> Result<Vec<sdf::Path>, String> {
-        self.prim
-            .relationship(name)
-            .targets()
-            .map_err(|e| format!("{} {name}: {e}", self.path()))
     }
 
     /// Whether attribute `name` holds time samples of more than one value.
@@ -475,114 +445,125 @@ impl PrimReader<'_> {
         }
         Ok(false)
     }
+}
 
-    /// The times the prim's `xformOpOrder` ops are sampled at, in order; none where each op holds
-    /// one value. Values tell that and matrices can't: a full turn ends where it began.
-    pub(super) fn xform_times(&self) -> Result<Vec<f64>, String> {
+/// A prim's transform stack (`UsdGeomXformable`), read once and evaluated at any time. A prim
+/// that is not `Xformable` has an empty one.
+#[derive(Clone, Default)]
+pub(super) struct Stack {
+    /// The prim's path, which errors name.
+    path: String,
+    query: geom::XformQuery,
+    /// The times its ops are sampled at, in order; none where each op holds one value. Values
+    /// tell that and matrices can't: a full turn ends where it began.
+    pub(super) times: Vec<f64>,
+}
+
+/// Whether an op of `kind` takes `value`, as `xformOp.h` types them: a double, float or half
+/// for one axis, a vector of three for `translate`, `scale` and the three-axis rotations, a
+/// quaternion for `orient` and a `matrix4d` for `transform`.
+fn op_takes(kind: geom::XformOpKind, value: &vt::Value) -> bool {
+    use geom::XformOpKind as K;
+    use vt::Value as V;
+    match kind {
+        K::Transform => matches!(value, V::Matrix4d(_)),
+        K::Orient => matches!(value, V::Quatd(_) | V::Quatf(_) | V::Quath(_)),
+        K::TranslateX
+        | K::TranslateY
+        | K::TranslateZ
+        | K::ScaleX
+        | K::ScaleY
+        | K::ScaleZ
+        | K::RotateX
+        | K::RotateY
+        | K::RotateZ => matches!(value, V::Double(_) | V::Float(_) | V::Half(_)),
+        K::Translate
+        | K::Scale
+        | K::RotateXYZ
+        | K::RotateXZY
+        | K::RotateYXZ
+        | K::RotateYZX
+        | K::RotateZXY
+        | K::RotateZYX => matches!(value, V::Vec3d(_) | V::Vec3f(_) | V::Vec3h(_)),
+    }
+}
+
+impl Stack {
+    pub(super) fn read(prim: &usd::Prim) -> Result<Self, String> {
+        let path = prim.path().as_str();
+        let fail = |e: openusd::Error| format!("{path}: {e}");
+        let Some(xformable) = geom::Xformable::from_prim(prim.clone()).map_err(fail)? else {
+            return Ok(Self {
+                path: path.to_string(),
+                ..Self::default()
+            });
+        };
+        let (ops, reset) = xformable.ordered_xform_ops().map_err(fail)?;
         let mut times = Vec::new();
         let mut moves = false;
-        for op in self.tokens("xformOpOrder")? {
-            let name = op.strip_prefix("!invert!").unwrap_or(&op);
-            if name == "!resetXformStack!" {
-                continue;
-            }
-            let held = self.prim.attribute(name).time_sample_times();
-            let held = held.map_err(|e| format!("{} {name}: {e}", self.path()))?;
-            if let Some((&first, rest)) = held.split_first() {
-                let value = self.at(first).numbers(name)?;
-                for &t in rest {
-                    moves = moves || self.at(t).numbers(name)? != value;
+        for op in &ops {
+            let name = op.name();
+            let Some(kind) = op.kind() else {
+                return Err(format!("{path}: {name} is not an xform op"));
+            };
+            let fail = |e: openusd::Error| format!("{path} {name}: {e}");
+            let value = |t: Option<f64>| {
+                let v = op.query().get_at::<vt::Value>(t.map(usd::TimeCode::new));
+                let v = v.map_err(fail)?;
+                match &v {
+                    Some(v) if !op_takes(kind, v) => Err(format!(
+                        "{path}: xform op {} holds a value it does not take",
+                        kind.as_token()
+                    )),
+                    _ => Ok(v),
+                }
+            };
+            let held = op.query().time_sample_times().map_err(fail)?;
+            match held.split_first() {
+                Some((&first, rest)) => {
+                    let first = value(Some(first))?;
+                    for &t in rest {
+                        moves = moves || value(Some(t))? != first;
+                    }
+                }
+                None => {
+                    value(None)?;
                 }
             }
             times.extend(held);
         }
-        if !moves {
-            return Ok(Vec::new());
+        if moves {
+            times.sort_by(f64::total_cmp);
+            times.dedup();
+        } else {
+            times.clear();
         }
-        times.sort_by(f64::total_cmp);
-        times.dedup();
-        Ok(times)
+        Ok(Self {
+            path: path.to_string(),
+            query: geom::XformQuery::from_ops(ops, reset),
+            times,
+        })
     }
 
-    /// The prim's local transform from its `xformOpOrder`, and whether it resets the
-    /// parent's.
-    pub(super) fn local_transform(&self) -> Result<(DMat4, bool), String> {
-        let order = self.tokens("xformOpOrder")?;
-        let mut m = DMat4::IDENTITY;
-        let mut reset = false;
-        for op in &order {
-            if op == "!resetXformStack!" {
-                reset = true;
-                m = DMat4::IDENTITY;
-                continue;
-            }
-            let (invert, name) = match op.strip_prefix("!invert!") {
-                Some(n) => (true, n),
-                None => (false, op.as_str()),
-            };
-            let Some(v) = self.numbers(name)? else {
-                continue;
-            };
-            let kind = name
-                .strip_prefix("xformOp:")
-                .and_then(|k| k.split(':').next())
-                .ok_or_else(|| format!("{}: {name} is not an xform op", self.path()))?;
-            let deg = |x: f64| x.to_radians();
-            let axis = |a: char, x: f64| match a {
-                'X' => DMat4::from_rotation_x(deg(x)),
-                'Y' => DMat4::from_rotation_y(deg(x)),
-                _ => DMat4::from_rotation_z(deg(x)),
-            };
-            let op_m = match kind {
-                "translate" if v.len() == 3 => DMat4::from_translation(DVec3::from_slice(&v)),
-                "scale" if v.len() == 1 => DMat4::from_scale(DVec3::splat(v[0])),
-                "scale" if v.len() == 3 => DMat4::from_scale(DVec3::from_slice(&v)),
-                "translateX" if v.len() == 1 => DMat4::from_translation(DVec3::X * v[0]),
-                "translateY" if v.len() == 1 => DMat4::from_translation(DVec3::Y * v[0]),
-                "translateZ" if v.len() == 1 => DMat4::from_translation(DVec3::Z * v[0]),
-                "scaleX" if v.len() == 1 => DMat4::from_scale(DVec3::new(v[0], 1.0, 1.0)),
-                "scaleY" if v.len() == 1 => DMat4::from_scale(DVec3::new(1.0, v[0], 1.0)),
-                "scaleZ" if v.len() == 1 => DMat4::from_scale(DVec3::new(1.0, 1.0, v[0])),
-                "rotateX" if v.len() == 1 => axis('X', v[0]),
-                "rotateY" if v.len() == 1 => axis('Y', v[0]),
-                "rotateZ" if v.len() == 1 => axis('Z', v[0]),
-                "orient" if v.len() == 4 => DMat4::from_quat(quat(&v).normalize()),
-                "transform" if v.len() == 16 => matrix(&v),
-                "rotateXYZ" | "rotateXZY" | "rotateYXZ" | "rotateYZX" | "rotateZXY"
-                | "rotateZYX"
-                    if v.len() == 3 =>
-                {
-                    // rotateZYX applies Z first, and its value is (x, y, z) whatever the order.
-                    kind[6..].chars().fold(DMat4::IDENTITY, |r, a| {
-                        axis(a, v[usize::from(a as u8 - b'X')]) * r
-                    })
-                }
-                k => return Err(format!("{}: xform op {k}", self.path())),
-            };
-            m *= if invert { op_m.inverse() } else { op_m };
-        }
-        Ok((m, reset))
+    /// The local transform at `time`.
+    pub(super) fn local(&self, time: usd::TimeCode) -> Result<DMat4, String> {
+        let m = self.query.local_transform(time);
+        let m = m.map_err(|e| format!("{}: {e}", self.path))?;
+        Ok(matrix(&m.0))
     }
-}
 
-/// Interpolation of a primvar's values over a mesh.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(super) enum Interp {
-    Constant,
-    Uniform,
-    /// A value per point on the surface's basis.
-    Vertex,
-    /// A value per point, linear over each face.
-    Varying,
-    FaceVarying,
+    /// Whether the local transform starts from the stage, not the parent.
+    pub(super) fn resets(&self) -> bool {
+        self.query.resets_xform_stack()
+    }
 }
 
 /// A primvar's elements (of `width` numbers each), its interpolation and indices.
 pub(super) struct Primvar {
     values: Vec<f64>,
     width: usize,
-    pub(super) interp: Interp,
-    pub(super) indices: Option<Vec<i64>>,
+    pub(super) interp: Interpolation,
+    pub(super) indices: Option<Vec<i32>>,
 }
 
 impl Primvar {
@@ -608,15 +589,26 @@ impl Primvar {
     /// The element for a corner: `point`, `face` and `corner` index into each domain.
     pub(super) fn at(&self, point: usize, face: usize, corner: usize) -> Option<&[f64]> {
         self.get(match self.interp {
-            Interp::Constant => 0,
-            Interp::Uniform => face,
-            Interp::Vertex | Interp::Varying => point,
-            Interp::FaceVarying => corner,
+            Interpolation::Constant => 0,
+            Interpolation::Uniform => face,
+            Interpolation::Vertex | Interpolation::Varying => point,
+            Interpolation::FaceVarying => corner,
         })
     }
 }
 
 impl PrimReader<'_> {
+    /// Primvar `name` (`primvars:name`) of the prim; `None` for a name no primvar has, which
+    /// holds no value, as `GetPrimvar` gives an invalid primvar there.
+    fn geom_primvar(&self, name: &str) -> Result<Option<geom::Primvar>, String> {
+        let api = geom::PrimvarsAPI::from_prim_unchecked(self.prim.clone());
+        match api.primvar(name) {
+            Ok(p) => Ok(Some(p)),
+            Err(openusd_schemas::SchemaError::InvalidPrimvarName { .. }) => Ok(None),
+            Err(e) => Err(format!("{} primvar {name}: {e}", self.path())),
+        }
+    }
+
     /// Primvar `name` (`primvars:name`), or a plain attribute `fallback` with vertex
     /// interpolation; `None` when neither holds values.
     pub(super) fn primvar(
@@ -642,53 +634,63 @@ impl PrimReader<'_> {
         width: usize,
         fallback: Option<&str>,
     ) -> Result<Option<(Primvar, String)>, String> {
-        let full = format!("primvars:{name}");
+        let Some(primvar) = self.geom_primvar(name)? else {
+            return Ok(None);
+        };
+        let full = primvar.attribute().name().to_string();
         let held = |attr: &str| Ok::<_, String>(self.numbers(attr)?.filter(|v| !v.is_empty()));
-        let (values, attr) = match (held(&full)?, fallback) {
-            (Some(v), _) => (v, full.as_str()),
-            (None, Some(f)) => match held(f)? {
-                Some(v) => (v, f),
-                None => return Ok(None),
-            },
-            (None, None) => return Ok(None),
+        let fail = |attr: &str, e: openusd::Error| format!("{} {attr}: {e}", self.path());
+        if let Some(values) = held(&full)? {
+            let interp = primvar.interpolation().map_err(|e| fail(&full, e))?;
+            let indices = primvar.indices(self.time).map_err(|e| fail(&full, e))?;
+            let primvar = Primvar {
+                values,
+                width,
+                interp,
+                indices,
+            };
+            return Ok(Some((primvar, full)));
+        }
+        let Some(f) = fallback else {
+            return Ok(None);
         };
-        let interp = match self.metadata_token(attr, "interpolation").as_deref() {
-            Some("constant") => Interp::Constant,
-            Some("uniform") => Interp::Uniform,
-            Some("faceVarying") => Interp::FaceVarying,
-            Some("varying") => Interp::Varying,
-            // A primvar unauthored is constant; the plain attribute has vertex as its fallback.
-            None if attr == full => Interp::Constant,
-            Some("vertex") | None => Interp::Vertex,
-            Some(i) => return Err(format!("{} {attr}: interpolation {i}", self.path())),
+        let Some(values) = held(f)? else {
+            return Ok(None);
         };
-        let indices = if attr == full {
-            self.ints(&format!("{full}:indices"))?
-        } else {
-            None
-        };
+        // The plain attribute's interpolation falls back to vertex.
+        let interp = self
+            .prim
+            .attribute(f)
+            .metadata::<Interpolation>(geom::tokens::INTERPOLATION)
+            .map_err(|e| fail(f, e))?
+            .unwrap_or(Interpolation::Vertex);
         let primvar = Primvar {
             values,
             width,
             interp,
-            indices,
+            indices: None,
         };
-        Ok(Some((primvar, attr.to_string())))
+        Ok(Some((primvar, f.to_string())))
     }
 
     /// Primvar `name` of tangent frame vectors, as wide as its type declares: three components, or
     /// four where the last is a bitangent sign.
     pub(super) fn frame_primvar(&self, name: &str) -> Result<Option<Primvar>, String> {
-        let full = format!("primvars:{name}");
-        let Some(value) = self.value(&full)? else {
+        let Some(primvar) = self.geom_primvar(name)? else {
             return Ok(None);
         };
-        match element_width(&value).map(|w| w * self.element_size(&full)) {
-            Some(width @ (3 | 4)) => self.primvar(name, width, None),
-            Some(width) => Err(format!(
-                "{} {full}: {width} components, not a vector of three or four",
-                self.path()
-            )),
+        let full = primvar.attribute().name();
+        let Some(value) = self.value(full)? else {
+            return Ok(None);
+        };
+        match element_width(&value) {
+            Some(w) => match w * self.element_size(&primvar)? {
+                width @ (3 | 4) => self.primvar(name, width, None),
+                width => Err(format!(
+                    "{} {full}: {width} components, not a vector of three or four",
+                    self.path()
+                )),
+            },
             None => self.primvar(name, 3, None),
         }
     }
@@ -696,56 +698,64 @@ impl PrimReader<'_> {
     /// Primvar `name` as its elements stand, each as wide as its type and `elementSize` make it.
     /// A last element the array falls short of holds no value.
     pub(super) fn wide_primvar(&self, name: &str) -> Result<Option<Primvar>, String> {
-        let full = format!("primvars:{name}");
-        let Some(value) = self.value(&full)? else {
+        let Some(primvar) = self.geom_primvar(name)? else {
             return Ok(None);
         };
-        let Some(width) = self.stride(&full, &value) else {
+        let Some(value) = self.value(primvar.attribute().name())? else {
+            return Ok(None);
+        };
+        let Some(width) = self.stride(&primvar, &value)? else {
             return Ok(None);
         };
         Ok(self.elements(name, width, None)?.map(|(p, _)| p))
     }
 
-    /// The numbers of one element of attribute `name` holding `value`, if it holds numbers.
-    fn stride(&self, name: &str, value: &vt::Value) -> Option<usize> {
-        let width = element_width(value).or_else(|| numbers(value).map(|v| v.len()))?;
-        Some(width * self.element_size(name))
+    /// The numbers of one element of `primvar` holding `value`, if it holds numbers.
+    fn stride(&self, primvar: &geom::Primvar, value: &vt::Value) -> Result<Option<usize>, String> {
+        let Some(width) = element_width(value).or_else(|| numbers(value).map(|v| v.len())) else {
+            return Ok(None);
+        };
+        Ok(Some(width * self.element_size(primvar)?))
     }
 
     /// Whether primvar `name` holds values.
     pub(super) fn holds_primvar(&self, name: &str) -> Result<bool, String> {
-        let held = self.numbers(&format!("primvars:{name}"))?;
+        let Some(primvar) = self.geom_primvar(name)? else {
+            return Ok(false);
+        };
+        let held = self.numbers(primvar.attribute().name())?;
         Ok(held.is_some_and(|v| !v.is_empty()))
     }
 
-    /// Attribute `name`'s `elementSize`: how many array elements make one of its values.
-    pub(super) fn element_size(&self, name: &str) -> usize {
-        self.prim
-            .attribute(name)
-            .metadata::<vt::Value>("elementSize")
+    /// `primvar`'s `elementSize`: how many array elements make one of its values.
+    fn element_size(&self, primvar: &geom::Primvar) -> Result<usize, String> {
+        let name = primvar.attribute().name();
+        let size = primvar
+            .element_size()
+            .map_err(|e| format!("{} {name}: {e}", self.path()))?;
+        usize::try_from(size)
             .ok()
-            .flatten()
-            .and_then(|v| numbers(&v))
-            .map_or(1, |v| v[0] as usize)
-            .max(1)
+            .filter(|&s| s > 0)
+            .ok_or_else(|| format!("{} {name}: elementSize {size}", self.path()))
     }
 
     /// Primvar `name` as a value for the whole prim, whatever the width of its elements. One
     /// that holds no numbers, or whose index misses its values, gives a reader nothing. The stream
     /// makes room for `reach` times its largest value.
     pub(super) fn whole_primvar(&self, name: &str, reach: f64) -> Result<shading::Primvar, String> {
-        let full = format!("primvars:{name}");
-        let Some(value) = self.value(&full)? else {
+        let Some(primvar) = self.geom_primvar(name)? else {
+            return Ok(shading::Primvar::Missing);
+        };
+        let full = primvar.attribute().name();
+        let Some(value) = self.value(full)? else {
             return Ok(shading::Primvar::Missing);
         };
         let Some(values) = numbers(&value).filter(|v| !v.is_empty()) else {
             return Ok(shading::Primvar::Missing);
         };
-        let width = self.stride(&full, &value).unwrap_or(values.len());
-        if self
-            .metadata_token(&full, "interpolation")
-            .is_some_and(|i| i != "constant")
-        {
+        let width = self.stride(&primvar, &value)?.unwrap_or(values.len());
+        let fail = |e: openusd::Error| format!("{} {full}: {e}", self.path());
+        if primvar.interpolation().map_err(fail)? != Interpolation::Constant {
             let channels = width.min(4);
             let peak = values
                 .chunks(width)
@@ -759,8 +769,8 @@ impl PrimReader<'_> {
         let primvar = Primvar {
             values,
             width,
-            interp: Interp::Constant,
-            indices: self.ints(&format!("{full}:indices"))?,
+            interp: Interpolation::Constant,
+            indices: primvar.indices(self.time).map_err(fail)?,
         };
         Ok(match primvar.at(0, 0, 0) {
             Some(v) => shading::Primvar::Constant(v.iter().map(|&x| x as f32).collect()),

@@ -1,63 +1,90 @@
-//! UsdShade materials as shading networks: the surface a `Material` prim outputs
-//! (`outputs:mtlx:surface`, else `outputs:surface`), its MaterialX displacement
-//! (`outputs:mtlx:displacement`), and every shader feeding them. Connections pass through
-//! the inputs and outputs of `NodeGraph` and `Material` prims.
+//! UsdShade materials as shading networks: the surface a `Material` prim outputs (its
+//! `mtlx` render context, else the universal one), its MaterialX displacement
+//! (`outputs:mtlx:displacement`), and every shader feeding them. Each input reads what
+//! `UsdShadeUtils::GetValueProducingAttributes` finds for it: a shader output, or a value authored
+//! on the input itself or on the `NodeGraph` or `Material` interface it connects through. An input
+//! that finds nothing keeps its node's default. A texture file is in the color space
+//! `UsdColorSpaceAPI` assigns it.
 
 use std::collections::{BTreeMap, HashMap};
 
 use openusd::{sdf, usd, vt};
+use openusd_schemas::shade::{
+    self, Connectable, ConnectableContext, ProducerFilter, ShadingAttribute,
+};
 
 use super::read::{PrimReader, numbers};
 use crate::shading::{self, Input, Network, Node, Unit};
 
+/// The render context whose terminals a material outputs first.
+const MTLX: &str = "mtlx";
+
 struct Builder<'a> {
-    stage: &'a usd::Stage,
     time: usd::TimeCode,
     /// Loads the image an asset value names; returns its index.
     load: &'a mut dyn FnMut(&sdf::AssetPath) -> usize,
+    spaces: &'a mut usd::ColorSpaceCache,
+    context: ConnectableContext,
     net: Network,
     by_prim: HashMap<String, usize>,
+    /// The material's path, which warnings name.
+    material: String,
+    warnings: Vec<String>,
 }
 
-/// The network of material prim `material`, its surface node and its displacement node.
+/// The network of a material.
+pub(super) struct Shaded {
+    pub(super) net: Network,
+    pub(super) surface: usize,
+    pub(super) displacement: Option<usize>,
+    /// Inputs whose connections reach nothing that gives a value.
+    pub(super) warnings: Vec<String>,
+}
+
+/// The network of `material`. `spaces` keeps the color spaces of the prims it reads.
 pub(super) fn network(
-    stage: &usd::Stage,
+    material: &shade::Material,
     time: usd::TimeCode,
-    material: &sdf::Path,
     load: &mut dyn FnMut(&sdf::AssetPath) -> usize,
-) -> Result<(Network, usize, Option<usize>), String> {
+    spaces: &mut usd::ColorSpaceCache,
+) -> Result<Shaded, String> {
+    let path = material.path().as_str();
     let mut b = Builder {
-        stage,
         time,
         load,
+        spaces,
+        context: ConnectableContext::default(),
         net: Network::default(),
         by_prim: HashMap::new(),
+        material: path.to_string(),
+        warnings: Vec::new(),
     };
-    let prim = stage.prim(material.clone()).map_err(|e| e.to_string())?;
-    let output = |name: &str| -> Result<Option<sdf::Path>, String> {
-        let attr = prim.attribute(name);
-        let targets = attr
-            .connections()
-            .map_err(|e| format!("{material} {name}: {e}"))?;
-        Ok(targets.into_iter().next())
+    let surface = material
+        .surface_source(&[MTLX])
+        .map_err(|e| format!("{path}: {e}"))?
+        .ok_or_else(|| format!("{path} has no surface output"))?;
+    let surface = &surface.sources()[0];
+    let Input::Connect { node: surface, .. } = b.produced(surface.attribute())? else {
+        return Err(format!("{path}: the surface output reads no shader"));
     };
-    // MaterialX outputs first, then the universal render context.
-    let surface = match output("outputs:mtlx:surface")? {
-        Some(t) => Some(t),
-        None => output("outputs:surface")?,
-    };
-    let surface = surface.ok_or_else(|| format!("{material} has no surface output"))?;
-    let Input::Connect { node: surface, .. } = b.source(&surface)? else {
-        return Err(format!("{material}: the surface output reads no shader"));
-    };
-    let displacement = match output("outputs:mtlx:displacement")? {
-        Some(t) => match b.source(&t)? {
+    let displacement = material
+        .displacement_output_for(MTLX)
+        .map_err(|e| format!("{path}: {e}"))?
+        .value_producing_attributes(ProducerFilter::ShaderOutputsOnly)
+        .map_err(|e| format!("{path}: {e}"))?;
+    let displacement = match displacement.first() {
+        Some(producer) => match b.produced(producer)? {
             Input::Connect { node, .. } => Some(node),
             _ => None,
         },
         None => None,
     };
-    Ok((b.net, surface, displacement))
+    Ok(Shaded {
+        net: b.net,
+        surface,
+        displacement,
+        warnings: b.warnings,
+    })
 }
 
 /// The output type of a node definition whose id ends in `suffix`. An `extract` id names the type
@@ -72,40 +99,31 @@ fn output_type<'s>(kind: &str, suffix: &'s str) -> &'s str {
 }
 
 impl Builder<'_> {
-    /// What a connection to property `target` reads.
-    fn source(&mut self, target: &sdf::Path) -> Result<Input, String> {
-        let (prim_path, property) = target
-            .split_property()
-            .ok_or_else(|| format!("connection {target} is not to a property"))?;
-        let property = property.to_string();
-        let prim = self.stage.prim(prim_path).map_err(|e| e.to_string())?;
-        let ty = prim
-            .type_name()
-            .map_err(|e| e.to_string())?
-            .map_or_default(|t| t.as_str().to_string());
-        if ty == "Shader" {
-            let output = property
-                .strip_prefix("outputs:")
-                .ok_or_else(|| format!("connection {target} is not to a shader output"))?;
+    /// What `producer`, an attribute that produces a value, gives: a shader output, or the value
+    /// authored on it.
+    fn produced(&mut self, producer: &ShadingAttribute) -> Result<Input, String> {
+        let attr = producer.attribute();
+        let prim = attr.prim();
+        let path = attr.path();
+        let container = self.context.is_container(&prim);
+        let container = container.map_err(|e| format!("{path}: {e}"))?;
+        if let ShadingAttribute::Output(output) = producer
+            && !container
+        {
             let node = self.shader(&prim)?;
             return Ok(Input::Connect {
                 node,
-                output: output.to_string(),
+                output: output.base_name().to_string(),
             });
-        }
-        // A node graph or material: follow its interface attribute.
-        let attr = prim.attribute(property.as_str());
-        let connections = attr.connections().map_err(|e| format!("{target}: {e}"))?;
-        if let Some(next) = connections.into_iter().next() {
-            return self.source(&next);
         }
         let reader = PrimReader {
             prim: &prim,
             time: self.time,
         };
-        match reader.value(&property)? {
-            Some(v) => self.value(&reader, &property, v),
-            None => Err(format!("{target} has no value or connection")),
+        let name = attr.name();
+        match reader.value(name)? {
+            Some(v) => self.value(&reader, attr, v),
+            None => Err(format!("{path} has no value")),
         }
     }
 
@@ -115,14 +133,13 @@ impl Builder<'_> {
         if let Some(&n) = self.by_prim.get(&path) {
             return Ok(n);
         }
-        let reader = PrimReader {
-            prim,
-            time: self.time,
-        };
-        let id = reader
-            .token("info:id")?
+        let shader = shade::Shader::from_prim_unchecked(prim.clone());
+        let id = shader.node_def().shader_id();
+        let id = id
+            .map_err(|e| format!("{path}: {e}"))?
             .ok_or_else(|| format!("{path}: shader without info:id"))?;
-        let kind = shading::category(&id).to_string();
+        let id = id.as_str();
+        let kind = shading::category(id).to_string();
         let ty = id
             .strip_prefix("ND_")
             .and_then(|r| r.strip_prefix(kind.as_str()))
@@ -137,43 +154,70 @@ impl Builder<'_> {
             inputs: BTreeMap::new(),
         });
         self.by_prim.insert(path.clone(), n);
-        let attrs = prim
-            .authored_attributes_in_namespace("inputs")
-            .map_err(|e| format!("{path}: {e}"))?;
+        let reader = PrimReader {
+            prim,
+            time: self.time,
+        };
         let mut inputs = BTreeMap::new();
-        for attr in attrs {
-            let full = attr.name().to_string();
-            let name = full.trim_start_matches("inputs:").to_string();
-            let connections = attr
-                .connections()
-                .map_err(|e| format!("{path} {full}: {e}"))?;
-            let input = match connections.into_iter().next() {
-                Some(t) => self.source(&t)?,
-                None => match reader.value(&full)? {
-                    Some(vt::Value::AssetPath(a)) if a.asset_path().is_empty() => continue,
-                    Some(v) => self.value(&reader, &full, v)?,
-                    None => continue,
-                },
+        for input in shader
+            .authored_inputs()
+            .map_err(|e| format!("{path}: {e}"))?
+        {
+            let fail =
+                |e: openusd_schemas::SchemaError| format!("{}: {e}", input.attribute().path());
+            let producers = input.value_producing_attributes(ProducerFilter::Any);
+            let Some(producer) = producers.map_err(fail)?.into_iter().next() else {
+                let to = input.attribute().connections();
+                let to = to.map_err(|e| format!("{}: {e}", input.attribute().path()))?;
+                if !to.is_empty() {
+                    let to: Vec<String> = to.iter().map(ToString::to_string).collect();
+                    self.warnings.push(format!(
+                        "material {}: {} connects to {}, which gives no value; it keeps its \
+                         default",
+                        self.material,
+                        input.attribute().path(),
+                        to.join(", ")
+                    ));
+                }
+                continue;
             };
-            inputs.insert(name, input);
+            let value = match &producer {
+                // A value on the input itself, read where the shader stands.
+                ShadingAttribute::Input(own)
+                    if own.attribute().path() == input.attribute().path() =>
+                {
+                    match reader.value(own.attribute().name())? {
+                        Some(vt::Value::AssetPath(a)) if a.asset_path().is_empty() => continue,
+                        Some(v) => self.value(&reader, own.attribute(), v)?,
+                        None => continue,
+                    }
+                }
+                _ => self.produced(&producer)?,
+            };
+            inputs.insert(input.base_name().to_string(), value);
         }
         self.net.nodes[n].inputs = inputs;
         Ok(n)
     }
 
-    /// An authored input value.
+    /// The value `v` of `attr`, which `reader` reads.
     fn value(
         &mut self,
         reader: &PrimReader<'_>,
-        name: &str,
+        attr: &usd::Attribute,
         v: vt::Value,
     ) -> Result<Input, String> {
+        let name = attr.name();
         Ok(match v {
-            vt::Value::AssetPath(a) => Input::Image {
-                image: (self.load)(&a),
-                color_space: reader.metadata_token(name, "colorSpace"),
-                unit: Unit::Unstated,
-            },
+            vt::Value::AssetPath(a) => {
+                let space = usd::ColorSpaceAPI::compute_attribute_name(attr, Some(self.spaces));
+                let space = space.map_err(|e| format!("{} {name}: {e}", reader.path()))?;
+                Input::Image {
+                    image: (self.load)(&a),
+                    color_space: space.map(|s| s.as_str().to_string()),
+                    unit: Unit::Unstated,
+                }
+            }
             vt::Value::Token(t) => Input::Text(t.as_str().to_string()),
             vt::Value::String(s) => Input::Text(s),
             v => Input::Value(

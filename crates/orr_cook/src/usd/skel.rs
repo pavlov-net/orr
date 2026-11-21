@@ -2,7 +2,7 @@
 //! `SkelAnimation`s as its clips.
 //!
 //! Joints keep the skeleton's order, which must list parents first; a joint's parent is its
-//! nearest ancestor path among them, a joint without one being a root. Model space is the
+//! nearest ancestor path among them, a joint without one being a root (`UsdSkelTopology`). Model space is the
 //! stage's (Y up, meters): the root is the skeleton prim's world transform, inverse binds are
 //! those of the bind transforms in model space, and rest transforms come from `restTransforms`
 //! (from the bind transforms without them); [`Skel::settle`] then moves them into a space of
@@ -13,7 +13,8 @@
 //! where the skeleton prim's world transform collapses an axis and has no inverse for the binds
 //! to undo; the mesh prim's own transform is not used, as UsdSkel specifies. A mesh's
 //! `skel:joints` maps its joint indices to skeleton joints by name; that, `geomBindTransform`
-//! and the joint influences inherit, as [`SkinSource`] says. An animation that names one of
+//! and the joint influences, flattened through their indices, inherit as `UsdSkelCache` resolves
+//! them ([`usd_skel::SkinningQuery`]). An animation that names one of
 //! the joints is a clip, named after its prim (by its index among the skeleton's animations
 //! when the name is shared): at each time any of its attributes is sampled, the authored
 //! joints' local transforms, sampled linearly between those times (rotations by slerp). At a
@@ -33,17 +34,21 @@
 use std::collections::HashMap;
 
 use openusd::usd;
-use orr_math::{Affine3, DMat3, DMat4, DVec3, DVec4};
+use openusd_schemas::skel::{self as usd_skel, SkeletonSchema};
+use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec3, DVec4};
 use orr_pack::skeleton::{MAX_SKINNED_JOINTS, NO_PARENT, SkeletonInfo, Trs};
 
 use super::Timeline;
 use super::mesh::Influence;
-use super::read::{PrimReader, matrix, quat};
+use super::read::{PrimReader, matrix};
 use crate::import::{collapses, singular};
 use crate::skin::{self, Channel, ClipSource, Interpolation, Property, RigSpace};
 
-/// The attributes of a `SkelAnimation` that pose its joints.
-pub(super) const ANIMATED: [&str; 3] = ["translations", "rotations", "scales"];
+/// The query of `SkelAnimation` prim `anim`.
+pub(super) fn anim_query(anim: &usd::Prim) -> Result<usd_skel::AnimQuery, String> {
+    let anim_view = usd_skel::Animation::from_prim_unchecked(anim.clone());
+    usd_skel::AnimQuery::new(anim_view).map_err(|e| format!("{}: {e}", anim.path().as_str()))
+}
 
 pub(super) struct Skel {
     pub(super) info: SkeletonInfo,
@@ -64,20 +69,6 @@ pub(super) struct Skel {
     /// Per joint, the joint's bind space from model space, which [`Self::settle`] puts in
     /// `info`.
     inverse_binds: Vec<DMat4>,
-}
-
-/// The prims a mesh's skinning attributes come from: its own, or the nearest ancestor's up to
-/// its `SkelRoot` that authors the attribute and applies `SkelBindingAPI`.
-pub(super) struct SkinSource<'a> {
-    pub(super) joints: Option<PrimReader<'a>>,
-    pub(super) indices: PrimReader<'a>,
-    pub(super) weights: PrimReader<'a>,
-    pub(super) geom_bind: Option<PrimReader<'a>>,
-}
-
-/// The path above joint path `joint`.
-fn above(joint: &str) -> Option<&str> {
-    joint.rsplit_once('/').map(|a| a.0)
 }
 
 /// A skeleton of prims.
@@ -172,26 +163,23 @@ impl Skel {
         if !to_model.as_mat4().is_finite() {
             return Err(format!("{path}: its world transform is not finite"));
         }
-        let joints = r.tokens("joints")?;
+        let fail = |e: openusd::Error| format!("{path}: {e}");
+        let skeleton = usd_skel::Skeleton::from_prim_unchecked(r.prim.clone());
+        let joints = skeleton.joint_paths().map_err(fail)?;
         if joints.is_empty() || joints.len() > MAX_SKINNED_JOINTS {
             return Err(format!(
                 "{path}: {} joints; 1 to {MAX_SKINNED_JOINTS}",
                 joints.len()
             ));
         }
-        let mats = |name: &str| -> Result<Option<Vec<DMat4>>, String> {
-            let Some(v) = r.numbers(name)? else {
+        let mats = |name: &str, held: Option<Vec<openusd::gf::Mat4d>>| {
+            let Some(v) = held else {
                 return Ok(None);
             };
-            if v.len() != 16 * joints.len() {
+            if v.len() != joints.len() {
                 return Err(format!("{path} {name}: not one matrix per joint"));
             }
-            let m: Vec<DMat4> = v
-                .as_chunks::<16>()
-                .0
-                .iter()
-                .map(DMat4::from_cols_array)
-                .collect();
+            let m: Vec<DMat4> = v.iter().map(|m| matrix(&m.0)).collect();
             if !m
                 .iter()
                 .all(|m| m.is_finite() && m.row(3).abs_diff_eq(DVec4::W, 1e-5))
@@ -200,23 +188,19 @@ impl Skel {
             }
             Ok(Some(m))
         };
-        let binds = mats("bindTransforms")?.ok_or_else(|| format!("{path}: no bindTransforms"))?;
+        let binds = mats("bindTransforms", skeleton.bind_transforms().map_err(fail)?)?
+            .ok_or_else(|| format!("{path}: no bindTransforms"))?;
         let by_name: HashMap<String, u16> = joints
             .iter()
             .enumerate()
             .map(|(i, j)| (j.clone(), i as u16))
             .collect();
-        let mut parents = Vec::with_capacity(joints.len());
-        for (i, j) in joints.iter().enumerate() {
-            let parent = std::iter::successors(above(j), |p| above(p))
-                .find_map(|a| by_name.get(a).copied())
-                .unwrap_or(NO_PARENT);
-            if parent != NO_PARENT && usize::from(parent) >= i {
-                return Err(format!("{path}: joint {j} comes before its parent"));
-            }
-            parents.push(parent);
-        }
-        let rest = match mats("restTransforms")? {
+        let topology = usd_skel::Topology::from_joint_paths(&joints);
+        topology.validate().map_err(|e| format!("{path}: {e}"))?;
+        let parents: Vec<u16> = (0..joints.len())
+            .map(|i| topology.parent(i).map_or(NO_PARENT, |p| p as u16))
+            .collect();
+        let rest = match mats("restTransforms", skeleton.rest_transforms().map_err(fail)?)? {
             Some(r) => r,
             None => Vec::from_fn(joints.len(), |i| match parents[i] {
                 NO_PARENT => binds[i],
@@ -236,10 +220,7 @@ impl Skel {
             parents,
             rest: Vec::with_capacity(joints.len()),
             inverse_binds: Vec::new(),
-            names: joints
-                .iter()
-                .map(|j| j.rsplit('/').next().unwrap_or(j).to_string())
-                .collect(),
+            names: skeleton.joint_short_names().map_err(fail)?,
         };
         let mut inverse_binds = Vec::with_capacity(joints.len());
         for i in 0..joints.len() {
@@ -330,20 +311,19 @@ impl Skel {
         )
     }
 
-    /// Skin influences per point of a bound mesh `path`, and bind space from its points.
+    /// Skin influences per point of mesh `path`, which binds `bound`, and bind space from its
+    /// points at `time`.
     pub(super) fn binding(
         &self,
         path: &str,
-        source: &SkinSource<'_>,
+        bound: &super::Bound,
         points: usize,
+        time: usd::TimeCode,
     ) -> Result<(Vec<Influence>, DMat4), String> {
-        let joints = match &source.joints {
-            Some(r) => r.tokens("skel:joints")?,
-            None => Vec::new(),
-        };
-        let map: Vec<u16> = match joints.as_slice() {
-            [] => (self.first..self.first + self.joints.len() as u16).collect(),
-            names => names
+        let query = &bound.query;
+        let map: Vec<u16> = match query.joint_order() {
+            None => (self.first..self.first + self.joints.len() as u16).collect(),
+            Some(names) => names
                 .iter()
                 .map(|n| {
                     self.by_name
@@ -353,32 +333,10 @@ impl Skel {
                 })
                 .collect::<Result<_, _>>()?,
         };
-        let r = &source.indices;
-        let indices = r
-            .numbers("primvars:skel:jointIndices")?
-            .ok_or_else(|| format!("{path}: no primvars:skel:jointIndices"))?;
-        let weights = source
-            .weights
-            .numbers("primvars:skel:jointWeights")?
-            .ok_or_else(|| format!("{path}: no primvars:skel:jointWeights"))?;
-        if indices.len() != weights.len() {
-            return Err(format!(
-                "{path}: joint indices and weights differ in length"
-            ));
-        }
-        let size = r.element_size("primvars:skel:jointIndices");
-        // A primvar unauthored is constant, unless it holds more than one element's influences.
-        let constant = match r.metadata_token("primvars:skel:jointIndices", "interpolation") {
-            Some(i) => i == "constant",
-            None => indices.len() == size,
-        };
+        let constant = query.is_rigidly_deformed();
+        let size = query.influences_per_component();
         let elements = if constant { 1 } else { points };
-        if indices.len() != elements * size {
-            return Err(format!(
-                "{path}: {} joint influences for {elements} elements of {size}",
-                indices.len()
-            ));
-        }
+        let (indices, weights) = &bound.influences;
         // Influences in sets of four, as glTF's JOINTS_n/WEIGHTS_n.
         let sets = size.div_ceil(4);
         let mut influence_sets: Vec<skin::InfluenceSet> = Vec::with_capacity(sets);
@@ -392,8 +350,8 @@ impl Skel {
                     let i = 4 * s + k;
                     if i < size {
                         let index = indices[e * size + i];
-                        w[k] = weights[e * size + i] as f32;
-                        if index < 0.0 && w[k] != 0.0 {
+                        w[k] = weights[e * size + i];
+                        if index < 0 && w[k] != 0.0 {
                             return Err(format!("{path}: joint index {index}"));
                         }
                         j[k] = index as u16;
@@ -416,15 +374,9 @@ impl Skel {
         } else {
             influences
         };
-        let bind = match &source.geom_bind {
-            Some(r) => r.value("primvars:skel:geomBindTransform")?,
-            None => None,
-        };
-        let geom_bind = match bind {
-            Some(openusd::vt::Value::Matrix4d(m)) => matrix(&m.0),
-            _ => DMat4::IDENTITY,
-        };
-        Ok((influences, self.to_bind * geom_bind))
+        let geom_bind = query.geom_bind_transform(time);
+        let geom_bind = geom_bind.map_err(|e| format!("{path}: {e}"))?;
+        Ok((influences, self.to_bind * matrix(&geom_bind.0)))
     }
 
     /// The clip of one animation prim beside the channels `xforms` of the prims above, over the
@@ -438,25 +390,14 @@ impl Skel {
         space: &RigSpace,
     ) -> Result<Option<ClipSource>, String> {
         let path = anim.path().as_str().to_string();
-        let names = PrimReader {
-            prim: anim,
-            time: usd::TimeCode::new(0.0),
-        }
-        .tokens("joints")?;
+        let query = anim_query(anim)?;
+        let names = query.joint_order();
         let joints: Vec<Option<u16>> = names.iter().map(|n| self.by_name.get(n).copied()).collect();
         if joints.iter().all(Option::is_none) {
             return Ok(None);
         }
-        let mut times: Vec<f64> = Vec::new();
-        for a in ANIMATED {
-            times.extend(
-                anim.attribute(a)
-                    .time_sample_times()
-                    .map_err(|e| format!("{path} {a}: {e}"))?,
-            );
-        }
-        times.sort_by(f64::total_cmp);
-        times.dedup();
+        let fail = |e: openusd::Error| format!("{path}: {e}");
+        let times = query.joint_transform_time_samples().map_err(fail)?;
         if times.is_empty() {
             return Ok(None);
         }
@@ -464,36 +405,37 @@ impl Skel {
         let mut keys: Vec<Vec<Trs>> = Vec::with_capacity(times.len());
         let mut valid = false;
         for &t in &times {
-            let r = PrimReader {
-                prim: anim,
-                time: usd::TimeCode::new(t),
-            };
-            let read = |a: &str, k: usize| -> Result<Option<Vec<f64>>, String> {
-                Ok(r.numbers(a)?.filter(|v| v.len() == n * k))
-            };
-            let trs = (
-                read("translations", 3)?,
-                read("rotations", 4)?,
-                read("scales", 3)?,
-            );
+            let trs = query.joint_transform_components(usd::TimeCode::new(t));
+            let trs = trs
+                .map_err(fail)?
+                .filter(|(tr, ro, sc)| tr.len() == n && ro.len() == n && sc.len() == n);
             let mut locals = Vec::with_capacity(n);
             for (i, j) in joints.iter().enumerate() {
                 let Some(j) = *j else {
                     locals.push(Trs::IDENTITY);
                     continue;
                 };
-                let three = |v: &[f64]| std::array::from_fn(|k| v[3 * i + k] as f32);
                 locals.push(match &trs {
-                    (Some(tr), Some(ro), Some(sc)) => Trs {
-                        rotation: quat(&ro[4 * i..]).normalize().as_quat().to_array(),
-                        translation: space.translation(&self.info, usize::from(j), three(tr)),
-                        scale: three(sc),
-                        shear: [0.0; 3],
-                    },
-                    _ => self.info.rest[usize::from(j)],
+                    Some((tr, ro, sc)) => {
+                        let q = ro[i];
+                        let rotation = DQuat::from_xyzw(
+                            f64::from(q.x),
+                            f64::from(q.y),
+                            f64::from(q.z),
+                            f64::from(q.w),
+                        );
+                        let translation = <[f32; 3]>::from(tr[i]);
+                        Trs {
+                            rotation: rotation.normalize().as_quat().to_array(),
+                            translation: space.translation(&self.info, usize::from(j), translation),
+                            scale: <[f32; 3]>::from(sc[i]),
+                            shear: [0.0; 3],
+                        }
+                    }
+                    None => self.info.rest[usize::from(j)],
                 });
             }
-            valid |= matches!(&trs, (Some(_), Some(_), Some(_)));
+            valid |= trs.is_some();
             keys.push(locals);
         }
         if !valid {

@@ -1,6 +1,7 @@
 //! USD behavior clause by clause. Each row cites the text it holds the importer to:
 //! `xformOp.h`, `xformable.h`, `mesh.h`, `primvar.h`, `pointBased.h`, `pointInstancer.h` (PI),
-//! `overview.dox` in usdGeom, `bindingAPI.h` and `schemas.dox` in usdSkel, and
+//! `overview.dox` and `schema.usda` in usdGeom, `bindingAPI.h`, `cache.h` and `schemas.dox` in
+//! usdSkel, `materialBindingAPI.h` and `connectableAPI.h` in usdShade, the AOUSD core spec, and
 //! `spec_usdpreviewsurface.rst` (PS), all as OpenUSD's `release` branch has them.
 
 #[allow(dead_code)]
@@ -300,7 +301,7 @@ fn xform_ops_compose_as_listed() {
         (
             "ops-before-reset-dropped",
             r#"double3 xformOp:translate = (9, 9, 9)
-    float xformOp:scale:after = 2
+    float3 xformOp:scale:after = (2, 2, 2)
     uniform token[] xformOpOrder = ["xformOp:translate", "!resetXformStack!", "xformOp:scale:after"]"#,
             [2.0, 0.0, 0.0],
         ),
@@ -341,6 +342,38 @@ fn polygonal_meshes_without_normals_are_faceted() {
             "{scheme}: {mesh:?}"
         );
     }
+}
+
+/// `mesh.h` declares `interpolateBoundary`, `faceVaryingLinearInterpolation` and
+/// `triangleSubdivisionRule` varying, so each reads at the time the stage is read: the cage that
+/// samples them shares the rules of the one that states them, as every cage of a model must.
+#[test]
+fn varying_subdivision_rules_read_at_the_time_read() {
+    let cage = |name: &str, rules: &str| {
+        format!(
+            r#"def Mesh "{name}"
+{{
+    int[] faceVertexCounts = [4]
+    int[] faceVertexIndices = [0, 1, 2, 3]
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)]
+    {rules}
+}}"#
+        )
+    };
+    let stated = r#"token interpolateBoundary = "edgeOnly"
+    token faceVaryingLinearInterpolation = "all"
+    token triangleSubdivisionRule = "smooth""#;
+    let sampled = r#"token interpolateBoundary.timeSamples = { 1: "edgeOnly" }
+    token faceVaryingLinearInterpolation.timeSamples = { 1: "all" }
+    token triangleSubdivisionRule.timeSamples = { 1: "smooth" }"#;
+    let body = format!("{}\n{}", cage("A", stated), cage("B", sampled));
+    let settings = UsdSettings {
+        subdivision: Subdivision::Cage,
+        time: Some(1.0),
+        ..Default::default()
+    };
+    let a = cook_at(&dir("sampled-subd-rules"), &body, settings);
+    assert!(a.is_ok_and(|a| has(&a, "u/subd")));
 }
 
 /// `primvar.h`: "Return the Primvar's interpolation, which is UsdGeomTokens->constant if
@@ -828,7 +861,8 @@ def PointInstancer "I"
 
 /// `overview.dox`: "A prim that is Imageable with an authored opinion about its purpose will
 /// always have the same effective purpose as its authored value"; a non-Imageable prim's opinion
-/// is ignored, and what isn't authored comes from the closest Imageable ancestor.
+/// is ignored, and what isn't authored comes from the closest Imageable ancestor. VisibilityAPI
+/// `renderVisibility` "controls visibility for geometry with purpose "render"".
 #[test]
 fn purpose_is_the_nearest_opinion_on_an_imageable_prim() {
     let mesh = |purpose: &str| format!("def Mesh \"M\" {{\n{TRIANGLE}\n{purpose}\n}}");
@@ -861,6 +895,22 @@ fn purpose_is_the_nearest_opinion_on_an_imageable_prim() {
                 mesh("")
             ),
             false,
+        ),
+        (
+            "render-visibility",
+            format!(
+                "def Xform \"A\" (\n prepend apiSchemas = [\"VisibilityAPI\"]\n)\n{{\n uniform token renderVisibility = \"invisible\"\n{}\n}}",
+                mesh("uniform token purpose = \"render\"")
+            ),
+            false,
+        ),
+        (
+            "render-visibility-default-purpose",
+            format!(
+                "def Xform \"A\" (\n prepend apiSchemas = [\"VisibilityAPI\"]\n)\n{{\n uniform token renderVisibility = \"invisible\"\n{}\n}}",
+                mesh("")
+            ),
+            true,
         ),
     ];
     for (name, body, drawn) in rows {
@@ -930,7 +980,9 @@ fn skinning_properties_inherit_from_binding_ancestors() {
     {{
         {attributes}
 
-        def Mesh "Body"
+        def Mesh "Body" (
+            prepend apiSchemas = ["SkelBindingAPI"]
+        )
         {{
             {TRIANGLE}
             rel skel:skeleton = </Hero/Rig>
@@ -1001,13 +1053,17 @@ fn skinning_properties_inherit_from_binding_ancestors() {
 /// A skinned triangle under `SkelRoot` `Hero` at `root`, with `prims` beside the skeleton.
 fn skinned(root: &str, prims: &str) -> String {
     format!(
-        r#"def SkelRoot "Hero"
+        r#"def SkelRoot "Hero" (
+    prepend apiSchemas = ["SkelBindingAPI"]
+)
 {{
     {root}
     {RIG}
     {prims}
 
-    def Mesh "Body"
+    def Mesh "Body" (
+        prepend apiSchemas = ["SkelBindingAPI"]
+    )
     {{
         {TRIANGLE}
         rel skel:skeleton = </Hero/Rig>
@@ -1031,6 +1087,17 @@ fn joint_influences_without_interpolation_are_constant() {
     );
     let joints = joints_of(&a, &ModelName::source("Hero").mesh("u"));
     assert_eq!(joints, [1, 1, 1]);
+
+    // Constant influences of a run per point hold more than one run: `ComputeJointInfluences`
+    // gives none, and the mesh cooks static.
+    let a = cook(
+        "skel-unauthored-interpolation-per-point",
+        &skinned("", "")
+            .replace("interpolation = \"constant\"", "")
+            .replace("= [1] (", "= [1, 1, 1] ("),
+    );
+    assert!(!has(&a, &ModelName::source("Hero").skeleton("u")));
+    assert!(has(&a, "u/mesh"));
 }
 
 /// `schemas.dox`: "An animation source is only valid if its translation, rotation, and scale
@@ -1079,7 +1146,10 @@ fn an_animation_source_inherits_down_to_the_binding_site() {
         "def SkelAnimation \"Wave\"\n{{\n uniform token[] joints = [\"Root\"]\n {TRANSLATIONS}\n {ROTATIONS}\n {SCALES}\n}}"
     );
     let source = "rel skel:animationSource = </Wave>";
-    let above = format!("def Xform \"Above\"\n{{\n{source}\n{}\n}}", skinned("", ""));
+    let above = format!(
+        "def Xform \"Above\" (\n prepend apiSchemas = [\"SkelBindingAPI\"]\n)\n{{\n{source}\n{}\n}}",
+        skinned("", "")
+    );
     for (name, body) in [
         (
             "above-the-root",
@@ -1092,12 +1162,16 @@ fn an_animation_source_inherits_down_to_the_binding_site() {
 {{
     {RIG}
 
-    def Xform "Site"
+    def Xform "Site" (
+        prepend apiSchemas = ["SkelBindingAPI"]
+    )
     {{
         {source}
         rel skel:skeleton = </Hero/Rig>
 
-        def Mesh "Body"
+        def Mesh "Body" (
+            prepend apiSchemas = ["SkelBindingAPI"]
+        )
         {{
             {TRIANGLE}
             {INFLUENCES}
@@ -1141,7 +1215,9 @@ fn a_skinned_mesh_outside_a_skel_root_is_static() {
 {{
     {RIG}
 
-    def Mesh "Body"
+    def Mesh "Body" (
+        prepend apiSchemas = ["SkelBindingAPI"]
+    )
     {{
         double3 xformOp:translate = (0, 3, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
@@ -1157,6 +1233,134 @@ fn a_skinned_mesh_outside_a_skel_root_is_static() {
             .iter()
             .any(|c| c.0.abs_diff_eq(Vec3::new(0.0, 4.0, 0.0), 1e-3))
     );
+}
+
+/// `cache.h`: population "resolves inherited skel bindings set using the UsdSkelBindingAPI", so
+/// a mesh that states its binding without the schema applied binds nothing.
+#[test]
+fn a_binding_without_skel_binding_api_binds_nothing() {
+    let body = skinned("", "").replace("prepend apiSchemas = [\"SkelBindingAPI\"]", "");
+    let a = cook("skel-no-binding-api", &body);
+    assert!(!has(&a, &ModelName::source("Hero").skeleton("u")));
+    assert!(has(&a, "u/mesh"), "the mesh cooks static");
+}
+
+/// `materialBindingAPI.h`: a binding's `bindMaterialAs` is `weakerThanDescendants` when not
+/// authored, and `strongerThanDescendants` makes an ancestor's binding win over the bindings
+/// below it, a `materialBind` subset's among them.
+#[test]
+fn a_stronger_ancestor_binding_wins_over_its_descendants() {
+    let surface = |name: &str| {
+        format!(
+            r#"def Material "{name}"
+{{
+    token outputs:surface.connect = </{name}/S.outputs:surface>
+    def Shader "S"
+    {{
+        uniform token info:id = "UsdPreviewSurface"
+        token outputs:surface
+    }}
+}}"#
+        )
+    };
+    let bound = |strength: &str| {
+        let body = format!(
+            r#"{}
+{}
+def Xform "A" (
+    prepend apiSchemas = ["MaterialBindingAPI"]
+)
+{{
+    rel material:binding = </Outer>{strength}
+    def Mesh "M" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {{
+        {TRIANGLE}
+        rel material:binding = </Inner>
+        def GeomSubset "Face" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {{
+            uniform token elementType = "face"
+            uniform token familyName = "materialBind"
+            int[] indices = [0]
+            rel material:binding = </Inner>
+        }}
+    }}
+}}"#,
+            surface("Outer"),
+            surface("Inner")
+        );
+        let a = cook(&format!("binding-{}", strength.is_empty()), &body);
+        let named = |p: &str| {
+            has(
+                &a,
+                &MaterialName::new(MaterialBase::Path(p.into())).entry("u"),
+            )
+        };
+        (named("/Outer"), named("/Inner"))
+    };
+    assert_eq!(bound(""), (false, true));
+    let stronger = " (
+        bindMaterialAs = \"strongerThanDescendants\"
+    )";
+    assert_eq!(bound(stronger), (true, false));
+}
+
+/// `subset.h`: a `materialBind` subset binds the faces it lists, here on an instanceable mesh,
+/// whose subset stands under it as an instance proxy of the referenced source's.
+#[test]
+fn an_instanceable_meshs_subset_binds_its_faces() {
+    let surface = |name: &str| {
+        format!(
+            r#"def Material "{name}"
+{{
+    token outputs:surface.connect = </{name}/S.outputs:surface>
+    def Shader "S"
+    {{
+        uniform token info:id = "UsdPreviewSurface"
+        token outputs:surface
+    }}
+}}"#
+        )
+    };
+    let body = format!(
+        r#"{}
+{}
+class Mesh "Source" (
+    prepend apiSchemas = ["MaterialBindingAPI"]
+)
+{{
+    {TRIANGLE}
+    rel material:binding = </Plain>
+    def GeomSubset "S" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {{
+        uniform token elementType = "face"
+        uniform token familyName = "materialBind"
+        int[] indices = [0]
+        rel material:binding = </Red>
+    }}
+}}
+def Mesh "IM" (
+    instanceable = true
+    prepend references = </Source>
+)
+{{
+}}"#,
+        surface("Plain"),
+        surface("Red")
+    );
+    let a = cook("instanceable-subset", &body);
+    let named = |p: &str| {
+        has(
+            &a,
+            &MaterialName::new(MaterialBase::Path(p.into())).entry("u"),
+        )
+    };
+    assert!(named("/Red"));
 }
 
 /// A triangle bound to `Material` `M`, whose `UsdPreviewSurface` holds `inputs`, beside `prims`.
@@ -1200,6 +1404,7 @@ fn texture(name: &str, inputs: &str) -> String {
         float4 outputs:rgba
         float outputs:r
         float outputs:g
+        float outputs:a
         float3 outputs:rgb
     }}"#
     )
@@ -3797,23 +4002,65 @@ fn the_color_space_holds_for_every_input_of_the_file() {
     }
 }
 
-/// `colorSpace` metadata on the file names its space where `sourceColorSpace` leaves it to `auto`,
-/// and a `sourceColorSpace` authored over `auto` stands. This project's rule: PS doesn't mention
-/// the metadata, and `UsdAttribute::GetColorSpace` states what it means.
+/// `UsdImagingDataSourceAttributeColorSpace` reads a `UsdUVTexture` file by its authored
+/// `inputs:sourceColorSpace`, `auto` included, and by the file's `colorSpace` metadata only where
+/// that input is unauthored. PS `auto` reads what the image file states: here 8 bits of RGB with
+/// no tag, so sRGB.
 #[test]
-fn file_metadata_stands_in_for_auto() {
+fn file_metadata_stands_in_for_an_unauthored_source_space() {
     let image = tagged::flat_rgb([128; 3], &[]);
     let srgb = orr_color::srgb_decode(128.0 / 255.0) as f32;
-    for (space, want) in [("auto", 128.0 / 255.0), ("sRGB", srgb)] {
-        let body = read_through("diffuseColor", "color3f", "rgb", space).replace(
-            "@tex.png@",
-            "@tex.png@ (
+    for (space, want) in [("auto", srgb), ("sRGB", srgb), ("", 128.0 / 255.0)] {
+        let body = read_through("diffuseColor", "color3f", "rgb", "auto")
+            .replace(
+                "token inputs:sourceColorSpace = \"auto\"",
+                &match space {
+                    "" => String::new(),
+                    s => format!("token inputs:sourceColorSpace = \"{s}\""),
+                },
+            )
+            .replace(
+                "@tex.png@",
+                "@tex.png@ (
  colorSpace = \"lin_rec709_scene\"
 )",
+            );
+        let name = format!(
+            "metadata_{}",
+            if space.is_empty() {
+                "unauthored"
+            } else {
+                space
+            }
+            .to_lowercase()
         );
-        let name = format!("metadata_{}", space.to_lowercase());
         let got = material(&shaded(&name, &body, &image)).base_color[0];
         assert!((got - want).abs() < 2e-3, "{space}: {got}, not {want}");
+    }
+}
+
+/// AOUSD core 1.0.1 14.4.2: `colorSpace:name` "will set the source color space for all color
+/// attributes and color-containing assets in the prim", and 14.4.3: one without a color space of
+/// its own searches "up the hierarchy until a prim with ColorSpaceAPI is found". So a material's
+/// space reaches the file of a texture inside it whose `sourceColorSpace` is unauthored, as
+/// `UsdImagingDataSourceAttributeColorSpace` reads a `UsdUVTexture` file.
+#[test]
+fn an_inherited_color_space_stands_in_for_an_unauthored_source_space() {
+    let image = tagged::flat_rgb([128; 3], &[]);
+    let srgb = orr_color::srgb_decode(128.0 / 255.0) as f32;
+    let named = "{\n    uniform token colorSpace:name = \"lin_rec709_scene\"";
+    let applied = "(\n    prepend apiSchemas = [\"ColorSpaceAPI\"]\n)\n";
+    // A prim that names a space without the schema applied names none.
+    for (api, want) in [(applied, 128.0 / 255.0), ("", srgb)] {
+        let body = read_through("diffuseColor", "color3f", "rgb", "auto")
+            .replace("token inputs:sourceColorSpace = \"auto\"", "")
+            .replace(
+                "def Material \"M\"\n{",
+                &format!("def Material \"M\" {api}{named}"),
+            );
+        let name = format!("inherited_space_{}", api.is_empty());
+        let got = material(&shaded(&name, &body, &image)).base_color[0];
+        assert!((got - want).abs() < 2e-3, "{api}: {got}, not {want}");
     }
 }
 
@@ -4134,7 +4381,9 @@ fn an_xform_above_a_skeleton_moves_its_skin() {
     def SkelRoot "Hero"
     {{
         {RIG}
-        def Mesh "Body"
+        def Mesh "Body" (
+            prepend apiSchemas = ["SkelBindingAPI"]
+        )
         {{
             {TRIANGLE}
             rel skel:skeleton = </Mover/Hero/Rig>
@@ -4237,7 +4486,9 @@ fn a_thin_turned_bind_keeps_the_points_off_its_plane() {
         uniform token[] joints = ["Root"]
         uniform matrix4d[] bindTransforms = [{bind}]
     }}
-    def Mesh "Body"
+    def Mesh "Body" (
+        prepend apiSchemas = ["SkelBindingAPI"]
+    )
     {{
         {TRIANGLE}
         rel skel:skeleton = </Hero/Rig>
@@ -4285,7 +4536,9 @@ fn a_skinned_prototype_is_a_model_placed_per_copy() {
     def SkelRoot "Hero"
     {{
         {RIG}
-        def Mesh "Body"
+        def Mesh "Body" (
+            prepend apiSchemas = ["SkelBindingAPI"]
+        )
         {{
             {TRIANGLE}
             rel skel:skeleton = </Crowd/Hero/Rig>
@@ -4358,7 +4611,9 @@ fn each_skeleton_binding_under_a_root_is_a_model() {
     {{
         rel skel:skeleton = </Crowd/{skeleton}>
         rel skel:animationSource = </Crowd/{anim}>
-        def Mesh "M"
+        def Mesh "M" (
+            prepend apiSchemas = ["SkelBindingAPI"]
+        )
         {{
             {TRIANGLE}
             {INFLUENCES}
@@ -4429,7 +4684,9 @@ fn a_prototype_whose_copies_all_flatten_stays_skinned() {
             {ROTATIONS}
             half3[] scales = [(1, 1, 1)]
         }}
-        def Mesh "Body"
+        def Mesh "Body" (
+            prepend apiSchemas = ["SkelBindingAPI"]
+        )
         {{
             {TRIANGLE}
             rel skel:skeleton = </Crowd/Hero/Rig>
@@ -4475,7 +4732,9 @@ fn what_moves_in_a_skinned_prototype_moves() {
             uniform token[] xformOpOrder = ["xformOp:translate"]
             {RIG}
         }}
-        def Mesh "Body"
+        def Mesh "Body" (
+            prepend apiSchemas = ["SkelBindingAPI"]
+        )
         {{
             {TRIANGLE}
             rel skel:skeleton = </Crowd/Hero/Lift/Rig>
@@ -4540,7 +4799,9 @@ fn binding_prims_of_one_name_and_a_drawn_prototype_each_keep_a_model() {
         )
         {{
             rel skel:skeleton = </Hero/Rig>
-            def Mesh "M"
+            def Mesh "M" (
+                prepend apiSchemas = ["SkelBindingAPI"]
+            )
             {{
                 {TRIANGLE}
                 {INFLUENCES}
@@ -4683,7 +4944,9 @@ fn a_skeleton_outside_a_prototype_is_seen_from_its_first_copy() {
         {{
             double3 xformOp:translate = (0, 9, 0)
             uniform token[] xformOpOrder = ["xformOp:translate"]
-            def Mesh "Body"
+            def Mesh "Body" (
+                prepend apiSchemas = ["SkelBindingAPI"]
+            )
             {{
                 {TRIANGLE}
                 rel skel:skeleton = </Root/Rig>
@@ -4757,7 +5020,9 @@ fn a_moving_prototype_root_hangs_its_skeleton_in_the_model() {
             double3 xformOp:translate.timeSamples = {{ 0: (0, 0, 0), 10: (0, 3, 0) }}
             uniform token[] xformOpOrder = ["xformOp:translate"]
             {RIG}
-            def Mesh "Body"
+            def Mesh "Body" (
+                prepend apiSchemas = ["SkelBindingAPI"]
+            )
             {{
                 {TRIANGLE}
                 rel skel:skeleton = </Group/Crowd/Hero/Rig>
@@ -4890,7 +5155,9 @@ fn skinned_copies_under_a_moving_prim_share_their_skeleton() {
         r#"def SkelRoot "Hero"
         {{
             {RIG}
-            def Mesh "Body"
+            def Mesh "Body" (
+                prepend apiSchemas = ["SkelBindingAPI"]
+            )
             {{
                 {TRIANGLE}
                 rel skel:skeleton = </Mover/Crowd/Hero/Rig>

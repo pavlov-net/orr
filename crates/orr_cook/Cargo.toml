@@ -32,8 +32,9 @@ meshopt.workspace = true
 # buffers and faults them in again on the next job. Exact pin: it builds its C sources.
 mimalloc = { version = "=0.1.52", default-features = false }
 moxcms = "0.9"
-# Exact pin: no stable API before 1.0, and its composition shapes cooked meshes.
+# Exact pins: no stable API before 1.0, and their composition and schema logic shape cooked meshes.
 openusd = "=0.9.0"
+openusd-schemas = { version = "=0.9.0", features = ["geom", "lux", "media", "physics", "proc", "shade", "skel", "vol"] }
 orr_math.workspace = true
 percent-encoding = "2.3"
 png.workspace = true

@@ -3,8 +3,8 @@
 //! Every value converts as the UsdLux schema of OpenUSD v26.05 defines it:
 //! `pxr/usd/usdLux/schema.usda` (cited by its class and attribute) and `overview.dox`, with the
 //! `hdEmbree` delegate, which `overview.dox` names as the reference implementation, where the
-//! text leaves a formula's details to it. An attribute not authored takes the fallback that class
-//! states.
+//! text leaves a formula's details to it. An attribute not authored takes the fallback its schema
+//! declares, ShadowAPI's `inputs:shadow:enable` `true` without the schema applied.
 //!
 //! - Emission is `L = intensity · 2^exposure · color / sizeFactor` (LightAPI `inputs:intensity`,
 //!   `inputs:exposure`, `inputs:color`), luminance in nits, where `sizeFactor` is 1 without
@@ -15,7 +15,9 @@
 //!   the scene's sphere takes. With `treatAsPoint` it is a point of that intensity, the sphere it
 //!   stands for as seen from outside it, and so is a sphere of radius 0.
 //! - `inputs:enableColorTemperature` multiplies `inputs:color` by `inputs:colorTemperature`'s
-//!   color ([`super::blackbody`]).
+//!   color: `UsdLuxBlackbodyTemperatureAsRgb`'s linear Rec.709 color, D65 white, "normalized
+//!   such that the default value of 6500 will always result in white", so divided by its color
+//!   at 6500 K.
 //! - ShadowAPI `inputs:shadow:enable = false` makes a sphere, point or rect light one surfaces
 //!   cast no shadow from.
 //! - A RectLight emits `L` from one side of its `width` x `height` rectangle in its XY plane,
@@ -26,44 +28,27 @@
 //! - `ShapingAPI` shapes a sphere, point or rect light around its −Z axis as
 //!   `orr_pack::layout::ShapingSource` states, `inputs:shaping:cone:softness` clamped to
 //!   [0, 1] and an `inputs:shaping:focus` below 0 ignored, as the schema says.
-//! - Colors are in the stage's color space: linear Rec.709 where none is authored
-//!   (`UsdColorSpaceAPI`, `pxr/usd/usd/schema.usda`), the space layout records take.
+//! - Colors are in the color space `UsdColorSpaceAPI` assigns them (`pxr/usd/usd/schema.usda`):
+//!   linear Rec.709 where none is, the space layout records take.
 //!
 //! What a light states that the scene has no term for fails the import, naming the prim: other
 //! light types, light filters and linking, IES profiles, rect textures, ShadowAPI's shadow
 //! color, distance and falloff, a DistantLight without shadows, the non-physical
 //! `inputs:diffuse` and `inputs:specular`, and an input whose time samples change.
 
-use openusd::vt;
-use orr_math::{DMat3, DMat4, DVec3};
+use openusd::{usd, vt};
+use orr_math::{DMat3, DMat4, DVec3, Vec3};
 use orr_pack::layout::{LightSource, ShapingSource};
+
+use openusd_schemas::lux::{self as usd_lux, blackbody_rgb};
 
 use super::read::{self, PrimReader};
 
-/// The UsdLux concrete light types (`schema.usda`).
-pub(super) const LIGHT_TYPES: &[&str] = &[
-    "CylinderLight",
-    "DiskLight",
-    "DistantLight",
-    "DomeLight",
-    "DomeLight_1",
-    "GeometryLight",
-    "PluginLight",
-    "PortalLight",
-    "RectLight",
-    "SphereLight",
-];
-
-/// API schemas that make another prim a light.
-const LIGHT_APIS: &[&str] = &["LightAPI", "MeshLightAPI", "VolumeLightAPI"];
-
-/// Whether `prim`, of no light type, is made a light by an applied API schema.
-pub(super) fn light_api(prim: &openusd::usd::Prim) -> Result<Option<String>, String> {
-    let applied = prim.api_schemas().map_err(|e| e.to_string())?;
-    Ok(applied
-        .iter()
-        .find(|a| LIGHT_APIS.contains(&a.as_str()))
-        .map(|a| a.as_str().to_owned()))
+/// Whether `prim` is a light: one that has `LightAPI`, which every light type and the API
+/// schemas that make other prims lights include.
+pub(super) fn is_light(prim: &usd::Prim) -> Result<bool, String> {
+    let light = prim.has_api_schema(usd_lux::tokens::LIGHT_API);
+    light.map_err(|e| format!("{}: {e}", prim.path().as_str()))
 }
 
 /// The bits of a float a record keeps; two values a record can't tell apart are the same.
@@ -87,24 +72,35 @@ fn numbers(r: &PrimReader<'_>, name: &str) -> Result<Option<Vec<f64>>, String> {
         .transpose()
 }
 
-fn number(r: &PrimReader<'_>, name: &str, fallback: f64) -> Result<f64, String> {
-    Ok(numbers(r, name)?.map_or(fallback, |v| v[0]))
+/// An input the light's schema declares a fallback for, which stands where none is authored.
+fn held(r: &PrimReader<'_>, name: &str) -> Result<Vec<f64>, String> {
+    numbers(r, name)?.ok_or_else(|| format!("{} {name}: no value", r.path()))
 }
 
-fn triple(r: &PrimReader<'_>, name: &str, fallback: [f64; 3]) -> Result<DVec3, String> {
-    match numbers(r, name)? {
-        None => Ok(DVec3::from_array(fallback)),
-        Some(v) if v.len() == 3 => Ok(DVec3::new(v[0], v[1], v[2])),
-        Some(_) => Err(format!("{} {name}: not three numbers", r.path())),
+fn number(r: &PrimReader<'_>, name: &str) -> Result<f64, String> {
+    Ok(held(r, name)?[0])
+}
+
+fn triple(r: &PrimReader<'_>, name: &str) -> Result<DVec3, String> {
+    match held(r, name)?[..] {
+        [x, y, z] => Ok(DVec3::new(x, y, z)),
+        _ => Err(format!("{} {name}: not three numbers", r.path())),
     }
 }
 
-fn flag(r: &PrimReader<'_>, name: &str, fallback: bool) -> Result<bool, String> {
+/// A bool input, `None` where nothing states one: an API schema that is not applied declares
+/// no fallback.
+fn bool_input(r: &PrimReader<'_>, name: &str) -> Result<Option<bool>, String> {
     match input(r, name)? {
-        None => Ok(fallback),
-        Some(vt::Value::Bool(b)) => Ok(b),
+        None => Ok(None),
+        Some(vt::Value::Bool(b)) => Ok(Some(b)),
         Some(_) => Err(format!("{} {name}: not a bool", r.path())),
     }
+}
+
+/// A bool input the light's schema declares a fallback for.
+fn flag(r: &PrimReader<'_>, name: &str) -> Result<bool, String> {
+    bool_input(r, name)?.ok_or_else(|| format!("{} {name}: no value", r.path()))
 }
 
 /// Whether `name` holds an opinion other than `fallback`, its schema fallback.
@@ -123,24 +119,13 @@ fn uniform_scale(l: DMat3) -> Option<f64> {
         .then(|| s2.sqrt())
 }
 
-/// The color space `inputs:color` is in, where one is authored: on the attribute, else by
-/// `UsdColorSpaceAPI` on the prim or its nearest ancestor that states one.
+/// The color space `inputs:color` is in, where one is assigned: on the attribute, else by
+/// `UsdColorSpaceAPI` on the prim or its nearest ancestor that applies it.
 fn color_space(r: &PrimReader<'_>) -> Result<Option<String>, String> {
-    if let Some(space) = r.metadata_token("inputs:color", "colorSpace") {
-        return Ok(Some(space));
-    }
-    let mut at = Some(r.prim.clone());
-    while let Some(p) = at {
-        let reader = PrimReader {
-            prim: &p,
-            time: r.time,
-        };
-        if let Some(space) = reader.token("colorSpace:name")? {
-            return Ok(Some(space));
-        }
-        at = p.parent();
-    }
-    Ok(None)
+    let attr = r.prim.attribute("inputs:color");
+    let name = usd::ColorSpaceAPI::compute_attribute_name(&attr, None);
+    let name = name.map_err(|e| format!("{} inputs:color: {e}", r.path()))?;
+    Ok(name.map(|n| n.as_str().to_owned()))
 }
 
 /// Light `r`, a prim of light type `ty`, whose space `to_scene` takes to scene space.
@@ -149,22 +134,14 @@ pub(super) fn light(r: &PrimReader<'_>, ty: &str, to_scene: DMat4) -> Result<Lig
     let fail = |what: &str| Err(format!("{path}: {what}"));
     if !matches!(ty, "DistantLight" | "SphereLight" | "RectLight") {
         return fail(&format!(
-            "a {ty} is not cooked; DistantLight, SphereLight and RectLight are"
+            "{ty} lights are not cooked; DistantLight, SphereLight and RectLight are"
         ));
     }
     unsupported(r)?;
-    // LightAPI `inputs:intensity` (DistantLight overrides its fallback), `inputs:exposure`,
-    // `inputs:color`.
-    let intensity = number(
-        r,
-        "inputs:intensity",
-        match ty {
-            "DistantLight" => 50000.0,
-            _ => 1.0,
-        },
-    )?;
-    let exposure = number(r, "inputs:exposure", 0.0)?;
-    let color = triple(r, "inputs:color", [1.0; 3])?;
+    // LightAPI `inputs:intensity`, `inputs:exposure`, `inputs:color`.
+    let intensity = number(r, "inputs:intensity")?;
+    let exposure = number(r, "inputs:exposure")?;
+    let color = triple(r, "inputs:color")?;
     if let Some(space) = color_space(r)?
         && space != "lin_rec709_scene"
     {
@@ -174,17 +151,14 @@ pub(super) fn light(r: &PrimReader<'_>, ty: &str, to_scene: DMat4) -> Result<Lig
     }
     // LightAPI `inputs:enableColorTemperature`, `inputs:colorTemperature`: "the computed result
     // multiplies against the color attribute".
-    let color = match flag(r, "inputs:enableColorTemperature", false)? {
-        true => {
-            color
-                * super::blackbody::temperature_color(number(r, "inputs:colorTemperature", 6500.0)?)
-        }
+    let color = match flag(r, "inputs:enableColorTemperature")? {
+        true => color * temperature_color(number(r, "inputs:colorTemperature")?),
         false => color,
     };
-    let normalize = flag(r, "inputs:normalize", false)?;
+    let normalize = flag(r, "inputs:normalize")?;
     let emitted = color * (intensity * exposure.exp2());
     // ShadowAPI `inputs:shadow:enable`.
-    let shadows = flag(r, "inputs:shadow:enable", true)?;
+    let shadows = bool_input(r, "inputs:shadow:enable")?.unwrap_or(true);
     let l = DMat3::from_mat4(to_scene);
     // Lights with a primary axis emit along -Z (`overview.dox`).
     let axis = (l * DVec3::NEG_Z).normalize();
@@ -200,7 +174,7 @@ pub(super) fn light(r: &PrimReader<'_>, ty: &str, to_scene: DMat4) -> Result<Lig
             }
             // `inputs:angle` is clipped to [0, 360); `normalize`'s θmax is its half, clamped to
             // [0, π].
-            let angle = number(r, "inputs:angle", 0.53)?.clamp(0.0, 360.0);
+            let angle = number(r, "inputs:angle")?.clamp(0.0, 360.0);
             let theta = (angle.to_radians() / 2.0).clamp(0.0, std::f64::consts::PI);
             if theta == 0.0 || theta > std::f64::consts::FRAC_PI_2 {
                 return fail(&format!(
@@ -221,7 +195,7 @@ pub(super) fn light(r: &PrimReader<'_>, ty: &str, to_scene: DMat4) -> Result<Lig
             })
         }
         "SphereLight" => {
-            let radius = number(r, "inputs:radius", 0.5)?;
+            let radius = number(r, "inputs:radius")?;
             let Some(scale) = uniform_scale(l) else {
                 return fail("its transform stretches the sphere unevenly");
             };
@@ -236,7 +210,7 @@ pub(super) fn light(r: &PrimReader<'_>, ty: &str, to_scene: DMat4) -> Result<Lig
                 false => emitted * disc,
             };
             let intensity = intensity.as_vec3();
-            if flag(r, "treatAsPoint", false)? || radius == 0.0 {
+            if flag(r, "treatAsPoint")? || radius == 0.0 {
                 Ok(LightSource::Point {
                     position,
                     intensity,
@@ -257,8 +231,8 @@ pub(super) fn light(r: &PrimReader<'_>, ty: &str, to_scene: DMat4) -> Result<Lig
             if input(r, "inputs:texture:file")?.is_some() {
                 return fail("a RectLight's inputs:texture:file is not cooked");
             }
-            let ex = l * DVec3::new(number(r, "inputs:width", 1.0)?, 0.0, 0.0);
-            let mut ey = l * DVec3::new(0.0, number(r, "inputs:height", 1.0)?, 0.0);
+            let ex = l * DVec3::new(number(r, "inputs:width")?, 0.0, 0.0);
+            let mut ey = l * DVec3::new(0.0, number(r, "inputs:height")?, 0.0);
             if ex.dot(ey).abs() > RECORD_EPSILON * ex.length() * ey.length() {
                 return fail("its transform shears the rectangle");
             }
@@ -281,6 +255,12 @@ pub(super) fn light(r: &PrimReader<'_>, ty: &str, to_scene: DMat4) -> Result<Lig
     }
 }
 
+/// The color `inputs:colorTemperature` multiplies `inputs:color` by, white at 6500 K.
+fn temperature_color(kelvin: f64) -> DVec3 {
+    let rgb = |k: f32| Vec3::from(<[f32; 3]>::from(blackbody_rgb(k))).as_dvec3();
+    rgb(kelvin as f32) / rgb(6500.0)
+}
+
 /// `ShapingAPI`'s shaping of a light whose −Z axis is `axis` in scene space, where it is applied.
 fn shaping(r: &PrimReader<'_>, axis: DVec3) -> Result<Option<ShapingSource>, String> {
     if !r
@@ -298,13 +278,13 @@ fn shaping(r: &PrimReader<'_>, axis: DVec3) -> Result<Option<ShapingSource>, Str
     }
     // `inputs:shaping:cone:angle` in degrees, `cone:softness` "clamped to [0, 1]", `focus`
     // whose "values < 0 are ignored", `focusTint`.
-    let focus = number(r, "inputs:shaping:focus", 0.0)?;
+    let focus = number(r, "inputs:shaping:focus")?;
     Ok(Some(ShapingSource {
         axis: axis.as_vec3(),
-        cone_angle: number(r, "inputs:shaping:cone:angle", 90.0)?.to_radians() as f32,
-        cone_softness: number(r, "inputs:shaping:cone:softness", 0.0)?.clamp(0.0, 1.0) as f32,
+        cone_angle: number(r, "inputs:shaping:cone:angle")?.to_radians() as f32,
+        cone_softness: number(r, "inputs:shaping:cone:softness")?.clamp(0.0, 1.0) as f32,
         focus: focus.max(0.0) as f32,
-        focus_tint: triple(r, "inputs:shaping:focusTint", [0.0; 3])?.as_vec3(),
+        focus_tint: triple(r, "inputs:shaping:focusTint")?.as_vec3(),
     }))
 }
 
@@ -325,19 +305,26 @@ fn unsupported(r: &PrimReader<'_>) -> Result<(), String> {
             return Err(format!("{path}: {name} is not cooked"));
         }
     }
-    if !r.targets("light:filters")?.is_empty() {
+    let fail = |e: openusd::Error| format!("{path}: {e}");
+    let light = usd_lux::LightAPI::from_prim_unchecked(r.prim.clone());
+    if !light.filters_rel().targets().map_err(fail)?.is_empty() {
         return Err(format!("{path}: light filters are not cooked"));
     }
     // Linking collections, which include the root by default and list nothing.
-    for link in ["lightLink", "shadowLink"] {
-        let c = format!("collection:{link}");
-        let narrowed = !flag(r, &format!("{c}:includeRoot"), true)?
-            || !r.targets(&format!("{c}:includes"))?.is_empty()
-            || !r.targets(&format!("{c}:excludes"))?.is_empty()
-            || input(r, &format!("{c}:membershipExpression"))?.is_some();
+    for c in [
+        light.light_link_collection(),
+        light.shadow_link_collection(),
+    ] {
+        let narrowed = c.include_root().map_err(fail)? == Some(false)
+            || !c.includes().map_err(fail)?.is_empty()
+            || !c.excludes().map_err(fail)?.is_empty()
+            || c.membership_expression_attr()
+                .has_authored_value()
+                .map_err(fail)?;
         if narrowed {
             return Err(format!(
-                "{path}: {c} narrows what the light reaches, which is not cooked"
+                "{path}: collection:{} narrows what the light reaches, which is not cooked",
+                c.name()
             ));
         }
     }

@@ -88,8 +88,9 @@
 //! OpenImageIO, which MaterialX's OSL shaders read textures through, applies the wrap mode within
 //! the tile alone.
 //!
-//! A `UsdUVTexture` reads as its `sourceColorSpace` says, or under `auto` as the file's
-//! `colorSpace` metadata names, and a MaterialX image of a color type as its `colorspace` names;
+//! A `UsdUVTexture` reads as an authored `sourceColorSpace` says, `auto` included; without one,
+//! as the color space USD gives its file (`colorSpace` metadata, or `UsdColorSpaceAPI` above it),
+//! else as `auto`. A MaterialX image of a color type reads as its `colorspace` names;
 //! [`crate::texture::color`] has what each rule does. An unknown `colorspace` warns and reads as
 //! "data". A channel picked from a color image takes the space's curve and none of its primaries:
 //! a renderer working in the document's space would read the channel as it stands.
@@ -1250,10 +1251,7 @@ impl Mapper<'_, '_> {
         let modes = [self.text(n, "wrapS"), self.text(n, "wrapT")];
         let wrap = [wrap(modes[0])?, wrap(modes[1])?];
         let file_wrap = modes.map(|m| matches!(m, None | Some("useMetadata")));
-        let stated = match self.text(n, "sourceColorSpace") {
-            Some(s @ ("sRGB" | "raw")) => Some(s),
-            _ => color_space.as_deref(),
-        };
+        let stated = self.text(n, "sourceColorSpace").or(color_space.as_deref());
         let color = match stated {
             Some("sRGB") => ImageColor::Named(Space::SRGB),
             s => s.and_then(ImageColor::named).unwrap_or(ImageColor::UsdAuto),

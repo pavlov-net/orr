@@ -209,7 +209,9 @@ def Xform "World"
             }
         }
 
-        def Mesh "Body"
+        def Mesh "Body" (
+            prepend apiSchemas = ["SkelBindingAPI"]
+        )
         {
             uniform token subdivisionScheme = "none"
             int[] faceVertexCounts = [3]
@@ -673,7 +675,9 @@ def SkelRoot "Hero"
         {skeleton}
     }}
 
-    def Mesh "Body"
+    def Mesh "Body" (
+        prepend apiSchemas = ["SkelBindingAPI"]
+    )
     {{
         uniform token subdivisionScheme = "none"
         int[] faceVertexCounts = [3]
@@ -1800,7 +1804,9 @@ const PAINTED_CAGE: &str = r#"#usda 1.0
     metersPerUnit = 1
 )
 
-def Mesh "Grid"
+def Mesh "Grid" (
+    prepend apiSchemas = ["MaterialBindingAPI"]
+)
 {
     uniform token orientation = "leftHanded"
     int[] faceVertexCounts = [4, 4, 4, 4]
@@ -1818,7 +1824,9 @@ def Mesh "Grid"
     )
     rel material:binding = </Looks/M>
 
-    def GeomSubset "Right"
+    def GeomSubset "Right" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
     {
         uniform token elementType = "face"
         uniform token familyName = "materialBind"
