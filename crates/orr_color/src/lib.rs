@@ -12,11 +12,11 @@
 //! let rec2020 = to_rec2020 * DVec3::new(1.0, 0.5, 0.25);
 //! ```
 //!
-//! Slang has the primaries, luminance, transfer and chromaticity functions in f32 as the
-//! modules `orr_color.primaries`, `orr_color.luminance`, `orr_color.transfer` and
-//! `orr_color.chromaticity`, without CIE 1976 u'v', and ICtCp (`orr_color.ictcp`) and SDR gamut
-//! compression (`orr_color.gamut`) besides, under [`SHADER_DIR`], an import root of every
-//! shader build.
+//! Slang has what kernels use of these in f32 as the modules `orr_color.primaries` (the
+//! matrices to and from Rec.2020), `orr_color.luminance` (of Rec.2020), `orr_color.transfer`
+//! (sRGB and PQ) and `orr_color.chromaticity` (without CIE 1976 u'v'), and ICtCp
+//! (`orr_color.ictcp`) and SDR gamut compression (`orr_color.gamut`) besides, under
+//! [`SHADER_DIR`], an import root of every shader build.
 
 #![forbid(unsafe_code)]
 
@@ -31,8 +31,8 @@ pub use luminance::{LUMINOUS_EFFICACY, luminance};
 pub use primaries::{Primaries, RgbPrimaries, rec709_to_rec2020};
 pub use srgb8::{srgb8_decode, srgb8_decode_fixed, srgb8_encode, srgb8_encode_fixed};
 pub use transfer::{
-    EDR_REFERENCE_NITS, PQ_MAX_NITS, SCRGB_WHITE_NITS, hlg_decode, hlg_encode, pq_decode,
-    pq_encode, srgb_decode, srgb_encode,
+    EDR_REFERENCE_NITS, PQ_MAX_NITS, SCRGB_WHITE_NITS, hlg_decode, pq_decode, pq_encode,
+    srgb_decode, srgb_encode,
 };
 
 /// The import root of the crate's Slang modules (`orr_color.*`).

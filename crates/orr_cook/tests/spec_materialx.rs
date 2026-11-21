@@ -2450,8 +2450,8 @@ fn named_spaces_stand_over_what_the_file_states() {
 }
 
 /// Spec L184: "implementations are expected to translate those color values", and L331's working
-/// space is "the default color space for all image inputs and color values". The audit's rows:
-/// 0.5 under an sRGB name reads 0.214, a document in ACEScg converts what it doesn't mark, and
+/// space is "the default color space for all image inputs and color values". So 0.5 under an
+/// sRGB name reads 0.214, a document in ACEScg converts what it doesn't mark, and
 /// "data" (L381) converts nothing.
 #[test]
 fn color_values_read_in_their_space() {

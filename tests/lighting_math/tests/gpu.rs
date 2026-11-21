@@ -14,7 +14,7 @@ use openpbr_ref::report::{Counts, SAME_MODEL, evaluate};
 use openpbr_ref::{Bsdf, Inputs, Lobe, Reference, Sample};
 use shader_math::stats::Rng;
 
-/// Directional albedo accuracy the plan asks of the approximation, absolute.
+/// Directional albedo accuracy the approximation must reach, absolute.
 const ALBEDO: f64 = 0.02;
 
 fn assert_clean() {

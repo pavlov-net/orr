@@ -15,12 +15,8 @@ fn matrices_and_luminance_match_orr_color() {
         RgbPrimaries::REC2020,
     );
     let want = [
-        r709.rgb_to_xyz(),
-        r709.xyz_to_rgb(),
         r2020.rgb_to_xyz(),
         r2020.xyz_to_rgb(),
-        p3.rgb_to_xyz(),
-        p3.xyz_to_rgb(),
         r709.matrix_to(r2020),
         r2020.matrix_to(r709),
         p3.matrix_to(r2020),
@@ -35,13 +31,10 @@ fn matrices_and_luminance_match_orr_color() {
             .all(|(d, e)| d.abs() <= 1e-7 * e.abs().max(1.0));
         assert!(close, "{}: {got} vs {w}", MATRICES[i]);
     }
-    let w709 = r709.luminance_weights();
     let mut rng = Rng::new(40);
     for _ in 0..1000 {
         let c = [rng.f32(), rng.f32(), rng.f32()];
-        let y709 = w709.dot(d3(c));
         let y2020 = orr_color::luminance(d3(c));
-        assert!((f64::from(luminance_rec709(c)) - y709).abs() < 1e-6);
         assert!((f64::from(luminance_rec2020(c)) - y2020).abs() < 1e-6);
     }
 }
@@ -79,24 +72,6 @@ fn transfer_functions_match_orr_color() {
     // relative at worst.
     assert!(worst_signal < 2e-5, "PQ signal error {worst_signal}");
     assert!(worst_trip < 5e-5, "PQ decode error {worst_trip}");
-}
-
-#[test]
-fn hlg_matches_orr_color() {
-    for i in 0..=4096 {
-        let x = 1.2 * f64::from(i) / 4096.0;
-        let e = hlg_encode([x as f32; 3])[0];
-        assert!(
-            (f64::from(e) - orr_color::hlg_encode(x)).abs() < 1e-6,
-            "encode {x}"
-        );
-        let d = hlg_decode([x as f32; 3])[0];
-        let want = orr_color::hlg_decode(x);
-        assert!(
-            (f64::from(d) - want).abs() < 2e-6 * want.max(1.0),
-            "decode {x}"
-        );
-    }
 }
 
 #[test]

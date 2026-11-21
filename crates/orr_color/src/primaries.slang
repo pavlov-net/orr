@@ -9,22 +9,6 @@ public static const uint PRIMARIES_REC709 = 0;
 public static const uint PRIMARIES_DISPLAY_P3 = 1;
 public static const uint PRIMARIES_REC2020 = 2;
 
-public static const float3x3 REC709_TO_XYZ = float3x3(
-    0.4123908, 0.35758433, 0.1804808,
-    0.212639, 0.71516865, 0.07219232,
-    0.019330818, 0.11919478, 0.95053214);
-public static const float3x3 XYZ_TO_REC709 = float3x3(
-    3.24097, -1.5373832, -0.49861076,
-    -0.96924365, 1.8759675, 0.04155506,
-    0.05563008, -0.20397696, 1.0569715);
-public static const float3x3 P3_TO_XYZ = float3x3(
-    0.48657095, 0.2656677, 0.19821729,
-    0.22897457, 0.69173855, 0.07928691,
-    0.0, 0.04511338, 1.0439444);
-public static const float3x3 XYZ_TO_P3 = float3x3(
-    2.493497, -0.9313836, -0.4027108,
-    -0.829489, 1.7626641, 0.023624687,
-    0.03584583, -0.07617239, 0.9568845);
 public static const float3x3 REC2020_TO_XYZ = float3x3(
     0.63695806, 0.1446169, 0.16888097,
     0.2627002, 0.67799807, 0.059301715,

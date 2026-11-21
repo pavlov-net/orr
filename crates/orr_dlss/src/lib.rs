@@ -5,7 +5,7 @@
 //! library. Without `DLSS_SDK` the crate still builds, and [`raw::Ngx::new`] returns
 //! [`DlssError::NoSdk`]. The `mock` feature needs no SDK: it reports every feature
 //! unsupported, and ray reconstruction and super resolution copy the color input to the
-//! output with a bilinear upscale. The `debug_overlay` feature loads NGX's development DLLs,
+//! output with a bilinear upscale. The `debug-overlay` feature loads NGX's development DLLs,
 //! which draw the DLSS debug overlay.
 //!
 //! NGX loads its feature DLLs from, in order: the executable's directory; in debug builds,

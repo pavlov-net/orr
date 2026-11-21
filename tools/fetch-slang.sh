@@ -10,8 +10,9 @@
 #                    NVIDIA/libdeflate's gdeflate branch at a pinned commit (MIT and
 #                    Apache-2.0): the GDeflate codec of orr_cook's `gdeflate` feature
 #   OpenSubdiv-TAG/
-#    PixarAnimationStudios/OpenSubdiv at opensubdiv_tag's commit (Apache-2.0
-#                    modified): the Far library of orr_cook's `subd` feature
+#                    PixarAnimationStudios/OpenSubdiv at opensubdiv_tag's commit (Tomorrow
+#                    Open Source Technology License 1.0): the Far library of orr_cook's
+#                    `subd` feature
 # With ORR_VALIDATION_DATA=1 it also fetches the test-only validation data:
 #   precomputed_atmospheric_scattering/
 #                    ebruneton/precomputed_atmospheric_scattering at a pinned commit: ASTM G173

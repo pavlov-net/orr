@@ -100,3 +100,60 @@ functions, from <https://github.com/ebruneton/precomputed_atmospheric_scattering
 > CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 > OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 > OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## GT7 tone mapping sample
+
+`crates/orr_output/src/gt7.slang` and `crates/orr_output/src/gt7.rs` port Polyphony Digital's GT7
+tone mapping sample, `gt7_tone_mapping.cpp` from the supplemental material of
+<https://blog.selfshadow.com/publications/s2025-shading-course/>, which `tools/fetch-slang.sh`
+pins.
+
+> MIT License
+>
+> Copyright (c) 2025 Polyphony Digital Inc.
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction, including without limitation the rights
+> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all
+> copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+> IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+> AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+> LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+> OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+> SOFTWARE.
+
+## meshoptimizer
+
+`crates/orr_cook/src/mesh/clod.rs` ports `clodBuild` from `demo/clusterlod.h` of
+<https://github.com/zeux/meshoptimizer>, as the meshopt 0.7.0 crate ships it (meshoptimizer 1.3).
+
+> Copyright (c) 2016-2026 Arseny Kapoulkine
+>
+> Permission is hereby granted, free of charge, to any person
+> obtaining a copy of this software and associated documentation
+> files (the "Software"), to deal in the Software without
+> restriction, including without limitation the rights to use,
+> copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the
+> Software is furnished to do so, subject to the following
+> conditions:
+>
+> The above copyright notice and this permission notice shall be
+> included in all copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+> EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+> OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+> NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+> HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+> WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+> FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+> OTHER DEALINGS IN THE SOFTWARE.

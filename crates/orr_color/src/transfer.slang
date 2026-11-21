@@ -1,4 +1,4 @@
-// orr_color's sRGB, PQ and HLG transfer functions, in f32.
+// orr_color's sRGB and PQ transfer functions, in f32.
 module transfer;
 
 // The sRGB transfer function (IEC 61966-2-1), linear to non-linear. Values below 0 stay on
@@ -41,22 +41,4 @@ public float3 pq_decode(float3 signal)
 {
     float3 e = pow(clamp(signal, 0.0, 1.0), 1.0 / PQ_M2);
     return PQ_MAX_NITS * pow(max(e - PQ_C1, 0.0) / (PQ_C2 - PQ_C3 * e), 1.0 / PQ_M1);
-}
-
-// The HLG OETF (ITU-R BT.2100): scene-linear light, 1 at the nominal peak and clamped at 0,
-// to a signal in 0..1, and back.
-static const float HLG_A = 0.17883277;
-static const float HLG_B = 1.0 - 4.0 * HLG_A;
-static const float HLG_C = 0.5 - HLG_A * log(4.0 * HLG_A);
-
-public float3 hlg_encode(float3 linear)
-{
-    float3 e = max(linear, 0.0);
-    return select(e <= 1.0 / 12.0, sqrt(3.0 * e), HLG_A * log(12.0 * e - HLG_B) + HLG_C);
-}
-
-public float3 hlg_decode(float3 signal)
-{
-    float3 s = max(signal, 0.0);
-    return select(s <= 0.5, s * s / 3.0, (exp((s - HLG_C) / HLG_A) + HLG_B) / 12.0);
 }

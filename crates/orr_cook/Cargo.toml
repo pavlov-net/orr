@@ -52,14 +52,11 @@ zstd.workspace = true
 [features]
 # CPU zones, plots and thread names for the Tracy profiler.
 tracy = ["dep:tracy-client", "dep:tracy-client-sys"]
-# Neural texture sets through RTXNTC's LibNTC (NVIDIA RTX SDK license, never vendored): the
-# headers of the checkout at ORR_NTC_SDK at build time, the library loaded when a set cooks.
+# Neural texture sets through RTXNTC's LibNTC, which loads when a set cooks.
 ntc = ["dep:libloading", "dep:cc", "dep:orr_shaders"]
-# Subdivision cages through OpenSubdiv's Far (Apache-2.0, never vendored): the release
-# checkout at ORR_OPENSUBDIV is compiled into the cook.
+# Subdivision cages through OpenSubdiv's Far, compiled into the cook.
 subd = ["dep:cc", "dep:orr_shaders"]
-# GDeflate payload blobs through NVIDIA's libdeflate fork (`gdeflate` branch; MIT and
-# Apache-2.0, never vendored), compiled from the checkout at ORR_GDEFLATE.
+# GDeflate payload blobs through NVIDIA's libdeflate fork, compiled into the cook.
 gdeflate = ["dep:cc", "dep:orr_shaders"]
 # `--simd fallback`: the vector loops' scalar build, which no x86-64 or aarch64 CPU picks, for
 # checking that it cooks the bytes every level does.

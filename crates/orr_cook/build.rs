@@ -5,9 +5,9 @@
 //!
 //! With the `ntc` feature, compiles the LibNTC shim against the headers of the RTXNTC-Library
 //! checkout in `ORR_NTC_SDK` (else `RTXNTC/libraries/RTXNTC-Library` under `ORR_TOOLS` or the
-//! nearest `.tools`, where `ORR_FETCH_NTC=1 tools/fetch-slang.sh` puts it) and sets
-//! `ORR_COOK_NTC_SDK`, `ORR_COOK_NTC_INTERFACE` (the headers' `InterfaceVersion`) and
-//! `ORR_COOK_NTC_SCHEMA` (the NTC file schema version the checkout writes).
+//! nearest `.tools`) and sets `ORR_COOK_NTC_SDK`, `ORR_COOK_NTC_INTERFACE` (the headers'
+//! `InterfaceVersion`) and `ORR_COOK_NTC_SCHEMA` (the NTC file schema version the checkout
+//! writes).
 //!
 //! With the `subd` feature, compiles OpenSubdiv's Sdc, Vtr and Far sources from the release
 //! checkout in `ORR_OPENSUBDIV` (else `OpenSubdiv-<tag>` under `ORR_TOOLS` or the nearest
@@ -15,8 +15,7 @@
 //!
 //! With the `gdeflate` feature, compiles the GDeflate codec of NVIDIA's libdeflate fork from
 //! the checkout in `ORR_GDEFLATE` (else `libdeflate-gdeflate` under `ORR_TOOLS` or the
-//! nearest `.tools`, where `tools/fetch-slang.sh` puts it) and sets `ORR_COOK_GDEFLATE` to
-//! its commit.
+//! nearest `.tools`) and sets `ORR_COOK_GDEFLATE` to its commit.
 
 use std::path::Path;
 

@@ -8,7 +8,7 @@ license.workspace = true
 publish = false
 
 [features]
-# Runs the counters target, which needs the Nsight Perf SDK at `NVPERF_SDK_PATH`.
+# Runs the counters target, which reads orr_gpu's per-pass hardware counters.
 nsight-perf = ["orr_gpu/nsight-perf"]
 
 [dependencies]

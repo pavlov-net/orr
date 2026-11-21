@@ -600,13 +600,14 @@ impl Shared {
 
 impl Device {
     /// Allocates `count` values of `T` with a device address, sub-allocated from large
-    /// blocks of `kind`. The address is a multiple of 256 and of `T`'s alignment. The buffer
-    /// can hold any data on any queue: storage, uniform, indirect arguments, copies,
-    /// acceleration structures and their build inputs, and with `Caps::ray_dispatch` shader
-    /// binding tables. DeviceLocal and Upload allocations of 64 KiB and more start at a
-    /// 64 KiB-aligned offset in their memory and span a multiple of 64 KiB, so sparse pages
-    /// and placed textures at aligned offsets in them stay aligned and share no granule with
-    /// a neighboring buffer.
+    /// blocks of `kind`. The address is a multiple of 256 and of `T`'s alignment; in a
+    /// host-visible `kind` an alignment over 4 KiB can fail with [`Error::Invalid`], since
+    /// offsets are aligned but a host-visible block can start on any 4 KiB page. The buffer can hold any data on any queue: storage, uniform, indirect
+    /// arguments, copies, acceleration structures and their build inputs, and with
+    /// `Caps::ray_dispatch` shader binding tables. DeviceLocal and Upload allocations of
+    /// 64 KiB and more start at a 64 KiB-aligned offset in their memory and span a multiple of
+    /// 64 KiB, so sparse pages and placed textures at aligned offsets in them stay aligned and
+    /// share no granule with a neighboring buffer.
     pub fn gpu_malloc<T>(
         &self,
         kind: MemoryKind,

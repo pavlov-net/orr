@@ -219,7 +219,7 @@ impl SurfaceClass {
     }
 }
 
-/// A rigid part.
+/// A rigid part, as stored in the [`MeshHeader::parts`] table of blob 0 (not in mesh pages).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct Part {
@@ -234,7 +234,8 @@ pub struct Part {
     pub sections: u32,
 }
 
-/// The clusters of one part at one discrete level: a range of mesh cluster indices.
+/// The clusters of one part at one discrete level: a range of mesh cluster indices. Stored in
+/// the [`MeshHeader::part_levels`] table of blob 0, not in mesh pages.
 ///
 /// Mesh cluster indices count clusters page by page in page order.
 #[repr(C)]
@@ -270,7 +271,9 @@ pub struct PageInfo {
 }
 
 /// A DAG hierarchy node. Traversal enters a node while its projected `max_error` is over
-/// the threshold; a leaf names a group.
+/// the threshold; a leaf names a group. Stored in the [`MeshHeader::nodes`] table of blob 0
+/// when the hierarchy is resident and in [`NodePage`] blobs when it is paged, not in mesh
+/// pages.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct Node {
@@ -286,7 +289,8 @@ pub struct Node {
     pub group: i32,
 }
 
-/// A DAG group: clusters that stream and are replaced together.
+/// A DAG group: clusters that stream and are replaced together. Stored in the
+/// [`MeshHeader::groups`] table of blob 0, not in mesh pages.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct Group {

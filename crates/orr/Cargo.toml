@@ -12,14 +12,15 @@ links = "orr"
 default = ["dlss", "metalfx"]
 # orr_output's `dlss`: DLSS ray reconstruction and frame generation where the target has Vulkan.
 dlss = ["orr_output/dlss"]
+# orr_output's `dlss-debug-overlay`: `dlss` with the DLSS debug overlay drawn.
+dlss-debug-overlay = ["orr_output/dlss-debug-overlay"]
 # orr_output's `metalfx`: MetalFX ray reconstruction, upscaling and frame interpolation on Apple.
 metalfx = ["orr_output/metalfx"]
 # Recompiles kernels whose sources change and swaps their pipelines at step 1, for dev builds.
 hot-reload = ["orr_scene/hot-reload"]
-# PCL Stats for every display (orr_output's `pcl-stats`; needs the Reflex SDK at `REFLEX_SDK`).
+# orr_output's `pcl-stats`: PCL Stats events for every display.
 pcl-stats = ["orr_output/pcl-stats"]
-# orr_gpu's `nsight-perf`: per-pass hardware counters (needs the Nsight Perf SDK at
-# `NVPERF_SDK_PATH`).
+# orr_gpu's `nsight-perf`: per-pass hardware counters.
 nsight-perf = ["orr_gpu/nsight-perf"]
 # orr_gpu's `tracy`: profiling with Tracy.
 tracy = ["orr_gpu/tracy"]

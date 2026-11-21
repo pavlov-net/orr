@@ -51,7 +51,7 @@ const BLOCK_SIZE: f32 = 5.0;
 /// Street lamps per side of each street.
 const LAMPS: i32 = 16;
 const LAMP_HEIGHT: f32 = 3.2;
-/// Glowing signs, one per building face.
+/// Glowing sign materials, cycled across the blocks: each block has one sign on one face.
 const SIGNS: usize = 4;
 
 fn main() {

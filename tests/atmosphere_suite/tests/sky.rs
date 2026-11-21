@@ -262,7 +262,8 @@ fn composition_error(multiple: bool, precision: &Precision, eyes: &[DVec3]) -> f
 }
 
 /// The LUT starts where the froxels stop: nothing inside `near_range` is counted twice or
-/// dropped. Single scattering on both sides, which the A2 suite holds to the reference.
+/// dropped. Single scattering on both sides, which is held to the reference on its own, so the
+/// multiple-scattering LUT's model error stays out of the gate.
 #[test]
 fn near_range_composition() {
     let single = Precision {

@@ -21,11 +21,10 @@ ORR_ROOT(Root);
 void main(uint3 id: SV_DispatchThreadID)
 {
     float3 n = float3(id) / 31.0;
-    float3 c = mul(REC2020_TO_REC709, mul(P3_TO_REC2020, mul(XYZ_TO_P3, mul(REC709_TO_XYZ, n))));
-    c = mul(XYZ_TO_REC709, mul(REC2020_TO_XYZ, mul(REC709_TO_REC2020, c)));
-    c = mul(XYZ_TO_REC2020, mul(P3_TO_XYZ, mul(REC2020_TO_P3, c)));
-    float3 color = srgb_decode(srgb_encode(c)) + pq_decode(pq_encode(c)) + hlg_decode(hlg_encode(c))
-        + luminance_rec709(c) + luminance_rec2020(c) + guide_luminance(c)
+    float3 c = mul(REC2020_TO_REC709, mul(P3_TO_REC2020, mul(REC2020_TO_P3, mul(REC709_TO_REC2020, n))));
+    c = mul(XYZ_TO_REC2020, mul(REC2020_TO_XYZ, c));
+    float3 color = srgb_decode(srgb_encode(c)) + pq_decode(pq_encode(c))
+        + luminance_rec2020(c) + guide_luminance(c)
         + rec2020_from_ictcp(ictcp_from_rec2020(c)) + gamut_compress(c);
     float2 xy = xy_from_xyz(xyz_from_xy(D65_XY, 1.0) + c);
     float cct = cct_from_xy(xy);

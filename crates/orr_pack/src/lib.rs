@@ -1,9 +1,16 @@
-//! Cooked asset archives: the container format, asset identity and the readers and writer.
+//! orr's cooked format: the archive container, asset identity, the readers and writer, the
+//! record types of each asset class and the Slang modules kernels read them with.
 //!
 //! An archive starts with its header in a 4 KiB page, then 4 KiB-aligned payload blobs, and
 //! ends with one 4 KiB-aligned index range (a copy of the header, the table of contents and
 //! the mount section), so a writer streams the payload and appends the index. Each asset is an [`Entry`] with
 //! one or more [`Blob`]s; blobs are compressed per chunk so a chunk reads and decodes alone.
+//!
+//! Each class module documents its blobs and the records they hold: [`mesh`], [`subd`],
+//! [`model`], [`material`], [`texture`], [`tiles`], [`neural`], [`raster`], [`volume`],
+//! [`skeleton`], [`clip`] and [`instance`]. The Slang modules under `orr_pack.*` (`mesh`,
+//! `page_codec`, `subd`, `volume`, `skeleton`, `instance`, `neural` and `normal_map`) read
+//! the same layouts on the GPU.
 
 mod archive;
 mod bc_split;

@@ -56,22 +56,12 @@ pub fn pq_decode(signal: f64) -> f64 {
     PQ_MAX_NITS * ((e - PQ_C1).max(0.0) / (PQ_C2 - PQ_C3 * e)).powf(1.0 / PQ_M1)
 }
 
-/// The HLG OETF (ITU-R BT.2100): scene-linear light, 1 at the nominal peak and clamped at
-/// 0, to a signal in 0..=1.
-pub fn hlg_encode(linear: f64) -> f64 {
-    let e = linear.max(0.0);
-    if e <= 1.0 / 12.0 {
-        (3.0 * e).sqrt()
-    } else {
-        HLG_A * (12.0 * e - HLG_B).ln() + hlg_c()
-    }
-}
-
 fn hlg_c() -> f64 {
     0.5 - HLG_A * (4.0 * HLG_A).ln()
 }
 
-/// The inverse of [`hlg_encode`].
+/// The inverse of the HLG OETF (ITU-R BT.2100): a signal, clamped at 0, to scene-linear
+/// light, 1 at the nominal peak.
 pub fn hlg_decode(signal: f64) -> f64 {
     let s = signal.max(0.0);
     if s <= 0.5 {
@@ -121,15 +111,12 @@ mod tests {
     }
 
     #[test]
-    fn hlg_inverts_and_its_segments_meet() {
-        for i in 0..=1200 {
-            let x = f64::from(i) / 1000.0;
-            assert!((hlg_decode(hlg_encode(x)) - x).abs() < 1e-12, "{x}");
-        }
+    fn hlg_segments_meet_and_reach_the_peak() {
         // The log segment starts where the square root ends: 1/12 at signal 0.5.
-        let joint = 1.0 / 12.0 + 1e-12;
-        assert!((hlg_encode(joint) - 0.5).abs() < 1e-10);
+        assert!((hlg_decode(0.5) - 1.0 / 12.0).abs() < 1e-15);
         assert!((hlg_decode(0.5 + 1e-12) - 1.0 / 12.0).abs() < 1e-10);
-        assert!((hlg_encode(1.0) - 1.0).abs() < 1e-8);
+        // BT.2100 rounds `a` to 8 digits, which the log segment's slope of about 5.5 at the
+        // peak turns into 2.7e-8.
+        assert!((hlg_decode(1.0) - 1.0).abs() < 5e-8);
     }
 }

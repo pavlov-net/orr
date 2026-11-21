@@ -262,7 +262,7 @@ mod tests {
             assert!(same, "{name}: {rows:?} vs {want:?}");
             seen += 1;
         }
-        assert_eq!(seen, 10);
+        assert_eq!(seen, 6);
         let d65 = Chromaticity::D65;
         let want = format!("D65_XY = float2({:?}, {:?});", d65.x as f32, d65.y as f32);
         assert!(SLANG.contains(&want), "{want}");

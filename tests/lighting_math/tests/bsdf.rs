@@ -18,7 +18,7 @@ use openpbr_ref::{Bsdf, Inputs, Lobe, Reference};
 use orr_math::Vec3;
 use shader_math::stats::{Rng, SphereGrid};
 
-/// Directional albedo accuracy the plan asks of the approximation, absolute.
+/// Directional albedo accuracy the approximation must reach, absolute.
 const ALBEDO: f64 = 0.02;
 
 /// `a` and `b` agree within `tolerance` plus 3 combined standard errors in every channel.

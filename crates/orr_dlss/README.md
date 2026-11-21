@@ -19,7 +19,7 @@ Features:
 
 - `mock`: no SDK needed. Every feature reports unsupported, and ray reconstruction and super
   resolution copy their color input to the output with a bilinear upscale.
-- `debug_overlay`: loads the SDK's `dev` DLLs, which draw the DLSS debug overlay. Never ship
+- `debug-overlay`: loads the SDK's `dev` DLLs, which draw the DLSS debug overlay. Never ship
   these.
 
 ## Use

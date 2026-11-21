@@ -87,14 +87,11 @@ mod ffi {
         ) -> f32;
 
         pub(crate) fn orr_color_primaries_matrix(which: u32, out: *mut f32);
-        pub(crate) fn orr_color_luminance_rec709(c: *const f32) -> f32;
         pub(crate) fn orr_color_luminance_rec2020(c: *const f32) -> f32;
         pub(crate) fn orr_color_srgb_encode(c: *const f32, out: *mut f32);
         pub(crate) fn orr_color_srgb_decode(c: *const f32, out: *mut f32);
         pub(crate) fn orr_color_pq_encode(c: *const f32, out: *mut f32);
         pub(crate) fn orr_color_pq_decode(c: *const f32, out: *mut f32);
-        pub(crate) fn orr_color_hlg_encode(c: *const f32, out: *mut f32);
-        pub(crate) fn orr_color_hlg_decode(c: *const f32, out: *mut f32);
         pub(crate) fn orr_color_ictcp_from_rec2020(c: *const f32, out: *mut f32);
         pub(crate) fn orr_color_rec2020_from_ictcp(c: *const f32, out: *mut f32);
         pub(crate) fn orr_color_gamut_compress(c: *const f32, out: *mut f32);
@@ -355,13 +352,9 @@ pub mod color {
     use super::{M3, V3, ffi};
 
     /// The matrices of `orr_color.primaries`, in [`matrix`] order.
-    pub const MATRICES: [&str; 10] = [
-        "REC709_TO_XYZ",
-        "XYZ_TO_REC709",
+    pub const MATRICES: [&str; 6] = [
         "REC2020_TO_XYZ",
         "XYZ_TO_REC2020",
-        "P3_TO_XYZ",
-        "XYZ_TO_P3",
         "REC709_TO_REC2020",
         "REC2020_TO_REC709",
         "P3_TO_REC2020",
@@ -374,9 +367,6 @@ pub mod color {
             which as u32,
             o.as_mut_ptr()
         ))
-    }
-    pub fn luminance_rec709(c: V3) -> f32 {
-        call!(ffi::orr_color_luminance_rec709(c.as_ptr()))
     }
     pub fn luminance_rec2020(c: V3) -> f32 {
         call!(ffi::orr_color_luminance_rec2020(c.as_ptr()))
@@ -401,18 +391,6 @@ pub mod color {
     }
     pub fn pq_decode(signal: V3) -> V3 {
         out!(V3, |o| ffi::orr_color_pq_decode(
-            signal.as_ptr(),
-            o.as_mut_ptr()
-        ))
-    }
-    pub fn hlg_encode(c: V3) -> V3 {
-        out!(V3, |o| ffi::orr_color_hlg_encode(
-            c.as_ptr(),
-            o.as_mut_ptr()
-        ))
-    }
-    pub fn hlg_decode(signal: V3) -> V3 {
-        out!(V3, |o| ffi::orr_color_hlg_decode(
             signal.as_ptr(),
             o.as_mut_ptr()
         ))

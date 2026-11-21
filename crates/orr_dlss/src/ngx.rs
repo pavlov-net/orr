@@ -116,7 +116,7 @@ impl Setup {
 
 /// Directories NGX searches for its feature DLLs after the executable's own.
 fn dll_dirs() -> Vec<PathBuf> {
-    let sub = if cfg!(feature = "debug_overlay") {
+    let sub = if cfg!(feature = "debug-overlay") {
         "dev"
     } else {
         "rel"

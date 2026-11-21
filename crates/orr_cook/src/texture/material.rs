@@ -2176,6 +2176,8 @@ impl<'a> Packer<'a> {
 
     /// The textures of `m` that a neural set may hold, in slot order. The textures of a set have
     /// one size, so each cell of tiles makes a set of its own, apart from `m`'s plain textures.
+    /// Opacity and the slots only the interior medium reads stay out: kernels read those
+    /// outside the material resolve, which alone decodes sets.
     fn neural_members(&self, m: &Material) -> BTreeMap<Option<Cell>, Vec<AssetId>> {
         let mut ids: BTreeMap<Option<Cell>, Vec<AssetId>> = BTreeMap::new();
         let mut add = |cell, id| {
@@ -2184,8 +2186,18 @@ impl<'a> Packer<'a> {
                 member.push(id);
             }
         };
+        let resolve_reads = |s: usize| {
+            !matches!(
+                s,
+                slot::OPACITY
+                    | slot::TRANSMISSION_SCATTER
+                    | slot::TRANSMISSION_SCATTER_ANISOTROPY
+                    | slot::DISPERSION_SCALE
+                    | slot::DISPERSION_ABBE
+            )
+        };
         for (s, b) in m.textures.iter().enumerate() {
-            if s == slot::OPACITY || b.texture == AssetId::NONE {
+            if !resolve_reads(s) || b.texture == AssetId::NONE {
                 continue;
             }
             match self.tiles_of.get(&b.texture) {

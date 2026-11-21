@@ -1,10 +1,12 @@
-//! Neural texture sets: a material's textures, except opacity, compressed together by
-//! RTXNTC's LibNTC into latent images and a decoder network ([`orr_pack::neural`]). The BC
-//! textures always cook and ship beside the set.
+//! Neural texture sets: a material's textures, except opacity and the interior medium's
+//! scatter, anisotropy and dispersion, compressed together by RTXNTC's LibNTC into latent
+//! images and a decoder network ([`orr_pack::neural`]). The BC textures always cook and ship
+//! beside the set.
 //!
 //! - Members: the material's bound textures in slot order whose cooked mip 0 is the largest
-//!   among them, while their channels fit LibNTC's 16. BC6H textures and uncompressed ones
-//!   other than displacement stay BC only.
+//!   among them, while their channels fit LibNTC's 16. BC6H and uncompressed textures stay BC
+//!   only, displacement among them: only the material resolve decodes sets, and displacement
+//!   reads its own texture.
 //! - Input: the same mip chains the BC encoders get (alpha coverage and Toksvig roughness
 //!   included). Color textures are stored as sRGB, signed ones (normal maps, directions,
 //!   anisotropies) at `0.5 v + 0.5`, which the decoder's output layer maps back to `v`
@@ -97,7 +99,7 @@ fn channels(job: &TextureJob) -> Option<(u8, u8)> {
         Encoding::Bc7 => Some((4, NeuralTexture::LINEAR)),
         Encoding::Bc5 => Some((2, NeuralTexture::LINEAR)),
         Encoding::Bc5Snorm => Some((2, NeuralTexture::SIGNED)),
-        Encoding::Bc4 | Encoding::Raw(super::DataFormat::R16) => Some((1, NeuralTexture::LINEAR)),
+        Encoding::Bc4 => Some((1, NeuralTexture::LINEAR)),
         Encoding::Bc4Snorm => Some((1, NeuralTexture::SIGNED)),
         Encoding::Bc6h | Encoding::Raw(_) => None,
     }
@@ -354,6 +356,8 @@ impl NeuralJob {
         }
 
         let latents_name = orr_pack::names::latents(&self.name);
+        // Kernels reach latents through their set's slot index, never a material binding, so
+        // no kernel converts them by this primaries tag.
         let latents = super::layout(
             vk::A4R4G4B4_UNORM_PACK16,
             [out.latent_size[0], out.latent_size[1]],

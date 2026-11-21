@@ -614,7 +614,8 @@ impl Loading {
 
     /// Calls `signal` each time a job is queued, so a consumer's own thread pool can call
     /// [`Loading::run_one`] when there is work instead of polling. Replaces any earlier
-    /// signal.
+    /// signal. `signal` runs on whichever thread queues the job (the render thread, the loading
+    /// thread or a worker), so it must return promptly and never block.
     pub fn set_job_signal(&self, signal: impl Fn() + Send + Sync + 'static) {
         *self.signal.lock().unwrap() = Some(Arc::new(signal));
     }
