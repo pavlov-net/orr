@@ -27,8 +27,8 @@ pub struct TextureBinding {
     /// [`filter`] bits.
     pub filter: u8,
     /// One more than the first channel of the vertex color stream that multiplies what the slot
-    /// reads, bound or not; 0 for none. A color reads three from it, a scalar one. A mesh without
-    /// the stream reads 1.
+    /// reads, bound or not; 0 for none. A color reads three from it, a scalar one, and multiplies
+    /// channel by channel in linear Rec.709. A mesh without the stream reads 1.
     pub vertex: u8,
     /// Nonzero: the slot reads `1 - 2^(vertex_complement - 1) v` of the stream's `v` in place of
     /// `v`, held to 0..1, so a mesh without the stream reads 0 at 1. Past 1 the power of two

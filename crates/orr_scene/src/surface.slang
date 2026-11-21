@@ -468,20 +468,22 @@ float surface_scale(SurfaceInput i, MaterialGpu* m, uint slot)
     return material_scale(m, slot, i.uv) * surface_vertex(i, m, slot).x;
 }
 
-// `material_color` of `slot` at the hit, its factor multiplied by the vertex color stream, which
-// is linear Rec.709.
+// `material_color` of `slot` at the hit, times the vertex color stream's value for it
+// (`streamed_color`).
 float3 surface_color(SurfaceInput i, MaterialGpu* m, uint slot, float3 factor)
 {
-    return material_color(m, slot, i.uv, surface_color_factor(i, m, slot, factor));
+    float3 c = material_color(m, slot, i.uv, factor);
+    if (may2(MAY2_VERTEX_COLORS) && (m.flags & MATERIAL_VERTEX) != 0 && ((m.samplers[slot].modes >> TEXTURE_VERTEX_SHIFT) & TEXTURE_VERTEX_MASK) != 0)
+        c = streamed_color(c, surface_vertex(i, m, slot));
+    return c;
 }
 
-// `factor` multiplied by the vertex color stream's value for color slot `slot`: the factor
-// `surface_color` tints by the slot's texel.
-float3 surface_color_factor(SurfaceInput i, MaterialGpu* m, uint slot, float3 factor)
+// Linear Rec.2020 `color` times `stream`, a value of the vertex color stream, channel by channel
+// in linear Rec.709, the stream's space. It multiplies what the slot reads, after the factor has
+// tinted the texel in the texture's primaries.
+float3 streamed_color(float3 color, float3 stream)
 {
-    if (may2(MAY2_VERTEX_COLORS) && (m.flags & MATERIAL_VERTEX) != 0 && ((m.samplers[slot].modes >> TEXTURE_VERTEX_SHIFT) & TEXTURE_VERTEX_MASK) != 0)
-        return mul(REC709_TO_REC2020, mul(REC2020_TO_REC709, factor) * surface_vertex(i, m, slot));
-    return factor;
+    return mul(REC709_TO_REC2020, mul(REC2020_TO_REC709, color) * stream);
 }
 
 // `material_more_color` of `slot`, with `surface_color`'s vertex color.
@@ -1004,15 +1006,13 @@ public struct CoverageFeedback<S : ISurfaces> : ISurfaces
     }
 }
 
-// Color slot `slot`'s color from its factor `factor`: times the vertex color stream's value
-// `stream` where the slot reads the stream (`streamed`), as `surface_color_factor`, then tinted by
-// its texel `texel` where one was read.
+// Color slot `slot`'s color from its factor `factor`: tinted by its texel `texel` where one was
+// read, then times the vertex color stream's value `stream` where the slot reads the stream
+// (`streamed`), as `surface_color` does.
 float3 slot_color(MaterialGpu* m, uint slot, bool read, float3 texel, bool streamed, float3 stream, float3 factor)
 {
-    float3 c = factor;
-    if (streamed)
-        c = mul(REC709_TO_REC2020, mul(REC2020_TO_REC709, factor) * stream);
-    return read ? material_tint(m, slot, texel, c) : c;
+    float3 c = read ? material_tint(m, slot, texel, factor) : factor;
+    return streamed ? streamed_color(c, stream) : c;
 }
 
 // The standard surface: OpenPBR from the hit's `MaterialGpu` and its textures, with the decals

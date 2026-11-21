@@ -13929,6 +13929,89 @@ fn vertex_colors_multiply_the_slots_that_read_them() {
     assert_clean();
 }
 
+/// The vertex color stream multiplies what a color slot reads channel by channel in linear
+/// Rec.709, whatever primaries its texture holds: glTF's base color is factor x texel x
+/// `COLOR_0` there, and a texel the cook stores in Rec.2020, or one of Display P3, converts to
+/// Rec.709 before the stream multiplies it. The surface's read and the emission a light's sample
+/// reads agree.
+#[test]
+fn vertex_colors_multiply_a_texel_in_rec709_whatever_its_primaries() {
+    use orr_color::Primaries;
+    use orr_gpu::{Format, TextureDesc, TextureMemory, TextureUsage};
+    use orr_pack::material::{Material, TextureBinding, slot};
+    let _guard = serial();
+    let d = device();
+    const TEXEL: [u8; 4] = [64, 160, 96, 255];
+    let texel = DVec4::from(TEXEL.map(|c| f64::from(c) / 255.0)).truncate();
+    let desc = TextureDesc::d2(Format::Rgba8Unorm, 4, 4, TextureUsage::SAMPLED);
+    let texture = d
+        .create_texture(&desc, TextureMemory::Dedicated, "one texel")
+        .unwrap();
+    let slot_index = d.alloc_image_slot().unwrap();
+    let index = d.write_sampled(slot_index, &texture, &orr_gpu::ViewDesc::default());
+    let binding: TextureBinding = bytemuck::Zeroable::zeroed();
+    let sampler = d.sampler(&orr_scene::binding_sampler(&binding)).unwrap();
+    let factor = 0.8;
+    let mut m = Material {
+        base_color: [factor; 3],
+        emission_color: [factor; 3],
+        emission_luminance: 1.0,
+        ..Material::default()
+    };
+    m.textures[slot::BASE_COLOR].vertex = 1;
+    m.textures[slot::EMISSION].vertex = 1;
+    let primaries = [Primaries::Rec709, Primaries::DisplayP3, Primaries::Rec2020];
+    let records: Vec<MaterialGpu> = primaries
+        .iter()
+        .map(|p| {
+            let mut bound = [BoundTexture::NONE; slot::COUNT];
+            for s in [slot::BASE_COLOR, slot::EMISSION] {
+                bound[s] = BoundTexture {
+                    index,
+                    primaries: p.id(),
+                    sampler,
+                    ..BoundTexture::NONE
+                };
+            }
+            MaterialGpu::new(&m, &bound)
+        })
+        .collect();
+    let texels = {
+        let mut a = d
+            .gpu_malloc::<u8>(MemoryKind::Upload, 64, "texels")
+            .unwrap();
+        a.as_mut_slice().unwrap().copy_from_slice(&TEXEL.repeat(16));
+        a
+    };
+    let vertex = [0.9, 0.3, 0.6, 1.0];
+    let out = surface_params(
+        d,
+        &records,
+        |list| {
+            list.discard(&texture);
+            list.copy_to_texture(&texture, &TextureRegion::whole_mip(&desc, 0), texels.gpu());
+            list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
+        },
+        vertex,
+    );
+    let stream = DVec3::from_slice(&vertex.map(f64::from)[..3]);
+    for (p, o) in primaries.iter().zip(&out) {
+        let rec709 = p.rgb().matrix_to(RgbPrimaries::REC709) * texel;
+        let want = RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020)
+            * (f64::from(factor) * rec709 * stream);
+        let want = want.as_vec3();
+        for (what, got) in [("base color", o.base_color), ("emitted", o.emitted)] {
+            let got = Vec3::from(got);
+            assert!(
+                (got - want).abs().max_element() < 1e-5,
+                "{p:?} {what}: {got}, not {want}"
+            );
+        }
+    }
+    d.free_image_slot_after_submitted(slot_index);
+    assert_clean();
+}
+
 /// PS `opacity`: 1 is "fully opaque" and 0 "fully transparent", as a slot's complement of the
 /// stream reads it. A mesh without the stream reads 1, so it is opaque.
 #[test]

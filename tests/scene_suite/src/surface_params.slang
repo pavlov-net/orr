@@ -36,6 +36,8 @@ struct Params
     float specular_anisotropy;
     float tangent_angle;
     float coat_tangent_angle;
+    // What a light's sample reads the surface to emit (`surface_emission`).
+    float3 emitted;
     uint flags;
     float transmission_weight;
 }
@@ -113,5 +115,6 @@ void main(uint3 id: SV_DispatchThreadID)
     o.tangent_angle = p.tangent_angle;
     o.coat_tangent_angle = p.coat_tangent_angle;
     o.flags = p.flags;
+    o.emitted = surface_emission(i, i.scene.materials + id.x);
     root.out[id.x] = o;
 }

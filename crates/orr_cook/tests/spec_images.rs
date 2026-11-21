@@ -1206,6 +1206,34 @@ fn material_colors_below_zero_convert_to_rec2020() {
     assert_eq!(clip_warnings(&report), 0);
 }
 
+/// glTF 2.0's images are sRGB Rec.709, PNG, JPEG or a format an extension adds, none of which
+/// holds a value below 0, so a glTF color image that reads below 0 fails the cook, flat or not.
+#[test]
+fn a_gltf_color_image_below_0_fails_the_cook() {
+    let d = dir("gltf-below-zero");
+    let json = r#"{"pbrMetallicRoughness":{"baseColorTexture":{"index":0}}}"#;
+    let varying = |x: usize| {
+        let [r, g, b] = if x < 4 { BELOW } else { [0.5, 0.25, 0.5] };
+        (r, g, b, 1.0)
+    };
+    for image in [flat_exr(BELOW, |_, _| {}), exr_image(varying, |_, _| {})] {
+        let path = d.join("m.glb");
+        write_glb(&path, &[json.into()], &[image]);
+        let assets = vec![AssetSpec {
+            name: "u".into(),
+            source: Source::Gltf {
+                path,
+                settings: GltfSettings::default(),
+            },
+        }];
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(Target::Memory, assets)],
+        };
+        let error = orr_cook::cook(&manifest, &Default::default()).unwrap_err();
+        assert!(error.to_string().contains("below 0"), "{error}");
+    }
+}
+
 /// A slot holds one primaries id, so whether a set converts is one answer for all of its tiles: a
 /// tile with nothing below 0 converts beside one that has, or the two would read in different
 /// primaries. And a set is one image to the report, however many tiles clip.

@@ -9,7 +9,6 @@ use std::f32::consts::{PI, TAU};
 use std::path::{Path, PathBuf};
 
 use float_ktx2::{float_ktx2, with_swizzle};
-use orr_color::RgbPrimaries;
 use orr_cook::{
     ArchiveSpec, AssetSpec, CookOptions, DataFormat, GltfSettings, InputChannels, Manifest,
     MaterialPatch, Primaries, Quality, Source, TextureOverride, TextureRules, TextureSettings,
@@ -1640,34 +1639,43 @@ fn signed_standalone_sources_keep_their_values_in_signed_formats() {
 #[test]
 fn constants_fold_into_factors_clamped_to_their_domain() {
     let d = dir("constant-clamp");
-    let material = r#"{"alphaMode":"BLEND",
-        "pbrMetallicRoughness":{"baseColorTexture":{"index":0},"metallicRoughnessTexture":{"index":0},
-            "baseColorFactor":[0.5,0.5,0.5,0.5],"metallicFactor":0.5,"roughnessFactor":0.5},
-        "emissiveTexture":{"index":0},"emissiveFactor":[0.5,0.5,0.5],
-        "extensions":{
+    let scalars =
+        r#""metallicRoughnessTexture":{"index":0},"metallicFactor":0.5,"roughnessFactor":0.5"#;
+    let extensions = r#""extensions":{
             "KHR_materials_specular":{"specularTexture":{"index":0},"specularFactor":0.5},
             "KHR_materials_clearcoat":{"clearcoatTexture":{"index":0},"clearcoatFactor":0.5},
-            "KHR_materials_transmission":{"transmissionTexture":{"index":0},"transmissionFactor":0.5}}}"#;
-    for (format, value, want) in [
-        (ctt::Format::R8G8B8A8_SNORM, -0.2, 0.0),
-        (ctt::Format::R32G32B32A32_SFLOAT, 1.5, 0.5),
+            "KHR_materials_transmission":{"transmissionTexture":{"index":0},"transmissionFactor":0.5}}"#;
+    // A glTF color image below 0 fails the cook, so the colors fold only from above 1.
+    for (format, value, want, colors) in [
+        (ctt::Format::R8G8B8A8_SNORM, -0.2, 0.0, false),
+        (ctt::Format::R32G32B32A32_SFLOAT, 1.5, 0.5, true),
     ] {
+        let material = if colors {
+            format!(
+                r#"{{"alphaMode":"BLEND","pbrMetallicRoughness":{{"baseColorTexture":{{"index":0}},
+                "baseColorFactor":[0.5,0.5,0.5,0.5],{scalars}}},
+                "emissiveTexture":{{"index":0}},"emissiveFactor":[0.5,0.5,0.5],{extensions}}}"#
+            )
+        } else {
+            format!(r#"{{"pbrMetallicRoughness":{{{scalars}}},{extensions}}}"#)
+        };
         let format = ctt::TargetFormat::Uncompressed(format);
         let image = float_ktx2(8, 8, format, false, |_, _| [value; 4]);
         let path = d.join("constant.glb");
-        write_glb(&path, &[material.into()], &[image]);
+        write_glb(&path, &[material], &[image]);
         let (_, m) = cook_glb(&path, GltfSettings::default());
         assert!(m.textures.iter().all(|b| b.texture == AssetId::NONE));
-        for got in [
-            m.base_color[0],
-            m.geometry_opacity,
-            m.emission_color[0],
+        let mut got = vec![
             m.specular_roughness,
             m.metalness,
             m.specular_weight,
             m.coat_weight,
             m.transmission_weight,
-        ] {
+        ];
+        if colors {
+            got.extend([m.base_color[0], m.geometry_opacity, m.emission_color[0]]);
+        }
+        for got in got {
             assert_eq!(got, want, "{m:?}");
         }
     }
@@ -1956,17 +1964,18 @@ fn gltf_materials_cook_their_canonical_channel_set() {
     println!("texture bytes: packed {packed}, one texture per image {per_image}");
 }
 
+/// glTF 2.0's images are sRGB Rec.709, so an override that gives one other primaries fails the
+/// cook.
 #[test]
-fn a_constant_color_folds_into_its_factor_in_the_image_primaries() {
-    let d = dir("gltf-constant-primaries");
+fn a_gltf_image_refuses_a_primaries_override() {
+    let d = dir("gltf-primaries-override");
     let path = d.join("quad.glb");
-    let texel = [255u8, 128, 0];
     write_glb(
         &path,
         &[r#"{"emissiveTexture":{"index":0},"emissiveFactor":[2,1,0.5]}"#.into()],
-        &[png(8, 8, |_, _| [texel[0], texel[1], texel[2], 255])],
+        &[png(8, 8, |_, _| [255, 128, 0, 255])],
     );
-    let a = cook(vec![AssetSpec {
+    let assets = vec![AssetSpec {
         name: "quad".into(),
         source: Source::Gltf {
             path,
@@ -1984,20 +1993,10 @@ fn a_constant_color_folds_into_its_factor_in_the_image_primaries() {
                 ..GltfSettings::default()
             },
         },
-    }]);
-    let model = a.find(AssetId::from_name("quad")).unwrap();
-    let model = ModelInfo::parse(&read_blob(&a, model, 0)).unwrap();
-    let m = Material::from_bytes(&read_blob(&a, a.find(model.materials[0]).unwrap(), 0)).unwrap();
-    assert_eq!(m.textures[slot::EMISSION].texture, AssetId::NONE);
-    let (rec709, p3) = (RgbPrimaries::REC709, RgbPrimaries::DISPLAY_P3);
-    let factor = rec709.matrix_to(p3) * orr_math::DVec3::new(2.0, 1.0, 0.5);
-    let texel = texel.map(|c| orr_color::srgb_decode(f64::from(c) / 255.0));
-    let want = p3.matrix_to(RgbPrimaries::REC2020) * (factor * orr_math::DVec3::from(texel));
-    for c in 0..3 {
-        assert!(
-            (f64::from(m.emission_color[c]) - want[c]).abs() < 1e-4,
-            "emission {:?}, want {want:?}",
-            m.emission_color
-        );
-    }
+    }];
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(Target::Memory, assets)],
+    };
+    let error = orr_cook::cook(&manifest, &Default::default()).unwrap_err();
+    assert!(error.to_string().contains("primaries"), "{error}");
 }

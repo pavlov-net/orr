@@ -1598,6 +1598,33 @@ impl<'a> Packer<'a> {
         }
     }
 
+    /// Refuses what glTF 2.0 images can't be: every one is sRGB Rec.709 (PNG, JPEG, or a format an
+    /// extension adds, none of which holds values below 0), so an override can't give one other
+    /// primaries and a color image read below 0 is outside the format. An override of Rec.709
+    /// takes the texels as they are, so what they hold below 0 clips.
+    fn gltf_images_are_rec709(&self, t: &MaterialTextures) -> Result<()> {
+        let fail = |r: &TexRef, why: &str| Error::Texture {
+            asset: self.asset.into(),
+            message: format!("glTF image {}: {why}", self.images[r.image].name),
+        };
+        for r in t.colors().filter(|r| r.rules == ImageRules::Gltf) {
+            let over = self.overridden(&[r.image], |o| o.primaries);
+            if over.is_some_and(|p| p != Primaries::Rec709) {
+                return Err(fail(
+                    r,
+                    "a texture override sets its primaries, but glTF images are sRGB Rec.709",
+                ));
+            }
+            if self.color_read(r).2.is_some() {
+                return Err(fail(
+                    r,
+                    "its colors read below 0, which no glTF image format holds",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The channel `r` reads for an input: the last override for its image that sets the
     /// input's channel, else its two-channel reading on a red-green image, else its own.
     fn channel_of(&self, r: TexRef, input: fn(&InputChannels) -> Option<u8>) -> Result<TexRef> {
@@ -1627,6 +1654,7 @@ impl<'a> Packer<'a> {
         m: &mut Material,
         t: &MaterialTextures,
     ) -> Result<()> {
+        self.gltf_images_are_rec709(t)?;
         let mut read = t.clone();
         for r in read.refs_mut() {
             if let Some(wrap) = self.image(r.image).wrap {
