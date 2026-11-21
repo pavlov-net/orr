@@ -3335,14 +3335,14 @@ fn texture_head(arc: &Archive, id: AssetId) -> Result<(&[orr_pack::Blob], Textur
 
 /// Luminance per channel in a cooked texture's primaries.
 fn luminance_weights(arc: &Archive, id: AssetId) -> Result<Vec3> {
-    let primaries = texture_head(arc, id)?.1.header.primaries;
-    header_luminance(primaries)
+    header_luminance(&texture_head(arc, id)?.1.header)
 }
 
-/// Luminance per channel in primaries `id`.
-fn header_luminance(id: u8) -> Result<Vec3> {
-    let primaries =
-        orr_color::Primaries::from_id(id).ok_or(orr_pack::Error::Malformed("texture primaries"))?;
+/// Luminance per channel in the primaries of texture header `h`.
+fn header_luminance(h: &orr_pack::texture::TextureHeader) -> Result<Vec3> {
+    let primaries = h.color_primaries().ok_or(orr_pack::Error::Malformed(
+        "emission texture without primaries",
+    ))?;
     Ok(primaries.rgb().luminance_weights().as_vec3())
 }
 
@@ -3361,7 +3361,7 @@ fn emission_map(arc: &Archive, id: AssetId) -> Result<EmissionMap> {
     let [w, hh] = h.mip_size(mip);
     let srgb = h.vk_format == orr_pack::texture::vk::BC7_SRGB;
     let planes = mip_planes(h.vk_format, w, hh, &bytes, 3)?;
-    let y = header_luminance(h.primaries)?;
+    let y = header_luminance(&h)?;
     // BC7 decodes to its 8-bit codes over 255.
     let linear = |c: f32| {
         if srgb {

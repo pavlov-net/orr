@@ -968,9 +968,13 @@ impl Renderer {
         Ok(self.scenes.texture(m, id)?)
     }
 
-    /// The `orr_color::Primaries` id the cooked texture `id` holds its colors in
-    /// ([`orr_scene::Scenes::texture_primaries`]).
-    pub fn texture_primaries(&self, m: MountId, id: orr_pack::AssetId) -> Result<u8> {
+    /// The primaries the cooked texture `id` holds its colors in, `None` for a neural set's
+    /// latents ([`orr_scene::Scenes::texture_primaries`]).
+    pub fn texture_primaries(
+        &self,
+        m: MountId,
+        id: orr_pack::AssetId,
+    ) -> Result<Option<Primaries>> {
         Ok(self.scenes.texture_primaries(m, id)?)
     }
 

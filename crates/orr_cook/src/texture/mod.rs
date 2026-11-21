@@ -532,19 +532,20 @@ fn finish(chains: Vec<Vec<Img>>, plan: &Plan) -> Result<Built, String> {
         plan.encoding.vk_format(),
         [w, h],
         plan.cube,
-        plan.primaries,
+        Some(plan.primaries),
         alpha_cutoff,
         plan.lights.clone(),
         &encoded,
     ))
 }
 
-/// Archive blobs of an encoded texture: `levels[layer][mip]` holds tight block rows.
+/// Archive blobs of an encoded texture: `levels[layer][mip]` holds tight block rows. `primaries`
+/// is `None` for a texture that holds no color.
 fn layout(
     vk_format: u32,
     [w, h]: [u32; 2],
     cube: bool,
-    primaries: Primaries,
+    primaries: Option<Primaries>,
     alpha_cutoff: f32,
     lights: Vec<ExtractedLight>,
     levels: &[Vec<Vec<u8>>],
@@ -564,7 +565,7 @@ fn layout(
         },
         mip_count: mip_count as u8,
         tail_first_mip: tail as u8,
-        primaries: primaries.id(),
+        primaries: primaries.map_or(TextureHeader::NO_PRIMARIES, Primaries::id),
         _pad: [0; 2],
         alpha_cutoff,
         lights: Span::default(),
@@ -805,7 +806,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
                 encoding.vk_format(),
                 mip_size(w, h, skip),
                 src.cube,
-                primaries,
+                Some(primaries),
                 coverage.map_or(f32::NAN, |c| c.1),
                 Vec::new(),
                 &levels,

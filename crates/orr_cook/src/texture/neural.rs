@@ -27,7 +27,7 @@ use orr_pack::{ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span};
 use serde::Deserialize;
 
 use super::material::{ImageFile, TextureJob};
-use super::{Built, Encoding, Img, Primaries, linear_to_srgb};
+use super::{Built, Encoding, Img, linear_to_srgb};
 use crate::decoded::Decoded;
 use crate::key::Key;
 use crate::report::{NeuralReport, NeuralTextureReport};
@@ -356,13 +356,11 @@ impl NeuralJob {
         }
 
         let latents_name = orr_pack::names::latents(&self.name);
-        // Kernels reach latents through their set's slot index, never a material binding, so
-        // no kernel converts them by this primaries tag.
         let latents = super::layout(
             vk::A4R4G4B4_UNORM_PACK16,
             [out.latent_size[0], out.latent_size[1]],
             false,
-            Primaries::Rec709,
+            None,
             f32::NAN,
             Vec::new(),
             &out.latents,

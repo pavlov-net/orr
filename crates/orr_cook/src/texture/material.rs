@@ -2822,7 +2822,7 @@ impl TextureJob {
             self.pack.encoding.vk_format(),
             size,
             false,
-            self.primaries,
+            Some(self.primaries),
             self.pack.coverage.map_or(f32::NAN, |c| c.1),
             Vec::new(),
             &[mips],

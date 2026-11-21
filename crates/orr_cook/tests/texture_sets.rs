@@ -452,6 +452,7 @@ fn neural_sets_meet_the_floor() {
             let latents = a.find(info.header.latents).unwrap();
             let t = TextureInfo::parse(&read_blob(&a, latents, 0)).unwrap();
             assert_eq!(t.header.vk_format, vk::A4R4G4B4_UNORM_PACK16);
+            assert_eq!(t.header.color_primaries(), None, "latents hold no color");
             assert_eq!(
                 u32::from(t.header.layers) * 4,
                 u32::from(info.header.latent_features)

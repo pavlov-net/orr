@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use orr_color::Primaries;
 use orr_gpu::{
     Allocation, ClearColor, ColorAttachment, ColorLoad, CommandList, ComputePipeline,
     DEFAULT_ENVIRONMENT, DEFAULT_MEDIUM, Device, GpuAddress, GpuPtr, Hazards, HitTable, KernelSet,
@@ -1044,11 +1045,12 @@ impl Scenes {
         self.core.mounts.lookup(m, id, |r| &r.textures)
     }
 
-    /// The primaries the cooked texture `id` of mount `m` holds its colors in, as an
-    /// `orr_color::Primaries` id: what its header states, which a kernel converting its texels
-    /// to render primaries reads.
-    pub fn texture_primaries(&self, m: MountId, id: AssetId) -> Result<u8> {
-        self.core.mounts.lookup(m, id, |r| &r.texture_primaries)
+    /// The primaries the cooked texture `id` of mount `m` holds its colors in: what its header
+    /// states, which a kernel converting its texels to render primaries reads. `None` for a
+    /// neural set's latents, which hold no color.
+    pub fn texture_primaries(&self, m: MountId, id: AssetId) -> Result<Option<Primaries>> {
+        let id = self.core.mounts.lookup(m, id, |r| &r.texture_primaries)?;
+        Ok(Primaries::from_id(id))
     }
 
     /// The cooked material `id` of mount `m`, for consumer data and [`MaterialWriter`] edits.

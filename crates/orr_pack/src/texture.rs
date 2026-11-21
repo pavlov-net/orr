@@ -37,7 +37,9 @@ pub struct TextureHeader {
     pub mip_count: u8,
     /// Mips from this one down share the last blob; `mip_count` when there is no tail.
     pub tail_first_mip: u8,
-    /// Source primaries of color texels: an `orr_color::Primaries` id.
+    /// Source primaries of color texels: an `orr_color::Primaries` id, or
+    /// [`Self::NO_PRIMARIES`] for neural latents. Other textures of numbers keep the primaries
+    /// their source was read in, which a color slot that binds one applies.
     pub primaries: u8,
     pub _pad: [u8; 2],
     /// Cutoff the alpha-coverage mips were built for; NaN when not alpha-tested.
@@ -49,6 +51,13 @@ pub struct TextureHeader {
 impl TextureHeader {
     pub const D2: u8 = 0;
     pub const CUBE: u8 = 1;
+    /// [`Self::primaries`] of neural latents, which no kernel reads as color.
+    pub const NO_PRIMARIES: u8 = u8::MAX;
+
+    /// The primaries of the texture's color texels; `None` for [`Self::NO_PRIMARIES`].
+    pub fn color_primaries(&self) -> Option<orr_color::Primaries> {
+        orr_color::Primaries::from_id(self.primaries)
+    }
 
     pub fn format(&self) -> Result<FormatInfo> {
         FormatInfo::of(self.vk_format).ok_or(Error::Malformed("texture format"))
@@ -103,6 +112,7 @@ impl TextureInfo {
             || h.mip_count == 0
             || u32::from(h.mip_count) > full
             || h.kind > TextureHeader::CUBE
+            || (h.color_primaries().is_none() && h.primaries != TextureHeader::NO_PRIMARIES)
             || (h.kind == TextureHeader::CUBE && !h.layers.is_multiple_of(6))
             || u32::from(h.tail_first_mip)
                 != tail_first_mip(f, h.width, h.height, u32::from(h.mip_count))

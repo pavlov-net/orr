@@ -515,6 +515,8 @@ pub fn environment_map(
         primaries: renderer
             .texture_primaries(mount, id)
             .expect("environment texture")
+            .expect("environment maps hold color")
+            .id()
             .into(),
         from_world: from_world.into(),
     };
