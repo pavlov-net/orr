@@ -1,20 +1,22 @@
 //! Dielectric paths on the bed: the interior list, Beer transmittance through a slab,
 //! rough refraction, the glass furnace and a diffuse sphere beside glass in one, single scattering against a CPU integral, an albedo-1
 //! medium, presence layers, a camera inside water, layer guides under camera rotation,
-//! the frosted-glass term of rough glass, dispersion: a white line through a prism against a
+//! a textured floor through an ideal window against the floor seen directly, the frosted-glass
+//! term of rough glass, dispersion: a white line through a prism against a
 //! CPU model, a dispersive furnace, and paths without dispersive hits, the layer tiles
 //! against tracing every tile, the dielectric layer view, an emissive particle seen through
 //! glass, and each pixel's front layer.
 
 use lighting_suite::bed::{
-    Accumulated, Analytic, BLACK_SPHERE, Bed, CLOUD_SPHERE, Capture, DEPTH_SPLIT_SLAB,
-    DISPERSIVE_SPHERE, EMITTER_LUMINANCE, EXTENT, FLOOR, FURNACE_RADIANCE, FlatColor, FrostGuide,
-    GLASS_SPHERE, Item, LIGHT_FLOOR, LINE, LINE_HALF_HEIGHT, LINE_HALF_WIDTH, LIT_SLAB,
-    MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, MIXED_SLAB, NEAR, OverlayFrontLayer, PRESENCE_VEIL,
-    PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Particle, ParticleLook,
-    Paths, ROUGH_SLAB, SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB,
-    TWO_SIDED_SLAB, WATER_BOX, WHITE_SPHERE, assert_close, fresnel, pixel_of, prism_corners,
-    reference, surface_mean, water_transmission,
+    Accumulated, Analytic, BLACK_SPHERE, Bed, CHECKER_FLOOR, CLOUD_SPHERE, Capture,
+    DEPTH_SPLIT_SLAB, DISPERSIVE_SPHERE, EMITTER_LUMINANCE, EXTENT, FLOOR, FURNACE_RADIANCE,
+    FlatColor, FrostGuide, GLASS_SPHERE, IDEAL_WINDOW, Item, LIGHT_FLOOR, LINE, LINE_HALF_HEIGHT,
+    LINE_HALF_WIDTH, LIT_SLAB, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, MIXED_SLAB, NEAR,
+    OverlayFrontLayer, PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT,
+    PRISM_IOR, Particle, ParticleLook, Paths, ROUGH_SLAB, SLAB_THICKNESS, SMOOTH_FLOOR, SUN,
+    SpareView, Spec, TINTED_SLAB, TWO_SIDED_SLAB, WATER_BOX, WHITE_SPHERE, assert_close,
+    assert_within_noise, fresnel, pixel_of, prism_corners, reference, surface_mean,
+    water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
 use lighting_suite::welch::assert_mean;
@@ -722,6 +724,45 @@ fn a_rough_slab_transmits_about_as_much_as_a_smooth_one() {
         )
     };
     assert_close("rough slab", render(ROUGH_SLAB), render(TINTED_SLAB), 0.05);
+    assert_clean();
+}
+
+/// A checkered floor seen through an ideal window, which passes every ray on unbent, shades as
+/// the floor seen directly: the camera sees it through the window, so its hits read their
+/// texture with the same footprint and the view's mip bias as the camera rays' own. The bias is
+/// large, so hits that read the finer levels of hits the camera does not see show a sharper
+/// checker.
+#[test]
+fn a_floor_seen_through_an_ideal_window_shades_as_one_seen_directly() {
+    let direct = Spec {
+        copies: vec![at(CHECKER_FLOOR, Vec3::ZERO)],
+        lights: Vec::new(),
+        environment: Some([1.0; 3]),
+        eye: Vec3::new(0.0, 1.5, 3.0),
+        target: Vec3::new(0.0, 0.0, -1.0),
+        fov_y: 0.8,
+        focus: None,
+    };
+    let through = Spec {
+        copies: vec![
+            at(CHECKER_FLOOR, Vec3::ZERO),
+            at(IDEAL_WINDOW, Vec3::new(0.0, 1.5, 2.0)),
+        ],
+        ..direct.clone()
+    };
+    let paths = paths(ViewLighting {
+        traced_primary: true,
+        ..reference(1)
+    });
+    let render = |spec, seed| {
+        let mut bed = Bed::with(spec);
+        bed.set_mip_bias(3.0);
+        lighting_suite::bed::render_paths(&mut bed, &paths, 16, seed)
+    };
+    let seen = render(direct.clone(), 1);
+    let noise = render(direct, 2);
+    let windowed = render(through, 1);
+    assert_within_noise("floor through the window", &windowed, &seen, &noise, 1.25);
     assert_clean();
 }
 

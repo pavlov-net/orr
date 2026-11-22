@@ -184,9 +184,18 @@ public float2 reprojected_motion(ViewConstants* v, float3 q, float w)
     return moved_motion(v, q, q, w);
 }
 
-float3x3 mirror_matrix(float3 n)
+// A reflection through the plane of unit normal n is the half turn about n, negated, and half
+// turns compose as the quaternions (n, 0) multiply: a chain of k reflections maps v to
+// (-1)^k q v q* for their product q, which holds in four numbers what a matrix holds in nine.
+float4 quat_mul(float4 a, float4 b)
 {
-    return float3x3(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0) - 2.0 * float3x3(n * n.x, n * n.y, n * n.z);
+    return float4(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz), a.w * b.w - dot(a.xyz, b.xyz));
+}
+
+float3 quat_rotate(float4 q, float3 v)
+{
+    float3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
 }
 
 // What the mirror direction of a pixel's surface reaches.
@@ -230,7 +239,8 @@ float3 rough_widening(LayerVertex x, float s)
 public struct LayerChain
 {
     // The reflection's and the chain's guides added by their throughputs, with normal and
-    // roughness weighed by `reflected` and `transmitted`.
+    // roughness weighed by `reflected` and `transmitted`, and emission in the diffuse albedo, as
+    // ray reconstruction's guide holds it.
     public Guides guides;
     // Luminance of the reflection's albedo with what the chain's interiors scatter, and of
     // the chain's throughput.
@@ -249,11 +259,16 @@ public struct LayerChain
 // list around the ray before it and `cone` the ray's cone there; the chain crosses at most
 // `depth` layers. `exposure` scales emission to pre-exposed units. Each rough interface widens
 // the chain by its roughness squared per m beyond it (half the cone spread a rough lobe gives a
-// path).
+// path). The chain's hits take the kind and the cone the path's rays along it would
+// (`seen_kind`).
 public LayerChain layer_chain<S : ISurfaces>(SceneRoot* s, ViewConstants* v, LayerVertex l, Bsdf b, float3 dir, Interior interior, uint depth, RayCone cone, float exposure)
 {
     LobeAlbedo a = b.albedo();
     Guides own = surface_guides(l.x.surface, b, exposure);
+    // What of the layer's own the guides take past the chain, summed now so the chain carries
+    // less.
+    float3 reflection = a.specular + a.diffuse;
+    float3 own_diffuse = own.diffuse + own.emission;
     float3 lean = l.front ? l.x.surface.normal : -l.x.surface.normal;
     LayerChain c;
     c.through = a.transmission;
@@ -274,10 +289,14 @@ public LayerChain layer_chain<S : ISurfaces>(SceneRoot* s, ViewConstants* v, Lay
     // What the chain's interiors scatter, which shows in their single-scattering color.
     float3 scattered = float3(0.0);
     if (open)
+    {
         c.blur += rough_widening(x, 0.0);
+        cone.spread += b.mirror_spread();
+    }
     for (uint k = 0; open && k < depth; k++)
     {
-        LayerAccept<S> ta = { s, v, d, hit_context(HIT_SECONDARY, k + 1, cone, 0.0), 0, PRESENCE_ANY };
+        uint kind = seen_kind(v, cone);
+        LayerAccept<S> ta = { s, v, d, hit_context(kind, k + 1, cone, 0.0), 0, PRESENCE_ANY };
         float3 positions[3];
         Hit th = trace_closest(scene_traced(s), path_ray(vertex_origin(x.x, d), d, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, ta, positions);
         InteriorMedium im = interior_medium(s, list.innermost(), list.point(list.innermost()));
@@ -289,7 +308,8 @@ public LayerChain layer_chain<S : ISurfaces>(SceneRoot* s, ViewConstants* v, Lay
             behind = sky_guides();
             break;
         }
-        SurfaceHit sh = resolve_hit<S>(s, v, d, th.instance_index, uint(th.cluster_id), th.primitive_index, th.barycentrics, positions, false, hit_context(HIT_SECONDARY, k + 1, cone, th.t));
+        cone = cone_after_hit(cone, th.t, 0.0);
+        SurfaceHit sh = resolve_hit<S>(s, v, d, th.instance_index, uint(th.cluster_id), th.primitive_index, th.barycentrics, positions, false, hit_context(kind, k + 1, cone, 0.0));
         if (!sh.valid)
             break;
         length_so_far += th.t;
@@ -313,57 +333,69 @@ public LayerChain layer_chain<S : ISurfaces>(SceneRoot* s, ViewConstants* v, Lay
             break;
         }
         c.blur += rough_widening(x, length_so_far);
+        cone.spread += xb.mirror_spread();
         if (crosses_interior(s, x.section))
             list.cross(x.section, x.front, x.x.surface.medium_point);
     }
-    c.reflected = luminance_rec2020(a.specular + a.diffuse + scattered);
+    c.reflected = luminance_rec2020(reflection + scattered);
     c.transmitted = luminance_rec2020(c.through);
     float wr = c.reflected;
     float wt = c.transmitted;
-    c.guides.diffuse = own.diffuse + scattered + c.through * behind.diffuse;
+    c.guides.diffuse = own_diffuse + scattered + c.through * (behind.diffuse + behind.emission);
     c.guides.specular = own.specular + c.through * behind.specular;
-    c.guides.emission = own.emission + c.through * behind.emission;
+    c.guides.emission = float3(0.0);
     float3 n = wr * lean + wt * behind.normal;
     c.guides.normal = dot(n, n) > 0.0 ? normalize(n) : lean;
     c.guides.roughness = wr + wt > 0.0 ? (wr * own.roughness + wt * behind.roughness) / (wr + wt) : own.roughness;
     return c;
 }
 
-// Traces the mirror direction from `pixel`'s G-buffer surface `x1` (guides `g1`), meeting
-// dielectrics and passing presence layers. With `chain`, keeps reflecting off near-mirrors for up to `MIRROR_CHAIN` bounces and returns the guides of
-// the surface past the last one, or the `LayerChain` guides of the dielectric it meets, scaled
-// by the chain's specular albedo, with the normal mirrored through the chain into the view;
-// otherwise one bounce and `g1`. The virtual point lies along the camera ray at the camera
-// distance plus every bounce's length, and past a dielectric whose refraction chain carries
-// more than its reflection, plus that chain's length or at infinity, as a pixel's first layer
-// takes it.
-public Reflection mirror_chain<S : ISurfaces>(GuideRoot r, uint2 pixel, PathVertex x1, Guides g1, bool chain)
+// Traces the mirror direction from `pixel`'s G-buffer surface `x1` (guides `g1`, its reflection
+// spreading a ray cone by `spread`, `Bsdf.mirror_spread`), meeting dielectrics and passing
+// presence layers. With `chain`, keeps reflecting off near-mirrors for up to `MIRROR_CHAIN`
+// bounces and returns the guides of the surface past the last one, or the `LayerChain` guides of
+// the dielectric it meets, scaled by the chain's specular albedo, with the normal mirrored
+// through the chain into the view; otherwise one bounce and `g1`. The chain's hits take the kind
+// and the cone the path's rays in the mirror direction would. The virtual point lies along the
+// camera ray at the camera distance plus every bounce's length, and past a dielectric whose
+// refraction chain carries more than its reflection, plus that chain's length or at infinity, as
+// a pixel's first layer takes it.
+public Reflection mirror_chain<S : ISurfaces>(GuideRoot r, uint2 pixel, PathVertex x1, Guides g1, float spread, bool chain)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
     float exposure = v.exposure[v.exposure_slot].pre_exposure;
+    // The chain's guides hold their emission in their diffuse albedo, as ray reconstruction's
+    // guide takes it, so the trace carries no emission of its own.
     Reflection out;
     out.guides = g1;
+    out.guides.diffuse += g1.emission;
+    out.guides.emission = float3(0.0);
     float3 camera_dir = -x1.view;
     float traveled = x1.camera_distance;
     float3 throughput = float3(1.0);
-    float3x3 mirrors = float3x3(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    // The chain's reflections as one quaternion (`quat_mul`).
+    float4 mirrors = float4(0.0, 0.0, 0.0, 1.0);
     PathVertex x = x1;
     Guides g = g1;
     RayCone cone = camera_cone(v);
     cone.width = cone_width(cone, x1.camera_distance);
+    cone.spread += spread;
     for (uint i = 0; i < MIRROR_CHAIN; i++)
     {
+        // The kind of the path's ray in the mirror direction, which alpha-tests as this trace does.
+        uint kind = seen_kind(v, cone);
         float3 dir = reflect(-x.view, x.surface.normal);
-        HitContext trace_context = hit_context(HIT_SECONDARY, i + 1, cone, 0.0);
-        LayerAccept<S> a = { s, v, dir, trace_context, 0, PRESENCE_NONE };
-        float3 positions[3];
-        Hit h = trace_closest(scene_traced(s), path_ray(vertex_origin(x, dir), dir, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+        // The mirror's albedo and turn apply before the trace, which then holds neither.
         if (chain)
         {
             throughput *= g.specular;
-            mirrors = mul(mirrors, mirror_matrix(x.surface.normal));
+            mirrors = quat_mul(mirrors, float4(x.surface.normal, 0.0));
         }
+        HitContext trace_context = hit_context(kind, i + 1, cone, 0.0);
+        LayerAccept<S> a = { s, v, dir, trace_context, 0, PRESENCE_NONE };
+        float3 positions[3];
+        Hit h = trace_closest(scene_traced(s), path_ray(vertex_origin(x, dir), dir, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
         if (!h.hit || h.cluster_id < 0)
         {
             if (chain)
@@ -382,7 +414,7 @@ public Reflection mirror_chain<S : ISurfaces>(GuideRoot r, uint2 pixel, PathVert
         if (!chain && !layer)
             return out;
         cone = cone_after_hit(cone, h.t, 0.0);
-        SurfaceHit sh = resolve_hit<S>(s, v, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, hit_context(HIT_SECONDARY, i + 1, cone, h.t));
+        SurfaceHit sh = resolve_hit<S>(s, v, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, hit_context(kind, i + 1, cone, 0.0));
         if (!sh.valid)
             return out;
         if (layer)
@@ -407,12 +439,14 @@ public Reflection mirror_chain<S : ISurfaces>(GuideRoot r, uint2 pixel, PathVert
             x = hit_vertex(v, sh, dir);
             Bsdf b = bsdf_prepare(bsdf_collapse(x.surface.bsdf), x.surface.normal, x.view);
             g = surface_guides(x.surface, b, exposure);
+            cone.spread += b.mirror_spread();
         }
         out.guides = g;
-        out.guides.diffuse *= throughput;
+        out.guides.diffuse = (g.diffuse + g.emission) * throughput;
         out.guides.specular *= throughput;
-        out.guides.emission *= throughput;
-        out.guides.normal = mul(mirrors, g.normal);
+        out.guides.emission = float3(0.0);
+        // The chain has made i + 1 reflections.
+        out.guides.normal = ((i & 1) == 0 ? -1.0 : 1.0) * quat_rotate(mirrors, g.normal);
         if (layer || !near_delta(g))
             return out;
     }
@@ -440,7 +474,7 @@ public void guide_body<S : ISurfaces>(GuideRoot r, uint2 pixel)
         bool chain = near_delta(g);
         if (chain || g.roughness < r.motion_roughness)
         {
-            Reflection m = mirror_chain<S>(r, pixel, x1, g, chain);
+            Reflection m = mirror_chain<S>(r, pixel, x1, g, b.mirror_spread(), chain);
             g = m.guides;
             specular_motion = reprojected_motion(v, m.virtual_point, m.w);
             specular_distance = m.w > 0.0 ? length(m.virtual_point) - x1.camera_distance : positive_infinity();

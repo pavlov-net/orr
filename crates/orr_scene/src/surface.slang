@@ -2,6 +2,14 @@
 // at build time into every kernel that shades hits: the material resolve for primary hits and
 // ray hit shading for every other. `StandardSurface` shades from `MaterialGpu` and serves
 // surface id 0, every id nothing links and every hit a linked surface leaves to it.
+//
+// A hit's context says how the camera sees it (`HitContext.kind`). A primary hit is the surface
+// a pixel shows. A hit the camera sees through smooth interfaces, in a mirror or under clear
+// water, lands on screen pixels too: it shades as finely as a primary one, with the same slots,
+// the view's mip bias and its ray cone's footprint (`camera_sees`). Its emission reads with that
+// footprint too, but where light sampling weighs its light against a sample of the emitter's
+// point (`HitContext.weighed`, `filtered_emission`), which reads the point. Every other hit only
+// lights what the camera sees, and a surface may shade it more coarsely.
 module surface;
 
 import orr_shaders.abi;
@@ -15,23 +23,44 @@ __exported import orr_scene.view;
 import orr_scene.scene_may;
 
 // `HitContext.kind`.
-public static const uint HIT_PRIMARY = 0;   // the material resolve and the dielectric camera ray's first hit
+public static const uint HIT_PRIMARY = 0;   // the material resolve's and a camera ray's, its layers' among them
 public static const uint HIT_SECONDARY = 1; // every other ray hit
+// A hit of a view path's ray past its camera ray that the camera sees through the smooth
+// reflections and refractions before it (`seen_kind`).
+public static const uint HIT_THROUGH = 2;
 
-// What a hit's texture footprint is scaled by: the view's mip bias at primary hits.
+// Whether the camera sees a hit of kind `kind`, directly or through smooth interfaces: it lands on
+// screen pixels, so it shades as a primary hit does.
+public bool camera_sees(uint kind)
+{
+    return kind != HIT_SECONDARY;
+}
+
+// Whether a hit of context `c` reads its emission with its footprint: where the camera sees it,
+// but where light sampling weighs its light, whose sample reads an emitter's point, it reads the
+// point too, so both techniques take the same light.
+public bool filtered_emission(HitContext c)
+{
+    return camera_sees(c.kind) && !c.weighed;
+}
+
+// What a hit's texture footprint is scaled by: the view's mip bias at hits the camera sees.
 public float footprint_bias(uint kind, ViewConstants* v)
 {
-    return kind == HIT_PRIMARY && v != nullptr ? exp2(v.mip_bias) : 1.0;
+    return camera_sees(kind) && v != nullptr ? exp2(v.mip_bias) : 1.0;
 }
 
 public struct HitContext
 {
-    public uint kind;          // HIT_*
+    public uint kind;          // HIT_*: how the camera sees the hit
     public uint depth;         // path depth, 0 at primary hits
     public float cone_width;   // m: the ray cone's width at the hit
     public float cone_spread;  // rad: the ray cone's spread angle
     public float2 tap;         // the hit's `UvFootprint.tap`: negative x for hardware filtering
     public bool feedback;      // the hit reports the texture levels it reads (`FeedbackSurface`, `CoverageFeedback`)
+    // HIT_THROUGH's: the light the hit emits is weighed against light sampling's, as the hit of a
+    // ray drawn from a lobe that light sampling serves too (`filtered_emission`).
+    public bool weighed;
 }
 
 // Everything a surface knows about its hit. Directions and normals are unit vectors in
@@ -495,11 +524,12 @@ float3 surface_more_color(SurfaceInput i, MaterialGpu* m, uint slot, float3 fact
 }
 
 // What the surface emits at the hit, in nits: `material_emission_at` with the vertex color
-// stream on both of its slots. Past a primary hit it reads with no footprint, as light sampling
-// reads an emitter's point, so a ray that meets a light sees what a sample drawn there carries.
+// stream on both of its slots. It reads with no footprint, as light sampling reads an emitter's
+// point, but where the hit's emission is filtered (`filtered_emission`), so a ray that meets a
+// light sees what a sample drawn there carries.
 public float3 surface_emission(SurfaceInput i, MaterialGpu* m)
 {
-    if (i.context.kind != HIT_PRIMARY)
+    if (!filtered_emission(i.context))
     {
         i.uv[0] = finest_footprint(i.uv[0]);
         i.uv[1] = finest_footprint(i.uv[1]);
@@ -627,9 +657,9 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
     share *= m.geometry_opacity;
     uint c = d.channels;
     bool emits = (c & DECAL_EMISSION) != 0;
-    // Past a primary hit a decal's light reads with no footprint, as `surface_emission` does.
-    bool primary = i.context.kind == HIT_PRIMARY;
-    UvFootprint e = primary ? f : finest_footprint(f);
+    // A decal's light reads with no footprint where `surface_emission` does.
+    bool filtered = filtered_emission(i.context);
+    UvFootprint e = filtered ? f : finest_footprint(f);
     uint cover = opacity_slot(m);
     float coverage = 1.0;
     float lit_coverage = 1.0;
@@ -645,14 +675,14 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
     [loop]
     for (uint k = 0; k < 8; k++)
     {
-        float lit = share * (primary ? coverage : lit_coverage);
+        float lit = share * (filtered ? coverage : lit_coverage);
         bool covers = !(share * coverage <= 0.0);
         uint slot;
         bool read;
         switch (k)
         {
         case 0: slot = cover; read = true; break;
-        case 1: slot = cover; read = emits && !primary; break;
+        case 1: slot = cover; read = emits && !filtered; break;
         case 2: slot = TEXTURE_EMISSION_LUMINANCE; read = emits && lit > 0.0 && (m.flags & MATERIAL_MORE_TEXTURES) != 0; break;
         case 3: slot = TEXTURE_EMISSION; read = emits && lit > 0.0; break;
         case 4: slot = TEXTURE_BASE_COLOR; read = covers && (c & DECAL_BASE_COLOR) != 0; break;
@@ -680,7 +710,7 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
     }
     if (emits)
     {
-        float lit = share * (primary ? coverage : lit_coverage);
+        float lit = share * (filtered ? coverage : lit_coverage);
         if (lit > 0.0)
             decal_over(layer.emission, layer.emission_cover, luminance * emission, lit);
     }
@@ -726,8 +756,8 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
 }
 
 // Reports to the frame's texture feedback what `blend_decal` of decal `d` reads at hit `i`: its
-// coverage, then its channels' slots, emission's at mip 0 past a primary hit as
-// `surface_emission` reads, with the coverage there too. The coverage is a texel this does not
+// coverage, then its channels' slots, emission's at mip 0 where `surface_emission` reads it there,
+// with the coverage there too. The coverage is a texel this does not
 // read, so where it is 0 the channels report what the blend skips. One read site serves every
 // slot, which keeps the code small.
 void decal_feedback(SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3 py)
@@ -738,7 +768,7 @@ void decal_feedback(SurfaceInput i, DecalGpu* d, float3 relative, float3 px, flo
         return;
     MaterialGpu* m = i.scene.materials + d.material;
     uint c = d.channels;
-    bool past = i.context.kind != HIT_PRIMARY;
+    bool past = !filtered_emission(i.context);
     bool shown = share * m.geometry_opacity > 0.0;
     // Read 0 is the coverage's, of the slot `opacity_slot` picks.
     static const uint SLOTS[7] = { TEXTURE_OPACITY, TEXTURE_EMISSION, TEXTURE_EMISSION_LUMINANCE, TEXTURE_BASE_COLOR, TEXTURE_ROUGHNESS, TEXTURE_METALNESS, TEXTURE_NORMAL };
@@ -789,7 +819,8 @@ struct DecalFeedback : IDecalVisit
 
 // The decals over hit `i`, each handed to `v`: those of the bin of world space holding it and
 // the scene's global ones, merged in (order, id) order by their ranks. Texture footprints
-// follow the hit's ray cone onto the triangle's plane, with the view's mip bias at primary hits.
+// follow the hit's ray cone onto the triangle's plane, with the view's mip bias at hits the
+// camera sees.
 void surface_decals_each<V : IDecalVisit>(SurfaceInput i, inout V v)
 {
     SceneRoot* s = i.scene;
@@ -876,11 +907,11 @@ float surface_tangent_angle(float4 tangent, float3 normal, float rotation)
     return atan2(dot(d, b0), dot(d, t0));
 }
 
-// Whether `StandardSurface` reads bound slot `slot` of `m` at the hit's footprint. Opacity is
-// the alpha test's, at mip 0 (`material_opacity_feedback`), displacement the tessellation's
-// and the medium's slots `material_medium`'s; emission reads at mip 0 past a primary hit
-// (`surface_reads_point`).
-bool surface_reads(MaterialGpu* m, uint slot, bool primary)
+// Whether `StandardSurface` reads bound slot `slot` of `m` at the footprint of a hit, whose
+// emission reads with it with `filtered` (`filtered_emission`). Opacity is the alpha test's, at
+// mip 0 (`material_opacity_feedback`), displacement the tessellation's and the medium's slots
+// `material_medium`'s; emission reads at mip 0 elsewhere (`surface_reads_point`).
+bool surface_reads(MaterialGpu* m, uint slot, bool filtered)
 {
     switch (slot)
     {
@@ -895,7 +926,7 @@ bool surface_reads(MaterialGpu* m, uint slot, bool primary)
         return false;
     case TEXTURE_EMISSION:
     case TEXTURE_EMISSION_LUMINANCE:
-        return primary;
+        return filtered;
     case TEXTURE_ANISOTROPY:
     case TEXTURE_TANGENT:
         return (m.flags & MATERIAL_ANISOTROPY) != 0;
@@ -909,17 +940,17 @@ bool surface_reads(MaterialGpu* m, uint slot, bool primary)
     }
 }
 
-// Whether a hit on `m` reads bound slot `slot` at mip 0 at its uv: emission past a primary hit
-// (`surface_emission`) and with MATERIAL_MEDIUM_TEXTURED, the interior medium's slots
+// Whether a hit on `m` reads bound slot `slot` at mip 0 at its uv: emission where it reads with no
+// footprint (`surface_emission`) and with MATERIAL_MEDIUM_TEXTURED, the interior medium's slots
 // (`material_medium`, at the point the path enters it). A slot read here wants no coarser mip
 // where `surface_reads` reads it too.
-bool surface_reads_point(MaterialGpu* m, uint slot, bool primary)
+bool surface_reads_point(MaterialGpu* m, uint slot, bool filtered)
 {
     switch (slot)
     {
     case TEXTURE_EMISSION:
     case TEXTURE_EMISSION_LUMINANCE:
-        return !primary;
+        return !filtered;
     case TEXTURE_TRANSMISSION_COLOR:
     case TEXTURE_TRANSMISSION_DEPTH:
     case TEXTURE_TRANSMISSION_SCATTER:
@@ -940,13 +971,13 @@ bool surface_reads_point(MaterialGpu* m, uint slot, bool primary)
 public void surface_feedback(SurfaceInput i)
 {
     MaterialGpu* m = i.scene.materials + i.material;
-    bool primary = i.context.kind == HIT_PRIMARY;
+    bool filtered = filtered_emission(i.context);
     for (uint slot = 0; slot < TEXTURE_SLOTS; slot++)
     {
         if (!material_bound(m, slot))
             continue;
-        bool point = surface_reads_point(m, slot, primary);
-        if (!point && !surface_reads(m, slot, primary))
+        bool point = surface_reads_point(m, slot, filtered);
+        if (!point && !surface_reads(m, slot, filtered))
             continue;
         UvFootprint uv[2] = { point ? finest_footprint(i.uv[0]) : i.uv[0], point ? finest_footprint(i.uv[1]) : i.uv[1] };
         material_feedback(m, slot, uv);
@@ -1048,10 +1079,10 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset, bool report)
     float4 coat_normal = float4(0.0);
     float2 tangent = float2(0.0);
     float2 coat_tangent = float2(0.0);
-    // Past a primary hit the emission slots read with no footprint, as `surface_emission` does.
+    // The emission slots read with no footprint where `surface_emission` does.
     UvFootprint finest[2] = { finest_footprint(i.uv[0]), finest_footprint(i.uv[1]) };
-    bool primary = i.context.kind == HIT_PRIMARY;
-    bool emission_finest = !primary;
+    bool filtered = filtered_emission(i.context);
+    bool emission_finest = !filtered;
 
     // Every bound slot the surface reads goes through one texture read, and every slot of a
     // material with a vertex color stream through one read of the stream, so a kernel holds one
@@ -1078,8 +1109,8 @@ GSurface standard_surface(SurfaceInput i, out float depth_offset, bool report)
             continue;
         if (report && bound)
         {
-            bool point = surface_reads_point(m, slot, primary);
-            if (point || surface_reads(m, slot, primary))
+            bool point = surface_reads_point(m, slot, filtered);
+            if (point || surface_reads(m, slot, filtered))
             {
                 UvFootprint wanted[2] = { point ? finest[0] : i.uv[0], point ? finest[1] : i.uv[1] };
                 material_feedback(m, slot, wanted);

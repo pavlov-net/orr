@@ -45,8 +45,7 @@ public static const uint JOB_MODE_SHIFT = 21;
 public static const uint JOB_ENVIRONMENT = 1u << 23;
 // A directional light's ray that a plane stack may bend (`path_light`).
 public static const uint JOB_BEND = 1u << 24;
-// The hit context's: HIT_PRIMARY in place of HIT_SECONDARY, and texture feedback.
-public static const uint JOB_PRIMARY = 1u << 25;
+// The hit context's texture feedback.
 public static const uint JOB_FEEDBACK = 1u << 26;
 // A shadow ray of a light surfaces cast no shadow from: it meets medium proxies alone.
 public static const uint JOB_MEDIA_ONLY = 1u << 27;
@@ -122,7 +121,8 @@ public struct ShadowTraceRoot
 
 // A shadow job: a ray from `origin` along unit `direction` to `t_max`, with ray flags
 // `ray_flags`, in mode `mode` (SHADOW_*), whose candidates take `context` (its cone at the
-// origin, no tap).
+// origin, no tap) as hits the camera does not see, which a shadow ray's are in either tracer
+// (`ShadowCover.context`).
 public RayJob shadow_job(float3 origin, float3 direction, float t_max, uint ray_flags, uint mode, HitContext context, bool environment, bool bend, uint user)
 {
     RayJob j;
@@ -131,7 +131,7 @@ public RayJob shadow_job(float3 origin, float3 direction, float t_max, uint ray_
     j.direction = direction;
     j.flags = (ray_flags & JOB_RAY_FLAGS) | (RAY_SHADOW << JOB_KIND_SHIFT) | (mode << JOB_MODE_SHIFT)
         | (environment ? JOB_ENVIRONMENT : 0) | (bend ? JOB_BEND : 0)
-        | (context.kind == HIT_PRIMARY ? JOB_PRIMARY : 0) | (context.feedback ? JOB_FEEDBACK : 0);
+        | (context.feedback ? JOB_FEEDBACK : 0);
     j.cone = pack_top16(context.cone_width) | (pack_top16(context.cone_spread) << 16);
     j.extra = 0;
     j.depth = context.depth;
@@ -163,7 +163,7 @@ public bool job_bends(RayJob j)
 public HitContext job_context(RayJob j)
 {
     RayCone cone = { unpack_top16(j.cone & 0xffff), unpack_top16(j.cone >> 16) };
-    return hit_context((j.flags & JOB_PRIMARY) != 0 ? HIT_PRIMARY : HIT_SECONDARY, j.depth, cone, 0.0, float2(-1.0), (j.flags & JOB_FEEDBACK) != 0);
+    return hit_context(HIT_SECONDARY, j.depth, cone, 0.0, float2(-1.0), (j.flags & JOB_FEEDBACK) != 0);
 }
 
 // The mode the thin tracer traces a shadow job in: a ray a plane stack may bend first goes as a

@@ -1264,8 +1264,7 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
         }
         bool delta = (s.lobe & LOBE_SPECULAR) != 0;
         bool diffuse = (s.lobe & LOBE_DIFFUSE) != 0;
-        float roughness = g.bsdf.specular_roughness;
-        cone.y += delta ? 0.0 : diffuse ? 1.0 : 2.0 * roughness * roughness;
+        cone.y += s.spread;
         flags |= HOT_RAY;
         flags = diffuse ? flags | HOT_DIFFUSE : flags & ~HOT_DIFFUSE;
         uint4 w1 = load_coherent(at + 1);
@@ -2723,7 +2722,7 @@ public void path_walk_meets<M : IMedium>(PathRoot r, uint slot, inout WalkMeetCa
             store_coherent(cold + COLD_WALK_WORD, uint4(asuint(walk_reflected_origin(r.view, point, n)), medium));
             store_coherent(cold + COLD_WALK_WORD + 3, uint4(e.rng.seed, oct_encode_snorm16(s.wi), e.rng.dimension, steps));
             store_coherent(at + 1, uint4(w1.xy, as_halves(onward.xy), as_halves(float2(onward.z, halves(w1.w).y))));
-            cone.y += (s.lobe & LOBE_SPECULAR) != 0 ? 0.0 : (s.lobe & LOBE_DIFFUSE) != 0 ? 1.0 : 2.0 * b.alpha_iso;
+            cone.y += s.spread;
             c.next = PAYLOAD_GOES_ON;
         }
         store_coherent(at, uint4(asuint(point), hot_flags(flags, rng.dimension)));
@@ -2958,7 +2957,7 @@ void path_hit_as<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial, let
     float t = h.t();
     float3 dir = h.world_direction();
     RayCone cone = { c.context.cone_width, c.context.cone_spread };
-    HitContext context = hit_context(c.context.kind, c.context.depth, cone, t, texture_tap(r.view, pixel, r.frame, r.seed, c.context.depth), c.context.feedback);
+    HitContext context = hit_context(c.context.kind, c.context.depth, cone, t, texture_tap(r.view, pixel, r.frame, r.seed, c.context.depth), c.context.feedback, c.context.weighed);
     float3 positions[3] = { h.corner(0), h.corner(1), h.corner(2) };
     // An emitter's light is weighed by its triangle as light sampling reads it, and a plane stack
     // face is flat.

@@ -330,6 +330,21 @@ pub const GLASS_SLAB: &str = "glass slab";
 pub const SKIN_SLAB: &str = "skin slab";
 /// An upright 2 m square perfect mirror (metal), facing +z.
 pub const MIRROR: &str = "mirror";
+/// [`MIRROR`] of roughness [`SMOOTH_ROUGHNESS`], as smooth as calm water.
+pub const SMOOTH_MIRROR: &str = "smooth mirror";
+/// [`MIRROR`] of roughness 0.08, glossy enough that light sampling serves its lobe, smooth
+/// enough that the camera sees through it.
+pub const GLOSSY_MIRROR: &str = "glossy mirror";
+/// [`MIRROR`] of roughness 0.25, through which the camera sees no image.
+pub const BLURRY_MIRROR: &str = "blurry mirror";
+pub const SMOOTH_ROUGHNESS: f32 = 0.05;
+/// [`MIRROR`]'s square as an ideal window: thin-walled clear glass of IOR 1, double-sided,
+/// which passes every ray on unbent.
+pub const IDEAL_WINDOW: &str = "ideal window";
+/// [`IDEAL_WINDOW`] of roughness [`SMOOTH_ROUGHNESS`].
+pub const SMOOTH_WINDOW: &str = "smooth window";
+/// [`FLOOR`]'s 10 m square, diffuse, its base color a checker of 32 x 32 cells.
+pub const CHECKER_FLOOR: &str = "checker floor";
 /// A unit sphere of [`MIRROR`]'s material.
 pub const MIRROR_SPHERE: &str = "mirror sphere";
 /// The floor as a perfectly smooth black dielectric: only its mirror reflection shows.
@@ -966,6 +981,26 @@ fn halves_png(name: &str, left: u8, right: u8) -> PathBuf {
     path
 }
 
+/// A grayscale PNG of 128 x 128 texels in a checker of 4-texel cells.
+fn checker_png() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("orr_lighting_bed_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("checker.png");
+    let n = 128;
+    let data: Vec<u8> = Vec::from_fn(n * n, |i| {
+        if ((i % n) / 4 + (i / n) / 4) % 2 == 0 {
+            230
+        } else {
+            25
+        }
+    });
+    let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), n as u32, n as u32);
+    enc.set_color(png::ColorType::Grayscale);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header().unwrap().write_image_data(&data).unwrap();
+    path
+}
+
 /// A grayscale PNG of concentric rings, opaque on the inner 60% of each ring.
 fn rings_png() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("orr_lighting_bed_{}", std::process::id()));
@@ -1108,6 +1143,14 @@ fn cook() -> Arc<[u8]> {
         specular_roughness: 0.0,
         ..Material::default()
     };
+    let window = Material {
+        specular_ior: 1.0,
+        thin_walled: 1,
+        double_sided: 1,
+        ..glass
+    };
+    let mut checker = diffuse([1.0; 3]);
+    checker.textures[slot::BASE_COLOR].texture = AssetId::from_name("checker");
     let smooth = Material {
         base_color: [0.0; 3],
         specular_roughness: 0.0,
@@ -1502,6 +1545,54 @@ fn cook() -> Arc<[u8]> {
                     },
                 },
                 model(MIRROR, upright(1.0), vec![mirror]),
+                model(
+                    SMOOTH_MIRROR,
+                    upright(1.0),
+                    vec![Material {
+                        specular_roughness: SMOOTH_ROUGHNESS,
+                        ..mirror
+                    }],
+                ),
+                model(
+                    GLOSSY_MIRROR,
+                    upright(1.0),
+                    vec![Material {
+                        specular_roughness: 0.08,
+                        ..mirror
+                    }],
+                ),
+                model(
+                    BLURRY_MIRROR,
+                    upright(1.0),
+                    vec![Material {
+                        specular_roughness: 0.25,
+                        ..mirror
+                    }],
+                ),
+                model(IDEAL_WINDOW, upright(1.0), vec![window]),
+                model(
+                    SMOOTH_WINDOW,
+                    upright(1.0),
+                    vec![Material {
+                        specular_roughness: SMOOTH_ROUGHNESS,
+                        ..window
+                    }],
+                ),
+                AssetSpec {
+                    name: "checker".into(),
+                    source: Source::Texture {
+                        path: checker_png(),
+                        settings: TextureSettings {
+                            usage: Usage::Color,
+                            ..TextureSettings::default()
+                        },
+                    },
+                },
+                model(
+                    CHECKER_FLOOR,
+                    mesh(|b| b.quad(0, square(5.0, 0.0), y, 8)),
+                    vec![checker],
+                ),
                 model(MIRROR_SPHERE, mesh(|b| b.sphere(0, 32, 1.0)), vec![mirror]),
                 model(
                     SMOOTH_FLOOR,
@@ -2105,6 +2196,8 @@ pub struct Bed {
     pub lighting: SceneLighting,
     /// The frames' views are ones no raster draws, for paths that trace the camera rays.
     traced_primary: bool,
+    /// The views' texture level-of-detail bias, as an upscaler's (`ViewDesc::mip_bias`).
+    mip_bias: f32,
     scenes: Scenes,
     scene: SceneId,
     history: ViewHistoryId,
@@ -2384,6 +2477,7 @@ impl Bed {
             last_id: 0,
             last_root: GpuPtr::NULL,
             traced_primary: false,
+            mip_bias: 0.0,
             last_overlay: None,
             lights,
             light_writes: Vec::new(),
@@ -3005,6 +3099,11 @@ impl Bed {
         self.run_frame(0, 0, true, true, false, &mut |_, _| {});
     }
 
+    /// Renders later frames with the texture level-of-detail bias `bias`, as an upscaler sets it.
+    pub fn set_mip_bias(&mut self, bias: f32) {
+        self.mip_bias = bias;
+    }
+
     /// Renders the frames after the next at pre-exposure `p`, with no frame of its own, as the
     /// output's adapt moves it.
     pub fn move_pre_exposure(&mut self, p: f32) {
@@ -3061,7 +3160,7 @@ impl Bed {
             output_extent: UVec2::from(EXTENT),
             jitter: Vec2::ZERO,
             camera_cut: cut,
-            mip_bias: 0.0,
+            mip_bias: self.mip_bias,
             texture_filter: TextureFilter::Hardware,
         };
         if !self.light_writes.is_empty() || !self.proxy_writes.is_empty() {

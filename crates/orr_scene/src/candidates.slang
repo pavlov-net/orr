@@ -58,7 +58,7 @@ public PathCover new_path_cover(uint mask, uint policy, uint presence, uint seed
 public uint4 path_payload(PathCover c)
 {
     uint word = (c.mask & 0xff) | (c.policy << 8) | (c.presence << 10) | (c.context.kind << 12)
-        | (c.context.feedback ? 1u << 13 : 0u) | (min(c.context.depth, 0x7fffu) << 17);
+        | (c.context.feedback ? 1u << 17 : 0u) | (c.context.weighed ? 1u << 18 : 0u) | (min(c.context.depth, 0x1fffu) << 19);
     return uint4(word, c.seed, asuint(c.context.cone_width), asuint(c.context.cone_spread));
 }
 
@@ -71,7 +71,7 @@ public PathCover path_cover(uint4 payload)
     c.presence = (word >> 10) & 3;
     c.seed = payload.y;
     RayCone cone = { asfloat(payload.z), asfloat(payload.w) };
-    c.context = hit_context((word >> 12) & 1, word >> 17, cone, 0.0, float2(-1.0), ((word >> 13) & 1) != 0);
+    c.context = hit_context((word >> 12) & 3, word >> 19, cone, 0.0, float2(-1.0), ((word >> 17) & 1) != 0, ((word >> 18) & 1) != 0);
     return c;
 }
 
@@ -222,7 +222,8 @@ public struct ShadowCover
     public float3 product;
     public uint word;
 
-    // A shadow ray's: secondary, of no cone.
+    // A shadow ray's, of no cone: a hit the camera does not see, as a thin tracer's job's is
+    // (`job_context`).
     public HitContext context()
     {
         RayCone cone = { 0.0, 0.0 };

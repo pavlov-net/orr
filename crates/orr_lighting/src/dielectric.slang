@@ -95,9 +95,10 @@ public LayerGuide layer_guides<S : ISurfaces>(PathRoot r, LayerVertex l, Bsdf b,
     RayCone cone = camera_cone(v);
     cone.width = cone_width(cone, l.x.camera_distance);
 
-    // The mirror reflection's virtual point.
+    // The mirror reflection's virtual point, along a ray of the path's kind and cone there.
     float3 reflected = reflect(dir, lean);
-    LayerAccept<S> ra = { s, v, reflected, hit_context(HIT_SECONDARY, 1, cone, 0.0), 0, PRESENCE_ANY };
+    RayCone mirrored = { cone.width, cone.spread + b.mirror_spread() };
+    LayerAccept<S> ra = { s, v, reflected, hit_context(seen_kind(v, mirrored), 1, mirrored, 0.0), 0, PRESENCE_ANY };
     Hit rh = trace_closest(scene_traced(s), path_ray(vertex_origin(l.x, reflected), reflected, positive_infinity()), MASK_OPAQUE | MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, ra);
     float3 camera = l.x.surface.position - v.eye_render.xyz;
     g.specular_motion = rh.hit ? reprojected_motion(v, dir * (length(camera) + rh.t), 1.0) : reprojected_motion(v, dir, 0.0);
@@ -121,7 +122,7 @@ public LayerGuide layer_guides<S : ISurfaces>(PathRoot r, LayerVertex l, Bsdf b,
     LayerChain c = layer_chain<S>(s, v, l, b, dir, interior, r.dielectric_depth, cone, exposure);
     float wr = c.reflected;
     float wt = c.transmitted;
-    g.diffuse = c.guides.diffuse + c.guides.emission;
+    g.diffuse = c.guides.diffuse;
     g.specular = c.guides.specular;
     g.normal = c.guides.normal;
     g.roughness = c.guides.roughness;

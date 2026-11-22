@@ -797,7 +797,9 @@ uint path_front_mask(PathRoot r, uint slot, uint4 w0, bool view, bool chain)
 // length where the path starts on the G-buffer's surface, which a sky pixel alone traces it on; on
 // a layered tile it looks for layers up to that surface, and the path starts there where it meets
 // none; where the view's paths trace their camera rays it is the ray the camera sees along. Its
-// hit is a primary one in either. A layered tile's ray takes only layers, since the G-buffer holds
+// hit is a primary one in either. The camera sees the hits of a view path's later rays through
+// the smooth interfaces before them until their cone spreads (`seen_kind`), but past a walk, whose
+// rays a medium's scattering turns. A layered tile's ray takes only layers, since the G-buffer holds
 // the opaque surface the camera sees. Update paths, which start on the G-buffer's surface alone
 // and are no `VIEW`'s, have camera rays that look for none, take a scattering interior's
 // transmittance alone and see no particles. Every ray of a view path inside one may scatter: in
@@ -840,9 +842,13 @@ uint trace_ray<let VIEW : bool, let PHOTON : bool>(PathRoot r, uint slot, uint4*
     uint flags = traced_camera ? RAY_FLAG_NONE : RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE;
     uint depth = context_depth(r, slot, w0.w);
     RayCone c = { cone.x, cone.y };
+    uint kind = primary ? HIT_PRIMARY : VIEW && !trail.walked ? seen_kind(r.view, c) : HIT_SECONDARY;
+    // The light a seen hit emits is weighed against light sampling's but where the ray's vertex
+    // drew it from a delta lobe, its density 0, which light sampling serves none of.
+    bool weighed = kind == HIT_THROUGH && asfloat(load_coherent(at + 3).w) != 0.0;
     // A presence layer is there where the ray's draw falls below its opacity.
     PathCover cover = new_path_cover(mask, COVER_LAYERS, PRESENCE_DRAWN, cover_draw(r, pixel, depth),
-        hit_context(primary ? HIT_PRIMARY : HIT_SECONDARY, depth, c, 0.0, float2(-1.0), !PHOTON && texture_feedback_drawn(pixel, r.frame)));
+        hit_context(kind, depth, c, 0.0, float2(-1.0), !PHOTON && texture_feedback_drawn(pixel, r.frame), weighed));
     RayDesc ray = path_ray(asfloat(w0.xyz), oct_decode_snorm16(w1.x), t_max);
     // A model that mixes classes holds opaque geometry a layered tile's mask can't turn away: the
     // search goes on past it.

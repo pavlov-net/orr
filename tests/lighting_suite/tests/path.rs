@@ -1,12 +1,12 @@
 //! The path kernel on the bed's analytic scenes: the furnace, convergence, the three
 //! estimators against each other, pixel subsets, directional lights, ray counts, ray
-//! origins, the thin lens and the background layer behind foreground, and emissive particles
-//! as lights.
+//! origins, the thin lens and the background layer behind foreground, emissive particles as
+//! lights, and a glossy reflection of a textured emitter under a mip bias.
 
 use lighting_suite::bed::{
     Accumulated, Analytic, BLACK_SPHERE, BUMPY_FLOOR, Bed, COATED_EMITTER, CONVERGES, EMITTER,
     EMITTER_FIELD, EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal, FrostGuide, GLASS_SPHERE,
-    GLOSSY_FLOOR, Item, LAYERED_SPHERE, MIRROR, NEAR, Particle, ParticleLook, Paths,
+    GLOSSY_FLOOR, GLOSSY_MIRROR, Item, LAYERED_SPHERE, MIRROR, NEAR, Particle, ParticleLook, Paths,
     QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR, SUN, Spec, StrandRow, TILED_FLOOR,
     TINTED_FLOOR, TRANSLUCENT_SHEET, TROUGH, WATER_BOX, WHITE_FLOOR, assert_close,
     assert_converges, assert_renders_alike, assert_within_noise, glass_scene, image_mean,
@@ -2183,5 +2183,47 @@ fn a_sphere_light_behind_glass_lights_a_glossy_floor_alike_by_full_and_bsdf_rays
     );
     assert!(bsdf.iter().sum::<f64>() > 0.0, "BSDF rays met no light");
     assert_same_mean("full against BSDF", &full, &bsdf);
+    assert_clean();
+}
+
+/// A glossy mirror that the camera sees through reflects a textured emitter: next-event
+/// estimation weighs the light its BSDF rays meet, so their hits read the emitter's point as light
+/// sampling does, and the view's mip bias, large enough to average the texture, moves nothing.
+#[test]
+fn a_glossy_reflection_of_a_textured_emitter_takes_no_mip_bias() {
+    let spec = Spec {
+        copies: vec![
+            at(GLOSSY_MIRROR, Mat3::IDENTITY, Vec3::new(0.0, 1.0, 0.0)),
+            // Facing the mirror, behind the eye.
+            at(
+                QUADRANT_EMITTER,
+                Mat3::from_diagonal(Vec3::splat(4.0))
+                    * Mat3::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                Vec3::new(0.0, 1.0, 4.0),
+            ),
+        ],
+        lights: Vec::new(),
+        environment: None,
+        eye: Vec3::new(0.0, 1.0, 3.0),
+        target: Vec3::new(0.0, 1.0, 0.0),
+        fov_y: 0.8,
+        focus: None,
+    };
+    let p = paths(reference(1));
+    let render = |bias, seed| {
+        let mut bed = Bed::with(spec.clone());
+        bed.set_mip_bias(bias);
+        render_paths(&mut bed, &p, 32, seed)
+    };
+    let unbiased = render(0.0, 1);
+    let noise = render(0.0, 2);
+    let biased = render(6.0, 1);
+    assert_within_noise(
+        "reflection under a mip bias",
+        &biased,
+        &unbiased,
+        &noise,
+        1.25,
+    );
     assert_clean();
 }

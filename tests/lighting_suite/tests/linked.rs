@@ -1,14 +1,14 @@
 //! Linked kernels through the path kernel, kept in one target because each target compiles
 //! its own linked path pipelines: linked coverage against the equivalent alpha texture, and a
-//! linked surface in a mirror, behind glass and at each bounce. A scene's data against its linked
-//! types. Linked surfaces and coverage, geometry kinds and rich materials in real time against
-//! the reference.
+//! linked surface in a mirror, through smooth and blurry interfaces, behind glass and at each
+//! bounce. A scene's data against its linked types. Linked surfaces and coverage, geometry kinds
+//! and rich materials in real time against the reference.
 
 use lighting_suite::bed::{
-    Accumulated, BARE_LEAF, Bed, CONVERGES, FLOOR, GLASS_SLAB, Item, LAYERED_SPHERE, MIRROR, PANEL,
-    Particle, ParticleLook, Paths, RINGS_LEAF, SKINNED_EMITTER, SKY, SUN, Spec, StrandRow,
-    WHITE_SPHERE, assert_close, assert_converges, assert_within_noise, luminance, mean_where,
-    quad_scene, reference, render_paths, surface_mean,
+    Accumulated, BARE_LEAF, BLURRY_MIRROR, Bed, CONVERGES, FLOOR, GLASS_SLAB, Item, LAYERED_SPHERE,
+    MIRROR, PANEL, Particle, ParticleLook, Paths, RINGS_LEAF, SKINNED_EMITTER, SKY, SMOOTH_MIRROR,
+    SMOOTH_WINDOW, SUN, Spec, StrandRow, WHITE_SPHERE, assert_close, assert_converges,
+    assert_within_noise, luminance, mean_where, quad_scene, reference, render_paths, surface_mean,
 };
 use lighting_suite::{TestScene, assert_clean, linked};
 use orr_gpu::{GpuPtr, KernelSet};
@@ -123,15 +123,65 @@ fn a_linked_surface_looks_the_same_in_a_mirror() {
     let seen = color(direct);
     let reflected = color(mirrored);
     assert!(
-        seen[0] > 0.7,
-        "the panel seen directly is not red: {seen:?}"
+        seen[0] > 0.4 && seen[2] > 0.4,
+        "the panel seen directly is not in its near, seen form: {seen:?}"
     );
     assert_close("panel in the mirror", reflected, seen, 0.02);
     assert_clean();
 }
 
+/// The camera sees the panel through interfaces as smooth as calm water, which blur it well
+/// inside the bound of what it sees through, and not in a mirror that blurs it past the bound: in
+/// a smooth mirror, and in it through a smooth window crossed both ways, the panel shows the form
+/// of a hit the camera sees; in a blurry mirror, the form of one it does not.
+#[test]
+fn a_linked_surface_is_seen_through_smooth_interfaces_and_not_in_a_blurry_mirror() {
+    let panel = at(
+        PANEL,
+        Mat3::from_rotation_y(std::f32::consts::PI),
+        Vec3::new(0.0, 1.0, 6.0),
+    );
+    let mirror = |model| at(model, Mat3::IDENTITY, Vec3::new(0.0, 1.0, 0.0));
+    let seen_share = |copies| {
+        let spec = Spec {
+            copies,
+            lights: Vec::new(),
+            environment: None,
+            eye: Vec3::new(0.0, 1.0, 3.0),
+            target: Vec3::new(0.0, 1.0, 0.0),
+            fov_y: 0.8,
+            focus: None,
+        };
+        let mut bed = linked_bed(spec);
+        let image = render_paths(&mut bed, &linked_paths(reference(2)), 4, 1);
+        let m = mean_where(&image, |p| luminance(p) > 1.0);
+        m[2] / (m[0] + m[1] + m[2])
+    };
+    let smooth = seen_share(vec![mirror(SMOOTH_MIRROR), panel]);
+    let windowed = seen_share(vec![
+        mirror(SMOOTH_MIRROR),
+        at(SMOOTH_WINDOW, Mat3::IDENTITY, Vec3::new(0.0, 1.0, 2.0)),
+        panel,
+    ]);
+    let blurry = seen_share(vec![mirror(BLURRY_MIRROR), panel]);
+    assert!(
+        smooth > 0.4,
+        "the panel in a smooth mirror is not seen: {smooth}"
+    );
+    assert!(
+        windowed > 0.4,
+        "the panel in a smooth mirror through a smooth window is not seen: {windowed}"
+    );
+    assert!(
+        blurry < 0.15,
+        "the panel in a blurry mirror is seen: {blurry}"
+    );
+    assert_clean();
+}
+
 /// The panel behind glass is reached only by the layer kernels' rays, whose first-layer ray and
-/// guides resolve through the linked surface. The slab's two faces put it at depth 2.
+/// guides resolve through the linked surface. The slab's two faces put it at depth 2, and the
+/// camera sees it through their refractions.
 #[test]
 fn a_linked_surface_shows_through_glass() {
     let spec = Spec {
@@ -155,8 +205,8 @@ fn a_linked_surface_shows_through_glass() {
     let m = mean_where(&image, |p| luminance(p) > 1.0);
     let total = m[0] + m[1] + m[2];
     assert!(
-        m[1] > 0.7 * total,
-        "the panel behind glass is not in its far form: {m:?}"
+        m[1] > 0.4 * total && m[2] > 0.4 * total,
+        "the panel behind glass is not in its far, seen form: {m:?}"
     );
     assert_clean();
 }

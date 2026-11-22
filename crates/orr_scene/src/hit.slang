@@ -567,6 +567,25 @@ public RayCone camera_cone(ViewConstants* v)
     return c;
 }
 
+// The GGX roughness of one interface past which the camera no longer sees what lies beyond it as
+// finely as what it sees directly. A path's glossy scatter spreads its ray cone by twice its
+// roughness squared, so the interfaces before a hit may together spread it by SEEN_SPREAD, 1/32
+// rad: about 30 pixels of a 1080p view 60 degrees high, a blur through which the hit's texture
+// still shows. Smooth water of roughness 0.05 crossed or reflected once spreads it by a sixth of
+// that, and a 0.05 mirror seen through 0.05 water by a third. The hit's footprint follows its
+// cone, so a wider bound costs slot reads, not aliasing.
+public static const float SEEN_ROUGHNESS = 0.125;
+public static const float SEEN_SPREAD = 2.0 * SEEN_ROUGHNESS * SEEN_ROUGHNESS;
+
+// The kind of the hit of a ray the camera sees along past its camera ray, of cone `c` at its
+// origin: HIT_THROUGH while the interfaces before it spread the cone by no more than SEEN_SPREAD
+// past the camera's own, else HIT_SECONDARY. A diffuse bounce or a scatter in a medium spreads it
+// by 1 rad, which ends the chain.
+public uint seen_kind(ViewConstants* v, RayCone c)
+{
+    return c.spread <= camera_cone(v).spread + SEEN_SPREAD ? HIT_THROUGH : HIT_SECONDARY;
+}
+
 // The cone's width `t` m along its ray.
 public float cone_width(RayCone c, float t)
 {
@@ -585,8 +604,8 @@ public RayCone cone_after_hit(RayCone c, float t, float spread_change)
 
 // The context of a hit `t` m along cone `c` whose stochastic texture filter draws `tap`
 // (`texture_tap`; negative x: hardware filtering), reporting texture feedback with `feedback`
-// (`texture_feedback_drawn`).
-public HitContext hit_context(uint kind, uint depth, RayCone c, float t, float2 tap = float2(-1.0), bool feedback = false)
+// (`texture_feedback_drawn`), its light weighed against light sampling's with `weighed`.
+public HitContext hit_context(uint kind, uint depth, RayCone c, float t, float2 tap = float2(-1.0), bool feedback = false, bool weighed = false)
 {
     HitContext h;
     h.kind = kind;
@@ -595,6 +614,7 @@ public HitContext hit_context(uint kind, uint depth, RayCone c, float t, float2 
     h.cone_spread = c.spread;
     h.tap = tap;
     h.feedback = feedback;
+    h.weighed = weighed;
     return h;
 }
 

@@ -98,6 +98,7 @@ public struct BsdfDraw
     uint component;
     float3 weight;              // a delta direction's coefficient
     float within;               // and its probability within its lobe
+    float spread;               // rad: what the draw spreads a path's ray cone by (`BsdfSample.spread`)
 }
 
 public struct BsdfSample
@@ -108,6 +109,11 @@ public struct BsdfSample
     public float pdf;                   // 0: no sample
     public uint lobe;                   // LOBE_*
     public uint component;              // the lobe drawn, for `Bsdf.delta_value`
+    // rad: what the scatter spreads a path's ray cone by: nothing along a delta lobe, 1 along one
+    // that draws over the hemisphere (diffuse, multiple scattering, the walk's uniform share), the
+    // fuzz's lateral scale of its cosine lobe, else twice the GGX alpha drawn with, of an
+    // anisotropic lobe its wider axis's.
+    public float spread;
 }
 
 // Directional albedo from the view, by kind, for guides and lobe selection.
@@ -457,6 +463,8 @@ public struct Bsdf : IDifferentiable
         float3 w = float3(0.0);
         float within = 1.0;
         bool ok = true;
+        // The walk's share drawn over the hemisphere.
+        bool hemisphere = false;
         switch (k)
         {
         case COAT:
@@ -529,6 +537,7 @@ public struct Bsdf : IDifferentiable
             if (u.z < walk_ms_share)
             {
                 l = mirrored(sample_uniform_hemisphere(uv));
+                hemisphere = true;
             }
             else
             {
@@ -590,6 +599,12 @@ public struct Bsdf : IDifferentiable
         r.component = k;
         r.weight = w;
         r.within = within;
+        // The fuzz's LTC scales its cosine lobe across by 1 / a_inv.
+        r.spread = delta ? 0.0
+            : k == COAT ? 2.0 * max(coat_alpha.x, coat_alpha.y)
+            : k == FUZZ ? min(1.0, 1.0 / fuzz_ltc.x)
+            : k == SPECULAR || k == THIN_SPECULAR || (k == WALK && !hemisphere) ? 2.0 * max(alpha.x, alpha.y)
+            : 1.0;
         return r;
     }
 
@@ -616,6 +631,7 @@ public struct Bsdf : IDifferentiable
         r.wi = d.wi;
         r.lobe = d.lobe;
         r.component = d.component;
+        r.spread = d.spread;
         return r;
     }
 
@@ -629,6 +645,13 @@ public struct Bsdf : IDifferentiable
         if (d.drawn && !d.delta)
             f = evaluate(d.l, pdf, diffuse);
         return drawn_sample(d, f, pdf, diffuse);
+    }
+
+    // What a scatter of the specular lobes, into the mirror or the refraction direction, spreads
+    // a path's ray cone by, as `BsdfSample.spread` gives: nothing at a mirror.
+    public float mirror_spread()
+    {
+        return mirror ? 0.0 : 2.0 * max(alpha.x, alpha.y);
     }
 
     // What a delta sample of `component` reaching `wi` has here: BSDF x cos over the
@@ -712,6 +735,7 @@ public struct Bsdf : IDifferentiable
             return r;
         float3 l;
         bool specular = false;
+        r.spread = 1.0;
         if (u.x < walk_ms_share)
         {
             l = mirrored(sample_uniform_hemisphere(u.yz));
@@ -723,6 +747,7 @@ public struct Bsdf : IDifferentiable
             if (!openpbr_refract(v, h, dot(v, h), eta_refraction, l) || l.z >= 0.0)
                 return r;
             specular = mirror;
+            r.spread = specular ? 0.0 : 2.0 * max(alpha.x, alpha.y);
         }
         // The mirror's refraction and the walk lobe take their coefficients from one call.
         Facet m = Facet();
@@ -1120,6 +1145,7 @@ public BsdfSample no_sample()
     r.pdf = 0.0;
     r.lobe = 0;
     r.component = LOBES;
+    r.spread = 0.0;
     return r;
 }
 
