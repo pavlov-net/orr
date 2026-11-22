@@ -1230,8 +1230,8 @@ bool photon_stack_owned(PathRoot r, uint slot, uint4* at)
 // its ray toward its light, then its first vertex, which its first ray reaches on the caster as the
 // light's own ray would, and each vertex past it, whose shader runs it adjoint. Where a vertex
 // leaves a deposit, the deposit's callable takes it, unless next-event estimation takes the
-// photon's light there through the plane stack it crossed. A photon that met nothing is gone. Its
-// caster entry counts the photons that deposited.
+// photon's light there through the plane stack it crossed. A photon that met nothing is gone. One
+// that deposited where the view read counts toward its caster cluster's aim cell.
 public void photon_paths(PathRoot r)
 {
     uint slot = DispatchRaysIndex().x;
@@ -1286,9 +1286,9 @@ public void photon_paths(PathRoot r)
             break;
         trail.chain = may(MAY_LAYERS) && layer_record(h);
     }
-    uint entry = load_coherent(path_record(r, slot)).w;
-    if ((entry & PHOTON_DEPOSITED) != 0)
-        InterlockedAdd(r.caustics.source.deposited[entry & ~PHOTON_DEPOSITED], 1u);
+    uint cell = load_coherent(path_record(r, slot)).w;
+    if ((cell & PHOTON_SEEN) != 0)
+        count_seen(r.caustics, cell & ~PHOTON_SEEN);
 }
 
 // The raygen of a view's update paths: the path of a block's pixel, which adds to the world

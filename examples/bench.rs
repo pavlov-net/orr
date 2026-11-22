@@ -419,6 +419,10 @@ fn script_report(script: Script, samples: &[Sample]) -> Value {
             "cache_queries": lit(&|l| l.world_cache.queries.into()),
             "cache_hits": lit(&|l| l.world_cache.hits.into()),
             "cache_updates": lit(&|l| l.world_cache.updates.into()),
+            "caustic_photons": lit(&|l| l.caustics.started.into()),
+            "caustic_deposits": lit(&|l| l.caustics.deposits.into()),
+            "caustic_seen": lit(&|l| l.caustics.seen.into()),
+            "caustic_read_cells": lit(&|l| l.caustics.read.into()),
         },
     })
 }

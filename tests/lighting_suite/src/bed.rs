@@ -347,6 +347,12 @@ pub const SMOOTH_WINDOW: &str = "smooth window";
 pub const CHECKER_FLOOR: &str = "checker floor";
 /// A unit sphere of [`MIRROR`]'s material.
 pub const MIRROR_SPHERE: &str = "mirror sphere";
+/// [`MIRROR`]'s material in one section: a 32 m square sheet at height 0 facing +y, with a 4 m
+/// square hole at its middle, and a 0.6 m square 1 m above the hole facing
+/// [`MIRROR_FIELD_FACING`].
+pub const MIRROR_FIELD: &str = "mirror field";
+/// The way [`MIRROR_FIELD`]'s small square faces, unnormalized.
+pub const MIRROR_FIELD_FACING: Vec3 = Vec3::new(0.0, 1.0, 2.0);
 /// The floor as a perfectly smooth black dielectric: only its mirror reflection shows.
 pub const SMOOTH_FLOOR: &str = "smooth floor";
 /// The floor with a strong bump normal map.
@@ -798,6 +804,31 @@ fn upright_square(half: f32) -> [Vec3; 4] {
 /// An upright square of half side `half` around the origin, facing +z.
 fn upright(half: f32) -> MeshInput {
     mesh(|b| b.quad(0, upright_square(half), Vec3::Z, 1))
+}
+
+/// [`MIRROR_FIELD`].
+fn mirror_field() -> MeshInput {
+    let (outer, hole) = (16.0, 2.0);
+    let flat = |x0: f32, z0: f32, x1: f32, z1: f32| {
+        [(x0, z1), (x1, z1), (x1, z0), (x0, z0)].map(|(x, z)| Vec3::new(x, 0.0, z))
+    };
+    let normal = MIRROR_FIELD_FACING.normalize();
+    let right = Vec3::Y.cross(normal).normalize();
+    let up = normal.cross(right);
+    let center = Vec3::Y;
+    let small = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+        .map(|(x, y)| center + (right * x + up * y) * 0.3);
+    mesh(|b| {
+        for corners in [
+            flat(-outer, hole, outer, outer),
+            flat(-outer, -outer, outer, -hole),
+            flat(-outer, -hole, -hole, hole),
+            flat(hole, -hole, outer, hole),
+        ] {
+            b.quad(0, corners, Vec3::Y, 16);
+        }
+        b.quad(0, small, normal, 8);
+    })
 }
 
 /// [`GRASS`]: the blades' grid points are jittered by up to a third of the spacing, and the
@@ -1594,6 +1625,7 @@ fn cook() -> Arc<[u8]> {
                     vec![checker],
                 ),
                 model(MIRROR_SPHERE, mesh(|b| b.sphere(0, 32, 1.0)), vec![mirror]),
+                model(MIRROR_FIELD, mirror_field(), vec![mirror]),
                 model(
                     SMOOTH_FLOOR,
                     mesh(|b| b.quad(0, square(5.0, 0.0), y, 8)),

@@ -1635,7 +1635,8 @@ void photon_stack_step<V : IVertexKind>(PathRoot r, uint slot, V on, BsdfSample 
 
 // The deposit's callable for `slot`'s photon, of the entry its vertex left (`leave_deposit`): its
 // flux, as its record holds it, times what reached the vertex, in the frame's caustics, the grid or
-// the reference's map; its record then says it deposited.
+// the reference's map; its record then says it was seen where the map took it, or where a cell of
+// the grid it took had been read the frame before.
 public void path_deposit(PathRoot r, uint slot)
 {
     uint4* at = path_hot(r, slot);
@@ -1659,11 +1660,13 @@ public void path_deposit(PathRoot r, uint slot)
     CausticsGpu* c = r.caustics;
     float3 position = asfloat(a.xyz);
     float3 n = oct_decode_snorm16(a.w);
+    bool seen = true;
     if (c.mode == CAUSTICS_MAP)
         map_deposit(c, position, n, flux, oct_decode_snorm16(b.z));
     else
-        grid_deposit(c, r.scene, position, n, flux, u);
-    store_coherent(record, uint4(photon.xyz, photon.w | PHOTON_DEPOSITED));
+        seen = grid_deposit(c, r.scene, position, n, flux, u);
+    if (seen)
+        store_coherent(record, uint4(photon.xyz, photon.w | PHOTON_SEEN));
 }
 
 // The start's callable of `slot`'s caustic photon, the frame's `r.slice_base + slot`th, from a point
@@ -1671,7 +1674,7 @@ public void path_deposit(PathRoot r, uint slot)
 // draws as a point in a medium draws its light candidates, from the light set's tiles at a tile its
 // place in the photons' rows picks (`photon_lit`). Its record takes its flux there, with what the
 // interiors around it and the linked medium `M` let through toward the light and an emitter's coat
-// and fuzz, and its caster entry. Its hot words take the ray toward its light, which the raygen
+// and fuzz, and its caster cluster's aim cell. Its hot words take the ray toward its light, which the raygen
 // traces first, as a shadow job's words, by origin, reach and direction, and its first ray, which
 // reaches the caster's point along the light's direction from `reach` m before it; its cold words
 // the interiors around it, and its stack words its track of a plane stack it may cross from a
@@ -1682,7 +1685,7 @@ public bool path_photon_start<M : IMedium>(PathRoot r, uint slot, out float reac
     reach = 0.0;
     uint index = r.slice_base + slot;
     CausticsGpu* g = r.caustics;
-    if (index >= g.photon_count || !(g.source.total > 0.0))
+    if (index >= photons_started(g) || !(g.source.total > 0.0))
         return false;
     uint2 pixel = item_pixel(r, index);
     Sampler rng = path_sampler(r, pixel);
@@ -1709,7 +1712,7 @@ public bool path_photon_start<M : IMedium>(PathRoot r, uint slot, out float reac
     }
     if (!any(flux > 0.0) || !all(isfinite(flux)))
         return false;
-    store_coherent(path_record(r, slot), uint4(asuint(flux), p.entry));
+    store_coherent(path_record(r, slot), uint4(asuint(flux), p.cell));
     uint flags = HOT_RAY | HOT_CAMERA | HOT_SHADOW;
     if (may_any(MAY_LAYERS | MAY_INTERIORS))
     {

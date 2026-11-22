@@ -1230,11 +1230,12 @@ public static const uint PHOTON_STREAM = 0xB5297A4D;
 // Rows of the photon dispatch's sampler grid.
 public static const uint PHOTON_ROW = 4096;
 
-// How photon `index` starts: its caster entry, the first vertex's hit and corners, its flux
-// and the interiors around it, the direction it arrives along and the light's feedback id.
+// How photon `index` starts: its caster cluster's aim cell, the first vertex's hit and corners,
+// its flux and the interiors around it, the direction it arrives along and the light's feedback
+// id.
 public struct PhotonStart
 {
-    public uint entry;
+    public uint cell;
     public Hit hit;
     public float3 positions[3];
     public float3 flux;
@@ -1254,11 +1255,11 @@ public struct PhotonRay
 
 // Where photon `index` of a frame whose casters have weight starts: a caster entry by its weight,
 // a cluster of its list by its fixed-point step, a triangle uniform by index and a point uniform in
-// it, at a density per m^2 among the frame's photons. Counts the photon started from its entry.
-// False for one that starts nowhere.
+// it, at a density per m^2 among the frame's photons. Counts the photon started, and from its
+// cluster's aim cell. False for one that starts nowhere.
 public struct PhotonCaster
 {
-    public uint entry;
+    public uint cell;               // its cluster's aim cell, or AIM_NONE
     public uint instance_index;
     public uint cluster_id;
     public uint triangle;
@@ -1273,6 +1274,7 @@ public struct PhotonCaster
 public bool photon_caster(PathRoot r, uint index, inout Sampler rng, out PhotonCaster k)
 {
     k = PhotonCaster();
+    k.cell = AIM_NONE;
     SceneRoot* s = r.scene;
     CausticsGpu* g = r.caustics;
     PhotonSourceGpu* source = g.source;
@@ -1280,13 +1282,18 @@ public bool photon_caster(PathRoot r, uint index, inout Sampler rng, out PhotonC
     uint2 bits = uint2(rng.next_bits(), rng.next_bits());
     float2 u = rng.next2();
     uint entry = upper_bound(source.cdf, source.entry_count, below(pick, source.total));
-    k.entry = entry;
-    count_started(source, g, entry);
+    count_started(g);
     EmissiveSelection e = source.entries[entry];
     float chosen = source.cdf[entry] - (entry > 0 ? source.cdf[entry - 1] : 0.0);
     if (e.count == 0)
         return false;
     uint pos = upper_bound(e.cdf, e.count, mulhi(bits.x, 0xffffffffu));
+    // The aim cells steer the grid's photons by what the real-time view reads; the reference's
+    // map counts every deposit as seen, so its photons leave them alone.
+    uint first = source.firsts[entry];
+    if (g.mode != CAUSTICS_MAP && first != AIM_NO_LIST)
+        k.cell = source.cells[first + pos];
+    count_aimed(source, k.cell);
     uint triangles, alpha_first;
     if (!list_cluster(s, e, entry, pos, k.instance_index, k.cluster_id, triangles, alpha_first) || triangles == 0)
         return false;
@@ -1317,12 +1324,12 @@ public bool photon_lit(PathRoot r, PhotonCaster k, ResolvedLightSample c, out Ph
     ray = PhotonRay();
     SceneRoot* s = r.scene;
     LightSetGpu* set = r.set;
-    p.entry = k.entry;
+    p.cell = k.cell;
     if (!(c.pdf > 0.0) || c.kind == LIGHT_SAMPLE_ENVIRONMENT)
         return false;
     float cos_y = abs(dot(k.normal, c.dir));
     float3 l = c.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, c.light, c.dir) : c.radiance;
-    float3 flux = l * (cos_y / (c.pdf * k.density * float(r.caustics.photon_count)));
+    float3 flux = l * (cos_y / (c.pdf * k.density * float(photons_started(r.caustics))));
     if (!any(flux > 0.0) || !all(isfinite(flux)))
         return false;
     p.interior = Interior(r.caustics.source.interiors[c.light]);

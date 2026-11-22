@@ -2,19 +2,20 @@
 //! ball lens against its 1D map from impact parameter to radius, and the reference's photons
 //! against BSDF rays alone, by Welch's test, through a glass sphere from a light photons own and
 //! from the environment, which they do not. A mirror ball's caustic on a floor at a voxel boundary
-//! of every grid level against the reference's map, and the sun off two mirrors against its
-//! illuminance.
+//! of every grid level against the reference's map, and the sun off two mirrors, and off one
+//! mirror of a producer whose other mirrors the sun does not reach, against its illuminance.
 
 use lighting_suite::assert_clean;
 use lighting_suite::bed::{
-    Accumulated, BLACK_SPHERE, Bed, EMITTER, FloorDecal, GLASS_SPHERE, Item, MIRROR, MIRROR_SPHERE,
-    Particle, Paths, SKY, SUN, Spec, TINTED_SLAB, WHITE_FLOOR, WHITE_FLOOR_ALBEDO, fresnel,
-    pixel_of, reference,
+    Accumulated, BLACK_SPHERE, Bed, EMITTER, FloorDecal, GLASS_SPHERE, Item, MIRROR, MIRROR_FIELD,
+    MIRROR_FIELD_FACING, MIRROR_SPHERE, Particle, Paths, SKY, SUN, Spec, TINTED_SLAB, WHITE_FLOOR,
+    WHITE_FLOOR_ALBEDO, fresnel, pixel_of, reference,
 };
 use lighting_suite::welch::{assert_mean, assert_same_mean};
 use orr_gpu::KernelSet;
 use orr_lighting::{
-    CausticStats, DirectionalLight, DiscProfile, Light, LightingDebugView, ViewLighting,
+    CausticSettings, CausticStats, DirectionalLight, DiscProfile, Light, LightingDebugView,
+    SceneLightingSettings, ViewLighting,
 };
 use orr_math::{Affine3, DVec2, Mat3, Vec2, Vec3};
 
@@ -512,6 +513,100 @@ fn the_grid_comes_with_a_scene_s_first_caster_and_goes_with_its_last() {
     assert_clean();
 }
 
+/// A producer's photons find the one mirror of its 4,097 that the sun reaches: the rest lie under
+/// the floor, in its shadow, so the lit mirror holds 0.024% of the producer's area, the share of
+/// its photons it would take by area alone. The mirror is white metal, which reflects all of the
+/// sun, so the patch it throws the sun on takes the sun's illuminance across the beam slanted
+/// onto the floor: measured within 3% over 8 frames, after 16 in which the photons find it. The
+/// first frame aims them blind, and the few that reach the patch carry a flux thousands of times
+/// a later frame's, which the grid weighs by and lets go of.
+#[test]
+fn photons_find_the_one_lit_mirror_of_a_producer() {
+    let spec = Spec {
+        copies: vec![at(WHITE_FLOOR, Vec3::ZERO)],
+        lights: vec![Light::Directional(SUN)],
+        environment: None,
+        eye: Vec3::new(0.0, 3.0, 4.0),
+        target: Vec3::new(0.0, 0.0, -0.5),
+        fov_y: 0.9,
+        focus: None,
+    };
+    let center = Vec3::new(0.0, 0.5, -1.0);
+    let normal = (spec.eye - center).normalize();
+    let sun = -SUN.direction_to_light.normalize();
+    let off = sun - 2.0 * sun.dot(normal) * normal;
+    let lit = pixel_of(&spec, center - off * (center.y / off.y));
+    let side = 64;
+    let cell = |k: u32| (k as f32 + 0.5) / side as f32 * 8.8 - 4.4;
+    let mirrors: Vec<Particle> = std::iter::once(Particle { center, size: 0.3 })
+        .chain((0..side * side).map(|i| Particle {
+            center: Vec3::new(cell(i % side), -0.5, cell(i / side)),
+            size: 0.3,
+        }))
+        .collect();
+    let mut bed = Bed::with(spec);
+    let pre_exposure = 1.0 / 64.0;
+    bed.set_pre_exposure(pre_exposure);
+    bed.set_mirror_quads(&mirrors, Affine3::IDENTITY);
+    let gathered = paths(gathered());
+    render_paths(&mut bed, &gathered, 16, 1);
+    let got = render_paths(&mut bed, &gathered, 8, 2).around(lit, 2)[1];
+    let want = f64::from(pre_exposure) * f64::from(WHITE_FLOOR_ALBEDO) / std::f64::consts::PI
+        * f64::from(SUN.illuminance.y)
+        * f64::from(-off.y);
+    assert!(
+        (got / want - 1.0).abs() < 0.03,
+        "the lit mirror's patch shows {got}, not {want}"
+    );
+    assert_clean();
+}
+
+/// A copy's photons find the one mirror of its caster section that the sun reaches: the section
+/// is a cooked mesh, a 1,008 m^2 sheet under a floor scaled to cover it, in its shadow, and a
+/// 0.36 m^2 square above the floor, which its cooked set gives 0.036% of the photons by area.
+/// The square is white metal, which reflects all of the sun, so the patch it throws the sun on
+/// takes the sun's illuminance across the beam slanted onto the floor: measured within 3% over
+/// 8 frames, after 16 in which the photons find it.
+#[test]
+fn photons_find_the_lit_square_of_a_cooked_caster() {
+    let field = Vec3::new(0.0, -0.5, 0.0);
+    let spec = Spec {
+        copies: vec![
+            Item {
+                model: WHITE_FLOOR,
+                linear: Mat3::from_diagonal(Vec3::new(4.0, 1.0, 4.0)),
+                at: Vec3::ZERO,
+            },
+            at(MIRROR_FIELD, field),
+        ],
+        lights: vec![Light::Directional(SUN)],
+        environment: None,
+        eye: Vec3::new(0.0, 3.0, 4.0),
+        target: Vec3::new(0.0, 0.0, -0.5),
+        fov_y: 0.9,
+        focus: None,
+    };
+    let center = field + Vec3::Y;
+    let normal = MIRROR_FIELD_FACING.normalize();
+    let sun = -SUN.direction_to_light.normalize();
+    let off = sun - 2.0 * sun.dot(normal) * normal;
+    let lit = pixel_of(&spec, center - off * (center.y / off.y));
+    let mut bed = Bed::with(spec);
+    let pre_exposure = 1.0 / 64.0;
+    bed.set_pre_exposure(pre_exposure);
+    let gathered = paths(gathered());
+    render_paths(&mut bed, &gathered, 16, 1);
+    let got = render_paths(&mut bed, &gathered, 8, 2).around(lit, 2)[1];
+    let want = f64::from(pre_exposure) * f64::from(WHITE_FLOOR_ALBEDO) / std::f64::consts::PI
+        * f64::from(SUN.illuminance.y)
+        * f64::from(-off.y);
+    assert!(
+        (got / want - 1.0).abs() < 0.03,
+        "the lit square's patch shows {got}, not {want}"
+    );
+    assert_clean();
+}
+
 /// The floor before a mirror takes the light of two emitters above by the reference's photons
 /// as it does by BSDF rays alone, by Welch's test. The mirror is a producer set once frames
 /// have run, after a producer that emits nothing: the two emitters' copies hold the emissive
@@ -566,7 +661,9 @@ fn photons_reflect_off_a_producer_set_as_the_producer_table_alone_grows() {
 /// its copies gives its photons the rounds of a chain of opaque vertices. The mirrors are white
 /// metal, which reflects all of the sun, so the patch takes the sun's illuminance across the beam
 /// slanted onto the floor along its way down, in the grid and in the reference's map: measured
-/// within 1.5%. At a pre-exposure of 1 the patch passes the HDR ceiling, which would clip the
+/// within 1.5%. The grid takes it again with cells 8 times as wide, wider than a pixel's
+/// footprint, so its reads take the finer of their two levels where the coarser holds photons
+/// enough. At a pre-exposure of 1 the patch passes the HDR ceiling, which would clip the
 /// frames that draw it brightest; the frame that sets the pre-exposure runs no photons, which the
 /// grid's frames after it count as no frame at all.
 #[test]
@@ -618,5 +715,18 @@ fn photons_chain_through_two_mirrors() {
             "the {what}'s patch by both mirrors shows {got}, not {want}"
         );
     }
+    let wide = SceneLightingSettings {
+        caustics: CausticSettings {
+            base_cell_log2: -5,
+            ..bed.lighting.settings().caustics
+        },
+        ..*bed.lighting.settings()
+    };
+    bed.lighting.set_settings(&wide).unwrap();
+    let got = render_paths(&mut bed, &paths(gathered()), 8, 2).around(lit, 1)[1];
+    assert!(
+        (got / want - 1.0).abs() < 0.03,
+        "the grid of wide cells' patch shows {got}, not {want}"
+    );
     assert_clean();
 }

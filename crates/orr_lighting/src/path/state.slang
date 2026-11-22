@@ -565,10 +565,10 @@ public float3 spectral_radiance(uint4* at, float3 pending)
     return p.committed + mul(p.transfer, pending);
 }
 
-// A caustic photon's record: its flux in the first three lanes, and its caster entry in the last,
-// with PHOTON_DEPOSITED once it deposited.
+// A caustic photon's record: its flux in the first three lanes, and its caster cluster's aim cell
+// in the last, with PHOTON_SEEN once it deposited in a cell the view read the frame before.
 [Host] public static const uint PATH_PHOTON_RECORD_WORDS = 1;
-public static const uint PHOTON_DEPOSITED = 1u << 31;
+public static const uint PHOTON_SEEN = 1u << 31;
 
 // A view path's record, a word in its slot of the launch's records: the light its feedback names,
 // one of those that lit it, kept in proportion to what each added (`view_light`).

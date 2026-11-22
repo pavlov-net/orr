@@ -5,10 +5,11 @@
 //! reflection or refraction, the water's and the amber's absorption, the jade's scattering,
 //! and nested media where the glass meets the water. The camera orbits the pool, or with
 //! `--dive` bobs through the water's surface, the eye's medium following it. `--turbid` makes the
-//! water scatter, so a dive shows the light in it. A still camera averages its frames in a
-//! scene-referred hook.
+//! water scatter, so a dive shows the light in it. `--sea N` widens the water by N rings of 2 m
+//! patches around the pool, under a ground that grows to cover them, so the producer holds far
+//! more caster area than the pool. A still camera averages its frames in a scene-referred hook.
 //!
-//! `dielectrics [--dive] [--turbid] [--still] [--reference] [--frames N] [--headless]
+//! `dielectrics [--dive] [--turbid] [--sea N] [--still] [--reference] [--frames N] [--headless]
 //! [--out file.png]`: `--reference` renders the accumulation reference at 64 bounces and 64
 //! dielectric vertices. Headless runs keep the camera still, render 480 x 270 for 120 frames
 //! unless told otherwise and write the last frame as a PNG.
@@ -114,7 +115,11 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
     let _workers = Workers::machine(renderer.loading());
-    let (mount, mut frame) = mount_at(&mut renderer, PackSource::Memory(cook()), FIRST_FRAME);
+    let sea: u32 = options
+        .value("--sea")
+        .map_or(0, |n| n.parse().expect("--sea takes a count of rings"));
+    let reach = POOL_HALF * (1 + sea) as f32;
+    let (mount, mut frame) = mount_at(&mut renderer, PackSource::Memory(cook(reach)), FIRST_FRAME);
 
     let scene = renderer
         .create_scene(
@@ -137,9 +142,9 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .compute_pipeline(&slab::MODULE, "main", SpecData::default())
         .expect("slab pipeline");
     let pond = Slab {
-        patches: 2,
+        patches: 2 + 2 * sea,
         patch_size: POOL_HALF,
-        corner: [-POOL_HALF; 2],
+        corner: [-reach; 2],
         level: WATER_LEVEL,
         amplitude: 0.015,
     };
@@ -362,9 +367,9 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     captured
 }
 
-/// The ground around the pool, the pool's tiled inside, and the glass, amber and jade
-/// objects, cooked with the sky into an in-memory pack.
-fn cook() -> Arc<[u8]> {
+/// The ground around the pool, out to at least `reach` m from its center, the pool's tiled
+/// inside, and the glass, amber and jade objects, cooked with the sky into an in-memory pack.
+fn cook(reach: f32) -> Arc<[u8]> {
     let ground = Material {
         base_color: orr_examples::rec2020([0.48, 0.45, 0.4]).to_array(),
         specular_roughness: 0.8,
@@ -401,7 +406,7 @@ fn cook() -> Arc<[u8]> {
         ..glass
     };
 
-    let (h, p) = (20.0, POOL_HALF);
+    let (h, p) = (reach.max(20.0), POOL_HALF);
     let flat = |x0: f32, z0: f32, x1: f32, z1: f32| {
         [
             Vec3::new(x0, 0.0, z1),

@@ -2155,11 +2155,7 @@ impl Scene {
                 decals_changed: false,
                 decal_bin_slots: 0,
                 decal_globals: 0,
-                emissive_blocks: ClusterBlocks::new(
-                    device,
-                    LightTables::default(),
-                    "emissive cluster blocks",
-                )?,
+                emissive_blocks: ClusterBlocks::new(device, 0, 0, "emissive cluster blocks")?,
                 last_update: 0,
                 pages: Vec::new(),
                 pages_removed: Vec::new(),

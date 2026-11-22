@@ -10,7 +10,7 @@ use orr_scene::orr_gpu::{
 };
 use orr_scene::{ClusterBlocks, LightTables, SceneFeatures, SceneRoot, SkyStats};
 
-use crate::caustics::{CausticSettings, CausticStats, Caustics, PerEntry, feedback_ids};
+use crate::caustics::{CausticSettings, CausticStats, Caustics, feedback_ids};
 use crate::environment::EnvironmentBake;
 use crate::shaders::light_sampling::{directional, tiles};
 use crate::shaders::types::{
@@ -246,10 +246,9 @@ pub struct SceneLighting {
     presample: ComputePipeline,
     /// For the light tables of the last scene pass recorded.
     per: PerTable,
-    /// What grown light tables replaced, with the caustics', by the frame whose scene pass
-    /// replaced it: that pass reads its feedback and its casters' yields, and the frames in
-    /// flight before it read all of it.
-    replaced: Vec<(u64, PerTable, PerEntry)>,
+    /// What grown light tables replaced, by the frame whose scene pass replaced it: that pass
+    /// reads its feedback, and the frames in flight before it read all of it.
+    replaced: Vec<(u64, PerTable)>,
     retired: Retired,
     set: Allocation<LightSetGpu>,
     /// The producer entries' cluster CDFs, for `cluster_room` clusters.
@@ -311,11 +310,7 @@ impl SceneLighting {
             set: device_local(device, 1, "light set")?,
             cluster_cdf: device_local(device, 0, "emissive cluster cdf")?,
             cluster_room: 0,
-            cluster_blocks: ClusterBlocks::new(
-                device,
-                LightTables::default(),
-                "emissive list blocks",
-            )?,
+            cluster_blocks: ClusterBlocks::new(device, 0, 0, "emissive list blocks")?,
             tiles: None,
             linked_environment: kernels.environment != DEFAULT_ENVIRONMENT,
             shadow_overflows: device_local(device, 1, "shadow overflows")?,
@@ -375,8 +370,8 @@ impl SceneLighting {
     /// writes `SkyStats`, resolves the world cache at the focus, and writes the statistics
     /// [`Self::stats`] reads. Its outputs are visible to every later stage of the list. A pass
     /// whose light tables have grown since the last makes what the scene holds per light, per
-    /// emissive list entry and per producer cluster anew, and takes the light feedback and the
-    /// casters' yields so far by the ids the smaller tables gave. The scene's first pass makes
+    /// emissive list entry and per producer cluster anew, and takes the light feedback so far
+    /// by the ids the smaller tables gave. The scene's first pass makes
     /// its world cache, and the first to find something a tile sample can name or a caster
     /// makes the light tiles or the caustics' grid; each starts empty in that pass. Fails
     /// without device memory for any of it, recording nothing and leaving the scene's lighting
@@ -407,8 +402,9 @@ impl SceneLighting {
         let cluster_cdf = (clusters != self.cluster_room)
             .then(|| device_local(&self.device, u64::from(clusters), "emissive cluster cdf"))
             .transpose()?;
-        let cluster_blocks = (!self.cluster_blocks.holds(pass.tables))
-            .then(|| ClusterBlocks::new(&self.device, pass.tables, "emissive list blocks"))
+        let producers = pass.tables.producers;
+        let cluster_blocks = (!self.cluster_blocks.holds(producers, clusters))
+            .then(|| ClusterBlocks::new(&self.device, producers, clusters, "emissive list blocks"))
             .transpose()?;
         let tiles = (sampled && self.tiles.is_none())
             .then(|| {
@@ -422,7 +418,7 @@ impl SceneLighting {
         };
         let room = self
             .caustics
-            .room(&self.device, pass.tables, grown, casters)?;
+            .room(&self.device, pass.tables, grown, casters, slot)?;
         if let Some(cdf) = cluster_cdf {
             let before = std::mem::replace(&mut self.cluster_cdf, cdf);
             self.retired.push(pass.frame, before);
@@ -438,15 +434,13 @@ impl SceneLighting {
         if cache.is_some() {
             self.cache = cache;
         }
-        let before = self
-            .caustics
+        self.caustics
             .follow(room, casters, pass.frame, &mut self.retired);
-        if let (Some(per), Some(entries)) = (per, before) {
+        if let Some(per) = per {
             let before = std::mem::replace(&mut self.per, per);
-            self.replaced.push((pass.frame, before, entries));
+            self.replaced.push((pass.frame, before));
         }
         self.per.tables = pass.tables;
-        self.caustics.set_producers(pass.tables.producers);
         let now = &self.per;
         // The frames before left their feedback in what this pass's tables replaced.
         let replaced = self.replaced.last().filter(|_| grown);
@@ -531,10 +525,10 @@ impl SceneLighting {
         self.caustics.record(
             list,
             slot,
+            pass.frame,
             pass.scene,
             self.set.gpu(),
             pass.focus,
-            replaced.map(|r| &r.2),
         );
         cache.record(list, &self.cache_pipelines, slot, pass.scene, pass.focus);
         list.barrier(

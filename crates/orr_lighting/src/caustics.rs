@@ -8,6 +8,7 @@ use orr_scene::{ClusterBlocks, LightTables, SceneRoot};
 
 use crate::scene::{FRAME_SLOTS, Retired, Ring, device_local};
 use crate::shaders::caustics::{casters, resolve};
+use crate::shaders::consts::AIM_CELLS;
 use crate::shaders::types::{
     CausticStatsGpu, CausticsGpu, EmissiveSelection, EyeInterior, LightSetGpu, ListBlock,
     PhotonGpu, PhotonSourceGpu,
@@ -15,7 +16,7 @@ use crate::shaders::types::{
 use crate::{Error, KernelSet, pipeline};
 
 /// Counters the caustics keep on the GPU (`caustics`' `CAUSTIC_COUNTERS`).
-const COUNTERS: u64 = 8;
+const COUNTERS: u64 = 11;
 
 /// `caustics`' `CAUSTICS_GRID` and `CAUSTICS_MAP`.
 const CAUSTICS_GRID: u32 = 0;
@@ -25,7 +26,13 @@ const CAUSTICS_MAP: u32 = 1;
 const RESOLVE_GROUP: u64 = 256;
 const RESOLVE_ROW: u64 = 4096;
 
-/// Largest [`CausticSettings::capacity_log2`]: 768 MiB of cells.
+/// Threads per workgroup of the aim cells' kernels (`caustics/casters`' `AIM_GROUP`).
+const AIM_GROUP: u32 = 256;
+
+/// Workgroups per row of a grid over a count of them (`visibility`'s `GRID_X`).
+const GRID_X: u32 = 65535;
+
+/// Largest [`CausticSettings::capacity_log2`]: 960 MiB of cells.
 pub const MAX_CAUSTIC_CAPACITY_LOG2: u32 = 24;
 
 /// Most photons a frame starts: rows of 4096 in one dispatch.
@@ -33,10 +40,20 @@ pub const MAX_PHOTONS: u32 = 4096 * 65535;
 
 /// Caustics a scene's views share: photons each frame from its lights toward its caster
 /// surfaces (smooth dielectrics and metals the cook ranks as casters, and producer clusters of
-/// casting materials), deposited in a hash grid of 2^`capacity_log2` cells of 48 B on voxels
+/// casting materials), deposited in a hash grid of 2^`capacity_log2` cells of 60 B on voxels
 /// whose edge doubles with each level, from 2^`base_cell_log2` m within `lod_scale` m of the
 /// scene focus; while the grid runs full the levels start coarser ([`CausticStats::finest`]).
 /// Each cell keeps a running mean of the frames' irradiance.
+///
+/// Photons aim at the casters whose light the view sees: each caster cluster, of a producer or
+/// of a copy's caster section, takes a share by its area, its distance from the focus and the
+/// share of the photons started from its voxel, whose edge is a share of its distance from the
+/// focus, that deposited in a cell of the grid the view read in the last frames. About a tenth
+/// of the photons go by area and distance alone, and every photon carries its flux over the
+/// density its caster was drawn at, so the caustics converge to the same light however they
+/// aim. A frame starts as many photons as it takes for `cell_photons` to deposit in each
+/// occupied cell the view read, by the share of the last frames' that deposited where it read:
+/// at most `photons`, and at least a sixteenth of them, which find caustics coming into view.
 ///
 /// A scene holds the grid while it may hold a caster ([`orr_scene::SceneFeatures::CASTERS`])
 /// and `photons` is above 0. The scene pass that first finds both makes it, empty. The pass that
@@ -49,9 +66,13 @@ pub const MAX_PHOTONS: u32 = 4096 * 65535;
 /// `capacity_log2` reallocates it, and that or a new `base_cell_log2` or `lod_scale` clears it.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct CausticSettings {
-    /// Photons each frame, at most [`MAX_PHOTONS`]; 0 turns caustics off, which leaves the
-    /// light they carry to BSDF rays.
+    /// The most photons a frame starts, at most [`MAX_PHOTONS`]; 0 turns caustics off, which
+    /// leaves the light they carry to BSDF rays.
     pub photons: u32,
+    /// The photons a frame aims to deposit in each occupied cell of the grid the view read in
+    /// the last frames, above 0. At 16 a view's caustics show about a third more noise than
+    /// every photon of the default count gives them where that count is far more than they need.
+    pub cell_photons: f32,
     /// 3 to [`MAX_CAUSTIC_CAPACITY_LOG2`].
     pub capacity_log2: u32,
     /// Base voxel size as a power of two, meters.
@@ -76,6 +97,7 @@ impl Default for CausticSettings {
     fn default() -> Self {
         Self {
             photons: 1 << 18,
+            cell_photons: 16.0,
             capacity_log2: 20,
             base_cell_log2: -8,
             lod_scale: 2.0,
@@ -89,7 +111,7 @@ impl Default for CausticSettings {
 /// The caustics after one frame's resolve.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct CausticStats {
-    /// Photons started from caster entries.
+    /// Photons started from caster entries, as [`CausticSettings::cell_photons`] asks.
     pub started: u32,
     /// Photons that deposited.
     pub deposits: u32,
@@ -104,6 +126,13 @@ pub struct CausticStats {
     /// gives it: one coarser while more than half the grid is occupied, one finer again below
     /// 8%, each move held for longer than a cell's lifetime.
     pub finest: u32,
+    /// Photons that deposited in a cell the view read in the last frames.
+    pub seen: u32,
+    /// Occupied cells the view read in the last frames.
+    pub read: u32,
+    /// Those of them a read first found too few frames ago to tell what they need, which ask
+    /// for their share of every photon.
+    pub fresh: u32,
 }
 
 pub(crate) fn check_settings(s: &CausticSettings) -> Result<(), Error> {
@@ -113,6 +142,11 @@ pub(crate) fn check_settings(s: &CausticSettings) -> Result<(), Error> {
     if s.photons > MAX_PHOTONS {
         return Err(Error::Settings(
             "caustics photons must be at most MAX_PHOTONS",
+        ));
+    }
+    if !(s.cell_photons > 0.0 && s.cell_photons.is_finite()) {
+        return Err(Error::Settings(
+            "caustics cell_photons must be above 0 and finite",
         ));
     }
     if !(0.0..=1.0).contains(&s.jitter) {
@@ -139,6 +173,8 @@ pub(crate) fn check_settings(s: &CausticSettings) -> Result<(), Error> {
 }
 
 pub(crate) struct CausticPipelines {
+    aim: ComputePipeline,
+    aim_sweep: ComputePipeline,
     pool: ComputePipeline,
     lists_weigh: ComputePipeline,
     lists_place: ComputePipeline,
@@ -156,6 +192,8 @@ pub(crate) struct CausticPipelines {
 impl CausticPipelines {
     pub(crate) fn new(device: &Device, kernels: &KernelSet) -> Result<Self, Error> {
         Ok(Self {
+            aim: pipeline(device, kernels, &casters::MODULE, "aim")?,
+            aim_sweep: pipeline(device, kernels, &casters::MODULE, "aim_sweep")?,
             pool: pipeline(device, kernels, &casters::MODULE, "pool")?,
             lists_weigh: pipeline(device, kernels, &casters::MODULE, "lists_weigh")?,
             lists_place: pipeline(device, kernels, &casters::MODULE, "lists_place")?,
@@ -191,13 +229,14 @@ pub(crate) struct Caustics {
     source: Allocation<PhotonSourceGpu>,
     /// Held while the scene passes find a caster with photons on.
     grid: Option<Grid>,
-    /// The producer entries' caster lists' CDFs, for `pool_room` clusters: none without the
-    /// grid.
-    pool: Allocation<u32>,
-    pool_room: u32,
+    /// The caster lists' CDFs and each position's aim cell: `producer_room` positions for the
+    /// producers' lists, then `list_room` for the copies'. None without the grid.
+    pool: Pool,
+    producer_room: u32,
+    list_room: u32,
     /// The caster lists' clusters in blocks, with room for the light tables of a scene pass
     /// that recorded the caustics.
-    blocks: ClusterBlocks<ListBlock>,
+    blocks: Blocks,
     /// For the scene's light tables at the last scene pass.
     per: PerEntry,
     roots: Ring<CausticsGpu>,
@@ -208,19 +247,59 @@ pub(crate) struct Caustics {
     recorded: [bool; FRAME_SLOTS],
 }
 
-/// The cells of a scene's real-time grid.
+/// The cells of a scene's real-time grid, and the aim cells its photons start by.
 struct Grid {
     checks: Allocation<u32>,
     accumulated: Allocation<[u32; 4]>,
     resolved: Allocation<[u32; 2]>,
     cell_photons: Allocation<f32>,
+    history: Allocation<f32>,
+    reads: Allocation<u32>,
+    first_reads: Allocation<u32>,
+    aim_checks: Allocation<u32>,
+    aim: Allocation<[u32; 4]>,
+}
+
+/// Per position of the caster lists: its CDF and its cluster's aim cell.
+struct Pool {
+    cdf: Allocation<u32>,
+    cells: Allocation<u32>,
+}
+
+impl Pool {
+    fn new(device: &Device, clusters: u32) -> Result<Self, Error> {
+        let n = u64::from(clusters);
+        Ok(Self {
+            cdf: device_local(device, n, "caster list cdf")?,
+            cells: device_local(device, n, "caster list aim cells")?,
+        })
+    }
+}
+
+/// The most pool positions the copies' caster lists take, 128 MiB of CDF and aim cells: a
+/// copy's list that finds no room keeps its cooked CDF (`casters`' `pool`).
+const MAX_LIST_POSITIONS: u32 = 1 << 24;
+
+/// The caster lists' clusters in blocks, and what each block adds to its entry's masses.
+struct Blocks {
+    lists: ClusterBlocks<ListBlock>,
+    masses: Allocation<[f32; 2]>,
+}
+
+impl Blocks {
+    /// Room for `entries` lists of `clusters` clusters between them.
+    fn new(device: &Device, entries: u32, clusters: u32) -> Result<Self, Error> {
+        let lists = ClusterBlocks::new(device, entries, clusters, "caster list blocks")?;
+        let masses = device_local(device, lists.block_count(), "caster list block masses")?;
+        Ok(Self { lists, masses })
+    }
 }
 
 /// The memory a scene pass takes for the caustics before anything of the pass changes.
 pub(crate) struct Room {
     per: Option<PerEntry>,
-    pool: Option<(Allocation<u32>, u32)>,
-    blocks: Option<ClusterBlocks<ListBlock>>,
+    pool: Option<(Pool, u32, u32)>,
+    blocks: Option<Blocks>,
     grid: Option<Grid>,
 }
 
@@ -230,10 +309,9 @@ pub(crate) struct PerEntry {
     tables: LightTables,
     selections: Allocation<EmissiveSelection>,
     cdf: Allocation<f32>,
-    started: Allocation<u32>,
-    deposited: Allocation<u32>,
-    yields: Allocation<f32>,
-    areas: Allocation<f32>,
+    weights: Allocation<f32>,
+    firsts: Allocation<u32>,
+    masses: Allocation<[f32; 2]>,
     interiors: Allocation<EyeInterior>,
 }
 
@@ -250,10 +328,9 @@ impl PerEntry {
             tables,
             selections: device_local(device, entries, "caster lists")?,
             cdf: device_local(device, entries, "caster cdf")?,
-            started: device_local(device, entries, "caster photons started")?,
-            deposited: device_local(device, entries, "caster photons deposited")?,
-            yields: device_local(device, entries, "caster yields")?,
-            areas: device_local(device, entries, "caster areas")?,
+            weights: device_local(device, entries, "caster weights")?,
+            firsts: device_local(device, entries, "caster list firsts")?,
+            masses: device_local(device, entries, "caster masses")?,
             interiors: device_local(device, feedback_ids(tables), "light interiors")?,
         })
     }
@@ -267,6 +344,11 @@ impl Grid {
             accumulated: device_local(device, 2 * capacity, "caustic grid deposits")?,
             resolved: device_local(device, capacity, "caustic grid irradiance")?,
             cell_photons: device_local(device, capacity, "caustic grid photons")?,
+            history: device_local(device, capacity, "caustic grid history")?,
+            reads: device_local(device, capacity, "caustic grid reads")?,
+            first_reads: device_local(device, capacity, "caustic grid first reads")?,
+            aim_checks: device_local(device, u64::from(AIM_CELLS), "caustic aim checks")?,
+            aim: device_local(device, u64::from(AIM_CELLS), "caustic aim cells")?,
         })
     }
 }
@@ -289,9 +371,10 @@ impl Caustics {
             )?,
             source: device_local(device, 1, "photon source")?,
             grid: None,
-            pool: device_local(device, 0, "producer caster cdf")?,
-            pool_room: 0,
-            blocks: ClusterBlocks::new(device, LightTables::default(), "caster list blocks")?,
+            pool: Pool::new(device, 0)?,
+            producer_room: 0,
+            list_room: 0,
+            blocks: Blocks::new(device, 0, 0)?,
             per: PerEntry::new(device, LightTables::default())?,
             roots: Ring::new(device, "caustic roots")?,
             caster_roots: Ring::new(device, "caster roots")?,
@@ -303,7 +386,7 @@ impl Caustics {
 
     /// Takes `settings`. A new size makes a held grid anew; that and new cells or a new focus
     /// falloff clear the grid and the casters' yields at the next scene pass. A new photon
-    /// count, history, lifetime or jitter keeps them.
+    /// count, photons per cell, history, lifetime or jitter keeps them.
     pub(crate) fn set_settings(
         &mut self,
         device: &Device,
@@ -335,37 +418,56 @@ impl Caustics {
         casters && self.settings.photons > 0
     }
 
-    /// The memory the caustics lack for a scene pass over light tables `tables`, for
-    /// [`Self::follow`] to take once nothing else can fail: what they hold per entry and per
-    /// feedback id where `grown`, the producers' caster lists where they are to hold other
-    /// clusters, and the grid where the scene has come to hold `casters`. The lists hold what
-    /// the tables hold room for while the scene pass records the caustics and nothing
-    /// otherwise: only that pass writes them. Fails without device memory.
+    /// The memory the caustics lack for a scene pass over light tables `tables` into frame slot
+    /// `slot`, for [`Self::follow`] to take once nothing else can fail: what they hold per entry
+    /// and per feedback id where `grown`, the caster lists where they are to hold more clusters,
+    /// and the grid where the scene has come to hold `casters`. While the scene pass records the
+    /// caustics the lists hold every cluster the producers can emit, and for the copies' lists
+    /// as many as the slot's last frame asked for, growing by powers of two up to
+    /// MAX_LIST_POSITIONS; nothing otherwise, since only that pass writes them. Fails without
+    /// device memory.
     pub(crate) fn room(
         &self,
         device: &Device,
         tables: LightTables,
         grown: bool,
         casters: bool,
+        slot: usize,
     ) -> Result<Room, Error> {
         let per = grown.then(|| PerEntry::new(device, tables)).transpose()?;
-        let clusters = if self.casts(casters) {
-            tables.producer_clusters
+        let casts = self.casts(casters);
+        let producer_room = if casts { tables.producer_clusters } else { 0 };
+        // The slot's last frame has completed, so its readback holds what its pool asked for.
+        let wanted = if self.recorded[slot] {
+            self.readback.as_slice().expect("mapped")[slot].list_wanted
         } else {
             0
         };
-        let pool = (clusters != self.pool_room)
-            .then(|| device_local(device, u64::from(clusters), "producer caster cdf"))
+        let list_room = if !casts {
+            0
+        } else if wanted > self.list_room {
+            wanted
+                .checked_next_power_of_two()
+                .map_or(MAX_LIST_POSITIONS, |n| n.min(MAX_LIST_POSITIONS))
+                .max(self.list_room)
+        } else {
+            self.list_room
+        }
+        .min(u32::MAX - producer_room);
+        let rooms = (producer_room, list_room);
+        let pool = (rooms != (self.producer_room, self.list_room))
+            .then(|| Pool::new(device, producer_room + list_room))
             .transpose()?;
-        let blocks = (self.casts(casters) && !self.blocks.holds(tables))
-            .then(|| ClusterBlocks::new(device, tables, "caster list blocks"))
+        let positions = producer_room + list_room;
+        let blocks = (casts && !self.blocks.lists.holds(tables.entries, positions))
+            .then(|| Blocks::new(device, tables.entries, positions))
             .transpose()?;
         let grid = (self.casts(casters) && self.grid.is_none())
             .then(|| Grid::new(device, &self.settings))
             .transpose()?;
         Ok(Room {
             per,
-            pool: pool.map(|pool| (pool, clusters)),
+            pool: pool.map(|pool| (pool, producer_room, list_room)),
             blocks,
             grid,
         })
@@ -373,19 +475,13 @@ impl Caustics {
 
     /// Takes `room`, from [`Self::room`] with the same `casters`, in the scene pass of `frame`,
     /// and gives up the grid where the scene holds no caster: what the frames in flight read,
-    /// of it and of the caster lists `room` replaces, goes to `retired`. Returns what the
-    /// caustics held per entry before, which the next [`Self::record`] takes the casters'
-    /// yields from.
-    pub(crate) fn follow(
-        &mut self,
-        room: Room,
-        casters: bool,
-        frame: u64,
-        retired: &mut Retired,
-    ) -> Option<PerEntry> {
-        if let Some((pool, clusters)) = room.pool {
+    /// of it, of what the caustics held per entry and of the caster lists `room` replaces, goes
+    /// to `retired`.
+    pub(crate) fn follow(&mut self, room: Room, casters: bool, frame: u64, retired: &mut Retired) {
+        if let Some((pool, producer_room, list_room)) = room.pool {
             retired.push(frame, std::mem::replace(&mut self.pool, pool));
-            self.pool_room = clusters;
+            self.producer_room = producer_room;
+            self.list_room = list_room;
         }
         if let Some(blocks) = room.blocks {
             retired.push(frame, std::mem::replace(&mut self.blocks, blocks));
@@ -399,27 +495,21 @@ impl Caustics {
         {
             retired.push(frame, grid);
         }
-        room.per.map(|per| std::mem::replace(&mut self.per, per))
-    }
-
-    /// Takes the entries of the scene's producer table, which the producers' caster lists
-    /// run over.
-    pub(crate) fn set_producers(&mut self, producers: u32) {
-        self.per.tables.producers = producers;
+        if let Some(per) = room.per {
+            retired.push(frame, std::mem::replace(&mut self.per, per));
+        }
     }
 
     /// Records slot `slot`'s photon source after the light set's selection and starts the
-    /// grid's frame, for a frame focused on `focus`. `before` is what [`Self::follow`]
-    /// returned since the last record, when the scene's light tables have grown since.
-    /// Records nothing without the grid.
+    /// grid's frame `frame`, focused on `focus`. Records nothing without the grid.
     pub(crate) fn record(
         &mut self,
         list: &mut CommandList<'_>,
         slot: usize,
+        frame: u64,
         scene: GpuPtr<SceneRoot>,
         set: GpuPtr<LightSetGpu>,
         focus: [f32; 3],
-        before: Option<&PerEntry>,
     ) {
         let s = self.settings;
         self.recorded[slot] = self.grid.is_some();
@@ -429,7 +519,6 @@ impl Caustics {
         let capacity = 1u64 << s.capacity_log2;
         let clear = std::mem::take(&mut self.clear);
         let per = &self.per;
-        let before = before.unwrap_or(per);
         self.roots.write(
             slot,
             CausticsGpu {
@@ -438,6 +527,9 @@ impl Caustics {
                 accumulated: grid.accumulated.gpu(),
                 resolved: grid.resolved.gpu(),
                 photons: grid.cell_photons.gpu(),
+                history: grid.history.gpu(),
+                reads: grid.reads.gpu(),
+                first_reads: grid.first_reads.gpu(),
                 counters: self.counters.gpu(),
                 map: GpuPtr::NULL,
                 heads: GpuPtr::NULL,
@@ -451,8 +543,8 @@ impl Caustics {
                 radius: 0.0,
                 photon_count: s.photons,
                 jitter: s.jitter,
+                frame: frame as u32,
                 _pad1: 0,
-                _pad2: 0,
             },
         );
         let casters = self.caster_roots.write(
@@ -463,22 +555,26 @@ impl Caustics {
                 source: self.source.gpu(),
                 entries: per.selections.gpu(),
                 cdf: per.cdf.gpu(),
-                started: per.started.gpu(),
-                deposited: per.deposited.gpu(),
-                yields: per.yields.gpu(),
-                areas: per.areas.gpu(),
-                started_before: before.started.gpu(),
-                deposited_before: before.deposited.gpu(),
-                yields_before: before.yields.gpu(),
-                blocks: self.blocks.records(),
-                pool: self.pool.gpu(),
+                weights: per.weights.gpu(),
+                firsts: per.firsts.gpu(),
+                masses: per.masses.gpu(),
+                blocks: self.blocks.lists.records(),
+                block_masses: self.blocks.masses.gpu(),
+                pool: self.pool.cdf.gpu(),
+                pool_cells: self.pool.cells.gpu(),
                 interiors: per.interiors.gpu(),
+                aim_checks: grid.aim_checks.gpu(),
+                aim: grid.aim.gpu(),
+                photons: s.photons,
+                cell_photons: s.cell_photons,
+                producer_room: self.producer_room,
+                list_room: self.list_room,
+                _pad0: 0,
+                _pad1: 0,
                 focus: [focus[0], focus[1], focus[2], s.lod_scale],
                 clear: u32::from(clear),
                 base_cell_log2: s.base_cell_log2,
-                entries_before: before.tables.entries,
-                _pad1: 0,
-                block_layout: self.blocks.layout(),
+                block_layout: self.blocks.lists.layout(),
             },
         );
         let grid = self.resolve_roots.write(
@@ -493,13 +589,18 @@ impl Caustics {
             },
         );
         let p = &self.pipelines;
+        list.dispatch(&p.aim, casters, [AIM_CELLS / AIM_GROUP, 1, 1]);
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        list.dispatch(&p.aim_sweep, casters, [AIM_CELLS / AIM_GROUP, 1, 1]);
         list.dispatch(&p.pool, casters, [1, 1, 1]);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
-        if per.tables.producers > 0 {
-            let groups = self.blocks.groups();
+        let entries = per.tables.entries;
+        if entries > 0 {
+            let groups = self.blocks.lists.groups();
             list.dispatch_indirect(&p.lists_weigh, casters, groups);
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-            list.dispatch(&p.lists_place, casters, [per.tables.producers, 1, 1]);
+            let rows = entries.div_ceil(GRID_X);
+            list.dispatch(&p.lists_place, casters, [entries.min(GRID_X), rows, 1]);
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
             list.dispatch_indirect(&p.lists_finish, casters, groups);
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
@@ -514,7 +615,7 @@ impl Caustics {
         list.dispatch(&p.begin, grid, [1, 1, 1]);
     }
 
-    /// The photons a frame starts, 0 with caustics off.
+    /// The most photons a frame starts, 0 with caustics off.
     pub(crate) fn photons(&self) -> u32 {
         self.settings.photons
     }
@@ -556,6 +657,9 @@ impl Caustics {
             evicted: s.evicted,
             quantum: s.quantum,
             finest: s.finest,
+            seen: s.seen,
+            read: s.read,
+            fresh: s.fresh,
         }
     }
 
@@ -579,6 +683,9 @@ impl Caustics {
                 accumulated: GpuPtr::NULL,
                 resolved: GpuPtr::NULL,
                 photons: GpuPtr::NULL,
+                history: GpuPtr::NULL,
+                reads: GpuPtr::NULL,
+                first_reads: GpuPtr::NULL,
                 counters: map.counters.gpu(),
                 map: map.photons.gpu(),
                 heads: map.heads.gpu(),
@@ -592,8 +699,8 @@ impl Caustics {
                 radius,
                 photon_count: photons,
                 jitter: 0.0,
+                frame: 0,
                 _pad1: 0,
-                _pad2: 0,
             },
         );
         let clear = map.resolve_roots.write(

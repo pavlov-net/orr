@@ -2674,9 +2674,14 @@ impl<'a> Frame<'a> {
                 if tables.producers > 0 {
                     let held = core.scene(id)?;
                     let cpu = &mut *held.cpu.lock().unwrap();
-                    if !cpu.emissive_blocks.holds(tables) {
-                        cpu.emissive_blocks =
-                            ClusterBlocks::new(device, tables, "emissive cluster blocks")?;
+                    let (producers, clusters) = (tables.producers, tables.producer_clusters);
+                    if !cpu.emissive_blocks.holds(producers, clusters) {
+                        cpu.emissive_blocks = ClusterBlocks::new(
+                            device,
+                            producers,
+                            clusters,
+                            "emissive cluster blocks",
+                        )?;
                     }
                     r.block_layout = cpu.emissive_blocks.layout();
                     r.blocks = cpu.emissive_blocks.records();

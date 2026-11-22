@@ -1,6 +1,7 @@
-// Producer entries' emitted clusters in blocks of BLOCK_CLUSTERS, one workgroup each, for
-// kernels that weigh every cluster of a frame at once and gather per entry after. A layout over
-// `entries` producer entries is BLOCKS_FIRST + entries + 1 words: the workgroup grid over its
+// Lists of clusters, one per entry of a table, in blocks of BLOCK_CLUSTERS, one workgroup each,
+// for kernels that weigh every cluster of a frame at once and gather per entry after: the
+// producer entries' emitted clusters, or the emissive list's caster lists. A layout over
+// `entries` entries is BLOCKS_FIRST + entries + 1 words: the workgroup grid over its
 // blocks (`write_grid`), then from BLOCKS_FIRST each entry's first block, the end last. An
 // entry's block j holds its clusters from j * BLOCK_CLUSTERS.
 module producer_blocks;
