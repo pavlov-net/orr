@@ -36,7 +36,7 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-edit
-        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         env:
           # There is no prebuilt cargo-edit; it is built from source with stable.
           RUSTUP_TOOLCHAIN: stable
@@ -59,7 +59,7 @@ jobs:
             cargo set-version --workspace "$VERSION"
           fi
 
-      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+      - uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         id: app-token
         with:
           client-id: ${{ vars.RELEASE_DRAFTER_CLIENT_ID }}
