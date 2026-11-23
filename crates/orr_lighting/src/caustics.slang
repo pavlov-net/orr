@@ -402,10 +402,8 @@ public float3 grid_irradiance(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, 
     float3 t, b;
     orthonormal_basis(n, t, b);
     float photons;
-    if (level >= top)
-        return grid_cell(g, s, p, n, t, b, axis, bucket, level, u.zw, photons);
-    float3 coarse = grid_cell(g, s, p, n, t, b, axis, bucket, level + 1, u.zw, photons);
-    if (u.x < blend)
+    float3 coarse = grid_cell(g, s, p, n, t, b, axis, bucket, level >= top ? level : level + 1, u.zw, photons);
+    if (level >= top || u.x < blend)
         return coarse;
     bool finer = photons >= 4.0 * CAUSTIC_MIN_PHOTONS && exp2(float(g.base_cell_log2 + int(level))) >= width;
     float unused;
@@ -419,10 +417,14 @@ public float3 grid_irradiance(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, 
 public float3 grid_gather(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float3 front, float3 back, float width, float4 u, float4 u_back)
 {
     float3 e = float3(0.0);
-    if (any(front > 0.0))
-        e += front * grid_irradiance(g, s, p, n, width, u);
-    if (any(back > 0.0))
-        e += back * grid_irradiance(g, s, p, -n, width, u_back);
+    // One read in a loop, not one per side: each read inlines its cells' probes.
+    [loop]
+    for (uint side = 0; side < 2; side++)
+    {
+        float3 albedo = side == 0 ? front : back;
+        if (any(albedo > 0.0))
+            e += albedo * grid_irradiance(g, s, p, side == 0 ? n : -n, width, side == 0 ? u : u_back);
+    }
     return e * INV_PI;
 }
 
