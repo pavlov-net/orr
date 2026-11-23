@@ -765,14 +765,15 @@ fn walks_meet_their_surface_with_its_inputs_there() {
     assert_clean();
 }
 
-/// Next-event estimation reaches the surface of a dense interior's walks through a plane stack,
-/// whose re-runs trace each walk's step to its surface again to weigh the light the stack bent:
+/// Next-event estimation reaches the surface of a dense interior's walks through the water's
+/// surface by a manifold walk, whose re-runs trace each walk's step to its surface again to weigh
+/// the light the walk bent:
 /// a very rough jade sphere in a box of water under a wide sun, seen from in the water, takes as
 /// much light by next-event estimation alone as by its rays alone, in real time, where the walks
-/// meet the surface, and in the reference, where they end at it. Through the stack, next-event
+/// meet the surface, and in the reference, where they end at it. Through the water, next-event
 /// estimation falls a few percent short of the rays for an opaque sphere there too.
 #[test]
-fn walks_take_the_light_a_plane_stack_bends() {
+fn walks_take_the_light_a_manifold_walk_bends() {
     let mut paths = Paths::new(&KernelSet::default(), real_time(LightingDebugView::NeeOnly));
     paths.settings.max_bounces = 4;
     // The sphere lies 1.5 m under the water's surface, in a box so wide and deep that the light

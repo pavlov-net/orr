@@ -34,7 +34,6 @@ public struct ParticleLighting
     public WorldCacheGpu* cache;
     public FroxelLights* lights;        // the froxels' shadowed directional lights
     public EyeColumn* eye;              // per froxel column; null without froxels
-    public uint64_t* stacks;            // per froxel column, the plane stacks of its shadowed lights (`column_stacks`); null without `eye_depth`
     public LayerGuide* layers;          // the view's layer memory, null for none
     public uint64_t* overlay_front;     // per pixel of the view, its front layer; null for none
     public TextureIndex incident;       // froxel_incident; NONE without froxels
@@ -50,15 +49,17 @@ public struct ParticleLighting
     public TextureIndex aerial;         // the aerial-perspective LUT
     public TextureIndex aerial_rgb;     // its rgb transmittance; NONE for its luminance
     public float ap_range;              // m, the LUT's far end
-    public TextureIndex eye_depth;      // per shadowed light, m its ray spends in the column's interior, times its visibility; NONE for none
+    public TextureIndex arrival;        // `FroxelRoot.arrival`; NONE for none
+    public uint shadowed;               // the shadowed lights it holds slices of
+    public uint _pad0;
 }
 
 // The light at render-space `x` that does not depend on a direction, as mean radiance over the
 // sphere: inside the froxels their incident light, with `vis` the visibility of their shadowed
-// lights and `arrives` the directions they arrive along, and `inside` true; else the world
-// cache's on two opposed faces along unit `to_eye`, with `vis` 1 and `arrives` the lights'
-// directions. Draws two sampler dimensions.
-public float3 particle_ambient(ParticleLighting* l, float3 x, float3 to_eye, inout Sampler rng, out bool inside, out float3 vis[MAX_FROXEL_SHADOWED_LIGHTS], out float3 arrives[MAX_FROXEL_SHADOWED_LIGHTS])
+// lights and `arrives` the directions they arrive along where it `reads` them, and `inside` true;
+// else the world cache's on two opposed faces along unit `to_eye`. Where it reads none, `vis` is
+// 1 and `arrives` the lights' directions. Draws two sampler dimensions.
+public float3 particle_ambient(ParticleLighting* l, float3 x, float3 to_eye, inout Sampler rng, out bool inside, out float3 vis[MAX_FROXEL_SHADOWED_LIGHTS], out float3 arrives[MAX_FROXEL_SHADOWED_LIGHTS], bool reads = true)
 {
     SceneRoot* s = l.scene;
     float3 coord = float3(0.0);
@@ -73,39 +74,39 @@ public float3 particle_ambient(ParticleLighting* l, float3 x, float3 to_eye, ino
         return particle_irradiance(l.cache, s, x, to_eye, rng) * (0.5 * INV_PI);
     SamplerState ss = l.sampler.get();
     float4 incident = l.incident.get<Texture3D<float4>>().SampleLevel(ss, coord, 0.0);
+    rng.next2();
+    if (!reads)
+        return incident.rgb;
     float4 more = l.lights.count > 1 ? l.visibility.get<Texture3D<float4>>().SampleLevel(ss, coord, 0.0) : float4(1.0);
     vis[0] = float3(incident.a);
     vis[1] = float3(more.x);
     vis[2] = float3(more.y);
     vis[3] = float3(more.z);
-    if (l.eye_depth.index != IMAGE_NONE && l.lights.eye != 0)
+    if (l.arrival.index != IMAGE_NONE && l.lights.eye != 0)
     {
         uint2 column = min(uint2(coord.xy * float2(l.columns, l.rows)), uint2(l.columns, l.rows) - 1u);
-        uint index = column.y * l.columns + column.x;
-        EyeColumn eye = l.eye[index];
+        EyeColumn eye = l.eye[column.y * l.columns + column.x];
         if (uint(coord.z * float(l.slices)) < eye.slices)
         {
-            float4 stacks[MAX_FROXEL_SHADOWED_LIGHTS];
-            column_stacks(l.stacks, index, stacks);
-            uint m = eye.interior.innermost();
-            float3 sigma_t = interior_medium(s, m).sigma_t;
-            float4 depth = l.eye_depth.get<Texture3D<float4>>().SampleLevel(ss, coord, 0.0);
+            float3 sigma_t = interior_medium(s, eye.interior.innermost()).sigma_t;
             for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
             {
-                vis[j] *= vis[j].x > 0.0 ? beer(sigma_t, depth[j] / vis[j].x) : float3(1.0);
-                if (stacks[j].w > 0.0 && !stack_direction(arrives[j], stacks[j].xyz, interior_ior(s, m), arrives[j]))
-                    vis[j] = float3(0.0);
+                if (j >= l.lights.count)
+                    continue;
+                float4 a = l.arrival.get<Texture3D<float4>>().SampleLevel(ss, arrival_coord(coord, j, l.slices, l.shadowed), 0.0);
+                if (vis[j].x > 0.0)
+                    vis[j] *= beer(sigma_t, a.w / vis[j].x);
+                if (any(a.xyz != 0.0))
+                    arrives[j] = normalize(a.xyz);
             }
         }
     }
-    rng.next2();
     return incident.rgb;
 }
 
-// One shadow ray from render-space `x` toward each of the froxels' shadowed lights, unbent, and in
-// `arrives` the direction the light arrives along: past the froxels, whose plane stacks give the
-// direction there, the light's own.
-public void particle_shadow_rays<S : ISurfaces, M : IMedium>(ParticleLighting* l, float3 x, out float3 vis[MAX_FROXEL_SHADOWED_LIGHTS], out float3 arrives[MAX_FROXEL_SHADOWED_LIGHTS])
+// One shadow ray from render-space `x` toward each of the froxels' shadowed lights, unbent, so each
+// arrives along its own direction.
+public void particle_shadow_rays<S : ISurfaces, M : IMedium>(ParticleLighting* l, float3 x, out float3 vis[MAX_FROXEL_SHADOWED_LIGHTS])
 {
     SceneRoot* s = l.scene;
     float offset = T_MIN_BASE * (1.0 + length(x - l.view.eye_render.xyz) * T_MIN_SCALE);
@@ -114,14 +115,12 @@ public void particle_shadow_rays<S : ISurfaces, M : IMedium>(ParticleLighting* l
     for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
     {
         vis[j] = float3(1.0);
-        arrives[j] = float3(0.0);
         if (j >= count)
             continue;
         float3 to_light = s.lights[l.lights.ids[j]].direction;
         float3 depth;
         vis[j] = surface_visibility<S, M, SHADOW_UNBENT>(s, l.view, x + to_light * offset, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, Interior(), l.set.shadow_overflows, depth);
         vis[j] *= exp(-depth);
-        arrives[j] = to_light;
     }
 }
 
@@ -169,7 +168,7 @@ public float3 particle_light<S : ISurfaces, M : IMedium>(ParticleLighting* l, fl
     float3 arrives[MAX_FROXEL_SHADOWED_LIGHTS];
     float3 light = particle_ambient(l, x, to_eye, rng, inside, vis, arrives);
     if (!inside)
-        particle_shadow_rays<S, M>(l, x, vis, arrives);
+        particle_shadow_rays<S, M>(l, x, vis);
     return light + particle_directional<M>(l, x, to_eye, anisotropy, inside, vis, arrives);
 }
 

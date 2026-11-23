@@ -14,21 +14,17 @@ use orr_shaders::surface_declares;
 
 use crate::mask_sets::{Members, driver_cost};
 use crate::shaders::consts::{
-    PATH_SOURCE_BACKGROUND, PATH_SOURCE_PHOTON, PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW,
+    PATH_SOURCE_BACKGROUND, PATH_SOURCE_FROXEL, PATH_SOURCE_PHOTON, PATH_SOURCE_UPDATE,
+    PATH_SOURCE_VIEW,
 };
 use crate::shaders::path::{layer, plain, rich, walk};
 use crate::specialize::{
     MAY_ALL, MAY_BACKGROUND, MAY_CAUSTICS, MAY_DEBUG, MAY_DISPERSION, MAY_EMISSIVE, MAY_EMITTER,
-    MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOBES, MAY_LOCAL_LIGHTS, MAY_MEDIUM, MAY_PARTICLES,
-    MAY_PHOTON, MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING, MAY_STACK, MAY_UPDATE, MAY_VIEW,
-    MAY_WALK,
+    MAY_FROXELS, MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOBES, MAY_LOCAL_LIGHTS, MAY_MEDIUM,
+    MAY_PARTICLES, MAY_PHOTON, MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING, MAY_UPDATE, MAY_VIEW,
+    MAY_WALK, may_manifolds, may2,
 };
 use crate::{Error, KernelSet, module};
-
-/// The bit of `path_may2`, in the high word, that `feature` decides.
-fn may2(feature: SceneFeatures) -> u64 {
-    u64::from(!SceneFeatures(!feature.0).surface_may()) << 32
-}
 
 /// What a stage does in the pipeline.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -48,8 +44,15 @@ pub enum Role {
     Exit,
     /// The callable that weighs a coated emitter's light by what its coat and fuzz pass.
     View,
-    /// The callable of a step of a directional job's walk through a plane stack.
-    Stack,
+    /// The stage of manifold walks, which the raygens invoke as a miss and which traces their
+    /// rays, and the callables of a walk's steps: at a surface, and at the chain's end.
+    ManifoldWalk,
+    ManifoldFace,
+    ManifoldEnd,
+    /// The closest-hit of a manifold walk's face ray on solid glass, which the face ray's hit
+    /// object runs from its run's record of the shadow ray type: the surface's resolve and the
+    /// call of the step at it.
+    FaceHit,
     /// The callable that takes what a path's ray meets on its way to its hit: particles, the
     /// proxies of sphere and rect lights, and the march of the linked medium's in-scatter.
     Front,
@@ -228,8 +231,10 @@ impl Spec {
 struct Table {
     specs: Vec<Spec>,
     /// The raygen stage of each source by its id, where the pipeline runs the source.
-    raygens: [Option<u32>; 4],
-    misses: [u32; 2],
+    raygens: [Option<u32>; 5],
+    /// The miss stages: of a path's ray, of its shadow ray and, where the paths may walk a
+    /// manifold walk, the walks' stage.
+    misses: Vec<u32>,
     /// The callable of a path's first vertex, where the pipeline runs paths of a view, and where
     /// it may show a debug view, the one of a debug view of the first vertex alone.
     first: Option<u32>,
@@ -244,9 +249,11 @@ struct Table {
     /// The callable that weighs a coated emitter's light by its coat and fuzz, where an emitter
     /// may have one.
     emitter_view: Option<u32>,
-    /// The callable of a step of a directional job's walk through a plane stack, where the paths
-    /// may meet one.
-    stack_step: Option<u32>,
+    /// The callables of a manifold walk's steps, where a directional light may reach the paths
+    /// through the surfaces of solid glass: at a surface, from the layer kernel, whose BSDF holds
+    /// transmission, and at the chain's end.
+    manifold_face: Option<u32>,
+    manifold_end: Option<u32>,
     /// The callable that takes what a path's ray meets on its way to its hit, where the paths may
     /// meet particles, sphere and rect lights or a linked medium.
     front: Option<u32>,
@@ -329,7 +336,7 @@ impl Table {
             may,
             hit_surface: plain::Spec::default().hit_surface,
         };
-        let mut raygens = [None; 4];
+        let mut raygens = [None; 5];
         for (source, bit, entry, role) in [
             (PATH_SOURCE_VIEW, MAY_VIEW, "paths", Role::Raygen),
             (
@@ -350,10 +357,23 @@ impl Table {
                 raygens[source as usize] = Some(Self::stage(&mut specs, folded(entry, role)));
             }
         }
-        let misses = [
+        // The froxels' walks run in a view's pipeline whose paths read froxels and may walk.
+        if may & MAY_VIEW != 0 && may & MAY_FROXELS != 0 && may & may_manifolds() != 0 {
+            raygens[PATH_SOURCE_FROXEL as usize] = Some(Self::stage(
+                &mut specs,
+                folded("froxel_walks", Role::Raygen),
+            ));
+        }
+        let mut misses = vec![
             Self::stage(&mut specs, folded("miss_scatter", Role::Miss)),
             Self::stage(&mut specs, folded("miss_shadow", Role::Miss)),
         ];
+        if may & may_manifolds() != 0 {
+            misses.push(Self::stage(
+                &mut specs,
+                folded("manifold_walk", Role::ManifoldWalk),
+            ));
+        }
         // Any surface of the G-buffer may be a path's first vertex.
         let first = viewed.then(|| {
             Self::stage(
@@ -402,9 +422,19 @@ impl Table {
                 },
             )
         });
-        // A photon draws no light, so no job of its walks through a plane stack.
-        let stack_step = (viewed && may & MAY_STACK != 0)
-            .then(|| Self::stage(&mut specs, folded("stack_step", Role::Stack)));
+        // A photon's deposit walks to ask whether an estimate owns its light.
+        let manifolds = may & may_manifolds() != 0;
+        let manifold_face = manifolds.then(|| {
+            Self::stage(
+                &mut specs,
+                Spec {
+                    kernel: Kernel::Layer,
+                    ..folded("manifold_face", Role::ManifoldFace)
+                },
+            )
+        });
+        let manifold_end =
+            manifolds.then(|| Self::stage(&mut specs, folded("manifold_end", Role::ManifoldEnd)));
         let gather = (viewed && may & MAY_CAUSTICS != 0)
             .then(|| Self::stage(&mut specs, folded("gather", Role::Gather)));
         let photon_start =
@@ -442,7 +472,7 @@ impl Table {
         // through its shading and an any-hit only through its coverage, so the shader of a type
         // that declares neither is the standard surface's, made for id 0.
         let reaches = |role| match role {
-            Role::Hit => surface_declares::SHADING,
+            Role::Hit | Role::FaceHit => surface_declares::SHADING,
             _ => surface_declares::COVERAGE,
         };
         let pinned = |entry, role, pin: u32, geometry: Geometry| Spec {
@@ -526,16 +556,18 @@ impl Table {
         let mut hit_groups = Vec::new();
         let pins = groups.pins();
         // Each pinned kind's groups one after another by pin, the first named in `groups`.
-        // Each kind: its groups, shaders and geometry, whether the table holds it, and whether its
-        // materials may emit and may have a rich lobe. A rich material that emits takes the rich
-        // kind.
-        for (first, hit, any_hit, geometry, linked, emissive, lobed_kind, layer) in [
+        // Each kind: its groups, shaders and geometry, whether the table holds it, whether its
+        // materials may emit and may have a rich lobe, whether they are layers, and whether its
+        // closest-hit is a face ray's, beside the shadow's any-hit. A rich material that emits
+        // takes the rich kind.
+        for (first, hit, any_hit, geometry, linked, emissive, lobed_kind, layer, face) in [
             (
                 &mut groups.path,
                 Some("surface_hit"),
                 Some("cover_hit"),
                 Geometry::Copies,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -549,6 +581,7 @@ impl Table {
                 true,
                 false,
                 false,
+                false,
             ),
             (
                 &mut groups.rich_path,
@@ -559,6 +592,7 @@ impl Table {
                 true,
                 true,
                 false,
+                false,
             ),
             (
                 &mut groups.producer_path,
@@ -566,6 +600,7 @@ impl Table {
                 Some("cover_hit"),
                 Geometry::Producers,
                 producers,
+                false,
                 false,
                 false,
                 false,
@@ -579,6 +614,7 @@ impl Table {
                 true,
                 false,
                 false,
+                false,
             ),
             (
                 &mut groups.producer_rich_path,
@@ -588,6 +624,7 @@ impl Table {
                 producers && lobes,
                 true,
                 true,
+                false,
                 false,
             ),
             (
@@ -599,6 +636,7 @@ impl Table {
                 true,
                 false,
                 true,
+                false,
             ),
             (
                 &mut groups.producer_layer_path,
@@ -609,6 +647,7 @@ impl Table {
                 true,
                 false,
                 true,
+                false,
             ),
             // A strand is opaque: its rays take no any-hit. Its kind serves all of its materials,
             // which may emit or have a rich lobe.
@@ -621,6 +660,7 @@ impl Table {
                 true,
                 true,
                 false,
+                false,
             ),
             (
                 &mut groups.shadow,
@@ -631,6 +671,30 @@ impl Table {
                 false,
                 false,
                 false,
+                false,
+            ),
+            // Solid glass under shadow rays, whose records a face ray's hit object runs.
+            (
+                &mut groups.layer_shadow,
+                Some("face_hit"),
+                Some("shadow_hit"),
+                Geometry::Copies,
+                layers && manifolds,
+                false,
+                false,
+                true,
+                true,
+            ),
+            (
+                &mut groups.producer_layer_shadow,
+                Some("face_hit"),
+                Some("shadow_hit"),
+                Geometry::Producers,
+                producers && layers && manifolds,
+                false,
+                false,
+                true,
+                true,
             ),
         ] {
             if !linked {
@@ -648,10 +712,15 @@ impl Table {
                     continue;
                 }
                 let pin = if general { 0 } else { pin };
+                // A face ray's closest-hit resolves a surface that transmits; on any other a face
+                // ray's step finds nothing, which a record with no closest-hit answers.
+                let hit = hit.filter(|_| !face || transmits(pin));
+                let any_geometry = if face { Geometry::Triangles } else { geometry };
                 hit_groups.push(HitGroup {
                     closest_hit: hit.map(|e| {
-                        let spec = pinned(e, Role::Hit, pin, geometry);
-                        let bit = if emitter(pin, emissive) {
+                        let role = if face { Role::FaceHit } else { Role::Hit };
+                        let spec = pinned(e, role, pin, geometry);
+                        let bit = if !face && emitter(pin, emissive) {
                             MAY_EMITTER
                         } else {
                             0
@@ -672,8 +741,9 @@ impl Table {
                             },
                         )
                     }),
-                    any_hit: any_hit
-                        .map(|e| Self::stage(&mut specs, pinned(e, Role::AnyHit, pin, geometry))),
+                    any_hit: any_hit.map(|e| {
+                        Self::stage(&mut specs, pinned(e, Role::AnyHit, pin, any_geometry))
+                    }),
                     intersection: None,
                 });
             }
@@ -730,7 +800,8 @@ impl Table {
             medium,
             walk_exit,
             emitter_view,
-            stack_step,
+            manifold_face,
+            manifold_end,
             front,
             proxy_march,
             eye_lens,
@@ -911,11 +982,16 @@ pub fn path_stage_sizes(kernels: &KernelSet, may: u64) -> Result<PathStageSizes,
 pub(crate) struct PathPipeline {
     pub(super) pipeline: RayPipeline,
     /// The raygen record of each source by its id.
-    pub(super) raygens: [Option<u32>; 4],
+    pub(super) raygens: [Option<u32>; 5],
     groups: HitGroups,
 }
 
 impl PathPipeline {
+    /// Whether it runs the paths of source `source` (`PATH_SOURCE_*`).
+    pub(crate) fn raygen(&self, source: u32) -> bool {
+        self.raygens[source as usize].is_some()
+    }
+
     /// Compiles the pipeline from `kernels` on `threads` for paths that may meet `may`: the
     /// stages a scene of that mask can reach, each folded with it.
     pub(crate) fn new(
@@ -964,7 +1040,7 @@ impl PathPipeline {
             .collect::<Result<Vec<_>, Error>>()?;
         // A source's record is its place among the raygens the pipeline holds.
         let mut records = Vec::new();
-        let mut raygens = [None; 4];
+        let mut raygens = [None; 5];
         for (source, stage) in table.raygens.iter().enumerate() {
             if let Some(stage) = stage {
                 raygens[source] = Some(records.len() as u32);
@@ -974,7 +1050,11 @@ impl PathPipeline {
         let desc = RayPipelineDesc {
             stages: &stages,
             raygens: &records,
-            misses: &table.misses.map(ShaderRecord::new),
+            misses: &table
+                .misses
+                .iter()
+                .map(|&m| ShaderRecord::new(m))
+                .collect::<Vec<_>>(),
             hit_groups: &table.hit_groups,
             callables: &[
                 table.first.map(ShaderRecord::new),
@@ -983,7 +1063,7 @@ impl PathPipeline {
                 table.medium.map(ShaderRecord::new),
                 table.walk_exit.map(ShaderRecord::new),
                 table.emitter_view.map(ShaderRecord::new),
-                table.stack_step.map(ShaderRecord::new),
+                table.manifold_face.map(ShaderRecord::new),
                 table.front.map(ShaderRecord::new),
                 table.proxy_march.map(ShaderRecord::new),
                 table.eye_lens.map(ShaderRecord::new),
@@ -994,8 +1074,10 @@ impl PathPipeline {
                 table.disperse.map(ShaderRecord::new),
                 table.walk_meets.map(ShaderRecord::new),
                 table.sky.map(ShaderRecord::new),
+                table.manifold_end.map(ShaderRecord::new),
             ],
-            max_recursion: 1,
+            // The walks' stage traces its rays and invokes their hits below the raygen's invoke.
+            max_recursion: if table.misses.len() > 2 { 2 } else { 1 },
             flags: RayPipelineFlags::scene(device.caps()),
             threads,
         };

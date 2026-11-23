@@ -2,11 +2,12 @@
 //! their paths may meet, `path_may` and its bits in the low word and `scene_may.slang`'s
 //! `path_may2`, what a scene's surface evaluations and hits may meet, in the high one.
 
+use orr_scene::SceneFeatures;
+
 use crate::shaders::consts;
 
 /// The specialization constant id of `path_may`.
 pub(crate) const PATH_MAY_ID: u32 = 110;
-pub(crate) const MAY_STACK: u64 = consts::MAY_STACK as u64;
 pub(crate) const MAY_DISPERSION: u64 = consts::MAY_DISPERSION as u64;
 pub(crate) const MAY_CAUSTICS: u64 = consts::MAY_CAUSTICS as u64;
 pub(crate) const MAY_VIEW: u64 = consts::MAY_VIEW as u64;
@@ -40,5 +41,15 @@ pub(crate) const MAY_PROXIES: u64 = consts::MAY_PROXIES as u64;
 pub(crate) const MAY_SMOKE: u64 = consts::MAY_SMOKE as u64;
 pub(crate) const MAY_SCATTERING: u64 = consts::MAY_SCATTERING as u64;
 pub(crate) const MAY_MEDIUM: u64 = consts::MAY_MEDIUM as u64;
+/// The bit of `path_may2`, in the high word, that says a directional, sphere, point or rect light
+/// may reach a point through the surface of solid glass, which the path tracer's manifold
+/// next-event estimation takes (`MAY2_MANIFOLDS`).
+pub(crate) fn may_manifolds() -> u64 {
+    u64::from(!SceneFeatures(!SceneFeatures::INTERIORS.0).surface_may()) << 32
+}
+/// The bit of `path_may2`, in the high word, that `feature` decides.
+pub(crate) fn may2(feature: SceneFeatures) -> u64 {
+    u64::from(!SceneFeatures(!feature.0).surface_may()) << 32
+}
 /// Everything: what a pipeline made without a value may meet.
 pub(crate) const MAY_ALL: u64 = u64::MAX;

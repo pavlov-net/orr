@@ -70,8 +70,12 @@ world.
   cache
 - Glass with nested interiors, absorption and hero wavelength dispersion, which every path ray
   bends at
+- Sunlight through glass and water surfaces by manifold next-event estimation, which solves for
+  the refracted path through curved, normal-mapped or rough surfaces, so a sea floor's light
+  doesn't depend on how wide the sea is
 - Caustics through glass and mirrors from photons traced each frame into a world space grid, and
-  a progressive photon map in the accumulation reference
+  a progressive photon map in the accumulation reference, for the light paths the sun's estimate
+  doesn't find
 - Random walk subsurface scattering
 - Froxel fog, smoke, and volumes from cooked or your own data
 - A physically based, spectral sky, sun and moon in `orr_atmosphere`

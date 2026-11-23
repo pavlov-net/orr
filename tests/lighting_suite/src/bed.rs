@@ -375,6 +375,8 @@ pub const LIGHT_FLOOR: &str = "light floor";
 /// A smooth glass slab 1.6 x [`SLAB_THICKNESS`] x 1 m around its origin (IOR 1.5) whose
 /// interior transmits half the light over its thickness.
 pub const TINTED_SLAB: &str = "tinted slab";
+/// [`TINTED_SLAB`] 20 m square, so light the faces reflect inside it reaches its sides far off.
+pub const WIDE_SLAB: &str = "wide slab";
 /// [`TINTED_SLAB`] whose `transmission_depth` a texture of 128 / 255 multiplies.
 pub const DEPTH_TEXTURED_SLAB: &str = "depth textured slab";
 /// [`TINTED_SLAB`] whose `transmission_depth` a texture multiplies by 128 / 255 where its top and
@@ -400,6 +402,8 @@ pub const ROUGH_SLAB: &str = "rough slab";
 pub const GLASS_SPHERE: &str = "glass sphere";
 /// [`GLASS_SPHERE`] with specular roughness 0.3.
 pub const ROUGH_GLASS_SPHERE: &str = "rough glass sphere";
+/// [`GLASS_SPHERE`] of 128 rings, whose facets bend the light within a percent of the sphere's.
+pub const FINE_GLASS_SPHERE: &str = "fine glass sphere";
 /// A smooth thin-walled pane 400 m square facing +y at y = 0, of IOR [`PANE_IOR`].
 pub const GLASS_PANE: &str = "glass pane";
 pub const PANE_IOR: f32 = 2.0;
@@ -410,6 +414,8 @@ pub const PRISM: &str = "prism";
 pub const PRISM_IOR: f32 = 1.6;
 pub const PRISM_ABBE: f32 = 20.0;
 pub const PRISM_HALF_HEIGHT: f32 = 1.0;
+/// [`PRISM`] of the clear glass of [`GLASS_SPHERE`], which disperses nothing.
+pub const CLEAR_PRISM: &str = "clear prism";
 /// A white emitter of [`EMITTER_LUMINANCE`] facing +z: a strip 2 [`LINE_HALF_WIDTH`] wide
 /// and 2 [`LINE_HALF_HEIGHT`] tall, both on the cook's 2^-11 m position grid, so the cooked
 /// strip has the size a CPU model takes from them.
@@ -439,10 +445,22 @@ pub const CLOUD_SPHERE: &str = "cloud sphere";
 /// A water box 6 x 4 x 6 m around its origin (IOR 1.33) whose transmission color over 1 m
 /// is exp(-[`WATER_SIGMA`]) in Rec.709.
 pub const WATER_BOX: &str = "water box";
+/// A clear water box 20 x 1 x 20 m around its origin (IOR [`POOL_IOR`]), which passes all the
+/// light it refracts.
+pub const CLEAR_POOL: &str = "clear pool";
+/// [`CLEAR_POOL`] under a surface of specular roughness [`ROUGH_POOL_ROUGHNESS`].
+pub const ROUGH_POOL: &str = "rough pool";
+pub const ROUGH_POOL_ROUGHNESS: f32 = 0.03;
+/// [`CLEAR_POOL`] under a surface of specular roughness 0.3.
+pub const FROSTED_POOL: &str = "frosted pool";
+pub const POOL_IOR: f64 = 1.33;
 pub const WATER_SIGMA: [f32; 3] = [0.4, 0.2, 0.1];
 /// A water box 40 x 8 x 40 m around its origin (IOR 1.33), turbid: extinction
 /// [`TURBID_SIGMA_T`] and isotropic scattering [`TURBID_SIGMA_S`] per m, in Rec.709.
 pub const TURBID_WATER: &str = "turbid water";
+/// [`TURBID_WATER`] under a surface of specular roughness [`ROUGH_WATER_ROUGHNESS`].
+pub const ROUGH_TURBID_WATER: &str = "rough turbid water";
+pub const ROUGH_WATER_ROUGHNESS: f32 = 0.05;
 pub const TURBID_SIGMA_T: [f32; 3] = [0.45, 0.25, 0.2];
 pub const TURBID_SIGMA_S: [f32; 3] = [0.1, 0.12, 0.13];
 
@@ -1323,22 +1341,24 @@ fn cook() -> Arc<[u8]> {
         transmission_dispersion_abbe_number: PRISM_ABBE,
         ..glass
     };
-    let prism = mesh(|b| {
-        let c = prism_corners();
-        let h = Vec3::Y * PRISM_HALF_HEIGHT;
-        for i in 0..3 {
-            let (p, q) = (c[i], c[(i + 1) % 3]);
-            let mid = 0.5 * (p + q);
-            let n = Vec3::Y.cross(q - p).normalize();
-            let n = if n.dot(mid) < 0.0 { -n } else { n };
-            b.quad(0, [p - h, q - h, q + h, p + h], n, 1);
-        }
-        for side in [-1.0f32, 1.0] {
-            let n = Vec3::Y * side;
-            let v = c.map(|p| b.vertex(p + h * side, n, Vec2::ZERO));
-            b.triangle(0, v);
-        }
-    });
+    let prism = || {
+        mesh(|b| {
+            let c = prism_corners();
+            let h = Vec3::Y * PRISM_HALF_HEIGHT;
+            for i in 0..3 {
+                let (p, q) = (c[i], c[(i + 1) % 3]);
+                let mid = 0.5 * (p + q);
+                let n = Vec3::Y.cross(q - p).normalize();
+                let n = if n.dot(mid) < 0.0 { -n } else { n };
+                b.quad(0, [p - h, q - h, q + h, p + h], n, 1);
+            }
+            for side in [-1.0f32, 1.0] {
+                let n = Vec3::Y * side;
+                let v = c.map(|p| b.vertex(p + h * side, n, Vec2::ZERO));
+                b.triangle(0, v);
+            }
+        })
+    };
     let line = mesh(|b| {
         let (w, h) = (LINE_HALF_WIDTH, LINE_HALF_HEIGHT);
         b.quad(
@@ -1653,6 +1673,11 @@ fn cook() -> Arc<[u8]> {
                     vec![tinted],
                 ),
                 model(
+                    WIDE_SLAB,
+                    mesh(|b| b.cuboid(0, Vec3::new(10.0, SLAB_THICKNESS * 0.5, 10.0))),
+                    vec![tinted],
+                ),
+                model(
                     DEPTH_TEXTURED_SLAB,
                     mesh(|b| b.cuboid(0, Vec3::new(0.8, SLAB_THICKNESS * 0.5, 0.5))),
                     vec![depth_textured],
@@ -1695,6 +1720,11 @@ fn cook() -> Arc<[u8]> {
                 ),
                 model(GLASS_SPHERE, mesh(|b| b.sphere(0, 32, 1.0)), vec![glass]),
                 model(
+                    FINE_GLASS_SPHERE,
+                    mesh(|b| b.sphere(0, 128, 1.0)),
+                    vec![glass],
+                ),
+                model(
                     ROUGH_GLASS_SPHERE,
                     mesh(|b| b.sphere(0, 32, 1.0)),
                     vec![Material {
@@ -1717,7 +1747,8 @@ fn cook() -> Arc<[u8]> {
                     mesh(|b| b.sphere(0, 32, 1.0)),
                     vec![dispersive],
                 ),
-                model(PRISM, prism, vec![dispersive]),
+                model(PRISM, prism(), vec![dispersive]),
+                model(CLEAR_PRISM, prism(), vec![glass]),
                 model(LINE, line, vec![light_floor]),
                 model(
                     MILKY_SLAB,
@@ -1786,9 +1817,43 @@ fn cook() -> Arc<[u8]> {
                     vec![water],
                 ),
                 model(
+                    CLEAR_POOL,
+                    mesh(|b| b.cuboid(0, Vec3::new(10.0, 0.5, 10.0))),
+                    vec![Material {
+                        transmission_color: [1.0; 3],
+                        ..water
+                    }],
+                ),
+                model(
+                    ROUGH_POOL,
+                    mesh(|b| b.cuboid(0, Vec3::new(10.0, 0.5, 10.0))),
+                    vec![Material {
+                        transmission_color: [1.0; 3],
+                        specular_roughness: ROUGH_POOL_ROUGHNESS,
+                        ..water
+                    }],
+                ),
+                model(
+                    FROSTED_POOL,
+                    mesh(|b| b.cuboid(0, Vec3::new(10.0, 0.5, 10.0))),
+                    vec![Material {
+                        transmission_color: [1.0; 3],
+                        specular_roughness: 0.3,
+                        ..water
+                    }],
+                ),
+                model(
                     TURBID_WATER,
                     mesh(|b| b.cuboid(0, Vec3::new(20.0, 4.0, 20.0))),
                     vec![turbid],
+                ),
+                model(
+                    ROUGH_TURBID_WATER,
+                    mesh(|b| b.cuboid(0, Vec3::new(20.0, 4.0, 20.0))),
+                    vec![Material {
+                        specular_roughness: ROUGH_WATER_ROUGHNESS,
+                        ..turbid
+                    }],
                 ),
                 model(
                     PRESENCE_VEIL,
@@ -3726,7 +3791,7 @@ pub fn plume_bed() -> Bed {
 
 /// A tinted slab over the floor under the sun, whose shadow the sun's light through both faces
 /// fills; with `emitter`, under a sky too, beside an emitter with a coat and fuzz.
-pub fn plane_stack_spec(emitter: bool) -> Spec {
+pub fn slab_spec(emitter: bool) -> Spec {
     let mut copies = vec![
         item_at(FLOOR, Mat3::IDENTITY, Vec3::ZERO),
         item_at(TINTED_SLAB, Mat3::IDENTITY, Vec3::new(0.0, 0.8, 0.0)),
@@ -3749,10 +3814,10 @@ pub fn plane_stack_spec(emitter: bool) -> Spec {
     }
 }
 
-/// [`plane_stack_spec`] without its emitter, whose slab a producer entry shows: the same box of
+/// [`slab_spec`] without its emitter, whose slab a producer entry shows: the same box of
 /// the slab's material, at the same place.
-pub fn producer_stack_bed() -> Bed {
-    let mut spec = plane_stack_spec(false);
+pub fn producer_slab_bed() -> Bed {
+    let mut spec = slab_spec(false);
     spec.copies.retain(|c| c.model != TINTED_SLAB);
     let mut bed = Bed::with(spec);
     let slab = bed.material(TINTED_SLAB);
@@ -4091,7 +4156,7 @@ impl Paths {
             })
         });
         self.kernels
-            .record_media(list, lighting, target, pass, settings)
+            .record_media(list, lighting, target, pass, settings, f.scene_hits)
             .unwrap();
         self.kernels
             .record_paths(list, lighting, target, pass, settings, f.scene_hits)

@@ -35,6 +35,9 @@ import orr_lighting.specialize;
 [Host] public static const uint PATH_SOURCE_BACKGROUND = 1;
 [Host] public static const uint PATH_SOURCE_UPDATE = 2;
 [Host] public static const uint PATH_SOURCE_PHOTON = 3;
+// The froxels' jobs whose light comes through the surfaces of solid glass, which the view's
+// pipeline walks in a launch of their own before its paths (`froxel_walks`).
+[Host] public static const uint PATH_SOURCE_FROXEL = 4;
 
 // `r.mode`, which is PATH_FULL in a pipeline that shows no debug view.
 public uint path_mode(PathRoot r)
@@ -48,11 +51,18 @@ public bool thin_lens(PathRoot r) { return may(MAY_LENS) && r.aperture_radius > 
 public bool has_froxels(PathRoot r) { return may(MAY_FROXELS) && r.froxels != nullptr; }
 
 // Whether a pipeline made for the source of bit `bit` runs no other source's paths, so its root's
-// source is known where it is made.
-bool sole_source(uint bit)
+// source is known where it is made. A view's pipeline may run the froxel source too.
+public bool sole_source(uint bit)
 {
     uint others = (MAY_VIEW | MAY_BACKGROUND | MAY_UPDATE | MAY_PHOTON) & ~bit;
-    return PATH_SPECIALIZES && may(bit) && !may_any(others);
+    return PATH_SPECIALIZES && may(bit) && !may_any(others) && !(bit == MAY_VIEW && froxel_source_may());
+}
+
+// Whether the pipeline may run the froxel source: a view's whose paths read froxels and may take
+// manifold walks.
+public bool froxel_source_may()
+{
+    return may(MAY_VIEW) && may(MAY_FROXELS) && may2(MAY2_MANIFOLDS);
 }
 
 // Whether the paths of `r` are of `source`, which the pipeline may not run at all, or may run
@@ -61,6 +71,7 @@ public bool from_view(PathRoot r) { return may(MAY_VIEW) && (sole_source(MAY_VIE
 public bool from_background(PathRoot r) { return may(MAY_BACKGROUND) && (sole_source(MAY_BACKGROUND) || r.source == PATH_SOURCE_BACKGROUND); }
 public bool from_update(PathRoot r) { return may(MAY_UPDATE) && (sole_source(MAY_UPDATE) || r.source == PATH_SOURCE_UPDATE); }
 public bool from_photon(PathRoot r) { return may(MAY_PHOTON) && (sole_source(MAY_PHOTON) || r.source == PATH_SOURCE_PHOTON); }
+public bool from_froxel(PathRoot r) { return froxel_source_may() && r.source == PATH_SOURCE_FROXEL; }
 
 // The pixel of the path of item `index` of the root's source: a photon's place in its rows, an
 // update block's pixel, or a view's pixel.

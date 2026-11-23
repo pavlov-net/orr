@@ -667,14 +667,12 @@ public struct SurfaceHit
 
 // The triangle a hit met as light sampling reads it (`traced_area`, `traced_point`): its
 // render-space area, unit front-face normal and the point hit, without the surface's depth
-// offset, and whether it is flat: at rest, its corners share one normal. An area of 0 off a
-// triangle.
+// offset. An area of 0 off a triangle.
 public struct HitTriangle
 {
     public float area;
     public float3 normal;
     public float3 position;
-    public bool flat;
 }
 
 // The slot copy of PTLAS instance `index`: slot instances name themselves, part instances
@@ -948,41 +946,18 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
 {
     SectionLookup lookup;
     HitTriangle traced;
-    return hit_input_by<SectionLookup, false, false>(s, v, d, instance_index, cluster_id, primitive, bary, t, fetched, previous, sided, context, lookup, h, traced);
+    return hit_input_by<SectionLookup, false>(s, v, d, instance_index, cluster_id, primitive, bary, t, fetched, previous, sided, context, lookup, h, traced);
 }
 
 // `hit_input` with the section material from `m`, and with `TRACED` its triangle as light
 // sampling reads it in `traced`, which is an area of 0 without.
-bool hit_input_by<M : ISectionMaterial, let TRACED : bool, let FLAT : bool>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, M m, out HitInput h, out HitTriangle traced)
+bool hit_input_by<M : ISectionMaterial, let TRACED : bool>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, M m, out HitInput h, out HitTriangle traced)
 {
     h = HitInput();
     traced = HitTriangle();
     uint entry;
-    if (may2(MAY2_STRANDS) && hit_producer(s, instance_index, entry) && s.producers[entry].strands != 0)
-    {
-        // Strands are opaque, so only closest hits with their hit point reach here.
-        uint cell_log2 = uint(s.origin_cell.w);
-        float bias = footprint_bias(context.kind, v);
-        SurfaceInput i = SurfaceInput();
-        Placement pl;
-        ProducerGpu p = s.producers[entry];
-        ProducerBatch b = s.batches[entry];
-        if (!fetched || !producer_placement(s, p, previous, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
-            return false;
-        uint segment = strand_segment(cluster_id, primitive);
-        float3 object = cluster_id == SWEPT_CLUSTER ? t.position[0]
-            : (1.0 - bary.x - bary.y) * t.position[0] + bary.x * t.position[1] + bary.y * t.position[2];
-        if (!strand_geometry(i, b, segment, object, pl, previous, context.cone_width * bias))
-            return false;
-        uint material = strand_material(p);
-        if (material == MATERIAL_NONE)
-            return false;
-        i.instance = instance_index;
-        i.user_tag = p.user_tag;
-        h.origin = p.origin;
-        finish_input(s, v, d, material, pl, sided, context, i, h);
-        return true;
-    }
+    if (hit_strand(s, instance_index, entry))
+        return strand_input(s, v, d, instance_index, entry, cluster_id, primitive, bary, t, fetched, previous, sided, context, h);
     TracedTriangle tri;
     if (!traced_triangle_by(s, instance_index, cluster_id, primitive, previous, m, tri))
         return false;
@@ -992,12 +967,98 @@ bool hit_input_by<M : ISectionMaterial, let TRACED : bool, let FLAT : bool>(Scen
         traced.area = traced_area(tri, traced.normal);
         traced.position = traced_point(tri, bary);
     }
-    if (FLAT)
+    return true;
+}
+
+// `hit_input_by`, and the triangle it met in `tri`, none on a strand: what a face question
+// resolves by.
+bool hit_input_tri<M : ISectionMaterial, let TRACED : bool>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, M m, out HitInput h, out HitTriangle traced, out TracedTriangle tri)
+{
+    h = HitInput();
+    traced = HitTriangle();
+    uint entry;
+    if (hit_strand(s, instance_index, entry))
     {
-        // Values, not branches, so a stage that never reads it keeps none of the test.
-        VertexAttributes a0 = tri.corners.attributes[0];
-        traced.flat = all(bool3(!tri.deformed, all(a0.normal == tri.corners.attributes[1].normal), all(a0.normal == tri.corners.attributes[2].normal)));
+        tri = TracedTriangle();
+        return strand_input(s, v, d, instance_index, entry, cluster_id, primitive, bary, t, fetched, previous, sided, context, h);
     }
+    if (!traced_triangle_by(s, instance_index, cluster_id, primitive, previous, m, tri))
+        return false;
+    triangle_input(s, v, d, tri, primitive, bary, t, fetched, previous, sided, context, h);
+    if (TRACED)
+    {
+        traced.area = traced_area(tri, traced.normal);
+        traced.position = traced_point(tri, bary);
+    }
+    return true;
+}
+
+// How the shading normal and alpha of material `m` change across a triangle, as `surface_change`
+// takes them: CHANGE_PLAIN where it shades by its interpolated vertex normal and a specular
+// roughness of its own alone, CHANGE_RESOLVED otherwise: with a normal map, of a linked surface
+// type, with a roughness texture, a vertex color stream or displacement, or in a scene that lists
+// a decal.
+public static const uint CHANGE_PLAIN = 0;
+public static const uint CHANGE_RESOLVED = 2;
+
+public uint change_kind(SceneRoot* s, uint m)
+{
+    MaterialGpu* g = s.materials + m;
+    if (g.surface != 0 || (g.flags & (MATERIAL_VERTEX | MATERIAL_DISPLACED)) != 0 || material_bound(g, TEXTURE_ROUGHNESS)
+        || s.decal_globals != 0 || s.decal_bin_slots != 0 || material_bound(g, TEXTURE_NORMAL))
+        return CHANGE_RESOLVED;
+    return CHANGE_PLAIN;
+}
+
+// The barycentric step along each axis of triangle `tri` over which the uv that normal slot
+// `slot` of material `m` reads moves by one texel of its texture, at most MANIFOLD_SHIFT: the
+// finite difference of the map's texels, which a smaller step would read within one bilinear
+// cell and a larger one blur.
+float2 texel_steps(MaterialGpu* m, uint slot, TracedTriangle tri)
+{
+    uint width, height;
+    m.textures[slot].get_nonuniform<Texture2D<float4>>().GetDimensions(width, height);
+    float2 size = float2(width, height);
+    bool second = material_uv_set(m, slot) == 1;
+    Corners k = tri.corners;
+    float2 uv0 = second ? k.attributes[0].uv[1] : k.attributes[0].uv[0];
+    float2 along1 = ((second ? k.attributes[1].uv[1] : k.attributes[1].uv[0]) - uv0) * size;
+    float2 along2 = ((second ? k.attributes[2].uv[1] : k.attributes[2].uv[0]) - uv0) * size;
+    float2 texels = float2(max(abs(along1.x), abs(along1.y)), max(abs(along2.x), abs(along2.y)));
+    return min(float2(MANIFOLD_SHIFT), 1.0 / max(texels, float2(1.0)));
+}
+
+// Whether PTLAS instance `instance_index` is a producer entry of strands, `entry`.
+public bool hit_strand(SceneRoot* s, uint instance_index, out uint entry)
+{
+    return may2(MAY2_STRANDS) && hit_producer(s, instance_index, entry) && s.producers[entry].strands != 0;
+}
+
+// The surface input of a hit on strand entry `entry`, PTLAS instance `instance_index`, into `h`,
+// which its caller cleared, as `hit_input_by` takes it.
+bool strand_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint entry, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, bool sided, HitContext context, inout HitInput h)
+{
+    // Strands are opaque, so only closest hits with their hit point reach here.
+    uint cell_log2 = uint(s.origin_cell.w);
+    float bias = footprint_bias(context.kind, v);
+    SurfaceInput i = SurfaceInput();
+    Placement pl;
+    ProducerGpu p = s.producers[entry];
+    ProducerBatch b = s.batches[entry];
+    if (!fetched || !producer_placement(s, p, previous, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
+        return false;
+    uint segment = strand_segment(cluster_id, primitive);
+    float3 object = cluster_id == SWEPT_CLUSTER ? t.position[0]
+        : (1.0 - bary.x - bary.y) * t.position[0] + bary.x * t.position[1] + bary.y * t.position[2];
+    if (!strand_geometry(i, b, segment, object, pl, previous, context.cone_width * bias))
+        return false;
+    uint material = strand_material(p);
+    if (material == MATERIAL_NONE)
+        return false;
+    i.instance = instance_index;
+    i.user_tag = p.user_tag;
+    h.origin = p.origin;
+    finish_input(s, v, d, material, pl, sided, context, i, h);
     return true;
 }
 
@@ -1073,18 +1134,18 @@ public SurfaceHit resolve_hit<S : ISurfaces>(SceneRoot* s, ViewConstants* v, flo
 public SurfaceHit resolve_hit_by<S : ISurfaces, M : ISectionMaterial>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], bool previous, HitContext context, M m)
 {
     HitTriangle traced;
-    return resolve_hit_traced<S, M, false, false>(s, v, d, instance_index, cluster_id, primitive, bary, object_positions, previous, context, m, traced);
+    return resolve_hit_traced<S, M, false>(s, v, d, instance_index, cluster_id, primitive, bary, object_positions, previous, context, m, traced);
 }
 
 // `resolve_hit_by`, and with `TRACED` the triangle it met in `traced`, which is an area of 0
 // without.
-public SurfaceHit resolve_hit_traced<S : ISurfaces, M : ISectionMaterial, let TRACED : bool, let FLAT : bool>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], bool previous, HitContext context, M m, out HitTriangle traced)
+public SurfaceHit resolve_hit_traced<S : ISurfaces, M : ISectionMaterial, let TRACED : bool>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], bool previous, HitContext context, M m, out HitTriangle traced)
 {
     SurfaceHit hit = SurfaceHit();
     Corners t;
     t.position = object_positions;
     HitInput h;
-    if (!hit_input_by<M, TRACED, FLAT>(s, v, d, instance_index, cluster_id, primitive, bary, t, true, previous, true, context, m, h, traced))
+    if (!hit_input_by<M, TRACED>(s, v, d, instance_index, cluster_id, primitive, bary, t, true, previous, true, context, m, h, traced))
         return hit;
     float offset;
     GSurface g = hit_surface<S>(s, h.input, h.origin, false, offset);
@@ -1106,6 +1167,131 @@ public SurfaceHit resolve_hit_traced<S : ISurfaces, M : ISectionMaterial, let TR
     hit.section = h.section;
     hit.valid = true;
     return hit;
+}
+
+// `resolve_hit_traced`, and the triangle it met in `tri`, none on a strand: what a face question
+// resolves by.
+public SurfaceHit resolve_hit_input<S : ISurfaces, M : ISectionMaterial, let TRACED : bool>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], bool previous, HitContext context, M m, out HitTriangle traced, out TracedTriangle tri)
+{
+    SurfaceHit hit = SurfaceHit();
+    Corners t;
+    t.position = object_positions;
+    HitInput h;
+    if (!hit_input_tri<M, TRACED>(s, v, d, instance_index, cluster_id, primitive, bary, t, true, previous, true, context, m, h, traced, tri))
+        return hit;
+    float offset;
+    GSurface g = hit_surface<S>(s, h.input, h.origin, false, offset);
+    // The back of a single-sided material emits nothing.
+    if (h.input.back_face && (s.materials[h.section].flags & MATERIAL_DOUBLE_SIDED) == 0)
+        g.bsdf.emission = float3(0.0);
+    g.position = h.input.position + d * offset;
+    g.raster_error = 0.0;
+    g.medium_point = float4(h.input.uv[0].uv, h.input.uv[1].uv);
+    hit.surface = g;
+    hit.uv = h.input.uv;
+    hit.user_tag = h.input.user_tag;
+    hit.part = h.input.part;
+    hit.geometric_error = h.error * h.placement.scale;
+    hit.cluster_user = h.input.cluster_user;
+    hit.vertex_user = h.input.vertex_user;
+    hit.depth_offset = offset;
+    hit.swapped = h.input.swapped;
+    hit.section = h.section;
+    hit.valid = true;
+    return hit;
+}
+
+// How a hit's shading normal and specular alpha change across its surface, the model a manifold
+// walk refracts by about the hit: the normal at the hit, not always unit, whose normalized linear
+// sum with its changes along the basis of the geometric normal (`orthonormal_basis`) times the
+// moves along them is the normal there, and the alpha's changes. On a triangle whose material
+// shades by its interpolated vertex normal and an alpha of its own alone (`change_kind`) that
+// sum is the interpolation of the corners' normals, exact across the triangle; on any other it is
+// the derivative that two more resolves of the surface give, at barycentric shifts of
+// MANIFOLD_SHIFT, or a texel of its normal map apart where it has one (`resolve_shifts`). Where the model is exact it holds the hit's barycentrics and their changes,
+// first's along each axis then second's, which bound the triangle it is exact across; zeros
+// elsewhere.
+public struct SurfaceChange
+{
+    public float3 normal;
+    public float3 normal_t;
+    public float3 normal_b;
+    public float alpha_t;
+    public float alpha_b;
+    public float2 bary;
+    public float4 bary_change;
+}
+
+// The barycentric shift between the resolves of a surface whose change they give, and the most
+// a normal map's texel step takes.
+static const float MANIFOLD_SHIFT = 0.01;
+
+// The barycentric shifts of the two more resolves of a surface whose change they give
+// (CHANGE_RESOLVED), from a hit at `bary` on triangle `tri`: inward of the triangle along each
+// axis, by MANIFOLD_SHIFT, or by a texel of the normal map of a material that has one
+// (`texel_steps`), whose texels a smaller shift would read within one bilinear cell of.
+public float2 resolve_shifts(SceneRoot* s, TracedTriangle tri, float2 bary)
+{
+    MaterialGpu* m = s.materials + tri.material;
+    float2 step = material_bound(m, TEXTURE_NORMAL) ? texel_steps(m, TEXTURE_NORMAL, tri) : float2(MANIFOLD_SHIFT);
+    float w = 1.0 - bary.x - bary.y;
+    return float2(w >= step.x ? step.x : -step.x, w >= step.y ? step.y : -step.y);
+}
+
+// How the surface of solid glass that `resolve_hit_traced` resolved to `g` at `bary` on triangle
+// `tri` changes about the hit (`SurfaceChange`), its material's kind of change being `kind`
+// (`change_kind`): where that is CHANGE_RESOLVED from the two more resolves the hit's stage ran at
+// `resolve_shifts`, which moved the point by `moved` and the normal and alpha by `shifted`. A
+// dielectric's frame turns with no back face, so the corners' normals stand as the triangle's
+// geometry places them. Only a face question asks, so no other hit carries its work.
+public SurfaceChange surface_change(SceneRoot* s, TracedTriangle tri, uint kind, float2 bary, float3 object_positions[3], bool previous, GSurface g, float3 moved[2], float4 shifted[2])
+{
+    SurfaceChange change = SurfaceChange();
+    change.normal = g.normal;
+    Corners t;
+    t.position = object_positions;
+    Corners k = tri.corners;
+    if (!(tri.deformed && previous))
+        k.position = t.position;
+    bool plain = kind == CHANGE_PLAIN;
+    float3 d1 = moved[0];
+    float3 d2 = moved[1];
+    float4 e1 = shifted[0];
+    float4 e2 = shifted[1];
+    if (plain)
+    {
+        float3x3 normals = normal_matrix(tri.placement.linear);
+        float3 n[3];
+        for (uint c = 0; c < 3; c++)
+            n[c] = unit_direction(mul(normals, k.attributes[c].normal), g.geometric_normal);
+        change.normal = (1.0 - bary.x - bary.y) * n[0] + bary.x * n[1] + bary.y * n[2];
+        d1 = mul(tri.placement.linear, k.position[1] - k.position[0]);
+        d2 = mul(tri.placement.linear, k.position[2] - k.position[0]);
+        e1 = float4(n[1] - n[0], 0.0);
+        e2 = float4(n[2] - n[0], 0.0);
+    }
+    float3 tx, bx;
+    orthonormal_basis(g.geometric_normal, tx, bx);
+    float a1 = dot(d1, tx);
+    float b1 = dot(d1, bx);
+    float a2 = dot(d2, tx);
+    float b2 = dot(d2, bx);
+    float det = a1 * b2 - a2 * b1;
+    if (det != 0.0)
+    {
+        float4 ct = (e1 * b2 - e2 * b1) / det;
+        float4 cb = (e2 * a1 - e1 * a2) / det;
+        change.normal_t = ct.xyz;
+        change.normal_b = cb.xyz;
+        change.alpha_t = ct.w;
+        change.alpha_b = cb.w;
+        if (plain)
+        {
+            change.bary = bary;
+            change.bary_change = float4(b2, -a2, -b1, a1) / det;
+        }
+    }
+    return change;
 }
 
 // Whether a fading copy's step is present for the ray along `d`; true for every other hit.
@@ -1228,7 +1414,7 @@ bool coverage_input<S : ISurfaces>(SceneRoot* s, ViewConstants* v, float3 d, uin
         {
             HitInput h;
             HitTriangle traced;
-            bool found = hit_input_by<SectionGiven, false, false>(s, v, d, instance_index, cluster_id, primitive, bary, Corners(), false, false, false, context, section_given(material), h, traced);
+            bool found = hit_input_by<SectionGiven, false>(s, v, d, instance_index, cluster_id, primitive, bary, Corners(), false, false, false, context, section_given(material), h, traced);
             i = h.input;
             i.ray_origin = ray.origin;
             i.ray_distance = ray.t;

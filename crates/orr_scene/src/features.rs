@@ -89,14 +89,6 @@ impl SceneFeatures {
     /// A record has the caster flag, which on a producer entry that rays trace makes
     /// [`Self::CASTERS`].
     const CASTING: Self = Self(1 << 28);
-    /// A plane stack face may bend a directional light's ray: a record has the stack face flag
-    /// while a copy holds a caster entry, which can show it, or a producer entry that rays
-    /// trace names such a record (`tiles.slang`'s `stack_entry`), and the scene lists no decal,
-    /// which any face may show (`shadow.slang`'s `stack_material`).
-    pub const PLANE_STACKS: Self = Self(1 << 31);
-    /// A record has the stack face flag, which with a caster or producer entry makes
-    /// [`Self::PLANE_STACKS`].
-    const STACK_FACES: Self = Self(1 << 32);
     /// A material is of a linked surface type, which shades its hits.
     pub const LINKED_SURFACES: Self = Self(1 << 33);
     /// A material the standard surface shades emits by its own emission factor.
@@ -156,6 +148,12 @@ impl SceneFeatures {
                 ruled_out |= bit;
             }
         }
+        // Manifold walks take a directional, sphere, point or rect light through the surfaces of
+        // the interiors' solid glass.
+        let lights = self.contains(Self::DIRECTIONAL_LIGHTS) || self.contains(Self::LOCAL_LIGHTS);
+        if !(self.contains(Self::INTERIORS) && lights) {
+            ruled_out |= 1 << 19;
+        }
         !ruled_out
     }
 
@@ -208,7 +206,6 @@ impl SceneFeatures {
                 m.flags & (f::DIELECTRIC | f::THIN_WALLED) == f::DIELECTRIC | f::THIN_WALLED,
                 Self::THIN_DIELECTRICS,
             ),
-            (m.flags & f::STACK_FACE != 0, Self::STACK_FACES),
             (m.surface != 0, Self::LINKED_SURFACES),
             (emits && !linked, Self::EMISSION_FACTORS),
             (emits && linked, Self::LINKED_EMISSION_FACTORS),
@@ -312,25 +309,12 @@ impl MaterialFeatures {
         if out & layered != 0 && out & SceneFeatures::EMISSIVE.0 != 0 {
             out |= SceneFeatures::COATED_EMITTERS.0;
         }
-        let private = SceneFeatures::CASTING.0 | SceneFeatures::STACK_FACES.0;
-        SceneFeatures((out & !private) | self.built)
-    }
-
-    /// Whether any record has the stack face flag.
-    pub(crate) fn stack_faces(&self) -> bool {
-        self.counts[SceneFeatures::STACK_FACES.0.trailing_zeros() as usize] > 0
+        SceneFeatures((out & !SceneFeatures::CASTING.0) | self.built)
     }
 
     /// Whether any record has the caster flag.
     pub(crate) fn casts(&self) -> bool {
         self.counts[SceneFeatures::CASTING.0.trailing_zeros() as usize] > 0
-    }
-
-    /// Whether material `id`'s record has the stack face flag.
-    pub(crate) fn stack_face(&self, id: u32) -> bool {
-        self.held
-            .get(&id)
-            .is_some_and(|&f| f & SceneFeatures::STACK_FACES.0 != 0)
     }
 
     /// Whether material `id`'s record has the caster flag.

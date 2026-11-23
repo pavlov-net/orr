@@ -1,11 +1,14 @@
 // A view's froxel passes beside the light pass (`froxel_light.slang`): `order` picks the shadowed
 // directional lights, `eye_column` and `eye_reach` find what the interior at the near plane holds
 // of each column, `inject` writes the linked medium per froxel, `list` lists the froxels the
-// light pass lights, `integrate` each column's in-scatter and transmittance.
+// light pass lights, `walk_append` lists the retraced jobs that walk, `walk_slices` sizes the
+// launch of the light pass's jobs that walk, and `integrate` each column's in-scatter and
+// transmittance.
 #include "orr_root.h"
 import orr_lighting.media;
 import orr_scene.surface;
 import orr_lighting.froxels;
+import orr_lighting.rays;
 
 extern struct Surface : ISurfaces = StandardSurface;
 extern struct Medium : IMedium = NoMedium;
@@ -18,6 +21,22 @@ void order()
 {
     ORR_OMM(order);
     froxel_order(root);
+}
+
+[shader("compute")]
+[numthreads(RAY_GROUP, 1, 1)]
+void walk_append(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
+{
+    ORR_OMM(walk_append);
+    froxel_walk_append_lane(root, group, lane);
+}
+
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void walk_slices()
+{
+    ORR_OMM(walk_slices);
+    froxel_walk_slices(root);
 }
 
 [shader("compute")]

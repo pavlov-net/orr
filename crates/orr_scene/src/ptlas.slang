@@ -101,6 +101,7 @@ public static const uint OP_FAR_TAKE = 128;       // take a far instance and wri
 public static const uint OP_FAR_WRITE = 256;      // rewrite the held far instance
 public static const uint OP_FAR_RELEASE = 512;    // null-write the held far instance and release it
 public static const uint OP_FAR = OP_FAR_TAKE | OP_FAR_WRITE | OP_FAR_RELEASE;
+public static const uint OP_INTERIOR = 1024;      // the slot holds MASK_INTERIOR instances: their box goes into the scene's
 
 // A cell partition: the world cell its transforms are relative to and the instances it holds.
 public struct PartitionGpu
@@ -200,6 +201,8 @@ uint section_ray_mask(MeshGpu* mesh, uint shown, uint flags)
         mask |= opaque_ray_mask(flags);
     if ((mesh.layer_sections & shown) != 0)
         mask |= MASK_DIELECTRIC;
+    if ((mesh.dielectric_sections & shown) != 0)
+        mask |= MASK_INTERIOR;
     return mask;
 }
 
@@ -337,6 +340,52 @@ void clear(uint3 id: SV_DispatchThreadID)
         t.counters[id.x] = 0;
     if (first && id.x < PART_STATE)
         t.part_state[id.x] = 0;
+    if (id.x < 6)
+        root.scene.interior[id.x < 3 ? id.x : id.x + 1] = ordered(asfloat(id.x < 3 ? 0x7f800000u : 0xff800000u));
+}
+
+// Grows the scene's box of the instances that may show dielectric-class geometry (`interior`) by
+// write `w` of an instance of `partition`, which lies relative to its cell, as the partition's
+// translation places it, but in the global partition, which lies in render space: by its box
+// there, grown by the rounding of its render-space coordinates.
+void merge_interior(SceneRoot* s, PtlasGpu* t, PtlasWrite w, uint partition)
+{
+    if (w.blas == 0 || (w.mask & MASK_INTERIOR) == 0)
+        return;
+    float3 shift = float3(0.0);
+    if (partition != global_partition())
+        shift = float3((t.partitions[partition].cell - s.origin_cell.xyz) << uint(s.origin_cell.w));
+    float3 lo = float3(w.aabb_min[0], w.aabb_min[1], w.aabb_min[2]) + shift;
+    float3 hi = float3(w.aabb_max[0], w.aabb_max[1], w.aabb_max[2]) + shift;
+    float pad = F32_PRECISION * max(max_component(abs(lo)), max_component(abs(hi)));
+    for (uint c = 0; c < 3; c++)
+    {
+        InterlockedMin(s.interior[c], ordered(lo[c] - pad));
+        InterlockedMax(s.interior[4 + c], ordered(hi[c] + pad));
+    }
+}
+
+// Grows the scene's box of the instances that may show dielectric-class geometry by those slot
+// `slot` holds: its instance, its parts and its far instance, as the writes that put them in
+// the PTLAS made them. Their writes are mandatory (`want`), so this frame's tables give each
+// instance as the PTLAS holds it.
+void slot_interior(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot)
+{
+    InstanceGpu base = s.instances[slot];
+    if ((st.rt_flags & (RT_WRITTEN | RT_INTERIOR)) == (RT_WRITTEN | RT_INTERIOR))
+    {
+        InstanceGpu inst = traced_step_record(s, base, (st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK);
+        merge_interior(s, t, copy_write(s, t, slot, st.rt_partition, inst, st.rt_blas), st.rt_partition);
+        if (st.part_count != 0)
+            write_parts(s, t, st, slot, inst, st.rt_lod, st.rt_partition, false, true);
+    }
+    if ((st.rt_flags & RT_FAR_INTERIOR) != 0 && st.far_part != 0)
+    {
+        InstanceGpu far = traced_step_record(s, base, chain_far(*st));
+        MeshGpu* mesh = s.meshes + s.models[far.model].mesh;
+        uint64_t blas = mesh.rt_cuts[(st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff].blas;
+        merge_interior(s, t, copy_write(s, t, s.part_base + st.far_part - 1, st.rt_partition, far, blas), st.rt_partition);
+    }
 }
 
 // The class of a run of `n` part instances: runs of class c hold 2^c.
@@ -390,7 +439,7 @@ void want(uint3 id: SV_DispatchThreadID)
     // A rebuild's PTLAS holds none of what the slot wrote before.
     if ((root.flags & PTLAS_REBUILD) != 0)
     {
-        st.rt_flags &= ~(RT_WRITTEN | RT_GLOBAL);
+        st.rt_flags &= ~(RT_WRITTEN | RT_GLOBAL | RT_INTERIOR | RT_FAR_INTERIOR);
         st.rt_blas = 0;
     }
     uint near = chain_near(*st);
@@ -398,6 +447,9 @@ void want(uint3 id: SV_DispatchThreadID)
     InstanceGpu inst = traced_step_record(s, base, near);
     bool seen = (st.rt_flags & RT_SEEN) != 0;
     bool written = (st.rt_flags & RT_WRITTEN) != 0;
+    // A slot whose instances may show dielectric-class geometry writes them the frame it asks,
+    // so the scene's box of those (`slot_interior`) holds them where the PTLAS does.
+    bool interior = (st.rt_flags & (RT_INTERIOR | RT_FAR_INTERIOR)) != 0;
     // The instance holds another chain step, model or fade state than the copy shows: a
     // chain can replace a step's model, and a model past step 0 shows other materials,
     // sections and no pose.
@@ -481,7 +533,7 @@ void want(uint3 id: SV_DispatchThreadID)
         // A removed slot's instances go now: its slot may be handed out again. So does one
         // holding another chain step than the copy's, whose hits resolve through the copy's,
         // and one whose contribution names another row's hit records.
-        bool mandatory = inst.flags == 0 || held_built || stepped || rerun || st.far_part != 0;
+        bool mandatory = inst.flags == 0 || held_built || stepped || rerun || st.far_part != 0 || interior;
         if (written)
             op.op = OP_WRITE | OP_NULL;
         if (release)
@@ -493,6 +545,8 @@ void want(uint3 id: SV_DispatchThreadID)
             op.op |= mandatory ? OP_MANDATORY : 0;
             charge_write(op.partition, mandatory);
         }
+        if (interior)
+            op.op |= OP_INTERIOR;
         t.pending[slot] = op;
         return;
     }
@@ -519,7 +573,7 @@ void want(uint3 id: SV_DispatchThreadID)
     bool update = false;
     if (!placed || (target == global_partition() && rebased))
     {
-        bool mandatory = (in_global && target == global_partition() && rebased) || held_built || restep;
+        bool mandatory = (in_global && target == global_partition() && rebased) || held_built || restep || interior;
         op.op = OP_WRITE | (mandatory ? OP_MANDATORY : 0);
         charge_write(target, mandatory);
         if (written && st.rt_partition != target)
@@ -534,7 +588,7 @@ void want(uint3 id: SV_DispatchThreadID)
     // and its copy every frame.
     bool repose = posed && !take && (op.op != OP_NONE || update || op.cut != st.rt_lod || pose_moved(s, inst, mesh));
     op.op |= (take ? OP_TAKE : 0) | (release ? OP_RELEASE : 0) | (repose ? OP_POSE : 0);
-    bool parts_mandatory = repose || (take && built);
+    bool parts_mandatory = repose || (take && built) || (interior && (take || release));
     if (parts_mandatory)
         op.op |= OP_MANDATORY;
     if ((op.op & OP_PARTS) != 0)
@@ -579,6 +633,8 @@ void want(uint3 id: SV_DispatchThreadID)
             charge_write(st.rt_partition, true);
     }
     op.partition = target;
+    if (interior)
+        op.op |= OP_INTERIOR;
     t.pending[slot] = op;
 }
 
@@ -724,6 +780,7 @@ void release_far(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st)
 {
     release_part_run(s, t, st.far_part - 1, 1, st.rt_partition);
     st.far_part = 0;
+    st.rt_flags &= ~RT_FAR_INTERIOR;
 }
 
 // Takes a run of `n` part instances for slot copy `copy`, from its class's free list or else
@@ -789,7 +846,7 @@ void write_far(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, InstanceGpu base, ui
     PtlasWrite w = copy_write(s, t, s.part_base + st.far_part - 1, partition, far, mesh.rt_cuts[cut].blas);
     w.flags |= INSTANCE_FORCE_NO_OPAQUE;
     store((uint64_t)t.writes, index, w);
-    st.rt_flags = (st.rt_flags & ~(0xffu << RT_FAR_CUT_SHIFT)) | (cut << RT_FAR_CUT_SHIFT);
+    st.rt_flags = (st.rt_flags & ~((0xffu << RT_FAR_CUT_SHIFT) | RT_FAR_INTERIOR)) | (cut << RT_FAR_CUT_SHIFT) | ((w.mask & MASK_INTERIOR) != 0 ? RT_FAR_INTERIOR : 0);
     st.far_model = far.model;
     st.far_run = copy_run(s, far);
 }
@@ -797,11 +854,11 @@ void write_far(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, InstanceGpu base, ui
 // Writes every part instance of the slot's run: the cut's part BLAS posed by the copy's
 // transform and `pose[part]`, null where the part has no clusters at the cut, its sections
 // are all hidden or its pose hides it; non-opaque while the copy fades.
-void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot, InstanceGpu inst, uint cut, uint partition, bool fading)
+void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot, InstanceGpu inst, uint cut, uint partition, bool fading, bool bounds = false)
 {
     uint n = st.part_count;
-    uint index;
-    if (!reserve(COUNTER_WRITES, t.write_capacity, n, index))
+    uint index = 0;
+    if (!bounds && !reserve(COUNTER_WRITES, t.write_capacity, n, index))
         return;
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
@@ -826,7 +883,10 @@ void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot, Instanc
             w = instance_write(w.instance_index, partition, placed_after(copy, pose), part.bounds_min, part.bounds_max, blas, 0, section_ray_mask(mesh, part.sections & ~hidden, inst.flags), copy_run(s, inst));
         if (fading && w.blas != 0)
             w.flags |= INSTANCE_FORCE_NO_OPAQUE;
-        store((uint64_t)t.writes, index + j, w);
+        if (bounds)
+            merge_interior(s, t, w, partition);
+        else
+            store((uint64_t)t.writes, index + j, w);
     }
 }
 
@@ -843,6 +903,11 @@ void emit(uint3 id: SV_DispatchThreadID)
     if (op.op == OP_NONE)
         return;
     SlotStateGpu* st = s.slot_state + slot;
+    if (op.op == OP_INTERIOR)
+    {
+        slot_interior(s, t, st, slot);
+        return;
+    }
     bool mandatory = (op.op & OP_MANDATORY) != 0;
     bool admitted;
     if ((op.op & (OP_WRITE | OP_PARTS | OP_FAR)) != 0)
@@ -860,6 +925,8 @@ void emit(uint3 id: SV_DispatchThreadID)
         st.rt_age = st.rt_age + 1;
         InterlockedAdd(t.counters[COUNTER_DEFERRED], 1);
         InterlockedMax(t.counters[COUNTER_MAX_AGE], st.rt_age);
+        if ((op.op & OP_INTERIOR) != 0)
+            slot_interior(s, t, st, slot);
         return;
     }
     st.rt_age = 0;
@@ -927,8 +994,8 @@ void emit(uint3 id: SV_DispatchThreadID)
         st.rt_model = inst.model;
         st.rt_run = copy_run(s, inst);
         uint chain = disable ? 0 : (near << RT_STEP_SHIFT) | (fading ? RT_FADING : 0);
-        st.rt_flags = (st.rt_flags & ~(RT_WRITTEN | RT_GLOBAL | RT_FADING | (CHAIN_STEP_MASK << RT_STEP_SHIFT)))
-            | (disable ? 0 : RT_WRITTEN) | (global ? RT_GLOBAL : 0) | chain;
+        st.rt_flags = (st.rt_flags & ~(RT_WRITTEN | RT_GLOBAL | RT_FADING | RT_INTERIOR | (CHAIN_STEP_MASK << RT_STEP_SHIFT)))
+            | (disable ? 0 : RT_WRITTEN) | (global ? RT_GLOBAL : 0) | chain | (!disable && (w.mask & MASK_INTERIOR) != 0 ? RT_INTERIOR : 0);
     }
     if (held && (op.op & (OP_TAKE | OP_POSE)) != 0)
     {
@@ -942,11 +1009,15 @@ void emit(uint3 id: SV_DispatchThreadID)
         st.far_part = start + 1;
     if ((op.op & (OP_FAR_TAKE | OP_FAR_WRITE)) != 0 && st.far_part != 0)
         write_far(s, t, st, base, op.partition, op.far_cut);
+    if ((st.rt_flags & (RT_INTERIOR | RT_FAR_INTERIOR)) != 0)
+        slot_interior(s, t, st, slot);
 }
 
 // `ProducerStateGpu.rt_flags` of this frame's decision.
 static const uint PRODUCER_RT_WRITE = 4;
 static const uint PRODUCER_RT_NULL = 8;
+// Its instance may show dielectric-class geometry (MASK_INTERIOR).
+static const uint PRODUCER_RT_INTERIOR = 16;
 
 // What a producer instance is written with besides its BLAS address: transform, class and the
 // first run of its hit records.
@@ -1002,7 +1073,7 @@ void producer_want(uint3 id: SV_DispatchThreadID)
     ProducerStateGpu* st = s.producer_state + e;
     uint flags = st.rt_flags & ~(PRODUCER_RT_WRITE | PRODUCER_RT_NULL);
     if ((root.flags & PTLAS_REBUILD) != 0)
-        flags &= ~PRODUCER_RT_WRITTEN;
+        flags &= ~(PRODUCER_RT_WRITTEN | PRODUCER_RT_INTERIOR);
     bool written = (flags & PRODUCER_RT_WRITTEN) != 0;
     Placement pl;
     float3 lo, hi;
@@ -1038,6 +1109,8 @@ void producer_emit(uint3 id: SV_DispatchThreadID)
     if ((flags & (PRODUCER_RT_WRITE | PRODUCER_RT_NULL)) == 0)
     {
         st.rt_flags = flags & ~PRODUCER_RT_BUILT;
+        if ((flags & PRODUCER_RT_INTERIOR) != 0)
+            merge_interior(s, t, producer_write(s, e, *st), global_partition());
         return;
     }
     uint index;
@@ -1050,13 +1123,9 @@ void producer_emit(uint3 id: SV_DispatchThreadID)
     bool write = (flags & PRODUCER_RT_WRITE) != 0;
     if (write)
     {
-        Placement pl;
-        float3 lo, hi;
-        producer_render_placement(s, p, pl);
-        producer_bounds(*st, lo, hi);
-        uint run = producer_run(s, p);
-        w = instance_write(w.instance_index, global_partition(), pl, lo, hi, st.blas, p.class_id, producer_ray_mask(s, p), run);
-        st.rt_key = producer_key(s.groups + p.group, p, run);
+        w = producer_write(s, e, *st);
+        st.rt_key = producer_key(s.groups + p.group, p, producer_run(s, p));
+        merge_interior(s, t, w, global_partition());
     }
     store((uint64_t)t.writes, index, w);
     bool was = (flags & PRODUCER_RT_WRITTEN) != 0;
@@ -1064,7 +1133,18 @@ void producer_emit(uint3 id: SV_DispatchThreadID)
         InterlockedAdd(t.counters[COUNTER_PRODUCERS], 1);
     if (!write && was)
         InterlockedAdd(t.counters[COUNTER_PRODUCERS], uint(-1));
-    st.rt_flags = write ? PRODUCER_RT_WRITTEN : 0;
+    st.rt_flags = write ? PRODUCER_RT_WRITTEN | ((w.mask & MASK_INTERIOR) != 0 ? PRODUCER_RT_INTERIOR : 0) : 0;
+}
+
+// The write of producer entry `e`'s instance in state `st`, in the global partition.
+PtlasWrite producer_write(SceneRoot* s, uint e, ProducerStateGpu st)
+{
+    ProducerGpu p = s.producers[e];
+    Placement pl;
+    float3 lo, hi;
+    producer_render_placement(s, p, pl);
+    producer_bounds(st, lo, hi);
+    return instance_write(s.producer_base + e, global_partition(), pl, lo, hi, st.blas, p.class_id, producer_ray_mask(s, p), producer_run(s, p));
 }
 
 // A proxy job naming light `job & ~LIGHT_JOB`.

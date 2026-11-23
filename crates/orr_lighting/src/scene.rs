@@ -128,9 +128,6 @@ pub struct LightingStats {
     /// Deposits of reference views' photon maps in the frame before that found their map full;
     /// each dropped its photon.
     pub photon_overflows: u32,
-    /// Caster entries whose material could be a plane stack face. With none, directional
-    /// lights' rays look for no plane stack.
-    pub stack_entries: u32,
     pub world_cache: WorldCacheStats,
     pub caustics: CausticStats,
 }
@@ -577,7 +574,6 @@ impl SceneLighting {
                 shadow_overflows: s.shadow_overflows,
                 capped_walks: s.capped_walks,
                 photon_overflows: s.photon_overflows,
-                stack_entries: s.stack_entries,
                 world_cache: self
                     .cache
                     .as_ref()

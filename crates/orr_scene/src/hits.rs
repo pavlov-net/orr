@@ -10,8 +10,9 @@ use orr_gpu::{
 
 use crate::memory::UploadWindow;
 use crate::shaders::consts::{
-    FIXED_KINDS, HIT_DATA_BYTES, KIND_EMISSIVE_PATH, KIND_FRONT, KIND_LAYER_PATH, KIND_LIGHT_FRONT,
-    KIND_MEDIUM_SHADOW, KIND_PATH, KIND_PRODUCER_EMISSIVE_PATH, KIND_PRODUCER_LAYER_PATH,
+    FIXED_KINDS, HIT_DATA_BYTES, KIND_EMISSIVE_PATH, KIND_FRONT, KIND_LAYER_PATH,
+    KIND_LAYER_SHADOW, KIND_LIGHT_FRONT, KIND_MEDIUM_SHADOW, KIND_PATH,
+    KIND_PRODUCER_EMISSIVE_PATH, KIND_PRODUCER_LAYER_PATH, KIND_PRODUCER_LAYER_SHADOW,
     KIND_PRODUCER_PATH, KIND_PRODUCER_RICH_PATH, KIND_RICH_PATH, KIND_SHADOW, KIND_STRAND_PATH,
     PINNED_KINDS, RAY_TYPES, RUNS_PER_GROUP,
 };
@@ -54,6 +55,11 @@ pub struct HitGroups {
     pub strand_path: Option<u32>,
     /// Triangles under shadow rays: an any-hit that decides by `cover_shadow`.
     pub shadow: Option<u32>,
+    /// As [`Self::shadow`], for copies' and producer entries' clusters that trace as a
+    /// dielectric, with the closest-hit of a manifold walk's face ray on them, which the face
+    /// ray's hit object runs from this record; `None` serves those by [`Self::shadow`].
+    pub layer_shadow: Option<u32>,
+    pub producer_layer_shadow: Option<u32>,
     /// Particles under path rays: an any-hit that keeps them as what lies in front of the ray's
     /// hit and ignores them, since a record of zeros would commit them.
     pub front: Option<u32>,
@@ -106,6 +112,11 @@ impl HitGroups {
             ),
             (KIND_STRAND_PATH, self.strand_path),
             (KIND_SHADOW, self.shadow),
+            (KIND_LAYER_SHADOW, self.layer_shadow.or(self.shadow)),
+            (
+                KIND_PRODUCER_LAYER_SHADOW,
+                self.producer_layer_shadow.or(self.shadow),
+            ),
         ] {
             pinned[kind as usize] = group;
         }

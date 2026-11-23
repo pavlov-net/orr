@@ -1,13 +1,13 @@
 // The path tracer's stages: the raygens of a view's paths, of its background layer's, of its update
-// paths and of the frame's caustic photons; the callables of a path's first vertex and of a debug
+// paths, of its froxels' manifold walks and of the frame's caustic photons; the callables of a path's first vertex and of a debug
 // view of it alone, the ones that start a path in the interiors around the eye or at a thin lens's
-// point, the one that runs its vertex in an interior's medium, the one of a step of a directional
-// job's walk through a plane stack, the one that takes what a path's ray meets in front of its hit,
-// the one that marches the medium proxies with a volume a shadow ray passed, and those of the
-// caustic photons' gathers, a photon's start and its deposit; the hit shaders of a plain opaque
-// surface and of a strand, the any-hit shaders of a path's ray and of its shadow ray at a candidate
-// that is not opaque, a medium proxy's intersection and any-hit shaders under a shadow ray, and the
-// miss shaders of the two.
+// point, the one that runs its vertex in an interior's medium, the one of the end step of a
+// manifold walk, the one that takes what a path's ray meets in front of its hit, the one that
+// marches the medium proxies with a volume a shadow ray passed, and those of the caustic photons'
+// gathers, a photon's start and its deposit; the hit shaders of a plain opaque surface and of a
+// strand, the any-hit shaders of a path's ray and of its shadow ray at a candidate that is not
+// opaque, a medium proxy's intersection and any-hit shaders under a shadow ray, the miss
+// shaders of the two, and the stage of manifold walks, which the raygens invoke as a miss.
 #include "orr_root.h"
 import orr_shaders.pipeline;
 import orr_shaders.trace;
@@ -17,10 +17,11 @@ import orr_scene.surface;
 import orr_scene.candidates;
 import orr_scene.runs;
 import orr_scene.hit;
+import orr_scene.scene_may;
 import orr_lighting.path;
 import orr_lighting.path.vertex;
 import orr_lighting.path.raygen;
-import orr_lighting.path.stack;
+import orr_lighting.path.manifold;
 
 extern struct Surface : ISurfaces = StandardSurface;
 extern struct Medium : IMedium = NoMedium;
@@ -72,6 +73,13 @@ void updates()
 }
 
 [shader("raygeneration")]
+void froxel_walks()
+{
+    ORR_OMM(froxel_walks);
+    path_froxel_walks(root);
+}
+
+[shader("raygeneration")]
 void photons()
 {
     ORR_OMM(photons);
@@ -91,7 +99,7 @@ void caster_photon(inout Payload p)
 void deposit(inout Payload p)
 {
     ORR_OMM(deposit);
-    path_deposit(root, DispatchRaysIndex().x);
+    path_deposit(root, DispatchRaysIndex().x, may2(MAY2_MANIFOLDS) && p.words.x != 0);
 }
 
 [shader("callable")]
@@ -136,18 +144,25 @@ void medium_vertex(inout Payload p)
     path_medium_vertex<Medium>(root, DispatchRaysIndex().x, p.words);
 }
 
-[shader("callable")]
-void stack_step(inout StackStep c)
+[shader("miss")]
+void manifold_walk(inout Payload p)
 {
-    ORR_OMM(stack_step);
-    path_stack_step<Medium>(root, DispatchRaysIndex().x, c);
+    ORR_OMM(manifold_walk);
+    path_manifold_walk(root, DispatchRaysIndex().x, p.words);
+}
+
+[shader("callable")]
+void manifold_end(inout Payload p)
+{
+    ORR_OMM(manifold_end);
+    path_manifold_end<Medium>(root, DispatchRaysIndex().x, p.words);
 }
 
 [shader("callable")]
 void front(inout Payload p)
 {
     ORR_OMM(front);
-    p.words.x = path_front<Medium>(root, DispatchRaysIndex().x, asfloat(p.words.x), p.words.y, p.words.z != 0, p.words.w) ? 1 : 0;
+    p.words.x = path_front<Medium>(root, DispatchRaysIndex().x, asfloat(p.words.x), p.words.y, (p.words.z & 1) != 0, p.words.w, (p.words.z & 2) != 0) ? 1 : 0;
 }
 
 [shader("callable")]

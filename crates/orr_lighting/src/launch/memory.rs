@@ -6,8 +6,8 @@ use orr_scene::orr_gpu::{Allocation, Device, GpuPtr, MemoryKind};
 
 use crate::Error;
 use crate::shaders::consts::{
-    PATH_COLD_WORDS, PATH_HOT_WORDS, PATH_PHOTON_RECORD_WORDS, PATH_SPECTRAL_WORDS,
-    PATH_STACK_WORDS, PATH_UPDATE_RECORD_WORDS, PATH_VIEW_RECORD_WORDS,
+    PATH_COLD_WORDS, PATH_HOT_WORDS, PATH_MANIFOLD_WORDS, PATH_PHOTON_RECORD_WORDS,
+    PATH_SPECTRAL_WORDS, PATH_UPDATE_RECORD_WORDS, PATH_VIEW_RECORD_WORDS,
 };
 use crate::shaders::types::LaunchHeader;
 
@@ -56,7 +56,7 @@ pub(crate) struct SourceMemory {
     pub(super) header: Allocation<LaunchHeader>,
     _hot: Allocation<[u32; 4]>,
     cold: Option<Allocation<[u32; 4]>>,
-    stack: Option<Allocation<[u32; 4]>>,
+    manifold: Option<Allocation<[u32; 4]>>,
     chain: Option<Allocation<[u32; 4]>>,
     spectral: Option<Allocation<[u32; 4]>>,
     debug: Option<Allocation<[u32; 4]>>,
@@ -65,7 +65,7 @@ pub(crate) struct SourceMemory {
 
 impl SourceMemory {
     /// The slots of `items` paths, at most [`MAX_SLOTS`], laid out as `layout`, with their cold
-    /// words where `cold` holds, their plane stack's where `stack` does, their chain word
+    /// words where `cold` holds, their manifold words where `manifold` does, their chain word
     /// (`PathChain`) where `chain` does, their spectral words (`PathSpectral`) where `spectral`
     /// does and their debug word where `debug` does.
     pub(crate) fn new(
@@ -77,7 +77,7 @@ impl SourceMemory {
     ) -> Result<Self, Error> {
         let SlotParts {
             cold,
-            stack,
+            manifold,
             chain,
             spectral,
             debug,
@@ -95,8 +95,8 @@ impl SourceMemory {
         let cold = cold
             .then(|| words(PATH_COLD_WORDS, "path interiors"))
             .transpose()?;
-        let stack = stack
-            .then(|| words(PATH_STACK_WORDS, "path plane stacks"))
+        let manifold = manifold
+            .then(|| words(PATH_MANIFOLD_WORDS, "path manifold walks"))
             .transpose()?;
         let chain = chain.then(|| words(1, "path chains")).transpose()?;
         let spectral = spectral
@@ -108,7 +108,7 @@ impl SourceMemory {
         header.as_mut_slice().expect("mapped")[0] = LaunchHeader {
             hot: hot.gpu(),
             cold: cold.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
-            stack: stack.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
+            manifold: manifold.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
             records: records.gpu(),
             chain: chain.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
             spectral: spectral.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
@@ -120,12 +120,22 @@ impl SourceMemory {
             header,
             _hot: hot,
             cold,
-            stack,
+            manifold,
             chain,
             spectral,
             debug,
             _records: records,
         })
+    }
+
+    /// Its launch header, which places its slots.
+    pub(crate) fn header(&self) -> GpuPtr<LaunchHeader> {
+        self.header.gpu()
+    }
+
+    /// The paths a launch of its slots runs at most.
+    pub(crate) fn slots(&self) -> u32 {
+        self.slots
     }
 
     /// Whether it holds the slots [`Self::new`] makes of `items` paths laid out as `layout` with
@@ -137,7 +147,7 @@ impl SourceMemory {
     fn parts(&self) -> SlotParts {
         SlotParts {
             cold: self.cold.is_some(),
-            stack: self.stack.is_some(),
+            manifold: self.manifold.is_some(),
             chain: self.chain.is_some(),
             spectral: self.spectral.is_some(),
             debug: self.debug.is_some(),
@@ -146,14 +156,15 @@ impl SourceMemory {
 }
 
 /// The parts a slot holds beside its hot words and its record: its cold words, which paths that
-/// may meet a layer, an interior or a walk keep; the words of a plane stack, which paths that may
-/// meet one keep; the chain word, which paths that may gather caustic photons keep; the spectral
-/// words, which paths that may split by wavelength keep; and the debug word, which paths whose
-/// pipeline may show a debug view keep.
+/// may meet a layer, an interior or a walk keep; the words of manifold next-event estimation, which
+/// paths that a directional light may reach through the surfaces of solid glass keep; the chain
+/// word, which paths that may gather caustic photons keep; the spectral words, which paths that
+/// may split by wavelength keep; and the debug word, which paths whose pipeline may show a debug
+/// view keep.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SlotParts {
     pub(crate) cold: bool,
-    pub(crate) stack: bool,
+    pub(crate) manifold: bool,
     pub(crate) chain: bool,
     pub(crate) spectral: bool,
     pub(crate) debug: bool,
@@ -163,43 +174,79 @@ fn slots(items: u32) -> u32 {
     items.clamp(1, MAX_SLOTS)
 }
 
-/// What a view's paths keep in the pipeline: its own paths' slots and its update paths'.
+/// What a view's paths keep in the pipeline: its own paths' slots and its update paths', each made
+/// at the first frame that runs them.
+#[derive(Default)]
 pub(crate) struct LaunchMemory {
-    pub(crate) view: SourceMemory,
-    pub(crate) update: SourceMemory,
+    view: Option<SourceMemory>,
+    update: Option<SourceMemory>,
 }
 
 impl LaunchMemory {
-    /// Slots for a slice of a view of `pixels` pixels and one of its `update` update paths, with
-    /// `parts`.
-    pub(crate) fn new(
+    /// Slots for a slice of a view of `pixels` pixels with `parts`, made again where those it holds
+    /// do not fit.
+    pub(crate) fn view(
+        &mut self,
         device: &Device,
         pixels: u32,
+        parts: SlotParts,
+    ) -> Result<&SourceMemory, Error> {
+        fitted(
+            &mut self.view,
+            device,
+            pixels,
+            SlotLayout::view(),
+            parts,
+            "launched view",
+        )
+    }
+
+    /// Slots for a slice of a view's `update` update paths with `parts`, made again where those it
+    /// holds do not fit.
+    pub(crate) fn update(
+        &mut self,
+        device: &Device,
         update: u32,
         parts: SlotParts,
-    ) -> Result<Self, Error> {
-        let view = SourceMemory::new(device, pixels, SlotLayout::view(), parts, "launched view")?;
-        let update = SourceMemory::new(
+    ) -> Result<&SourceMemory, Error> {
+        fitted(
+            &mut self.update,
             device,
             update,
             SlotLayout::update(),
             parts,
             "launched update",
-        )?;
-        let memory = Self { view, update };
-        log::debug!(
-            "launched paths: {} view slots of {} bytes and {} update slots of {} bytes",
-            memory.view.slots,
-            16 * memory.view.layout.slot_words(),
-            memory.update.slots,
-            16 * memory.update.layout.slot_words()
-        );
-        Ok(memory)
+        )
     }
 
-    /// Whether it holds the slots [`Self::new`] makes for its arguments.
-    pub(crate) fn fits(&self, pixels: u32, update: u32, parts: SlotParts) -> bool {
-        self.view.fits(pixels, SlotLayout::view(), parts)
-            && self.update.fits(update, SlotLayout::update(), parts)
+    /// Whether a frame launched the view's paths.
+    pub(crate) fn launched(&self) -> bool {
+        self.view.is_some()
     }
+}
+
+/// The slots `memory` holds, made again for `items` paths laid out as `layout` with `parts` where
+/// they do not fit.
+fn fitted<'a>(
+    memory: &'a mut Option<SourceMemory>,
+    device: &Device,
+    items: u32,
+    layout: SlotLayout,
+    parts: SlotParts,
+    name: &str,
+) -> Result<&'a SourceMemory, Error> {
+    if !memory
+        .as_ref()
+        .is_some_and(|m| m.fits(items, layout, parts))
+    {
+        *memory = None;
+        let made = SourceMemory::new(device, items, layout, parts, name)?;
+        log::debug!(
+            "{name}: {} slots of {} bytes",
+            made.slots,
+            16 * made.layout.slot_words()
+        );
+        *memory = Some(made);
+    }
+    Ok(memory.as_ref().expect("made above"))
 }

@@ -20,7 +20,9 @@
 //! suits the extent), `--parts all|trunk`, `--poses-per-variant N`, `--pose-stride`,
 //! `--no-part-animation`, `--rt-range M`, `--animation-range M`, `--directional-lights L,T`,
 //! `--sw-raster-px P`, `--lod0-only`, `--world-km K`, `--world-density N` (trees per km^2
-//! outside the tile), `--particles N`, `--stream-load`, `--no-chain`, `--extent WxH`,
+//! outside the tile), `--particles N`, `--pond-lamps N` (shadowed sphere lights 1 m over the pond
+//! in front of the shore, which light the water's bed and its in-scatter through its surface),
+//! `--stream-load`, `--no-chain`, `--extent WxH`,
 //! `--script NAME` (walk, turn, overview, flythrough, flyout, shore), `--script-frames N`,
 //! `--exact-frame N` and `--exact-frames K` (the first of the first script's frames whose
 //! passes are timed exactly, with `Renderer::set_exact_timing`, and how many, 3 unless given;
@@ -259,6 +261,8 @@ pub struct Settings {
     pub world_km: f32,
     pub world_density: f32,
     pub particles: u32,
+    /// Shadowed sphere lights 1 m over the pond, in a row along the shore script's view.
+    pub pond_lamps: u32,
     pub stream_load: bool,
     /// Trees switch to coarser stand-ins with distance, where the packs hold them.
     pub chain: bool,
@@ -307,6 +311,7 @@ impl Settings {
             world_km: 1.0,
             world_density: 400.0,
             particles: 320,
+            pond_lamps: 0,
             stream_load: false,
             chain: true,
             extent: [1920, 1080],
@@ -378,6 +383,7 @@ impl Settings {
                 "--world-km" => s.world_km = number(value()).max(1.0),
                 "--world-density" => s.world_density = number(value()),
                 "--particles" => s.particles = number(value()) as u32,
+                "--pond-lamps" => s.pond_lamps = number(value()) as u32,
                 "--stream-load" => s.stream_load = true,
                 "--no-chain" => s.chain = false,
                 "--extent" => {
@@ -1392,6 +1398,31 @@ impl DenseVegetation {
                 .expect("particles");
             }
 
+            // The lamps stand 4 m apart along the shore script's first view, from where the bed
+            // first lies 0.3 m under the water: its shore rises over 1 m above the water for
+            // 40 m in front of the eye.
+            let (eye, ahead) = Script::Shore.camera(&heights, 0.0);
+            let along = (ahead - eye).with_y(0.0).normalize();
+            let at = |d: f32| eye + along * d;
+            let wet = (0..1000)
+                .map(|i| i as f32 * 0.5)
+                .find(|&d| heights.at(at(d).x, at(d).z) < water_level() - 0.3)
+                .expect("the shore's view reaches the pond");
+            for i in 0..settings.pond_lamps {
+                let p = at(wet + 4.0 * i as f32);
+                w.add_light(&Light::Sphere {
+                    position: DVec3::new(
+                        f64::from(p.x),
+                        f64::from(water_level()) + 1.0,
+                        f64::from(p.z),
+                    ),
+                    radius: 0.1,
+                    intensity: Vec3::splat(4000.0),
+                    shaping: None,
+                    shadows: true,
+                })
+                .expect("pond lamp");
+            }
             let suns: Vec<LightId> = (0..lights)
                 .map(|i| {
                     let mut light = solar_disc(sun_direction(i));

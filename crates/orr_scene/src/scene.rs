@@ -361,6 +361,8 @@ pub(crate) struct Tables {
     pub(crate) tess_state: Column<TessStateGpu>,
     pub(crate) producer_state: Column<ProducerStateGpu>,
     pub(crate) sky_stats: Allocation<SkyStats>,
+    /// `SceneRoot.interior`: the box of the PTLAS's instances of dielectric-class geometry.
+    pub(crate) interior: Allocation<u32>,
     /// By skinned-copy entry, like `skin_state`: the two grow together.
     pub(crate) skinned: Column<SkinnedGpu>,
     pub(crate) skin_state: Column<SkinStateGpu>,
@@ -2071,6 +2073,7 @@ impl Scene {
             tess_state: Column::new(device, MemoryPriority::Normal, "tessellation state", true)?,
             producer_state: Column::new(device, MemoryPriority::Normal, "producer state", true)?,
             sky_stats: device.gpu_malloc(dl, 1, "sky stats")?,
+            interior: device.gpu_malloc(dl, 8, "interior bounds")?,
             skinned: Column::new(device, MemoryPriority::Normal, "skinned copies", true)?,
             skin_state: Column::new(device, MemoryPriority::Normal, "skin state", true)?,
             decals: Column::new(device, MemoryPriority::Normal, "decals", true)?,
@@ -2086,6 +2089,17 @@ impl Scene {
             words(sky.size() as usize),
             0,
         )];
+        // The box of the instances of dielectric-class geometry holds everything until the
+        // PTLAS kernels first rebuild it: its low corner at -infinity, its high one at +infinity,
+        // as `ordered` floats.
+        let interior = tables.interior.gpu().address().0;
+        records.push(Record::fill(0, interior, 3, !f32::NEG_INFINITY.to_bits()));
+        records.push(Record::fill(
+            0,
+            interior + 16,
+            3,
+            f32::INFINITY.to_bits() | 0x8000_0000,
+        ));
         // The fixed runs, by their index.
         let fixed = tables.runs.alloc(device, FIXED_RUNS)?;
         records.push(Record {

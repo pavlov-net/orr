@@ -22,12 +22,13 @@ use crate::launch::{
 };
 use crate::mask_sets::{MaskSet, MaskSets};
 use crate::media::{
-    MediaKernels, MediaSettings, MediaStats, MediaView, fogged, links_medium, readers, shows_media,
+    FroxelWalks, MediaKernels, MediaSettings, MediaStats, MediaView, fogged, links_medium, readers,
+    shows_media,
 };
 use crate::scene::{FRAME_SLOTS, Ring, device_local};
 use crate::shaders::consts::{
-    HOT_DEPTH_MASK, PATH_SOURCE_BACKGROUND, PATH_SOURCE_PHOTON, PATH_SOURCE_UPDATE,
-    PATH_SOURCE_VIEW,
+    HOT_DEPTH_MASK, PATH_SOURCE_BACKGROUND, PATH_SOURCE_FROXEL, PATH_SOURCE_PHOTON,
+    PATH_SOURCE_UPDATE, PATH_SOURCE_VIEW,
 };
 use crate::shaders::dielectric::tiles;
 use crate::shaders::guides::{frost, overlay_front};
@@ -40,8 +41,8 @@ use crate::specialize::{
     MAY_ALL, MAY_BACKGROUND, MAY_CACHE, MAY_CAUSTICS, MAY_COAT, MAY_COVERAGE, MAY_DEBUG,
     MAY_DIRECTIONAL, MAY_DISPERSION, MAY_EMISSIVE, MAY_FILM, MAY_FROST, MAY_FROXELS, MAY_FUZZ,
     MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOCAL, MAY_LOCAL_LIGHTS, MAY_MEDIUM, MAY_PARTICLES,
-    MAY_PHOTON, MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING, MAY_SMOKE, MAY_STACK, MAY_SUBSURFACE,
-    MAY_TRACED, MAY_UPDATE, MAY_VIEW, MAY_WALK,
+    MAY_PHOTON, MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING, MAY_SMOKE, MAY_SUBSURFACE, MAY_TRACED,
+    MAY_UPDATE, MAY_VIEW, MAY_WALK, may_manifolds,
 };
 use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::support::{Masked, MaskedFrame, MaskedSupport, Runs};
@@ -315,8 +316,9 @@ pub const MAX_LOCAL_LIGHT_SHARE: f32 = 0.9;
 /// Smallest [`ViewLighting::pixel_fraction`].
 pub const MIN_PIXEL_FRACTION: f32 = 1.0 / 16.0;
 
-/// Largest [`ViewLighting::max_bounces`]: the vertices a path's state counts, less one.
-pub const MAX_BOUNCES: u32 = HOT_DEPTH_MASK - 1;
+/// Largest [`ViewLighting::max_bounces`]: the vertices a path's state counts, less its first and
+/// the last bounce's hit, which scatters nothing and must count past the others to end the path.
+pub const MAX_BOUNCES: u32 = HOT_DEPTH_MASK - 2;
 
 /// Pixels per side of the screen tiles that share a local light sampler (`light_sampling`'s
 /// `LOCAL_TILE`).
@@ -616,11 +618,13 @@ pub struct LightingView {
     /// The reference's photon map, while the view traces one.
     photon_map: Option<PhotonMap>,
     /// What the view's paths keep in the pipeline, made at their first frame.
-    launched: Option<LaunchMemory>,
+    launched: LaunchMemory,
     /// What the scene's photons keep there while they run in the view.
     launched_photons: Option<SourceMemory>,
     /// The pipelines the view's last frame launched paths through, kept until its next.
     launched_ran: LaunchedRan,
+    /// The pipeline the view's last frame walked its froxels' jobs through, kept until its next.
+    froxels_walked: Option<Arc<MaskSet<PathPipeline>>>,
 }
 
 /// The pipelines a view's frame launched its sources' paths through: what the view asked them
@@ -739,9 +743,10 @@ impl LightingView {
             previous: None,
             scene_resets: 0,
             history_reset: true,
-            launched: None,
+            launched: LaunchMemory::default(),
             launched_photons: None,
             launched_ran: LaunchedRan::default(),
+            froxels_walked: None,
             media: MediaView::new(device)?,
             dof: None,
             overlay_front: None,
@@ -960,7 +965,7 @@ impl LightingView {
 
     /// The path pipelines the view's last [`LightingKernels::record_paths`] ran.
     pub fn paths_ran(&self) -> Option<PathsRan> {
-        self.launched.as_ref().map(|_| PathsRan {
+        self.launched.launched().then(|| PathsRan {
             asked: self.launched_ran.asked,
             ran: self.launched_ran.held.iter().map(|s| s.may()).collect(),
         })
@@ -1322,19 +1327,70 @@ fn bit(on: bool, bit: u64) -> u64 {
 }
 
 /// What a view's paths under `lighting` may meet in a scene that may hold `features` of what their
-/// slots keep: a subsurface walk an opaque vertex starts, wavelengths, the interiors they lie in
-/// and a directional light's walk through a plane stack.
+/// slots keep: a subsurface walk an opaque vertex starts, wavelengths and the interiors they lie
+/// in.
 fn state_may(features: SceneFeatures, lighting: &ViewLighting) -> u64 {
     // The eye's interior is one whatever the materials say.
     let interiors = features.contains(SceneFeatures::INTERIORS) || lighting.camera_medium.is_some();
-    // A stack bends directional lights alone.
-    let stack = features.contains(SceneFeatures::PLANE_STACKS | SceneFeatures::DIRECTIONAL_LIGHTS);
     let walk =
         features.contains(SceneFeatures::WALKING) && features.contains(SceneFeatures::SUBSURFACE);
     bit(walk, MAY_WALK)
         | bit(disperses(features, lighting), MAY_DISPERSION)
         | bit(interiors, MAY_INTERIORS)
-        | bit(stack, MAY_STACK)
+}
+
+/// The root of the froxel source's walks of `pass` under `lighting`, which read the view's scene,
+/// light set and frame and whether its paths split by wavelength, and no other part of a view's
+/// paths. The froxels' root and the launch's slots come with each launch.
+fn froxel_walk_root(scene: &SceneLighting, pass: &ViewPass, lighting: &ViewLighting) -> PathRoot {
+    PathRoot {
+        scene: pass.scene,
+        view: pass.view,
+        gbuffer: pass.gbuffer,
+        set: scene.light_set(),
+        cache: GpuPtr::NULL,
+        local: GpuPtr::NULL,
+        radiance: StorageImageIndex::NONE,
+        primary_candidates: 0,
+        bounce_candidates: 0,
+        max_bounces: 0,
+        roulette_depth: 0,
+        mode: 0,
+        frame: pass.sample_index,
+        seed: pass.seed,
+        segment_steps: 0,
+        aperture_radius: 0.0,
+        focus_distance: 0.0,
+        cache_flags: 0,
+        update_block: 1,
+        feedback: StorageImageIndex::NONE,
+        local_columns: 0,
+        light_flags: 0,
+        layers: GpuPtr::NULL,
+        froxels: GpuPtr::NULL,
+        dielectric_depth: 0,
+        camera_medium: NO_MATERIAL,
+        dielectric_flags: if lighting.dispersion {
+            DIELECTRIC_DISPERSION
+        } else {
+            0
+        },
+        sss_max_steps: 0,
+        subsurface_table: GpuPtr::NULL,
+        sss_flags: 0,
+        pixel_fraction: 1.0,
+        dof_background: StorageImageIndex::NONE,
+        dof_mask: TextureIndex::NONE,
+        dof_focus: GpuPtr::NULL,
+        dof_aperture: 0.0,
+        source: PATH_SOURCE_FROXEL,
+        overlay_front: GpuPtr::NULL,
+        caustics: GpuPtr::NULL,
+        slice_base: 0,
+        slice_count: 0,
+        froxel: GpuPtr::NULL,
+        launch: GpuPtr::NULL,
+    }
 }
 
 /// The root of the update paths of the view of `root`.
@@ -1477,7 +1533,6 @@ fn support_may(
         | MAY_WALK
         | MAY_DISPERSION
         | MAY_INTERIORS
-        | MAY_STACK
         | MAY_LENS
         | MAY_FROXELS
         | MAY_DEBUG
@@ -1591,21 +1646,21 @@ fn predict(
         background,
         // Update paths run outside the reference, end in the cache and neither walk nor split
         // by wavelength. Photons do not walk.
-        update: shared | (state & (MAY_INTERIORS | MAY_STACK)) | MAY_CACHE,
+        update: shared | (state & MAY_INTERIORS) | MAY_CACHE,
         photons: shared | (state & !MAY_WALK) | bit(reference, MAY_REFERENCE),
     }
 }
 
 /// The parts beside their hot words the slots of the pipeline's paths that may meet `may` hold:
 /// the interiors they lie in, where they may meet a layer or an interior, and the walk a vertex
-/// starts, where they may walk; a shadow job's walk through a plane stack, where they may meet one;
-/// the light they find past chain vertices, where they may gather caustic photons; their
-/// wavelengths, where they may split by wavelength; and what a debug view shows of their first
-/// vertex, where they may show one.
+/// starts, where they may walk; the words of manifold next-event estimation, where a directional
+/// light may reach them through the surfaces of solid glass; the light they find past chain
+/// vertices, where they may gather caustic photons; their wavelengths, where they may split by
+/// wavelength; and what a debug view shows of their first vertex, where they may show one.
 fn slot_parts(may: u64) -> SlotParts {
     SlotParts {
         cold: may & (MAY_LAYERS | MAY_INTERIORS | MAY_WALK) != 0,
-        stack: may & MAY_STACK != 0,
+        manifold: may & may_manifolds() != 0,
         chain: may & MAY_CAUSTICS != 0,
         spectral: may & MAY_DISPERSION != 0,
         debug: may & MAY_DEBUG != 0,
@@ -1912,6 +1967,11 @@ impl LightingKernels {
     /// [`LightingDebugView::Froxels`] read everything. With neither kind of reader the view
     /// frees its froxel targets and only the shadowed lights are picked. The froxel history
     /// starts over when the light gets a reader again.
+    ///
+    /// Where the light pass runs and a light may reach its froxels through the surfaces of solid
+    /// glass, the view's path pipeline walks that light's chains (`hits` writes its hit table),
+    /// in the slots the view's paths take later: the shadowed directional lights' from inside an
+    /// interior, and any other whose shadow ray meets solid glass.
     pub fn record_media(
         &self,
         list: &mut CommandList<'_>,
@@ -1919,12 +1979,61 @@ impl LightingKernels {
         view: &mut LightingView,
         pass: &ViewPass,
         lighting: &ViewLighting,
+        hits: &HitTableWriter<'_>,
     ) -> Result<(), Error> {
         let _zone = orr_scene::orr_gpu::zone!("record media");
         let masked = self.masked_frame(pass, lighting);
+        let set = self.froxel_walk_set(scene, pass, lighting, masked.runs)?;
+        let walks = match &set {
+            Some(set) => {
+                let launch = set.member(0).get().expect("the set's pipeline is ready");
+                let (pipeline, groups) = launch.hit_pipeline();
+                let table = hits.table(list, pipeline, groups)?;
+                let parts = slot_parts(set.may());
+                let pixels = view.extent[0] * view.extent[1];
+                let memory = view.launched.view(&view.device, pixels, parts)?;
+                Some(FroxelWalks {
+                    pipeline: launch,
+                    table,
+                    root: froxel_walk_root(scene, pass, lighting),
+                    header: memory.header(),
+                    slots: memory.slots(),
+                })
+            }
+            None => None,
+        };
         self.support
             .media
-            .record(list, scene, view, pass, lighting, masked)
+            .record(list, scene, view, pass, lighting, masked, walks)?;
+        view.froxels_walked = set;
+        Ok(())
+    }
+
+    /// The path pipeline whose froxel source walks the froxels' jobs of `pass`: the one the view's
+    /// paths run through, where the froxels' light pass runs (`runs`) and that pipeline holds the
+    /// source, which it does where the froxels' light may come through the surfaces of solid glass.
+    fn froxel_walk_set(
+        &self,
+        scene: &SceneLighting,
+        pass: &ViewPass,
+        lighting: &ViewLighting,
+        runs: Runs,
+    ) -> Result<Option<Arc<MaskSet<PathPipeline>>>, Error> {
+        if !runs.froxel_light {
+            return Ok(None);
+        }
+        let needs = PathNeeds {
+            features: pass.scene_features,
+            frosted_glass: pass.frosted_glass,
+            dof_background: pass.dof_background.is_some(),
+            particle_lighting: pass.particle_lighting,
+        };
+        let paths = &*self.paths;
+        let wanted = paths.wanted(scene, needs, lighting);
+        paths.ask_wanted(&wanted, lighting)?;
+        let set = paths.set(wanted[0])?;
+        let launch = set.member(0).get().expect("the set's pipeline is ready");
+        Ok(launch.raygen(PATH_SOURCE_FROXEL).then_some(set))
     }
 
     /// Records media apply into `view`'s radiance after [`Self::record_media`] and the paths
@@ -2189,8 +2298,7 @@ impl LightingKernels {
             caustics: GpuPtr::NULL,
             slice_base: 0,
             slice_count: 0,
-            _pad0: 0,
-            _pad1: 0,
+            froxel: GpuPtr::NULL,
             launch: GpuPtr::NULL,
         };
         let paths = &*self.paths;
@@ -2234,15 +2342,6 @@ impl LightingKernels {
         // one's stages reach.
         let set = paths.set(may)?;
         let parts = slot_parts(set.may());
-        if !view
-            .launched
-            .as_ref()
-            .is_some_and(|m| m.fits(pixels, update, parts))
-        {
-            view.launched = None;
-            view.launched = Some(LaunchMemory::new(&view.device, pixels, update, parts)?);
-        }
-        let memory = view.launched.as_ref().expect("made above");
         list.begin_pass(
             if update == 0 || lighting.stage_passes {
                 "view paths"
@@ -2261,7 +2360,7 @@ impl LightingKernels {
             &root,
             may,
             &set,
-            &memory.view,
+            view.launched.view(&view.device, pixels, parts)?,
             pixels,
         )?;
         if update > 0 && lighting.stage_passes {
@@ -2281,7 +2380,7 @@ impl LightingKernels {
                 &update_root(&root),
                 may,
                 &set,
-                &memory.update,
+                view.launched.update(&view.device, update, parts)?,
                 update,
             )?;
         }
@@ -2305,7 +2404,7 @@ impl LightingKernels {
                 &background_root,
                 may,
                 &set,
-                &memory.view,
+                view.launched.view(&view.device, pixels, parts)?,
                 pixels,
             )?;
             list.end_pass();

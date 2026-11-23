@@ -28,17 +28,19 @@ pub(crate) enum Masked {
     LayerGuides,
     FroxelWalk,
     FroxelSample,
+    FroxelView,
     ShadowTrace,
     FroxelRetrace,
     FroxelAccumulate,
     MediaApply,
 }
 
-const MASKED: [Masked; 8] = [
+const MASKED: [Masked; 9] = [
     Masked::Guides,
     Masked::LayerGuides,
     Masked::FroxelWalk,
     Masked::FroxelSample,
+    Masked::FroxelView,
     Masked::ShadowTrace,
     Masked::FroxelRetrace,
     Masked::FroxelAccumulate,
@@ -46,9 +48,10 @@ const MASKED: [Masked; 8] = [
 ];
 
 /// The froxels' light pass, which runs from one set.
-pub(crate) const FROXEL_LIGHT: [Masked; 5] = [
+pub(crate) const FROXEL_LIGHT: [Masked; 6] = [
     Masked::FroxelWalk,
     Masked::FroxelSample,
+    Masked::FroxelView,
     Masked::ShadowTrace,
     Masked::FroxelRetrace,
     Masked::FroxelAccumulate,
@@ -92,6 +95,7 @@ impl Masked {
             ),
             Self::FroxelWalk => froxel("walk_main", "froxel walk"),
             Self::FroxelSample => froxel("sample_main", "froxel sample"),
+            Self::FroxelView => froxel("view_main", "froxel view"),
             Self::ShadowTrace => (
                 &shadow::MODULE,
                 shadow::Spec::ENTRIES,
@@ -165,6 +169,7 @@ impl Runs {
             Masked::LayerGuides => self.layer_guides,
             Masked::FroxelWalk
             | Masked::FroxelSample
+            | Masked::FroxelView
             | Masked::ShadowTrace
             | Masked::FroxelRetrace
             | Masked::FroxelAccumulate => self.froxel_light,
@@ -196,7 +201,7 @@ impl MaskedFrame<'_> {
 /// The masked kernels' pipelines for one mask, each made when a view first runs it.
 pub(crate) struct SupportSet {
     may: u64,
-    pipelines: [Late<ComputePipeline>; 8],
+    pipelines: [Late<ComputePipeline>; 9],
 }
 
 impl SupportSet {

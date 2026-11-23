@@ -6,9 +6,9 @@
 // where micromaps leave one, presence layers, particles, a linked surface's coverage, a medium
 // proxy without a volume) and flags a ray that meets one it does not resolve, without
 // approximating it. Its client lists the flagged rays and retraces each with the full handling
-// (`shadow_full`), which writes the same result whole. A flagged ray that the thin trace finds
-// blocked ends at 0 there, since nothing the full handling adds lets light through an opaque hit;
-// a ray that a plane stack may bend leaves that to its probe.
+// (`surface_visibility`), which writes the same result whole. A flagged ray that the thin trace
+// finds blocked ends at 0 there, since nothing the full handling adds lets light through an opaque
+// hit.
 //
 // Shadow rays are the one kind built: `trace_shadow` is the thin tracer, `rays/shadow.slang` its
 // kernel. A closest-hit kind would take its own value of JOB_KIND, its instance mask from the
@@ -43,8 +43,17 @@ public static const uint JOB_KIND_SHIFT = 19;
 public static const uint JOB_MODE_SHIFT = 21;
 // The ray goes to the environment, whose map holds the linked medium.
 public static const uint JOB_ENVIRONMENT = 1u << 23;
-// A directional light's ray that a plane stack may bend (`path_light`).
-public static const uint JOB_BEND = 1u << 24;
+// A ray whose light may come through the surfaces of solid glass, which a manifold walk takes
+// where the ray meets solid glass: the client's, which the tracer does not read.
+public static const uint JOB_WALKS = 1u << 24;
+// A walking job whose light's other chains seeded walks look for wherever its ray goes: the
+// client's.
+public static const uint JOB_SEEDS = 1u << 28;
+// A froxel's job toward a shadowed light that walks first from the start direction of a chain its
+// froxel took of late, as its own walk, which `RayJob.extra` holds: the client's.
+public static const uint JOB_RECALL = 1u << 29;
+// Of those, one whose chain is a neighbor's, recalled only in a frame its seeds run: the client's.
+public static const uint JOB_RECALL_SEEDED = 1u << 30;
 // The hit context's texture feedback.
 public static const uint JOB_FEEDBACK = 1u << 26;
 // A shadow ray of a light surfaces cast no shadow from: it meets medium proxies alone.
@@ -65,7 +74,7 @@ public struct RayJob
     public float3 direction;    // unit
     public uint flags;          // JOB_*
     public uint cone;           // the cone's width at the origin (m) in the low half, its spread (rad) in the high half
-    public uint extra;          // a closest ray's presence draw; 0 for a shadow ray
+    public uint extra;          // a closest ray's presence draw; 0 for a shadow ray, but the client's
     public uint depth;          // the hit context's path depth
     public uint user;           // the client's
 }
@@ -74,6 +83,7 @@ public struct RayJob
 public static const uint SHADOW_THIN = 0;    // the thin tracer's: the candidates' product along a ray that crosses no interior surface
 public static const uint SHADOW_FLAGGED = 1; // left to the full handling
 public static const uint SHADOW_FULL = 2;    // the full handling's, with `ShadowFull` at the job's index
+public static const uint SHADOW_WALKS = 3;   // left by the full handling to the client's walk (JOB_WALKS), which writes it
 
 // What a shadow job's ray lets through, 16 bytes. A thin result holds the product of the
 // candidates; `thin_outcome` gives what the full handling would make of it.
@@ -84,15 +94,19 @@ public struct ShadowResult
 }
 
 // The rest of what the full handling finds for a shadow job: the interiors' optical depth along
-// the ray, and for a directional light that a plane stack bends, `StackLight`'s jacobian, faces'
-// normal and density.
+// the ray, and for a job a manifold walk took (`walked` 1), that along its chain's first leg, the
+// direction the chain leaves its origin along, and the start direction of the first chain other
+// than the straight way that took light, as `oct_encode_snorm16` codes it, NO_CHAIN for none.
 public struct ShadowFull
 {
     public float3 depth;
-    public float jacobian;
-    public float3 normal;
-    public float density;
+    public uint walked;
+    public float3 arrival;
+    public uint chain;
 }
+
+// A code `oct_encode_snorm16` never makes.
+public static const uint NO_CHAIN = 0x80008000u;
 
 // A compacted list's count and the indirect dispatch over it, in rows of RAY_ROW workgroups of
 // RAY_GROUP lanes.
@@ -123,14 +137,14 @@ public struct ShadowTraceRoot
 // `ray_flags`, in mode `mode` (SHADOW_*), whose candidates take `context` (its cone at the
 // origin, no tap) as hits the camera does not see, which a shadow ray's are in either tracer
 // (`ShadowCover.context`).
-public RayJob shadow_job(float3 origin, float3 direction, float t_max, uint ray_flags, uint mode, HitContext context, bool environment, bool bend, uint user)
+public RayJob shadow_job(float3 origin, float3 direction, float t_max, uint ray_flags, uint mode, HitContext context, bool environment, uint user)
 {
     RayJob j;
     j.origin = origin;
     j.t_max = t_max;
     j.direction = direction;
     j.flags = (ray_flags & JOB_RAY_FLAGS) | (RAY_SHADOW << JOB_KIND_SHIFT) | (mode << JOB_MODE_SHIFT)
-        | (environment ? JOB_ENVIRONMENT : 0) | (bend ? JOB_BEND : 0)
+        | (environment ? JOB_ENVIRONMENT : 0)
         | (context.feedback ? JOB_FEEDBACK : 0);
     j.cone = pack_top16(context.cone_width) | (pack_top16(context.cone_spread) << 16);
     j.extra = 0;
@@ -154,23 +168,10 @@ public bool job_environment(RayJob j)
     return (j.flags & JOB_ENVIRONMENT) != 0;
 }
 
-// Whether a plane stack may bend the job's ray in this pipeline.
-public bool job_bends(RayJob j)
-{
-    return may(MAY_STACK) && (j.flags & JOB_BEND) != 0;
-}
-
 public HitContext job_context(RayJob j)
 {
     RayCone cone = { unpack_top16(j.cone & 0xffff), unpack_top16(j.cone >> 16) };
     return hit_context(HIT_SECONDARY, j.depth, cone, 0.0, float2(-1.0), (j.flags & JOB_FEEDBACK) != 0);
-}
-
-// The mode the thin tracer traces a shadow job in: a ray a plane stack may bend first goes as a
-// path's, as `path_light` takes it.
-public uint traced_mode(RayJob j)
-{
-    return job_bends(j) ? SHADOW_PATH : job_mode(j);
 }
 
 // Appends this lane to `list`'s count where `take`, with one atomic per wave: the index it takes,
@@ -208,8 +209,7 @@ public uint list_index(uint3 group, uint lane)
 // The thin tracer's candidates of one shadow ray, as `ShadowCandidates` takes them in mode
 // `mode`, except those it flags: a medium proxy with a volume to march and a dielectric surface
 // that a SHADOW_PATH ray takes as a window or a SHADOW_UNBENT ray crosses. A flagged candidate
-// passes the ray and counts as the full handling counts it. In mode SHADOW_PROBE it flags the
-// first present dielectric and ends the trace there, and counts nothing.
+// passes the ray and counts as the full handling counts it.
 struct ThinShadow<S : ISurfaces> : ICandidate
 {
     SceneRoot* scene;
@@ -219,7 +219,6 @@ struct ThinShadow<S : ISurfaces> : ICandidate
     HitContext context;
     uint mode;
     bool flagged;
-    float solid_t;
 
     bool positions(Candidate c)
     {
@@ -247,29 +246,22 @@ struct ThinShadow<S : ISurfaces> : ICandidate
             return float3(1.0);
         uint found;
         float3 t = thin_candidate<S>(scene, view, context, mode, dir, c.class_id, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, may(MAY_LAYERS), may(MAY_PARTICLES), counted, found);
-        if ((found & SHADOW_SOLID) != 0)
-            solid_t = c.t;
-        if (mode == SHADOW_PROBE && c.class_id == CLASS_DIELECTRIC)
-            flagged = (found & SHADOW_CROSSES) != 0;
-        else if ((found & SHADOW_CROSSES) != 0)
+        if ((found & SHADOW_CROSSES) != 0)
             flagged = true;
         return t;
     }
 }
 
-// The thin tracer of shadow job `job`: `surface_visibility`'s traces in the job's traced mode with
-// the cheap candidates handled and the rest flagged. A ray a plane stack may bend that ends at an
-// opaque surface or solid glass leaves its light 0 unless `path_light`'s probe for a stack face
-// would find a dielectric first; a second trace of the dielectrics up to the probe's end, in the
-// same query, flags the ray where it finds one, which covers every ray whose probe does. A thin
-// result holds the candidates' product, 0 where the ray is blocked; a flagged one holds nothing.
-// A ray past SHADOW_CANDIDATES non-opaque candidates in one of its traces adds 1 to `overflows`
-// where its result is thin, and the full handling counts it otherwise.
+// The thin tracer of shadow job `job`: `surface_visibility`'s traces in the job's mode with the
+// cheap candidates handled and the rest flagged. A thin result holds the candidates' product, 0
+// where the ray is blocked; a flagged one holds nothing. A ray past SHADOW_CANDIDATES non-opaque
+// candidates in one of its traces adds 1 to `overflows` where its result is thin, and the full
+// handling counts it otherwise.
 public ShadowResult trace_shadow<S : ISurfaces>(SceneRoot* s, ViewConstants* v, RayJob job, uint* overflows)
 {
-    uint mode = traced_mode(job);
+    uint mode = job_mode(job);
     HitContext context = job_context(job);
-    ThinShadow<S> h = { s, v, job.direction, job.t_max, context, mode, false, positive_infinity() };
+    ThinShadow<S> h = { s, v, job.direction, job.t_max, context, mode, false };
     RayDesc ray;
     ray.Origin = job.origin;
     ray.Direction = job.direction;
@@ -288,43 +280,19 @@ public ShadowResult trace_shadow<S : ISurfaces>(SceneRoot* s, ViewConstants* v, 
         uint c;
         float c_t;
         float3 p = trace_transmittance(scene_traced(s), ray, mask, pass_flags, h, SHADOW_CANDIDATES, more, c, c_t);
-        if (pass == 1 && h.mode == SHADOW_PROBE)
-        {
-            // Light that ends at anything but a dielectric is 0.
-            flagged = h.flagged || c == CLASS_DIELECTRIC;
-            product = float3(0.0);
-            break;
-        }
         product *= p;
         overflow = overflow || more;
         flagged = h.flagged && !all(product == 0.0);
-        if (pass == 1 || media_only)
+        if (pass == 1 || media_only || mode != SHADOW_UNBENT)
             break;
-        if (mode == SHADOW_UNBENT)
-        {
-            // Solid glass that the first trace commits takes the full handling's second trace of
-            // everything forced non-opaque; the full handling retraces the dielectrics of a flagged
-            // ray with the rest.
-            flagged = flagged || c == CLASS_DIELECTRIC;
-            if (flagged || all(product == 0.0))
-                break;
-            mask = MASK_DIELECTRIC;
-            pass_flags = flags | RAY_FLAG_FORCE_NON_OPAQUE;
-            continue;
-        }
-        if (c == ~0u && h.solid_t < positive_infinity())
-        {
-            c = CLASS_DIELECTRIC;
-            c_t = h.solid_t;
-        }
-        if (!job_bends(job) || c == ~0u)
+        // Solid glass that the first trace commits takes the full handling's second trace of
+        // everything forced non-opaque; the full handling retraces the dielectrics of a flagged
+        // ray with the rest.
+        flagged = flagged || c == CLASS_DIELECTRIC;
+        if (flagged || all(product == 0.0))
             break;
-        // `path_light`'s probe of the opaque surfaces and solid glass up to the hit.
-        h.mode = SHADOW_PROBE;
-        h.flagged = false;
         mask = MASK_DIELECTRIC;
-        pass_flags = job_ray_flags(job);
-        ray.TMax = c_t * (1.0 + 1e-4) + T_MIN_BASE;
+        pass_flags = flags | RAY_FLAG_FORCE_NON_OPAQUE;
     }
     if (overflow && !flagged && overflows != nullptr)
         InterlockedAdd(*overflows, 1u);
@@ -334,34 +302,14 @@ public ShadowResult trace_shadow<S : ISurfaces>(SceneRoot* s, ViewConstants* v, 
     return r;
 }
 
-// What thin result `r` of a shadow job that reaches `t_max` in traced mode `mode`
-// (`traced_mode`) lets through to the job's origin, inside the interiors of `inside` there, as
-// the full handling gives it, with in `depth` the interiors' optical depth, which means nothing
-// where the transmittance is 0. Its light is a straight ray's: a stack's jacobian of 1 and no
-// faces.
+// What thin result `r` of a shadow job that reaches `t_max` in mode `mode` lets through to the
+// job's origin, inside the interiors of `inside` there, as the full handling gives it, with in
+// `depth` the interiors' optical depth, which means nothing where the transmittance is 0.
 public float3 thin_outcome(SceneRoot* s, float t_max, uint mode, ShadowResult r, Interior inside, out float3 depth)
 {
     float scale;
     depth = straight_depth(s, inside, t_max, mode == SHADOW_UNBENT, scale);
     return r.transmittance * scale;
-}
-
-// The full handling of shadow job `job` from inside the interiors of `inside` at its origin, in
-// mode MODE: `surface_visibility`'s, after `path_light`'s plane stack for a ray that one may
-// bend, which reaches the light where no stack breaks it: what a client retraces a flagged job
-// with (`froxel_retrace`). A ray past SHADOW_CANDIDATES non-opaque candidates in one of its traces
-// adds 1 to `overflows`.
-public float3 shadow_full<S : ISurfaces, M : IMedium, let MODE : uint>(SceneRoot* s, ViewConstants* v, RayJob job, Interior inside, uint* overflows, out float3 depth, out StackLight stack)
-{
-    HitContext context = job_context(job);
-    uint flags = job_ray_flags(job);
-    if (job_bends(job) && path_light<S, M>(s, v, job.origin, job.origin, job.direction, positive_infinity(), flags, context, false, inside, true, false, false, overflows, stack) != STACK_BROKEN)
-    {
-        depth = stack.depth;
-        return stack.transmittance;
-    }
-    stack = straight_light(job.direction);
-    return surface_visibility<S, M, MODE>(s, v, job.origin, job.direction, job.t_max, flags, context, job_environment(job), inside, overflows, depth, (job.flags & JOB_MEDIA_ONLY) != 0);
 }
 
 // Lane `lane` of workgroup `group` of a thin shadow tracer: traces its job where it

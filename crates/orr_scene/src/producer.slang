@@ -135,6 +135,11 @@ public float unordered(uint u)
     return asfloat((u & 0x80000000u) != 0 ? u & 0x7fffffffu : ~u);
 }
 
+public float3 unordered(uint3 u)
+{
+    return asfloat(select((u & 0x80000000u) != 0, u & 0x7fffffffu, ~u));
+}
+
 // The entry's bounds from its state; false while it has built no cluster.
 public bool producer_bounds(ProducerStateGpu st, out float3 lo, out float3 hi)
 {

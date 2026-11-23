@@ -39,7 +39,12 @@ import orr_scene.tables;
 // none of the above.
 [Host] public static const uint KIND_EMISSIVE_PATH = 8;
 [Host] public static const uint KIND_PRODUCER_EMISSIVE_PATH = 9;
-[Host] public static const uint PINNED_KINDS = 10;
+// Under shadow rays, a copy's or a producer entry's clusters that trace as a dielectric: with a
+// closest-hit beside the shadow's any-hit, which a manifold walk's face ray runs on its hit object
+// in place of its path record's shader, as no shadow ray runs one.
+[Host] public static const uint KIND_LAYER_SHADOW = 10;
+[Host] public static const uint KIND_PRODUCER_LAYER_SHADOW = 11;
+[Host] public static const uint PINNED_KINDS = 12;
 // No group: a record of zeros.
 static const uint SLOT_NONE = 0xffffffff;
 
@@ -125,6 +130,7 @@ void write_records(SceneRoot* s, uint run)
     uint class_id;
     uint attributes = 0;
     uint path = KIND_PATH;
+    uint shadow = KIND_SHADOW;
     if (kind == ROW_PRODUCER)
     {
         // The entry's record and its row change together, a run per material.
@@ -153,9 +159,11 @@ void write_records(SceneRoot* s, uint run)
             path = producer ? KIND_PRODUCER_RICH_PATH : KIND_RICH_PATH;
         else if (data.has(HIT_EMITS))
             path = producer ? KIND_PRODUCER_EMISSIVE_PATH : KIND_EMISSIVE_PATH;
+        if (class_id == CLASS_DIELECTRIC)
+            shadow = producer ? KIND_PRODUCER_LAYER_SHADOW : KIND_LAYER_SHADOW;
     }
     // A particle is no path ray's hit: its record keeps it as what lies in front of one.
-    write_run(run, uint2(class_id == CLASS_PARTICLE ? KIND_FRONT : pinned(path, pin), pinned(KIND_SHADOW, pin)), data);
+    write_run(run, uint2(class_id == CLASS_PARTICLE ? KIND_FRONT : pinned(path, pin), pinned(shadow, pin)), data);
 }
 
 // One workgroup per range of runs.

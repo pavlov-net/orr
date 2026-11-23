@@ -512,6 +512,40 @@ fn a_scattering_slab_matches_single_scattering_within_5_percent() {
     assert_clean();
 }
 
+/// The scattering slab under a point lamp 200 m away 20 degrees from the zenith, against the same
+/// single-scattering integral: the lamp's light reaches a scatter by the chain through the slab's
+/// top, whatever the medium takes along the straight way to the lamp, which its 200 m of milk put
+/// below the least float. A lamp that far lights the slab as a sun of its illuminance does.
+#[test]
+fn a_far_lamp_over_a_scattering_slab_lights_its_scatters_by_their_chains() {
+    let tilt = 20f64.to_radians();
+    let axis = DVec3::new(tilt.sin(), tilt.cos(), 0.0);
+    let (distance, illuminance) = (200.0f64, 1000.0f64);
+    let lamp = DVec3::new(0.0, 1.0, 0.0) + axis * distance;
+    let spec = from_above(
+        vec![at(MILKY_SLAB, Vec3::new(0.0, 0.5, 0.0))],
+        vec![Light::Point {
+            position: lamp,
+            intensity: Vec3::splat((illuminance * distance * distance) as f32),
+            shaping: None,
+            shadows: true,
+        }],
+        4.0,
+    );
+    let image = render_paths(&mut Bed::with(spec), &paths(reference(0)), 128);
+    let (sigma_t, sigma_s) = (f64::from(MILK_SIGMA_T), f64::from(MILK_SIGMA_S));
+    let mu = axis.y;
+    let mu_t = (1.0 - (1.0 - mu * mu) / (1.5 * 1.5)).sqrt();
+    let k = sigma_t * (1.0 + 1.0 / mu_t);
+    let beam = illuminance * mu * (1.0 - fresnel(1.5, mu)) / mu_t;
+    let l = beam * (1.0 - fresnel(1.5, 1.0)) * sigma_s / (4.0 * std::f64::consts::PI)
+        * (1.0 - (-k).exp())
+        / k
+        / (1.5 * 1.5);
+    assert_close("single scattering", center(&image, 16), [l; 3], 0.05);
+    assert_clean();
+}
+
 /// A sphere of non-absorbing scattering medium in a uniform environment keeps at most its
 /// energy.
 #[test]

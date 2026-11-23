@@ -187,3 +187,30 @@ public uint upper_bound<let N : int>(__ref float cdf[N], uint count, float targe
     }
     return lo;
 }
+
+// The basis that a surface's slopes take about its unit normal `n`: continuous across the surface
+// but where `n` lies along the x axis, which the up axis of a level surface is far from.
+public void facet_basis(float3 n, out float3 t, out float3 b)
+{
+    float3 axis = abs(n.x) < 0.9 ? float3(1.0, 0.0, 0.0) : float3(0.0, 1.0, 0.0);
+    t = normalize(cross(axis, n));
+    b = cross(n, t);
+}
+
+// The microfacet normal of slope `slope` about unit normal `n` (`facet_basis`).
+public float3 facet(float3 n, float2 slope)
+{
+    float3 t, b;
+    facet_basis(n, t, b);
+    return normalize(n - slope.x * t - slope.y * b);
+}
+
+// A slope of the GGX distribution of alpha 1, from two uniform numbers: a surface of alpha `a`
+// scales it by `a`, which then has the density of that alpha's distribution of microfacet normals,
+// GGX's D(m) cos(m) (`facet_density`).
+public float2 unit_slope(float2 u)
+{
+    float r = sqrt(u.x / (1.0 - u.x));
+    float phi = 2.0 * PI * u.y;
+    return r * float2(cos(phi), sin(phi));
+}

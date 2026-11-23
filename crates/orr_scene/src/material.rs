@@ -42,12 +42,6 @@ pub mod material_flags {
     /// The ray origin policy, 0-2 (default, surface, triangle), in bits 13-14.
     pub const ORIGIN_SHIFT: u32 = 13;
     pub const ORIGIN_MASK: u32 = 3 << ORIGIN_SHIFT;
-    /// The record is a solid dielectric caster that transmits and that no texture, vertex
-    /// color stream, back, displacement, linked surface, coat, fuzz, thin film or anisotropy
-    /// varies: a plane stack face where its BSDF is an ideal mirror and window (`shadow.slang`'s
-    /// `stack_material`), which only a surface smoother than `CHAIN_ROUGHNESS` is. The material
-    /// table sets it on every record it stores, from the record's other fields.
-    pub const STACK_FACE: u32 = 1 << 15;
     pub const MORE_TEXTURES: u32 = 1 << 22;
     pub const VERTEX: u32 = 1 << 24;
     pub const OBJECT_NORMAL: u32 = 1 << 25;
@@ -320,26 +314,6 @@ fn hit_key(m: &MaterialGpu) -> [u32; 4] {
     ]
 }
 
-/// Whether record `m` takes [`material_flags::STACK_FACE`].
-fn stack_face(m: &MaterialGpu) -> bool {
-    use material_flags as f;
-    let varies = f::THIN_WALLED
-        | f::VERTEX
-        | f::MORE_TEXTURES
-        | f::ANISOTROPY
-        | f::HAS_BACK
-        | f::DISPLACED
-        | f::MEDIUM_TEXTURED;
-    m.surface == 0
-        && m.flags & varies == 0
-        && m.flags & (f::DIELECTRIC | f::CASTER) == f::DIELECTRIC | f::CASTER
-        && m.coat_weight == 0.0
-        && m.fuzz_weight == 0.0
-        && m.thin_film_weight == 0.0
-        && m.textures.iter().all(|&t| t == TextureIndex::NONE)
-        && (1.0 - m.metalness) * m.transmission_weight > 0.0
-}
-
 /// Whether pixels of `m` may use the extended G-buffer targets: by its record where the
 /// standard surface shades it, and by the lobes `declared` of its linked surface type.
 fn needs_extended(m: &MaterialGpu, declared: u32) -> bool {
@@ -443,14 +417,11 @@ impl MaterialTable {
         })
     }
 
-    /// `m` as the table stores it: pointing at the texture stream table, with the stack face
-    /// flag as its other fields decide and the lobes its surface may show.
+    /// `m` as the table stores it: pointing at the texture stream table, with the lobes its
+    /// surface may show.
     pub(crate) fn record(&self, m: &MaterialGpu) -> MaterialGpu {
-        use material_flags as f;
-        let stack = if stack_face(m) { f::STACK_FACE } else { 0 };
         MaterialGpu {
             texture_streams: self.streams.gpu(),
-            flags: m.flags & !f::STACK_FACE | stack,
             lobes: record_lobes(m, self.declares),
             ..*m
         }
@@ -558,21 +529,10 @@ impl MaterialTable {
         self.features.lock().unwrap().bounds_interior(id.0)
     }
 
-    /// Whether any record has the stack face flag.
-    pub(crate) fn stack_faces(&self) -> bool {
-        self.features.lock().unwrap().stack_faces()
-    }
-
     /// Whether any of `ids` casts caustics.
     pub(crate) fn any_casts<'a>(&self, ids: impl IntoIterator<Item = &'a MaterialId>) -> bool {
         let features = self.features.lock().unwrap();
         features.casts() && ids.into_iter().any(|id| features.casting(id.0))
-    }
-
-    /// Whether any of `ids` has the stack face flag.
-    pub(crate) fn any_stack_face<'a>(&self, ids: impl IntoIterator<Item = &'a MaterialId>) -> bool {
-        let features = self.features.lock().unwrap();
-        features.stack_faces() && ids.into_iter().any(|id| features.stack_face(id.0))
     }
 
     /// Whether any of `ids` displaces by a world length.

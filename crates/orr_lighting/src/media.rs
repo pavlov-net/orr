@@ -5,19 +5,21 @@ use std::mem::offset_of;
 
 use orr_scene::orr_gpu::{
     self, AddressMode, Allocation, CommandList, ComputePipeline, DEFAULT_MEDIUM, Device, Filter,
-    Format, GpuPtr, Hazards, MemoryKind, SamplerDesc, SamplerIndex, Stages, StorageImageIndex,
-    Texture, TextureDesc, TextureIndex, TextureKind, TextureMemory, TextureUsage,
+    Format, GpuPtr, Hazards, HitTable, MemoryKind, SamplerDesc, SamplerIndex, Stages,
+    StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureKind, TextureMemory,
+    TextureUsage,
 };
 use orr_scene::{MaterialId, SceneFeatures};
 
+use crate::launch::PathPipeline;
 use crate::scene::{FRAME_SLOTS, Ring};
 use crate::shaders::media::{aerial, froxel, smoke};
 use crate::shaders::types::{
     EyeColumn, EyeInterior, FroxelLights, FroxelQueue, FroxelRays, FroxelRoot, FroxelVolume,
-    LayerGuide, MediaApplyRoot, ParticleLighting, RayJob, RayList, ShadowFull, ShadowResult,
-    ShadowTraceRoot,
+    FroxelWalkList, LaunchHeader, LayerGuide, MediaApplyRoot, ParticleLighting, PathRoot, RayJob,
+    RayList, ShadowFull, ShadowResult, ShadowTraceRoot,
 };
-use crate::specialize::MAY_INTERIORS;
+use crate::specialize::{MAY_INTERIORS, may2};
 use crate::support::{FROXEL_LIGHT, Masked, MaskedFrame};
 use crate::view::{LightingDebugView, LightingView, NO_MATERIAL, ViewLighting, ViewPass};
 use crate::{CompilePipeline, Error, KernelSet, SceneLighting, pipeline};
@@ -39,8 +41,8 @@ pub const MAX_PROXY_RAYS: u32 = 8;
 /// `froxels`' `SMOKE_WORDS`.
 const SMOKE_WORDS: u32 = 7;
 
-/// `froxels`' `STACK_KEYS`.
-const STACK_KEYS: u32 = 3;
+/// `froxels`' `EYE_CROSSING_SLOTS`.
+const EYE_CROSSING_SLOTS: u32 = 9;
 
 /// `camera_media`'s `MEDIA_*`.
 const MEDIA_COMPOSE: u32 = 0;
@@ -105,6 +107,8 @@ pub struct MediaStats {
     pub froxel_rays: u32,
     /// Of those, the rays the thin tracer left to the full handling, which traced them again.
     pub froxel_flagged_rays: u32,
+    /// Of the rays, those whose light a manifold walk through the surfaces of solid glass took.
+    pub froxel_walks: u32,
     /// Medium proxies in the view's frustum.
     pub visible_proxies: u32,
     /// Froxel columns whose near-plane point lies in a dielectric's interior.
@@ -130,14 +134,17 @@ struct Shape {
     /// The scene holds a smoke entry.
     smoke: bool,
     /// A column of this view has lain in a dielectric's interior, which takes rgb transmittance
-    /// and each shadowed light's distance through that interior.
+    /// and each shadowed light's arrival in that interior.
     eye: bool,
+    /// The light pass walks the jobs whose light comes through the surfaces of solid glass, which
+    /// takes the seeded walks' yield.
+    walks: bool,
 }
 
 /// A view's froxel targets: `froxel_material`, `froxel_incident` and `froxel_visibility`
-/// with their histories, `froxel_integrated`; `eye_depth` with its history and the columns' plane
-/// stacks; its `aerial` LUT; and the list of froxels the light pass lights, with its records and
-/// shadow rays.
+/// with their histories, `froxel_integrated`; the shadowed lights' `arrival` with its history; its
+/// `aerial` LUT; and the list of froxels the light pass lights, with its records and shadow
+/// rays.
 struct Volumes {
     device: Device,
     shape: Shape,
@@ -153,9 +160,12 @@ struct Volumes {
     /// `froxels`' `SMOKE_WORDS` per froxel.
     smoke: Option<Allocation<u32>>,
     eye: Allocation<EyeColumn>,
-    eye_depth: Option<[Volume; 2]>,
-    /// `froxels`' `STACK_KEYS` per shadowed light per column.
-    stacks: Option<Allocation<u64>>,
+    /// `FroxelRoot.arrival`: each shadowed light's slices after the one's before.
+    arrival: Option<[Volume; 2]>,
+    /// `FroxelRoot.seed_yield`.
+    seed_yield: Option<[Volume; 2]>,
+    /// `FroxelRoot.chain`: each shadowed light's slices after the one's before.
+    chain: Option<[Volume; 2]>,
     /// The light pass's records, from the first frame that runs it on.
     light: Option<LightRecords>,
 }
@@ -167,27 +177,63 @@ struct LightRecords {
     /// Per listed froxel, the interiors around its sample point and the light pass's record.
     around: Allocation<EyeInterior>,
     rays: Allocation<FroxelRays>,
+    /// Per column, the surfaces of interiors its ray crosses and the end of their list,
+    /// `EYE_CROSSING_SLOTS` entries of two words.
+    crossings: Allocation<u32>,
     /// Per shadow ray, with room for `Shape::rays` per froxel: its job, its result and its full
     /// handling's, and the list of those the thin tracer flagged.
     jobs: Allocation<RayJob>,
     results: Allocation<ShadowResult>,
     full: Allocation<ShadowFull>,
     flagged: Allocation<u32>,
+    /// Per shadow ray room for the jobs that walk, the extent of their launch and what names them
+    /// to the light pass, `walk_slots` walks at most.
+    _walk_jobs: Allocation<u32>,
+    _walk_slices: Allocation<RayList>,
+    walk_list: Allocation<FroxelWalkList>,
+    walk_slots: u32,
 }
 
 impl LightRecords {
-    fn new(device: &Device, shape: Shape) -> Result<Self, Error> {
+    /// The records of a light pass of `shape`, whose walks run `walk_slots` to a launch and count
+    /// in `walks`.
+    fn new(
+        device: &Device,
+        shape: Shape,
+        walk_slots: u32,
+        walks: GpuPtr<RayList>,
+    ) -> Result<Self, Error> {
         let froxels: u64 = shape.grid.iter().map(|&n| u64::from(n)).product();
+        let columns = u64::from(shape.grid[0]) * u64::from(shape.grid[1]);
         let rays = froxels * u64::from(shape.rays);
         let kind = MemoryKind::DeviceLocal;
+        let walk_jobs = device.gpu_malloc(kind, rays, "froxel walks")?;
+        let walk_slices = device.gpu_malloc(kind, 1, "froxel walk launch")?;
+        let mut walk_list = device.gpu_malloc(MemoryKind::Upload, 1, "froxel walk list")?;
+        walk_list.as_mut_slice().expect("mapped")[0] = FroxelWalkList {
+            list: walks,
+            jobs: walk_jobs.gpu(),
+            slices: walk_slices.gpu(),
+            slots: walk_slots,
+            launches: 1,
+        };
         Ok(Self {
             lit: device.gpu_malloc(kind, froxels, "lit froxels")?,
             around: device.gpu_malloc(kind, froxels, "froxel interiors")?,
             rays: device.gpu_malloc(kind, froxels, "froxel rays")?,
+            crossings: device.gpu_malloc(
+                kind,
+                columns * u64::from(EYE_CROSSING_SLOTS) * 2,
+                "froxel column crossings",
+            )?,
             jobs: device.gpu_malloc(kind, rays, "froxel ray jobs")?,
             results: device.gpu_malloc(kind, rays, "froxel ray results")?,
             full: device.gpu_malloc(kind, rays, "froxel full ray results")?,
             flagged: device.gpu_malloc(kind, rays, "froxel flagged rays")?,
+            _walk_jobs: walk_jobs,
+            _walk_slices: walk_slices,
+            walk_list,
+            walk_slots,
         })
     }
 }
@@ -223,16 +269,44 @@ impl Volumes {
         } else {
             None
         };
-        let mut volume = |format, name: &str| sized(shape.grid, format, name);
-        let visibility_format = match shape.extra {
-            1 => Format::R8Unorm,
-            2 => Format::Rg8Unorm,
-            _ => Format::Rgba8Unorm,
+        let arrival = if shape.eye {
+            let [columns, rows, slices] = shape.grid;
+            let extent = [columns, rows, slices * (shape.extra + 1)];
+            Some([
+                sized(extent, Format::Rgba16Float, "froxel arrival")?,
+                sized(extent, Format::Rgba16Float, "froxel arrival")?,
+            ])
+        } else {
+            None
         };
-        let eye_depth_format = match shape.extra {
-            0 => Format::R16Float,
-            1 => Format::Rg16Float,
-            _ => Format::Rgba16Float,
+        let chain = if shape.walks {
+            let [columns, rows, slices] = shape.grid;
+            let extent = [columns, rows, slices * (shape.extra + 1)];
+            Some([
+                sized(extent, Format::Rgba16Float, "froxel chain")?,
+                sized(extent, Format::Rgba16Float, "froxel chain")?,
+            ])
+        } else {
+            None
+        };
+        let seed_yield = if shape.walks {
+            Some([
+                sized(shape.grid, Format::R16Float, "froxel seed yield")?,
+                sized(shape.grid, Format::R16Float, "froxel seed yield")?,
+            ])
+        } else {
+            None
+        };
+        let mut volume = |format, name: &str| sized(shape.grid, format, name);
+        // A walked job's visibility holds its chain's density, which a chain that gathers light
+        // takes past 1.
+        let visibility_format = match (shape.extra, shape.walks) {
+            (1, false) => Format::R8Unorm,
+            (2, false) => Format::Rg8Unorm,
+            (_, false) => Format::Rgba8Unorm,
+            (1, true) => Format::R16Float,
+            (2, true) => Format::Rg16Float,
+            (_, true) => Format::Rgba16Float,
         };
         // 8 bits run out of transmittance within meters of water.
         let integrated_rgb_format = if shape.eye {
@@ -261,14 +335,9 @@ impl Volumes {
             } else {
                 None
             },
-            eye_depth: if shape.eye {
-                Some([
-                    volume(eye_depth_format, "froxel eye depth")?,
-                    volume(eye_depth_format, "froxel eye depth")?,
-                ])
-            } else {
-                None
-            },
+            arrival,
+            seed_yield,
+            chain,
             aerial,
             aerial_rgb,
             smoke: if shape.smoke {
@@ -283,13 +352,6 @@ impl Volumes {
                 u64::from(shape.grid[0] * shape.grid[1]),
                 "froxel eye columns",
             )?,
-            stacks: if shape.eye {
-                let keys = STACK_KEYS * MAX_FROXEL_SHADOWED_LIGHTS;
-                let words = u64::from(keys) * u64::from(shape.grid[0] * shape.grid[1]);
-                Some(device.gpu_malloc(MemoryKind::DeviceLocal, words, "froxel plane stacks")?)
-            } else {
-                None
-            },
             light: None,
             device: device.clone(),
             shape,
@@ -426,6 +488,7 @@ impl MediaView {
                 active_froxels: q.froxels.count,
                 froxel_rays: q.jobs.count,
                 froxel_flagged_rays: q.flagged.count,
+                froxel_walks: q.walks.count,
                 visible_proxies: q.counts.proxies,
                 eye_columns: q.counts.eye_columns,
             }
@@ -519,6 +582,17 @@ pub(crate) fn fogged(linked: bool, features: SceneFeatures, lighting: &ViewLight
     scatters(linked, features, lighting) || features.contains(SceneFeatures::INTERIORS)
 }
 
+/// What walks the light pass's jobs whose light comes through the surfaces of solid glass: the
+/// view's path pipeline, which runs their source, its hit table, the root that source runs with
+/// and the slots of a launch of it, `slots` of them.
+pub(crate) struct FroxelWalks<'a> {
+    pub(crate) pipeline: &'a PathPipeline,
+    pub(crate) table: HitTable,
+    pub(crate) root: PathRoot,
+    pub(crate) header: GpuPtr<LaunchHeader>,
+    pub(crate) slots: u32,
+}
+
 /// The media kernels of one device.
 pub(crate) struct MediaKernels {
     order: ComputePipeline,
@@ -529,6 +603,8 @@ pub(crate) struct MediaKernels {
     list: ComputePipeline,
     integrate: ComputePipeline,
     aerial: ComputePipeline,
+    walk_append: ComputePipeline,
+    walk_slices: ComputePipeline,
     sampler: SamplerIndex,
     /// The kernels link a medium.
     linked_medium: bool,
@@ -536,7 +612,7 @@ pub(crate) struct MediaKernels {
 
 impl MediaKernels {
     /// Its pipelines, in the order [`Self::new`] takes them.
-    pub(crate) const PIPELINES: [CompilePipeline; 8] = [
+    pub(crate) const PIPELINES: [CompilePipeline; 10] = [
         |d, k| pipeline(d, k, &froxel::MODULE, "order"),
         |d, k| pipeline(d, k, &froxel::MODULE, "eye_column"),
         |d, k| pipeline(d, k, &froxel::MODULE, "eye_reach"),
@@ -545,6 +621,8 @@ impl MediaKernels {
         |d, k| pipeline(d, k, &froxel::MODULE, "list"),
         |d, k| pipeline(d, k, &froxel::MODULE, "integrate"),
         |d, k| pipeline(d, k, &aerial::MODULE, "main"),
+        |d, k| pipeline(d, k, &froxel::MODULE, "walk_append"),
+        |d, k| pipeline(d, k, &froxel::MODULE, "walk_slices"),
     ];
 
     /// The kernels over the next of `pipelines`, which [`Self::PIPELINES`] compiled from
@@ -564,6 +642,8 @@ impl MediaKernels {
             list: next(),
             integrate: next(),
             aerial: next(),
+            walk_append: next(),
+            walk_slices: next(),
             sampler: device.sampler(&SamplerDesc {
                 mag: Filter::Linear,
                 min: Filter::Linear,
@@ -586,7 +666,7 @@ impl MediaKernels {
     }
 
     /// The froxel passes' root of `pass`, with no targets while `media` holds none: what the
-    /// order pass alone reads.
+    /// order pass alone reads. Its jobs walk where `walking`.
     fn root(
         &self,
         media: &MediaView,
@@ -594,6 +674,7 @@ impl MediaKernels {
         pass: &ViewPass,
         lighting: &ViewLighting,
         trace: GpuPtr<ShadowTraceRoot>,
+        walking: bool,
     ) -> FroxelRoot {
         let settings = &lighting.media;
         let v = media.volumes.as_ref();
@@ -620,7 +701,9 @@ impl MediaKernels {
             pair(v.and_then(|v| v.integrated_rgb.as_ref()));
         let (aerial, aerial_sampled) = pair(v.map(|v| &v.aerial));
         let (aerial_rgb, aerial_rgb_sampled) = pair(v.and_then(|v| v.aerial_rgb.as_ref()));
-        let (eye_depth, eye_depth_history) = history(v.and_then(|v| v.eye_depth.as_ref()));
+        let (arrival, arrival_history) = history(v.and_then(|v| v.arrival.as_ref()));
+        let (seed_yield, seed_yield_history) = history(v.and_then(|v| v.seed_yield.as_ref()));
+        let (chain, chain_history) = history(v.and_then(|v| v.chain.as_ref()));
         FroxelRoot {
             scene: pass.scene,
             view: pass.view,
@@ -660,18 +743,22 @@ impl MediaKernels {
             ap_range: settings.ap_range,
             smoke_anisotropy: settings.smoke_anisotropy,
             camera_medium: lighting.camera_medium.map_or(NO_MATERIAL, |m| m.0),
-            eye_depth,
-            eye_depth_history,
-            stacks: v
-                .and_then(|v| v.stacks.as_ref())
-                .map_or(GpuPtr::NULL, Allocation::gpu),
+            arrival,
+            arrival_history,
+            seed_yield,
+            seed_yield_history,
+            chain,
+            chain_history,
             queue: media.queue.gpu(),
             lit: light.map_or(GpuPtr::NULL, |l| l.lit.gpu()),
             around: light.map_or(GpuPtr::NULL, |l| l.around.gpu()),
             rays: light.map_or(GpuPtr::NULL, |l| l.rays.gpu()),
             trace,
             froxels: media.list(offset_of!(FroxelQueue, froxels)),
-            winners: media.list(offset_of!(FroxelQueue, winners)),
+            walks: light
+                .filter(|_| walking)
+                .map_or(GpuPtr::NULL, |l| l.walk_list.gpu()),
+            crossings: light.map_or(GpuPtr::NULL, |l| l.crossings.gpu()),
         }
     }
 
@@ -716,9 +803,6 @@ impl MediaKernels {
             cache: scene.world_cache(pass.frame),
             lights: media.lights.gpu(),
             eye: held.map_or(GpuPtr::NULL, |v| v.eye.gpu()),
-            stacks: v
-                .and_then(|v| v.stacks.as_ref())
-                .map_or(GpuPtr::NULL, Allocation::gpu),
             layers,
             overlay_front,
             incident: v.map_or(TextureIndex::NONE, |v| current(&v.incident)),
@@ -740,9 +824,14 @@ impl MediaKernels {
                 .and_then(|v| v.aerial_rgb.as_ref())
                 .map_or(TextureIndex::NONE, |t| t.sampled),
             ap_range: lighting.media.ap_range,
-            eye_depth: v
-                .and_then(|v| v.eye_depth.as_ref())
+            arrival: v
+                .and_then(|v| v.arrival.as_ref())
                 .map_or(TextureIndex::NONE, current),
+            shadowed: lighting
+                .media
+                .froxel_shadowed_lights
+                .min(MAX_FROXEL_SHADOWED_LIGHTS),
+            _pad0: 0,
         }
     }
 
@@ -750,7 +839,10 @@ impl MediaKernels {
     /// [`SceneLighting::record`] and the view's raster half; their outputs are visible to
     /// later compute and ray stages. Each pass runs where something reads what it writes
     /// ([`Readers`]); the order pass always does, since the shadowed lights it picks depend on
-    /// the frames before. The light's history starts over after a frame without its pass.
+    /// the frames before. The light's history starts over after a frame without its pass. With
+    /// `walks` the light pass walks the jobs whose light comes through the surfaces of solid
+    /// glass; without it they pass such glass unbent.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record(
         &self,
         list: &mut CommandList<'_>,
@@ -759,6 +851,7 @@ impl MediaKernels {
         pass: &ViewPass,
         lighting: &ViewLighting,
         masked: MaskedFrame<'_>,
+        walks: Option<FroxelWalks<'_>>,
     ) -> Result<(), Error> {
         let extent = view.extent();
         let reset = view.history_reset();
@@ -799,6 +892,7 @@ impl MediaKernels {
                 chromatic: settings.chromatic_transmittance,
                 smoke: pass.smoke_args.is_some(),
                 eye: media.eye,
+                walks: walks.is_some(),
             };
             let mut fresh = false;
             if media.volumes.as_ref().is_none_or(|v| v.shape != shape) {
@@ -806,12 +900,22 @@ impl MediaKernels {
                 media.volumes = Some(Volumes::new(device, list, shape)?);
                 fresh = true;
             }
-            // A view whose frames never light its froxels holds none of the light pass's records.
+            // A view whose frames never light its froxels holds none of the light pass's records,
+            // which hold the walks' launches.
+            let walk_slots = walks.as_ref().map_or(u32::MAX, |w| w.slots);
+            let walk_list = media.list(offset_of!(FroxelQueue, walks));
             if light.is_some()
                 && let Some(v) = media.volumes.as_mut()
-                && v.light.is_none()
+                && v.light
+                    .as_ref()
+                    .is_none_or(|l| walks.is_some() && l.walk_slots != walk_slots)
             {
-                v.light = Some(LightRecords::new(scene.device(), shape)?);
+                v.light = Some(LightRecords::new(
+                    scene.device(),
+                    shape,
+                    walk_slots,
+                    walk_list,
+                )?);
             }
             if fresh
                 || reset
@@ -834,7 +938,16 @@ impl MediaKernels {
         let trace = media
             .trace_roots
             .write(slot, Self::trace_root(media, scene, pass));
-        let root = self.root(media, scene, pass, lighting, trace);
+        let walking = walks.is_some() && light.is_some() && media.volumes.is_some();
+        let root = self.root(media, scene, pass, lighting, trace, walking);
+        let (walk_slices, launches) = media
+            .volumes
+            .as_ref()
+            .and_then(|v| v.light.as_ref())
+            .map_or((GpuPtr::NULL, 0), |l| {
+                let w = l.walk_list.as_slice().expect("mapped")[0];
+                (w.slices, w.launches)
+            });
         if readers.fogged {
             media.volume_roots.write(
                 slot,
@@ -919,6 +1032,13 @@ impl MediaKernels {
             stage(list, "froxel sample");
             list.dispatch_indirect(kernel(Masked::FroxelSample), root, froxels);
             lists(list);
+            // A winner's emitter may pass its light through a coat or fuzz, which its own kernel
+            // weighs.
+            if set.may() & may2(SceneFeatures::COATED_EMITTERS) != 0 {
+                stage(list, "froxel view");
+                list.dispatch_indirect(kernel(Masked::FroxelView), root, froxels);
+                step(list);
+            }
             stage(list, "froxel trace");
             let jobs = args(offset_of!(FroxelQueue, jobs));
             list.dispatch_indirect(kernel(Masked::ShadowTrace), trace, jobs);
@@ -927,6 +1047,27 @@ impl MediaKernels {
             let flagged = args(offset_of!(FroxelQueue, flagged));
             list.dispatch_indirect(kernel(Masked::FroxelRetrace), root, flagged);
             step(list);
+            if let Some(w) = walks.filter(|_| walking) {
+                stage(list, "froxel walks");
+                list.dispatch_indirect(&self.walk_append, root, jobs);
+                step(list);
+                list.dispatch(&self.walk_slices, root, [1, 1, 1]);
+                list.barrier(Stages::COMPUTE, Stages::RAY, Hazards::DRAW_ARGUMENTS);
+                let walk_root = PathRoot {
+                    froxel: root,
+                    ..w.root
+                };
+                w.pipeline.record_indirect(
+                    list,
+                    &w.table,
+                    &walk_root,
+                    w.header,
+                    w.slots,
+                    walk_slices,
+                    launches,
+                );
+                list.barrier(Stages::RAY, Stages::COMPUTE, Hazards::empty());
+            }
             stage(list, "froxel accumulate");
             list.dispatch_indirect(kernel(Masked::FroxelAccumulate), root, froxels);
             step(list);

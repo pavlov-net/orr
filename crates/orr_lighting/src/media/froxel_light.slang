@@ -1,6 +1,7 @@
 // A view's froxel light pass beside the thin shadow tracer (`rays/shadow.slang`), each kernel a
 // lane per froxel the `list` pass found or per flagged ray: `walk_main` finds the interiors around
 // each froxel's sample point, `sample_main` draws its light and writes its shadow rays as jobs,
+// `view_main` weighs the coat and fuzz of the emitters its winners drew,
 // `retrace_main` retraces the rays the tracer flagged with the full handling, and
 // `accumulate_main` lights each froxel from its rays' results.
 #include "orr_root.h"
@@ -29,6 +30,14 @@ void sample_main(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
 {
     ORR_OMM(sample_main);
     froxel_sample_lane<Surface>(root, group, lane);
+}
+
+[shader("compute")]
+[numthreads(FROXEL_LIGHT_GROUP, 1, 1)]
+void view_main(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
+{
+    ORR_OMM(view_main);
+    froxel_view_lane<Surface>(root, group, lane);
 }
 
 [shader("compute")]

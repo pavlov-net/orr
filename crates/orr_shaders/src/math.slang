@@ -13,6 +13,8 @@ public static const float INV_FOUR_PI = 0.07957747154594766788;
 public static const float GOLDEN_ANGLE = 2.39996322972865332;
 // The smallest normal f32. A device may flush a smaller magnitude to 0.
 public static const float F32_MIN_NORMAL = 1.17549435e-38;
+// The offset per meter of render-space magnitude that clears f32 rounding: 4 to 8 ulps.
+public static const float F32_PRECISION = 1.0 / 1048576.0;
 
 // `v` at unit length, or `fallback` when its length is zero, denormal or not finite.
 public float3 safe_normalize(float3 v, float3 fallback = float3(0, 0, 1))

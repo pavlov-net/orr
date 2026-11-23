@@ -18,10 +18,11 @@
 
 use bytemuck::{Pod, Zeroable};
 use lighting_suite::bed::{
-    Accumulated, BLACK_SPHERE, Bed, CANOPY, EXTENT, FLOOR, GLASS_SLAB, GLASS_SPHERE, Gate, Item,
-    LEAF, MILK_SPHERE, MIRROR, NEAR, PLUME, Particle, ParticleLook, Paths, RT_RANGE, SKY, SUN,
-    Spec, TURBID_WATER, WATER_BOX, WHITE_SPHERE, assert_gate, fresnel, look, pixel_of,
-    plume_volume, water_transmission,
+    Accumulated, BLACK_SPHERE, Bed, CANOPY, CLEAR_PRISM, COATED_EMITTER, EMITTER, EXTENT, FLOOR,
+    GLASS_SLAB, GLASS_SPHERE, Gate, Item, LEAF, MILK_SPHERE, MIRROR, NEAR, PLUME, POOL_IOR,
+    PRISM_HALF_HEIGHT, Particle, ParticleLook, Paths, ROUGH_TURBID_WATER, RT_RANGE, SKY, SUN, Spec,
+    TURBID_SIGMA_S, TURBID_SIGMA_T, TURBID_WATER, WATER_BOX, WHITE_SPHERE, assert_gate, fresnel,
+    look, pixel_of, plume_volume, prism_corners, rec2020, water_transmission,
 };
 use lighting_suite::shaders::{froxel_lookup, froxel_probe, segment_probe};
 use lighting_suite::{assert_clean, finish, pipeline, readback, render, upload};
@@ -307,6 +308,58 @@ const DENSE: Fog = Fog {
     base_height: 0.0,
     falloff_height: 100.0,
 };
+
+/// Dense fog lit by an emitter under a blue coat and a fuzz, whose winners' coats the froxels' view
+/// kernel weighs: the in-scatter's tint, blue over red, within 2% of the reference camera march's,
+/// which weighs the coat at each of its own samples, and its mean over the bare emitter's within 15%
+/// of the reference's ratio. Froxels the kernel left unweighed hold no light of the emitter's.
+#[test]
+fn fog_lit_by_a_coated_emitter_takes_its_coat() {
+    let lit = |model| {
+        let emitter = Item {
+            model,
+            linear: Mat3::from_rotation_x(-0.6),
+            at: Vec3::new(0.0, 4.0, -2.0),
+        };
+        let eye = Vec3::new(0.0, 1.0, 2.5);
+        foggy(
+            &DENSE,
+            vec![emitter],
+            Vec::new(),
+            None,
+            eye,
+            Vec3::new(0.0, 1.5, -2.0),
+        )
+    };
+    let mean = |a: &Accumulated| {
+        let blocks = block_rgb(a);
+        let n = blocks.len() as f64;
+        blocks.iter().fold([0.0; 3], |s, b| {
+            [s[0] + b[0] / n, s[1] + b[1] / n, s[2] + b[2] / n]
+        })
+    };
+    let (mut coated, _fog) = lit(COATED_EMITTER);
+    let froxels = mean(&inscatter(&mut coated, false, MediaSettings::default(), 64));
+    let reference = mean(&inscatter(&mut coated, true, MediaSettings::default(), 256));
+    let (mut bare, _fog) = lit(EMITTER);
+    let bare_froxels = mean(&inscatter(&mut bare, false, MediaSettings::default(), 64));
+    let bare_reference = mean(&inscatter(&mut bare, true, MediaSettings::default(), 256));
+    let tint = |m: [f64; 3]| m[2] / m[0];
+    let (got, wanted) = (tint(froxels), tint(reference));
+    assert!(
+        (got - wanted).abs() < 0.02 * wanted,
+        "the coated emitter's fog is {got:.3} as blue as red, the reference's {wanted:.3}"
+    );
+    let (got, wanted) = (
+        froxels[1] / bare_froxels[1],
+        reference[1] / bare_reference[1],
+    );
+    assert!(
+        (got - wanted).abs() < 0.15 * wanted,
+        "the coated emitter's fog is {got:.3} of the bare one's, the reference's {wanted:.3}"
+    );
+    assert_clean();
+}
 
 fn mean_luminance(a: &Accumulated) -> f64 {
     let n = a.mean.len() as f64;
@@ -1176,6 +1229,386 @@ fn shafts_below_a_surface_match_the_reference() {
     assert_clean();
 }
 
+/// The single scattering CPU integral of the froxels' in-scatter that `spec`'s camera sees through
+/// pixel (`x`, `y`) from inside turbid water whose box (half extents 20 x 4 x 20 m around the
+/// origin) has a flat top at 4 m of IOR [`POOL_IOR`]: `light` gives the irradiance across its beam
+/// that reaches a point `depth` m under the surface along the beam's cosine there below, and the
+/// in-scatter takes the water's isotropic scattering of it over the water from the eye to the box,
+/// per Rec.2020 channel.
+fn water_inscatter(spec: &Spec, x: f64, y: f64, light: &dyn Fn(DVec3) -> (f64, f64)) -> [f64; 3] {
+    let [w, h] = EXTENT.map(f64::from);
+    let tan = (0.5 * f64::from(spec.fov_y)).tan();
+    let ndc = [2.0 * x / w - 1.0, 1.0 - 2.0 * y / h];
+    let q = Vec3::new((ndc[0] * tan * w / h) as f32, (ndc[1] * tan) as f32, -1.0);
+    let dir = (look(spec.eye, spec.target) * q).normalize().as_dvec3();
+    let eye = spec.eye.as_dvec3();
+    let half = DVec3::new(20.0, 4.0, 20.0);
+    let exit = (0..3)
+        .map(|a| (half[a] * dir[a].signum() - eye[a]) / dir[a])
+        .fold(f64::INFINITY, f64::min);
+    let sigma_t = rec2020(TURBID_SIGMA_T.map(|s| (-s).exp())).map(|c| -f64::from(c).ln());
+    let sigma_s = rec2020(TURBID_SIGMA_S).map(f64::from);
+    let steps = 4000;
+    let dt = exit / f64::from(steps);
+    let mut sum = [0.0; 3];
+    for k in 0..steps {
+        let t = (f64::from(k) + 0.5) * dt;
+        let p = eye + dir * t;
+        let (e, cos) = light(p);
+        let leg = (half.y - p.y) / cos;
+        for c in 0..3 {
+            sum[c] += sigma_s[c] / (4.0 * std::f64::consts::PI)
+                * e
+                * (-sigma_t[c] * (leg + t)).exp()
+                * dt;
+        }
+    }
+    sum
+}
+
+/// Turbid water under a rough surface (roughness 0.05) with the eye in it, looking along it under a
+/// low sun, then a point light 1.5 m over the surface 5 m to the side, then one 0.3 m over it 8 m
+/// to the side, whose light meets the surface at about 86 degrees and leaves it under the water
+/// within a degree of the critical angle: the froxels take each light's chain through the surface
+/// by manifold walks, so each 8 x 8 block's in-scatter matches the single scattering CPU integral
+/// of the light refracted at the flat surface, per channel, within 5%. Straight shadow rays would
+/// take the sun past the surface unbent, along a slant 1.7 times as long through the water and
+/// without the beam's widening there, and the lamp's light along the straight line, at the angle
+/// it meets the surface at there and by the paraxial scale of its apparent depth. Last, the first
+/// lamp with dark slats 0.1 m under the surface across every straight way from the view's middle
+/// to the lamp: the walks' seeds find the chains between the slats, which take the light where no
+/// slat shades their leg under the surface, and the view's in-scatter summed over its blocks
+/// matches the CPU integral's, which takes the chains' shade.
+#[test]
+fn froxels_under_a_rough_surface_take_the_light_their_walks_bend() {
+    let n = POOL_IOR;
+    let eye = Vec3::new(0.0, 1.0, 0.0);
+    let target = Vec3::new(10.0, 1.0, 0.0);
+    let (elevation, illuminance) = (25.0f64, 1_000.0f64);
+    let (lamp, grazing) = (DVec3::new(6.0, 5.5, 5.0), DVec3::new(6.0, 4.3, 8.0));
+    let intensity = 20_000.0f64;
+    let sun_light = directional(elevation as f32, 0.0, illuminance as f32);
+    let point = |position: DVec3| Light::Point {
+        position,
+        intensity: Vec3::splat(intensity as f32),
+        shaping: None,
+        shadows: true,
+    };
+    let top = 4.0;
+    // The sun's beam below a flat surface: Fresnel's transmittance, and its width over the
+    // surface's widened from the cosine above to the one below.
+    let sun = |_: DVec3| {
+        let c = elevation.to_radians().sin();
+        let below = (1.0 - (1.0 - c * c) / (n * n)).sqrt();
+        (illuminance * (1.0 - fresnel(n, c)) * c / below, below)
+    };
+    // The lamp's beam to a point under the surface: the chain whose angles above and below keep
+    // Snell's law and whose legs reach the point, and the solid angle its beam leaves the lamp in
+    // over the area across it at the point.
+    let lamp_light = |lamp: DVec3, p: DVec3| {
+        let (h1, h2) = (lamp.y - top, top - p.y);
+        let r = DVec3::new(p.x - lamp.x, 0.0, p.z - lamp.z).length();
+        let reach = |a: f64| {
+            let b = (a.sin() / n).asin();
+            h1 * a.tan() + h2 * b.tan()
+        };
+        let (mut lo, mut hi) = (0.0, 0.5 * std::f64::consts::PI - 1e-9);
+        // Halving the span 64 times leaves it under a double's rounding of the angle.
+        for _ in 0..64 {
+            let mid = 0.5 * (lo + hi);
+            if reach(mid) < r { lo = mid } else { hi = mid }
+        }
+        let a = 0.5 * (lo + hi);
+        let b = (a.sin() / n).asin();
+        let spread = h1 / a.cos().powi(2) + h2 / b.cos().powi(2) * a.cos() / (n * b.cos());
+        // Toward the lamp, sin a / r -> 1 / (h1 + h2 / n), the paraxial limit.
+        let across = if r > 1e-9 {
+            a.sin() / r
+        } else {
+            1.0 / (h1 + h2 / n)
+        };
+        (
+            intensity * (1.0 - fresnel(n, a.cos())) * across / (spread * b.cos()),
+            b.cos(),
+        )
+    };
+    let near = |p: DVec3| lamp_light(lamp, p);
+    let low = |p: DVec3| lamp_light(grazing, p);
+    // The canopy turned so its slats run along x, 1 m wide across z with 1 m gaps, one on z in
+    // [0.5, 1.5]: the straight ways from the view's middle cross their height at z = 3.22, on a
+    // slat, and the chains between 1.1 and 2.5.
+    let slat_height = top - 0.1;
+    let slats = Item {
+        model: CANOPY,
+        linear: Mat3::from_rotation_y(std::f32::consts::FRAC_PI_2),
+        at: Vec3::new(0.0, slat_height as f32, -0.5),
+    };
+    let slatted = |p: DVec3| {
+        let (e, below) = lamp_light(lamp, p);
+        let toward = DVec3::new(lamp.x - p.x, 0.0, lamp.z - p.z).normalize_or_zero();
+        let z = p.z + toward.z * (slat_height - p.y) * (1.0 - below * below).sqrt() / below;
+        let shaded = (z + 1.5).rem_euclid(2.0) < 1.0;
+        (if shaded { 0.0 } else { e }, below)
+    };
+    for (name, light, reach, more) in [
+        ("sun", sun_light, &sun as &dyn Fn(DVec3) -> (f64, f64), None),
+        ("lamp", point(lamp), &near, None),
+        ("grazing lamp", point(grazing), &low, None),
+        ("lamp past slats", point(lamp), &slatted, Some(slats)),
+    ] {
+        let blockwise = more.is_none();
+        let copies = [
+            vec![at(ROUGH_TURBID_WATER, Vec3::ZERO)],
+            more.into_iter().collect(),
+        ]
+        .concat();
+        let (mut bed, _fog) = foggy(&CLEAR, copies, vec![light], None, eye, target);
+        bed.spec.fov_y = 0.3;
+        let water = bed.material(ROUGH_TURBID_WATER);
+        let view = ViewLighting {
+            debug_view: LightingDebugView::Media,
+            ..water_view(Some(water), false)
+        };
+        let mut paths = fog_paths();
+        paths.settings = view;
+        bed.accumulate(16, 3, &mut |list, f| paths.record(list, f));
+        let lit = bed.accumulate_on(16, 64, 3, &mut |list, f| paths.record(list, f));
+        let stats = bed.view().media_stats(bed.last_frame()).unwrap();
+        assert!(stats.froxel_walks > 0, "{name}: no froxel walked");
+        let w = EXTENT[0];
+        let mut worst = (0.0f64, [0.0; 3], [0.0; 3], 0);
+        let mut sums = [[0.0f64; 3]; 2];
+        for (b, got) in block_rgb(&lit).iter().enumerate() {
+            let (bx, by) = (b as u32 % (w / 8), b as u32 / (w / 8));
+            // The block's mean by the midpoints of its quarters: the in-scatter changes smoothly
+            // across a block.
+            let mut wanted = [0.0; 3];
+            for y in 0..2 {
+                for x in 0..2 {
+                    let px = f64::from(bx * 8 + 4 * x) + 2.0;
+                    let py = f64::from(by * 8 + 4 * y) + 2.0;
+                    let l = water_inscatter(&bed.spec, px, py, reach);
+                    for c in 0..3 {
+                        wanted[c] += l[c] / 4.0;
+                    }
+                }
+            }
+            for c in 0..3 {
+                sums[0][c] += got[c];
+                sums[1][c] += wanted[c];
+            }
+            for c in 0..3 {
+                let e = (got[c] - wanted[c]).abs() / wanted[c];
+                if e > worst.0 {
+                    worst = (e, *got, wanted, b);
+                }
+            }
+        }
+        // The slats' shade has edges finer than the froxels, which blur it across blocks: the
+        // view's whole in-scatter holds.
+        if !blockwise {
+            for c in 0..3 {
+                let e = (sums[0][c] - sums[1][c]).abs() / sums[1][c];
+                assert!(
+                    e < 0.05,
+                    "{name}: in-scatter summed over the view {:.2} in channel {c}, the CPU integral's {:.2}, {e:.3} off",
+                    sums[0][c],
+                    sums[1][c]
+                );
+            }
+            continue;
+        }
+        assert!(
+            worst.0 < 0.05,
+            "{name}: block {} in-scatter {:?} against the CPU integral's {:?}, {:.3} off",
+            worst.3,
+            worst.1,
+            worst.2,
+            worst.0
+        );
+    }
+    assert_clean();
+}
+
+/// Refracts unit `d` through a surface of normal `n` (either way) into a medium `eta` times as dense
+/// as the one it leaves, with the incidence cosine before and the refraction cosine after.
+fn refract(d: DVec3, n: DVec3, eta: f64) -> (DVec3, f64, f64) {
+    let n = if d.dot(n) > 0.0 { -n } else { n };
+    let c = -d.dot(n);
+    let t = (1.0 - (1.0 - c * c) / (eta * eta)).sqrt();
+    ((d / eta + n * (c / eta - t)).normalize(), c, t)
+}
+
+/// A clear upright glass prism in haze under a sun whose light crosses two of its sides at their
+/// least deviation, seen from beside the beam it bends 37 degrees off the sun's way, which no
+/// froxel's straight way to the sun crosses glass along: only the froxels' seeded walks find its
+/// chains, which they then recall, and the seeds run in a frame by a chance that follows how often
+/// chains took light of late, with each chain they take weighed by its reciprocal and by the count
+/// of seeds it takes to find it again. The view's in-scatter over
+/// that of the same view without the prism, less 1, is the beams' share: for each pair of sides
+/// the sun's light crosses, the CPU's beam irradiance over the sun's (Fresnel's transmittance at
+/// both and the beam's widths) times the share of the haze's in-scatter along each pixel's ray
+/// that lies in that beam, summed over the view, within 4%: the froxels, which sample the beam at a
+/// point each and blend across the slices of its sharp edges, read a few percent under the
+/// integral even given the exact beam at their points. The froxels weigh the beams by the sun's
+/// own direction, so the haze's phase function and its transmittance toward the light leave the
+/// ratio alone.
+#[test]
+fn froxels_beside_a_prism_take_its_beam_by_their_seeds() {
+    let n = 1.5;
+    let height = 4.0f64;
+    let corners = prism_corners().map(Vec3::as_dvec3);
+    // The sides, each from corner i to the next, with their outward normals; the sun meets the
+    // first (corners 0, 1) at the least deviation toward the last (2, 0).
+    let faces = [0, 1, 2].map(|i| {
+        let (p, q) = (corners[i], corners[(i + 1) % 3]);
+        let normal = DVec3::Y.cross(q - p).normalize();
+        let mid = 0.5 * (p + q);
+        (
+            p,
+            q,
+            if normal.dot(mid) < 0.0 {
+                -normal
+            } else {
+                normal
+            },
+        )
+    });
+    // At the least deviation the ray inside runs along +x, parallel to the base.
+    let half = ((60.0f64.to_radians() * 0.5).sin() * n).asin() - 30.0f64.to_radians();
+    let elevation = 20.0f64.to_radians();
+    let sun_way = DVec3::new(
+        elevation.cos() * half.cos(),
+        -elevation.sin(),
+        elevation.cos() * half.sin(),
+    );
+    // Each beam through a side the sun lights and another it leaves by without total internal
+    // reflection: the ways in and out and its irradiance over the sun's.
+    let mut beams = Vec::new();
+    for (i, entry) in faces.iter().enumerate() {
+        if sun_way.dot(entry.2) >= 0.0 {
+            continue;
+        }
+        let (inside, c1, c2) = refract(sun_way, entry.2, n);
+        for (j, exit) in faces.iter().enumerate() {
+            if j == i || inside.dot(exit.2) <= 0.0 {
+                continue;
+            }
+            let (out, c3, c4) = refract(inside, exit.2, 1.0 / n);
+            if out.is_nan() {
+                continue;
+            }
+            let share = (1.0 - fresnel(n, c1)) * (1.0 - fresnel(n, c4)) * c1 * c3 / (c2 * c4);
+            beams.push((*entry, inside, *exit, out, share));
+        }
+    }
+    // Back along a way from `p` to a side, within it.
+    let within = |p: DVec3, way: DVec3, f: (DVec3, DVec3, DVec3)| {
+        let t = (p - f.0).dot(f.2) / way.dot(f.2);
+        let q = p - way * t;
+        let along = (q - f.0).dot(f.1 - f.0) / (f.1 - f.0).length_squared();
+        (t > 0.0 && (0.0..=1.0).contains(&along) && q.y.abs() <= height).then_some(q)
+    };
+    // The beams' irradiance at `p` over the sun's: back to the side a beam leaves by, then inside
+    // back to the one it entered by, with nothing else of the prism between.
+    let in_beams = |p: DVec3| {
+        beams
+            .iter()
+            .filter(|(entry, inside, exit, out, _)| {
+                within(p, *out, *exit)
+                    .and_then(|q| within(q, *inside, *entry))
+                    .is_some()
+            })
+            .map(|b| b.4)
+            .sum::<f64>()
+    };
+    let sun = Light::Directional(DirectionalLight {
+        direction_to_light: (-sun_way).as_vec3(),
+        illuminance: Vec3::splat(1_000.0),
+        angular_radius: 4.65e-3,
+        disc: DiscProfile::Uniform,
+    });
+    let eye = Vec3::new(4.0, 0.0, -6.0);
+    let target = Vec3::new(4.0, 0.0, 0.0);
+    // A black backdrop whose near face lies at z = 0 in front of the eye.
+    let backdrop = Item {
+        model: BLACK_SPHERE,
+        linear: Mat3::from_diagonal(Vec3::splat(10.0)),
+        at: Vec3::new(4.0, 0.0, 10.0),
+    };
+    let prism = Item {
+        model: CLEAR_PRISM,
+        linear: Mat3::from_diagonal(Vec3::new(
+            1.0,
+            (height / f64::from(PRISM_HALF_HEIGHT)) as f32,
+            1.0,
+        )),
+        at: Vec3::ZERO,
+    };
+    let fog = Fog {
+        density: 0.02,
+        base_height: 0.0,
+        falloff_height: 100.0,
+    };
+    let render = |copies: Vec<Item>| {
+        let (mut bed, _fog) = foggy(&fog, copies, vec![sun], None, eye, target);
+        bed.spec.fov_y = 0.3;
+        let mut paths = fog_paths();
+        paths.settings = settings(false, MediaSettings::default());
+        bed.accumulate(64, 3, &mut |list, f| paths.record(list, f));
+        let a = bed.accumulate_on(64, 256, 3, &mut |list, f| paths.record(list, f));
+        (a, bed.spec.clone())
+    };
+    let (with, spec) = render(vec![backdrop, prism]);
+    let (without, _) = render(vec![backdrop]);
+    let total = |a: &Accumulated| {
+        a.mean
+            .iter()
+            .map(|p| luminance([p[0], p[1], p[2]].map(f64::from)))
+            .sum::<f64>()
+    };
+    let got = total(&with) / total(&without) - 1.0;
+    // The CPU's share of each pixel's in-scatter that lies in the beam, by the haze's extinction
+    // along the ray; the view's rays all reach the backdrop at a like distance.
+    let [w, h] = EXTENT.map(f64::from);
+    let tan = (0.5 * f64::from(spec.fov_y)).tan();
+    let sigma = f64::from(fog.density);
+    let center = backdrop.at.as_dvec3();
+    let (mut lit, mut all) = (0.0, 0.0);
+    for y in 0..EXTENT[1] {
+        for x in 0..EXTENT[0] {
+            let ndc = [
+                2.0 * (f64::from(x) + 0.5) / w - 1.0,
+                1.0 - 2.0 * (f64::from(y) + 0.5) / h,
+            ];
+            let q = Vec3::new((ndc[0] * tan * w / h) as f32, (ndc[1] * tan) as f32, -1.0);
+            let dir = (look(spec.eye, spec.target) * q).normalize().as_dvec3();
+            let from = spec.eye.as_dvec3();
+            let to = from - center;
+            let (bq, cq) = (to.dot(dir), to.length_squared() - 100.0);
+            let end = -bq - (bq * bq - cq).sqrt();
+            let steps = 2000;
+            let dt = end / f64::from(steps);
+            for k in 0..steps {
+                let t = (f64::from(k) + 0.5) * dt;
+                let weight = (-sigma * t).exp() * dt;
+                all += weight;
+                lit += weight * in_beams(from + dir * t);
+            }
+        }
+    }
+    let wanted = lit / all;
+    assert!(
+        wanted > 0.02,
+        "the beam crosses too little of the view: its share {wanted:.4}"
+    );
+    assert!(
+        (got - wanted).abs() < 0.04 * wanted,
+        "the prism's beam adds {got:.4} of the view's in-scatter, the CPU's {wanted:.4}"
+    );
+    assert_clean();
+}
+
 /// A surface through the near plane, with the eye on either side of it: pixels with the near-plane
 /// point in the water take the water's in-scatter, the others none, with nothing crossing the
 /// waterline. A view that names no medium gets its volumes from the columns' count.
@@ -1230,9 +1663,9 @@ fn a_waterline_at_the_near_plane_is_clean() {
 }
 
 /// A glass sphere in the water does not end the water for the pixels beside it: the blocks clear
-/// of its silhouette and of its shadow match the reference. In the shadow the froxels pass the
-/// sun through the sphere unbent, their named approximation, and the reference only by paths that
-/// find the sun through it.
+/// of its silhouette and of its shadow match the reference. In the shadow the froxels take the
+/// sun by walks through the sphere and the surface, and the reference by paths that find the sun
+/// through them.
 #[test]
 fn a_body_in_the_water_leaves_no_halo() {
     let target = Vec3::new(0.0, 0.0, -6.0);

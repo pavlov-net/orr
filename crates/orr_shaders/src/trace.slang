@@ -14,6 +14,9 @@ import orr_shaders.abi;
 [Host] public static const uint MASK_MEDIUM = 0x04;     // medium proxies (AABBs)
 public static const uint MASK_LIGHT = 0x08;      // sphere and rect light proxies (AABBs)
 [Host] public static const uint MASK_DIELECTRIC = 0x80; // dielectric and presence surfaces
+// Geometry of the dielectric class, which bounds an interior where its material is solid: the
+// glass a manifold walk may cross. Its instances carry MASK_DIELECTRIC too.
+[Host] public static const uint MASK_INTERIOR = 0x40;
 // Opaque and alpha-tested geometry as shadow rays and as camera rays see it: an entry can show
 // each kind of ray another form, or none.
 [Host] public static const uint MASK_SHADOW = 0x10;
@@ -84,6 +87,7 @@ public uint class_mask(uint class_id)
     case CLASS_OPAQUE:
         return MASK_OPAQUE_KINDS;
     case CLASS_DIELECTRIC:
+        return MASK_DIELECTRIC | MASK_INTERIOR;
     case CLASS_PRESENCE:
         return MASK_DIELECTRIC;
     case CLASS_PARTICLE:

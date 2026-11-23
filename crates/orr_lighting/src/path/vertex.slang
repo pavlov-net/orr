@@ -37,7 +37,9 @@ import orr_lighting.path.state;
 import orr_lighting.interiors;
 import orr_lighting.subsurface;
 import orr_lighting.caustics;
+import orr_scene.producer;
 import orr_lighting.spectrum;
+__exported import orr_lighting.path.facet;
 
 // The hot words of the slice's `slot`th path.
 public uint4* path_hot(PathRoot r, uint slot)
@@ -57,10 +59,10 @@ public uint4* path_cold(PathRoot r, uint slot)
     return r.launch.cold + slot * PATH_COLD_WORDS;
 }
 
-// The plane stack words of the slice's `slot`th path, where the pipeline may meet a stack.
-public uint4* path_stack(PathRoot r, uint slot)
+// The manifold words of the slice's `slot`th path, where its pipeline may walk a manifold.
+public uint4* path_manifold(PathRoot r, uint slot)
 {
-    return r.launch.stack + slot * PATH_STACK_WORDS;
+    return r.launch.manifold + slot * PATH_MANIFOLD_WORDS;
 }
 
 // The chain word of the slice's `slot`th path (`PathChain`), where its paths may gather caustic
@@ -118,11 +120,27 @@ public bool path_caustics(PathRoot r)
     return may(MAY_CAUSTICS) && !from_photon(r) && r.caustics != nullptr && !mode_counts(r).one_technique;
 }
 
-// Whether a directional light may reach `r`'s paths through a plane stack: the light set holds a
-// stack entry and a directional light, the one light a stack bends.
-public bool path_stacks(PathRoot r)
+// Whether a light manifold next-event estimation takes (`walks_kind`) may reach `r`'s paths
+// through the surfaces of solid glass by it.
+public bool path_manifolds(PathRoot r)
 {
-    return may(MAY_STACK) && r.set.stack_entries != 0 && r.set.directional_count != 0;
+    return may2(MAY2_MANIFOLDS) && (r.set.directional_count != 0 || (may(MAY_LOCAL_LIGHTS) && r.set.local_lights != 0));
+}
+
+// Whether light pick `k` is a directional light's, which no ray reaches from inside an interior
+// but through its surfaces: a walking job's light toward one comes by its walk alone. A point on a
+// sphere, point or rect light may lie in the interior itself, which the job's ray then reaches.
+bool far_light(LightPick k)
+{
+    return !isfinite(k.distance);
+}
+
+// Whether manifold next-event estimation takes a light pick of kind `kind` (LIGHT_SAMPLE_*) through
+// the surfaces of solid glass: a directional light's, toward its direction, and a shadowed sphere,
+// point or rect light's, toward the point drawn on it, where the paths may meet one.
+public bool walks_kind(uint kind)
+{
+    return kind == LIGHT_SAMPLE_DIRECTIONAL || (may(MAY_LOCAL_LIGHTS) && (kind == LIGHT_SAMPLE_SPHERE || kind == LIGHT_SAMPLE_RECT || kind == LIGHT_SAMPLE_POINT));
 }
 
 // The interior list cold words `at` hold.
@@ -239,7 +257,25 @@ float3 left_normal(uint flags, uint4 w1)
 {
     if (may_scatter() && (flags & HOT_MEDIUM) != 0)
         return float3(0.0);
+    if (may2(MAY2_MANIFOLDS) && (flags & HOT_ANY_SIDE) != 0)
+        return float3(0.0);
     return oct_decode_snorm16(w1.y);
+}
+
+// Whether a view's vertex where a photon deposits, of a stage that runs a `LAYER` or not and
+// `inside` an interior, draws its directional lights with no normal (`any_side_nee`).
+bool any_side_nee_at(bool inside, bool layer)
+{
+    return may2(MAY2_MANIFOLDS) && !layer && inside;
+}
+
+// Whether `r`'s vertex of a stage that runs a `LAYER` or not, which lies `inside` an interior,
+// draws its directional lights with no normal: an opaque vertex there takes a directional light by
+// the direction its walk bends it to, which may lie in front of its surface where the light's own
+// lies behind it, so its choice of light cannot turn on the light's own side.
+bool any_side_nee(PathRoot r, bool inside, bool layer)
+{
+    return may2(MAY2_MANIFOLDS) && !layer && inside && path_manifolds(r) && !from_photon(r);
 }
 
 // The layers a path met, which its cold words `at` count.
@@ -343,13 +379,18 @@ interface IVertexKind
     // the light crosses, as `past` met it. That interior's medium goes in `medium`: MATERIAL_NONE
     // where the light comes through none, PATH_MEDIUM where through the path's own.
     bool toward_light(bool inside, LayerPast past, inout float3 sigma, out uint medium);
-    // The interiors past the surface, where light comes through it into the vertex's side.
-    Interior past(PathRoot r, uint4* cold, bool inside);
-    // Whether scatter `s` crosses a plane stack face ideally into or out of an interior, and the
-    // face's unit normal.
-    bool crosses_stack(PathRoot r, BsdfSample s, out float3 face);
+    // How a manifold walk of a job whose light comes through the surface crosses it into the
+    // interiors past it (MANIFOLD_LIST_PAST): the section material, with the top bit set where
+    // the walk enters it, whose medium it enters at what it leaves in the walk's medium word of
+    // manifold words `words`.
+    uint across(uint4* words);
+    // Whether it is a layer a manifold walk crosses (`walk_crosses`), where the paths may meet
+    // one.
+    bool on_face();
     // Whether the vertex lies on a solid's back, inside the interior its material bounds.
     bool behind_solid(PathRoot r);
+    // Whether the path reached the surface on its material's front side.
+    bool front();
     // The parameters `prepare` prepares the vertex `x`'s BSDF from, and in `exterior` the IOR of
     // the medium outside it.
     BsdfParams params(PathRoot r, PathVertex x, uint4* cold, bool inside, out float exterior);
@@ -400,14 +441,13 @@ struct OnOpaque : IVertexKind
         return inside;
     }
 
-    Interior past(PathRoot r, uint4* cold, bool inside)
+    uint across(uint4* words)
     {
-        return Interior();
+        return MATERIAL_NONE;
     }
 
-    bool crosses_stack(PathRoot r, BsdfSample s, out float3 face)
+    bool on_face()
     {
-        face = float3(0.0);
         return false;
     }
 
@@ -415,16 +455,19 @@ struct OnOpaque : IVertexKind
     {
         return false;
     }
+
+    bool front()
+    {
+        return true;
+    }
 }
 
 // A layer `l`, prepared with the media on its two sides as the path's interiors give them, on a
-// plane stack face of unit normal `face` where `stack`, which a path's ray that may weigh a
-// directional light against next-event estimation through a stack asks.
+// surface a manifold walk crosses where `face`.
 struct OnLayer : IVertexKind
 {
     LayerVertex l;
-    bool stack;
-    float3 face;
+    bool face;
 
     Bsdf prepare(PathRoot r, PathVertex x, uint4* cold, bool inside, float nm)
     {
@@ -493,6 +536,7 @@ struct OnLayer : IVertexKind
         return medium != MATERIAL_NONE;
     }
 
+    // The interiors past the surface, where light comes through it into the vertex's side.
     Interior past(PathRoot r, uint4* cold, bool inside)
     {
         Interior interior = inside ? load_interior(cold) : Interior();
@@ -500,16 +544,25 @@ struct OnLayer : IVertexKind
         return interior;
     }
 
-    bool crosses_stack(PathRoot r, BsdfSample s, out float3 face)
+    uint across(uint4* words)
     {
-        face = this.face;
-        uint ideal = LOBE_SPECULAR | LOBE_TRANSMISSION;
-        return stack && (s.lobe & ideal) == ideal && crosses_interior(r.scene, l.section);
+        store_coherent(words + WALK_MEDIUM, asuint(l.x.surface.medium_point));
+        return l.section | (l.front ? MANIFOLD_ENTERS : 0u);
+    }
+
+    bool on_face()
+    {
+        return face;
     }
 
     bool behind_solid(PathRoot r)
     {
         return !l.front && crosses_interior(r.scene, l.section);
+    }
+
+    bool front()
+    {
+        return l.front;
     }
 }
 
@@ -826,6 +879,8 @@ struct HitLight : IVertexLight
         float pdf = asfloat(load_coherent(at + 3)).w;
         if (may(MAY_SCATTERING) && pdf == PDF_LIT)
             return float3(0.0);
+        if (may2(MAY2_MANIFOLDS))
+            pdf = ray_density(pdf);
         if (first || !(emitter.density > 0.0))
             return e;
         // Past chain vertices the photons own a light light sampling draws.
@@ -862,20 +917,25 @@ struct HitLight : IVertexLight
 uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKind, let LAYER : bool>(PathRoot r, uint slot, uint4* at, PathVertex x, float3 dir, float t, float2 cone, L emits, V on, uint4 input, out float exterior)
 {
     exterior = 0.0;
-    // A re-run (`PAYLOAD_BENT`) weighs the light of the job the vertex left where a plane stack
+    // A re-run (`PAYLOAD_BENT`) weighs the light of the job the vertex left where a manifold walk
     // bent it, from the words the vertex started with: its scatter alone, toward the light's bent
     // direction.
     bool bent = false;
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
         bent = input.y == PAYLOAD_BENT;
     // Of the path's words the vertex holds its flags and its throughput. The radiance it adds
     // goes into the path's word at once, and the ray and the shadow job it leaves are written
     // whole, so nothing else of the path is live across the surface's light.
     uint4 w0 = load_coherent(at);
-    if (may(MAY_STACK))
+    // A layer keeps what re-runs it where its job walks (`keep_ray`) before its work, which then
+    // holds none of it across the emitter's call at its light; an opaque vertex keeps it with its
+    // job.
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
-            w0 = load_coherent(path_stack(r, slot) + STACK_BENT_WORD);
+            w0 = load_coherent(path_manifold(r, slot) + MANIFOLD_BENT_WORD);
+        else if (LAYER && path_manifolds(r) && !from_photon(r))
+            keep_ray(r, slot, w0, load_coherent(at + 1), input, t, FIRST == 1 ? BENT_FIRST : BENT_HIT);
     }
     uint flags = w0.w;
     // A photon's first vertex is the caster it starts on, which its first ray reaches as the
@@ -885,10 +945,10 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     // Whether light along the ray counts, as the vertex it left had it.
     bool along = (flags & HOT_COUNTED) != 0;
     bool was_diffuse = (flags & HOT_DIFFUSE) != 0;
-    flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_WINDOW);
+    flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_WINDOW | HOT_ANY_SIDE);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
     float3 throughput = hot_throughput(load_coherent(at + 1));
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
             throughput = float3(1.0);
@@ -924,7 +984,7 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     // A re-run adds no light of the vertex's own, ends in no cache and draws no light.
     bool cache = mode.cache;
     bool count_nee = mode.count_nee;
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
         {
@@ -1027,7 +1087,7 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
             // normal, the one normal the path keeps. The last bounce's hit ends there regardless:
             // no ray past it finds the light another way.
             bool last = opaque == r.max_bounces + 2;
-            float3 left = left_normal(w0.w, load_coherent(at + 1));
+            float3 left = may_scatter() && (w0.w & HOT_MEDIUM) != 0 ? float3(0.0) : oct_decode_snorm16(load_coherent(at + 1).y);
             bool apart = t > CACHE_MIN_RAY_CELLS * cell.size
                 || (any(left != 0.0) && normal_bucket(left) != key_bucket(cell.key));
             ends = last || ((was_diffuse || cone.x > cell.size) && apart);
@@ -1072,14 +1132,18 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     {
         photon_chains = load_coherent(at + 2).w;
         if (photon_chains > 0 && any(photon_albedo(b) > 0.0))
-            flags |= leave_deposit(r, slot, at, x, throughput, rng);
+            flags |= leave_deposit(r, slot, at, x, throughput, any_side_nee_at(inside, LAYER), rng);
     }
-    // What the vertex hands the gather of the caustic photons' grid.
+    // What the vertex hands the gather of the caustic photons' grid. A view of the direct light
+    // alone gathers nothing, but where the vertex's job walks its gather still draws the point the
+    // job's ownership takes (`path_gather`), as in a view of all the light.
     GatherCall gather = {};
+    bool reads = owns && !bent && caustics_hold_light(r.caustics) && counted;
     bool gathers = owns && !bent && caustics_hold_light(r.caustics) && path_gathered(r, counted);
-    if (gathers)
+    bool places = may2(MAY2_MANIFOLDS) && reads && !gathers && path_manifolds(r);
+    if (gathers || places)
     {
-        gather = gather_call(x, b.diffuse_reflection(), thin_walled(g) ? b.diffuse_transmission() : float3(0.0), throughput, cone.x, rng);
+        gather = gather_call(x, b.diffuse_reflection(), thin_walled(g) ? b.diffuse_transmission() : float3(0.0), throughput, gathers ? cone.x : -cone.x, rng);
         // The reference's map evaluates the vertex's BSDF per photon, in a callable of its own.
         if (may(MAY_REFERENCE) && r.caustics.mode == CAUSTICS_MAP)
         {
@@ -1092,7 +1156,9 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
 
     // One light, resampled from the vertex's candidates, as a pending shadow job. A chain vertex
     // on a solid's back sees lights from inside it, which BSDF rays carry.
-    float run = chains && on.behind_solid(r) ? 0.0 : nee_probability(r.set, g);
+    bool any_side = any_side_nee(r, inside, LAYER);
+    float3 nee_normal = any_side ? float3(0.0) : g.normal;
+    float run = chains && on.behind_solid(r) ? 0.0 : nee_probability(r.set, g, nee_normal);
     float u_run = rng.next();
     uint candidates = first ? r.primary_candidates : r.bounce_candidates;
     // The scatter's direction is drawn first: the light candidates' loop evaluates it with them.
@@ -1104,12 +1170,12 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     BsdfDraw drawn = b.draw(u.xyz);
     bool evaluates = drawn.drawn && !drawn.delta;
     float3 wi = drawn.wi;
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
         {
             evaluates = true;
-            wi = bent_direction(path_stack(r, slot));
+            wi = bent_direction(path_manifold(r, slot));
         }
     }
     float3 scatter_f;
@@ -1123,19 +1189,20 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     // surface, or in a hit's stage where a camera ray may reach it.
     bool local = may(MAY_LOCAL) && scattered == 0 && (FIRST == 1 || may_any(MAY_LAYERS | MAY_TRACED | MAY_LENS | MAY_BACKGROUND));
     float3 unused;
-    LightPick k = pick_light<true>(r, b, g.position, g.normal, pixel, candidates, estimates, local, evaluates, wi, scatter_f, scatter_pdf, scatter_diffuse, rng, false, float3(0.0), unused);
+    LightPick k = pick_light<true>(r, b, g.position, nee_normal, pixel, candidates, estimates, local, evaluates, wi, scatter_f, scatter_pdf, scatter_diffuse, rng, false, float3(0.0), unused);
     // At a chain vertex what a light but the environment gives outside its diffuse lobes is the
     // photons' past the path's last vertex that was none.
     bool weighs_chain = owns && chains;
     if (weighs_chain && k.kind != LIGHT_SAMPLE_ENVIRONMENT)
         k.f = chain_value(k.f, k.diffuse, chain.keep);
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
         {
             if (weighs_chain)
                 scatter_f = chain_value(scatter_f, scatter_diffuse, chain.keep);
-            bent_add(path_stack(r, slot), at, scatter_f, scatter_pdf, sides_agree(g.normal, g.geometric_normal, wi));
+            uint4* kept = path_manifold(r, slot);
+            bent_add(r, slot, kept, at, scatter_f, scatter_diffuse, sides_agree(g.normal, g.geometric_normal, wi));
             return 0;
         }
     }
@@ -1147,28 +1214,60 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     float job_blue = 0.0;
     uint job_light = NO_LIGHT;
     // A surface takes light only from a side its shading and geometric normals agree on, where
-    // its BSDF rays leave too.
-    if (k.sum > 0.0 && sides_agree(g.normal, g.geometric_normal, k.dir))
+    // its BSDF rays leave too; a directional light its walk bends, from the side the bent direction
+    // reaches it on (`bent_add`).
+    bool bends = any_side && k.kind == LIGHT_SAMPLE_DIRECTIONAL && walks_kind(k.kind);
+    bool straight = sides_agree(g.normal, g.geometric_normal, k.dir);
+    // A surface a walk crosses that a ray reached which goes on tracked past it leaves its jobs
+    // toward lights past it to that ray's track (`face_tracks`).
+    bool face_checks = LAYER && may2(MAY2_MANIFOLDS) && path_manifolds(r) && on.on_face() && face_tracks(r, slot, at);
+    // A point light's estimate that owns every chain to it walks by its seeds, from the side the
+    // path's ray reached the surface from where its straight way reaches the other, but at a
+    // surface a walk crosses whose job a ray tracked to it checks, which estimates nothing.
+    bool seeds = false;
+    if (may2(MAY2_MANIFOLDS) && k.sum > 0.0 && path_manifolds(r) && !(past.light && face_checks))
+        seeds = seeds_reach(r, k, g.position, vertex_origin(x, straight ? k.dir : x.view));
+    if (k.sum > 0.0 && (straight || bends || seeds))
     {
         float3 radiance = k.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(r.set, k.light, k.dir) : k.radiance;
         float W = k.sum / (float(k.drawn) * k.target);
-        float mis = mode.one_technique ? 1.0 : nee_weight(k.kind, run * k.pdf, k.scatter_pdf);
-        float3 origin = vertex_origin(x, k.dir);
+        // A light a manifold walk takes may come through the surfaces of solid glass, which the
+        // walk takes the media along. A surface a walk crosses takes none of it through itself
+        // where a ray that reached it is tracked from the vertex before, whose estimate owns the
+        // chains its walks find: a directional light's other chains are that ray's BSDF rays', and
+        // a sphere, point or rect light's this job's, wherever no estimate owns its chain, which
+        // its raygen asks (MANIFOLD_JOB_CHECK), whole: rays past the surface take none of it. Where
+        // no caustic photons run, a point light's estimate owns every chain to it where it walks
+        // (`seeds_chains`).
+        bool walks = false;
+        bool checks = false;
+        if (may2(MAY2_MANIFOLDS))
+        {
+            walks = walks_kind(k.kind) && path_manifolds(r);
+            if (walks && past.light && face_checks)
+            {
+                walks = false;
+                checks = may(MAY_LOCAL_LIGHTS) && k.kind != LIGHT_SAMPLE_DIRECTIONAL;
+                if (!checks)
+                    radiance = float3(0.0);
+            }
+        }
+        float mis = mode.one_technique || checks ? 1.0 : nee_weight(k.kind, run * k.pdf, k.scatter_pdf);
+        // A bent job leaves the surface on the side the path's ray reached it from, and its
+        // straight way's light is none where that way reaches the surface from a side it takes no
+        // light from.
+        float3 origin = vertex_origin(x, bends || !straight ? x.view : k.dir);
         bool far = !isfinite(k.distance);
-        float3 e = throughput * k.f * radiance * (W * mis / run);
+        float3 e = straight ? throughput * k.f * radiance * (W * mis / run) : float3(0.0);
         // The medium's transmittance toward the light: the interior's on the light's side of the
         // vertex, which a shadow ray leaves through no surface of, or the linked medium's, whose
-        // transmittance the environment's map holds of its own. A directional light may come
-        // through a plane stack, whose walk takes the interior's medium along its legs.
-        bool stacked = false;
-        if (may(MAY_STACK))
-            stacked = k.kind == LIGHT_SAMPLE_DIRECTIONAL && r.set.stack_entries != 0;
+        // transmittance the environment's map holds of its own.
         float3 toward = sigma;
         uint medium;
         bool through = on.toward_light(inside, past, toward, medium);
         if (through)
         {
-            if (!stacked)
+            if (!(walks && far))
                 e *= beer(toward, k.distance);
         }
         else
@@ -1176,36 +1275,61 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
         // The point drawn on the light is the candidate's distance along its direction from the
         // vertex.
         float3 target = far ? k.dir : g.position + k.dir * k.distance;
+        // A walking job leaves its walk's words here: a directional light's pick has no emitter's
+        // coat to weigh, so nothing of them is kept across that call. A job outside every interior
+        // walks only where its ray meets solid glass, which few do: any other is a plain job, and
+        // leaves nothing (`glass_along`).
+        uint walk_light = NO_LIGHT;
+        float3 walk_light_weight = walk_weight(k, throughput, radiance, W / run);
+        // Where the vertex reads the grid, its gather's point (`path_gather`) may meet glass its own
+        // ray misses, within the reach of the cell it reads.
+        float pad = 0.0;
+        if (may2(MAY2_MANIFOLDS) && walks && !through && (gathers || places))
+            pad = cell_reach(r.caustics, g.position);
+        if (may2(MAY2_MANIFOLDS) && walks && (seeds || any((bends || through ? walk_light_weight : e) > 0.0) && (through || glass_along(r, origin, k.dir, pad))))
+        {
+            walk_light = through ? MANIFOLD_JOB_INSIDE : MANIFOLD_JOB_OUTSIDE;
+            // A layer's scatter may cross into the interiors past it, which its cold words then
+            // list: its job keeps the vertex's own list, and where its light comes through the
+            // surface, how its walk crosses it there (`settle_list`); a job outside every
+            // interior lists none.
+            uint source = through ? MANIFOLD_LIST_COLD : MANIFOLD_LIST_NONE;
+            uint across = 0;
+            if (LAYER && through)
+            {
+                uint4* words = path_manifold(r, slot);
+                store_list(words + MANIFOLD_LIST_WORD, inside ? load_interior(cold) : Interior());
+                source = MANIFOLD_LIST_JOB;
+                if (medium != PATH_MEDIUM)
+                {
+                    source = MANIFOLD_LIST_PAST;
+                    across = on.across(words);
+                }
+            }
+            if (!LAYER)
+                keep_ray(r, slot, w0, load_coherent(at + 1), input, t, FIRST == 1 ? BENT_FIRST : BENT_HIT);
+            // The probe bends the light across planes facing the normal on the side the light
+            // comes from, or for a bent job the side the path's ray reached the surface from.
+            float3 toward_side = bends ? x.view : k.dir;
+            manifold_job(r, slot, walk_source(k, source), g.position, dot(g.normal, toward_side) < 0.0 ? -g.normal : g.normal, walk_light_weight, across, bends);
+        }
+        if (LAYER && checks && any(e > 0.0))
+        {
+            walk_light = MANIFOLD_JOB_CHECK;
+            manifold_track(r, slot, at, w0, face_slope(x, b, k.dir), on.section(), dot(x.surface.geometric_normal, k.dir) < 0.0, k.light);
+        }
         if (may(MAY_EMISSIVE) && may2(MAY2_COATED_EMITTERS) && k.view && any(e > 0.0))
             e *= emitter_view(at, k, origin, target, medium);
-        if (any(e > 0.0))
+        if (any(e > 0.0) || walk_light != NO_LIGHT)
         {
             store_coherent(at + 4, uint4(asuint(origin), asuint(e.x)));
             store_coherent(at + 5, uint4(asuint(target), asuint(e.y)));
             job_blue = e.z;
-            job_light = k.kind != LIGHT_SAMPLE_DIRECTIONAL ? k.light : NO_LIGHT;
+            job_light = k.kind != LIGHT_SAMPLE_DIRECTIONAL && walk_light == NO_LIGHT ? k.light : walk_light;
             flags |= HOT_SHADOW | (far ? HOT_SHADOW_FAR : 0);
             // A layer's job may lie past the layer, or where the path's ray leaves for.
             if (LAYER && may(MAY_INTERIORS) && may2(MAY2_THIN_DIELECTRICS))
                 exterior = interior_ior(r.scene, medium == PATH_MEDIUM ? innermost_of(load_coherent(cold)) : medium);
-            if (may(MAY_STACK))
-            {
-                if (stacked && through)
-                {
-                    job_light = STACK_JOB_LIGHT;
-                    // A layer's scatter may cross into the interiors past it, which its cold
-                    // words then list: its job keeps its own list.
-                    Interior list = Interior();
-                    if (LAYER)
-                        list = medium == PATH_MEDIUM ? load_interior(cold) : on.past(r, cold, inside);
-                    // A hit's re-run traces its ray again with the cover it had, whose draw its
-                    // invoke took out of the payload.
-                    uint4 cover = input;
-                    if (FIRST != 1)
-                        cover.y = cover_draw(r, pixel, path_cover(input).context.depth);
-                    stack_job(path_stack(r, slot), LAYER ? 0 : STACK_COLD_LIST, list, g.position, w0, load_coherent(at + 1), cover, t, FIRST == 1 ? BENT_FIRST : BENT_HIT, throughput * radiance * (W / run), mode.one_technique ? -1.0 : run * k.pdf);
-                }
-            }
         }
     }
 
@@ -1238,25 +1362,36 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     }
     if (goes)
     {
+        // A ray a surface a manifold walk crosses passes on by transmission goes on tracked from the
+        // vertex that scattered it before the surfaces (`manifold_track`), whose estimate may own
+        // the directional light it meets; a photon tracks the surfaces it crosses from its light,
+        // and an ideal window passes its track on as it does its ray, which the walk's shadow rays
+        // pass as straight. Its slope comes before the companions' call, so the BSDF is not kept
+        // across it.
+        bool tracked = false;
+        bool crosses = false;
+        float2 slope = float2(0.0);
+        if (may2(MAY2_MANIFOLDS))
+        {
+            crosses = LAYER && on.on_face() && (s.lobe & LOBE_TRANSMISSION) != 0;
+            if (crosses)
+                slope = face_slope(x, b, s.wi);
+        }
         // The companions' BSDFs toward the hero's draw weigh them, with the interiors the path
         // arrived in.
         if (LAYER && may(MAY_DISPERSION) && split)
             call_disperse(disperse_call(on, r, x, cold, inside, s));
-        // A ray that crosses a plane stack face ideally past a vertex that scattered it goes on
-        // weighed as that vertex's ray against next-event estimation toward a directional light.
         uint left_normal = oct_encode_snorm16(g.normal);
-        bool stacks = false;
-        if (LAYER && may(MAY_STACK) && !photon)
+        if (may2(MAY2_MANIFOLDS))
         {
-            float3 face;
-            if (on.crosses_stack(r, s, face))
-                stacks = stack_track(r, slot, at, w0, face, left_normal, inside ? interior_ior(r.scene, innermost_of(load_coherent(cold))) : AMBIENT_IOR);
+            if (photon && !window)
+                crosses = photon_track(r, slot, crosses, slope, x.surface.position);
+            else if (crosses)
+                crosses = tracked = manifold_track(r, slot, at, w0, slope, on.section(), dot(x.surface.geometric_normal, s.wi) < 0.0);
         }
         // The interiors past the vertex.
         if (may(MAY_INTERIORS) && LAYER)
             flags = on.cross(r, s, cold, inside, past) ? flags | HOT_INTERIOR : flags & ~HOT_INTERIOR;
-        if (photon && may(MAY_STACK))
-            photon_stack_step(r, slot, on, s);
         if (walking)
         {
             store_walk(r, cold, x, s.wi, FIRST == 1, rng);
@@ -1265,11 +1400,13 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
         bool delta = (s.lobe & LOBE_SPECULAR) != 0;
         bool diffuse = (s.lobe & LOBE_DIFFUSE) != 0;
         cone.y += s.spread;
-        flags |= HOT_RAY;
+        flags |= HOT_RAY | (any_side ? HOT_ANY_SIDE : 0);
         flags = diffuse ? flags | HOT_DIFFUSE : flags & ~HOT_DIFFUSE;
         uint4 w1 = load_coherent(at + 1);
         float ray_run = ray_run_word(count_nee && !split ? run : 0.0, k.local);
-        float ray_pdf = stacks ? PDF_STACK : delta ? 0.0 : s.pdf;
+        float ray_pdf = delta ? 0.0 : s.pdf;
+        if (tracked)
+            ray_pdf = PDF_TRACKED - ray_pdf;
         // An ideal window passes the ray on as it reached it, weighed against next-event
         // estimation as the vertex before it left it, which took the lights past the window
         // through it.
@@ -1284,11 +1421,27 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
                 store_coherent(cold + COLD_FROM_WORD, uint4(w0.xyz, 0));
         }
         float3 origin = vertex_origin(x, s.wi);
+        // A tracked ray or photon leaves the surface it crosses along its own line through the
+        // hit, off the surface by as much, so its chain is one a walk can follow: off that line
+        // the next surface's normal differs where it curves. A walk starts from the surface.
+        if (crosses && !walking)
+        {
+            float3 n = g.geometric_normal;
+            origin = g.position + s.wi * (dot(origin - g.position, n) / dot(s.wi, n));
+        }
         // A ray inside an interior keeps the stretch from the surface to its origin, which the
         // medium covers too.
         if (may(MAY_INTERIORS) && (flags & HOT_INTERIOR) != 0)
         {
             offset = pack_signed9e5(origin - g.position);
+        }
+        // A ray the surface leaves untracked, whose jobs past it the ray that reached it checks,
+        // may start a track at a surface it crosses next, whose checks ask of this vertex: it
+        // leaves its origin for that track to know it by, with its normal on its view's side.
+        if (may2(MAY2_MANIFOLDS) && face_checks && !photon && !tracked && !delta)
+        {
+            float3 n = x.surface.geometric_normal;
+            store_coherent(path_manifold(r, slot) + MANIFOLD_TRACK_WORD + 2, uint4(asuint(origin), oct_encode_snorm16(on.front() ? n : -n)));
         }
         store_coherent(at, uint4(asuint(origin), hot_flags(flags, rng.dimension)));
         store_coherent(at + 1, uint4(oct_encode_snorm16(s.wi), left_normal, as_halves(throughput.xy), as_halves(float2(throughput.z, ray_run))));
@@ -1302,7 +1455,7 @@ uint path_vertex<M : IMedium, let FIRST : uint, L : IVertexLight, V : IVertexKin
     store_coherent(at + 2, uint4(as_halves(cone), asuint(job_blue), offset, job_light));
     if (owns)
         store_chain(path_chain(r, slot), after, chain);
-    if (gathers)
+    if (gathers || places && (job_light == MANIFOLD_JOB_INSIDE || job_light == MANIFOLD_JOB_OUTSIDE))
         call_gather(gather);
     return left;
 }
@@ -1476,7 +1629,8 @@ public struct GatherCall
 }
 
 // The gather at vertex `x`, whose diffuse lobes give `front` and `back`, on a path of `throughput`
-// whose footprint there is `width` m wide. It takes eight sampler dimensions of `rng`.
+// whose footprint there is `width` m wide, negated where it adds nothing to the path. It takes ten
+// sampler dimensions of `rng`.
 GatherCall gather_call(PathVertex x, float3 front, float3 back, float3 throughput, float width, inout Sampler rng)
 {
     GSurface g = x.surface;
@@ -1485,7 +1639,7 @@ GatherCall gather_call(PathVertex x, float3 front, float3 back, float3 throughpu
     c.at = uint4(asuint(g.position), oct_encode_snorm16(n));
     c.front = uint4(asuint(throughput * front), asuint(width));
     c.back = uint4(asuint(throughput * back), rng.dimension);
-    rng.dimension += 8;
+    rng.dimension += 10;
     return c;
 }
 
@@ -1496,15 +1650,37 @@ void call_gather(GatherCall c)
 }
 
 // The gather's callable for `slot`'s path: the grid's irradiance at the vertex `c` names by its
-// diffuse lobes (`grid_gather`), into the path's radiance.
+// diffuse lobes (`grid_gather`), into the path's radiance unless its width is negated. Where the
+// vertex's job walks, the photons its read takes were each left to an estimate or not where they
+// deposited, across the cell it read: the job's estimate takes the light its chains bring through
+// the diffuse lobes where it would own them at a point of that cell, which the gather draws on the
+// side the job leaves from, as its photons may land there (`cell_point`), and leaves in the walk's
+// start word beside GATHER_POINT, with the job's ray's offset off the surface, for `trace_shadow`.
 public void path_gather(PathRoot r, uint slot, GatherCall c)
 {
     Sampler rng = path_sampler(r, item_pixel(r, r.slice_base + slot));
     rng.dimension = c.back.w;
     float4 u = rng.next4();
     float4 u_back = rng.next4();
-    float3 e = grid_gather(r.caustics, r.scene, asfloat(c.at.xyz), oct_decode_snorm16(c.at.w), asfloat(c.front.xyz), asfloat(c.back.xyz), asfloat(c.front.w), u, u_back);
-    add_radiance(path_hot(r, slot), e);
+    float2 v = rng.next2();
+    float3 p = asfloat(c.at.xyz);
+    float3 n = oct_decode_snorm16(c.at.w);
+    uint4* at = path_hot(r, slot);
+    bool places = false;
+    float3 origin = float3(0.0);
+    if (may2(MAY2_MANIFOLDS) && path_manifolds(r))
+    {
+        uint job = load_coherent(at + 2).w;
+        places = job == MANIFOLD_JOB_INSIDE || job == MANIFOLD_JOB_OUTSIDE;
+        origin = asfloat(load_coherent(at + 4).xyz);
+    }
+    GridRead read;
+    float width = asfloat(c.front.w);
+    float3 e = grid_gather(r.caustics, r.scene, p, n, asfloat(c.front.xyz), asfloat(c.back.xyz), abs(width), u, u_back, dot(origin - p, n) < 0.0 ? 1 : 0, read);
+    if ((c.front.w & 0x80000000u) == 0)
+        add_radiance(at, e);
+    if (places && read.size > 0.0)
+        store_coherent(path_manifold(r, slot) + WALK_START, uint4(asuint(cell_point(read, v) + (origin - p)), GATHER_POINT));
 }
 
 // What a vertex hands the gather of the reference's map of caustic photons (`path_map_gather`):
@@ -1591,53 +1767,84 @@ void add_radiance(uint4* at, float3 e)
 // Leaves in `slot`'s photon's hot words `at` its deposit at vertex `x`, where it arrives with
 // `throughput` of its flux, for its raygen to deposit (`HOT_ARRIVED`, which it returns): where, the
 // geometric normal on the side it arrives from, the direction toward where it came from and the
-// sampler dimension the deposit draws from, four of `rng`'s. Where it crossed a plane stack from its
-// directional light, its stack words take where the probe that asks whether next-event estimation
-// takes that light leaves the vertex.
-uint leave_deposit(PathRoot r, uint slot, uint4* at, PathVertex x, float3 throughput, inout Sampler rng)
+// sampler dimension the deposit draws from, four of `rng`'s. Where it crossed the surfaces of solid
+// glass from its directional light, its manifold words take where the walk that asks whether an
+// estimate takes that light leaves the vertex (`start_photon_check`).
+uint leave_deposit(PathRoot r, uint slot, uint4* at, PathVertex x, float3 throughput, bool any_side, inout Sampler rng)
 {
     GSurface g = x.surface;
     float3 n = dot(g.geometric_normal, x.view) < 0.0 ? -g.geometric_normal : g.geometric_normal;
     store_coherent(at + 4, uint4(asuint(g.position), oct_encode_snorm16(n)));
     store_coherent(at + 5, uint4(as_halves(throughput.xy), as_halves(float2(throughput.z, 0.0)), oct_encode_snorm16(x.view), rng.dimension));
     rng.dimension += 4;
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
-        uint4* track = path_stack(r, slot) + STACK_TRACK_WORD;
-        uint4 k = load_coherent(track);
-        if (k.w != 0 && k.z > 0)
-            store_coherent(track + 1, uint4(asuint(vertex_origin(x, -oct_decode_snorm16(k.x))), 0));
+        // The walk from here toward the light crosses the photon's surfaces the other way round,
+        // from the list the photon arrived in, and is the photon's own where it starts along the
+        // direction the photon came from (`check_walk`), which with the surfaces' count the through
+        // word keeps. The vertex leaves what the walks' stage cannot find of it
+        // (`start_photon_check`).
+        uint4* words = path_manifold(r, slot);
+        uint4* track = words + MANIFOLD_TRACK_WORD;
+        uint4 last = load_coherent(track + 2);
+        uint crossed = last.w == TRACK_PHOTON ? track_crossed(load_coherent(track + 1)) : 0;
+        // An estimate there takes no light from a side its shading and geometric normals disagree
+        // on, nor any where it runs no next-event estimation.
+        float run = nee_probability(r.set, g, any_side ? float3(0.0) : g.normal);
+        if (!sides_agree(g.normal, g.geometric_normal, x.view) || !(run > 0.0))
+            crossed = 0;
+        if (crossed > 0)
+        {
+            // Toward a light's direction, or toward the point it left a light from.
+            uint4 light = load_coherent(track);
+            bool point = may(MAY_LOCAL_LIGHTS) && light.w != 0;
+            float3 toward = point ? normalize(asfloat(light.xyz) - g.position) : asfloat(light.xyz);
+            store_coherent(words + WALK_START, uint4(asuint(vertex_origin(x, toward)), WALK_PROBE | (point ? WALK_POINT_TARGET : 0)));
+            store_coherent(words + MANIFOLD_FROM_WORD, uint4(asuint(g.position), MANIFOLD_LIST_COLD | (light.w << MANIFOLD_LIGHT_SHIFT)));
+            // An estimate that draws its directional lights with no normal bends them across planes
+            // facing the normal on the side the path reached it from, which a photon that lights it
+            // arrives on.
+            float3 n = any_side && dot(g.normal, x.view) < 0.0 ? -g.normal : g.normal;
+            store_coherent(words + WALK_DIR, uint4(asuint(n), asuint(any_side ? WALK_MIRRORS : 1.0)));
+            store_coherent(words + MANIFOLD_START_NEE, uint4(asuint(run), 0, 0, 0));
+        }
+        store_coherent(words + MANIFOLD_THROUGH_WORD, uint4(asuint(x.view), crossed));
     }
     return HOT_ARRIVED;
 }
 
-// Whether `slot`'s photon tracks the plane stack it may cross from its directional light: every
-// vertex since its light crossed a stack face ideally, in a scene that holds a stack. Its stack
-// words' track word holds the direction it started along, the first face's normal, the faces
-// crossed and whether it tracks them.
-bool photon_tracks(PathRoot r, uint slot)
+// The track of `slot`'s photon past its vertex's scatter, which `crosses` a surface a manifold
+// walk crosses by transmission at `slope` (`face_slope`) at `position` or not: a crossing past
+// fewer than MANIFOLD_CROSSINGS counts, the first keeping its point, and any other scatter ends it.
+// Whether the photon goes on tracked.
+bool photon_track(PathRoot r, uint slot, bool crosses, float2 slope, float3 position)
 {
-    return load_coherent(path_stack(r, slot) + STACK_TRACK_WORD).w != 0;
-}
-
-// The track of `slot`'s photon past scatter `s` of its vertex `on`: an ideal crossing of a stack
-// face parallel to the first, fewer than STACK_CROSSINGS, counts; any other scatter ends it.
-void photon_stack_step<V : IVertexKind>(PathRoot r, uint slot, V on, BsdfSample s)
-{
-    uint4* track = path_stack(r, slot) + STACK_TRACK_WORD;
-    uint4 k = load_coherent(track);
-    if (k.w == 0)
-        return;
-    float3 face;
-    bool crosses = on.crosses_stack(r, s, face) && k.z < STACK_CROSSINGS && (k.z == 0 || abs(dot(face, oct_decode_snorm16(k.y))) >= STACK_PARALLEL);
-    store_coherent(track, crosses ? uint4(k.x, k.z == 0 ? oct_encode_snorm16(face) : k.y, k.z + 1, 1) : uint4(k.xyz, 0));
+    uint4* track = path_manifold(r, slot) + MANIFOLD_TRACK_WORD;
+    uint4 c = load_coherent(track + 2);
+    if (c.w != TRACK_PHOTON)
+        return false;
+    uint4 k = load_coherent(track + 1);
+    uint crossed = track_crossed(k);
+    if (!crosses || crossed == MANIFOLD_CROSSINGS)
+    {
+        store_coherent(track + 2, uint4(c.xyz, TRACK_NONE));
+        return false;
+    }
+    store_coherent(track + 3, with_lane(load_coherent(track + 3), crossed, as_halves(slope)));
+    store_coherent(track + 1, uint4(k.xyz, (k.w & ~(0x7u << TRACK_CROSSED_SHIFT)) | ((crossed + 1) << TRACK_CROSSED_SHIFT)));
+    if (crossed == 0)
+        store_coherent(track + 2, uint4(asuint(position), TRACK_PHOTON));
+    return true;
 }
 
 // The deposit's callable for `slot`'s photon, of the entry its vertex left (`leave_deposit`): its
 // flux, as its record holds it, times what reached the vertex, in the frame's caustics, the grid or
 // the reference's map; its record then says it was seen where the map took it, or where a cell of
-// the grid it took had been read the frame before.
-public void path_deposit(PathRoot r, uint slot)
+// the grid it took had been read the frame before. A photon whose light an estimate at its
+// receiver `owned` deposits none: it counts as the grid's frame's arrival (`grid_arrival`), and
+// its raygen takes a photon whose every deposit an estimate owned out of its cluster's photons
+// started (`count_owned`).
+public void path_deposit(PathRoot r, uint slot, bool owned)
 {
     uint4* at = path_hot(r, slot);
     uint4 a = load_coherent(at + 4);
@@ -1661,6 +1868,12 @@ public void path_deposit(PathRoot r, uint slot)
     float3 position = asfloat(a.xyz);
     float3 n = oct_decode_snorm16(a.w);
     bool seen = true;
+    if (may2(MAY2_MANIFOLDS) && owned)
+    {
+        if (c.mode != CAUSTICS_MAP)
+            grid_arrival(c, n, flux, u);
+        return;
+    }
     if (c.mode == CAUSTICS_MAP)
         map_deposit(c, position, n, flux, oct_decode_snorm16(b.z));
     else
@@ -1677,9 +1890,9 @@ public void path_deposit(PathRoot r, uint slot)
 // and fuzz, and its caster cluster's aim cell. Its hot words take the ray toward its light, which the raygen
 // traces first, as a shadow job's words, by origin, reach and direction, and its first ray, which
 // reaches the caster's point along the light's direction from `reach` m before it; its cold words
-// the interiors around it, and its stack words its track of a plane stack it may cross from a
-// directional light. An alpha test's hole and a presence layer are its first ray's to meet. False
-// for a photon that starts with no flux.
+// the interiors around it, and its manifold words its track of the surfaces of solid glass it may
+// cross from a light a manifold walk takes. An alpha test's hole and a presence layer are its
+// first ray's to meet. False for a photon that starts with no flux.
 public bool path_photon_start<M : IMedium>(PathRoot r, uint slot, out float reach)
 {
     reach = 0.0;
@@ -1699,6 +1912,17 @@ public bool path_photon_start<M : IMedium>(PathRoot r, uint slot, out float reac
     PhotonRay light;
     if (!photon_lit(r, caster, c, p, light))
         return false;
+    // Its track of the surfaces of solid glass it crosses from a light a manifold walk takes, which
+    // its manifold words take before its flux is weighed: the direction toward a directional
+    // light, or the point it left a sphere, point or rect light from with that light's id plus 1.
+    if (may2(MAY2_MANIFOLDS))
+    {
+        uint4* track = path_manifold(r, slot) + MANIFOLD_TRACK_WORD;
+        bool point = may(MAY_LOCAL_LIGHTS) && !p.directional && walks_kind(c.kind);
+        store_coherent(track, point ? uint4(asuint(c.point), c.light + 1) : uint4(asuint(-p.dir), 0));
+        store_coherent(track + 1, uint4(0));
+        store_coherent(track + 2, uint4(0, 0, 0, (p.directional || point) && path_manifolds(r) ? TRACK_PHOTON : TRACK_NONE));
+    }
     uint4* at = path_hot(r, slot);
     float scale;
     float3 flux = p.flux * exp(-straight_depth(r.scene, p.interior, light.t_max, false, scale)) * medium_transmittance<M>(r.scene.medium, light.origin, light.dir, light.t_max);
@@ -1736,8 +1960,6 @@ public bool path_photon_start<M : IMedium>(PathRoot r, uint slot, out float reac
     store_coherent(at + 4, uint4(asuint(light.origin), asuint(light.t_max)));
     bool unshadowed = may2(MAY2_UNSHADOWED_LIGHTS) && (c.kind & LIGHT_SAMPLE_UNSHADOWED) != 0;
     store_coherent(at + 5, uint4(asuint(light.dir), unshadowed ? PHOTON_UNSHADOWED : 0));
-    if (may(MAY_STACK))
-        store_coherent(path_stack(r, slot) + STACK_TRACK_WORD, uint4(oct_encode_snorm16(p.dir), 0, 0, p.directional && path_stacks(r) ? 1 : 0));
     if (path_disperses(r))
         store_coherent(path_spectral(r, slot) + 3, uint4(0));
     return true;
@@ -1750,100 +1972,222 @@ public uint cover_draw(PathRoot r, uint2 pixel, uint depth)
     return pcg(pcg3d(uint3(pixel, r.frame ^ r.seed ^ LAYER_STREAM)).x ^ depth);
 }
 
-// Leaves in stack words `at` what the walk of a directional job through a plane stack takes of the
-// vertex at `point`: the job's ray starts in the interiors of `list`, whose medium its light
-// leaves out, or as `cold` says in those of the path's cold list, which the walk copies
-// (`STACK_COLD_*`). The light
-// may bend at the vertex, and the words keep what weighs it again there: the words the vertex
-// started from, `w0` and `w1`, its `input`, the length `t` of the ray that reached it and its kind
-// (BENT_*), and of the job its light before the vertex's scatter, `light`, and its density against
-// the vertex's own rays, `pdf`, negative where it weighs 1.
-void stack_job(uint4* at, uint cold, Interior list, float3 point, uint4 w0, uint4 w1, uint4 input, float t, uint kind, float3 light, float pdf)
+// Whether a directional job outside every interior, whose ray leaves `origin` along unit `dir`,
+// may walk: a job walks only where that ray ends at solid glass, so only where it meets the box of
+// the instances that may show dielectric-class geometry (`SceneRoot.interior`).
+public bool glass_along(PathRoot r, float3 origin, float3 dir)
 {
-    if (cold == 0)
-        store_list(at + STACK_LIST_WORD, list);
-    store_coherent(at + STACK_FROM_WORD, uint4(asuint(point), cold));
-    uint4* bent = at + STACK_BENT_WORD;
+    return glass_within(r.scene, origin, dir, positive_infinity());
+}
+
+// As above, with the box grown by `pad` m, for a ray that leaves a point within `pad` of `origin`
+// along `dir`.
+public bool glass_along(PathRoot r, float3 origin, float3 dir, float pad)
+{
+    float2 span;
+    return glass_span(r.scene, origin, dir, positive_infinity(), span, pad);
+}
+
+// Whether the ray from `origin` along unit `dir` meets that box within `reach`.
+public bool glass_within(PathRoot r, float3 origin, float3 dir, float reach)
+{
+    return glass_within(r.scene, origin, dir, reach);
+}
+
+// The draw `n` of the seeded walks of an estimate whose walk starts at `from`, keyed on that point
+// and `r`'s frame (`seed_bits_of`).
+public uint4 seed_bits_at(PathRoot r, float3 from, uint n)
+{
+    return seed_bits_of(r.frame, r.seed, from, n);
+}
+
+// `seed_meets` of a walk toward the point `target` on a light, in `r`'s frame.
+public bool seed_meets(PathRoot r, float3 from, float3 origin, float3 target, uint n)
+{
+    return seed_meets(r.scene, r.frame, r.seed, from, origin, target, true, n);
+}
+
+// Whether the estimate of pick `k` from `point`, whose job's ray leaves `origin`, owns every chain
+// to its light, as a point light's does where no caustic photons run (`seeds_chains`), and its
+// first seed may find one (`seed_meets`): its job walks by its seeds whatever its straight way meets.
+bool seeds_reach(PathRoot r, LightPick k, float3 point, float3 origin)
+{
+    if (!(may(MAY_LOCAL_LIGHTS) && k.kind == LIGHT_SAMPLE_POINT && !from_photon(r) && !path_caustics(r)))
+        return false;
+    return seed_meets(r, point, origin, point + k.dir * k.distance, 1);
+}
+
+// Leaves in manifold words `at` what the walk of a directional job takes of the vertex at `point`,
+// of unit shading normal `normal`, zero for a point in a medium: the job's ray starts in the
+// interiors `source` says (MANIFOLD_LIST_*), the job's own list the caller leaves, and
+// its walk's probe leaves along the light bent by the normal (`start_probe`), which the walk's
+// direction word holds until its first walk. The light may bend at the vertex, and the words keep
+// what weighs it again there: what re-runs the vertex (`keep_ray`), and of the job its light
+// before the vertex's scatter, `light`, beside `across`, how a walk from a list past the vertex's
+// surface crosses it (MANIFOLD_LIST_PAST). A directional job that may walk leaves them, and most
+// never walk, so they are what the walk cannot find elsewhere; the walk finds the IOR of the
+// interior it starts in from its list (`settle_list`).
+void manifold_job(PathRoot r, uint slot, uint source, float3 point, float3 normal, float3 light, uint across, bool mirrors)
+{
+    uint4* at = path_manifold(r, slot);
+    store_coherent(at + MANIFOLD_FROM_WORD, uint4(asuint(point), source));
+    store_coherent(at + MANIFOLD_BENT_WORD + 3, uint4(asuint(light), across));
+    store_coherent(at + WALK_START, uint4(0));
+    store_coherent(at + WALK_DIR, uint4(asuint(normal), asuint(any(normal != 0.0) ? (mirrors ? WALK_MIRRORS : 1.0) : 0.0)));
+}
+
+// What the walk of a job for pick `k` at a vertex of `throughput` weighs by what reaches the
+// vertex along its chain, with `radiance` the pick's and `weight` its resampling weight over the
+// vertex's chance of running next-event estimation: a directional light's radiance, and for a
+// point on a sphere, point or rect light none, since the walk's end gives what the light emits
+// along the chain's last leg and the area of the point over the pick's density (`point_end`).
+float3 walk_weight(LightPick k, float3 throughput, float3 radiance, float weight)
+{
+    return throughput * (k.kind == LIGHT_SAMPLE_DIRECTIONAL ? radiance : float3(1.0)) * weight;
+}
+
+// The from word's last lane of the walk of a job for pick `k` from the interiors `source` says
+// (MANIFOLD_LIST_*): with a sphere, point or rect light's id plus 1 above the list's lanes.
+uint walk_source(LightPick k, uint source)
+{
+    return source | (k.kind != LIGHT_SAMPLE_DIRECTIONAL ? (k.light + 1) << MANIFOLD_LIGHT_SHIFT : 0);
+}
+
+// Keeps in `slot`'s manifold words what re-runs a vertex whose job walks (`bent_rerun`): the words
+// the vertex started from, `w0` and `w1`, its `input`, the length `t` of the ray that reached it
+// and its kind (BENT_*).
+void keep_ray(PathRoot r, uint slot, uint4 w0, uint4 w1, uint4 input, float t, uint kind)
+{
+    uint4* bent = path_manifold(r, slot) + MANIFOLD_BENT_WORD;
     store_coherent(bent, w0);
     store_coherent(bent + 1, input);
     store_coherent(bent + 2, uint4(w1.xy, asuint(t), kind));
-    store_coherent(bent + 3, uint4(asuint(light), asuint(pdf)));
 }
 
-// The direction toward the light at the vertex of the bent job whose stack words are `at`, as its
-// walk bent it.
+// The slopes (`unit_slope`) a job's walk from `point` refracts by at its surfaces, as halves, one
+// a lane: a hash of the point and `r`'s frame draws them.
+public uint4 job_slopes(PathRoot r, float3 point)
+{
+    uint4 bits = pcg4d(uint4(asuint(point), r.frame ^ r.seed ^ MANIFOLD_STREAM));
+    return uint4(job_slope(bits.x), job_slope(bits.y), job_slope(bits.z), job_slope(bits.w));
+}
+
+// A slope (`unit_slope`) from the two halves of `bits`, as two halves.
+uint job_slope(uint bits)
+{
+    return as_halves(unit_slope(float2(unit_float(bits & 0xffff0000u), unit_float(bits << 16))));
+}
+
+// Separates a manifold walk's slopes from the path's other draws.
+static const uint MANIFOLD_STREAM = 0x2c1b3c6d;
+
+// The direction toward the light at the vertex of the bent job whose manifold words are `at`, as
+// its walk bent it.
 float3 bent_direction(uint4* at)
 {
-    return asfloat(load_coherent(at + STACK_BEND_WORD).xyz);
+    return asfloat(load_coherent(at + MANIFOLD_BEND_WORD).xyz);
 }
 
-// Adds to the path in hot words `hot` the light of its bent job, whose stack words are `at`, which
-// the vertex's scatter gives `f` toward the bent direction, at density `pdf` there, where the
-// light comes from a side it takes light from (`sides`): through the stack's density at the
-// vertex, against the job's own.
-void bent_add(uint4* at, uint4* hot, float3 f, float pdf, bool sides)
+// Adds to the path in hot words `hot` the light of its bent job, whose manifold words are `at`,
+// which the vertex's scatter gives `f` toward the bent direction, `diffuse` of it by its diffuse
+// lobes, where the light comes from a side it takes light from (`sides`): through the walk's
+// density at the vertex. The estimate owns the light along its chains, which the rays and photons
+// past the surfaces it crosses take none of (`manifold_miss`, `start_photon_check`), so it takes no
+// weight against them; where it owns them at the point its gather drew but not at the vertex, or
+// the reverse (`trace_shadow`, the light's sign bits), it takes the diffuse share or the rest alone.
+void bent_add(PathRoot r, uint slot, uint4* at, uint4* hot, float3 f, float3 diffuse, bool sides)
 {
     if (!sides)
         return;
-    float density = asfloat(load_coherent(at + STACK_BEND_WORD).w);
-    float4 light = asfloat(load_coherent(at + STACK_BENT_WORD + 3));
-    float4 through = asfloat(load_coherent(at + STACK_THROUGH_WORD));
-    float mis = light.w < 0.0 ? 1.0 : mis_balance(light.w, pdf * density);
+    uint4 word = load_coherent(at + MANIFOLD_BENT_WORD + 3);
+    float3 light = abs(asfloat(word.xyz));
+    float3 own = (word.x & 0x80000000u) != 0 ? float3(0.0) : diffuse;
+    if ((word.y & 0x80000000u) == 0)
+        own += f - diffuse;
+    float4 through = asfloat(load_coherent(at + MANIFOLD_THROUGH_WORD));
     float4 radiance = asfloat(load_coherent(hot + 3));
-    store_coherent(hot + 3, asuint(float4(radiance.xyz + light.xyz * f * through.xyz * (through.w * mis), radiance.w)));
+    float3 added = light * own * through.xyz * through.w;
+    store_coherent(hot + 3, asuint(float4(radiance.xyz + added, radiance.w)));
+    // A sphere, point or rect light's walk feeds the light back as its shadow job would.
+    if (may(MAY_LOCAL_LIGHTS))
+    {
+        uint id = load_coherent(at + MANIFOLD_FROM_WORD).w >> MANIFOLD_LIGHT_SHIFT;
+        if (id != 0)
+            path_feedback(r, slot, id - 1, luminance_rec2020(added));
+    }
 }
 
-// Whether the ray of `slot`'s path in hot words `at`, whose first word is `w0`, that a layer's
-// vertex passes on across a plane stack face of unit normal `face`, which `code` encodes, from a
-// medium of IOR `ior`, is
-// weighed on as the ray that reached the face toward a directional light: one that a vertex's
-// scatter left, whose ray the stack words then keep, or one that crossed parallel faces past one,
-// fewer than STACK_CROSSINGS. Its density word says so (`PDF_STACK`).
-bool stack_track(PathRoot r, uint slot, uint4* at, uint4 w0, float3 face, uint code, float ior)
+// The slope (`facet_slope`) about vertex `x`'s shading normal on its material's front side of the
+// microfacet normal that refracts its view into `wi` by its BSDF `b`, over the alpha the BSDF's
+// microfacets take (`unit_slope`): 0 for a mirror.
+float2 face_slope(PathVertex x, Bsdf b, float3 wi)
+{
+    if (b.mirror)
+        return float2(0.0);
+    return facet_slope(x.surface.normal, normalize(x.view + b.eta_refraction * wi)) / b.alpha_iso;
+}
+
+// Whether the ray of `slot`'s path in hot words `at` that reached a surface a manifold walk
+// crosses goes on tracked where the surface passes it on by transmission (`manifold_track`): a
+// vertex's scatter drew it, or it is tracked past fewer than MANIFOLD_CROSSINGS surfaces.
+bool face_tracks(PathRoot r, uint slot, uint4* at)
 {
     if (mode_counts(r).one_technique)
         return false;
-    uint4 w1 = load_coherent(at + 1);
     float pdf = asfloat(load_coherent(at + 3)).w;
-    uint4* track = path_stack(r, slot) + STACK_TRACK_WORD;
-    if (pdf == PDF_STACK)
-    {
-        uint4 k = load_coherent(track + 1);
-        uint crossed = (k.w >> 16) & 0x7;
-        if (crossed == STACK_CROSSINGS || !(abs(dot(face, oct_decode_snorm16(k.z))) >= STACK_PARALLEL))
-            return false;
-        store_coherent(track + 1, uint4(k.xyz, (k.w & ~(0x7u << 16)) | ((crossed + 1) << 16)));
+    if (pdf > 0.0)
         return true;
-    }
-    if (!(pdf > 0.0))
-        return false;
-    // A ray ideal windows passed on left its vertex from the point the cold words keep.
-    float3 origin = asfloat(w0.xyz);
-    if (may2(MAY2_THIN_DIELECTRICS) && (w0.w & HOT_WINDOW) != 0)
-        origin = asfloat(load_coherent(path_cold(r, slot) + COLD_FROM_WORD).xyz);
-    bool medium = may_scatter() && (w0.w & HOT_MEDIUM) != 0;
-    uint depth = min((w0.w >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK, 0x7fu);
-    // The vertex's density of the ray, over the squared IOR it leaves into, which a directional
-    // light's density at the vertex through the stack divides by.
-    store_coherent(track, uint4(asuint(origin), asuint(pdf / (ior * ior))));
-    store_coherent(track + 1, uint4(w1.x, w1.y, code, (w1.w >> 16) | (1u << 16) | (medium ? 1u << 23 : 0u) | (depth << 24)));
-    return true;
+    return pdf <= PDF_TRACKED && track_crossed(load_coherent(path_manifold(r, slot) + MANIFOLD_TRACK_WORD + 1)) < MANIFOLD_CROSSINGS;
 }
 
-// The density of a directional light's direction `dir` that the ray of `slot`'s path met past
-// plane stack faces (`PDF_STACK`) at the vertex that scattered it, which next-event estimation
-// there reaches the light through the stack with: the vertex's over the squared IOR it left into
-// times the stack's density of `dir` there. That vertex's probability of running next-event
-// estimation goes in `run`, its shading normal in `normal`, zero in a medium.
-float stack_density(PathRoot r, uint slot, float3 dir, out float run, out float3 normal)
+// Tracks the ray of `slot`'s path in hot words `at`, whose first word is `w0`, that a surface a
+// manifold walk crosses passes on by transmission at `slope` (`face_slope`), the surface of section
+// material `material` crossed from its front where `front`: from the vertex that scattered it,
+// whose ray, the density it drew the ray at, its normal, its probability of running next-event
+// estimation and, where it is a surface whose jobs past it a ray tracked to it checks, that
+// surface's normal on its view's side (TRACK_NO_FACE for any other), the track keeps, or on past
+// fewer than MANIFOLD_CROSSINGS surfaces since (`face_tracks`). Its density word then says so
+// (`PDF_TRACKED`). For the vertex's job toward light `job` through the surface
+// (MANIFOLD_JOB_CHECK) it leaves the track as the crossing would, but for its count and slope,
+// which go in the check word with the light's id, since the vertex's scatter may cross the surface
+// too or not.
+bool manifold_track(PathRoot r, uint slot, uint4* at, uint4 w0, float2 slope, uint material, bool front, uint job = NO_LIGHT)
 {
-    uint4* track = path_stack(r, slot) + STACK_TRACK_WORD;
-    uint4 a = load_coherent(track);
-    uint4 b = load_coherent(track + 1);
-    float3 face = oct_decode_snorm16(b.z);
-    normal = (b.w & (1u << 23)) != 0 ? float3(0.0) : oct_decode_snorm16(b.y);
-    run = halves(b.w).x;
-    return asfloat(a.w) * abs(dot(dir, face)) / abs(dot(oct_decode_snorm16(b.x), face));
+    if (!face_tracks(r, slot, at))
+        return false;
+    float pdf = asfloat(load_coherent(at + 3)).w;
+    uint4* words = path_manifold(r, slot);
+    uint4* track = words + MANIFOLD_TRACK_WORD;
+    uint4 k;
+    if (pdf > 0.0)
+    {
+        // A ray ideal windows passed on left its vertex from the point the cold words keep.
+        float3 origin = asfloat(w0.xyz);
+        if (may2(MAY2_THIN_DIELECTRICS) && (w0.w & HOT_WINDOW) != 0)
+            origin = asfloat(load_coherent(path_cold(r, slot) + COLD_FROM_WORD).xyz);
+        uint4 w1 = load_coherent(at + 1);
+        bool medium = may_scatter() && (w0.w & HOT_MEDIUM) != 0;
+        uint depth = min((w0.w >> HOT_DEPTH_SHIFT) & HOT_DEPTH_MASK, 0x7fu);
+        store_coherent(track, uint4(asuint(origin), asuint(pdf)));
+        uint4 left = load_coherent(track + 2);
+        uint face = all(left.xyz == asuint(origin)) ? left.w : TRACK_NO_FACE;
+        k = uint4(w1.x, w1.y, face, (w1.w >> 16) | (medium ? TRACK_MEDIUM : 0u) | (depth << TRACK_DEPTH_SHIFT) | ((w0.w & HOT_ANY_SIDE) != 0 ? TRACK_ANY_SIDE : 0u));
+    }
+    else
+        k = load_coherent(track + 1);
+    uint crossed = track_crossed(k);
+    bool checked = job != NO_LIGHT;
+    if (checked)
+        store_coherent(words + MANIFOLD_CHECK_WORD, uint4(as_halves(slope), job, crossed + 1, 0));
+    else
+    {
+        store_coherent(track + 3, with_lane(load_coherent(track + 3), crossed, as_halves(slope)));
+        k.w = (k.w & ~(0x7u << TRACK_CROSSED_SHIFT)) | ((crossed + 1) << TRACK_CROSSED_SHIFT);
+    }
+    store_coherent(track + 4, with_lane(load_coherent(track + 4), crossed, material));
+    k.w |= front ? 1u << (TRACK_FRONTS_SHIFT + crossed) : 0u;
+    store_coherent(track + 1, k);
+    return true;
 }
 
 // Whether a stage's opaque vertices may walk: its BSDF holds the subsurface lobe, which its
@@ -1967,6 +2311,19 @@ void store_job(uint4* at, LightPick k, float3 origin, float3 point, float3 e, ui
     flags |= HOT_SHADOW | (far ? HOT_SHADOW_FAR : 0);
 }
 
+// Leaves a walking job of pick `k` from `point`, whose ray leaves `origin`, where `store_job` left
+// none for want of light along its straight way: a light whose estimate owns every chain to it
+// walks by its seeds whatever that way brings (`seeds_reach`).
+void walk_job(uint4* at, LightPick k, float3 origin, float3 point, inout uint flags)
+{
+    if ((flags & HOT_SHADOW) != 0)
+        return;
+    bool far = !isfinite(k.distance);
+    store_coherent(at + 4, uint4(asuint(origin), 0));
+    store_coherent(at + 5, uint4(asuint(far ? k.dir : point + k.dir * k.distance), 0));
+    flags |= HOT_SHADOW | (far ? HOT_SHADOW_FAR : 0);
+}
+
 // The light of pick `k`, which the vertex's scatter weighs by `k.f`, toward a vertex of
 // `throughput` that runs next-event estimation with probability `run`, weighed against its scatter
 // unless `weight_one`, before the medium toward the light; in `before`, what it is before the
@@ -1976,8 +2333,8 @@ float3 picked_light(PathRoot r, LightPick k, float3 throughput, float run, bool 
     float3 radiance = k.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(r.set, k.light, k.dir) : k.radiance;
     float W = k.sum / (float(k.drawn) * k.target);
     float mis = weight_one ? 1.0 : nee_weight(k.kind, run * k.pdf, k.scatter_pdf);
-    before = throughput * radiance * (W / run);
-    return before * k.f * mis;
+    before = walk_weight(k, throughput, radiance, W / run);
+    return throughput * radiance * (W / run) * k.f * mis;
 }
 
 // Survival of Russian roulette past the root's roulette depth, at the `opaque`th scatter, by the
@@ -2108,31 +2465,31 @@ public void path_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
     if (may(MAY_REFERENCE) && may(MAY_MEDIUM) && words.y == MEDIUM_FLIGHT && !linked_flight<M>(r, slot, words))
         return;
     uint word = words.x;
-    // A re-run (`MEDIUM_BENT`) weighs the light of the job the vertex left where a plane stack
+    // A re-run (`MEDIUM_BENT`) weighs the light of the job the vertex left where a manifold walk
     // bent it, from the words the vertex started with.
     uint kind = words.y;
     uint4* at = path_hot(r, slot);
     bool bent = false;
-    uint4* stack = at;
+    uint4* walk = at;
     uint4* start = at;
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         bent = (kind & MEDIUM_BENT) != 0;
         kind &= ~MEDIUM_BENT;
-        stack = path_stack(r, slot);
+        walk = path_manifold(r, slot);
         if (bent)
-            start = stack + STACK_BENT_WORD;
+            start = walk + MANIFOLD_BENT_WORD;
     }
     uint4 w0 = load_coherent(start);
     uint4 w1 = load_coherent(at + 1);
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
             w1 = uint4(load_coherent(start + 2).xy, as_halves(float2(1.0)), as_halves(float2(1.0)));
     }
     uint flags = w0.w;
     bool along = (flags & HOT_COUNTED) != 0;
-    flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE | HOT_WINDOW);
+    flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE | HOT_WINDOW | HOT_ANY_SIDE);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
     bool capped = kind == MEDIUM_CAPPED;
     bool walked = capped || words.w != 0;
@@ -2145,7 +2502,7 @@ public void path_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
     rng.dimension = flags >> HOT_DIMENSION_SHIFT;
     ModeCounts mode = mode_counts(r);
     // A re-run ends in no cache and draws no light.
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
         {
@@ -2257,10 +2614,10 @@ public void path_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
         float unused;
         wi = M.sample_phase(r.scene.medium, at_point, dir, u.xyz, unused);
     }
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
-            wi = bent_direction(stack);
+            wi = bent_direction(walk);
     }
     float3 scatter_f;
     float scatter_pdf;
@@ -2268,11 +2625,11 @@ public void path_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
     bool estimates = mode.count_nee && counted && r.bounce_candidates > 0;
     float3 unused;
     LightPick k = pick_light<false>(r, scatter, point, normal, pixel, r.bounce_candidates, estimates, false, bent || !capped, wi, scatter_f, scatter_pdf, scatter_diffuse, rng, false, float3(0.0), unused);
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
         {
-            bent_add(stack, at, scatter_f, scatter_pdf, true);
+            bent_add(r, slot, walk, at, scatter_f, float3(0.0), true);
             return;
         }
     }
@@ -2290,22 +2647,24 @@ public void path_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
         float3 e = picked_light(r, k, throughput, 1.0, weight_one, before);
         // The medium toward the light: the interior's, or past the surface out of every interior
         // the linked medium's, whose transmittance the environment's map holds of its own. A
-        // directional light may come through a plane stack, whose walk takes the interior's
-        // medium along its legs.
-        bool stacked = false;
-        if (may(MAY_STACK))
-            stacked = k.kind == LIGHT_SAMPLE_DIRECTIONAL && r.set.stack_entries != 0 && inside;
-        if (inside && !stacked)
+        // directional light may come through the surfaces of solid glass, which a manifold walk
+        // takes the media along.
+        bool walks = false;
+        if (may2(MAY2_MANIFOLDS))
+            walks = walks_kind(k.kind) && path_manifolds(r);
+        if (inside && !(walks && far_light(k)))
             e *= beer(sigma, k.distance);
         else if (!inside)
             e *= linked_toward<M>(r, origin, k);
         store_job(at, k, origin, point, e, beyond, flags, job_blue, job_light);
-        if (may(MAY_STACK))
+        if (may2(MAY2_MANIFOLDS))
         {
-            if (stacked && any(e > 0.0))
+            if (walks && (seeds_reach(r, k, point, origin) || any(before > 0.0) && (inside || glass_along(r, origin, k.dir))))
             {
-                job_light = STACK_JOB_LIGHT;
-                stack_job(stack, STACK_COLD_LIST, Interior(), point, w0, w1, words, 0.0, BENT_MEDIUM, before, weight_one ? -1.0 : k.pdf);
+                walk_job(at, k, origin, point, flags);
+                job_light = inside ? MANIFOLD_JOB_INSIDE : MANIFOLD_JOB_OUTSIDE;
+                keep_ray(r, slot, w0, w1, words, 0.0, BENT_MEDIUM);
+                manifold_job(r, slot, walk_source(k, inside ? MANIFOLD_LIST_COLD : MANIFOLD_LIST_NONE), point, float3(0.0), before, 0, false);
             }
         }
     }
@@ -2340,7 +2699,7 @@ public void path_medium_vertex<M : IMedium>(PathRoot r, uint slot, inout uint4 w
 // its surface (`path_walk_meets`): the parameters its BSDF there is prepared from, its shading
 // and geometric normals on the material's front side, the view along which the walk reached it,
 // the IOR outside it and the payload its hit was invoked with; and what the callable hands back:
-// in `next`, which on the way in is 1 for a re-run that weighs the light of the job a plane stack
+// in `next`, which on the way in is 1 for a re-run that weighs the light of the job a manifold walk
 // bent, `PAYLOAD_GOES_ON` where the walk goes on, and the IOR of the medium the vertex's shadow
 // job lies in.
 public struct WalkMeetCall
@@ -2497,30 +2856,30 @@ public void path_walk_meets<M : IMedium>(PathRoot r, uint slot, inout WalkMeetCa
 {
     uint4* at = path_hot(r, slot);
     uint4* cold = path_cold(r, slot);
-    // A re-run weighs the light of the job the vertex left where a plane stack bent it, from the
+    // A re-run weighs the light of the job the vertex left where a manifold walk bent it, from the
     // words the vertex started with, whose ray reached the surface, and the draw it kept.
     bool bent = false;
-    uint4* stack = at;
-    if (may(MAY_STACK))
+    uint4* walk = at;
+    if (may2(MAY2_MANIFOLDS))
     {
         bent = c.next != 0;
-        stack = path_stack(r, slot);
+        walk = path_manifold(r, slot);
     }
     c.next = 0;
     c.job_exterior = 0.0;
     uint4 w0 = load_coherent(at);
     uint4 w1 = load_coherent(at + 1);
     float4 step = asfloat(load_coherent(cold + COLD_STEP_WORD));
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
         {
-            uint4* kept = stack + STACK_BENT_WORD;
+            uint4* kept = walk + MANIFOLD_BENT_WORD;
             w0 = load_coherent(kept);
             w1 = uint4(load_coherent(kept + 2).xy, as_halves(float2(1.0)), as_halves(float2(1.0)));
         }
     }
-    uint flags = w0.w & ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE | HOT_WINDOW);
+    uint flags = w0.w & ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE | HOT_WINDOW | HOT_ANY_SIDE);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
     float3 travel = oct_decode_snorm16(w1.x);
     // The hot words hold the walk's step as the ray that reached the surface.
@@ -2536,7 +2895,7 @@ public void path_walk_meets<M : IMedium>(PathRoot r, uint slot, inout WalkMeetCa
     rng.dimension = flags >> HOT_DIMENSION_SHIFT;
     ModeCounts mode = mode_counts(r);
     // A re-run draws no light.
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
             mode.count_nee = false;
@@ -2577,7 +2936,7 @@ public void path_walk_meets<M : IMedium>(PathRoot r, uint slot, inout WalkMeetCa
         }
         if (first.delta)
             chance = b.drawn_sample(first, float3(0.0), 0.0, float3(0.0)).pdf;
-        if (may(MAY_STACK))
+        if (may2(MAY2_MANIFOLDS))
             store_coherent(cold + COLD_DRAW_WORD, uint4(drew, asuint(draws), asuint(chance), 0));
     }
     else
@@ -2644,10 +3003,10 @@ public void path_walk_meets<M : IMedium>(PathRoot r, uint slot, inout WalkMeetCa
         float3 dir = first.wi;
         if (light)
             dir = k.dir;
-        if (may(MAY_STACK))
+        if (may2(MAY2_MANIFOLDS))
         {
             if (light && bent)
-                dir = bent_direction(stack);
+                dir = bent_direction(walk);
         }
         float density;
         float3 f = scatter.value(dir, light, density);
@@ -2662,11 +3021,11 @@ public void path_walk_meets<M : IMedium>(PathRoot r, uint slot, inout WalkMeetCa
             drawn_pdf = density;
         }
     }
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
         {
-            bent_add(stack, at, k.f, k.scatter_pdf, true);
+            bent_add(r, slot, walk, at, k.f, float3(0.0), true);
             return;
         }
     }
@@ -2681,12 +3040,12 @@ public void path_walk_meets<M : IMedium>(PathRoot r, uint slot, inout WalkMeetCa
         float3 light = picked_light(r, k, throughput, 1.0, weight_one, before);
         // The medium toward the light, past the surface: an outer interior's, or out of every
         // interior the linked medium's, whose transmittance the environment's map holds of its
-        // own. A directional light may come through a plane stack, whose walk takes the
-        // interior's medium along its legs.
-        bool stacked = false;
-        if (may(MAY_STACK))
-            stacked = k.kind == LIGHT_SAMPLE_DIRECTIONAL && r.set.stack_entries != 0 && inside;
-        if (inside && !stacked)
+        // own. A directional light may come through the surfaces of solid glass, which a manifold
+        // walk takes the media along.
+        bool walks = false;
+        if (may2(MAY2_MANIFOLDS))
+            walks = walks_kind(k.kind) && path_manifolds(r);
+        if (inside && !(walks && far_light(k)))
             light *= beer(sigma, k.distance);
         else if (!inside)
             light *= linked_toward<M>(r, origin, k);
@@ -2694,16 +3053,14 @@ public void path_walk_meets<M : IMedium>(PathRoot r, uint slot, inout WalkMeetCa
         // The job's ray lies outside the walk's interior, whose walls take that medium's IOR.
         if (may(MAY_INTERIORS) && may2(MAY2_THIN_DIELECTRICS))
             c.job_exterior = interior_ior(r.scene, beyond);
-        if (may(MAY_STACK))
+        if (may2(MAY2_MANIFOLDS))
         {
-            if (stacked && any(light > 0.0))
+            if (walks && (seeds_reach(r, k, point, origin) || any(before > 0.0) && (inside || glass_along(r, origin, k.dir))))
             {
-                job_light = STACK_JOB_LIGHT;
-                // A re-run traces the walk's step to the surface again, with the cover its hit
-                // had, whose draw its invoke took out of the payload.
-                uint4 cover = c.input;
-                cover.y = cover_draw(r, pixel, path_cover(c.input).context.depth);
-                stack_job(stack, leaves ? STACK_COLD_LIST : STACK_COLD_OUT, Interior(), point, w0, w1, cover, step.w, BENT_HIT, before, weight_one ? -1.0 : k.pdf);
+                walk_job(at, k, origin, point, flags);
+                job_light = inside ? MANIFOLD_JOB_INSIDE : MANIFOLD_JOB_OUTSIDE;
+                keep_ray(r, slot, w0, w1, c.input, step.w, BENT_HIT);
+                manifold_job(r, slot, walk_source(k, !inside ? MANIFOLD_LIST_NONE : leaves ? MANIFOLD_LIST_COLD : MANIFOLD_LIST_COLD_OUT), point, c.normal, before, 0, false);
             }
         }
     }
@@ -2771,24 +3128,24 @@ float3 surface_ray_origin(PathRoot r, float3 point, float3 n, float3 dir)
 void path_exit_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathVertex x, float2 cone, uint4 input)
 {
     bool capped = input.x != 0;
-    // A re-run weighs the light of the job the vertex left where a plane stack bent it, from the
+    // A re-run weighs the light of the job the vertex left where a manifold walk bent it, from the
     // words the vertex started with.
     bool bent = false;
-    uint4* stack = at;
+    uint4* walk = at;
     uint4* start = at;
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         bent = input.y == PAYLOAD_BENT;
-        stack = path_stack(r, slot);
+        walk = path_manifold(r, slot);
         if (bent)
-            start = stack + STACK_BENT_WORD;
+            start = walk + MANIFOLD_BENT_WORD;
     }
     uint4 w0 = load_coherent(start);
     uint4 w1 = load_coherent(at + 1);
-    uint flags = w0.w & ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE | HOT_WINDOW);
+    uint flags = w0.w & ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA | HOT_MEDIUM | HOT_DIFFUSE | HOT_WINDOW | HOT_ANY_SIDE);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
     float3 throughput = hot_throughput(w1);
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
             throughput = float3(1.0);
@@ -2804,7 +3161,7 @@ void path_exit_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathVertex 
     rng.dimension = flags >> HOT_DIMENSION_SHIFT;
     ModeCounts mode = mode_counts(r);
     // A re-run draws no light.
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
             mode.count_nee = false;
@@ -2824,10 +3181,10 @@ void path_exit_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathVertex 
     float3 tangent, bitangent;
     orthonormal_basis(f.n, tangent, bitangent);
     float3 wi = normalize(from_local(sample_cosine_hemisphere(u.xy), tangent, bitangent, f.n));
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
-            wi = bent_direction(stack);
+            wi = bent_direction(walk);
     }
     float3 scatter_f;
     float scatter_pdf;
@@ -2847,11 +3204,11 @@ void path_exit_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathVertex 
             call_map_gather(m);
         }
     }
-    if (may(MAY_STACK))
+    if (may2(MAY2_MANIFOLDS))
     {
         if (bent)
         {
-            bent_add(stack, at, scatter_f, scatter_pdf, sides_agree(g.normal, g.geometric_normal, wi));
+            bent_add(r, slot, walk, at, scatter_f, float3(0.0), sides_agree(g.normal, g.geometric_normal, wi));
             return;
         }
     }
@@ -2863,22 +3220,24 @@ void path_exit_vertex<M : IMedium>(PathRoot r, uint slot, uint4* at, PathVertex 
         float3 before;
         float3 e = picked_light(r, k, throughput, 1.0, mode.one_technique, before);
         bool inside = may(MAY_INTERIORS) && (flags & HOT_INTERIOR) != 0;
-        // A directional light may come through a plane stack, whose walk takes the interior's
-        // medium along its legs.
-        bool stacked = false;
-        if (may(MAY_STACK))
-            stacked = k.kind == LIGHT_SAMPLE_DIRECTIONAL && r.set.stack_entries != 0 && inside;
-        if (inside && !stacked)
+        // A directional light may come through the surfaces of solid glass, which a manifold walk
+        // takes the media along.
+        bool walks = false;
+        if (may2(MAY2_MANIFOLDS))
+            walks = walks_kind(k.kind) && path_manifolds(r);
+        if (inside && !(walks && far_light(k)))
             e *= beer(interior_sigma(path_cold(r, slot)), k.distance);
         else if (!inside)
             e *= linked_toward<M>(r, origin, k);
         store_job(at, k, origin, g.position, e, inside ? PATH_MEDIUM : MATERIAL_NONE, flags, job_blue, job_light);
-        if (may(MAY_STACK))
+        if (may2(MAY2_MANIFOLDS))
         {
-            if (stacked && any(e > 0.0))
+            if (walks && (seeds_reach(r, k, g.position, origin) || any(before > 0.0) && (inside || glass_along(r, origin, k.dir))))
             {
-                job_light = STACK_JOB_LIGHT;
-                stack_job(stack, STACK_COLD_LIST, Interior(), g.position, w0, w1, input, 0.0, BENT_EXIT, before, mode.one_technique ? -1.0 : k.pdf);
+                walk_job(at, k, origin, g.position, flags);
+                job_light = inside ? MANIFOLD_JOB_INSIDE : MANIFOLD_JOB_OUTSIDE;
+                keep_ray(r, slot, w0, w1, input, 0.0, BENT_EXIT);
+                manifold_job(r, slot, walk_source(k, inside ? MANIFOLD_LIST_COLD : MANIFOLD_LIST_NONE), g.position, g.normal, before, 0, false);
             }
         }
     }
@@ -2922,12 +3281,72 @@ public void path_hit<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>
         path_hit_as<S, M, H, T, false, false>(r, slot, payload, material, h);
 }
 
+// The face step of `slot`'s manifold walk at hit `h` of its face ray on solid glass, which a face
+// ray's hit object runs in place of its path record's shader (`face_ray`), so no stage that runs a
+// vertex holds any of it: the surface resolved with how it changes about the hit
+// (`SurfaceChange`), which on a surface of CHANGE_RESOLVED takes two more resolves at shifts of
+// the hit, then the hit's once more last, so nothing of its first resolve is kept across the
+// others; and the manifold callable's step there. The payload holds the face ray's path depth in
+// its second word, and takes the step's answer.
+public void path_face_hit<S : ISurfaces, H : IHit, T : ISectionMaterial>(PathRoot r, uint slot, inout uint4 payload, T material, H h)
+{
+    uint depth = payload.y;
+    payload = uint4(STEP_DARK, 0, 0, 0);
+    uint2 pixel = item_pixel(r, r.slice_base + slot);
+    float3 dir = h.world_direction();
+    RayCone cone = { 0.0, 0.0 };
+    HitContext context = hit_context(HIT_SECONDARY, depth, cone, h.t(), texture_tap(r.view, pixel, r.frame, r.seed, depth), false);
+    float3 positions[3] = { h.corner(0), h.corner(1), h.corner(2) };
+    float2 bary = h.barycentrics();
+    float2 shift = float2(0.0);
+    TracedTriangle tri;
+    HitTriangle traced;
+    SurfaceHit sh;
+    uint kind = CHANGE_PLAIN;
+    uint passes = 1;
+    float3 moved_t = float3(0.0);
+    float3 moved_b = float3(0.0);
+    float4 shifted_t = float4(0.0);
+    float4 shifted_b = float4(0.0);
+    uint k = 0;
+    do
+    {
+        sh = resolve_hit_input<S, T, false>(r.scene, r.view, dir, h.instance_index(), uint(h.cluster_id()), h.primitive_index(), k == 1 ? bary + float2(shift.x, 0.0) : k == 2 ? bary + float2(0.0, shift.y) : bary, positions, false, context, material, traced, tri);
+        if (k == 0 && sh.valid)
+        {
+            kind = change_kind(r.scene, tri.material);
+            if (kind == CHANGE_RESOLVED && walk_crosses(r, sh))
+            {
+                passes = 4;
+                shift = resolve_shifts(r.scene, tri, bary);
+            }
+        }
+        float4 resolved = float4(sh.surface.normal, sh.surface.bsdf.specular_roughness * sh.surface.bsdf.specular_roughness);
+        if (k == 1)
+        {
+            moved_t = sh.surface.position;
+            shifted_t = resolved;
+        }
+        if (k == 2)
+        {
+            moved_b = sh.surface.position;
+            shifted_b = resolved;
+        }
+        k++;
+    } while (k < passes);
+    if (!(sh.valid && walk_crosses(r, sh)))
+        return;
+    GSurface g = sh.surface;
+    float4 at = float4(g.normal, g.bsdf.specular_roughness * g.bsdf.specular_roughness);
+    float3 moved[2] = { moved_t - g.position, moved_b - g.position };
+    float4 shifted[2] = { shifted_t - at, shifted_b - at };
+    payload = face_step(r, slot, sh, surface_change(r.scene, tri, kind, bary, positions, false, g, moved, shifted));
+}
+
 // `path_hit` of a hit `h` on a layer of the dielectric class: what the hit shader of such a
 // surface runs, its vertex crossing into or out of the interior its material bounds.
 // A thin wall's hit invoked with a window payload (`window_payload`) runs no vertex: it hands back
-// what the wall lets straight through in the payload's first three words; nor does a stack ray's
-// hit invoked with the stack question (`is_stack_question`), whose answer goes into the path's
-// stack words.
+// what the wall lets straight through in the payload's first three words.
 public void path_layer_hit<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial>(PathRoot r, uint slot, inout uint4 payload, T material, H h)
 {
     if (may(MAY_EMITTER))
@@ -2941,20 +3360,9 @@ void path_hit_as<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial, let
 {
     uint4* at = path_hot(r, slot);
     uint2 pixel = item_pixel(r, r.slice_base + slot);
-    // A stack ray's hit asks whether it is on a plane stack face (the stack question), which only a
-    // layer's stage holds and answers from the surface it resolves.
-    bool asks = false;
     bool bent = false;
-    if (may(MAY_STACK))
-    {
-        asks = is_stack_question(payload);
-        if (!LAYER && asks)
-        {
-            payload = NO_STACK_FACE;
-            return;
-        }
+    if (may2(MAY2_MANIFOLDS))
         bent = payload.y == PAYLOAD_BENT;
-    }
     // The ray's cone rides in its cover, so the surface resolves before the path's state loads.
     PathCover c = path_cover(payload);
     float t = h.t();
@@ -2962,26 +3370,14 @@ void path_hit_as<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial, let
     RayCone cone = { c.context.cone_width, c.context.cone_spread };
     HitContext context = hit_context(c.context.kind, c.context.depth, cone, t, texture_tap(r.view, pixel, r.frame, r.seed, c.context.depth), c.context.feedback, c.context.weighed);
     float3 positions[3] = { h.corner(0), h.corner(1), h.corner(2) };
-    // An emitter's light is weighed by its triangle as light sampling reads it, and a plane stack
-    // face is flat.
+    // An emitter's light is weighed by its triangle as light sampling reads it.
     HitTriangle traced;
-    SurfaceHit sh = resolve_hit_traced<FeedbackSurface<S>, T, EMITTER, LAYER>(r.scene, r.view, dir, h.instance_index(), uint(h.cluster_id()), h.primitive_index(), h.barycentrics(), positions, false, context, material, traced);
-    // A layer's vertex asks whether it lies on a plane stack face where its path's ray may go on
-    // weighed against next-event estimation through a stack, whose face it may cross.
-    // A face's material reads no texture, so its surface is the material's own: the stack's
-    // (`stack_material`).
-    bool on_stack = false;
-    if (LAYER && may(MAY_STACK))
-    {
-        bool tracks = asks || (!bent && !is_question(payload) && path_stacks(r) && (from_photon(r) ? photon_tracks(r, slot) : stack_tracked_ray(at)));
-        SceneRoot* s = r.scene;
-        on_stack = tracks && sh.valid && traced.flat && s.decal_globals == 0 && s.decal_bin_slots == 0 && (s.materials[sh.section].flags & MATERIAL_STACK_FACE) != 0 && bsdf_thin_mirror(sh.surface.bsdf, AMBIENT_IOR);
-        if (asks)
-        {
-            payload = stack_answer(on_stack, sh);
-            return;
-        }
-    }
+    SurfaceHit sh = resolve_hit_traced<FeedbackSurface<S>, T, EMITTER>(r.scene, r.view, dir, h.instance_index(), uint(h.cluster_id()), h.primitive_index(), h.barycentrics(), positions, false, context, material, traced);
+    // A layer's vertex says whether it lies on a surface a manifold walk crosses, which a ray its
+    // transmission passes on may cross weighed against next-event estimation at the vertex before.
+    bool face = false;
+    if (LAYER && may2(MAY2_MANIFOLDS))
+        face = path_manifolds(r) && sh.valid && walk_crosses(r, sh);
     if (!sh.valid)
     {
         uint4 w0 = load_coherent(at);
@@ -3001,7 +3397,7 @@ void path_hit_as<S : ISurfaces, M : IMedium, H : IHit, T : ISectionMaterial, let
         write_primary(r, slot, pixel, sh);
     float2 footprint = float2(cone_width(cone, t), cone.spread);
     PathVertex x;
-    OnLayer on = { LayerVertex(), on_stack, sh.surface.normal };
+    OnLayer on = { LayerVertex(), face };
     if (LAYER)
     {
         on.l = layer_vertex(r.view, sh, dir);
@@ -3142,41 +3538,47 @@ public uint4 window_payload(float exterior, float2 cone)
 
 public bool is_window(uint4 payload)
 {
-    // Where the pipeline may meet a stack, the stack question's second word is 0.
-    if (may(MAY_STACK))
-        return all(bool2(payload.x == 0, payload.y != 0));
     return payload.x == 0;
 }
 
 // Whether a hit is invoked with a question its shader answers in place of running a vertex: a
-// window's or the stack question, whose second word is 0.
+// window's.
 public bool is_question(uint4 payload)
 {
     return payload.x == 0;
 }
 
-// The stack question's answer where the hit is on no plane stack's face.
-public static const uint4 NO_STACK_FACE = uint4(0, 0, MATERIAL_NONE, 0);
-
-public bool is_stack_question(uint4 payload)
+// Whether surface `sh` is one `r`'s manifold walks cross: of solid glass, whose material bounds an
+// interior, that transmits, and not dispersive where the paths split by wavelength at one, whose
+// rays then follow the hero's refraction alone.
+public bool walk_crosses(PathRoot r, SurfaceHit sh)
 {
-    return payload.x == 0 && payload.y == 0;
+    BsdfParams p = sh.surface.bsdf;
+    return crosses_interior(r.scene, sh.section) && (p.flags & BSDF_THIN_WALLED) == 0 && (1.0 - p.metalness) * p.transmission_weight > 0.0
+        && !(path_disperses(r) && disperses(r.scene, sh.section));
 }
 
-// Whether the ray of the path in hot words `at` may cross a plane stack face weighed as a
-// vertex's ray toward a directional light: a vertex's scatter drew it, or it crossed faces since.
-bool stack_tracked_ray(uint4* at)
-{
-    float pdf = asfloat(load_coherent(at + 3)).w;
-    return pdf > 0.0 || pdf == PDF_STACK;
-}
-
-// The stack question's answer of a layer's hit on surface `sh`, `face` where it is a plane stack's
-// face: its shading and geometric normals, its material and its rounding error.
-uint4 stack_answer(bool face, SurfaceHit sh)
+// The face step of a face question's hit on surface `sh` of `slot`'s path, a surface a walk
+// crosses (`walk_crosses`), which changes about the hit as `change` says: what the manifold
+// callable answers.
+uint4 face_step(PathRoot r, uint slot, SurfaceHit sh, SurfaceChange change)
 {
     GSurface g = sh.surface;
-    return uint4(oct_encode_snorm16(g.normal), oct_encode_snorm16(g.geometric_normal), face ? sh.section : MATERIAL_NONE, asuint(sh.geometric_error));
+    ManifoldStep c;
+    c.answer = uint4(STEP_DARK, 0, 0, 0);
+    c.bary = change.bary;
+    c.bary_change = change.bary_change;
+    c.normal = float4(change.normal, 0.0);
+    c.geometric = float4(g.geometric_normal, sh.geometric_error);
+    c.gradient_t = float4(change.normal_t, change.alpha_t);
+    c.gradient_b = float4(change.normal_b, change.alpha_b);
+    c.at = float4(g.position, asfloat(sh.section));
+    c.p = g.bsdf;
+    if ((r.scene.materials[sh.section].flags & MATERIAL_MEDIUM_TEXTURED) != 0)
+        store_coherent(path_manifold(r, slot) + WALK_MEDIUM, asuint(g.medium_point));
+    FaceCall f = face_call(c);
+    call(CALL_MANIFOLD_FACE, f);
+    return f.normal;
 }
 
 // Writes into the record of `slot`'s view path that its first vertex is a layer `distance` m from
@@ -3211,7 +3613,7 @@ public void path_first<M : IMedium>(PathRoot r, uint slot, inout uint4 payload)
     // A re-run of the vertex for its bent job's light reads none of them.
     uint4 w2 = load_coherent(at + 2);
     bool behind = w2.z != 0;
-    if (!(may(MAY_STACK) && payload.y == PAYLOAD_BENT))
+    if (!(may2(MAY2_MANIFOLDS) && payload.y == PAYLOAD_BENT))
         store_coherent(at + 2, uint4(w2.xy, 0, w2.w));
     float exterior;
     payload.y = path_vertex<M, 1, GBufferLight, OnOpaque, false>(r, slot, at, x, -x.view, behind ? 0.0 : x.camera_distance, footprint, GBufferLight(), OnOpaque(), payload, exterior);
@@ -3230,7 +3632,7 @@ public void path_first_view<S : ISurfaces>(PathRoot r, uint slot)
 }
 
 // Adds to a view path's record that light `id` gave it `contribution` of luminance.
-void path_feedback(PathRoot r, uint slot, uint id, float contribution)
+public void path_feedback(PathRoot r, uint slot, uint id, float contribution)
 {
     if (!from_view(r) || !view_light_counts(contribution))
         return;
@@ -3265,21 +3667,22 @@ public void path_sky<E : IEnvironment>(PathRoot r, inout uint4 words)
 }
 
 // What `slot`'s path ray that met nothing adds: the environment along it and the directional
-// lights' discs, each weighed against next-event estimation at the vertex the ray left. A ray past
-// plane stack faces weighs a disc against next-event estimation at the vertex before them where
-// its probe found the stack there, `stack_owned`, as its raygen says.
+// lights' discs, each weighed against next-event estimation at the vertex the ray left. A ray
+// tracked past the surfaces of solid glass (`PDF_TRACKED`) takes a disc whole, its last surface
+// having taken no directional light through itself, but none where an estimate at the vertex
+// before them owns its light (`owned`, as its raygen's check says), which takes it whole.
 //
 // The reference's environment is its exact radiance, a draw in the sky callable that the raygen
 // makes once the miss returns (`path_sky_after_miss`), so the miss calls nothing and keeps no
-// stack: the miss returns what that radiance is weighed by, the path's throughput there by its
+// manifold words: the miss returns what that radiance is weighed by, the path's throughput there by its
 // weight against next-event estimation, with SKY_PENDING in w. It returns zeros where the
 // environment adds nothing.
-public uint4 path_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, bool stack_owned)
+public uint4 path_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, bool owned)
 {
     uint4 pending = uint4(0);
     uint4* at = path_hot(r, slot);
     PathHot p = load_hot(at);
-    if (may_scatter() && (p.flags & HOT_MEDIUM) != 0)
+    if ((may_scatter() && (p.flags & HOT_MEDIUM) != 0) || (may2(MAY2_MANIFOLDS) && (p.flags & HOT_ANY_SIDE) != 0))
         p.normal = float3(0.0);
     LightSetGpu* set = r.set;
     ModeCounts mode = mode_counts(r);
@@ -3290,6 +3693,12 @@ public uint4 path_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, boo
     p.flags &= ~(HOT_RAY | HOT_SHADOW | HOT_SHADOW_FAR | HOT_CAMERA);
     if (camera && traces_primary(r))
         write_primary_sky(r, item_pixel(r, r.slice_base + slot), p.dir);
+    bool tracked = false;
+    if (may2(MAY2_MANIFOLDS))
+    {
+        tracked = p.pdf <= PDF_TRACKED;
+        p.pdf = ray_density(p.pdf);
+    }
     if ((p.flags & HOT_COUNTED) != 0 && (mode.count_bsdf || camera))
     {
         bool weigh = !mode.one_technique && p.pdf > 0.0;
@@ -3310,8 +3719,8 @@ public uint4 path_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, boo
         }
         if (may(MAY_DIRECTIONAL))
         {
-            // Past chain vertices the photons own a directional light's, but where next-event
-            // estimation reaches it through a plane stack.
+            // Past chain vertices the photons own a directional light's, but where a manifold
+            // estimate owns it.
             float3 own = float3(1.0);
             if (path_caustics(r) && !camera)
                 own = load_chain(path_chain(r, slot), false).owned();
@@ -3321,19 +3730,19 @@ public uint4 path_miss<M : IMedium, E : IEnvironment>(PathRoot r, uint slot, boo
                 float3 d = directional_disc<M>(set, id, p.origin, p.dir);
                 if (!any(d > 0.0) || lit)
                     continue;
-                // Past plane stack faces the disc is weighed as the vertex before them drew it.
                 float pdf = p.pdf;
                 float run = abs(p.run);
                 float3 normal = p.normal;
                 bool weighs = weigh;
                 float3 kept = own;
-                if (may(MAY_STACK))
+                if (may2(MAY2_MANIFOLDS))
                 {
-                    if (stack_owned && p.pdf == PDF_STACK)
+                    // An estimate that owns the light takes it whole, and the ray none.
+                    if (tracked)
                     {
-                        pdf = stack_density(r, slot, p.dir, run, normal);
-                        weighs = true;
-                        kept = float3(1.0);
+                        weighs = false;
+                        if (owned)
+                            kept = float3(0.0);
                     }
                 }
                 e += d * kept * (weighs ? mis_balance(pdf, run * nee_directional_pdf(set, normal, id, p.dir)) : 1.0);
@@ -3443,8 +3852,10 @@ public static const uint MARCH_FROXELS = 2;
 // toward a ray whose light counts adds to the path's radiance, and what they cover leaves its
 // throughput; the medium's in-scatter in front of a layer is not covered by it. A view path's ray
 // inside a medium that scatters ends where the raygen's draw for its segment (`free_flight`) says
-// it scatters, if that falls before its hit. Whether the path still carries light.
-public bool path_front<M : IMedium>(PathRoot r, uint slot, float t, uint mask, bool view, uint march)
+// it scatters, if that falls before its hit. Whether the path still carries light. A ray tracked
+// past an ideal surface takes the sphere and rect lights the walks' stage decided (`lights_only`
+// for a round of them before the last, which adds their light alone and leaves the path as it is).
+public bool path_front<M : IMedium>(PathRoot r, uint slot, float t, uint mask, bool view, uint march, bool lights_only)
 {
     uint4* at = path_hot(r, slot);
     uint4 w0 = load_coherent(at);
@@ -3493,12 +3904,31 @@ public bool path_front<M : IMedium>(PathRoot r, uint slot, float t, uint mask, b
     LayerCover cover = uncovered();
     if (mask != 0)
     {
-        PathEmission pe = { r.scene, r.set, local, origin, dir, from, left_normal(flags, w1), mode.one_technique ? 0.0 : w3.w, abs(run), end, own, adds };
+        float density = w3.w;
+        bool tracked = false;
+        uint4* owned = nullptr;
+        float2 decided = float2(0.0, positive_infinity());
+        if (may2(MAY2_MANIFOLDS))
+        {
+            tracked = may(MAY_LOCAL_LIGHTS) && density <= PDF_TRACKED;
+            if (tracked)
+            {
+                owned = path_manifold(r, slot) + MANIFOLD_BENT_WORD;
+                decided = asfloat(load_coherent(path_manifold(r, slot) + MANIFOLD_CHECK_WORD).zw);
+            }
+            density = ray_density(density);
+        }
+        PathEmission pe = { r.scene, r.set, local, origin, dir, from, left_normal(flags, w1), mode.one_technique ? 0.0 : density, abs(run), end, own, adds, tracked, owned, decided.x, decided.y, may(MAY_LOCAL_LIGHTS) && lights_only };
         FrontLayers<M> f = { pe, r.scene.medium, inside, drawn, sigma_t, at };
         trace_resolve_translucent(scene_traced(r.scene), path_ray(origin, dir, end), mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, f, PARTICLE_CANDIDATES, layers, cover);
     }
     float3 throughput = hot_throughput(w1);
     w3.xyz += throughput * layers.rgb;
+    if (may(MAY_LOCAL_LIGHTS) && lights_only)
+    {
+        store_coherent(at + 3, asuint(w3));
+        return true;
+    }
     if (march != MARCH_NONE)
     {
         // The march's jitter is the first draw of the hit's vertex, which takes none of the medium.
@@ -3581,6 +4011,6 @@ public void path_shadow_add(PathRoot r, uint slot, float3 added)
     radiance.xyz += added;
     store_coherent(at + 3, asuint(radiance));
     uint light = load_coherent(at + 2).w;
-    if (light != NO_LIGHT && light != STACK_JOB_LIGHT)
+    if (light < MANIFOLD_JOB_CHECK)
         path_feedback(r, slot, light, luminance_rec2020(added));
 }

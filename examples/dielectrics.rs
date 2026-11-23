@@ -9,9 +9,11 @@
 //! patches around the pool, under a ground that grows to cover them, so the producer holds far
 //! more caster area than the pool. A still camera averages its frames in a scene-referred hook.
 //!
-//! `dielectrics [--dive] [--turbid] [--sea N] [--still] [--reference] [--frames N] [--headless]
-//! [--out file.png]`: `--reference` renders the accumulation reference at 64 bounces and 64
-//! dielectric vertices. Headless runs keep the camera still, render 480 x 270 for 120 frames
+//! `dielectrics [--dive] [--turbid] [--sea N] [--still] [--reference] [--photons N]
+//! [--roughness R] [--frames N] [--headless] [--out file.png]`: `--reference` renders the
+//! accumulation reference at 64 bounces and 64 dielectric vertices, `--photons` sets the caustic
+//! photons each frame (0 turns them off) and `--roughness` the water's specular roughness, 0.02
+//! unless told otherwise. Headless runs keep the camera still, render 480 x 270 for 120 frames
 //! unless told otherwise and write the last frame as a PNG.
 
 use std::path::Path;
@@ -127,7 +129,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                 global_instances: 8,
                 ..SceneDesc::default()
             },
-            &SceneLightingSettings::default(),
+            &lighting_settings(options),
         )
         .expect("scene");
     let history = renderer.create_view_history().expect("view history");
@@ -166,7 +168,9 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     let turbid = options.has("--turbid");
     let water = Material {
         base_color: [1.0; 3],
-        specular_roughness: 0.02,
+        specular_roughness: options
+            .value("--roughness")
+            .map_or(0.02, |r| r.parse().expect("--roughness takes a number")),
         specular_ior: 1.333,
         transmission_weight: 1.0,
         transmission_color: orr_examples::rec2020([0.62, 0.86, 0.9]).to_array(),
@@ -365,6 +369,15 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     drop(window);
     gpu.collect_garbage();
     captured
+}
+
+/// The scene's lighting settings: `--photons N` caustic photons each frame.
+fn lighting_settings(options: &Options) -> SceneLightingSettings {
+    let mut settings = SceneLightingSettings::default();
+    if let Some(n) = options.value("--photons") {
+        settings.caustics.photons = n.parse().expect("--photons takes a count");
+    }
+    settings
 }
 
 /// The ground around the pool, out to at least `reach` m from its center, the pool's tiled

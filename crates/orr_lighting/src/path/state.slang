@@ -3,7 +3,7 @@
 //
 // A path's ray, its throughput and its pending shadow job are all a hit's shader leaves for the
 // raygen: the raygen holds the slot's address across a trace or an invoke and nothing of the path.
-// What only some paths need (the interiors a path lies in, a plane stack, wavelengths, a walk)
+// What only some paths need (the interiors a path lies in, a manifold walk, wavelengths, a walk)
 // lives in cold parts of the slot that the shaders of those features load, by the hot flags.
 module state;
 
@@ -36,40 +36,79 @@ public static const uint COLD_FROM_WORD = 18;
 // step's length.
 public static const uint COLD_INTO_WORD = COLD_EXIT_WORD;
 public static const uint COLD_STEP_WORD = COLD_EXIT_WORD + 1;
-// What its draw there did, for a re-run that weighs the light of the job a plane stack bent.
+// What its draw there did, for a re-run that weighs the light of the job a manifold walk bent.
 public static const uint COLD_DRAW_WORD = COLD_EXIT_WORD + 2;
 [Host] public static const uint PATH_HOT_BYTES = 16 * PATH_HOT_WORDS;
-// The words a path keeps where the pipeline may meet a plane stack, apart from its cold ones, for
-// what passes between its shaders through a directional job's walk through a stack: the interior
-// list the walk works on, which the vertex that left the job gives where the job lies in an
-// interior (`STACK_LIST_WORD`, as the cold list holds one); the point the walk's segment starts
-// from with the stack's normal (`STACK_FROM_WORD`), what the walk let through so far with the
-// ratio of the faces' cosines (`STACK_THROUGH_WORD`), and the light's direction at the vertex and
-// its density there (`STACK_BEND_WORD`); what weighs the job's light again where the stack bends
-// it, as the vertex that left the job keeps it (`STACK_BENT_WORD`, four words); and where a path's
-// ray crossed stack faces since its vertex last scattered, that vertex's ray (`STACK_TRACK_WORD`,
-// two words). The face a stack ray meets and the walk's next leg pass in payloads.
-[Host] public static const uint PATH_STACK_WORDS = 14;
-public static const uint STACK_LIST_WORD = 0;
-public static const uint STACK_FROM_WORD = 5;
-public static const uint STACK_THROUGH_WORD = 6;
-public static const uint STACK_BEND_WORD = 7;
-public static const uint STACK_BENT_WORD = 8;
-public static const uint STACK_TRACK_WORD = 12;
-// The last lane of the walk's segment start where the job's list is the path's cold list, which
-// the walk copies, or that list out of the interior a walk of the path's goes through, whose
-// material its walk words keep: a meeting's job lies outside it.
-public static const uint STACK_COLD_LIST = 1;
-public static const uint STACK_COLD_OUT = 2;
-// The light word (NO_LIGHT less one) of a directional job whose ray starts inside an interior,
-// whose medium its light leaves out: the walk through a plane stack takes it, from the list the
-// vertex gave.
-public static const uint STACK_JOB_LIGHT = 0xfffffffeu;
-// The density word of a ray that crossed plane stack faces by ideal transmission since its vertex
-// last scattered, which the stack words keep: it weighs the lights it meets as 0 does, and a
-// directional light's disc against next-event estimation at that vertex where the stack's probe
-// from there owns it.
-public static const float PDF_STACK = -2.0;
+// The words a path keeps where a directional light may reach it through the surfaces of solid
+// dielectrics (`MAY2_MANIFOLDS`), apart from its cold ones, for manifold next-event estimation
+// (`orr_lighting.path.manifold`): the interior list a job's walk starts in, which the vertex that
+// left the job gives where it keeps one of its own (`MANIFOLD_LIST_WORD`); the surface point the
+// walk's first leg leaves, with where its list is (`MANIFOLD_FROM_WORD`, `MANIFOLD_LIST_*`); what
+// the walk let through, with the density of the light's direction at the vertex
+// (`MANIFOLD_THROUGH_WORD`), or for a check's walk the start of the chain it checks; that
+// direction, with the start of the walk its solve last accepted (`MANIFOLD_BEND_WORD`, WALK_ACCEPTED); what
+// weighs the job's light again at its bent direction, as the vertex that left the job keeps it
+// (`MANIFOLD_BENT_WORD`, four words, the last lane of the fourth the IOR of the interior a walk
+// starts in, `MANIFOLD_START_IOR`, and for a check's walk the first lane the probability of
+// next-event estimation at the vertex it asks of, `MANIFOLD_START_NEE`); the track of the surfaces a path's ray or a photon crossed
+// since its vertex last scattered (`MANIFOLD_TRACK_WORD`, five words); and the state of the walk
+// in progress (`MANIFOLD_WALK_WORD`, fifteen words).
+[Host] public static const uint PATH_MANIFOLD_WORDS = 32;
+public static const uint MANIFOLD_BENT_WORD = 0;
+public static const uint MANIFOLD_START_IOR = MANIFOLD_BENT_WORD + 3;
+public static const uint MANIFOLD_START_NEE = MANIFOLD_BENT_WORD + 3;
+public static const uint MANIFOLD_FROM_WORD = 4;
+public static const uint MANIFOLD_THROUGH_WORD = 5;
+public static const uint MANIFOLD_BEND_WORD = 6;
+public static const uint MANIFOLD_LIST_WORD = 7;
+public static const uint MANIFOLD_TRACK_WORD = 12;
+public static const uint MANIFOLD_WALK_WORD = 17;
+// Where a walk's list is, in the last lane of its from word: the job's own list, the path's cold
+// list, that list out of the interior a walk of the path's goes through, whose material its walk
+// words keep (a meeting's job lies outside it), or the cold list back across the surfaces the
+// path's track crossed: the list where the track started.
+public static const uint MANIFOLD_LIST_JOB = 0;
+public static const uint MANIFOLD_LIST_COLD = 1;
+public static const uint MANIFOLD_LIST_COLD_OUT = 2;
+public static const uint MANIFOLD_LIST_TRACK = 3;
+// An empty list: the job lies outside every interior.
+public static const uint MANIFOLD_LIST_NONE = 4;
+// The job's own list across the surface of its layer's vertex, which its light comes through:
+// the section material in the last lane of the job's light word, with MANIFOLD_ENTERS where the
+// walk enters it, and what its medium reads where the walk enters in the walk's medium word. The
+// walk crosses it first (`settle_list`).
+public static const uint MANIFOLD_LIST_PAST = 5;
+public static const uint MANIFOLD_ENTERS = 0x80000000u;
+public static const uint MANIFOLD_LIST_MASK = 7;
+// Above them, the id of the sphere, point or rect light whose point a walk's target is.
+public static const uint MANIFOLD_LIGHT_SHIFT = 3;
+// The light words (NO_LIGHT less one and two) of a directional job whose vertex left the words
+// that weigh its light again where it bends: one whose ray starts inside an interior, which takes
+// no light where it leaves that interior through none of its surfaces, and one whose ray starts
+// outside every interior.
+public static const uint MANIFOLD_JOB_INSIDE = 0xfffffffeu;
+public static const uint MANIFOLD_JOB_OUTSIDE = 0xfffffffdu;
+// The light word of a job toward a sphere, point or rect light that a layer's vertex a tracked ray
+// reached leaves through its own surface: its light is the path's where no estimate at the vertex
+// where the ray's track starts owns its chain, which the raygen asks once its shadow ray passed
+// (`start_ray_check`). The check word, the last of the bent words, holds the job's slope at the
+// surface as two halves, the light's id and the surfaces its chain crosses.
+public static const uint MANIFOLD_JOB_CHECK = 0xfffffffcu;
+// The walk's start word's last lane where a walking job's gather drew the point its ownership
+// takes in the word's first three (`path_gather`), which no walk's state is; the job's vertex
+// leaves 0 there.
+public static const uint GATHER_POINT = 0xffffffffu;
+public static const uint MANIFOLD_CHECK_WORD = MANIFOLD_BENT_WORD + 3;
+// The density word of a ray that crossed the surfaces of solid dielectrics by transmission since
+// its vertex last scattered, which the manifold words track: PDF_TRACKED less the density the
+// last surface's scatter gave the ray, which weighs the lights it meets but the directional ones.
+public static const float PDF_TRACKED = -2.0;
+
+// The density a ray's density word `w` gives its direction: a tracked ray's last surface's.
+public float ray_density(float w)
+{
+    return w <= PDF_TRACKED ? PDF_TRACKED - w : w;
+}
 // What the vertex that left a bent job was, which its re-run takes: a ray's hit, the G-buffer's
 // surface, where a subsurface walk leaves, or a point in an interior's medium.
 public static const uint BENT_HIT = 0;
@@ -95,6 +134,10 @@ public static const uint CALL_DEPOSIT = 12;
 public static const uint CALL_MAP_GATHER = 13;
 // The callable that weighs a dispersive layer's companion wavelengths toward the hero's draw.
 public static const uint CALL_DISPERSE = 14;
+// The callables of a manifold walk's steps, which a pipeline whose paths may walk one holds: at a
+// surface, which a face ray's hit calls, and at the chain's end, which the raygen calls.
+public static const uint CALL_MANIFOLD_FACE = 6;
+public static const uint CALL_MANIFOLD_END = 17;
 // The callable of the vertex where an interior's real-time walk meets its surface, which the
 // surface's layer stage calls with what it resolved there.
 public static const uint CALL_WALK_MEETS = 15;
@@ -116,6 +159,10 @@ public static const uint HOT_DIFFUSE = 1 << 4;      // the ray left a diffuse lo
 public static const uint HOT_COUNTED = 1 << 5;      // light its ray meets counts toward the root's mode
 public static const uint HOT_MEDIUM = 1 << 6;       // the ray left a point in a medium, which has no normal
 public static const uint HOT_ARRIVED = 1 << 7;      // an update path's hit left its vertex for the raygen to record
+// The ray's vertex drew its directional lights with no normal, as a point in a medium does, which
+// light along the ray is weighed against: an opaque vertex inside an interior, whose estimate takes
+// a directional light by the direction its walk bends it to (`any_side_nee`).
+public static const uint HOT_ANY_SIDE = 1 << 15;
 public static const uint HOT_INTERIOR = 1 << 16;    // the path lies in an interior, which its cold words list
 // The path lies in an interior, which its cold words list, but its camera ray takes none of the
 // medium, whose segment the froxels hold: its first vertex takes the interior on.
@@ -153,9 +200,10 @@ public static const uint MEDIUM_BENT = 1 << 8;
 public static const float PDF_LIT = -1.0;
 // The entered word of a path that entered no interior it lies in: not a point.
 public static const uint NO_ENTRY = 0xffffffffu;
-// From HOT_DEPTH_SHIFT, the vertices the path has scattered at, HOT_DEPTH_MASK at most.
+// From HOT_DEPTH_SHIFT, the vertices the path has scattered at, HOT_DEPTH_MASK at most, below
+// HOT_ANY_SIDE.
 public static const uint HOT_DEPTH_SHIFT = 8;
-[Host] public static const uint HOT_DEPTH_MASK = 0xff;
+[Host] public static const uint HOT_DEPTH_MASK = 0x7f;
 // From HOT_DIMENSION_SHIFT, the sampler dimension the path's next draw takes.
 public static const uint HOT_DIMENSION_SHIFT = 19;
 static const uint HOT_BELOW_DIMENSION = (1u << HOT_DIMENSION_SHIFT) - 1;

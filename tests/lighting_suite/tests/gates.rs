@@ -5,16 +5,16 @@ use std::any::Any;
 
 use lighting_suite::bed::{
     Analytic, Bed, EXTENT, FrostGuide, GLOSSY_FLOOR, Gate, Item, NEAR, Paths, SUN, Spec, WATER_BOX,
-    assert_gate, glass_scene, light_bed, particle_bed, plane_stack_spec, plume_bed,
-    producer_stack_bed, reference, shaped_bed, unshadowed_bed,
+    assert_gate, glass_scene, light_bed, particle_bed, plume_bed, producer_slab_bed, reference,
+    shaped_bed, slab_spec, unshadowed_bed,
 };
 use lighting_suite::{assert_clean, texture, upload};
 use orr_gpu::KernelSet;
 use orr_lighting::path_may::{
     MAY_BACKGROUND, MAY_CACHE, MAY_CAUSTICS, MAY_COVERAGE, MAY_DEBUG, MAY_DIRECTIONAL,
     MAY_DISPERSION, MAY_EMISSIVE, MAY_FROST, MAY_INTERIORS, MAY_LAYERS, MAY_LENS, MAY_LOCAL_LIGHTS,
-    MAY_PARTICLES, MAY_PHOTON, MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING, MAY_STACK,
-    MAY_SUBSURFACE, MAY_UPDATE, MAY_VIEW, MAY_WALK,
+    MAY_PARTICLES, MAY_PHOTON, MAY_PROXIES, MAY_REFERENCE, MAY_SCATTERING, MAY_SUBSURFACE,
+    MAY_UPDATE, MAY_VIEW, MAY_WALK,
 };
 use orr_lighting::{
     DofBackgroundPass, Light, LightingDebugView, ReferenceSettings, ThinLens, ViewLighting,
@@ -46,6 +46,7 @@ fn dim(bed: &mut Bed, _: &mut Paths) -> Box<dyn Any> {
 /// `path_may2` bits it sits behind, each with a scene whose paths run it.
 fn gates() -> Vec<Row> {
     let view = u64::from(MAY_VIEW);
+    let manifolds = may2(SceneFeatures::INTERIORS | SceneFeatures::DIRECTIONAL_LIGHTS);
     let real_time = ViewLighting::default();
     let row = |what, held: &[u64], bed, setup, settings| Row {
         what,
@@ -138,16 +139,16 @@ fn gates() -> Vec<Row> {
             },
         ),
         row(
-            "plane stack",
-            &[view | u64::from(MAY_STACK | MAY_LAYERS)],
-            || Bed::with(plane_stack_spec(false)),
+            "manifold walk through solid glass",
+            &[view | u64::from(MAY_LAYERS) | manifolds],
+            || Bed::with(slab_spec(false)),
             dim,
             real_time,
         ),
         row(
             "coated emitter",
             &[view | u64::from(MAY_EMISSIVE) | may2(SceneFeatures::COATED_EMITTERS)],
-            || Bed::with(plane_stack_spec(true)),
+            || Bed::with(slab_spec(true)),
             dim,
             real_time,
         ),
@@ -282,9 +283,9 @@ fn gates() -> Vec<Row> {
             real_time,
         ),
         row(
-            "plane stack on a producer entry",
-            &[view | u64::from(MAY_STACK | MAY_LAYERS) | may2(SceneFeatures::PRODUCERS)],
-            producer_stack_bed,
+            "manifold walk through solid glass on a producer entry",
+            &[view | u64::from(MAY_LAYERS) | manifolds | may2(SceneFeatures::PRODUCERS)],
+            producer_slab_bed,
             dim,
             real_time,
         ),

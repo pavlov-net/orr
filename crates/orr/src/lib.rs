@@ -1653,7 +1653,7 @@ impl<'a> Frame<'a> {
         state.scene_resets = Some(scene_resets);
         let traced = Stages::COMPUTE | Stages::RAY;
         list.barrier(Stages::ALL, traced, Hazards::empty());
-        kernels.record_media(list, scene, paths, &pass, lighting)?;
+        kernels.record_media(list, scene, paths, &pass, lighting, &hits)?;
         kernels.record_paths(list, scene, paths, &pass, lighting, &hits)?;
         let exact_paths = paths.paths_ran().is_none_or(|ran| ran.exact());
         state.samples = state.samples.wrapping_add(1);

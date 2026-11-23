@@ -63,7 +63,8 @@ public static const uint HIT_EMITS = 1 << 6;
 // (`MaterialGpu.lobes`): it has one of their weights above 0, or its linked surface type
 // declares one.
 public static const uint HIT_LOBED = 1 << 7;
-// Solid glass, a section cooked as a dielectric with an interior: a plane stack's ray stops at it.
+// Solid glass, a section cooked as a dielectric with an interior: a manifold walk's face ray stops
+// at it.
 public static const uint HIT_SOLID = 1 << 8;
 
 // A hit record's data, after its group's handle: what its shaders start from, HIT_DATA_BYTES of it.

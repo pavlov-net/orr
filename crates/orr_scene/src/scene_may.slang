@@ -65,6 +65,10 @@ public static const uint MAY2_LINKED_TRANSMISSION_FACTORS = 1 << 16;
 public static const uint MAY2_UNSHADOWED_LIGHTS = 1 << 17;
 // The scene may hold a sphere, point or rect light whose emission a cone or focus shapes.
 public static const uint MAY2_SHAPED_LIGHTS = 1 << 18;
+// A directional, sphere, point or rect light may reach a point through the surface of solid
+// glass: a material bounds an interior while the scene holds such a light. Read by orr_lighting's
+// path tracer, whose manifold next-event estimation takes those lights.
+public static const uint MAY2_MANIFOLDS = 1 << 19;
 
 public bool may2(uint bit)
 {

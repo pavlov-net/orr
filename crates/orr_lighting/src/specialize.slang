@@ -24,9 +24,6 @@ static const uint path_may = 0xffffffffu;
 [vk::constant_id(110)] const uint path_may = 0xffffffffu;
 #endif
 
-// A plane stack bends a directional light: the light set may hold a stack entry and a
-// directional light.
-[Host] public static const uint MAY_STACK = 1 << 0;
 // A dispersive layer splits a path by wavelength: dispersion is on and a material may disperse.
 [Host] public static const uint MAY_DISPERSION = 1 << 1;
 // `PathRoot.caustics` may be set: surfaces chain, vertices gather the photons' light.

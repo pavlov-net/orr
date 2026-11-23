@@ -182,18 +182,20 @@ public uint proxy_any_hit(SceneRoot* s, inout uint4 payload, uint instance, floa
     return d;
 }
 
-// `visibility` modes of shadow rays, and the thin tracer's probe for a dielectric in front of a
-// plane stack's face.
+// `visibility` modes of shadow rays.
 [Host] public static const uint SHADOW_PATH = 0;
 [Host] public static const uint SHADOW_PHOTON = 1;
 [Host] public static const uint SHADOW_UNBENT = 2;
-public static const uint SHADOW_PROBE = 3;
 
 // Non-opaque candidates an inline shadow trace multiplies before it ends with the product so far.
 // Alpha-tested candidates do not count. A shadow ray's any-hit shaders take every candidate.
 public static const uint SHADOW_CANDIDATES = 16;
 
 // `ShadowCover` flags.
+// A shadow ray's search goes on past a candidate that blocks it alone, which it commits, so its
+// hit is the nearest of those and of the opaque triangles the AS commits: any-hit shaders run in
+// no order along the ray, and one that ended the search would leave a nearer blocker unseen.
+public static const uint SHADOW_NEAREST = 1 << 14;
 // A shadow ray's miss shader ran: nothing ended the ray, and `product` is what reached its end.
 public static const uint SHADOW_MISSED = 1 << 15;
 public static const uint SHADOW_ENDED = 1 << 16;     // an any-hit ended the search: the hit is no opaque one the AS committed
@@ -203,7 +205,7 @@ public static const uint SHADOW_VOLUME = 1 << 19;    // it passed a medium proxy
 
 // What a shadow ray's any-hit shaders read and write, 16 bytes of payload: the product of what
 // its candidates let through, and a word of its mode (bits 0-1), its instance mask (bits 2-9),
-// SHADOW_* flags (bits 16-19) and the hit context its
+// SHADOW_* flags (bits 14-19) and the hit context its
 // candidates take (`context`): whether they report texture feedback (bit 20) and the path depth
 // (from bit 21).
 public struct ShadowCover
@@ -246,11 +248,18 @@ public struct ShadowCover
     }
 
     // Multiplies a candidate's `transmittance` in, ending the search where the product is 0:
-    // ANY_HIT_END or ANY_HIT_IGNORE.
+    // ANY_HIT_END or ANY_HIT_IGNORE. Under SHADOW_NEAREST a candidate that blocks alone is
+    // accepted (ANY_HIT_ACCEPT) and the search goes on, and one that lets light through never
+    // ends it.
     [mutating]
     public uint take(float3 transmittance)
     {
+        bool nearest = has(SHADOW_NEAREST);
+        if (nearest && all(transmittance == 0.0))
+            return ANY_HIT_ACCEPT;
         product *= transmittance;
+        if (nearest)
+            return ANY_HIT_IGNORE;
         if (all(product == 0.0))
         {
             word |= SHADOW_ENDED;
@@ -269,11 +278,11 @@ public ShadowCover shadow_cover(uint mode, uint mask)
 }
 
 // As above, its candidates taking the context of a ray at path depth `depth` that reports
-// texture feedback where `feedback` holds.
-public ShadowCover shadow_cover(uint mode, uint mask, uint depth, bool feedback)
+// texture feedback where `feedback` holds, with SHADOW_* `flags` set.
+public ShadowCover shadow_cover(uint mode, uint mask, uint depth, bool feedback, uint flags = 0)
 {
     ShadowCover c = shadow_cover(mode, mask);
-    c.word |= (feedback ? 1u << 20 : 0u) | (min(depth, 0x7ffu) << 21);
+    c.word |= flags | (feedback ? 1u << 20 : 0u) | (min(depth, 0x7ffu) << 21);
     return c;
 }
 
@@ -283,15 +292,12 @@ public ShadowCover shadow_cover(uint mode, uint mask, uint depth, bool feedback)
 // passes 1 minus its presence, counted; a present alpha-tested triangle blocks; a present
 // dielectric, counted, blocks a photon's ray, blocks a path's ray at cooked solid glass with
 // SHADOW_SOLID in `flags`, and passes with SHADOW_CROSSES otherwise, for the full handling to
-// walk. In mode SHADOW_PROBE a present dielectric blocks with SHADOW_CROSSES and nothing else
-// counts. `layers` and `particles` are false where a specialized pipeline holds no presence layer
+// walk. `layers` and `particles` are false where a specialized pipeline holds no presence layer
 // or dielectric, or no particle.
 public float3 thin_candidate<S : ISurfaces>(SceneRoot* s, ViewConstants* v, HitContext context, uint mode, float3 dir, uint class_id, uint instance_index, uint cluster_id, uint primitive, float2 bary, bool layers, bool particles, out bool counted, out uint flags)
 {
     counted = false;
     flags = 0;
-    if (mode == SHADOW_PROBE && class_id != CLASS_DIELECTRIC)
-        return float3(1.0);
     bool layer = (layers && class_id == CLASS_PRESENCE) || (particles && class_id == CLASS_PARTICLE);
     uint section;
     float present = resolve_presence_section<S>(s, v, dir, instance_index, cluster_id, primitive, bary, context, !layer, section);
@@ -335,11 +341,6 @@ float3 thin_present<W : IThinWall>(uint mode, uint class_id, bool layer, bool la
 {
     counted = false;
     flags = 0;
-    if (mode == SHADOW_PROBE)
-    {
-        flags = present > 0.0 ? SHADOW_CROSSES : 0;
-        return present > 0.0 ? float3(0.0) : float3(1.0);
-    }
     if (layer)
     {
         counted = true;
@@ -374,14 +375,10 @@ public uint cover_shadow<S : ISurfaces>(SceneRoot* s, ViewConstants* v, HitConte
     uint mode = p.mode();
     bool counted = false;
     uint flags = 0;
-    float3 t = float3(1.0);
-    if (mode != SHADOW_PROBE || class_id == CLASS_DIELECTRIC)
-    {
-        bool layer = class_id == CLASS_PRESENCE || class_id == CLASS_PARTICLE;
-        float present = record_presence<S>(s, v, dir, instance_index, uint(cluster_id), primitive, bary, context, d.material, d.attributes, d.has(HIT_ALPHA_TESTED), !layer, ray);
-        RecordWall wall = { d };
-        t = thin_present(mode, class_id, layer, true, present, wall, counted, flags);
-    }
+    bool layer = class_id == CLASS_PRESENCE || class_id == CLASS_PARTICLE;
+    float present = record_presence<S>(s, v, dir, instance_index, uint(cluster_id), primitive, bary, context, d.material, d.attributes, d.has(HIT_ALPHA_TESTED), !layer, ray);
+    RecordWall wall = { d };
+    float3 t = thin_present(mode, class_id, layer, true, present, wall, counted, flags);
     p.word |= flags;
     return p.take(t);
 }

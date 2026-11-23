@@ -368,7 +368,7 @@ pub(crate) struct Producer {
     /// The clusters its batch holds at most.
     pub(crate) max_clusters: u32,
     /// Its materials where rays trace its clusters, none where they do not: its clusters of
-    /// one that casts are caustic casters, and of one with a stack face are a plane stack's.
+    /// one that casts are caustic casters.
     pub(crate) traced_materials: Vec<MaterialId>,
     /// Those where rays meet its clusters at opaque vertices: none where its clusters are
     /// dielectric or presence layers.

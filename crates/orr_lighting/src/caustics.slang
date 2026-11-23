@@ -350,9 +350,20 @@ public bool grid_deposit(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float
     }
     if (stored == 0)
         return false;
-    InterlockedAdd(g.counters[CAUSTIC_DEPOSITS], 1u);
-    add_wide(g.counters + CAUSTIC_SUM_LOW, g.counters + CAUSTIC_SUM_HIGH, luminance_rec2020(per_cosine * a[first]), u.y);
+    grid_arrival(g, n, flux, u);
     return seen;
+}
+
+// Counts a photon arriving at a receiver of geometric normal `n` on its side with `flux` toward
+// the frame's mean flux per deposit (`frame_flux`), which weighs the frame in every cell's mean
+// and sets the next quantum: an estimate that owns its light there takes it from the grid, but
+// the frame's photons are the same. `u` rounds its quanta.
+public void grid_arrival(CausticsGpu* g, float3 n, float3 flux, float4 u)
+{
+    float3 a = abs(n);
+    float cosine = max(a.x, max(a.y, a.z));
+    InterlockedAdd(g.counters[CAUSTIC_DEPOSITS], 1u);
+    add_wide(g.counters + CAUSTIC_SUM_LOW, g.counters + CAUSTIC_SUM_HIGH, luminance_rec2020(flux / asfloat(g.counters[CAUSTIC_QUANTUM]) * cosine), u.y);
 }
 
 // The resolved irradiance of the cell of level `level` and bucket `bucket` (of axis `axis`) at
@@ -394,6 +405,24 @@ float3 grid_cell(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float3 t, flo
 // the coarser one is read for want of photons, so that the view's reads keep it marked.
 public float3 grid_irradiance(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float width, float4 u)
 {
+    GridRead read;
+    return grid_irradiance(g, s, p, n, width, u, read);
+}
+
+// Where a read of the grid lies (`grid_irradiance`): the point its probe jittered to, with the
+// normal on its reading side, the axis of its bucket's columns and the edge of the cell it took,
+// 0 for no read.
+public struct GridRead
+{
+    public float3 at;
+    public float size;
+    public float3 normal;
+    public uint axis;
+}
+
+// As above, with where the read lies in `read`.
+public float3 grid_irradiance(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float width, float4 u, out GridRead read)
+{
     float blend;
     uint level = caustic_level(g, length(p - g.focus), blend);
     uint top = g.source.top;
@@ -402,12 +431,21 @@ public float3 grid_irradiance(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, 
     float3 t, b;
     orthonormal_basis(n, t, b);
     float photons;
-    float3 coarse = grid_cell(g, s, p, n, t, b, axis, bucket, level >= top ? level : level + 1, u.zw, photons);
-    if (level >= top || u.x < blend)
-        return coarse;
-    bool finer = photons >= 4.0 * CAUSTIC_MIN_PHOTONS && exp2(float(g.base_cell_log2 + int(level))) >= width;
-    float unused;
-    float3 fine = grid_cell(g, s, p, n, t, b, axis, bucket, level, u.zw, unused);
+    uint coarser = level >= top ? level : level + 1;
+    float3 coarse = grid_cell(g, s, p, n, t, b, axis, bucket, coarser, u.zw, photons);
+    bool finer = false;
+    float3 fine = float3(0.0);
+    if (!(level >= top || u.x < blend))
+    {
+        finer = photons >= 4.0 * CAUSTIC_MIN_PHOTONS && exp2(float(g.base_cell_log2 + int(level))) >= width;
+        float unused;
+        fine = grid_cell(g, s, p, n, t, b, axis, bucket, level, u.zw, unused);
+    }
+    // The point a cell's probe takes, as `grid_cell` jitters it.
+    read.size = exp2(float(g.base_cell_log2 + int(finer ? level : coarser)));
+    read.at = p + (t * (u.z - 0.5) + b * (u.w - 0.5)) * (read.size * g.jitter);
+    read.normal = n;
+    read.axis = axis;
     return finer ? fine : coarse;
 }
 
@@ -416,16 +454,63 @@ public float3 grid_irradiance(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, 
 // albedo through it, read with `u_back`; a lobe of zero albedo reads nothing.
 public float3 grid_gather(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float3 front, float3 back, float width, float4 u, float4 u_back)
 {
+    GridRead read;
+    return grid_gather(g, s, p, n, front, back, width, u, u_back, 0, read);
+}
+
+// As above, with where the read of side `side` (0 the reading side, 1 through it) lies in `read`,
+// of size 0 for a lobe that reads nothing.
+public float3 grid_gather(CausticsGpu* g, SceneRoot* s, float3 p, float3 n, float3 front, float3 back, float width, float4 u, float4 u_back, uint side, out GridRead read)
+{
     float3 e = float3(0.0);
+    read = GridRead();
     // One read in a loop, not one per side: each read inlines its cells' probes.
     [loop]
-    for (uint side = 0; side < 2; side++)
+    for (uint k = 0; k < 2; k++)
     {
-        float3 albedo = side == 0 ? front : back;
+        float3 albedo = k == 0 ? front : back;
         if (any(albedo > 0.0))
-            e += albedo * grid_irradiance(g, s, p, side == 0 ? n : -n, width, side == 0 ? u : u_back);
+        {
+            GridRead r;
+            e += albedo * grid_irradiance(g, s, p, k == 0 ? n : -n, width, k == 0 ? u : u_back, r);
+            if (k == side)
+                read = r;
+        }
     }
     return e * INV_PI;
+}
+
+// A point drawn uniformly, by `v`, over the part of the plane of `read`'s receiver that its cell
+// holds across its bucket's axis: where the photons that deposit in that cell may land on a
+// receiver of that plane, as `crossing_point` bins them.
+public float3 cell_point(GridRead read, float2 v)
+{
+    float3 n = read.normal;
+    uint axis = read.axis;
+    uint j1 = axis == 0 ? 1 : 0;
+    uint j2 = axis == 2 ? 1 : 2;
+    float size = read.size;
+    float3 m = read.at + n * (size / 3.0);
+    float3 d = m;
+    d[j1] = (floor(m[j1] / size) + v.x) * size;
+    d[j2] = (floor(m[j2] / size) + v.y) * size;
+    d[axis] = m[axis] + (n[j1] * (m[j1] - d[j1]) + n[j2] * (m[j2] - d[j2])) / n[axis];
+    return d - n * (size / 3.0);
+}
+
+// How far from a receiver at render-space `p` the point `cell_point` draws for a read there may
+// lie: the coarser of the two levels' cells (`caustic_level`), its probe's jitter, the column's
+// edge across its axis and, along the axis, the plane's rise over that edge, which the bucket's
+// blend (`read_bucket`) bounds.
+public float cell_reach(CausticsGpu* g, float3 p)
+{
+    float blend;
+    uint level = caustic_level(g, length(p - g.focus), blend);
+    uint coarser = level >= g.source.top ? level : level + 1;
+    float size = exp2(float(g.base_cell_log2 + int(coarser)));
+    // Across the axis 4/3 of the edge each way, so under 1.5 x 4/3 in the plane across it; along
+    // it, the plane's normal no more than 1 / CAUSTIC_BUCKET_BLEND as steep on either other axis.
+    return size * (g.jitter + 4.0 / 3.0 * (1.5 + 2.0 / CAUSTIC_BUCKET_BLEND));
 }
 
 // The map's cell of render-space `p`: two radii wide, offset by `offset`.
@@ -522,6 +607,22 @@ public void count_aimed(PhotonSourceGpu* source, uint cell)
 {
     if (cell != AIM_NONE)
         InterlockedAdd(((uint*)(source.aim + cell))[0], 1u);
+}
+
+// A photon an estimate owns at its receiver arrived there, but its light is the estimate's: it
+// counts toward neither its cell's yield nor its photons started, and marks the cell
+// (`PhotonSourceGpu.aim`'s last lane), whose frame of owned photons alone yields nothing.
+public static const uint AIM_OWNED = 1u << 31;
+
+// Takes a photon started from aim cell `cell` back out of its photons started, as one an
+// estimate owns at its receiver.
+public void count_owned(PhotonSourceGpu* source, uint cell)
+{
+    if (cell == AIM_NONE)
+        return;
+    uint* c = (uint*)(source.aim + cell);
+    InterlockedAdd(c[0], 0xffffffffu);
+    InterlockedOr(c[3], AIM_OWNED);
 }
 
 // Counts a photon started from aim cell `cell` that deposited where the view reads.

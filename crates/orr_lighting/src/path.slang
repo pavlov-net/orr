@@ -8,7 +8,8 @@
 // estimation by the balance heuristic with densities taken from the vertex the ray left. Shadow
 // rays end at solid glass and at every thin wall but an ideal window, so light that bends on its
 // way comes by BSDF rays, or as a caustic by the photons (`caustics.slang`); a directional light's
-// through a plane stack comes by next-event estimation along its bent way too. Hits shade
+// through the surfaces of solid glass comes by manifold next-event estimation along its bent way
+// too (`path.manifold`), and the photons and BSDF rays leave it what it finds. Hits shade
 // through the kernel's linked surface with a `HitContext`. Paths may end in the scene's world
 // cache; the cache's update paths trace the same loop and add what each vertex scattered to its
 // cell.
@@ -37,6 +38,7 @@ import orr_color.luminance;
 import orr_shaders.random;
 import orr_shaders.sampling;
 import orr_shaders.trace;
+import orr_shaders.pipeline;
 import orr_shaders.hits;
 import orr_pack.mesh;
 import orr_scene.hit;
@@ -133,7 +135,7 @@ public static const float NEE_METAL_ROUGHNESS = 0.3;
 // words and its record, of PATH_VIEW_RECORD_WORDS, PATH_UPDATE_RECORD_WORDS or
 // PATH_PHOTON_RECORD_WORDS by its source, at a fixed stride; and where its pipeline's paths may reach
 // them, its cold words (PATH_COLD_WORDS a slot) where they may meet a layer, an interior or a walk,
-// its plane stack's (PATH_STACK_WORDS) where they may meet one, a word a slot (`PathChain`) where
+// its manifold words (PATH_MANIFOLD_WORDS) where they may walk one, a word a slot (`PathChain`) where
 // they may gather caustic photons, its spectral words (`PathSpectral`) where they may split by
 // wavelength, and a word a slot for what a debug view of the path's first vertex shows where its
 // pipeline may show one; null elsewhere.
@@ -141,7 +143,7 @@ public struct LaunchHeader
 {
     public uint4* hot;
     public uint4* cold;
-    public uint4* stack;
+    public uint4* manifold;
     public uint4* records;
     public uint4* chain;
     public uint4* spectral;
@@ -212,8 +214,8 @@ public struct PathRoot
     // The share of the source's paths a launch runs: `slice_count` from `slice_base` on.
     public uint slice_base;
     public uint slice_count;
-    public uint _pad0;
-    public uint _pad1;
+    // The froxels whose jobs the froxel source walks (`froxel_walks`); null for other sources.
+    public FroxelRoot* froxel;
     // The launch's slots and records.
     public LaunchHeader* launch;
 }
@@ -450,6 +452,31 @@ public struct PathEmission : ITranslucent
     public float t_max;             // the ray's hit, or infinity
     public float3 own;
     public bool adds;
+    // The ray crossed the surfaces of solid glass since its vertex scattered (`PDF_TRACKED`): the
+    // sphere and rect lights past them are the walks' and, past a last surface that is not ideal
+    // (`pdf` above 0), the jobs of that surface's vertex; past an ideal one, the ray's where no
+    // estimate owns them, of those it meets from `lo` to before `hi` m along it, which the walks'
+    // stage decided and whose owned ids, MANIFOLD_OWNED at most, `owned` lists
+    // (`path_manifold_walk`). Where `lights_only`, it takes those lights' light alone, through
+    // what lies in front of them.
+    public bool tracked;
+    public uint4* owned;
+    public float lo;
+    public float hi;
+    public bool lights_only;
+
+    // Lights a ray tracked past an ideal surface meets whose light an estimate owns, listed in
+    // the first three of a path's manifold words, nearest first: the walks' stage decides a ray's
+    // lights in rounds of as many owned ones.
+    public static const uint MANIFOLD_OWNED = 12;
+
+    bool owns(uint id)
+    {
+        bool found = false;
+        for (uint k = 0; k < MANIFOLD_OWNED / 4; k++)
+            found = found || any(load_coherent(owned + k) == id);
+        return found;
+    }
 
     public float4 layer(inout Candidate c)
     {
@@ -459,6 +486,8 @@ public struct PathEmission : ITranslucent
             float t;
             uint id = c.instance_index - scene.light_base;
             if (!adds || c.class_id != CLASS_LIGHT || id >= scene.light_capacity || !light_proxy_hit(set, id, origin, dir, t_max, t, l) || !any(l > 0.0))
+                return float4(0.0);
+            if (tracked && (pdf > 0.0 || t < lo || !(t < hi) || owns(id)))
                 return float4(0.0);
             c.t = t;
             float w = 1.0;
@@ -479,7 +508,7 @@ public struct PathEmission : ITranslucent
         a = saturate(a);
         uint flags = scene.materials[material].flags;
         bool back = dot(n, dir) >= 0.0;
-        if (!adds || (back && (flags & (MATERIAL_DOUBLE_SIDED | MATERIAL_HAS_BACK)) == 0))
+        if (!adds || lights_only || (back && (flags & (MATERIAL_DOUBLE_SIDED | MATERIAL_HAS_BACK)) == 0))
             return float4(0.0, 0.0, 0.0, a);
         float3 w = float3(1.0);
         if ((pdf > 0.0 || any(own != 1.0)) && any(e > 0.0))
@@ -521,8 +550,14 @@ public RayDesc path_ray(float3 origin, float3 dir, float t_max)
 // / `NEE_METAL_ROUGHNESS` in the share of its light that such lobes carry.
 public float nee_probability(LightSetGpu* set, GSurface s)
 {
+    return nee_probability(set, s, s.normal);
+}
+
+// As above, for a vertex that draws its directional lights at `normal`: zero for none.
+public float nee_probability(LightSetGpu* set, GSurface s, float3 normal)
+{
     float total;
-    if (directional_share(set, s.normal, total) > 0.0)
+    if (directional_share(set, normal, total) > 0.0)
         return 1.0;
     BsdfParams p = s.bsdf;
     float specular = p.metalness + (1.0 - p.metalness) * p.transmission_weight;
@@ -723,7 +758,6 @@ public struct LayerVertex
     public bool front;              // a layer reached from its front side
     public float anisotropy;        // a scatter's phase function
     public bool chains;             // light leaves it as a caustic by its non-diffuse lobes (`surface_chains`)
-    public bool stack;              // a layer on a plane stack face (`stack_face`)
 }
 
 // The layer vertex of surface `g` of section material `section`, as `vertex_on` places it, reached
@@ -737,7 +771,6 @@ LayerVertex layer_on(ViewConstants* v, GSurface g, float origin_error, float dep
     l.section = section;
     l.front = front;
     l.anisotropy = 0.0;
-    l.stack = false;
     l.x = vertex_on(v, g, origin_error, depth_offset, dir);
     float side = front ? 1.0 : -1.0;
     l.x.surface.normal = side * lean_normal(side * g.normal, l.x.view);
@@ -758,7 +791,6 @@ public LayerVertex opaque_vertex(PathVertex x)
     l.section = MATERIAL_NONE;
     l.front = true;
     l.anisotropy = 0.0;
-    l.stack = false;
     return l;
 }
 

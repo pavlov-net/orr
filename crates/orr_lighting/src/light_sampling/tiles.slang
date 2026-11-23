@@ -68,9 +68,8 @@ static const uint SELECT_GROUP = 1024;
 
 groupshared float scan_w[SELECT_GROUP];
 groupshared uint scan_c[SELECT_GROUP];
-// Local lights, emissive entries and their clusters, feedback pixels, stack entries and
-// particle entries.
-groupshared uint counts[6];
+// Local lights, emissive entries and their clusters, feedback pixels and particle entries.
+groupshared uint counts[5];
 groupshared float environment_feedback;
 
 // Inclusive sums over the workgroup; `total` is the group's sum.
@@ -145,40 +144,6 @@ void candidate(SceneRoot* s, uint i, out float w, out uint count, out uint poole
     else if (g.kind == EMISSIVE_INSTANCE && g.set != NO_SET)
         count = g.cluster_count;
     w = count > 0 ? y : 0.0;
-}
-
-// Whether emissive list entry `e` is a caster entry with a material that could be a plane stack
-// face, at any dispersion setting. Every stack face casts, so its section is a caster section and
-// its copy holds an entry for it; a producer entry counts by any of its materials.
-bool stack_entry(SceneRoot* s, uint e)
-{
-    EmissiveGpu g = s.emissive[e];
-    BsdfParams p;
-    if (g.kind == EMISSIVE_PRODUCER)
-    {
-        ProducerGpu q = s.producers[g.source];
-        for (uint k = 0; k < q.material_count; k++)
-        {
-            if (stack_material(s, q.materials[k], false, p))
-                return true;
-        }
-        return false;
-    }
-    if (g.kind != EMISSIVE_INSTANCE)
-        return false;
-    InstanceGpu inst = traced_record(s, g.source);
-    ModelGpu* model = s.models + inst.model;
-    MeshGpu* mesh = s.meshes + model.mesh;
-    // A copy's entries hold its chain's largest rank count, which the step it shows can lack.
-    if (g.rank < mesh.emissive.count || g.rank - mesh.emissive.count >= mesh.casters.count)
-        return false;
-    uint rank = g.rank - mesh.emissive.count;
-    for (uint k = 0; k < model.section_count; k++)
-    {
-        if (mesh.casters.ranks[k] == rank)
-            return stack_material(s, section_material(s, inst, model, k), false, p);
-    }
-    return false;
 }
 
 // Whether emissive list entry `e` is a producer entry's with an instance in the PTLAS that
@@ -260,7 +225,7 @@ void select(uint lane: SV_GroupIndex)
     SceneRoot* s = root.scene;
     uint lights = s.light_capacity;
     uint n = lights + s.emissive_capacity;
-    if (lane < 6)
+    if (lane < 5)
         counts[lane] = 0;
     GroupMemoryBarrierWithGroupSync();
     bool environment = root.environment.mean.a > 0.0;
@@ -283,10 +248,8 @@ void select(uint lane: SV_GroupIndex)
         {
             candidate(s, i, w, c, pooled);
             h = feedback(i, lights, s.emissive_capacity);
-            if (i >= lights && stack_entry(s, i - lights))
-                InterlockedAdd(counts[4], 1);
             if (i >= lights && particle_entry(s, i - lights))
-                InterlockedAdd(counts[5], 1);
+                InterlockedAdd(counts[4], 1);
         }
         uint chunk_c;
         uint first = carry_c + scan_uint(lane, pooled, chunk_c) - pooled;
@@ -387,8 +350,7 @@ void select(uint lane: SV_GroupIndex)
     set.environment_probability = env;
     set.frame = root.frame;
     set.local_lights = counts[0];
-    set.stack_entries = counts[4];
-    set.particle_entries = counts[5];
+    set.particle_entries = counts[4];
 
     float3 mean = root.environment.mean.rgb;
     float3 xyz = mul(REC2020_TO_XYZ, mean);
@@ -414,7 +376,6 @@ void select(uint lane: SV_GroupIndex)
     st.photon_overflows = root.clear_feedback != 0 ? 0 : root.reference_counts[1];
     root.reference_counts[0] = 0;
     root.reference_counts[1] = 0;
-    st.stack_entries = counts[4];
     *root.stats = st;
 }
 

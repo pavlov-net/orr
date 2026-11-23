@@ -5,8 +5,10 @@ module interiors;
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_shaders.random;
+import orr_shaders.sampling;
 import orr_shaders.trace;
 import orr_scene.hit;
+import orr_scene.producer;
 import orr_scene.visibility;
 __exported import orr_scene.candidates;
 
@@ -248,4 +250,86 @@ public void surface_crossings<S : ISurfaces>(SceneRoot* s, ViewConstants* v, flo
             interior.cross(m, front);
         at += t + 1e-4 * (1.0 + t);
     }
+}
+
+// Whether the ray from `origin` along unit `dir` meets the box of the instances that may show
+// dielectric-class geometry (`SceneRoot.interior`) within `reach`.
+public bool glass_within(SceneRoot* s, float3 origin, float3 dir, float reach)
+{
+    float2 span;
+    return glass_span(s, origin, dir, reach, span);
+}
+
+// As above, with the stretch of the ray within `reach` that lies in the box in `span`, as distances
+// from `origin`, the box grown by `pad` m on every side.
+public bool glass_span(SceneRoot* s, float3 origin, float3 dir, float reach, out float2 span, float pad = 0.0)
+{
+    uint4* b = (uint4*)s.interior;
+    float3 lo = unordered(b[0].xyz) - pad;
+    float3 hi = unordered(b[1].xyz) + pad;
+    // The slabs' spans along the ray. Along an axis the ray runs parallel to, a direction of
+    // 1e-30 in its place takes the whole ray where the origin lies within the slab, else none.
+    float3 inv = 1.0 / select(dir == 0.0, float3(1e-30), dir);
+    float3 t0 = (lo - origin) * inv;
+    float3 t1 = (hi - origin) * inv;
+    float3 near = min(t0, t1);
+    float3 far = max(t0, t1);
+    span = float2(max(0.0, max_component(near)), min(min(far.x, min(far.y, far.z)), reach));
+    return all(lo <= hi) && span.x <= span.y;
+}
+
+// Seeded walks' draws (Zeltner et al. 2020): their own stream, the spread of the seeds that
+// gather about the straight way to the walk's target, as a GGX alpha of slopes, and the draws a
+// seed takes at most for a way that meets the box of solid glass.
+static const uint SEED_STREAM = 0x9e3779b1;
+static const float SEED_SPREAD = 0.5;
+static const uint SEED_DRAWS = 4;
+
+// The draw `n` of the seeded walks of an estimate whose walk starts at `from`, keyed on that point
+// and the frame's `frame` and `seed`.
+public uint4 seed_bits_of(uint frame, uint seed, float3 from, uint n)
+{
+    return pcg4d(uint4(asuint(from), (frame ^ seed ^ SEED_STREAM) + n * 0x9e3779b9u));
+}
+
+// A seed's start direction `dir` from `bits` for a walk from `from` toward `target`, a point where
+// `point`, else a direction, whose rays leave `origin`, and whether the walk's first face ray,
+// which reaches no farther than where it passes a point target, meets the box of solid glass
+// (`glass_within`): a seed's walk whose first ray meets no surface it crosses ends dark. Half of
+// the draws gather about the straight way, as microfacet normals of alpha SEED_SPREAD, the others
+// go toward the box, over the sphere from within it and else toward a uniform point in it; a
+// draw that misses the box draws again. Every seed of an estimate draws alike, which is all the
+// count of seeds that find a chain again needs, so the draws need no density.
+public bool seed_way(SceneRoot* s, uint4 bits, float3 from, float3 origin, float3 target, bool point, out float3 dir)
+{
+    uint4* b = (uint4*)s.interior;
+    float3 lo = unordered(b[0].xyz);
+    float3 hi = unordered(b[1].xyz);
+    bool within = all(from >= lo) && all(from <= hi);
+    float3 straight = point ? normalize(target - from) : target;
+    dir = straight;
+    for (uint k = 0; k < SEED_DRAWS; k++)
+    {
+        float4 u = float4(unit_float(bits.x), unit_float(bits.y), unit_float(bits.z), unit_float(bits.w));
+        if (u.w >= 0.5)
+            dir = facet(straight, SEED_SPREAD * unit_slope(float2(min(u.x, 0.999999), u.y)));
+        else if (within)
+            dir = sample_uniform_sphere(u.xy);
+        else
+            dir = normalize(lerp(lo, hi, u.xyz) - from);
+        float reach = point ? dot(target - origin, dir) : asfloat(0x7f800000u);
+        if (reach > 0.0 && glass_within(s, origin, dir, reach))
+            return true;
+        bits = pcg4d(bits);
+    }
+    return false;
+}
+
+// Whether seed `n` of an estimate at `from` toward `target`, a point on a light where `point`,
+// else a direction, whose walk's rays leave `origin`, may find a chain in the frame of `frame` and
+// `seed` (`seed_way`).
+public bool seed_meets(SceneRoot* s, uint frame, uint seed, float3 from, float3 origin, float3 target, bool point, uint n)
+{
+    float3 dir;
+    return seed_way(s, seed_bits_of(frame, seed, from, n), from, origin, target, point, dir);
 }

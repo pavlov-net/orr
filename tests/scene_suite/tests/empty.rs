@@ -126,6 +126,7 @@ const STATED: &[(&str, Follows)] = &[
     ("froxel roots", Fixed),
     ("froxel trace roots", Fixed),
     ("froxel volumes", Fixed),
+    ("media stats", Fixed),
     ("guide roots", Fixed),
     ("layer tile roots", Fixed),
     ("local light sampler roots", Fixed),

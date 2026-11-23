@@ -163,7 +163,8 @@ float2 block_total(uint lane, float2 v)
     return r;
 }
 
-// One thread per aim cell: the last frame's photons folded into its yield, its counts started
+// One thread per aim cell: the last frame's photons folded into its yield, the share of those no
+// estimate owned that deposited where the view read, its counts started
 // over, and its eviction once no caster list has held it for AIM_LIFETIME frames, which leaves a
 // tombstone. A clear empties every cell.
 [shader("compute")]
@@ -183,9 +184,12 @@ void aim(uint3 id: SV_DispatchThreadID)
         return;
     uint4 c = root.aim[i];
     float y = asfloat(c.z);
-    if (c.x > 0)
+    // Photons an estimate owned are no photons started, and a frame of those alone yields none.
+    bool owned = (c.w & AIM_OWNED) != 0;
+    c.w &= ~AIM_OWNED;
+    if (c.x > 0 || owned)
     {
-        float frame = float(c.y) / float(c.x);
+        float frame = c.x > 0 ? float(c.y) / float(c.x) : 0.0;
         y = y < 0.0 ? frame : lerp(frame, y, SOURCE_YIELD_HISTORY);
     }
     if (c.w >= AIM_LIFETIME)

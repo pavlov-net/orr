@@ -1928,6 +1928,8 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
                         section_count: m.sections,
                         opaque_sections: m.header.opaque_sections,
                         layer_sections: m.header.layer_sections,
+                        dielectric_sections: dielectric_sections(&m.section_flags),
+                        _pad1: 0,
                         emissive: sets(m.header.emissive, m.ranks[0], m.cached_only[0]),
                         casters: sets(m.header.casters, m.ranks[1], m.cached_only[1]),
                     }
@@ -2579,6 +2581,18 @@ impl MeshPages {
         self.table.retire(completed);
         self.bases.retire(completed);
     }
+}
+
+/// The sections of the dielectric class among `cooked` ([`cooked_section`]'s flags), a bit per
+/// section an instance can hide and one for all the rest, as `MeshHeader::layer_sections`.
+fn dielectric_sections(cooked: &[u8]) -> u32 {
+    cooked
+        .iter()
+        .enumerate()
+        .filter(|&(_, &f)| SurfaceClass::from_flags(f) == Some(SurfaceClass::Dielectric))
+        .fold(0, |bits, (i, _)| {
+            bits | 1 << i.min(orr_pack::instance::MAX_HIDDEN_SECTION)
+        })
 }
 
 /// The bits of a section's flags its clusters trace by: its [`SurfaceClass`] and whether it is

@@ -10,8 +10,8 @@ use lighting_suite::bed::{
     QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR, SUN, Spec, StrandRow, TILED_FLOOR,
     TINTED_FLOOR, TRANSLUCENT_SHEET, TROUGH, WATER_BOX, WHITE_FLOOR, assert_close,
     assert_converges, assert_renders_alike, assert_within_noise, glass_scene, image_mean,
-    light_bed, luminance, mean_where, occluded_light_spec, particle_bed, pixel_of,
-    plane_stack_spec, plume_bed, producer_stack_bed, reference, render_paths, surface_mean,
+    light_bed, luminance, mean_where, occluded_light_spec, particle_bed, pixel_of, plume_bed,
+    producer_slab_bed, reference, render_paths, slab_spec, surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
@@ -315,13 +315,14 @@ fn real_time_paths_converge_through_scattering_interiors() {
     assert_clean();
 }
 
-/// Real-time paths converge to the reference where the sun bends through a plane stack and a
+/// Real-time paths converge to the reference where the sun bends through solid glass and a
 /// coated emitter's light passes its coat: a tinted slab over the floor under the sun and a sky,
-/// whose shadow the sun's light through both faces fills by next-event estimation, by BSDF rays
-/// that the stack leaves to it, and by caustic photons, beside an emitter with a coat and fuzz.
+/// whose shadow the sun's light through both faces fills by manifold next-event estimation, by
+/// BSDF rays that its estimate leaves to them, and by caustic photons, beside an emitter with a
+/// coat and fuzz.
 #[test]
-fn real_time_paths_converge_through_plane_stacks_and_coated_emitters() {
-    let mut bed = Bed::with(plane_stack_spec(true));
+fn real_time_paths_converge_through_solid_glass_and_coated_emitters() {
+    let mut bed = Bed::with(slab_spec(true));
     bed.set_pre_exposure(1.0 / 64.0);
     let truth = truth(&mut bed, 12, 1024);
     let real_time = paths(ViewLighting::default());
@@ -335,17 +336,17 @@ fn real_time_paths_converge_through_plane_stacks_and_coated_emitters() {
     assert_clean();
 }
 
-/// A plane stack that a producer entry shows lights the floor under it through the pipelines made
-/// for exactly what the scene may meet as the same stack on a copy does: the entry's glass, whose
-/// material bounds an interior, ends a shadow ray and is solid to the stack's probe, and its faces
-/// are flat, so the sun's light through both of them fills the slab's shadow by next-event
+/// Solid glass that a producer entry shows lights the floor under it through the pipelines made
+/// for exactly what the scene may meet as the same glass on a copy does: the entry's glass, whose
+/// material bounds an interior, ends a shadow ray and is solid to the manifold walk's face rays,
+/// so the sun's light through both of its faces fills the slab's shadow by manifold next-event
 /// estimation and BSDF rays leave it to it.
 #[test]
-fn a_plane_stack_on_a_producer_entry_lights_the_floor_as_one_on_a_copy() {
+fn solid_glass_on_a_producer_entry_lights_the_floor_as_on_a_copy() {
     let mut specialized = paths(ViewLighting::default());
     specialized.specialize = true;
-    let mut copy = Bed::with(plane_stack_spec(false));
-    let mut producer = producer_stack_bed();
+    let mut copy = Bed::with(slab_spec(false));
+    let mut producer = producer_slab_bed();
     for bed in [&mut copy, &mut producer] {
         bed.set_pre_exposure(1.0 / 64.0);
         render_paths(bed, &specialized, 32, 3);

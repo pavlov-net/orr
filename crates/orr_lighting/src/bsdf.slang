@@ -1411,6 +1411,82 @@ public float3 bsdf_emission_layer(BsdfParams p, float3 n, float3 wo, float exter
     return prepare_layers(p, n, wo, exterior_ior, false, layers, true, true, true, true).emission_layer();
 }
 
+// How the base of a surface of `p`, seen from inside the interior it bounds where `inside`, in a
+// medium of IOR `exterior_ior` with coat and fuzz weights `coat_weight` and `fuzz_weight` and
+// anisotropy `anisotropy`, refracts: its IOR ratios (`Bsdf.eta_refraction`, `eta_transparent`,
+// `eta_opaque`), the coat's over the medium, its roughness widened by the coat and fuzz as alphas
+// and whether it is an ideal mirror. The specular weight moves the base IOR toward the medium
+// above it.
+public struct BaseRefraction
+{
+    public float eta_refraction;
+    public float eta_transparent;
+    public float eta_opaque;
+    public float coat_eta;
+    public float specular_ior;
+    public float coat_ior;
+    public float roughness;
+    public float coat_roughness;
+    public float alpha_iso;
+    public float2 alpha;
+    public bool mirror;
+}
+
+BaseRefraction base_refraction(BsdfParams p, bool inside, float exterior_ior, float coat_weight, float fuzz_weight, float anisotropy)
+{
+    BaseRefraction b;
+    bool enter_coat = coat_weight > 0.0 && !inside;
+    float coat_layer_ior = max(p.coat_ior, MIN_IOR);
+    float coat_ior = enter_coat ? lerp(exterior_ior, coat_layer_ior, coat_weight) : exterior_ior;
+    float specular_ior = coat_ior * openpbr_apply_specular_weight_to_ior(p.specular_ior / coat_ior, p.specular_weight);
+    float eta_r;
+    float eta_t;
+    float eta_o;
+    float coat_eta = 1.0;
+    if (inside)
+    {
+        eta_r = exterior_ior / specular_ior;
+        eta_t = eta_r;
+        eta_o = specular_ior / exterior_ior;
+    }
+    else
+    {
+        eta_r = specular_ior / exterior_ior;
+        eta_t = eta_r;
+        if (enter_coat)
+        {
+            // No total internal reflection at the base under a coat that does not bend light.
+            eta_t = coat_ior > specular_ior && specular_ior >= exterior_ior ? coat_ior / specular_ior : specular_ior / coat_ior;
+            coat_eta = coat_layer_ior / exterior_ior;
+        }
+        eta_o = eta_t;
+    }
+    b.eta_refraction = eta_r >= 1.0 ? max(eta_r, 1.0001) : min(eta_r, 1.0 / 1.0001);
+    b.eta_transparent = eta_t;
+    b.eta_opaque = eta_o;
+    b.coat_eta = coat_eta;
+    b.specular_ior = specular_ior;
+    b.coat_ior = coat_ior;
+    b.roughness = widened_roughness(p, coat_weight, fuzz_weight, coat_eta, b.coat_roughness);
+    b.alpha_iso = sq(b.roughness);
+    b.alpha = openpbr_compute_anisotropic_alpha(b.alpha_iso, anisotropy, false, MIN_ALPHA);
+    b.mirror = max(b.alpha.x, b.alpha.y) < MIRROR_ALPHA;
+    return b;
+}
+
+// `base_refraction` of a surface of `p` seen along `wo` about its shading normal `n` as
+// `bsdf_prepare` takes it, with the coat and fuzz a pipeline's surfaces may have.
+public BaseRefraction bsdf_base_refraction(BsdfParams p, float3 n, float3 wo, float exterior_ior)
+{
+    bool coat = class_has(CLASS_COAT) && may(MAY_COAT);
+    bool fuzz = class_has(CLASS_FUZZ) && may(MAY_FUZZ);
+    bool thin = (p.flags & BSDF_THIN_WALLED) != 0;
+    float coat_weight = coat && (p.flags & BSDF_COAT) != 0 ? p.coat_weight : 0.0;
+    float fuzz_weight = fuzz && (p.flags & BSDF_FUZZ) != 0 ? p.fuzz_weight : 0.0;
+    float anisotropy = (p.flags & BSDF_ANISOTROPY) != 0 ? p.specular_anisotropy : 0.0;
+    return base_refraction(p, dot(wo, n) < 0.0 && !thin, exterior_ior, coat_weight, fuzz_weight, anisotropy);
+}
+
 // `bsdf_prepare_layers` of a surface that has a coat, a fuzz, a thin film and subsurface only
 // where `coat`, `fuzz`, `film` and `subsurface` allow them.
 Bsdf prepare_layers(BsdfParams p, float3 n, float3 wo, float exterior_ior, bool adjoint, out BsdfLayers layers, bool coat, bool fuzz, bool film, bool subsurface)
@@ -1458,44 +1534,23 @@ Bsdf prepare_layers(BsdfParams p, float3 n, float3 wo, float exterior_ior, bool 
         s.fuzz_v = leaned(mul(s.fuzz_basis, v));
     }
 
-    // IORs: the specular weight moves the base IOR toward the medium above it.
-    bool enter_coat = coat_weight > 0.0 && !s.inside;
-    float coat_layer_ior = max(p.coat_ior, MIN_IOR);
-    float coat_ior = enter_coat ? lerp(exterior_ior, coat_layer_ior, coat_weight) : exterior_ior;
-    float specular_ior = coat_ior * openpbr_apply_specular_weight_to_ior(p.specular_ior / coat_ior, p.specular_weight);
-    float eta_r;
-    float eta_t;
-    float eta_o;
-    float coat_eta = 1.0;
-    if (s.inside)
-    {
-        eta_r = exterior_ior / specular_ior;
-        eta_t = eta_r;
-        eta_o = specular_ior / exterior_ior;
-    }
-    else
-    {
-        eta_r = specular_ior / exterior_ior;
-        eta_t = eta_r;
-        if (enter_coat)
-        {
-            // No total internal reflection at the base under a coat that does not bend light.
-            eta_t = coat_ior > specular_ior && specular_ior >= exterior_ior ? coat_ior / specular_ior : specular_ior / coat_ior;
-            coat_eta = coat_layer_ior / exterior_ior;
-        }
-        eta_o = eta_t;
-    }
-    eta_r = eta_r >= 1.0 ? max(eta_r, 1.0001) : min(eta_r, 1.0 / 1.0001);
+    BaseRefraction base = base_refraction(p, s.inside, exterior_ior, coat_weight, fuzz_weight, anisotropy);
+    float eta_r = base.eta_refraction;
+    float eta_t = base.eta_transparent;
+    float coat_eta = base.coat_eta;
+    float eta_o = base.eta_opaque;
+    float specular_ior = base.specular_ior;
+    float coat_ior = base.coat_ior;
     s.eta_refraction = eta_r;
     s.radiance_scale = adjoint || thin ? 1.0 : 1.0 / (eta_r * eta_r);
     s.eta_transparent = eta_t;
     s.eta_opaque = eta_o;
 
-    float coat_roughness;
-    float roughness = widened_roughness(p, coat_weight, fuzz_weight, coat_eta, coat_roughness);
-    s.alpha_iso = sq(roughness);
-    s.alpha = openpbr_compute_anisotropic_alpha(s.alpha_iso, anisotropy, false, MIN_ALPHA);
-    s.mirror = max(s.alpha.x, s.alpha.y) < MIRROR_ALPHA;
+    float roughness = base.roughness;
+    float coat_roughness = base.coat_roughness;
+    s.alpha_iso = base.alpha_iso;
+    s.alpha = base.alpha;
+    s.mirror = base.mirror;
     float coat_alpha = max(sq(coat_roughness), MIN_ALPHA);
     s.coat_alpha = openpbr_compute_anisotropic_alpha(coat_alpha, p.coat_anisotropy, false, MIN_ALPHA);
     s.coat_mirror = max(s.coat_alpha.x, s.coat_alpha.y) < MIRROR_ALPHA;

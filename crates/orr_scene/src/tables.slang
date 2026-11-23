@@ -123,6 +123,8 @@ public static const uint RT_SEEN = 8;       // the PTLAS kernel has run over the
 public static const uint RT_ANIMATED = 16;  // inside animation_range: raster takes the pose
 public static const uint RT_WAS_ANIMATED = 32; // RT_ANIMATED of the previous frame
 public static const uint RT_FADING = 64;    // its PTLAS instance was written for a chain fade
+public static const uint RT_INTERIOR = 128; // its PTLAS instance and parts may show dielectric-class geometry (MASK_INTERIOR)
+public static const uint RT_FAR_INTERIOR = 1024; // its far instance may
 public static const uint RT_STEP_SHIFT = 8; // 2 bits: the chain step its PTLAS instance holds
 public static const uint RT_FAR_CUT_SHIFT = 16; // 8 bits: the cut its far instance holds
 
@@ -365,6 +367,8 @@ public struct MeshGpu
     public uint section_count;     // sections of the mesh, which a model's cage sections follow
     public uint opaque_sections;   // the sections of opaque class, as `PartGpu.sections`
     public uint layer_sections;    // the sections of dielectric or presence class, likewise
+    public uint dielectric_sections; // the sections of dielectric class, likewise
+    public uint _pad1;
     public SetTablesGpu emissive;  // the sections that emit
     public SetTablesGpu casters;   // the sections light leaves as a caustic
 }
@@ -476,6 +480,11 @@ public struct SceneRoot
     public uint64_t medium;          // consumer data for the linked medium
     public uint64_t surface_data;    // consumer data for linked surfaces whose material has none
     public Tlas tlas;                // the scene's PTLAS, or the device's empty TLAS
+    // The render-space box of every instance the PTLAS holds that may show dielectric-class
+    // geometry (MASK_INTERIOR), its low corner's coordinates in the first three lanes of two
+    // uint4s and its high one's in the second's, as `ordered` floats, which the PTLAS kernels
+    // rebuild every frame they run.
+    public uint* interior;
     public uint* part_slots;         // per part instance: the slot of the copy holding it
     public int4 origin_cell;         // render origin cell, w = cell_log2
     public float delta_time;

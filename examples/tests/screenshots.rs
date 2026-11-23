@@ -91,6 +91,21 @@ const VIEWER: Tolerance = converged(0.03, &[]);
 /// interior there only through exit rays that meet the sun's disc, so its blocks are not compared.
 const DIELECTRICS: Tolerance = converged(0.15, &[[400, 60, 480, 140]]);
 
+/// The band of the pool's floor beside the glass sphere's caustics, which the sun reaches through
+/// the wavy water by manifold next-event estimation alone, at a bound the photons' dilution on a
+/// wide sea and their absence both break: blocks of 32 px from (128, 128) to (288, 160).
+const POOL_FLOOR: Tolerance = Tolerance::Blocks {
+    size: 32,
+    relative: 0.05,
+    floor: 0.005,
+    skip: &[
+        [0, 0, 480, 128],
+        [0, 160, 480, 270],
+        [0, 128, 128, 160],
+        [288, 128, 480, 160],
+    ],
+};
+
 /// One example runs at a time on the shared device.
 fn serial() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
@@ -250,6 +265,22 @@ fn dielectrics_matches_its_converged_reference() {
         || dielectrics::run(&headless(&[])),
         Some(&|| dielectrics::run(&reference(&[]))),
     );
+    assert_clean();
+}
+
+/// The pool's floor takes the sun through the water as its converged reference does without
+/// caustic photons, and with the water a sea 81 patches wide, whose photons thin out over it.
+#[test]
+fn dielectrics_pool_floor_takes_the_sun_without_photons_and_under_a_sea() {
+    let _serial = serial();
+    for rest in [&["--photons", "0"][..], &["--sea", "40"]] {
+        compare_converged(
+            "dielectrics",
+            POOL_FLOOR,
+            || dielectrics::run(&headless(rest)),
+            None,
+        );
+    }
     assert_clean();
 }
 
