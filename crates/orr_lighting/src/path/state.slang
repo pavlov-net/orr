@@ -1,6 +1,5 @@
 // What a path holds between its shaders: PATH_HOT_WORDS words of 16 bytes in its slot, packed,
-// which every shader of the common path loads and stores whole, and the caps the tracer's stages
-// are held to.
+// which every shader of the common path loads and stores whole.
 //
 // A path's ray, its throughput and its pending shadow job are all a hit's shader leaves for the
 // raygen: the raygen holds the slot's address across a trace or an invoke and nothing of the path.
@@ -80,126 +79,6 @@ public static const uint BENT_MEDIUM = 3;
 // The second payload word of a vertex's re-run that weighs its bent job's light, which a hit's
 // invoke otherwise leaves 0.
 public static const uint PAYLOAD_BENT = 1;
-// What a raygen keeps across a trace or an invoke, bytes: the driver's stack size of the raygen
-// beyond its hit object.
-[Host] public static const uint RAYGEN_LIVE_BYTES = 32;
-// The caps on what a stage hands the driver, in instructions after the fold, by what it does: a
-// growth budget on orr's own code per stage role, which a feature's allowance adds to where the
-// pipeline's mask keeps the feature. A cap is raised only as a stated decision with its reason.
-// Instruction counts track the driver's CPU work, so a cap catches a heavy body inlined at one more
-// site; they track neither a cold compile's wall time nor a pass's time, which are measured as
-// themselves. Tests hold orr's stages to their caps over the masks that matter; a pipeline over
-// one is still made, with a warning.
-[Host] public static const uint RAYGEN_INSTRUCTIONS = 4000;
-// What a raygen holds more where its paths may be the accumulation reference's: the flights of its
-// rays through the linked medium, an environment job's exact radiance over its baked one, and the
-// environment's exact radiance a miss leaves to it.
-[Host] public static const uint RAYGEN_REFERENCE_INSTRUCTIONS = 2100;
-[Host] public static const uint MISS_INSTRUCTIONS = 4000;
-// What a miss holds more where its paths may be the accumulation reference's: what weighs the
-// environment's exact radiance, which the raygen draws.
-[Host] public static const uint MISS_REFERENCE_INSTRUCTIONS = 100;
-// The callable of the linked environment's exact radiance, which the reference's raygen calls
-// for its misses and environment jobs: orr's own part is the call of the linked type's draw.
-[Host] public static const uint SKY_INSTRUCTIONS = 200;
-// What the callable of a medium vertex holds more where the reference's paths may fly through
-// the linked medium: the free flight, and the vertex's phase function and its draw.
-[Host] public static const uint MEDIUM_LINKED_INSTRUCTIONS = 600;
-// What a raygen holds more where the scene may hold a layer: the camera ray's search for layers,
-// the walk of a shadow ray through thin walls in the medium its vertex says, and a frosted
-// pixel's second path.
-[Host] public static const uint RAYGEN_LAYER_INSTRUCTIONS = 1300;
-// What a raygen holds more where an interior's medium may scatter or a surface may walk: the draw
-// of where a ray inside an interior scatters, and the steps of a walk, with the last scatter an
-// interior's way out weighs its light by, and the invoke of the surface a real-time walk meets.
-[Host] public static const uint RAYGEN_WALK_INSTRUCTIONS = 5800;
-// The callable of a path's vertex at a scatter in an interior's medium, or where a walk stopped at
-// its cap leaves it.
-[Host] public static const uint MEDIUM_VERTEX_INSTRUCTIONS = 11500;
-// The callable of the vertex where an interior's real-time walk meets its surface
-// (`path_walk_meets`): the layer's BSDF from inside, prepared once at the walk's arrival and once
-// per light along a way in that a way out weighs by the walk's last scatter, its draw, and the
-// light through the surface; and what a layer's stage holds more for it, the call.
-[Host] public static const uint WALK_MEETS_INSTRUCTIONS = 38000;
-[Host] public static const uint WALK_LAYER_INSTRUCTIONS = 1400;
-// What a raygen holds more where its paths may meet a plane stack: the shadow job's trace into a
-// hit object, the probe and legs of a directional job's walk through a stack, the re-run of the
-// vertex its bent light is weighed at and the probe that decides whose a ray's light through a
-// stack is.
-[Host] public static const uint RAYGEN_STACK_INSTRUCTIONS = 2500;
-// The callable of a step of that walk: the light's bend at the vertex, and per leg the medium,
-// the crossing of the face it ends at and its Fresnel.
-[Host] public static const uint STACK_STEP_INSTRUCTIONS = 5000;
-// What a raygen holds more where its paths may meet particles, sphere and rect lights or a linked
-// medium: whether a ray sees the first two, whether its way to its hit takes the medium's march,
-// and the call that takes what it meets on that way.
-[Host] public static const uint RAYGEN_FRONT_INSTRUCTIONS = 300;
-// That callable: a ray query over particles and light proxies that composites them in depth order,
-// each particle's look resolved and each one's light weighed against next-event estimation at the
-// vertex the ray left, and inside a scattering medium the free flight that ends the ray; and the
-// march of the linked medium's in-scatter on the way, through the froxels for a ray that left a
-// layer, a scatter or a walk's way out, so no hit stage holds a march.
-[Host] public static const uint FRONT_INSTRUCTIONS = 17500;
-// The any-hit that marks a path ray's payload where it met a particle or a light's proxy, and the
-// intersection shader of a light's proxy under a path ray, which tests the ray against the light.
-[Host] public static const uint FRONT_ANY_HIT_INSTRUCTIONS = 50;
-[Host] public static const uint LIGHT_BOX_INSTRUCTIONS = 700;
-// What a raygen holds more where the view traces its camera rays through a thin lens or draws a
-// background layer: the lens's camera ray, the record of its first hit, and the background
-// layer's texel.
-[Host] public static const uint RAYGEN_LENS_INSTRUCTIONS = 2000;
-// What a raygen holds more where the scene may hold medium proxies: the call that marches those
-// with a volume that a shadow ray passed, after the job's ray and after a leg of a plane stack's
-// walk.
-[Host] public static const uint RAYGEN_PROXY_INSTRUCTIONS = 200;
-// A medium proxy under a shadow ray: its box's intersection shader, the any-hit that takes Beer's
-// law over the span or marks a proxy with a volume, and the callable of the marches of those with
-// a volume, a ray query over the proxies alone.
-[Host] public static const uint PROXY_INTERSECTION_INSTRUCTIONS = 100;
-[Host] public static const uint PROXY_ANY_HIT_INSTRUCTIONS = 200;
-[Host] public static const uint PROXY_MARCH_INSTRUCTIONS = 2000;
-// What a stage that runs a vertex holds more there: its re-run, which weighs its directional job's
-// light through the stack along the bent direction, and what the job leaves the walk; and in a
-// layer's stage the stack question's answer and the track of a ray its ideal transmission passes
-// on across a stack face.
-[Host] public static const uint STACK_VERTEX_INSTRUCTIONS = 500;
-[Host] public static const uint STACK_LAYER_INSTRUCTIONS = 1000;
-// The callable of the vertex where a subsurface walk leaves.
-[Host] public static const uint WALK_EXIT_INSTRUCTIONS = 17000;
-// The callable that weighs a coated emitter's light by what its coat and fuzz pass toward a
-// vertex.
-[Host] public static const uint EMITTER_VIEW_INSTRUCTIONS = 27200;
-// What a stage that runs a vertex holds more where the scene's paths may gather caustic photons
-// (`MAY_CAUSTICS`): whether its surface is a chain vertex (`surface_chains`, the most of it), the
-// share of the light its rays find past chain vertices that stays the path's, and the call of the
-// grid's gather. Where the pipeline runs photons (`MAY_PHOTON`), a hit holds a photon's vertex
-// beside: its throughput past a chain vertex and the deposit it leaves the raygen. Where it may be
-// the reference's (`MAY_REFERENCE`), the call of the map's gather, whose payload holds the
-// parameters of the vertex's BSDF.
-[Host] public static const uint CAUSTIC_HIT_INSTRUCTIONS = 2600;
-[Host] public static const uint PHOTON_HIT_INSTRUCTIONS = 1100;
-[Host] public static const uint MAP_GATHER_HIT_INSTRUCTIONS = 1600;
-// The callables of the grid's gather, which takes each level's cell from the receiver's plane
-// moved off the voxel boundaries, and the reference map's, which evaluates the vertex's BSDF per
-// photon; the photons' raygen, the callable that starts a photon from a caster and its light, and
-// the one of its deposit, which where paths split by wavelength carries the flux through their
-// transfer.
-[Host] public static const uint GATHER_INSTRUCTIONS = 2850;
-[Host] public static const uint MAP_GATHER_INSTRUCTIONS = 13500;
-[Host] public static const uint RAYGEN_PHOTON_INSTRUCTIONS = 2500;
-[Host] public static const uint PHOTON_START_INSTRUCTIONS = 14000;
-[Host] public static const uint DEPOSIT_INSTRUCTIONS = 2400;
-// What a layer's stage holds more where its paths may split by wavelength (`MAY_DISPERSION`): whether
-// the layer disperses, the start of the path's wavelengths, the IORs of both its sides at the
-// hero's wavelength, which read their media (about half of it), and the call of the callable that
-// weighs the companions, which prepares and evaluates their BSDFs; and what a raygen holds more
-// there, the radiance through the wavelengths' transfer at the path's end.
-[Host] public static const uint DISPERSION_LAYER_INSTRUCTIONS = 6600;
-[Host] public static const uint DISPERSE_INSTRUCTIONS = 19000;
-[Host] public static const uint RAYGEN_DISPERSION_INSTRUCTIONS = 200;
-// What a hit holds more where the scene's emitters may have a coat or a fuzz: the call of that
-// callable, and the winner's place in its list and cluster through the light candidates' loop.
-[Host] public static const uint COATED_EMITTER_HIT_INSTRUCTIONS = 340;
 
 // The callable that weighs the light of an emitter that has a coat or a fuzz by what they pass
 // toward a vertex's shadow ray (`emitter_view_layer`), which a pipeline whose emitters may have
@@ -223,41 +102,6 @@ public static const uint CALL_WALK_MEETS = 15;
 // raygen calls for its misses and environment shadow jobs (`path_sky`): its payload holds the
 // direction in xyz and in w a seed; it hands back the radiance.
 public static const uint CALL_SKY = 16;
-// What a hit made for surfaces that may walk holds more than one with the rich lobes alone: the
-// subsurface lobe, the start of its walk and what it leaves of the surface where a walk leaves.
-[Host] public static const uint WALK_HIT_INSTRUCTIONS = 5400;
-// A hit's cap is the standard surface's hit on a copy's clusters, with every scene flag set; the
-// standard alpha test's any-hit likewise. A stage made for producer entries, or for both kinds of
-// geometry, adds what resolves a producer's triangle where the scene may hold producer entries.
-// The caps hold orr's own code in orr's tests. The driver compiles a stage whole, so a stage of a
-// scene's pipeline from kernels that link types (a medium, an environment, a surface, in the stage
-// made for it too) is held to its role's cap whole, the linked code among it: the host warns where
-// one is over, and an application asserts it in its own tests.
-[Host] public static const uint HIT_INSTRUCTIONS = 46000;
-[Host] public static const uint ANY_HIT_INSTRUCTIONS = 4800;
-[Host] public static const uint PRODUCER_HIT_INSTRUCTIONS = 2000;
-[Host] public static const uint PRODUCER_ANY_HIT_INSTRUCTIONS = 800;
-// What a hit holds more where the view's paths trace its camera rays, whose hits write the
-// view's G-buffer: the mode's alone, the hit of every other pipeline holds none of it.
-[Host] public static const uint TRACED_HIT_INSTRUCTIONS = 2800;
-// What a hit made for materials that may emit holds more: their light toward the path, weighed
-// against the light pick of the vertex its ray left.
-[Host] public static const uint EMITTER_HIT_INSTRUCTIONS = 2500;
-// What a hit holds more where its vertex may be a path's first, which draws with its pixel's local
-// sampler: where the paths may meet local lights and a camera ray may reach a hit, through layers or
-// as the view's or a thin lens's camera ray.
-[Host] public static const uint LOCAL_FIRST_HIT_INSTRUCTIONS = 750;
-// What a hit or first vertex made for surfaces with a coat, a fuzz, a thin film or a thin wall's
-// transmission holds more: those lobes of the BSDF, as far as the scene's mask keeps them.
-[Host] public static const uint RICH_HIT_INSTRUCTIONS = 8500;
-// What a hit made for dielectrics holds more: their transmission and the interiors they bound.
-[Host] public static const uint LAYER_HIT_INSTRUCTIONS = 14000;
-// What a hit holds more where the scene's paths may lie in an interior: the medium's
-// transmittance over the whole of a ray inside it, from the surface its origin lies off.
-[Host] public static const uint INTERIOR_HIT_INSTRUCTIONS = 100;
-// The stages of a pipeline together, linked types' code among them: room for the largest pipeline
-// a full scene links, linked surface types and water among them.
-[Host] public static const uint PIPELINE_INSTRUCTIONS = 1500000;
 
 // A caustic photon's hot word 5's last word where surfaces cast no shadow from its light: its ray
 // toward the light is not traced.

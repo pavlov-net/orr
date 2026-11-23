@@ -73,7 +73,7 @@ mod world_cache;
 pub use bsdf::BsdfTables;
 pub use caustics::{CausticSettings, CausticStats, MAX_CAUSTIC_CAPACITY_LOG2, MAX_PHOTONS};
 pub use environment::{ENVIRONMENT_SIZE, EnvironmentMapGpu};
-pub use launch::{PathStageSizes, PipelineSize, Role, StageSize, path_stage_sizes};
+pub use launch::{PathStageSizes, Role, StageSize, path_stage_sizes};
 pub use media::{
     AERIAL_SIZE, MAX_FROXEL_SHADOWED_LIGHTS, MAX_PROXY_RAYS, MediaSettings, MediaStats,
 };

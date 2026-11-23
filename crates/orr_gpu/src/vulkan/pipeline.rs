@@ -16,7 +16,7 @@ use super::garbage::Item;
 use super::spirv;
 use crate::specialize;
 use crate::{
-    CodeStatistics, CompileCost, EntryPoint, Error, PipelineKind, ShaderModule, ShaderStack,
+    CodeStatistics, CompileCost, EntryPoint, Error, PipelineKind, RayShader, ShaderModule,
     SpecData, Stage, StageEntry,
 };
 
@@ -438,7 +438,7 @@ impl Shared {
     }
 
     /// Names a new pipeline and logs its creation, what it cost the driver where it `compiled`,
-    /// its statistics when it was created with `statistics`, and its shaders' `stacks`: at info
+    /// its statistics when it was created with `statistics`, and its ray `shaders`' stacks: at info
     /// for a compile, at debug for a pipeline from a cache, which a run loads again and again.
     pub(super) fn created(
         &self,
@@ -447,7 +447,7 @@ impl Shared {
         start: Instant,
         compiled: Option<&CompileCost>,
         statistics: bool,
-        stacks: &[ShaderStack],
+        shaders: &[RayShader],
     ) {
         name_object(&self.debug_fn, raw, name);
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
@@ -470,12 +470,12 @@ impl Shared {
         if statistics {
             self.log_statistics(raw, name);
         }
-        if !stacks.is_empty() {
-            let mut kept: Vec<_> = stacks.iter().filter(|s| s.bytes > 0).collect();
-            kept.sort_by_key(|s| std::cmp::Reverse(s.bytes));
+        if !shaders.is_empty() {
+            let mut kept: Vec<_> = shaders.iter().filter(|s| s.stack_bytes > 0).collect();
+            kept.sort_by_key(|s| std::cmp::Reverse(s.stack_bytes));
             let listed: Vec<_> = kept
                 .iter()
-                .map(|s| format!("{} {} B", s.shader, s.bytes))
+                .map(|s| format!("{} {} B", s.shader, s.stack_bytes))
                 .collect();
             let level = if compiled.is_some() {
                 log::Level::Info
@@ -490,8 +490,8 @@ impl Shared {
                 } else {
                     listed.join(", ")
                 },
-                stacks.len() - kept.len(),
-                stacks.len()
+                shaders.len() - kept.len(),
+                shaders.len()
             );
         }
     }

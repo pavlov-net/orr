@@ -59,4 +59,7 @@ setup. It has no users yet.
   the cause; never skip it. `README.md` covers installing it.
 - Don't commit plans, notes or reports. Working documents stay out of the repo.
 - Comments are rare: only a reason, constraint or surprise the code can't show, in plain words and
-  the present tense, with no history and no references that can go stale.
+  the present tense, with no history.
+- Don't write into code, tests or comments what another change can make wrong without touching
+  them: measured figures such as instruction counts, registers, stack sizes or compile times,
+  sample output, or an API's current callers. Compare measured figures before and after instead.

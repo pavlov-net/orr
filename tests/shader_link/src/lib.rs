@@ -34,7 +34,7 @@ pub mod orr_linked {
 }
 
 /// `consumer/strata.slang`'s large layered ground linked into orr's kernels as their one
-/// surface, which their path pipelines' stage caps are checked on and no GPU test compiles.
+/// surface, whose path pipelines' stages are checked without a GPU and no GPU test compiles.
 pub mod orr_strata {
     include!(concat!(env!("OUT_DIR"), "/orr-strata/orr_kernels.rs"));
 }

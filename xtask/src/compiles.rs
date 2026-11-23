@@ -20,8 +20,8 @@ const REFERENCE: &str = "path pipeline 0xffffffffffffffff";
 const LISTED: usize = 10;
 
 /// The fields the listed compiles' columns show or leave out on purpose; a compile shows any
-/// other after its name. A run's device and driver are the same for every compile, and the
-/// code limits name what they need of entries, specializations and stacks.
+/// other after its name. A run's device and driver are the same for every compile, and a ray
+/// pipeline's shaders are too many to list.
 const KNOWN: &[&str] = &[
     "kind",
     "key",
@@ -37,7 +37,7 @@ const KNOWN: &[&str] = &[
     "instructions",
     "entries",
     "specs",
-    "stacks",
+    "shaders",
 ];
 
 /// One pipeline compile of a test target.

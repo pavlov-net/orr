@@ -8,4 +8,4 @@ mod stages;
 
 pub(crate) use memory::{LaunchMemory, SlotLayout, SlotParts, SourceMemory};
 pub(crate) use stages::{PathPipeline, PathPipelines};
-pub use stages::{PathStageSizes, PipelineSize, Role, StageSize, path_stage_sizes};
+pub use stages::{PathStageSizes, Role, StageSize, path_stage_sizes};

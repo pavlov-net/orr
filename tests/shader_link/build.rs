@@ -3,7 +3,7 @@
 //! whose resolve root has an extra field. The CPU library calls the same linked types. Two
 //! more consumer builds link into orr's own kernels: one against orr as it is, one against a
 //! copy of orr_lighting's environment bake and library files whose bake root has an extra
-//! field. A large layered ground surface links into orr's kernels alone, for their stage caps.
+//! field. A large layered ground surface links into orr's kernels alone, for its stages' sizes.
 //! The renderer is linked once more with copies of the consumer modules in `OUT_DIR`, which the
 //! hot reload tests edit.
 

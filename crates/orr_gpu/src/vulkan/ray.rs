@@ -15,7 +15,7 @@ use super::garbage::{Item, RawBuffer};
 use super::pipeline::StageParts;
 use crate::{
     CompileCost, CompileThreads, Error, HitGroup, MemoryKind, PipelineKind, RayPipelineDesc,
-    RayPipelineFlags, ShaderRecord, ShaderStack, Stage,
+    RayPipelineFlags, RayShader, ShaderRecord, Stage,
 };
 
 /// A ray tracing pipeline and the raygen, miss and callable regions of its binding table.
@@ -614,7 +614,7 @@ impl Device {
             // A shader's stack is what it keeps in memory across its calls and traces, which the
             // driver reports per group and no pipeline statistic does.
             |raw| {
-                let mut stacks = Vec::new();
+                let mut shaders = Vec::new();
                 let mut seen = std::collections::BTreeSet::new();
                 for (i, g) in groups.iter().enumerate() {
                     for (which, stage) in [
@@ -639,13 +639,14 @@ impl Device {
                         } else {
                             s.label
                         };
-                        stacks.push(ShaderStack {
+                        shaders.push(RayShader {
                             shader: shader.to_string_lossy().into_owned(),
-                            bytes,
+                            stack_bytes: bytes,
+                            instructions: parts[stage as usize].instructions(),
                         });
                     }
                 }
-                stacks
+                shaders
             },
         )?;
         log::debug!(

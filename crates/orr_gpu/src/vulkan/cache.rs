@@ -37,7 +37,7 @@ use super::device::{Device, Shared};
 use super::driver_cpu::DriverCpu;
 use super::pipeline::StageParts;
 use crate::cache_file::{Identity, decode, encode, mark_used, write};
-use crate::{CompileCost, CompileRecord, Error, PipelineCacheReport, PipelineKind, ShaderStack};
+use crate::{CompileCost, CompileRecord, Error, PipelineCacheReport, PipelineKind, RayShader};
 
 /// The bytes `vkGetPipelineCacheData` would write for `cache`.
 fn data_size(device: &ash::Device, cache: vk::PipelineCache) -> Option<usize> {
@@ -534,7 +534,8 @@ impl Shared {
     /// tell pipelines apart. `create` builds the create info with `next` as its `p_next` (creation
     /// flags, then creation feedback), calls the create function with `cache` and returns the
     /// driver CPU the call took. A ray tracing pipeline takes no executable statistics, which
-    /// other pipelines capture where the device reports them; `stacks` reads its shaders' stacks.
+    /// other pipelines capture where the device reports them; `shaders` reads a ray pipeline's
+    /// shaders.
     /// Returns the pipeline and, where it compiled, what that cost and what the driver reports of
     /// the code it made, which is also logged. Every pipeline is recorded, one from a cache once.
     #[allow(clippy::too_many_arguments)]
@@ -550,7 +551,7 @@ impl Shared {
             vk::PipelineCache,
             *const c_void,
         ) -> Result<(vk::Pipeline, DriverCpu), vk::Result>,
-        stacks: impl FnOnce(vk::Pipeline) -> Vec<ShaderStack>,
+        shaders: impl FnOnce(vk::Pipeline) -> Vec<RayShader>,
     ) -> Result<(vk::Pipeline, Option<CompileCost>), Error> {
         let ray = kind == PipelineKind::Ray;
         let cache = &self.pipeline_cache;
@@ -634,8 +635,8 @@ impl Shared {
         } else {
             log::Level::Debug
         };
-        let stacks = if recorded.is_some() || log::log_enabled!(level) {
-            stacks(raw)
+        let shaders = if recorded.is_some() || log::log_enabled!(level) {
+            shaders(raw)
         } else {
             Vec::new()
         };
@@ -649,7 +650,7 @@ impl Shared {
                     stages.iter().map(|s| s.stage_entry()).collect()
                 },
                 code: if ray { None } else { self.code_statistics(raw) },
-                stacks: stacks.clone(),
+                shaders: shaders.clone(),
                 ..CompileCost::default()
             };
             if compiled {
@@ -662,7 +663,7 @@ impl Shared {
             cost
         });
         let compile = cost.clone().filter(|_| compiled);
-        self.created(raw, name, start, compile.as_ref(), !ray, &stacks);
+        self.created(raw, name, start, compile.as_ref(), !ray, &shaders);
         if let (Some(key), Some(file), Some(cost)) = (recorded, &self.compile_records, cost) {
             let record = CompileRecord {
                 kind,

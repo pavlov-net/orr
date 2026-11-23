@@ -1,8 +1,8 @@
-// A large layered ground surface, for the stage caps on linked code: a pair of sets picked from a
-// control texture's 2x2 texels, blended by height with a sward and a snow layer and a three-plane
-// cliff projection, each set three textures read with three hex-bombed taps, then macro color,
-// canopy, cavity and wetness. It unrolls the taps but loops over its layers: with the layers
-// unrolled too, its stages are over the caps.
+// A large layered ground surface, for the stages made for linked code: a pair of sets picked from
+// a control texture's 2x2 texels, blended by height with a sward and a snow layer and a
+// three-plane cliff projection, each set three textures read with three hex-bombed taps, then
+// macro color, canopy, cavity and wetness. It unrolls the taps but loops over its layers, whose
+// unrolled copies would multiply its stages' code.
 module strata;
 
 import orr_scene.surface;

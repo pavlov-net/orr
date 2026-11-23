@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::code_limits;
 use crate::compiles::{self, Records};
 use crate::load;
 
@@ -41,10 +40,9 @@ by targets, worktrees and commits. It defaults to target/test-pipelines in the m
 Each target's output goes to target/test-logs/<target>.log, and a line for each pipeline its
 test devices create, compiled or from a cache, in orr_gpu::CompileRecord's format, to
 target/test-logs/<target>.compiles, which ORR_TEST_COMPILE_RECORDS names to them. The summary
-lists the costliest of the run's compiles and how busy the machine was, and where a pipeline it
-used spills or a path stage keeps a stack over its budget (xtask/src/code_limits.rs). Exits 0 when every selected target
-passes, 1 when one fails or breaks those limits on the device and driver they were measured on,
-and 2 when the tests can't be built or run; compile times never fail a run.
+lists the costliest of the run's compiles and how busy the machine was. Exits 0 when every
+selected target passes, 1 when one fails, and 2 when the tests can't be built or run; compile
+times never fail a run.
 ";
 
 /// More GPU runs at once have coincided with device resets, and gain little: the driver's
@@ -870,20 +868,14 @@ fn try_run(args: Vec<String>) -> Result<ExitCode, String> {
     let load = load.load();
 
     let not_run = skipped(&ws, &options, &features);
-    let limits = code_limits::check(
-        outcomes
-            .iter()
-            .flat_map(|o| o.records.compiles.iter().chain(&o.records.hits)),
-    );
     report(&mut outcomes, &not_run, build_time, wall, load.as_ref());
-    print!("{limits}");
     let unbuilt = ws
         .selected(&options)
         .any(|t| t.exe.is_none() && t.required_features.is_empty());
     let not_started = outcomes.iter().any(|o| o.status.is_err());
     Ok(if unbuilt || not_started || outcomes.is_empty() {
         ExitCode::from(2)
-    } else if outcomes.iter().all(Outcome::ok) && !limits.fails() {
+    } else if outcomes.iter().all(Outcome::ok) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

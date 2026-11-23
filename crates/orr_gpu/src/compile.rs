@@ -32,7 +32,7 @@ pub struct CompileCost {
     /// The instructions the stages' functions hand the driver, as
     /// [`handed_instructions`](crate::handed_instructions) counts them.
     pub instructions: u32,
-    /// A compute or mesh pipeline's stages; empty for a ray tracing pipeline, whose `stacks`
+    /// A compute or mesh pipeline's stages; empty for a ray tracing pipeline, whose `shaders`
     /// name its shaders.
     pub entries: Vec<StageEntry>,
     /// What the driver reports of the pipeline's executables; `None` where it doesn't report
@@ -40,7 +40,7 @@ pub struct CompileCost {
     /// on a driver whose statistics name none of them.
     pub code: Option<CodeStatistics>,
     /// A ray tracing pipeline's shaders, each once, with their stacks; empty for other kinds.
-    pub stacks: Vec<ShaderStack>,
+    pub shaders: Vec<RayShader>,
 }
 
 /// What the driver reports of a pipeline's machine code. Of a pipeline with several
@@ -87,14 +87,17 @@ impl CompileCost {
     }
 }
 
-/// A ray tracing shader and the stack it keeps: what it holds in memory across its calls and
-/// traces, as `vkGetRayTracingShaderGroupStackSizeKHR` reports it.
+/// A ray tracing shader as the driver is handed it, and the stack it keeps.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShaderStack {
+pub struct RayShader {
     /// The stage's label, or where it has none the name its entry point takes in the code the
     /// driver is handed.
     pub shader: String,
-    pub bytes: u64,
+    /// What it holds in memory across its calls and traces, as
+    /// `vkGetRayTracingShaderGroupStackSizeKHR` reports it.
+    pub stack_bytes: u64,
+    /// As [`handed_instructions`](crate::handed_instructions) counts them.
+    pub instructions: u32,
 }
 
 /// What kind of pipeline a [`CompileRecord`] is of.
@@ -116,26 +119,27 @@ impl PipelineKind {
 }
 
 /// One pipeline a device created, compiled or from a cache, as a line of a compile records
-/// file:
+/// file, its fields in this order and those in brackets where they apply:
 ///
 /// ```text
-/// orr-compile kind=compute key=<hex> device=NVIDIA_GeForce_RTX_5090 driver=NVIDIA_621.24 wall_us=84575 cpu_us=93750 serial_us=93750 longest_join_us=0 joins=0 stages=1 instructions=1065 entries=gpu_suite.clusters.args specs=01000000 registers=34 local_bytes=0 shared_bytes=0 binary_bytes=11136 name=cluster_args
-/// orr-compile kind=compute key=<hex> device=NVIDIA_GeForce_RTX_5090 driver=NVIDIA_621.24 hit=1 wall_us=0 cpu_us=0 serial_us=0 longest_join_us=0 joins=0 stages=1 instructions=1065 entries=gpu_suite.clusters.args specs=01000000 registers=34 local_bytes=0 shared_bytes=0 binary_bytes=11136 name=cluster_args
-/// orr-compile kind=ray key=<hex> device=NVIDIA_GeForce_RTX_5090 driver=NVIDIA_621.24 wall_us=8410233 cpu_us=40921875 serial_us=2015625 longest_join_us=6890625 joins=32 stages=39 instructions=882114 stacks=paths:480,miss_scatter:0 name=path pipeline 0xffffffffffffffff
+/// orr-compile kind=<kind> key=<hex> device=<device> driver=<driver> [hit=1] wall_us=<n>
+///     cpu_us=<n> serial_us=<n> longest_join_us=<n> joins=<n> stages=<n> instructions=<n>
+///     [entries=<entry>,... specs=<hex>,...]
+///     [registers=<n> local_bytes=<n> shared_bytes=<n> binary_bytes=<n>]
+///     [shaders=<shader>:<stack_bytes>:<instructions>,...] name=<name>
 /// ```
 ///
-/// Times are whole microseconds. `kind` is `compute`, `mesh` or `ray`; `key` is the hash that
-/// names the pipeline's file in a pipeline store. `device` and `driver` are the device's name
-/// and its driver's name and version, as `Caps::device_name` and `Caps::driver` give them, with
-/// `_` for each space. `hit=1` marks a pipeline that came from the pipeline cache or the store,
-/// which cost the driver no compile: its times are 0, and the rest is what the driver reports of
-/// it as of a compiled one. A device records such a pipeline once, however often it creates it. `entries` lists a compute or mesh pipeline's
-/// stages by [`StageEntry::name`], separated by commas, and `specs` their specialization data in
-/// the same order, as hex bytes or `-` for none. `registers`, `local_bytes`, `shared_bytes` and
-/// `binary_bytes` are [`CodeStatistics`]' and appear together where the driver reports them.
-/// `stacks` lists a ray tracing pipeline's shaders as `shader:bytes` separated by commas. `name`
-/// comes last and runs to the end of the line, spaces and all. A reader skips fields it doesn't
-/// know.
+/// A line holds no breaks. Times are whole microseconds. `kind` is `compute`, `mesh` or `ray`;
+/// `key` is the hash that names the pipeline's file in a pipeline store. `device` and `driver`
+/// are the device's name and its driver's name and version, as `Caps::device_name` and
+/// `Caps::driver` give them, with `_` for each space. `hit=1` marks a pipeline that came from the
+/// pipeline cache or the store, which cost the driver no compile: its times are 0, and the rest
+/// is what the driver reports of it as of a compiled one. A device records such a pipeline once,
+/// however often it creates it. `entries` lists a compute or mesh pipeline's stages by
+/// [`StageEntry::name`], and `specs` their specialization data in the same order, as hex bytes or
+/// `-` for none. The code statistics are [`CodeStatistics`]', where the driver reports them.
+/// `shaders` lists a ray tracing pipeline's shaders. `name` comes last and runs to the end of the
+/// line, spaces and all. A reader skips fields it doesn't know.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompileRecord {
     pub kind: PipelineKind,
@@ -185,9 +189,9 @@ impl fmt::Display for CompileRecord {
                 code.registers, code.local_bytes, code.shared_bytes, code.binary_bytes
             )?;
         }
-        for (i, s) in c.stacks.iter().enumerate() {
-            let lead = if i == 0 { " stacks=" } else { "," };
-            write!(f, "{lead}{}:{}", s.shader, s.bytes)?;
+        for (i, s) in c.shaders.iter().enumerate() {
+            let lead = if i == 0 { " shaders=" } else { "," };
+            write!(f, "{lead}{}:{}:{}", s.shader, s.stack_bytes, s.instructions)?;
         }
         write!(f, " name={}", self.name)
     }
@@ -253,15 +257,17 @@ impl CompileRecord {
                         binary_bytes: bytes("binary_bytes")?,
                     }),
                 },
-                stacks: match fields.get("stacks") {
+                shaders: match fields.get("shaders") {
                     None => Vec::new(),
-                    Some(stacks) => stacks
+                    Some(shaders) => shaders
                         .split(',')
                         .map(|s| {
-                            let (shader, bytes) = s.rsplit_once(':')?;
-                            Some(ShaderStack {
+                            let (s, instructions) = s.rsplit_once(':')?;
+                            let (shader, stack_bytes) = s.rsplit_once(':')?;
+                            Some(RayShader {
                                 shader: shader.to_owned(),
-                                bytes: bytes.parse().ok()?,
+                                stack_bytes: stack_bytes.parse().ok()?,
+                                instructions: instructions.parse().ok()?,
                             })
                         })
                         .collect::<Option<_>>()?,
@@ -302,14 +308,16 @@ mod tests {
             hit: false,
             name: "path pipeline 0xffffffffffffffff".into(),
             cost: CompileCost {
-                stacks: vec![
-                    ShaderStack {
+                shaders: vec![
+                    RayShader {
                         shader: "paths".into(),
-                        bytes: 480,
+                        stack_bytes: 480,
+                        instructions: 21_345,
                     },
-                    ShaderStack {
+                    RayShader {
                         shader: "surface_hit.triangles.any.layer".into(),
-                        bytes: 0,
+                        stack_bytes: 0,
+                        instructions: 9_876,
                     },
                 ],
                 ..cost.clone()
