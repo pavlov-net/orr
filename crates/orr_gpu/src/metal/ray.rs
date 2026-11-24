@@ -763,11 +763,13 @@ impl CommandList<'_> {
         if groups.contains(&0) {
             return;
         }
-        let e = self.bind_rays(p, raygen, hits, root, extent, 0);
-        e.dispatchThreadgroups_threadsPerThreadgroup(
-            super::command::size(groups),
-            super::command::size([GROUP, 1, 1]),
-        );
+        self.bind_rays(p, raygen, hits, root, extent, 0);
+        self.compute(move |e, _| {
+            e.dispatchThreadgroups_threadsPerThreadgroup(
+                super::command::size(groups),
+                super::command::size([GROUP, 1, 1]),
+            );
+        });
     }
 
     /// As [`Self::trace_rays`], over the extent `args` holds on the GPU (width, height,
@@ -793,20 +795,23 @@ impl CommandList<'_> {
             [1, 1, 1],
             [1, 1, 1],
         );
-        self.compute()
-            .barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+        self.compute(|e, _| {
+            e.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
                 MTLStages::Dispatch,
                 MTLStages::Dispatch,
                 MTL4VisibilityOptions::Device,
             );
-        let e = self.bind_rays(p, raygen, hits, root, [0; 3], args.address().0);
-        // SAFETY: the counts are in the list's inline memory, written above.
-        unsafe {
-            e.dispatchThreadgroupsWithIndirectBuffer_threadsPerThreadgroup(
-                at,
-                super::command::size([GROUP, 1, 1]),
-            );
-        }
+        });
+        self.bind_rays(p, raygen, hits, root, [0; 3], args.address().0);
+        self.compute(move |e, _| {
+            // SAFETY: the counts are in the list's inline memory, written above.
+            unsafe {
+                e.dispatchThreadgroupsWithIndirectBuffer_threadsPerThreadgroup(
+                    at,
+                    super::command::size([GROUP, 1, 1]),
+                );
+            }
+        });
     }
 
     /// Binds raygen `raygen`'s kernel with `root` at buffers 0 and 4 and its launch block at 3:
@@ -819,7 +824,7 @@ impl CommandList<'_> {
         root: &R,
         extent: [u32; 3],
         extent_address: u64,
-    ) -> Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>> {
+    ) {
         assert_eq!(
             size_of::<R>(),
             p.inline_root_bytes as usize,
@@ -858,19 +863,20 @@ impl CommandList<'_> {
         };
         let launch = self.inline_bytes(bytemuck::bytes_of(&launch));
         let root = self.inline_bytes(bytemuck::bytes_of(root));
-        let e = self.compute();
-        e.setComputePipelineState(&r.state);
-        // SAFETY: the copies live in the list's inline blocks until the submit completes.
-        unsafe {
-            self.table.setAddress_atIndex(root, 0);
-            self.table.setAddress_atIndex(launch, 3);
-            self.table.setAddress_atIndex(root, 4);
-        }
-        e.setArgumentTable(Some(&self.table));
+        let state = r.state.clone();
+        self.compute(move |e, table| {
+            e.setComputePipelineState(&state);
+            // SAFETY: the copies live in the list's inline blocks until the submit completes.
+            unsafe {
+                table.setAddress_atIndex(root, 0);
+                table.setAddress_atIndex(launch, 3);
+                table.setAddress_atIndex(root, 4);
+            }
+            e.setArgumentTable(Some(table));
+        });
         self.keep.push(Box::new(r.state.clone()));
         self.keep.push(Box::new(r.table.clone()));
         self.keep.push(Box::new(Arc::clone(&p.records)));
         self.keep.push(Box::new(Arc::clone(&p.functions)));
-        e
     }
 }

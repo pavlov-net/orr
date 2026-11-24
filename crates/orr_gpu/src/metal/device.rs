@@ -15,7 +15,7 @@ use orr_memory::HeapPool;
 
 use super::accel::{EmptyTlas, build_empty_tlas};
 use super::cache::PipelineCache;
-use super::cluster::{self, Kernels, Objects, PtlasCheck, StructureIds};
+use super::cluster::{self, Kernels, Objects, PtlasCheck};
 use super::heap::Bindings;
 use super::queue::{Queue, TimestampRing};
 use super::{Buffers, Garbage, MAX_TIMELINES, Obj, Release, Timeline, lock};
@@ -70,7 +70,6 @@ pub(super) struct Shared {
     pub(super) timestamps: TimestampRing,
     /// Cluster and partitioned acceleration structures by the address of their object.
     pub(super) objects: Mutex<Objects>,
-    pub(super) structure_ids: StructureIds,
     /// The debug PTLAS check, created by the first PTLAS build of a debug build.
     pub(super) ptlas_check: OnceLock<PtlasCheck>,
     pub(super) cluster_kernels: OnceLock<Kernels>,
@@ -237,7 +236,6 @@ impl Device {
             results: Mutex::default(),
             timestamps,
             objects: Mutex::default(),
-            structure_ids: StructureIds::default(),
             ptlas_check: OnceLock::new(),
             cluster_kernels: OnceLock::new(),
             ray: OnceLock::new(),

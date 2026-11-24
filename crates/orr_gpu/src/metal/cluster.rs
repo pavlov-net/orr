@@ -19,15 +19,12 @@
 //! Metal builds only what the CPU encodes with exact counts, so cluster ops copy their
 //! records back and finish in a CPU step ([`CommandList::split`]) once the GPU has written
 //! them. PTLAS builds need none.
-//!
-//! Metal finds a structure from its ID through a table that grows as structures are created,
-//! and work encoded before a growth misses IDs past the old size: its traces and TLAS builds
-//! see no geometry. A CPU step creates structures after the work that uses them was encoded,
-//! so recording the op grows the table first ([`StructureIds`]).
+//! The work recorded after a step is encoded once the step has created its structures, so it
+//! sees them ([`super::command::HostStep`]).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -40,8 +37,7 @@ use objc2_metal::{
     MTL4PrimitiveAccelerationStructureDescriptor, MTLAccelerationStructure,
     MTLAccelerationStructureDescriptor, MTLAccelerationStructureInstanceDescriptorType,
     MTLAccelerationStructureUsage, MTLAttributeFormat, MTLBuffer, MTLComputePipelineState,
-    MTLDevice, MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLIndexType,
-    MTLResidencySet, MTLResource, MTLResourceOptions, MTLStorageMode,
+    MTLDevice, MTLIndexType, MTLResidencySet, MTLResource, MTLResourceOptions,
 };
 
 use super::command::CommandList;
@@ -180,90 +176,7 @@ impl Objects {
     }
 }
 
-/// The acceleration-structure IDs Metal's table holds. A CPU step hands out IDs no higher
-/// than the highest so far plus the structures recorded steps may still create, so
-/// recording an op makes the table hold those first.
-#[derive(Default)]
-pub(super) struct StructureIds {
-    /// The highest ID a structure the backend keeps has had.
-    high: AtomicU64,
-    /// Structures that recorded CPU steps may still create.
-    pending: AtomicU64,
-    /// IDs the table holds at least. Held while growing it.
-    held: std::sync::Mutex<u64>,
-}
-
-impl StructureIds {
-    pub(super) fn note(&self, s: &Structure) {
-        self.high
-            .fetch_max(id_bits(s.gpuResourceID()), Ordering::Relaxed);
-    }
-}
-
-/// Structures a recorded CPU step may create; released with the step.
-struct Reservation {
-    shared: Arc<Shared>,
-    count: u64,
-}
-
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        self.shared
-            .structure_ids
-            .pending
-            .fetch_sub(self.count, Ordering::Relaxed);
-    }
-}
-
 impl Shared {
-    /// Makes room in Metal's ID table for `count` more structures, created by a CPU step
-    /// after work recorded before it. Grows the table by creating throwaway structures,
-    /// to the next power of two past what is needed, so growths stay rare.
-    fn reserve_structures(self: &Arc<Self>, count: u64) -> Reservation {
-        let ids = &self.structure_ids;
-        let pending = ids.pending.fetch_add(count, Ordering::Relaxed) + count;
-        let reservation = Reservation {
-            shared: Arc::clone(self),
-            count,
-        };
-        let need = ids.high.load(Ordering::Relaxed) + pending + 1;
-        let mut held = lock(&ids.held);
-        if need > *held {
-            let target = need.next_power_of_two().max(256);
-            // SAFETY: any size is valid to ask about.
-            let placed = unsafe {
-                self.device
-                    .heapAccelerationStructureSizeAndAlignWithSize(16)
-            };
-            let desc = MTLHeapDescriptor::new();
-            desc.setType(MTLHeapType::Placement);
-            desc.setStorageMode(MTLStorageMode::Private);
-            desc.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
-            desc.setSize(placed.size);
-            let heap = self
-                .device
-                .newHeapWithDescriptor(&desc)
-                .expect("newHeapWithDescriptor");
-            // New IDs take the lowest free ones: the last of `target` structures has an ID
-            // at least `target - 1`, which makes the table hold `target`. They all alias one
-            // heap range because device allocations scan a free list per object, which takes
-            // minutes at a million structures.
-            let mut throwaway = Vec::new();
-            while (throwaway.len() as u64) < target {
-                // SAFETY: the structure fills the heap, and nothing builds or traces it.
-                let s = unsafe { heap.newAccelerationStructureWithSize_offset(16, 0) }
-                    .expect("newAccelerationStructureWithSize");
-                let id = id_bits(s.gpuResourceID());
-                throwaway.push(s);
-                if id + 1 >= target {
-                    break;
-                }
-            }
-            *held = target;
-        }
-        reservation
-    }
-
     /// Forgets the objects in `[start, end)`, memory being freed, and releases their
     /// structures; runs when nothing submitted uses them any more.
     pub(super) fn forget_objects(&self, start: u64, end: u64) {
@@ -305,7 +218,6 @@ impl Shared {
             .device
             .newAccelerationStructureWithSize(sizes.accelerationStructureSize.max(1))
             .expect("newAccelerationStructureWithSize");
-        self.structure_ids.note(&raw);
         (Obj(raw), sizes.buildScratchBufferSize as u64)
     }
 }
@@ -660,14 +572,8 @@ impl CommandList<'_> {
         } else {
             let (d, io) = (*d, *io);
             let readback = self.read_records(&d, &io);
-            let creates = match d.op {
-                RtasOp::BuildTemplates | RtasOp::Move => 0,
-                _ if d.flags.contains(RtasFlags::FLAT_ONLY) => 0,
-                _ => u64::from(max_args(&d)),
-            };
-            let reservation = self.queue.shared.reserve_structures(creates);
             self.split(Box::new(move |list: &mut CommandList<'_>| {
-                list.cluster_step(&d, &io, &readback, reservation);
+                list.cluster_step(&d, &io, &readback);
             }));
         }
         self.barrier(Stages::AS_BUILD, Stages::ALL, Hazards::ACCEL_STRUCT);
@@ -709,24 +615,17 @@ impl CommandList<'_> {
         }
     }
 
-    /// The CPU half of a cluster op: encodes it from the records the GPU wrote. The
-    /// structures it creates are within `reservation`, which it keeps until they exist.
-    fn cluster_step(
-        &mut self,
-        d: &RtasOpDesc,
-        io: &RtasIo,
-        rb: &Readback,
-        reservation: Reservation,
-    ) {
+    /// The CPU half of a cluster op: encodes it from the records the GPU wrote.
+    fn cluster_step(&mut self, d: &RtasOpDesc, io: &RtasIo, rb: &Readback) {
         let count = rb.count(max_args(d)) as usize;
         if count == 0 {
             return;
         }
         match d.op {
             RtasOp::BuildClas | RtasOp::BuildTemplates | RtasOp::InstantiateTemplates => {
-                self.build_objects(d, io, rb, count, reservation);
+                self.build_objects(d, io, rb, count);
             }
-            RtasOp::BuildClusterBlas => self.build_blas(d, io, rb, count, reservation),
+            RtasOp::BuildClusterBlas => self.build_blas(d, io, rb, count),
             RtasOp::Move => self.move_objects(d, io, rb, count),
             RtasOp::Ptlas => unreachable!("PTLAS builds take no CPU step"),
         }
@@ -846,19 +745,24 @@ impl CommandList<'_> {
         let scratch = self.scratch_memory(MemoryKind::DeviceLocal, total, "cluster scratch");
         let base = scratch.gpu().address().0;
         self.barrier(Stages::ALL, Stages::AS_BUILD, Hazards::empty());
-        let e: Retained<ProtocolObject<dyn MTL4ComputeCommandEncoder>> = self.compute();
-        for ((raw, desc, s), o) in builds.iter().zip(offsets) {
-            // SAFETY: the structure, its inputs and its scratch range are live until the
-            // submit completes.
-            unsafe {
-                e.buildAccelerationStructure_descriptor_scratchBuffer(
-                    raw,
-                    desc,
-                    range(base + o, (*s).max(256)),
-                );
+        self.keep.extend(
+            builds
+                .iter()
+                .map(|(raw, _, _)| Box::new(raw.clone()) as Box<_>),
+        );
+        self.compute(move |e, _| {
+            for ((raw, desc, s), o) in builds.iter().zip(offsets) {
+                // SAFETY: the structure, its inputs and its scratch range are live until the
+                // submit completes.
+                unsafe {
+                    e.buildAccelerationStructure_descriptor_scratchBuffer(
+                        raw,
+                        desc,
+                        range(base + o, (*s).max(256)),
+                    );
+                }
             }
-            self.keep.push(Box::new(raw.clone()));
-        }
+        });
         self.keep.push(Box::new(scratch));
         if !rest.is_empty() {
             let rest = RemainingBuilds(rest);
@@ -871,15 +775,8 @@ impl CommandList<'_> {
 
     /// CLAS builds, template builds and instantiations. A CLAS's triangles come back as their
     /// geometry words in `pack`'s order, from which a second step makes its runs and its Metal
-    /// BLAS, within `reservation`.
-    fn build_objects(
-        &mut self,
-        d: &RtasOpDesc,
-        io: &RtasIo,
-        rb: &Readback,
-        count: usize,
-        reservation: Reservation,
-    ) {
+    /// BLAS.
+    fn build_objects(&mut self, d: &RtasOpDesc, io: &RtasIo, rb: &Readback, count: usize) {
         let shared = Arc::clone(&self.queue.shared);
         let clas = d.op != RtasOp::BuildTemplates;
         let structures = clas && !d.flags.contains(RtasFlags::FLAT_ONLY);
@@ -953,7 +850,6 @@ impl CommandList<'_> {
         self.write_results(io, &addresses, &sizes);
         let Some(keys) = keys else { return };
         self.split(Box::new(move |list: &mut CommandList<'_>| {
-            let _reservation = reservation;
             list.place_runs(&keys, &shapes, &addresses, structures);
         }));
     }
@@ -1045,14 +941,7 @@ impl CommandList<'_> {
     }
 
     /// Cluster BLAS builds.
-    fn build_blas(
-        &mut self,
-        d: &RtasOpDesc,
-        io: &RtasIo,
-        rb: &Readback,
-        count: usize,
-        reservation: Reservation,
-    ) {
+    fn build_blas(&mut self, d: &RtasOpDesc, io: &RtasIo, rb: &Readback, count: usize) {
         let blas: Vec<(u64, u32)> = Vec::from_fn(count, |i| {
             let r = rb.record(i);
             (word64(r, 2), word(r, 0))
@@ -1089,7 +978,6 @@ impl CommandList<'_> {
             }
             let io = *io;
             self.split(Box::new(move |list: &mut CommandList<'_>| {
-                let _reservation = reservation;
                 let bytes = memory.as_slice().expect("readback is mapped");
                 let mut at = 0;
                 let clas: Vec<Vec<u64>> = blas
@@ -1447,17 +1335,19 @@ impl CommandList<'_> {
             [GROUP, 1, 1],
         );
         self.barrier(Stages::COMPUTE, Stages::AS_BUILD, Hazards::empty());
-        let e = self.compute();
-        // SAFETY: the TLAS, its descriptors and the caller's scratch are live until the
-        // submit completes.
-        unsafe {
-            e.buildAccelerationStructure_descriptor_scratchBuffer(
-                &raw,
-                &desc,
-                range(io.scratch.0, u64::MAX),
-            );
-        }
-        self.keep.push(Box::new(raw));
+        self.keep.push(Box::new(raw.clone()));
+        let scratch = io.scratch.0;
+        self.compute(move |e, _| {
+            // SAFETY: the TLAS, its descriptors and the caller's scratch are live until the
+            // submit completes.
+            unsafe {
+                e.buildAccelerationStructure_descriptor_scratchBuffer(
+                    &raw,
+                    &desc,
+                    range(scratch, u64::MAX),
+                );
+            }
+        });
     }
 }
 

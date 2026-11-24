@@ -382,31 +382,34 @@ impl CommandList<'_> {
             }
             self.barrier(Stages::COMPUTE, Stages::ALL, Hazards::DRAW_ARGUMENTS);
         }
-        self.end_encoder();
-        let e = autoreleasepool(|_| self.buffer.renderCommandEncoderWithDescriptor(&pass.desc))
-            .expect("renderCommandEncoderWithDescriptor");
-        self.open_barrier(ProtocolObject::from_ref(&*e));
-        // orr's clip space has +y pointing down the target, Metal's up: the viewport flips it.
-        let (w, h) = (f64::from(pass.extent[0]), f64::from(pass.extent[1]));
-        e.setViewport(MTLViewport {
-            originX: 0.0,
-            originY: h,
-            width: w,
-            height: -h,
-            znear: 0.0,
-            zfar: 1.0,
-        });
-        for c in pass.commands {
-            match c {
-                RenderCommand::Scissor(r) => e.setScissorRect(r),
-                RenderCommand::Draw {
-                    pipeline,
-                    root,
-                    draw,
-                } => self.encode_draw(&e, &pipeline, root, draw),
+        self.record(move |enc| {
+            enc.end_encoder();
+            let e = autoreleasepool(|_| enc.buffer.renderCommandEncoderWithDescriptor(&pass.desc))
+                .expect("renderCommandEncoderWithDescriptor");
+            enc.open_barrier(ProtocolObject::from_ref(&*e));
+            // orr's clip space has +y pointing down the target, Metal's up: the viewport flips
+            // it.
+            let (w, h) = (f64::from(pass.extent[0]), f64::from(pass.extent[1]));
+            e.setViewport(MTLViewport {
+                originX: 0.0,
+                originY: h,
+                width: w,
+                height: -h,
+                znear: 0.0,
+                zfar: 1.0,
+            });
+            for c in pass.commands {
+                match c {
+                    RenderCommand::Scissor(r) => e.setScissorRect(r),
+                    RenderCommand::Draw {
+                        pipeline,
+                        root,
+                        draw,
+                    } => encode_draw(&e, &enc.table, &pipeline, root, draw),
+                }
             }
-        }
-        e.endEncoding();
+            e.endEncoding();
+        });
     }
 
     fn pass(&mut self) -> &mut PendingPass {
@@ -432,62 +435,6 @@ impl CommandList<'_> {
                 groups,
             },
         );
-    }
-
-    fn encode_draw(&self, e: &RenderEncoder, p: &DrawState, root: u64, draw: Draw) {
-        e.setRenderPipelineState(&p.raw);
-        let raster = p.raster;
-        e.setCullMode(match raster.cull {
-            Cull::None => MTLCullMode::None,
-            Cull::Front => MTLCullMode::Front,
-            Cull::Back => MTLCullMode::Back,
-        });
-        e.setFrontFacingWinding(match raster.front_face {
-            FrontFace::CounterClockwise => MTLWinding::CounterClockwise,
-            FrontFace::Clockwise => MTLWinding::Clockwise,
-        });
-        e.setTriangleFillMode(match raster.fill {
-            Fill::Solid => MTLTriangleFillMode::Fill,
-            Fill::Lines => MTLTriangleFillMode::Lines,
-        });
-        let bias = raster.depth_bias.unwrap_or_default();
-        e.setDepthBias_slopeScale_clamp(bias.constant, bias.slope, bias.clamp);
-        e.setDepthStencilState(p.depth.as_deref());
-        // SAFETY: the root's address is the caller's to keep valid until the submit
-        // completes, as on every backend.
-        unsafe { self.table.setAddress_atIndex(root, 0) };
-        match draw {
-            Draw::Vertices {
-                topology,
-                vertices,
-                instances,
-            } => {
-                e.setArgumentTable_atStages(
-                    &self.table,
-                    MTLRenderStages::Vertex | MTLRenderStages::Fragment,
-                );
-                // SAFETY: the draw is inside rendering and the shaders fetch vertices through
-                // the root, whose data the caller sizes for the draw.
-                unsafe {
-                    e.drawPrimitives_vertexStart_vertexCount_instanceCount(
-                        topology,
-                        0,
-                        vertices as usize,
-                        instances as usize,
-                    );
-                }
-            }
-            Draw::Mesh { task, mesh, groups } => {
-                e.setArgumentTable_atStages(
-                    &self.table,
-                    MTLRenderStages::Object | MTLRenderStages::Mesh | MTLRenderStages::Fragment,
-                );
-                match groups {
-                    Groups::Direct(g) => e.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(size(g), size(task), size(mesh)),
-                    Groups::Indirect(args) => e.drawMeshThreadgroupsWithIndirectBuffer_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(args, size(task), size(mesh)),
-                }
-            }
-        }
     }
 
     /// Draws `vertices` vertices for each of `instances`, with both IDs starting at zero.
@@ -547,6 +494,65 @@ impl super::device::Shared {
         f.setLibrary(Some(&library));
         let state = self.compute_state(&f, [64, 1, 1], "draw gate")?;
         Ok(STATE.get_or_init(|| state).clone())
+    }
+}
+
+fn encode_draw(
+    e: &RenderEncoder,
+    table: &ProtocolObject<dyn MTL4ArgumentTable>,
+    p: &DrawState,
+    root: u64,
+    draw: Draw,
+) {
+    e.setRenderPipelineState(&p.raw);
+    let raster = p.raster;
+    e.setCullMode(match raster.cull {
+        Cull::None => MTLCullMode::None,
+        Cull::Front => MTLCullMode::Front,
+        Cull::Back => MTLCullMode::Back,
+    });
+    e.setFrontFacingWinding(match raster.front_face {
+        FrontFace::CounterClockwise => MTLWinding::CounterClockwise,
+        FrontFace::Clockwise => MTLWinding::Clockwise,
+    });
+    e.setTriangleFillMode(match raster.fill {
+        Fill::Solid => MTLTriangleFillMode::Fill,
+        Fill::Lines => MTLTriangleFillMode::Lines,
+    });
+    let bias = raster.depth_bias.unwrap_or_default();
+    e.setDepthBias_slopeScale_clamp(bias.constant, bias.slope, bias.clamp);
+    e.setDepthStencilState(p.depth.as_deref());
+    // SAFETY: the root's address is the caller's to keep valid until the submit
+    // completes, as on every backend.
+    unsafe { table.setAddress_atIndex(root, 0) };
+    match draw {
+        Draw::Vertices {
+            topology,
+            vertices,
+            instances,
+        } => {
+            e.setArgumentTable_atStages(table, MTLRenderStages::Vertex | MTLRenderStages::Fragment);
+            // SAFETY: the draw is inside rendering and the shaders fetch vertices through
+            // the root, whose data the caller sizes for the draw.
+            unsafe {
+                e.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                    topology,
+                    0,
+                    vertices as usize,
+                    instances as usize,
+                );
+            }
+        }
+        Draw::Mesh { task, mesh, groups } => {
+            e.setArgumentTable_atStages(
+                table,
+                MTLRenderStages::Object | MTLRenderStages::Mesh | MTLRenderStages::Fragment,
+            );
+            match groups {
+                Groups::Direct(g) => e.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(size(g), size(task), size(mesh)),
+                Groups::Indirect(args) => e.drawMeshThreadgroupsWithIndirectBuffer_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(args, size(task), size(mesh)),
+            }
+        }
     }
 }
 

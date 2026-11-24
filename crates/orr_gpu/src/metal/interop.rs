@@ -37,24 +37,30 @@ pub fn defer_after_submitted(device: &Device, release: impl FnOnce() + Send + 's
 }
 
 impl CommandList<'_> {
-    /// Hands out the list's command buffer, with no encoder open, for encoders of a library's
-    /// own. Their work starts after everything recorded on the queue before, whatever barriers
-    /// were pending: orr's barriers wait only in encoders orr opens, so this ends the list's
-    /// work with an encoder whose producer barrier holds back every later encoder. Work recorded
-    /// on the list afterwards waits for the library's only through a [`CommandList::barrier`],
-    /// as for orr's own work.
-    pub fn metal_raw(&mut self) -> &ProtocolObject<dyn MTL4CommandBuffer> {
+    /// Has `encode` encode a library's own encoders into the list's command buffer, with no
+    /// encoder open, when the list is encoded at submit. Their work starts after everything
+    /// recorded on the queue before, whatever barriers were pending: orr's barriers wait only
+    /// in encoders orr opens, so this ends the list's work with an encoder whose producer
+    /// barrier holds back every later encoder. Work recorded on the list afterwards waits for
+    /// the library's only through a [`CommandList::barrier`], as for orr's own work.
+    pub fn metal_raw(
+        &mut self,
+        encode: impl FnOnce(&ProtocolObject<dyn MTL4CommandBuffer>) + Send + 'static,
+    ) {
         assert!(
             self.pass.is_none(),
             "raw encoders are recorded outside rendering"
         );
-        let e = self.carrier();
-        e.barrierAfterStages_beforeQueueStages_visibilityOptions(
-            MTLStages::All,
-            MTLStages::All,
-            MTL4VisibilityOptions::Device,
-        );
-        self.end_encoder();
-        &self.buffer
+        let scratch = self.scratch();
+        self.record(move |e| {
+            let c = e.carrier(&scratch);
+            c.barrierAfterStages_beforeQueueStages_visibilityOptions(
+                MTLStages::All,
+                MTLStages::All,
+                MTL4VisibilityOptions::Device,
+            );
+            e.end_encoder();
+            encode(&e.buffer);
+        });
     }
 }

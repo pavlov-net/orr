@@ -238,7 +238,6 @@ impl Device {
             ClassicKind::Blas => "classic blas",
             ClassicKind::Tlas => "classic tlas",
         })));
-        self.shared.structure_ids.note(&raw);
         let id = super::heap::id_bits(raw.gpuResourceID());
         let tlas = match kind {
             ClassicKind::Tlas => {
@@ -301,19 +300,21 @@ impl CommandList<'_> {
             _ => None,
         };
         let desc = descriptor(b.desc, instances, data);
-        let e = self.compute();
-        // SAFETY: the inputs, destination and scratch are live device memory, as on every
-        // backend.
-        unsafe {
-            e.buildAccelerationStructure_descriptor_scratchBuffer(
-                &b.dst.raw,
-                &desc,
-                MTL4BufferRange {
-                    bufferAddress: b.scratch.0,
-                    length: u64::MAX,
-                },
-            );
-        }
+        let (dst, scratch) = (b.dst.raw.clone(), b.scratch.0);
+        self.compute(move |e, _| {
+            // SAFETY: the inputs, destination and scratch are live device memory, as on every
+            // backend.
+            unsafe {
+                e.buildAccelerationStructure_descriptor_scratchBuffer(
+                    &dst,
+                    &desc,
+                    MTL4BufferRange {
+                        bufferAddress: scratch,
+                        length: u64::MAX,
+                    },
+                );
+            }
+        });
         self.keep.push(Box::new(b.dst.raw.clone()));
         self.barrier(Stages::AS_BUILD, Stages::ALL, Hazards::ACCEL_STRUCT);
     }
@@ -418,17 +419,19 @@ impl CommandList<'_> {
     /// Writes the bytes `a` compacts into to `dst`, once its build has completed on the GPU.
     pub fn classic_compacted_size(&mut self, a: &ClassicAs, dst: GpuPtr<u64>) {
         self.barrier(Stages::AS_BUILD, Stages::AS_BUILD, Hazards::empty());
-        let e = self.compute();
-        // SAFETY: the structure is live and `dst` is eight bytes of the caller's memory.
-        unsafe {
-            e.writeCompactedAccelerationStructureSize_toBuffer(
-                &a.raw,
-                MTL4BufferRange {
-                    bufferAddress: dst.address().0,
-                    length: 8,
-                },
-            );
-        }
+        let (raw, dst) = (a.raw.clone(), dst.address().0);
+        self.compute(move |e, _| {
+            // SAFETY: the structure is live and `dst` is eight bytes of the caller's memory.
+            unsafe {
+                e.writeCompactedAccelerationStructureSize_toBuffer(
+                    &raw,
+                    MTL4BufferRange {
+                        bufferAddress: dst,
+                        length: 8,
+                    },
+                );
+            }
+        });
         self.keep.push(Box::new(a.raw.clone()));
         self.barrier(Stages::AS_BUILD, Stages::ALL, Hazards::empty());
     }
@@ -436,11 +439,11 @@ impl CommandList<'_> {
     /// Copies `src` into `dst`, created with at least its compacted size.
     pub fn compact_classic(&mut self, dst: &ClassicAs, src: &ClassicAs) {
         self.barrier(Stages::AS_BUILD, Stages::AS_BUILD, Hazards::empty());
-        let e = self.compute();
-        // SAFETY: both structures are live until the submit completes.
-        unsafe {
-            e.copyAndCompactAccelerationStructure_toAccelerationStructure(&src.raw, &dst.raw);
-        }
+        let (s, d) = (src.raw.clone(), dst.raw.clone());
+        self.compute(move |e, _| {
+            // SAFETY: both structures are live until the submit completes.
+            unsafe { e.copyAndCompactAccelerationStructure_toAccelerationStructure(&s, &d) };
+        });
         self.keep.push(Box::new(src.raw.clone()));
         self.keep.push(Box::new(dst.raw.clone()));
         self.barrier(Stages::AS_BUILD, Stages::ALL, Hazards::ACCEL_STRUCT);

@@ -421,24 +421,26 @@ impl CommandList<'_> {
         let layer = image * u64::from(region.extent[2].max(1));
         let bytes = layer * u64::from(region.layers);
         let (buffer, offset) = self.buffer_at(src.address().0, bytes, "texture copy source");
-        let e = self.compute();
-        for l in 0..region.layers {
-            // SAFETY: the source range lies within a live buffer (checked above); Metal
-            // validates the texture region.
-            unsafe {
-                e.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                    &buffer,
-                    (offset + layer * u64::from(l)) as usize,
-                    row as usize,
-                    image as usize,
-                    extent(region.extent),
-                    &dst.raw,
-                    (region.base_layer + l) as usize,
-                    region.mip as usize,
-                    origin(region.offset),
-                );
+        let (texture, region) = (dst.raw.clone(), *region);
+        self.compute(move |e, _| {
+            for l in 0..region.layers {
+                // SAFETY: the source range lies within a live buffer (checked above); Metal
+                // validates the texture region.
+                unsafe {
+                    e.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                        &buffer,
+                        (offset + layer * u64::from(l)) as usize,
+                        row as usize,
+                        image as usize,
+                        extent(region.extent),
+                        &texture,
+                        (region.base_layer + l) as usize,
+                        region.mip as usize,
+                        origin(region.offset),
+                    );
+                }
             }
-        }
+        });
         self.keep.push(Box::new(dst.raw.clone()));
     }
 
@@ -448,23 +450,25 @@ impl CommandList<'_> {
         let layer = image * u64::from(region.extent[2].max(1));
         let bytes = layer * u64::from(region.layers);
         let (buffer, offset) = self.buffer_at(dst.address().0, bytes, "texture copy destination");
-        let e = self.compute();
-        for l in 0..region.layers {
-            // SAFETY: as in `copy_rows_to_texture`.
-            unsafe {
-                e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
-                    &src.raw,
-                    (region.base_layer + l) as usize,
-                    region.mip as usize,
-                    origin(region.offset),
-                    extent(region.extent),
-                    &buffer,
-                    (offset + layer * u64::from(l)) as usize,
-                    row as usize,
-                    image as usize,
-                );
+        let (texture, region) = (src.raw.clone(), *region);
+        self.compute(move |e, _| {
+            for l in 0..region.layers {
+                // SAFETY: as in `copy_rows_to_texture`.
+                unsafe {
+                    e.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+                        &texture,
+                        (region.base_layer + l) as usize,
+                        region.mip as usize,
+                        origin(region.offset),
+                        extent(region.extent),
+                        &buffer,
+                        (offset + layer * u64::from(l)) as usize,
+                        row as usize,
+                        image as usize,
+                    );
+                }
             }
-        }
+        });
         self.keep.push(Box::new(src.raw.clone()));
     }
 }

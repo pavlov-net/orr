@@ -1,5 +1,6 @@
 //! Frame interpolation between two displayed frames: `MTL4FXFrameInterpolator` on orr textures.
 
+use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLPixelFormat, MTLTexture};
@@ -130,37 +131,48 @@ impl FrameInterpolator {
         check_usage(Input::Depth, raw(inputs.depth), need[1])?;
         check_usage(Input::Motion, raw(inputs.motion), need[2])?;
         check_usage(Input::Output, raw(inputs.output), need[3])?;
-        // SAFETY: setters of a live effect, with textures of the formats and sizes it was made
-        // for.
-        unsafe {
-            f.setColorTexture(Some(raw(inputs.color)));
-            f.setPrevColorTexture(Some(raw(inputs.previous_color)));
-            f.setDepthTexture(Some(raw(inputs.depth)));
-            f.setMotionTexture(Some(raw(inputs.motion)));
-            f.setOutputTexture(Some(raw(inputs.output)));
-            f.setUITexture(None);
-            let [mx, my] = crate::conventions::motion_scale(key.input);
-            f.setMotionVectorScaleX(mx);
-            f.setMotionVectorScaleY(my);
-            let [x, y] = crate::conventions::jitter(inputs.jitter);
-            f.setJitterOffsetX(x);
-            f.setJitterOffsetY(y);
-            f.setDeltaTime(inputs.delta_time);
-            f.setNearPlane(inputs.near);
-            f.setFarPlane(inputs.far);
-            f.setFieldOfView(inputs.fov_y.to_degrees());
-            f.setAspectRatio(inputs.aspect);
-            f.setDepthReversed(true);
-            f.setShouldResetHistory(reset);
-        }
-        let base = ProtocolObject::<dyn MTLFXFrameInterpolatorBase>::from_ref(e);
-        if interpolator_has_matrices(base) {
-            set_interpolator_matrices(base, inputs.world_to_view, inputs.view_to_clip);
-        }
-        if key.distortion {
-            set_interpolator_distortion(base, inputs.distortion.map(raw));
-        }
-        encode_after_list(list, |buffer| {
+        let effect = Keep(f.clone());
+        let held = |t: &Texture| Keep(raw(t).retain());
+        let (color, previous) = (held(inputs.color), held(inputs.previous_color));
+        let (depth, motion) = (held(inputs.depth), held(inputs.motion));
+        let output = held(inputs.output);
+        let distortion = key.distortion.then(|| inputs.distortion.map(held));
+        let [mx, my] = crate::conventions::motion_scale(key.input);
+        let [x, y] = crate::conventions::jitter(inputs.jitter);
+        let i = *inputs;
+        let (delta_time, near, far, fov, aspect) =
+            (i.delta_time, i.near, i.far, i.fov_y.to_degrees(), i.aspect);
+        let (world_to_view, view_to_clip) = (i.world_to_view, i.view_to_clip);
+        encode_after_list(list, move |buffer| {
+            let f = effect.get();
+            // SAFETY: setters of a live effect, with textures of the formats and sizes it was
+            // made for.
+            unsafe {
+                f.setColorTexture(Some(color.get()));
+                f.setPrevColorTexture(Some(previous.get()));
+                f.setDepthTexture(Some(depth.get()));
+                f.setMotionTexture(Some(motion.get()));
+                f.setOutputTexture(Some(output.get()));
+                f.setUITexture(None);
+                f.setMotionVectorScaleX(mx);
+                f.setMotionVectorScaleY(my);
+                f.setJitterOffsetX(x);
+                f.setJitterOffsetY(y);
+                f.setDeltaTime(delta_time);
+                f.setNearPlane(near);
+                f.setFarPlane(far);
+                f.setFieldOfView(fov);
+                f.setAspectRatio(aspect);
+                f.setDepthReversed(true);
+                f.setShouldResetHistory(reset);
+            }
+            let base = ProtocolObject::<dyn MTLFXFrameInterpolatorBase>::from_ref(f);
+            if interpolator_has_matrices(base) {
+                set_interpolator_matrices(base, world_to_view, view_to_clip);
+            }
+            if let Some(d) = &distortion {
+                set_interpolator_distortion(base, d.as_ref().map(Keep::get));
+            }
             // SAFETY: a Metal 4 effect encoding into a Metal 4 command buffer of its device.
             unsafe { f.encodeToCommandBuffer(buffer) }
         });

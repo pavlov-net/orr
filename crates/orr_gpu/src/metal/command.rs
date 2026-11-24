@@ -29,8 +29,7 @@ const INLINE_BLOCK: u64 = 64 << 10;
 type ComputeEncoder = ProtocolObject<dyn MTL4ComputeCommandEncoder>;
 pub(super) type RenderEncoder = ProtocolObject<dyn MTL4RenderCommandEncoder>;
 
-/// The encoder commands go into now. Render encoders open and close within
-/// `end_rendering`.
+/// The encoder commands go into now. Render encoders open and close within one command.
 pub(super) enum Encoder {
     None,
     Compute(Retained<ComputeEncoder>),
@@ -40,155 +39,36 @@ pub(super) enum Encoder {
 /// has completed everything before it, and records into a fresh list the queue commits next.
 /// Metal encodes some work only from values the GPU writes, such as acceleration-structure
 /// builds whose counts kernels decide.
+///
+/// What a list records after a step is encoded only once the step has run. Metal resolves
+/// acceleration-structure IDs through a table that grows as structures are created, and work
+/// encoded before a growth misses IDs past the old size, so work encoded before a step would
+/// miss the structures the step creates.
 pub(super) type HostStep = Box<dyn FnOnce(&mut CommandList<'_>) + Send>;
+
+/// A recorded command: what it encodes, run when its command buffer is encoded.
+pub(super) type Command = Box<dyn FnOnce(&mut Encoding)>;
 
 type CommandBuffer = Retained<ProtocolObject<dyn MTL4CommandBuffer>>;
 
-/// What a list's commands use until its submit completes.
-pub(super) struct Finished {
-    /// The list's command buffers in order, each with the CPU step that follows it.
-    pub(super) buffers: Vec<(CommandBuffer, Option<HostStep>)>,
-    _allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
-    _table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
-    _inline: Vec<Allocation<u8>>,
-    _keep: Vec<Box<dyn Any + Send>>,
-    /// The list's passes: each name and the sequence number of its begin timestamp.
-    pub(super) passes: Vec<(&'static str, u64)>,
-    /// The list's sequence number in the device's open lists.
-    pub(super) seq: u64,
+/// The commands of one command buffer and the CPU step that follows it.
+pub(super) struct Segment {
+    pub(super) commands: Vec<Command>,
+    pub(super) step: Option<HostStep>,
 }
 
-// SAFETY: a finished list is only dropped, on whichever thread collects garbage; Metal command
-// buffers, allocators and argument tables may be released from any thread once no encoding is
-// under way.
-unsafe impl Send for Finished {}
-
-/// A one-shot command list for one queue. Record on any thread, then hand it to the queue's
-/// owner for [`Queue::submit`]. Dropping it unsubmitted discards it. It names memory and
-/// objects without holding them, so what is dropped while it is open lives until its submit
-/// has completed, or until it is dropped unsubmitted.
-pub struct CommandList<'q> {
-    pub(super) queue: &'q Queue,
-    pub(super) buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
-    allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
+/// A command buffer being encoded from a segment's commands.
+pub(super) struct Encoding {
+    pub(super) buffer: CommandBuffer,
     /// Buffer 0 holds the root, 1 the texture view pool's base ID, 2 the sampler IDs; a ray
     /// tracing launch's 3 its launch block and 4 its root again.
     pub(super) table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
-    pub(super) encoder: Encoder,
-    /// The render pass between `begin_rendering` and `end_rendering`.
-    pub(super) pass: Option<PendingPass>,
+    encoder: Encoder,
     /// Stages the next encoder waits for, and its stages that wait: a queue barrier.
     pending: Option<(MTLStages, MTLStages)>,
-    inline: Vec<Allocation<u8>>,
-    /// Bytes used of the last inline block.
-    inline_used: u64,
-    pub(super) keep: Vec<Box<dyn Any + Send>>,
-    /// Ended command buffers before `buffer`, each with the CPU step that follows it.
-    segments: Vec<(Retained<ProtocolObject<dyn MTL4CommandBuffer>>, HostStep)>,
-    /// Each pass's name and the sequence number of its begin timestamp in the device's
-    /// timestamp ring.
-    passes: Vec<(&'static str, u64)>,
-    /// A pass is open.
-    in_pass: bool,
-    /// Set by `finish`, so dropping does not end the buffer twice.
-    finished: bool,
-    /// The list's sequence number in the device's open lists, until `finish` takes it.
-    seq: Option<u64>,
 }
 
-// SAFETY: one thread at a time records a list: `CommandList` is not `Sync` and every method
-// takes `&mut self`; Metal command buffers and encoders may move between threads.
-unsafe impl Send for CommandList<'_> {}
-
-impl<'q> CommandList<'q> {
-    pub(super) fn new(queue: &'q Queue) -> Result<Self, Error> {
-        let shared = &queue.shared;
-        let fail = |call: &'static str| Error::Metal {
-            call,
-            message: format!("{:?} queue command list", queue.kind),
-        };
-        let allocator = shared
-            .device
-            .newCommandAllocator()
-            .ok_or_else(|| fail("newCommandAllocator"))?;
-        let buffer = shared
-            .device
-            .newCommandBuffer()
-            .ok_or_else(|| fail("newCommandBuffer"))?;
-        buffer.beginCommandBufferWithAllocator(&allocator);
-        let desc = MTL4ArgumentTableDescriptor::new();
-        desc.setMaxBufferBindCount(5);
-        let table = shared
-            .device
-            .newArgumentTableWithDescriptor_error(&desc)
-            .map_err(|e| super::device::metal_error("newArgumentTableWithDescriptor", &e))?;
-        let seq = lock(&shared.lists).open(queue.timeline(), queue.completed());
-        let b = &shared.bindings;
-        // SAFETY: both addresses are of live device buffers the residency set holds.
-        unsafe {
-            table.setAddress_atIndex(b.pool_base.gpuAddress(), 1);
-            table.setAddress_atIndex(b.samplers.gpuAddress(), 2);
-        }
-        Ok(Self {
-            queue,
-            buffer,
-            allocator,
-            table,
-            encoder: Encoder::None,
-            pass: None,
-            // Sparse mapping updates queued before the list come first.
-            pending: Some((MTLStages::ResourceState, MTLStages::All)),
-            inline: Vec::new(),
-            inline_used: INLINE_BLOCK,
-            keep: Vec::new(),
-            segments: Vec::new(),
-            passes: Vec::new(),
-            in_pass: false,
-            finished: false,
-            seq: Some(seq),
-        })
-    }
-
-    /// Ends recording; the queue commits the buffer and keeps the rest until it completes.
-    pub(super) fn finish(mut self) -> Finished {
-        self.end_encoder();
-        self.buffer.endCommandBuffer();
-        self.finished = true;
-        let mut buffers: Vec<_> = std::mem::take(&mut self.segments)
-            .into_iter()
-            .map(|(b, step)| (b, Some(step)))
-            .collect();
-        buffers.push((self.buffer.clone(), None));
-        Finished {
-            buffers,
-            _allocator: self.allocator.clone(),
-            _table: self.table.clone(),
-            _inline: std::mem::take(&mut self.inline),
-            _keep: std::mem::take(&mut self.keep),
-            passes: std::mem::take(&mut self.passes),
-            seq: self.seq.take().expect("a list is finished once"),
-        }
-    }
-
-    /// Ends the command buffer so far and leaves `step` to the CPU before what follows: the
-    /// queue runs it once the GPU has completed this list's work so far and commits what it
-    /// records before the rest. Later commands wait for all of it.
-    pub(super) fn split(&mut self, step: HostStep) {
-        assert!(self.pass.is_none(), "a CPU step inside rendering");
-        self.end_encoder();
-        self.buffer.endCommandBuffer();
-        let next = self
-            .queue
-            .shared
-            .device
-            .newCommandBuffer()
-            .expect("newCommandBuffer");
-        next.beginCommandBufferWithAllocator(&self.allocator);
-        let done = std::mem::replace(&mut self.buffer, next);
-        self.segments.push((done, step));
-        self.pending = Some((MTLStages::All, MTLStages::All));
-    }
-
+impl Encoding {
     pub(super) fn end_encoder(&mut self) {
         match std::mem::replace(&mut self.encoder, Encoder::None) {
             Encoder::None => {}
@@ -212,7 +92,6 @@ impl<'q> CommandList<'q> {
         if let Encoder::Compute(e) = &self.encoder {
             return e.clone();
         }
-        self.end_encoder();
         let e = autoreleasepool(|_| self.buffer.computeCommandEncoder())
             .expect("computeCommandEncoder");
         self.open_barrier(ProtocolObject::from_ref(&*e));
@@ -221,20 +100,210 @@ impl<'q> CommandList<'q> {
         e
     }
 
-    /// A fresh compute encoder, with the pending barrier, that holds a 4-byte copy: Metal drops
-    /// an encoder without work, and the barriers and timestamps on it with it.
-    pub(super) fn carrier(&mut self) -> Retained<ComputeEncoder> {
+    /// A fresh compute encoder, with the pending barrier, that holds a 4-byte copy within
+    /// `scratch` (8 bytes at an offset of a buffer): Metal drops an encoder without work, and
+    /// the barriers and timestamps on it with it.
+    pub(super) fn carrier(&mut self, scratch: &Scratch) -> Retained<ComputeEncoder> {
         self.end_encoder();
-        let at = self.inline_bytes(&[0; 8]);
-        // SAFETY: the two halves of inline memory this list keeps.
+        let e = self.compute();
+        let (b, at) = (&scratch.0, scratch.1 as usize);
+        // SAFETY: both halves of 8 bytes of inline memory the list keeps.
         unsafe {
-            self.copy(
-                GpuPtr::from_address(crate::GpuAddress(at + 4)),
-                GpuPtr::from_address(crate::GpuAddress(at)),
-                4,
-            );
+            e.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(b, at, b, at + 4, 4)
+        };
+        e
+    }
+
+    fn barrier(&mut self, before: MTLStages, after: MTLStages) {
+        self.end_encoder();
+        let (pb, pa) = self
+            .pending
+            .unwrap_or((MTLStages::empty(), MTLStages::empty()));
+        self.pending = Some((pb | before, pa | after));
+    }
+}
+
+/// Eight bytes of a list's inline memory, as its buffer and offset, for [`Encoding::carrier`].
+pub(super) struct Scratch(super::Obj<super::Buffer>, u64);
+
+/// What a list's commands use until its submit completes.
+pub(super) struct Finished {
+    /// The list's segments in order, not yet encoded.
+    pub(super) segments: Vec<Segment>,
+    /// The command buffers encoded so far.
+    encoded: Vec<CommandBuffer>,
+    allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
+    table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
+    _inline: Vec<Allocation<u8>>,
+    _keep: Vec<Box<dyn Any + Send>>,
+    /// The list's passes: each name and the sequence number of its begin timestamp.
+    pub(super) passes: Vec<(&'static str, u64)>,
+    /// The list's sequence number in the device's open lists.
+    pub(super) seq: u64,
+}
+
+// SAFETY: a finished list moves to the thread that commits it, encodes there and is dropped on
+// whichever thread collects garbage. Its commands capture Metal objects, which may be used from
+// any thread one at a time, plain values, and the `Send` closures of `metal_raw`.
+unsafe impl Send for Finished {}
+
+impl Finished {
+    /// Encodes segment `index`'s commands into a new command buffer, which the list keeps.
+    /// Each segment is encoded once the CPU step before it has run.
+    pub(super) fn encode(
+        &mut self,
+        device: &ProtocolObject<dyn MTLDevice>,
+        index: usize,
+        commands: Vec<Command>,
+    ) -> CommandBuffer {
+        let buffer = device.newCommandBuffer().expect("newCommandBuffer");
+        buffer.beginCommandBufferWithAllocator(&self.allocator);
+        let mut e = Encoding {
+            buffer,
+            table: self.table.clone(),
+            encoder: Encoder::None,
+            // Sparse mapping updates queued before the list come first; after a CPU step, the
+            // step's work does.
+            pending: Some(if index == 0 {
+                (MTLStages::ResourceState, MTLStages::All)
+            } else {
+                (MTLStages::All, MTLStages::All)
+            }),
+        };
+        for c in commands {
+            c(&mut e);
         }
-        self.compute()
+        e.end_encoder();
+        e.buffer.endCommandBuffer();
+        self.encoded.push(e.buffer.clone());
+        e.buffer
+    }
+}
+
+/// A one-shot command list for one queue. Record on any thread, then hand it to the queue's
+/// owner for [`Queue::submit`]. Dropping it unsubmitted discards it. It names memory and
+/// objects without holding them, so what is dropped while it is open lives until its submit
+/// has completed, or until it is dropped unsubmitted.
+pub struct CommandList<'q> {
+    pub(super) queue: &'q Queue,
+    allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
+    table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
+    /// The commands since the last CPU step.
+    commands: Vec<Command>,
+    /// The render pass between `begin_rendering` and `end_rendering`.
+    pub(super) pass: Option<PendingPass>,
+    inline: Vec<Allocation<u8>>,
+    /// Bytes used of the last inline block.
+    inline_used: u64,
+    pub(super) keep: Vec<Box<dyn Any + Send>>,
+    /// The segments before `commands`, each with the CPU step that follows it.
+    segments: Vec<Segment>,
+    /// Each pass's name and the sequence number of its begin timestamp in the device's
+    /// timestamp ring.
+    passes: Vec<(&'static str, u64)>,
+    /// A pass is open.
+    in_pass: bool,
+    /// The list's sequence number in the device's open lists, until `finish` takes it.
+    seq: Option<u64>,
+}
+
+// SAFETY: one thread at a time records a list: `CommandList` is not `Sync` and every method
+// takes `&mut self`; its commands capture what `Finished` says.
+unsafe impl Send for CommandList<'_> {}
+
+impl<'q> CommandList<'q> {
+    pub(super) fn new(queue: &'q Queue) -> Result<Self, Error> {
+        let shared = &queue.shared;
+        let fail = |call: &'static str| Error::Metal {
+            call,
+            message: format!("{:?} queue command list", queue.kind),
+        };
+        let allocator = shared
+            .device
+            .newCommandAllocator()
+            .ok_or_else(|| fail("newCommandAllocator"))?;
+        let desc = MTL4ArgumentTableDescriptor::new();
+        desc.setMaxBufferBindCount(5);
+        let table = shared
+            .device
+            .newArgumentTableWithDescriptor_error(&desc)
+            .map_err(|e| super::device::metal_error("newArgumentTableWithDescriptor", &e))?;
+        let seq = lock(&shared.lists).open(queue.timeline(), queue.completed());
+        let b = &shared.bindings;
+        // SAFETY: both addresses are of live device buffers the residency set holds.
+        unsafe {
+            table.setAddress_atIndex(b.pool_base.gpuAddress(), 1);
+            table.setAddress_atIndex(b.samplers.gpuAddress(), 2);
+        }
+        Ok(Self {
+            queue,
+            allocator,
+            table,
+            commands: Vec::new(),
+            pass: None,
+            inline: Vec::new(),
+            inline_used: INLINE_BLOCK,
+            keep: Vec::new(),
+            segments: Vec::new(),
+            passes: Vec::new(),
+            in_pass: false,
+            seq: Some(seq),
+        })
+    }
+
+    /// Ends recording; the queue encodes and commits the segments and keeps the rest until
+    /// the submit completes.
+    pub(super) fn finish(mut self) -> Finished {
+        let mut segments = std::mem::take(&mut self.segments);
+        segments.push(Segment {
+            commands: std::mem::take(&mut self.commands),
+            step: None,
+        });
+        Finished {
+            segments,
+            encoded: Vec::new(),
+            allocator: self.allocator.clone(),
+            table: self.table.clone(),
+            _inline: std::mem::take(&mut self.inline),
+            _keep: std::mem::take(&mut self.keep),
+            passes: std::mem::take(&mut self.passes),
+            seq: self.seq.take().expect("a list is finished once"),
+        }
+    }
+
+    /// Ends the command buffer so far and leaves `step` to the CPU before what follows: the
+    /// queue runs it once the GPU has completed this list's work so far and commits what it
+    /// records before the rest, which it encodes only then. Later commands wait for all of it.
+    pub(super) fn split(&mut self, step: HostStep) {
+        assert!(self.pass.is_none(), "a CPU step inside rendering");
+        self.segments.push(Segment {
+            commands: std::mem::take(&mut self.commands),
+            step: Some(step),
+        });
+    }
+
+    /// Records `command`, which encodes in order with the list's other commands.
+    pub(super) fn record(&mut self, command: impl FnOnce(&mut Encoding) + 'static) {
+        self.commands.push(Box::new(command));
+    }
+
+    /// Records `command` into the compute encoder, opened if another or none is open, with
+    /// the list's argument table.
+    pub(super) fn compute(
+        &mut self,
+        command: impl FnOnce(&ComputeEncoder, &ProtocolObject<dyn MTL4ArgumentTable>) + 'static,
+    ) {
+        self.record(move |e| {
+            let encoder = e.compute();
+            command(&encoder, &e.table);
+        });
+    }
+
+    /// Eight bytes of inline memory for [`Encoding::carrier`].
+    pub(super) fn scratch(&mut self) -> Scratch {
+        let at = self.inline_bytes(&[0; 8]);
+        let (b, offset) = self.buffer_at(at, 8, "carrier copy");
+        Scratch(b, offset)
     }
 
     /// The device address of a copy of `bytes`, for an inline root.
@@ -267,11 +336,7 @@ impl<'q> CommandList<'q> {
         if b.is_empty() || a.is_empty() {
             return;
         }
-        self.end_encoder();
-        let (pb, pa) = self
-            .pending
-            .unwrap_or((MTLStages::empty(), MTLStages::empty()));
-        self.pending = Some((pb | b, pa | a));
+        self.record(move |e| e.barrier(b, a));
     }
 
     /// Nothing on Metal: textures have no layouts.
@@ -298,19 +363,24 @@ impl<'q> CommandList<'q> {
     }
 
     fn dispatch_at(&mut self, p: &ComputePipeline, root: u64, groups: [u32; 3]) {
-        let e = self.bind_compute(p, root);
-        e.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(p.workgroup()));
+        let workgroup = p.workgroup();
+        self.bind_compute(p, root);
+        self.compute(move |e, _| {
+            e.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(workgroup));
+        });
     }
 
-    fn bind_compute(&mut self, p: &ComputePipeline, root: u64) -> Retained<ComputeEncoder> {
-        let e = self.compute();
-        e.setComputePipelineState(&p.raw);
+    /// Binds `p` and the root at `root` in the compute encoder.
+    fn bind_compute(&mut self, p: &ComputePipeline, root: u64) {
+        let state = p.raw.clone();
         self.keep.push(Box::new(p.raw.clone()));
-        // SAFETY: the root's address is the caller's to keep valid until the submit
-        // completes, as on every backend.
-        unsafe { self.table.setAddress_atIndex(root, 0) };
-        e.setArgumentTable(Some(&self.table));
-        e
+        self.compute(move |e, table| {
+            e.setComputePipelineState(&state);
+            // SAFETY: the root's address is the caller's to keep valid until the submit
+            // completes, as on every backend.
+            unsafe { table.setAddress_atIndex(root, 0) };
+            e.setArgumentTable(Some(table));
+        });
     }
 
     /// Runs one of orr_gpu's own pipeline states over `groups` workgroups of `workgroup`
@@ -323,12 +393,15 @@ impl<'q> CommandList<'q> {
         workgroup: [u32; 3],
     ) {
         let address = self.inline_bytes(root);
-        let e = self.compute();
-        e.setComputePipelineState(state);
-        // SAFETY: the root copy lives in the list's inline blocks until the submit completes.
-        unsafe { self.table.setAddress_atIndex(address, 0) };
-        e.setArgumentTable(Some(&self.table));
-        e.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(workgroup));
+        let s = state.clone();
+        self.compute(move |e, table| {
+            e.setComputePipelineState(&s);
+            // SAFETY: the root copy lives in the list's inline blocks until the submit
+            // completes.
+            unsafe { table.setAddress_atIndex(address, 0) };
+            e.setArgumentTable(Some(table));
+            e.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(workgroup));
+        });
         self.keep.push(Box::new(state.clone()));
     }
 
@@ -340,14 +413,7 @@ impl<'q> CommandList<'q> {
         args: GpuPtr<DispatchArgs>,
     ) {
         root_in_memory(p);
-        let e = self.bind_compute(p, root.address().0);
-        // SAFETY: `args` is the caller's live memory, as on every backend.
-        unsafe {
-            e.dispatchThreadgroupsWithIndirectBuffer_threadsPerThreadgroup(
-                args.address().0,
-                size(p.workgroup()),
-            );
-        }
+        self.dispatch_indirect_at(p, root.address().0, args);
     }
 
     /// [`CommandList::dispatch_indirect`] for kernels that hold the root inline.
@@ -359,31 +425,39 @@ impl<'q> CommandList<'q> {
     ) {
         root_inline::<R>(p);
         let root = self.inline_bytes(bytemuck::bytes_of(root));
-        let e = self.bind_compute(p, root);
-        // SAFETY: as in `dispatch_indirect`.
-        unsafe {
-            e.dispatchThreadgroupsWithIndirectBuffer_threadsPerThreadgroup(
-                args.address().0,
-                size(p.workgroup()),
-            );
-        }
+        self.dispatch_indirect_at(p, root, args);
+    }
+
+    fn dispatch_indirect_at(&mut self, p: &ComputePipeline, root: u64, args: GpuPtr<DispatchArgs>) {
+        let (workgroup, args) = (p.workgroup(), args.address().0);
+        self.bind_compute(p, root);
+        self.compute(move |e, _| {
+            // SAFETY: `args` is the caller's live memory, as on every backend.
+            unsafe {
+                e.dispatchThreadgroupsWithIndirectBuffer_threadsPerThreadgroup(
+                    args,
+                    size(workgroup),
+                );
+            }
+        });
     }
 
     /// Copies `bytes` bytes from `src` to `dst`.
     pub fn copy(&mut self, dst: GpuPtr<u8>, src: GpuPtr<u8>, bytes: u64) {
         let (sb, so) = self.buffer_at(src.address().0, bytes, "copy source");
         let (db, d) = self.buffer_at(dst.address().0, bytes, "copy destination");
-        let e = self.compute();
-        // SAFETY: both ranges lie within live buffers (checked by `buffer_at`).
-        unsafe {
-            e.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                &sb,
-                so as usize,
-                &db,
-                d as usize,
-                bytes as usize,
-            );
-        }
+        self.compute(move |e, _| {
+            // SAFETY: both ranges lie within live buffers (checked by `buffer_at`).
+            unsafe {
+                e.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    &sb,
+                    so as usize,
+                    &db,
+                    d as usize,
+                    bytes as usize,
+                );
+            }
+        });
     }
 
     /// The buffer holding `bytes` bytes at `address`, and the offset into it.
@@ -436,8 +510,10 @@ impl<'q> CommandList<'q> {
     pub fn begin_pass(&mut self, name: &'static str, stats: bool) {
         let _ = stats;
         assert!(!self.in_pass, "pass {name} begun inside another pass");
-        self.end_encoder();
-        self.buffer.pushDebugGroup(&NSString::from_str(name));
+        self.record(move |e| {
+            e.end_encoder();
+            e.buffer.pushDebugGroup(&NSString::from_str(name));
+        });
         let seq = self
             .queue
             .shared
@@ -457,10 +533,9 @@ impl<'q> CommandList<'q> {
 
     pub fn end_pass(&mut self) {
         assert!(self.in_pass, "end_pass without begin_pass");
-        self.end_encoder();
         let (_, seq) = *self.passes.last().unwrap();
         self.write_timestamp(seq + 1);
-        self.buffer.popDebugGroup();
+        self.record(|e| e.buffer.popDebugGroup());
         self.in_pass = false;
     }
 
@@ -469,28 +544,27 @@ impl<'q> CommandList<'q> {
     /// run concurrently with it; the barrier on this encoder takes in all of them. What the
     /// caller recorded for the next encoder stays pending for it.
     fn write_timestamp(&mut self, seq: u64) {
-        let pending = self.pending.replace((MTLStages::All, MTLStages::All));
-        let e = self.carrier();
-        let ring = &self.queue.shared.timestamps;
-        // SAFETY: ring indices are within the heap.
-        unsafe {
-            e.writeTimestampWithGranularity_intoHeap_atIndex(
-                MTL4TimestampGranularity::Precise,
-                &ring.heap,
-                TimestampRing::index(seq),
-            );
-        }
-        self.end_encoder();
-        self.pending = pending;
+        let scratch = self.scratch();
+        let heap = self.queue.shared.timestamps.heap.clone();
+        self.record(move |e| {
+            let pending = e.pending.replace((MTLStages::All, MTLStages::All));
+            let c = e.carrier(&scratch);
+            // SAFETY: ring indices are within the heap.
+            unsafe {
+                c.writeTimestampWithGranularity_intoHeap_atIndex(
+                    MTL4TimestampGranularity::Precise,
+                    &heap,
+                    TimestampRing::index(seq),
+                );
+            }
+            e.end_encoder();
+            e.pending = pending;
+        });
     }
 }
 
 impl Drop for CommandList<'_> {
     fn drop(&mut self) {
-        if !self.finished {
-            self.end_encoder();
-            self.buffer.endCommandBuffer();
-        }
         if let Some(seq) = self.seq.take() {
             lock(&self.queue.shared.lists).dropped(seq);
         }

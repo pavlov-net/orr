@@ -188,9 +188,7 @@ impl Queue {
             .iter_mut()
             .flat_map(|f| std::mem::take(&mut f.passes))
             .collect();
-        let steps = finished
-            .iter()
-            .any(|f| f.buffers.iter().any(|(_, step)| step.is_some()));
+        let steps = finished.iter().any(|f| f.segments.len() > 1);
         let wait = wait.to_vec();
         let mut backlog = lock(&self.backlog);
         let point = self.next_point();
@@ -315,9 +313,10 @@ impl Queue {
         }
     }
 
-    /// Queues `f`'s command buffers on `ready`, committing and running each CPU step on the
-    /// way; the lists the steps record (themselves split by steps) go to `steps`, part of the
-    /// submit that signals `point`.
+    /// Encodes `f`'s segments and queues their command buffers on `ready`, committing and
+    /// running each CPU step on the way, so what follows a step is encoded after it; the lists
+    /// the steps record (themselves split by steps) go to `steps`, part of the submit that
+    /// signals `point`.
     fn run_steps(
         &self,
         f: &mut Finished,
@@ -325,9 +324,9 @@ impl Queue {
         ready: &mut Vec<Retained<ProtocolObject<dyn MTL4CommandBuffer>>>,
         steps: &mut Vec<Finished>,
     ) {
-        for (buffer, step) in &mut f.buffers {
-            ready.push(buffer.clone());
-            if let Some(step) = step.take() {
+        for (i, segment) in std::mem::take(&mut f.segments).into_iter().enumerate() {
+            ready.push(f.encode(&self.shared.device, i, segment.commands));
+            if let Some(step) = segment.step {
                 self.commit(ready);
                 self.wait_for_gpu();
                 let mut list = CommandList::new(self).expect("a command list for a CPU step");

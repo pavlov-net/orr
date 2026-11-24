@@ -1,5 +1,6 @@
 //! Temporal upscaling and antialiasing: `MTL4FXTemporalScaler` on orr textures.
 
+use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLPixelFormat, MTLTexture};
@@ -131,29 +132,36 @@ impl TemporalScaler {
         check_usage(Input::Depth, raw(inputs.depth), need[1])?;
         check_usage(Input::Motion, raw(inputs.motion), need[2])?;
         check_usage(Input::Output, raw(inputs.output), need[3])?;
-        // SAFETY: setters of a live effect, with textures of the formats and sizes it was made
-        // for; MetalFX holds what it is given until the next set.
-        unsafe {
-            s.setColorTexture(Some(raw(inputs.color)));
-            s.setDepthTexture(Some(raw(inputs.depth)));
-            s.setMotionTexture(Some(raw(inputs.motion)));
-            s.setOutputTexture(Some(raw(inputs.output)));
-            s.setExposureTexture(inputs.exposure.map(raw));
-            s.setPreExposure(inputs.pre_exposure);
-            s.setInputContentWidth(self.render[0] as usize);
-            s.setInputContentHeight(self.render[1] as usize);
-            let [x, y] = crate::conventions::jitter(inputs.jitter);
-            s.setJitterOffsetX(x);
-            s.setJitterOffsetY(y);
-            let [mx, my] = crate::conventions::motion_scale(self.render);
-            s.setMotionVectorScaleX(mx);
-            s.setMotionVectorScaleY(my);
-            s.setDepthReversed(true);
-            s.setReset(reset);
-        }
-        encode_after_list(list, |buffer| {
-            // SAFETY: a Metal 4 effect encoding into a Metal 4 command buffer of its device.
-            unsafe { s.encodeToCommandBuffer(buffer) }
+        let effect = Keep(s.clone());
+        let held = |t: &Texture| Keep(raw(t).retain());
+        let (color, depth) = (held(inputs.color), held(inputs.depth));
+        let (motion, output) = (held(inputs.motion), held(inputs.output));
+        let exposure = inputs.exposure.map(held);
+        let (pre_exposure, render) = (inputs.pre_exposure, self.render);
+        let [x, y] = crate::conventions::jitter(inputs.jitter);
+        let [mx, my] = crate::conventions::motion_scale(self.render);
+        encode_after_list(list, move |buffer| {
+            let s = effect.get();
+            // SAFETY: setters of a live effect, with textures of the formats and sizes it was
+            // made for, then a Metal 4 effect encoding into a Metal 4 command buffer of its
+            // device.
+            unsafe {
+                s.setColorTexture(Some(color.get()));
+                s.setDepthTexture(Some(depth.get()));
+                s.setMotionTexture(Some(motion.get()));
+                s.setOutputTexture(Some(output.get()));
+                s.setExposureTexture(exposure.as_ref().map(Keep::get));
+                s.setPreExposure(pre_exposure);
+                s.setInputContentWidth(render[0] as usize);
+                s.setInputContentHeight(render[1] as usize);
+                s.setJitterOffsetX(x);
+                s.setJitterOffsetY(y);
+                s.setMotionVectorScaleX(mx);
+                s.setMotionVectorScaleY(my);
+                s.setDepthReversed(true);
+                s.setReset(reset);
+                s.encodeToCommandBuffer(buffer);
+            }
         });
         Ok(())
     }

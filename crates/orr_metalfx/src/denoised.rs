@@ -1,6 +1,7 @@
 //! Denoising and upscaling of path-traced radiance: `MTL4FXTemporalDenoisedScaler` on orr
 //! textures.
 
+use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLPixelFormat, MTLTexture};
@@ -154,37 +155,44 @@ impl DenoisedScaler {
         check_usage(Input::Depth, raw(inputs.depth), need[1])?;
         check_usage(Input::Motion, raw(inputs.motion), need[2])?;
         check_usage(Input::Output, raw(inputs.output), need[3])?;
-        // SAFETY: setters of a live effect, with textures of the formats and sizes it was made
-        // for.
-        unsafe {
-            s.setColorTexture(Some(raw(inputs.color)));
-            s.setDepthTexture(Some(raw(inputs.depth)));
-            s.setMotionTexture(Some(raw(inputs.motion)));
-            s.setDiffuseAlbedoTexture(Some(raw(inputs.diffuse_albedo)));
-            s.setSpecularAlbedoTexture(Some(raw(inputs.specular_albedo)));
-            s.setNormalTexture(Some(raw(inputs.normal)));
-            s.setRoughnessTexture(Some(raw(inputs.roughness)));
-            s.setSpecularHitDistanceTexture(inputs.specular_hit_distance.map(raw));
-            s.setTransparencyOverlayTexture(inputs.transparency.map(raw));
-            s.setOutputTexture(Some(raw(inputs.output)));
-            // The color is pre-exposed, and the history drops at each step of the pre-exposure.
-            s.setExposureTexture(None);
-            s.setPreExposure(1.0);
-            let [x, y] = crate::conventions::jitter(inputs.jitter);
-            s.setJitterOffsetX(x);
-            s.setJitterOffsetY(y);
-            let [mx, my] = crate::conventions::motion_scale(self.render);
-            s.setMotionVectorScaleX(mx);
-            s.setMotionVectorScaleY(my);
-            s.setDepthReversed(true);
-            s.setShouldResetHistory(reset);
-        }
-        crate::set_scaler_matrices(
-            ProtocolObject::from_ref(e),
-            inputs.world_to_view,
-            inputs.view_to_clip,
-        );
-        encode_after_list(list, |buffer| {
+        let effect = Keep(s.clone());
+        let held = |t: &Texture| Keep(raw(t).retain());
+        let (color, depth) = (held(inputs.color), held(inputs.depth));
+        let (motion, output) = (held(inputs.motion), held(inputs.output));
+        let (diffuse, specular) = (held(inputs.diffuse_albedo), held(inputs.specular_albedo));
+        let (normal, roughness) = (held(inputs.normal), held(inputs.roughness));
+        let hit_distance = inputs.specular_hit_distance.map(held);
+        let transparency = inputs.transparency.map(held);
+        let [x, y] = crate::conventions::jitter(inputs.jitter);
+        let [mx, my] = crate::conventions::motion_scale(self.render);
+        let (world_to_view, view_to_clip) = (inputs.world_to_view, inputs.view_to_clip);
+        encode_after_list(list, move |buffer| {
+            let s = effect.get();
+            // SAFETY: setters of a live effect, with textures of the formats and sizes it was
+            // made for.
+            unsafe {
+                s.setColorTexture(Some(color.get()));
+                s.setDepthTexture(Some(depth.get()));
+                s.setMotionTexture(Some(motion.get()));
+                s.setDiffuseAlbedoTexture(Some(diffuse.get()));
+                s.setSpecularAlbedoTexture(Some(specular.get()));
+                s.setNormalTexture(Some(normal.get()));
+                s.setRoughnessTexture(Some(roughness.get()));
+                s.setSpecularHitDistanceTexture(hit_distance.as_ref().map(Keep::get));
+                s.setTransparencyOverlayTexture(transparency.as_ref().map(Keep::get));
+                s.setOutputTexture(Some(output.get()));
+                // The color is pre-exposed, and the history drops at each step of the
+                // pre-exposure.
+                s.setExposureTexture(None);
+                s.setPreExposure(1.0);
+                s.setJitterOffsetX(x);
+                s.setJitterOffsetY(y);
+                s.setMotionVectorScaleX(mx);
+                s.setMotionVectorScaleY(my);
+                s.setDepthReversed(true);
+                s.setShouldResetHistory(reset);
+            }
+            crate::set_scaler_matrices(ProtocolObject::from_ref(s), world_to_view, view_to_clip);
             // SAFETY: a Metal 4 effect encoding into a Metal 4 command buffer of its device.
             unsafe { s.encodeToCommandBuffer(buffer) }
         });

@@ -60,6 +60,36 @@ fn clas_tlas() {
     assert_clean();
 }
 
+/// Many structures created after the cluster ops and traces are recorded and before they are
+/// submitted. Metal resolves structure IDs through a table that grows as structures are
+/// created, and the cluster BLAS, made in a CPU step at submit, have IDs past them.
+#[test]
+fn structures_created_between_record_and_submit() {
+    let d = device();
+    let mut b = Builder::new();
+    let clusters = base_clusters();
+    let clas = b.build_clas(&clusters, data_flags(), 0, None, None);
+    let blas = b.build_blas(clas.addrs.gpu(), &[vec![0, 1, 2, 3], vec![4]], None);
+    let tlas = b.build_tlas(blas.addrs.gpu(), &two_instances(FRONT_Z));
+    let out = b.trace(tlas, 0);
+    let block = d
+        .gpu_malloc::<u8>(MemoryKind::DeviceLocal, 256, "unbuilt structures")
+        .unwrap();
+    let unbuilt: Vec<_> = (0..1 << 14)
+        .map(|_| {
+            d.create_classic_as(ClassicKind::Blas, 256, &block, 0)
+                .unwrap()
+        })
+        .collect();
+    b.flush();
+    let insts = front_back(&clusters, [0.0, 0.0, FRONT_Z]);
+    let r = check(out.as_slice().unwrap(), &insts, 0);
+    r.assert_ok("opaque");
+    assert_eq!(r.clusters.len(), 5, "every cluster is hit");
+    drop((unbuilt, block));
+    assert_clean();
+}
+
 /// A cluster BLAS and a compacted ordinary BLAS in one TLAS; ordinary hits have no cluster
 /// id.
 #[test]

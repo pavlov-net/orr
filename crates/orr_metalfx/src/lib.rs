@@ -139,22 +139,30 @@ pub(crate) fn check_usage(
 }
 
 /// Has `encode` encode an effect into `list`'s command buffer, after everything recorded on the
-/// list before. Work recorded on the list afterwards waits for the effect through a barrier, as
-/// for orr's own work.
+/// list before, when the list is encoded at submit. An effect encodes the inputs set on it at
+/// that moment, so `encode` sets them too. Work recorded on the list afterwards waits for the
+/// effect through a barrier, as for orr's own work.
 pub(crate) fn encode_after_list(
     list: &mut CommandList<'_>,
-    encode: impl FnOnce(&ProtocolObject<dyn MTL4CommandBuffer>),
+    encode: impl FnOnce(&ProtocolObject<dyn MTL4CommandBuffer>) + Send + 'static,
 ) {
-    encode(list.metal_raw());
+    list.metal_raw(encode);
 }
 
 /// An effect handed to the release queue: dropped on whichever thread collects garbage, once the
 /// GPU is done with it.
 pub(crate) struct Keep<T: ?Sized>(pub(crate) Retained<T>);
 
-// SAFETY: effects are only released through this, after their last encode; releasing an
+// SAFETY: effects and textures go through this to the thread that encodes a list, which alone
+// uses them then, and are released through it after their last encode; releasing an
 // Objective-C object is thread-safe.
 unsafe impl<T: ?Sized> Send for Keep<T> {}
+
+impl<T: ?Sized> Keep<T> {
+    pub(crate) fn get(&self) -> &T {
+        &self.0
+    }
+}
 
 /// A compiler for one effect's pipelines, apart from orr's, which records what it builds into
 /// orr's pipeline cache.
