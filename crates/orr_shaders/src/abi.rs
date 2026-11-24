@@ -112,7 +112,7 @@ pub const MAX_INLINE_ROOT_BYTES: usize = 248;
 /// pipeline, which must all match. The build defines them as `ORR_INTERSECTION_TAGS` atop the MSL
 /// it writes.
 pub const METAL_INTERSECTION_TAGS: &str =
-    "triangle_data, instancing, world_space_data, max_levels<3>, intersection_function_buffer";
+    "metal::raytracing::triangle_data, metal::raytracing::instancing, metal::raytracing::world_space_data, metal::raytracing::max_levels<3>, metal::raytracing::intersection_function_buffer";
 
 /// A sampler's slot in the sampler heap.
 #[repr(transparent)]

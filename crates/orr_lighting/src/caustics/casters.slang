@@ -255,17 +255,19 @@ EmissiveSelection instance_casters(SceneRoot* s, uint e, MeshGpu* mesh)
     return sel;
 }
 
-// The copy and mesh of instance entry `i` where it is a caster section's that casts this frame.
-bool instance_caster(SceneRoot* s, uint i, out InstanceGpu inst, out MeshGpu* mesh)
+// The mesh of instance entry `i`, and in `inst` its copy, where it is a caster section's that
+// casts this frame; nullptr otherwise.
+MeshGpu* instance_caster(SceneRoot* s, uint i, out InstanceGpu inst)
 {
     EmissiveGpu g = s.emissive[i];
     inst = InstanceGpu();
-    mesh = nullptr;
     if (g.kind != EMISSIVE_INSTANCE || g.set == NO_SET || g.cluster_count == 0 || !(g.area > 0.0))
-        return false;
+        return nullptr;
     inst = traced_record(s, g.source);
-    mesh = s.meshes + s.models[inst.model].mesh;
-    return g.rank >= mesh.emissive.count;
+    MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
+    if (g.rank < mesh.emissive.count)
+        return nullptr;
+    return mesh;
 }
 
 // The caster list of entry `i` this frame, its CDF aside: a traced producer's emitted clusters,
@@ -274,12 +276,15 @@ EmissiveSelection caster_list(SceneRoot* s, uint i)
 {
     EmissiveGpu g = s.emissive[i];
     EmissiveSelection sel = EmissiveSelection();
-    InstanceGpu inst;
-    MeshGpu* mesh;
     if (g.kind == EMISSIVE_PRODUCER && producer_traced(s, g.source))
         sel.count = emitted_clusters(s.batches[g.source]);
-    else if (instance_caster(s, i, inst, mesh))
-        sel = instance_casters(s, i, mesh);
+    else
+    {
+        InstanceGpu inst;
+        MeshGpu* mesh = instance_caster(s, i, inst);
+        if (mesh != nullptr)
+            sel = instance_casters(s, i, mesh);
+    }
     return sel;
 }
 
@@ -362,9 +367,9 @@ float instance_caster_area(SceneRoot* s, uint i, uint c, out float3 center)
 {
     center = float3(0.0);
     InstanceGpu inst;
-    MeshGpu* mesh;
+    MeshGpu* mesh = instance_caster(s, i, inst);
     Placement pl;
-    if (!instance_caster(s, i, inst, mesh)
+    if (mesh == nullptr
         || !placement(s.groups + inst.group, false, inst.group_index, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), pl))
         return 0.0;
     EmissiveSelection e = instance_casters(s, i, mesh);
@@ -393,9 +398,9 @@ float cooked_weight(SceneRoot* s, uint i, float aimed, out float2 mass)
 {
     mass = float2(0.0);
     InstanceGpu inst;
-    MeshGpu* mesh;
+    MeshGpu* mesh = instance_caster(s, i, inst);
     Placement pl;
-    if (!instance_caster(s, i, inst, mesh)
+    if (mesh == nullptr
         || !placement(s.groups + inst.group, false, inst.group_index, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), pl))
         return 0.0;
     ModelGpu* model = s.models + inst.model;

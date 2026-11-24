@@ -424,7 +424,7 @@ pub(super) fn wrap(
                 let data = b.data.as_deref().expect("a stage takes data");
                 write!(
                     out,
-                    "[[visible]] void {name}(thread void* data, thread const void* hit, ulong record, uint3 index, constant void* root, constant ulong* pool, device void* samplers, constant void* launch)\n{{\n{}    {};\n}}\n",
+                    "[[visible]] void {name}(thread void* data, thread const void* hit, ulong record, uint3 index, constant void* root, constant ulong* pool, const device void* samplers, constant void* launch)\n{{\n{}    {};\n}}\n",
                     context(&fields, &visible)?,
                     call(b, &format!("(thread {data}*)data, (thread const {traced}*)hit, record"))
                 )

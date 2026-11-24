@@ -1385,23 +1385,23 @@ public ResolvedLightSample nee_tile_candidate<let LOCAL : bool>(LightSetGpu* set
     uint pick = rng.next_bits();
     rng.dimension += 2;
     float2 u = rng.next4_parts().xy();
-    LocalLights* local = nullptr;
-    if (LOCAL && local_sampler)
-        local = v.local;
-    bool drawn = local != nullptr && choice < local.share;
+    // `v.local` is read only where the local sampler is on: a pointer the kernel's form makes a
+    // constant null would reach Metal as a member access of `nullptr_t`.
+    bool local = LOCAL && local_sampler && v.local != nullptr;
+    bool drawn = local && choice < v.local.share;
     if (!drawn && !light_tiles(set))
         return no_candidate();
     LightSample s;
     if (drawn)
-        s = local.samples[mulhi(pick, LOCAL_SAMPLES)];
+        s = v.local.samples[mulhi(pick, LOCAL_SAMPLES)];
     else
         s = set.tiles[light_tile(v.pixel, set.frame) * TILE_SIZE + mulhi(pick, TILE_SIZE)];
     ResolvedLightSample r = resolve_light_sample(set, s, v.position, u);
     // The local sampler's points are drawn with their slot's gain alone, the tile's samples with
     // the light set's selection.
-    if (r.pdf > 0.0 && local != nullptr)
+    if (r.pdf > 0.0 && local)
     {
-        float selection = light_selection(set, local, r.light, r.position);
+        float selection = light_selection(set, v.local, r.light, r.position);
         r.pdf *= drawn ? selection : selection / global_selection(set, r.light);
     }
     r.pdf *= 1.0 - v.share;

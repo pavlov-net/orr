@@ -747,17 +747,13 @@ void args(uint3 id: SV_DispatchThreadID)
     cut.counters[CUT_QUEUE + (pass + 1) % 2] = 0;
 }
 
-// Where node `node` of the mesh's hierarchy is; false when its node page is not resident.
+// Where node `node` of the mesh's hierarchy is; nullptr when its node page is not resident.
 // `page` is its node page, or ~0 in a resident hierarchy.
-bool node_at(MeshGpu* mesh, uint node, out Node* at, out uint page)
+Node* node_at(MeshGpu* mesh, uint node, out uint page)
 {
     page = 0xffffffff;
-    at = nullptr;
     if (mesh.nodes != nullptr)
-    {
-        at = (Node*)mesh.nodes + node;
-        return true;
-    }
+        return (Node*)mesh.nodes + node;
     NodePage* t = (NodePage*)mesh.node_table;
     uint lo = 0;
     uint hi = mesh.node_page_count;
@@ -772,9 +768,8 @@ bool node_at(MeshGpu* mesh, uint node, out Node* at, out uint page)
     page = lo;
     uint64_t base = mesh_node_page(root.scene, mesh, lo);
     if (base == 0)
-        return false;
-    at = (Node*)base + (node - t[lo].first_node);
-    return true;
+        return nullptr;
+    return (Node*)base + (node - t[lo].first_node);
 }
 
 // Tells the loading side that the traversal read mesh page table entry `entry` this frame,
@@ -900,9 +895,9 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     Placement p;
     if (!focus_placement(s, inst, placed) || !stage_placement(s, copy, inst, mesh, placed, part, merged, p))
         return;
-    Node* at;
     uint page;
-    if (!node_at(mesh, item.node, at, page))
+    Node* at = node_at(mesh, item.node, page);
+    if (at == nullptr)
         return;
     InterlockedAdd(cut.counters[CUT_NODES], 1);
     Node node = *at;
@@ -926,7 +921,8 @@ void traverse(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     if (internal)
     {
         uint child_page;
-        bool resident = node_at(mesh, node.child_first, children, child_page);
+        children = node_at(mesh, node.child_first, child_page);
+        bool resident = children != nullptr;
         if (!filling())
             report_node_page(cut, mesh, child_page, !resident, resident ? 0.0 : focus_error(p, node.sphere, node.max_error * l.scale));
         if (!resident)

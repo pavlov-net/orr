@@ -1273,7 +1273,7 @@ void table_call<D>(uint stage, inout D data, Traced hit, uint64_t record, uint3 
 static const String METAL_PRELUDE = R"(
 // A stage function: the caller's data, the hit, the record's address, the launch index, the root,
 // the texture pool base, the samplers and the launch block.
-typedef void orr_stage_fn(thread void*, thread const void*, ulong, uint3, constant void*, constant ulong*, device void*, constant void*);
+typedef void orr_stage_fn(thread void*, thread const void*, ulong, uint3, constant void*, constant ulong*, const device void*, constant void*);
 // What a trace hands its intersection functions ahead of its payload: what a stage's wrapper needs
 // to run its body, the trace's hit table and the report of a procedural hit it accepted. A function
 // that runs no any-hit declares only this, whatever the trace's payload.
@@ -1281,7 +1281,7 @@ struct orr_ray_head
 {
     constant void* root;
     constant ulong* pool;
-    device void* samplers;
+    const device void* samplers;
     constant void* launch;
     ulong tlas;
     ulong hits;
@@ -1326,10 +1326,10 @@ void metal_table_call<D>(uint stage, inout D data, inout Traced hit, uint64_t re
     __requirePrelude(METAL_PRELUDE);
     __requirePrelude(R"(
 template <typename D>
-inline void orr_table_call(uint stage, thread D* data, thread const void* hit, ulong record, uint3 index, constant void* root, constant ulong* pool, device void* samplers, constant void* launch)
+inline void orr_table_call(uint stage, thread D* data, thread const void* hit, ulong record, uint3 index, constant void* root, constant ulong* pool, const device void* samplers, constant void* launch)
 {
     constant metal::visible_function_table<orr_stage_fn>& t = *reinterpret_cast<constant metal::visible_function_table<orr_stage_fn>*>(launch);
-    t[stage]((thread void*)data, hit, record, index, root, pool, (device void*)samplers, launch);
+    t[stage]((thread void*)data, hit, record, index, root, pool, samplers, launch);
 }
 )");
     __intrinsic_asm "orr_table_call($0, $1, $2, $3, $4, $5, $6, $7, $8)";
@@ -1343,7 +1343,7 @@ bool metal_trace<P>(uint64_t id, uint64_t tlas, uint flags, uint mask, uint ray_
     __requirePrelude(METAL_PRELUDE);
     __requirePrelude(R"(
 template <typename P>
-inline bool orr_trace(ulong id, ulong tlas, uint flags, uint mask, uint ray_type, uint ray_types, float3 origin, float3 direction, float t_min, float t_max, thread P* payload, ulong hits, uint hit_stride, uint hit_count, uint3 index, constant void* root, constant ulong* pool, device void* samplers, constant void* launch, thread uint4* w0, thread uint4* w1, thread uint* function_id)
+inline bool orr_trace(ulong id, ulong tlas, uint flags, uint mask, uint ray_type, uint ray_types, float3 origin, float3 direction, float t_min, float t_max, thread P* payload, ulong hits, uint hit_stride, uint hit_count, uint3 index, constant void* root, constant ulong* pool, const device void* samplers, constant void* launch, thread uint4* w0, thread uint4* w1, thread uint* function_id)
 {
     using namespace metal::raytracing;
     intersector<ORR_INTERSECTION_TAGS> i;
@@ -1379,7 +1379,7 @@ inline bool orr_trace(ulong id, ulong tlas, uint flags, uint mask, uint ray_type
     rd.head.attribute_y = 0;
     rd.head.pad = 0;
     acceleration_structure<instancing> as = orr_from_id<acceleration_structure<instancing>>(id);
-    auto r = i.intersect(ray(origin, direction, t_min, t_max), mask, as, ifb, rd);
+    auto r = i.intersect(ray(origin, direction, t_min, t_max), as, mask, ifb, rd);
     *payload = rd.payload;
     if (r.type == intersection_type::none)
         return false;
