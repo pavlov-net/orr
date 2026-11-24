@@ -24,6 +24,8 @@ bytemuck.workspace = true
 half.workspace = true
 
 [dev-dependencies]
+orr_gpui.workspace = true
+gpui.workspace = true
 orr.workspace = true
 output_math = { path = "../output_math" }
 orr_egui = { path = "../../crates/orr_egui" }
