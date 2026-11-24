@@ -622,8 +622,21 @@ void ms_single(uint3 id: SV_DispatchThreadID)
 static const uint MS_MODE_SPAN = (MS_VIEW_ZENITHS * MS_MODES + WORKGROUP_LANES - 1) / WORKGROUP_LANES;
 static const uint MS_TEXEL_SPAN = (MS_VIEW_ZENITHS * MS_AZIMUTHS + WORKGROUP_LANES - 1) / WORKGROUP_LANES;
 
-// The radiance's cosine modes, then the in-scatter's.
-static groupshared float3 ms_hat[MS_RAY_ZENITHS * MS_MODES * MAX_GROUP_PASSES];
+// The radiance's cosine modes, then the in-scatter's, three floats each: Metal gives a float3
+// 16 bytes, which would put the kernel past its 32 KB of threadgroup memory.
+static groupshared float ms_hat[3 * MS_RAY_ZENITHS * MS_MODES * MAX_GROUP_PASSES];
+
+float3 ms_hat_at(uint i)
+{
+    return float3(ms_hat[3 * i], ms_hat[3 * i + 1], ms_hat[3 * i + 2]);
+}
+
+void ms_hat_set(uint i, float3 v)
+{
+    ms_hat[3 * i] = v.x;
+    ms_hat[3 * i + 1] = v.y;
+    ms_hat[3 * i + 2] = v.z;
+}
 static groupshared float ms_cos_in[MS_MODES * MS_AZIMUTHS];
 static groupshared float ms_cos_out[MS_MODES * MS_AZIMUTHS];
 static groupshared float3 ms_waves[WORKGROUP_LANES / 8 * MAX_GROUP_PASSES];
@@ -688,7 +701,7 @@ void ms_scatter(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
         }
         float scale = (m == 0 || m == azimuths - 1 ? 1.0 : 2.0) / float(azimuths - 1);
         for (uint p = 0; p < MAX_GROUP_PASSES; ++p)
-            ms_hat[item * MAX_GROUP_PASSES + p] = c[p] * scale;
+            ms_hat_set(item * MAX_GROUP_PASSES + p, c[p] * scale);
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -719,7 +732,7 @@ void ms_scatter(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
                 float4 k = root.kernel[row + ray];
                 for (uint p = 0; p < MAX_GROUP_PASSES; ++p)
                 {
-                    float3 l = ms_hat[(ray * MS_MODES + m) * MAX_GROUP_PASSES + p];
+                    float3 l = ms_hat_at((ray * MS_MODES + m) * MAX_GROUP_PASSES + p);
                     rayleigh[p] += k.x * l;
                     aerosol[p] += k.y * l;
                     fog[p] += k.z * l;
@@ -741,7 +754,7 @@ void ms_scatter(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
     {
         float3 e = float3(0.0);
         for (uint ray = 0; ray < MS_RAY_ZENITHS; ++ray)
-            e += root.aux[MS_AUX_GROUND_WEIGHTS + ray].x * ms_hat[(ray * MS_MODES) * MAX_GROUP_PASSES + lane];
+            e += root.aux[MS_AUX_GROUND_WEIGHTS + ray].x * ms_hat_at((ray * MS_MODES) * MAX_GROUP_PASSES + lane);
         uint at = light * MAX_GROUP_PASSES + lane;
         root.ground[at] = float4(e, 0.0);
         float4* sum = root.aux + MS_AUX_GROUND_SUM;
@@ -751,7 +764,7 @@ void ms_scatter(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
     for (uint i = 0; i < MS_MODE_SPAN; ++i)
         if (lane + i * WORKGROUP_LANES < MS_VIEW_ZENITHS * MS_MODES)
             for (uint p = 0; p < MAX_GROUP_PASSES; ++p)
-                ms_hat[(lane + i * WORKGROUP_LANES) * MAX_GROUP_PASSES + p] = jm[i][p];
+                ms_hat_set((lane + i * WORKGROUP_LANES) * MAX_GROUP_PASSES + p, jm[i][p]);
     GroupMemoryBarrierWithGroupSync();
 
     // The in-scatter at the table's texels, a few per lane.
@@ -769,7 +782,7 @@ void ms_scatter(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
         {
             float3 j = float3(0.0);
             for (uint m = 0; m < MS_MODES; ++m)
-                j += ms_hat[(view * MS_MODES + m) * MAX_GROUP_PASSES + p] * ms_cos_out[m * MS_AZIMUTHS + azimuth];
+                j += ms_hat_at((view * MS_MODES + m) * MAX_GROUP_PASSES + p) * ms_cos_out[m * MS_AZIMUTHS + azimuth];
             // A cut series rings below 0 where the radiance falls fast.
             jt[i][p] = held[i] ? max(j, 0.0) : float3(0.0);
         }
