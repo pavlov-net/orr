@@ -802,10 +802,18 @@ float3x3 inverse_linear(float3x3 m)
     return transpose(float3x3(c0, c1, c2)) / dot(m[0], c0);
 }
 
-// The hit group contribution of an instance descriptor, its intersection function table offset.
+// The records a hit table holds before its record 0 (`abi::METAL_HIT_PREFIX`), which the build
+// defines in the MSL.
+uint metal_hit_prefix()
+{
+    __intrinsic_asm "uint(ORR_HIT_PREFIX)";
+}
+
+// The hit group contribution of an instance descriptor: its intersection function table offset,
+// which the backend writes past the hit table's prefix.
 uint instance_contribution(uint64_t descriptor)
 {
-    return *(uint*)(descriptor + 56);
+    return *(uint*)(descriptor + 56) - metal_hit_prefix();
 }
 
 // The launch index the running stage works for; a launch kernel's thread's own, or the owner's of
@@ -928,9 +936,12 @@ public Traced trace_hit<P>(Tlas tlas, uint flags, uint mask, uint ray_type, uint
     }
     uint64_t d = instance_descriptor(tlas.address, h.instance_index());
     h.w0.x = instance_contribution(d) + h.geometry_index() * (ray_types & 15) + (ray_type & 15);
-    // Metal adds the instance offsets of every level it passes through, or of the last one; the
-    // backend's middle levels add 0, so either gives the index here.
-    if (ASSERTS && h.w0.x != function_id)
+    // Metal adds the last instancing level's offset alone: past the prefix by the record index
+    // for an instance over a BLAS, the prefix record of the ray type for an instance over an
+    // instance structure, whose offsets are 0.
+    uint prefix = metal_hit_prefix();
+    uint metal = function_id < prefix ? ray_type & 15 : h.w0.x + prefix;
+    if (ASSERTS && function_id != metal)
         pipeline_check_failed(PIPELINE_CHECK_FUNCTION_ID);
     return h;
 }
@@ -1275,8 +1286,9 @@ static const String METAL_PRELUDE = R"(
 // the texture pool base, the samplers and the launch block.
 typedef void orr_stage_fn(thread void*, thread const void*, ulong, uint3, constant void*, constant ulong*, const device void*, constant void*);
 // What a trace hands its intersection functions ahead of its payload: what a stage's wrapper needs
-// to run its body, the trace's hit table and the report of a procedural hit it accepted. A function
-// that runs no any-hit declares only this, whatever the trace's payload.
+// to run its body, the trace's hit table from its prefix (`hits`), the ray type and record stride
+// in `types` (bits 0-3 and 4-7) and the report of a procedural hit it accepted. A function that
+// runs no any-hit declares only this, whatever the trace's payload.
 struct orr_ray_head
 {
     constant void* root;
@@ -1292,13 +1304,28 @@ struct orr_ray_head
     uint kind;
     uint attribute_x;
     uint attribute_y;
-    uint pad;
+    uint types;
 };
 template <typename P>
 struct orr_ray_data
 {
     orr_ray_head head;
     P payload;
+};
+// A trace's ray data holds its payload in this, PAYLOAD_BYTES long, so the triangle dispatcher can
+// carry any payload; a function that knows the trace's payload type declares it in its place.
+struct orr_payload
+{
+    uint4 words;
+};
+// What the triangle dispatcher hands a record's any-hit: the payload, the minimum distance, and
+// room for the any-hit's decision.
+struct orr_any_call
+{
+    orr_payload payload;
+    float t_min;
+    uint pad;
+    uint2 decision;
 };
 // What an any-hit's and an intersection's functions return.
 struct orr_any_result
@@ -1335,9 +1362,9 @@ inline void orr_table_call(uint stage, thread D* data, thread const void* hit, u
     __intrinsic_asm "orr_table_call($0, $1, $2, $3, $4, $5, $6, $7, $8)";
 }
 
-// Traces with an intersector over the hit table as intersection function buffer: false for a
-// miss; for a hit, `w0` (but its record index) and `w1` of its `Traced`, and the index of the
-// function buffer entry Metal chose for it.
+// Traces with an intersector over the hit table as intersection function buffer, from its prefix:
+// false for a miss; for a hit, `w0` (but its record index) and `w1` of its `Traced`, and the index
+// of the function buffer entry Metal chose for it.
 bool metal_trace<P>(uint64_t id, uint64_t tlas, uint flags, uint mask, uint ray_type, uint ray_types, float3 origin, float3 direction, float t_min, float t_max, inout P payload, uint64_t hits, uint hit_stride, uint hit_count, uint3 index, ConstantBuffer<MetalRoot> root, ConstantBuffer<uint64_t> pool, StructuredBuffer<MetalSampler> samplers, ConstantBuffer<PipelineLaunch> launch, inout uint4 w0, inout uint4 w1, inout uint function_id)
 {
     __requirePrelude(METAL_PRELUDE);
@@ -1358,18 +1385,20 @@ inline bool orr_trace(ulong id, ulong tlas, uint flags, uint mask, uint ray_type
     if (flags & 0x80) i.set_opacity_cull_mode(opacity_cull_mode::non_opaque);
     if (flags & 0x100) i.set_geometry_cull_mode(geometry_cull_mode::triangle);
     if (flags & 0x200) i.set_geometry_cull_mode(geometry_cull_mode::bounding_box);
+    // The function buffer starts at the table's prefix.
+    ulong prefix = hits - ulong(ORR_HIT_PREFIX) * hit_stride;
     intersection_function_buffer_arguments ifb;
-    ifb.intersection_function_buffer = reinterpret_cast<const device void*>(hits);
-    ifb.intersection_function_buffer_size = size_t(hit_count) * hit_stride;
+    ifb.intersection_function_buffer = reinterpret_cast<const device void*>(prefix);
+    ifb.intersection_function_buffer_size = size_t(hit_count + ORR_HIT_PREFIX) * hit_stride;
     ifb.intersection_function_stride = hit_stride;
-    orr_ray_data<P> rd;
-    rd.payload = *payload;
+    orr_ray_data<orr_payload> rd;
+    *reinterpret_cast<thread P*>(&rd.payload) = *payload;
     rd.head.root = root;
     rd.head.pool = pool;
     rd.head.samplers = samplers;
     rd.head.launch = launch;
     rd.head.tlas = tlas;
-    rd.head.hits = hits;
+    rd.head.hits = prefix;
     rd.head.hit_stride = hit_stride;
     rd.head.index_x = index.x;
     rd.head.index_y = index.y;
@@ -1377,10 +1406,10 @@ inline bool orr_trace(ulong id, ulong tlas, uint flags, uint mask, uint ray_type
     rd.head.kind = 0;
     rd.head.attribute_x = 0;
     rd.head.attribute_y = 0;
-    rd.head.pad = 0;
+    rd.head.types = (ray_type & 15) | (ray_types & 15) << 4;
     acceleration_structure<instancing> as = orr_from_id<acceleration_structure<instancing>>(id);
     auto r = i.intersect(ray(origin, direction, t_min, t_max), as, mask, ifb, rd);
-    *payload = rd.payload;
+    *payload = *reinterpret_cast<thread P*>(&rd.payload);
     if (r.type == intersection_type::none)
         return false;
     bool tri = r.type == intersection_type::triangle;

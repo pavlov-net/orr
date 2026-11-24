@@ -331,9 +331,13 @@ impl Kernels {
     }
 
     fn new(shared: &Shared) -> Result<Kernels, Error> {
+        let source = format!(
+            "#define ORR_HIT_PREFIX {}\n{SOURCE}",
+            orr_shaders::abi::METAL_HIT_PREFIX
+        );
         let library = shared
             .device
-            .newLibraryWithSource_options_error(&NSString::from_str(SOURCE), None)
+            .newLibraryWithSource_options_error(&NSString::from_str(&source), None)
             .map_err(|e| metal_error("newLibraryWithSource", &e))?;
         let state = |name: &str| {
             let f = MTL4LibraryFunctionDescriptor::new();
@@ -458,8 +462,8 @@ fn max_args(d: &RtasOpDesc) -> u32 {
 }
 
 /// The triangle geometry of a run of a CLAS, or of a flat BLAS's triangles of one geometry index
-/// and opacity: unindexed when `indices` is 0. `geometry`, the orr geometry index, is its
-/// intersection function table offset.
+/// and opacity: unindexed when `indices` is 0. `geometry` is its intersection function table
+/// offset: a flat BLAS's orr geometry index.
 fn triangles(
     vertices: u64,
     verts: u64,
@@ -979,6 +983,9 @@ impl CommandList<'_> {
                 let vertices = at + HEADER;
                 let indices = vertices + 12 * u64::from(verts);
                 let data = indices + 12 * u64::from(tris);
+                // A CLAS is traced only below an instance structure, whose hits Metal sends to
+                // the hit table's prefix record of the ray type when its geometry and instance
+                // offsets are 0 (`orr_shaders::abi::METAL_HIT_PREFIX`).
                 let geometry = |r: &Run| {
                     triangles(
                         vertices,
@@ -987,7 +994,7 @@ impl CommandList<'_> {
                         r.count,
                         data + DATA_BYTES * u64::from(r.first),
                         r.opaque,
-                        r.geometry,
+                        0,
                     )
                 };
                 let geometries: Vec<_> = if runs.is_empty() {

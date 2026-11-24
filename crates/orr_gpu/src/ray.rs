@@ -258,7 +258,10 @@ pub struct RayPipelineDesc<'a> {
 }
 
 /// The hit region of a binding table: `count` records `stride` bytes apart from `address`,
-/// each a hit group's handle ([`crate::RayPipeline::hit_handle`]) followed by its record data.
+/// each a hit group's handle ([`crate::RayPipeline::hit_handle`]) followed by its record data,
+/// after the pipeline's [`crate::RayPipeline::hit_prefix_records`] records of
+/// [`crate::RayPipeline::hit_prefix_handle`] just before `address`
+/// ([`crate::RayPipeline::write_hit_prefix`]), which the backend's traces read.
 /// A trace's hit record is `instance contribution + geometry index * ray_types + ray_type`.
 /// `address` is a multiple of `Limits::ray_table_align`, `stride` of
 /// `Limits::ray_handle_align`, at most `Limits::max_ray_record_stride` and at least the

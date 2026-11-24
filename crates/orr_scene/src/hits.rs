@@ -148,6 +148,11 @@ struct Table {
     handles: Vec<u8>,
     stride: u64,
     handle_table: Allocation<u8>,
+    /// The records the backend's traces read before record 0
+    /// (`RayPipeline::write_hit_prefix`), which `records` starts with.
+    prefix: Allocation<u8>,
+    /// `records` holds `prefix`.
+    prefixed: bool,
     records: Allocation<u8>,
     /// Runs `records` holds room for.
     room: u32,
@@ -205,6 +210,9 @@ impl HitTables {
             .hit_stride()
             .max(handle + data)
             .next_multiple_of(u64::from(limits.ray_handle_align));
+        let prefix_bytes = u64::from(pipeline.hit_prefix_records()) * stride;
+        let mut prefix = vec![0u8; prefix_bytes as usize];
+        pipeline.write_hit_prefix(&mut prefix, stride);
         let slots = groups.slots();
         let mut handles = vec![0u8; slots.len() * handle as usize];
         for (k, g) in slots.iter().enumerate() {
@@ -215,11 +223,11 @@ impl HitTables {
         }
         self.retire(frame);
         let end = self.logged + self.log.len() as u64;
-        let at = match self
-            .tables
-            .iter()
-            .position(|t| t.handles == handles && t.stride == stride)
-        {
+        let at = match self.tables.iter().position(|t| {
+            t.handles == handles
+                && t.stride == stride
+                && t.prefix.as_slice().expect("upload is mapped") == &prefix[..]
+        }) {
             Some(at) => at,
             None => {
                 let mut handle_table = device.gpu_malloc::<u8>(
@@ -231,13 +239,22 @@ impl HitTables {
                     .as_mut_slice()
                     .expect("upload is mapped")
                     .copy_from_slice(&handles);
+                let mut prefix_table = device.gpu_malloc::<u8>(
+                    MemoryKind::Upload,
+                    prefix_bytes.max(1),
+                    "hit table prefix",
+                )?;
+                prefix_table.as_mut_slice().expect("upload is mapped")[..prefix.len()]
+                    .copy_from_slice(&prefix);
                 self.tables.push(Table {
                     handles,
                     stride,
                     handle_table,
+                    prefix: prefix_table,
+                    prefixed: false,
                     records: device.gpu_malloc::<u8>(
                         MemoryKind::DeviceLocal,
-                        stride,
+                        prefix_bytes + stride,
                         "hit table",
                     )?,
                     room: 0,
@@ -255,9 +272,10 @@ impl HitTables {
             let room = runs.max(2 * t.room);
             t.records = device.gpu_malloc::<u8>(
                 MemoryKind::DeviceLocal,
-                u64::from(room) * u64::from(RAY_TYPES) * stride,
+                prefix_bytes + u64::from(room) * u64::from(RAY_TYPES) * stride,
                 "hit table",
             )?;
+            t.prefixed = false;
             t.room = room;
             whole = true;
         }
@@ -268,11 +286,20 @@ impl HitTables {
         };
         t.applied = end;
         t.epoch = epoch;
+        let first = t.records.gpu().offset(prefix_bytes);
         let table = HitTable {
-            address: t.records.gpu().address(),
+            address: first.address(),
             stride,
             count: u64::from(runs) * u64::from(RAY_TYPES),
         };
+        if !t.prefixed {
+            if prefix_bytes > 0 {
+                list.barrier(Stages::RAY, Stages::TRANSFER, Hazards::empty());
+                list.copy(t.records.gpu(), t.prefix.gpu(), prefix_bytes);
+                list.barrier(Stages::TRANSFER, Stages::RAY, Hazards::empty());
+            }
+            t.prefixed = true;
+        }
         let groups_of = split(&mut ranges);
         if groups_of.is_empty() {
             return Ok(table);
@@ -285,7 +312,7 @@ impl HitTables {
             device,
             &HitTableRoot {
                 scene: root,
-                records: t.records.gpu().cast(),
+                records: first.cast(),
                 handles: t.handle_table.gpu().cast(),
                 ranges: at_ranges.cast(),
                 stride_words: (stride / 4) as u32,

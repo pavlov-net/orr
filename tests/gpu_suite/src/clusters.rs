@@ -801,6 +801,17 @@ impl Builder {
         groups: &[Vec<u32>],
         implicit: Option<GpuAddress>,
     ) -> Out {
+        self.build_blas_flagged(table, groups, implicit, RtasFlags::FAST_TRACE)
+    }
+
+    /// As [`Self::build_blas`], built with `flags`.
+    pub fn build_blas_flagged(
+        &mut self,
+        table: GpuPtr<u64>,
+        groups: &[Vec<u32>],
+        implicit: Option<GpuAddress>,
+        flags: RtasFlags,
+    ) -> Out {
         let flat: Vec<u32> = groups.iter().flatten().copied().collect();
         let mut first = 0u64;
         let blas: Vec<ClusterBlas> = groups
@@ -832,7 +843,7 @@ impl Builder {
         let desc = RtasOpDesc {
             op: RtasOp::BuildClusterBlas,
             mode: RtasMode::Implicit,
-            flags: RtasFlags::FAST_TRACE,
+            flags,
             vertex_format: ClusterVertexFormat::F32x3,
             limits: RtasLimits::Blas(BlasLimits {
                 max_args: groups.len() as u32,

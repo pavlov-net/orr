@@ -329,7 +329,8 @@ kernel void ptlas_descriptors(constant PtlasArgs& a [[buffer(0)]], uint i [[thre
     o.m[3] = packed_float3(m[3] + t.x, m[7] + t.y, m[11] + t.z);
     o.options = r[21] & 0xf;
     o.mask = blas == 0 ? 0 : r[19] & 0xff;
-    o.ift = r[20];
+    // Past the hit table's prefix (orr_shaders::abi::METAL_HIT_PREFIX).
+    o.ift = r[20] + ORR_HIT_PREFIX;
     o.user = (r[18] & 0xffffff) | (cluster ? 1u << 31 : 0u) | ((o.options & 8u) != 0 ? 1u << 30 : 0u);
     o.id = id;
     if (blas == 0)

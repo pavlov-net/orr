@@ -4,16 +4,23 @@
 //! raygen, and per other stage a body that calls the entry with what it takes, with a kernel that
 //! calls every body so Slang emits them. Slang cannot emit the rest, so [`wrap`] appends it to the
 //! stage program's MSL: per closest-hit, miss and callable a `[[visible]]` function, per any-hit a
-//! triangle intersection function, and per intersection, alone and with each procedural any-hit
-//! of the module, a bounding-box intersection function. Each builds the context Slang's functions
-//! take (`KernelContext`) and calls its body. [`wrap`] fails when Slang's MSL is not of the shape
-//! the wrappers expect.
+//! triangle intersection function and a `[[visible]]` function the triangle dispatcher
+//! (`abi::METAL_TRIANGLE_DISPATCHER`) calls, the dispatcher itself where the module has an
+//! any-hit, and per intersection, alone and with each procedural any-hit of the module, a
+//! bounding-box intersection function. Each builds the context Slang's functions take
+//! (`KernelContext`) and calls its body. [`wrap`] fails when Slang's MSL is not of the shape the
+//! wrappers expect.
+//!
+//! Metal's function buffer index is a hit table record's index past the table's prefix
+//! (`abi::METAL_HIT_PREFIX`), or a prefix record for a hit through an instance structure, whose
+//! instance and geometry offsets are 0; the dispatcher there finds the record itself.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use super::model::{Entry, Model, ParamRole};
 use crate::Stage;
+use crate::abi::{METAL_ANY_HIT_CALL, METAL_TRIANGLE_DISPATCHER};
 
 /// The Slang name of a triangle hit's attributes in the module's SPIR-V; the compute form's
 /// `TriangleAttributes` is the hit itself.
@@ -272,6 +279,7 @@ fn base_name(name: &str) -> &str {
 }
 
 /// Where a wrapper finds what its context's fields take.
+#[derive(Clone)]
 struct Sources {
     root: String,
     pool: String,
@@ -370,10 +378,12 @@ fn emitted_body(msl: &str, e: &Entry, traced: &str) -> Result<Body, String> {
 
 /// `msl`, the stage program of a module, with its wrappers appended, and each stage entry's
 /// function name: `[[visible]]` closest-hit, miss and callable functions `orr_stage_<symbol>`,
-/// any-hit triangle intersection functions `orr_anyhit_<symbol>`, and intersection bounding-box
+/// any-hit triangle intersection functions `orr_anyhit_<symbol>`, each with a `[[visible]]`
+/// function of it named with `abi::METAL_ANY_HIT_CALL` after, and intersection bounding-box
 /// functions `orr_isect_<symbol>`, with a function `orr_isect_<symbol>__<any-hit>` for each
 /// any-hit of the module that takes no triangle attributes, which runs it on a report that is not
-/// opaque. `symbol` names an entry's functions after its module.
+/// opaque; with an any-hit, the triangle dispatcher `abi::METAL_TRIANGLE_DISPATCHER`. `symbol`
+/// names an entry's functions after its module.
 pub(super) fn wrap(
     msl: &str,
     model: &Model,
@@ -436,12 +446,23 @@ pub(super) fn wrap(
                 let data = b.data.as_deref().expect("an any-hit takes data");
                 write!(
                     out,
-                    "[[intersection(triangle, ORR_INTERSECTION_TAGS)]]\norr_any_result {name}(float distance [[distance]], float2 bary [[barycentric_coord]], bool front [[front_facing]], array_ref<uint> instance [[instance_id]], array_ref<uint> user [[user_instance_id]], const device void* data [[primitive_data]], float3 origin [[world_space_origin]], float3 direction [[world_space_direction]], float t_min [[min_distance]], uint function_id [[function_id]], ray_data orr_ray_data<{data}>& rd [[payload]])\n{{\n    ulong at = reinterpret_cast<ulong>(data);\n    {traced} hit = {{uint4(function_id, as_type<uint>(distance), instance[0], (user[0] & 0xffffffu) | ((front ? 0xfeu : 0xffu) << 24)), uint4(uint(at), uint(at >> 32), as_type<uint2>(bary)), uint4(as_type<uint3>(origin), as_type<uint>(direction.x)), uint4(as_type<uint2>(direction.yz), uint(rd.head.tlas), uint(rd.head.tlas >> 32))}};\n{}    {data} p = rd.payload;\n    uint2 d = {};\n    rd.payload = p;\n    return {{d.x != 0, d.y != 0}};\n}}\n",
+                    "[[intersection(triangle, ORR_INTERSECTION_TAGS)]]\norr_any_result {name}(float distance [[distance]], float2 bary [[barycentric_coord]], bool front [[front_facing]], array_ref<uint> instance [[instance_id]], array_ref<uint> user [[user_instance_id]], const device void* data [[primitive_data]], float3 origin [[world_space_origin]], float3 direction [[world_space_direction]], float t_min [[min_distance]], uint function_id [[function_id]], ray_data orr_ray_data<{data}>& rd [[payload]])\n{{\n    ulong at = reinterpret_cast<ulong>(data);\n    {traced} hit = {{uint4(function_id - ORR_HIT_PREFIX, as_type<uint>(distance), instance[0], (user[0] & 0xffffffu) | ((front ? 0xfeu : 0xffu) << 24)), uint4(uint(at), uint(at >> 32), as_type<uint2>(bary)), uint4(as_type<uint3>(origin), as_type<uint>(direction.x)), uint4(as_type<uint2>(direction.yz), uint(rd.head.tlas), uint(rd.head.tlas >> 32))}};\n{}    {data} p = rd.payload;\n    uint2 d = {};\n    rd.payload = p;\n    return {{d.x != 0, d.y != 0}};\n}}\n",
                     context(&fields, &with_payload)?,
                     call(
                         b,
                         "&p, &hit, rd.head.hits + ulong(function_id) * rd.head.hit_stride"
                     )
+                )
+                .unwrap();
+                let calls = Sources {
+                    t_min: "c->t_min".into(),
+                    ..visible.clone()
+                };
+                write!(
+                    out,
+                    "[[visible]] void {name}{METAL_ANY_HIT_CALL}(thread void* data, thread const void* hit, ulong record, uint3 index, constant void* root, constant ulong* pool, const device void* samplers, constant void* launch)\n{{\n    thread orr_any_call* c = (thread orr_any_call*)data;\n{}    {data} p = *reinterpret_cast<thread {data}*>(&c->payload);\n    c->decision = {};\n    *reinterpret_cast<thread {data}*>(&c->payload) = p;\n}}\n",
+                    context(&fields, &calls)?,
+                    call(b, &format!("&p, (thread const {traced}*)hit, record"))
                 )
                 .unwrap();
                 names.insert(e.name.clone(), name);
@@ -485,7 +506,7 @@ pub(super) fn wrap(
                     }
                     write!(
                         out,
-                        "[[intersection(bounding_box, ORR_INTERSECTION_TAGS)]]\norr_box_result {fname}(uint geometry [[geometry_id]], uint primitive [[primitive_id]], array_ref<uint> instance [[instance_id]], array_ref<uint> user [[user_instance_id]], float3 origin [[world_space_origin]], float3 direction [[world_space_direction]], float t_min [[min_distance]], float t_max [[max_distance]], uint function_id [[function_id]]{opaque}, ray_data {ray_data}& rd [[payload]])\n{{\n    ulong record = {h}.hits + ulong(function_id) * {h}.hit_stride;\n    uint4 w2 = uint4(as_type<uint3>(origin), as_type<uint>(direction.x));\n    uint4 w3 = uint4(as_type<uint2>(direction.yz), uint({h}.tlas), uint({h}.tlas >> 32));\n    {traced} hit = {{uint4(function_id, as_type<uint>(t_max), instance[0], user[0] & 0xffffffu), uint4(geometry, primitive, 0, 0), w2, w3}};\n{}    uint4 r = {};\n    if (r.x == 0)\n        return {{false, true, 0.0f}};\n    float t = as_type<float>(r.y);\n    if (!(t >= t_min && t <= t_max))\n        return {{false, true, 0.0f}};\n    hit = {{uint4(function_id, r.y, instance[0], (user[0] & 0xffffffu) | ((r.x >> 1) << 24)), uint4(geometry, primitive, r.z, r.w), w2, w3}};\n{any_hit}    {h}.kind = r.x >> 1;\n    {h}.attribute_x = r.z;\n    {h}.attribute_y = r.w;\n    return {{true, {more}, t}};\n}}\n",
+                        "[[intersection(bounding_box, ORR_INTERSECTION_TAGS)]]\norr_box_result {fname}(uint geometry [[geometry_id]], uint primitive [[primitive_id]], array_ref<uint> instance [[instance_id]], array_ref<uint> user [[user_instance_id]], float3 origin [[world_space_origin]], float3 direction [[world_space_direction]], float t_min [[min_distance]], float t_max [[max_distance]], uint function_id [[function_id]]{opaque}, ray_data {ray_data}& rd [[payload]])\n{{\n    ulong record = {h}.hits + ulong(function_id) * {h}.hit_stride;\n    uint4 w2 = uint4(as_type<uint3>(origin), as_type<uint>(direction.x));\n    uint4 w3 = uint4(as_type<uint2>(direction.yz), uint({h}.tlas), uint({h}.tlas >> 32));\n    {traced} hit = {{uint4(function_id - ORR_HIT_PREFIX, as_type<uint>(t_max), instance[0], user[0] & 0xffffffu), uint4(geometry, primitive, 0, 0), w2, w3}};\n{}    uint4 r = {};\n    if (r.x == 0)\n        return {{false, true, 0.0f}};\n    float t = as_type<float>(r.y);\n    if (!(t >= t_min && t <= t_max))\n        return {{false, true, 0.0f}};\n    hit = {{uint4(function_id - ORR_HIT_PREFIX, r.y, instance[0], (user[0] & 0xffffffu) | ((r.x >> 1) << 24)), uint4(geometry, primitive, r.z, r.w), w2, w3}};\n{any_hit}    {h}.kind = r.x >> 1;\n    {h}.attribute_x = r.z;\n    {h}.attribute_y = r.w;\n    return {{true, {more}, t}};\n}}\n",
                         context(&fields, sources)?,
                         call(b, "&hit, record")
                     )
@@ -496,7 +517,19 @@ pub(super) fn wrap(
             _ => unreachable!("a stage"),
         }
     }
+    if stages.iter().any(|e| e.stage == Stage::AnyHit) {
+        write!(out, "{}", dispatcher(&traced)).unwrap();
+    }
     Ok((out, names))
+}
+
+/// The triangle dispatcher of a stage program whose hit type is `traced`. Its record is the one
+/// `trace_hit` names: the instance descriptor's contribution, past the prefix, plus the geometry
+/// index of the triangle's primitive data times the ray's record stride, plus its ray type.
+fn dispatcher(traced: &str) -> String {
+    format!(
+        "[[intersection(triangle, ORR_INTERSECTION_TAGS)]]\norr_any_result {METAL_TRIANGLE_DISPATCHER}(float distance [[distance]], float2 bary [[barycentric_coord]], bool front [[front_facing]], array_ref<uint> instance [[instance_id]], array_ref<uint> user [[user_instance_id]], const device void* data [[primitive_data]], float3 origin [[world_space_origin]], float3 direction [[world_space_direction]], float t_min [[min_distance]], ray_data orr_ray_data<orr_payload>& rd [[payload]])\n{{\n    ulong tlas = rd.head.tlas;\n    ulong descriptor = *reinterpret_cast<device const ulong*>(tlas + 48) + ulong(instance[0]) * *reinterpret_cast<device const uint*>(tlas + 56);\n    uint contribution = *reinterpret_cast<device const uint*>(descriptor + 56) - ORR_HIT_PREFIX;\n    uint geometry = reinterpret_cast<device const uint*>(data)[1] & 0xffffffu;\n    uint types = rd.head.types;\n    uint index = contribution + geometry * ((types >> 4) & 15u) + (types & 15u);\n    ulong record = rd.head.hits + ulong(index + ORR_HIT_PREFIX) * rd.head.hit_stride;\n    // The record's handle names its any-hit stage plus 1 in word 3.\n    uint any = reinterpret_cast<device const uint*>(record)[3];\n    if (any == 0)\n        return {{true, true}};\n    ulong at = reinterpret_cast<ulong>(data);\n    {traced} hit = {{uint4(index, as_type<uint>(distance), instance[0], (user[0] & 0xffffffu) | ((front ? 0xfeu : 0xffu) << 24)), uint4(uint(at), uint(at >> 32), as_type<uint2>(bary)), uint4(as_type<uint3>(origin), as_type<uint>(direction.x)), uint4(as_type<uint2>(direction.yz), uint(tlas), uint(tlas >> 32))}};\n    thread orr_any_call c;\n    c.payload = rd.payload;\n    c.t_min = t_min;\n    c.pad = 0;\n    c.decision = uint2(1, 1);\n    constant metal::visible_function_table<orr_stage_fn>& table = *reinterpret_cast<constant metal::visible_function_table<orr_stage_fn>*>(rd.head.launch);\n    table[any - 1]((thread void*)&c, &hit, record, uint3(rd.head.index_x, rd.head.index_y, rd.head.index_z), rd.head.root, rd.head.pool, rd.head.samplers, rd.head.launch);\n    rd.payload = c.payload;\n    return {{c.decision.x != 0, c.decision.y != 0}};\n}}\n"
+    )
 }
 
 #[cfg(test)]

@@ -110,6 +110,11 @@ impl Set {
                     hit_groups: &[
                         HitGroup {
                             closest_hit: Some(2),
+                            any_hit: None,
+                            intersection: None,
+                        },
+                        HitGroup {
+                            closest_hit: Some(2),
                             any_hit: Some(3),
                             intersection: None,
                         },
@@ -342,6 +347,38 @@ fn round_trip_and_refuse_foreign_files() {
         drop((set, d));
         std::fs::write(path, saved).unwrap();
     }
+}
+
+/// Pipelines a session first creates after a save, which emptied the serializer, compile and
+/// load warm from the next save: the default intersection function among them.
+#[test]
+fn pipelines_first_made_after_a_save_compile() {
+    let path = &cache_path("after_save");
+    let d = open(path);
+    let spec = cached::Spec { value: 6 }.bytes();
+    let data = SpecData {
+        entries: cached::Spec::ENTRIES,
+        bytes: &spec,
+    };
+    let stage = ShaderStage::new(&cached::MODULE, "compute_main", data).unwrap();
+    let compute = d.create_compute_pipeline(&stage, "cached compute").unwrap();
+    d.save_pipeline_cache().unwrap();
+    let set = Set::new(&d, 5);
+    set.check(&d);
+    d.save_pipeline_cache().unwrap();
+    assert_clean(&d);
+    drop((compute, set, d));
+
+    let d = open(path);
+    let set = Set::new(&d, 5);
+    assert_eq!(
+        set.cached,
+        [true, true, true, true],
+        "{:?}",
+        d.pipeline_cache_report()
+    );
+    set.check(&d);
+    assert_clean(&d);
 }
 
 /// A second save in one session keeps what the first saved: both sets load warm.

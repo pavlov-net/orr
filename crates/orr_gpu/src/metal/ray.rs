@@ -4,6 +4,13 @@
 //! and intersection stages are intersection functions whose resource IDs start the hit records,
 //! which traces hand Metal's intersector as an intersection function buffer.
 //!
+//! Metal adds only the last instancing level's intersection function table offset, so a hit
+//! through an instance structure over a cluster's BLAS loses its instance's contribution. Each
+//! instance's offset is written past the hit table's prefix (`orr_shaders::abi::METAL_HIT_PREFIX`),
+//! and those hits, whose structure and geometry offsets are 0, land on the prefix record of their
+//! ray type, which names the triangle dispatcher: it finds the hit's record itself and runs that
+//! record's any-hit, a `[[visible]]` function of the launch's table at the any-hit's stage index.
+//!
 //! Every function is compiled once, apart from any pipeline and in parallel, as a binary
 //! function whose handle is the same in every pipeline that links it, so one hit table serves
 //! every raygen's kernel. Static linking would let `[[function_groups]]` narrow the table calls,
@@ -26,7 +33,9 @@ use objc2_metal::{
     MTLComputePipelineState, MTLDevice, MTLFunctionHandle, MTLResidencySet, MTLResource,
     MTLResourceOptions, MTLStages, MTLVisibleFunctionTable, MTLVisibleFunctionTableDescriptor,
 };
-use orr_shaders::abi::METAL_INTERSECTION_TAGS;
+use orr_shaders::abi::{
+    METAL_ANY_HIT_CALL, METAL_HIT_PREFIX, METAL_INTERSECTION_TAGS, METAL_TRIANGLE_DISPATCHER,
+};
 
 use super::cache::BinaryFunction;
 use super::command::CommandList;
@@ -169,9 +178,10 @@ impl RayShared {
         let new = bits & !before;
         if new & 1 != 0 {
             log::error!(
-                "a trace's intersection function buffer index differs from the hit record \
-                 its instance's contribution and geometry name: Metal does not add instance \
-                 offsets across instancing levels as the backend lays them out"
+                "a trace's intersection function buffer index is neither past the hit table's \
+                 prefix by the record its instance's contribution and geometry name nor the \
+                 prefix record of its ray type: Metal does not take the last instancing \
+                 level's offset alone, as the backend lays them out"
             );
         }
         bits.count_ones()
@@ -203,6 +213,8 @@ pub struct RayPipeline {
     inline_root_bytes: u32,
     /// Every hit group's handle, in group order.
     handles: Vec<u8>,
+    /// The handle of the hit table's prefix records.
+    prefix: [u8; HANDLE_BYTES as usize],
     hit_records: Vec<u32>,
     hit_stride: u64,
     misses: Region,
@@ -247,6 +259,31 @@ impl RayPipeline {
     /// Every hit group's handle, in group order, `Limits::ray_handle_bytes` each.
     pub fn hit_handles(&self) -> &[u8] {
         &self.handles
+    }
+
+    /// The handle of each of the records a [`crate::HitTable`] holds before its record 0.
+    pub fn hit_prefix_handle(&self) -> &[u8] {
+        &self.prefix
+    }
+
+    /// The records a [`crate::HitTable`] holds before its record 0.
+    pub fn hit_prefix_records(&self) -> u32 {
+        METAL_HIT_PREFIX
+    }
+
+    /// Writes the records of a [`crate::HitTable`] of stride `stride` that come before its
+    /// record 0 to `prefix`, [`Self::hit_prefix_records`] records long.
+    pub fn write_hit_prefix(&self, prefix: &mut [u8], stride: u64) {
+        assert_eq!(
+            prefix.len() as u64,
+            u64::from(METAL_HIT_PREFIX) * stride,
+            "the prefix is {} records of {stride} bytes",
+            METAL_HIT_PREFIX
+        );
+        prefix.fill(0);
+        for record in prefix.chunks_mut(stride as usize) {
+            record[..HANDLE_BYTES as usize].copy_from_slice(&self.prefix);
+        }
     }
 
     /// The record data bytes hit group `group`'s shaders read after the handle.
@@ -384,12 +421,18 @@ impl Device {
         let mut sources: Vec<Source<'_>> = Vec::new();
         let mut visible = Vec::new();
         for (i, s) in desc.stages.iter().enumerate() {
-            if matches!(
-                s.entry.stage,
-                Stage::ClosestHit | Stage::Miss | Stage::Callable
-            ) {
-                visible.push((i, sources.len()));
-                sources.push(Source::Stage(s, None));
+            match s.entry.stage {
+                Stage::ClosestHit | Stage::Miss | Stage::Callable => {
+                    visible.push((i, sources.len()));
+                    sources.push(Source::Stage(s, None));
+                }
+                // What the triangle dispatcher calls for a record of a group with this any-hit.
+                Stage::AnyHit => {
+                    visible.push((i, sources.len()));
+                    let call = format!("{}{METAL_ANY_HIT_CALL}", s.metal_name()?);
+                    sources.push(Source::Stage(s, Some(call)));
+                }
+                _ => {}
             }
         }
         // Each hit group's intersection function, by its index among the binary functions: a
@@ -450,6 +493,22 @@ impl Device {
             };
             groups.push(f);
         }
+        // The prefix records' function, which a hit through an instance structure runs: the
+        // dispatcher of a triangle group's any-hit module, or, where no triangle group has an
+        // any-hit, the default, which accepts as every triangle record does.
+        let dispatching = desc
+            .hit_groups
+            .iter()
+            .find(|g| g.intersection.is_none() && g.any_hit.is_some())
+            .and_then(|g| g.any_hit);
+        sources.push(match dispatching {
+            Some(any) => Source::Stage(
+                &desc.stages[any as usize],
+                Some(METAL_TRIANGLE_DISPATCHER.to_owned()),
+            ),
+            None => Source::Default("orr_accept_triangle"),
+        });
+        let prefix_function = sources.len() - 1;
         let started = std::time::Instant::now();
         let ray = RayShared::get(shared)?;
         let compiled = desc.threads.map(sources.len(), |i| {
@@ -457,7 +516,7 @@ impl Device {
         });
         let functions = compiled.into_iter().collect::<Result<Vec<_>, _>>()?;
         let mut linked_key = blake3::Hasher::new();
-        for (_, key) in &functions {
+        for (_, key, _) in &functions {
             linked_key.update(key.as_bytes());
         }
         linked_key.update(&desc.call_depth.to_le_bytes());
@@ -467,7 +526,7 @@ impl Device {
             let d = super::pipeline::compute_descriptor(&function, [GROUP, 1, 1], name);
             d.setSupportBinaryLinking(true);
             let linking = MTL4PipelineStageDynamicLinkingDescriptor::new();
-            let refs: Vec<&BinaryFunction> = functions.iter().map(|(f, _)| &**f).collect();
+            let refs: Vec<&BinaryFunction> = functions.iter().map(|(f, ..)| &**f).collect();
             linking.setBinaryLinkedFunctions(Some(&objc2_foundation::NSArray::from_slice(&refs)));
             linking.setMaxCallStackDepth(desc.call_depth as usize);
             let mut key = blake3::Hasher::new();
@@ -477,6 +536,11 @@ impl Device {
             shared.cached_linked_compute(key.finalize(), self.cached_only, &d, &linking, name)
         });
         let states = states.into_iter().collect::<Result<Vec<_>, _>>()?;
+        // The pipeline is one entry of the cache's report, a hit when the cache held every
+        // part of it.
+        let hit = functions.iter().all(|(.., hit)| *hit) && states.iter().all(|(_, hit)| *hit);
+        shared.pipeline_cache.count(hit);
+        let states: Vec<_> = states.into_iter().map(|(s, _)| s).collect();
         log::debug!(
             "ray pipeline {name}: {} functions, {} launch kernels, {:.1} ms with {:?}",
             functions.len(),
@@ -492,7 +556,7 @@ impl Device {
                 .ok_or_else(|| invalid(format!("no handle of binary function {f}")))
         };
         let mut ids = vec![0u64; functions.len()];
-        for &f in &groups {
+        for &f in groups.iter().chain([&prefix_function]) {
             if ids[f] != 0 {
                 continue;
             }
@@ -507,6 +571,8 @@ impl Device {
             }
             ids[f] = id;
         }
+        let mut prefix = [0u8; HANDLE_BYTES as usize];
+        prefix[0..8].copy_from_slice(&ids[prefix_function].to_le_bytes());
         let mut handles = vec![0u8; desc.hit_groups.len() * HANDLE_BYTES as usize];
         let mut hit_records = Vec::with_capacity(desc.hit_groups.len());
         for ((g, f), h) in desc
@@ -620,6 +686,7 @@ impl Device {
             raygens,
             inline_root_bytes: root,
             handles,
+            prefix,
             hit_records,
             hit_stride,
             misses: region(starts[1], miss_stride, desc.misses.len()),
@@ -628,18 +695,19 @@ impl Device {
             launch_groups: ray.groups.clone(),
             checks: ray.checks.gpuAddress(),
             records: Arc::new(records),
-            functions: Arc::new(functions.into_iter().map(|(f, _)| f).collect()),
+            functions: Arc::new(functions.into_iter().map(|(f, ..)| f).collect()),
             shared: Arc::clone(shared),
         })
     }
 
-    /// The binary function `source` describes and its cache key, compiled pipeline-independent.
+    /// The binary function `source` describes, its cache key and whether the cache held it,
+    /// compiled pipeline-independent.
     fn binary_function(
         &self,
         ray: &RayShared,
         source: &Source<'_>,
         name: &str,
-    ) -> Result<(Obj<BinaryFunction>, blake3::Hash), Error> {
+    ) -> Result<(Obj<BinaryFunction>, blake3::Hash, bool), Error> {
         let shared = &self.shared;
         let mut key = blake3::Hasher::new();
         key.update(b"binary");
@@ -668,8 +736,9 @@ impl Device {
         d.setName(&NSString::from_str(&key.to_hex()));
         d.setFunctionDescriptor(&function);
         d.setOptions(MTL4BinaryFunctionOptions::PipelineIndependent);
-        let f = shared.cached_binary(key, self.cached_only, &d, &format!("{name}: {label}"))?;
-        Ok((f, key))
+        let (f, hit) =
+            shared.cached_binary(key, self.cached_only, &d, &format!("{name}: {label}"))?;
+        Ok((f, key, hit))
     }
 }
 

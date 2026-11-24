@@ -68,6 +68,23 @@ impl RayPipeline {
         &self.handles[at..at + self.hit_records.len() * self.handle_bytes]
     }
 
+    /// The handle of each of the records a [`crate::HitTable`] holds before its record 0: none
+    /// here.
+    pub fn hit_prefix_handle(&self) -> &[u8] {
+        &[]
+    }
+
+    /// The records a [`crate::HitTable`] holds before its record 0: none here.
+    pub fn hit_prefix_records(&self) -> u32 {
+        0
+    }
+
+    /// Writes the records of a [`crate::HitTable`] of stride `stride` that come before its
+    /// record 0 to `prefix`, [`Self::hit_prefix_records`] records long: nothing here.
+    pub fn write_hit_prefix(&self, prefix: &mut [u8], _stride: u64) {
+        assert!(prefix.is_empty(), "a Vulkan hit table has no prefix");
+    }
+
     /// The record data bytes hit group `group`'s shaders read after the handle.
     pub fn hit_record_bytes(&self, group: u32) -> u32 {
         self.hit_records[group as usize]

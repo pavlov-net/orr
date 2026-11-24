@@ -62,7 +62,8 @@ kernel void convert(constant Args& a [[buffer(0)]], uint i [[thread_position_in_
     o.m[3] = packed_float3(v.t[3], v.t[7], v.t[11]);
     o.options = (v.sbt_flags >> 24) & 0xf;
     o.mask = v.blas == 0 ? 0 : v.custom_mask >> 24;
-    o.ift_offset = v.sbt_flags & 0xffffff;
+    // Past the hit table's prefix (orr_shaders::abi::METAL_HIT_PREFIX).
+    o.ift_offset = (v.sbt_flags & 0xffffff) + ORR_HIT_PREFIX;
     bool cluster;
     o.as_id = resolve(v.blas, cluster);
     o.user_id = (v.custom_mask & 0xffffff) | (cluster ? 1u << 31 : 0u) | ((o.options & 8u) != 0 ? 1u << 30 : 0u);
@@ -473,9 +474,13 @@ impl Shared {
         if let Some((_, s)) = lock(states).iter().find(|(n, _)| *n == name) {
             return Ok(s.clone());
         }
+        let source = format!(
+            "#define ORR_HIT_PREFIX {}\n{INSTANCE_CONVERT}",
+            orr_shaders::abi::METAL_HIT_PREFIX
+        );
         let library = self
             .device
-            .newLibraryWithSource_options_error(&NSString::from_str(INSTANCE_CONVERT), None)
+            .newLibraryWithSource_options_error(&NSString::from_str(&source), None)
             .map_err(|e| metal_error("newLibraryWithSource", &e))?;
         let f = MTL4LibraryFunctionDescriptor::new();
         f.setName(Some(&NSString::from_str(name)));

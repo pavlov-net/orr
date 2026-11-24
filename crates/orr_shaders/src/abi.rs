@@ -111,8 +111,25 @@ pub const MAX_INLINE_ROOT_BYTES: usize = 248;
 /// The intersection tags of every intersector and intersection function of a Metal ray tracing
 /// pipeline, which must all match. The build defines them as `ORR_INTERSECTION_TAGS` atop the MSL
 /// it writes.
-pub const METAL_INTERSECTION_TAGS: &str =
-    "metal::raytracing::triangle_data, metal::raytracing::instancing, metal::raytracing::world_space_data, metal::raytracing::max_levels<3>, metal::raytracing::intersection_function_buffer";
+pub const METAL_INTERSECTION_TAGS: &str = "metal::raytracing::triangle_data, metal::raytracing::instancing, metal::raytracing::world_space_data, metal::raytracing::max_levels<3>, metal::raytracing::intersection_function_buffer";
+
+/// Hit records a Metal hit table holds before its record 0, each the pipeline's triangle
+/// dispatcher. Metal adds only the last instancing level's intersection function table offset,
+/// so a hit through an instance structure over a cluster's BLAS, whose geometry and instance
+/// offsets are 0, lands on record `ray_type` of the prefix; the backend writes each instance's
+/// offset as its contribution plus this, so other hits land past it. The build defines it as
+/// `ORR_HIT_PREFIX` atop the MSL it writes.
+pub const METAL_HIT_PREFIX: u32 = 16;
+
+/// The triangle intersection function the Metal stage program of a module with an any-hit
+/// defines, which a hit table's prefix records name: it finds the hit's record from its instance's
+/// contribution, its geometry index and the ray type, and runs that record's any-hit through the
+/// launch's visible function table, or accepts the hit where the record has none.
+pub const METAL_TRIANGLE_DISPATCHER: &str = "orr_dispatch_triangle";
+
+/// What the name of an any-hit's Metal function ends in for the `[[visible]]` function of it that
+/// [`METAL_TRIANGLE_DISPATCHER`] calls.
+pub const METAL_ANY_HIT_CALL: &str = "__call";
 
 /// A sampler's slot in the sampler heap.
 #[repr(transparent)]

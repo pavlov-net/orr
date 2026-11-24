@@ -9,6 +9,11 @@
 //! Serializing empties the serializer, so a save first compiles again, from the last saved
 //! archive, the pipelines an earlier save took out of it. A saved file holds the pipelines this
 //! session created, not ones the loaded archive held that it never asked for.
+//!
+//! The payload lists the keys of the pipelines its archive holds, after the header, and only
+//! those are looked up in it: asking an archive for an intersection function it lacks that takes
+//! no constants makes the compile that follows fail ("Failed to find compiled function in binary
+//! archives", macOS 27.2).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -37,7 +42,7 @@ const APPLE: u32 = 0x106b;
 /// The archive header: its size, version, vendor, device and the cache UUID, laid out as
 /// Vulkan's `VkPipelineCacheHeaderVersionOne`.
 const ARCHIVE_HEADER: usize = 32;
-const ARCHIVE_VERSION: u32 = 1;
+const ARCHIVE_VERSION: u32 = 2;
 
 type Archive = ProtocolObject<dyn MTL4Archive>;
 pub(super) type Serializer = ProtocolObject<dyn MTL4PipelineDataSetSerializer>;
@@ -101,6 +106,48 @@ pub(super) enum Record {
     Binary(Obj<MTL4BinaryFunctionDescriptor>),
 }
 
+/// What [`PipelineCache::get`] is asked for: the pipeline of `key`, refused with `cached_only`
+/// when neither this session nor the archive holds it. A `part` of a pipeline, as a ray tracing
+/// pipeline's binary functions and launch kernels are, isn't counted: the caller counts the
+/// pipeline once with [`PipelineCache::count`], from whether each part was a hit.
+#[derive(Clone, Copy)]
+struct Ask {
+    key: blake3::Hash,
+    cached_only: bool,
+    part: bool,
+}
+
+/// A record and its cache key; `held` while the serializer holds what it describes, which a
+/// save then writes.
+struct Entry {
+    key: blake3::Hash,
+    record: Record,
+    held: bool,
+}
+
+/// An archive pipelines are looked up in, the file Metal reads it from and the keys of the
+/// pipelines it holds.
+struct Held {
+    archive: Obj<Archive>,
+    file: PathBuf,
+    keys: HashSet<blake3::Hash>,
+}
+
+/// The keys an archive's payload lists after its header, and the archive's bytes after them;
+/// none when the list is cut short.
+fn split_keys(payload: &[u8]) -> Option<(HashSet<blake3::Hash>, &[u8])> {
+    let (count, rest) = payload.split_first_chunk::<4>()?;
+    let count = u32::from_le_bytes(*count) as usize;
+    let list = rest.get(..count.checked_mul(32)?)?;
+    let keys = list
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .map(|k| blake3::Hash::from_bytes(*k))
+        .collect();
+    Some((keys, &rest[list.len()..]))
+}
+
 /// What the last save wrote.
 #[derive(Default)]
 struct Saved {
@@ -115,11 +162,10 @@ struct Saved {
 pub(super) struct PipelineCache {
     path: Option<PathBuf>,
     identity: Identity,
-    /// The archive pipelines are looked up in, the loaded or last saved one, and the file
-    /// Metal reads it from.
-    archive: Mutex<Option<(Obj<Archive>, PathBuf)>>,
+    /// The archive pipelines are looked up in, the loaded or last saved one.
+    archive: Mutex<Option<Held>>,
     /// This session's pipelines in creation order; with a path only.
-    records: Mutex<Vec<Record>>,
+    records: Mutex<Vec<Entry>>,
     /// Held to read by pipeline creation, so a save, which holds it to write, sees every
     /// pipeline the serializer recorded among the records.
     saving: RwLock<()>,
@@ -212,8 +258,15 @@ impl PipelineCache {
             }
         };
         let header = archive_header(&cache.identity);
-        let Some(binaries) = archive.strip_prefix(&header[..]) else {
-            let why = "its archive was written for another device or OS".to_owned();
+        let Some(listed) = archive.strip_prefix(&header[..]) else {
+            let why =
+                "its archive was written for another device or OS, or in another layout".to_owned();
+            log::warn!("pipeline cache {}: {why}", path.display());
+            cache.rejected = Some(why);
+            return cache;
+        };
+        let Some((keys, binaries)) = split_keys(listed) else {
+            let why = "its list of archived pipelines is cut short".to_owned();
             log::warn!("pipeline cache {}: {why}", path.display());
             cache.rejected = Some(why);
             return cache;
@@ -233,7 +286,11 @@ impl PipelineCache {
                     path.display(),
                     binaries.len()
                 );
-                cache.archive = Mutex::new(Some((Obj(a), file)));
+                cache.archive = Mutex::new(Some(Held {
+                    archive: Obj(a),
+                    file,
+                    keys,
+                }));
                 cache.loaded = true;
                 mark_used(path);
             }
@@ -258,63 +315,87 @@ impl PipelineCache {
         CompileGuard { cache: self, key }
     }
 
-    /// The pipeline of `key`: this session's, else compiled, with the archive to look its
+    /// The pipeline `ask` names: this session's, else compiled, with the archive to look its
     /// binary up in when the archive holds it (a hit). `from_archive` asks the archive alone;
-    /// `compile` compiles with the given options. With `cached_only`, a pipeline neither
-    /// holds is refused. `record` describes it for later saves.
+    /// `compile` compiles with the given options. `record` describes it for later saves. The
+    /// second value says whether it was a hit.
     fn get<T: Message>(
         &self,
-        key: blake3::Hash,
-        cached_only: bool,
+        ask: Ask,
         record: impl FnOnce() -> Record,
         session: &Mutex<HashMap<blake3::Hash, Obj<T>>>,
         from_archive: impl FnOnce(&Archive) -> Option<Retained<T>>,
         compile: impl FnOnce(Option<&MTL4CompilerTaskOptions>) -> Result<Retained<T>, Error>,
-    ) -> Result<Obj<T>, Error> {
+    ) -> Result<(Obj<T>, bool), Error> {
+        let Ask {
+            key,
+            cached_only,
+            part,
+        } = ask;
         let counted = self.path.is_some();
         let _guard = self.begin_compile(key);
         if let Some(p) = lock(session).get(&key) {
-            if counted {
-                self.hits.fetch_add(1, Ordering::Release);
+            if !part {
+                self.count(true);
             }
-            return Ok(p.clone());
+            return Ok((p.clone(), true));
         }
         let _saving = self
             .saving
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let archive = lock(&self.archive).as_ref().map(|(a, _)| a.clone());
+        let archive = lock(&self.archive)
+            .as_ref()
+            .filter(|h| h.keys.contains(&key))
+            .map(|h| h.archive.clone());
         let archived = archive
             .as_ref()
             .and_then(|a| from_archive(a).map(|p| (a, p)));
         let hit = archived.is_some();
-        let raw = match archived {
+        let (raw, held) = match archived {
             Some((archive, found)) => {
                 let options = MTL4CompilerTaskOptions::new();
                 options.setLookupArchives(Some(&NSArray::from_slice(&[&**archive])));
                 // Compiled again so the serializer records it, taking the binary from the
                 // archive; the archive's own copy serves when that fails.
-                compile(Some(&options)).unwrap_or(found)
+                match compile(Some(&options)) {
+                    Ok(p) => (p, true),
+                    Err(_) => (found, false),
+                }
             }
             None if cached_only => return Err(Error::CompileRequired),
-            None => compile(None)?,
+            None => (compile(None)?, true),
         };
         // Counted once the serializer holds the pipeline, so a save that sees the count
         // writes it.
         if counted {
-            lock(&self.records).push(record());
-            if hit { &self.hits } else { &self.misses }.fetch_add(1, Ordering::Release);
+            lock(&self.records).push(Entry {
+                key,
+                record: record(),
+                held,
+            });
+        }
+        if !part {
+            self.count(hit);
         }
         let raw = Obj(raw);
         lock(session).insert(key, raw.clone());
-        Ok(raw)
+        Ok((raw, hit))
+    }
+
+    /// Counts a pipeline created through the cache as a hit or a miss, once the serializer
+    /// holds all of it, so a save that sees the count writes it.
+    pub(super) fn count(&self, hit: bool) {
+        if self.path.is_some() {
+            if hit { &self.hits } else { &self.misses }.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
 impl Drop for PipelineCache {
     fn drop(&mut self) {
         let archive = self.archive.get_mut().map(Option::take);
-        if let Ok(Some((archive, file))) = archive {
+        if let Ok(Some(Held { archive, file, .. })) = archive {
             drop(archive);
             let _ = std::fs::remove_file(file);
         }
@@ -334,11 +415,18 @@ impl Shared {
     ) -> Result<Obj<ComputeState>, Error> {
         let c = &self.pipeline_cache;
         let record = || Record::Compute(Obj(desc.clone()));
-        c.get(key, cached_only, record, &c.computes, from_archive, compile)
+        let ask = Ask {
+            key,
+            cached_only,
+            part: false,
+        };
+        c.get(ask, record, &c.computes, from_archive, compile)
+            .map(|(p, _)| p)
     }
 
     /// The compute pipeline of `key`, which links binary functions as `linking` says, through
-    /// the cache, as [`Shared::cached_compute`].
+    /// the cache, as [`Shared::cached_compute`], and whether it was a hit: a part of a ray
+    /// tracing pipeline, which its creation counts.
     pub(super) fn cached_linked_compute(
         &self,
         key: blake3::Hash,
@@ -346,12 +434,16 @@ impl Shared {
         desc: &Retained<MTL4ComputePipelineDescriptor>,
         linking: &Retained<MTL4PipelineStageDynamicLinkingDescriptor>,
         name: &str,
-    ) -> Result<Obj<ComputeState>, Error> {
+    ) -> Result<(Obj<ComputeState>, bool), Error> {
         let c = &self.pipeline_cache;
         let record = || Record::Linked(Obj(desc.clone()), Obj(linking.clone()));
-        c.get(
+        let ask = Ask {
             key,
             cached_only,
+            part: true,
+        };
+        c.get(
+            ask,
             record,
             &c.computes,
             |archive| {
@@ -374,19 +466,24 @@ impl Shared {
     }
 
     /// The binary function `desc` describes, through the cache: compiled once per `key`, its
-    /// binary looked up in the archive, as a pipeline's.
+    /// binary looked up in the archive, as a pipeline's; and whether it was a hit, a part of a
+    /// ray tracing pipeline as [`Shared::cached_linked_compute`].
     pub(super) fn cached_binary(
         &self,
         key: blake3::Hash,
         cached_only: bool,
         desc: &Retained<MTL4BinaryFunctionDescriptor>,
         name: &str,
-    ) -> Result<Obj<BinaryFunction>, Error> {
+    ) -> Result<(Obj<BinaryFunction>, bool), Error> {
         let c = &self.pipeline_cache;
         let record = || Record::Binary(Obj(desc.clone()));
-        c.get(
+        let ask = Ask {
             key,
             cached_only,
+            part: true,
+        };
+        c.get(
+            ask,
             record,
             &c.binaries,
             |archive| archive.newBinaryFunctionWithDescriptor_error(desc).ok(),
@@ -409,7 +506,13 @@ impl Shared {
     ) -> Result<Obj<RenderState>, Error> {
         let c = &self.pipeline_cache;
         let record = || Record::Render(Obj(desc));
-        c.get(key, cached_only, record, &c.renders, from_archive, compile)
+        let ask = Ask {
+            key,
+            cached_only,
+            part: false,
+        };
+        c.get(ask, record, &c.renders, from_archive, compile)
+            .map(|(p, _)| p)
     }
 }
 
@@ -449,48 +552,49 @@ impl Device {
             .saving
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let records = lock(&cache.records);
+        let mut records = lock(&cache.records);
         // The pipelines an earlier save took out of the serializer, compiled again from the
-        // archive it wrote: quick, and recorded again.
+        // archive it wrote where it holds them, quick, and from source where it does not: either
+        // way recorded again.
         if saved.flushed > 0 {
-            let options = MTL4CompilerTaskOptions::new();
-            if let Some((archive, _)) = &*lock(&cache.archive) {
-                options.setLookupArchives(Some(&NSArray::from_slice(&[&**archive])));
+            let held = lock(&cache.archive);
+            let lookup = MTL4CompilerTaskOptions::new();
+            if let Some(h) = &*held {
+                lookup.setLookupArchives(Some(&NSArray::from_slice(&[&*h.archive])));
             }
             let compiler = &self.shared.compiler;
-            for r in &records[..saved.flushed] {
-                let again = match r {
+            for e in &mut records[..saved.flushed] {
+                let archived = held.as_ref().is_some_and(|h| h.keys.contains(&e.key));
+                let options = archived.then_some(&*lookup);
+                let again = match &e.record {
                     Record::Compute(d) => compiler
                         .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(
-                            d,
-                            Some(&options),
+                            d, options,
                         )
                         .map(drop),
                     Record::Linked(d, l) => compiler
                         .newComputePipelineStateWithDescriptor_dynamicLinkingDescriptor_compilerTaskOptions_error(
                             d,
                             Some(l),
-                            Some(&options),
+                            options,
                         )
                         .map(drop),
                     Record::Binary(d) => compiler
-                        .newBinaryFunctionWithDescriptor_compilerTaskOptions_error(
-                            d,
-                            Some(&options),
-                        )
+                        .newBinaryFunctionWithDescriptor_compilerTaskOptions_error(d, options)
                         .map(drop),
                     Record::Render(d) => compiler
                         .newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(
-                            d,
-                            Some(&options),
+                            d, options,
                         )
                         .map(drop),
                 };
+                e.held = again.is_ok();
                 if let Err(e) = again {
                     log::warn!("pipeline cache: compiling a saved pipeline again failed: {e}");
                 }
             }
         }
+        let keys: Vec<blake3::Hash> = records.iter().filter(|e| e.held).map(|e| e.key).collect();
         let file = beside(path, &format!("{}.mtl4archive", saved.archives + 1));
         let serialized = serializer
             .serializeAsArchiveAndFlushToURL_error(&url(&file))
@@ -509,16 +613,25 @@ impl Device {
             }
         };
         let mut payload = archive_header(&cache.identity).to_vec();
+        payload.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+        for k in &keys {
+            payload.extend_from_slice(k.as_bytes());
+        }
         payload.extend_from_slice(&binaries);
         let bytes = encode(&cache.identity, &payload);
         write(path, &bytes)?;
         // Later lookups, and the next save, read the archive just written.
         match self.shared.device.newArchiveWithURL_error(&url(&file)) {
             Ok(a) => {
-                let old = lock(&cache.archive).replace((Obj(a), file));
-                if let Some((old, old_file)) = old {
-                    drop(old);
-                    let _ = std::fs::remove_file(old_file);
+                let old = lock(&cache.archive).replace(Held {
+                    archive: Obj(a),
+                    file,
+                    keys: keys.into_iter().collect(),
+                });
+                if let Some(old) = old {
+                    let Held { archive, file, .. } = old;
+                    drop(archive);
+                    let _ = std::fs::remove_file(file);
                 }
             }
             Err(e) => {

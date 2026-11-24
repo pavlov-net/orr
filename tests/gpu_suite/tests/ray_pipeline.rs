@@ -146,10 +146,15 @@ struct Table {
 
 fn hit_table(p: &RayPipeline, count: u64, fill: impl Fn(u64) -> Option<(u32, Vec<u8>)>) -> Table {
     let stride = p.hit_stride();
+    let prefix = u64::from(p.hit_prefix_records()) * stride;
     let mut records = device()
-        .gpu_malloc::<u8>(MemoryKind::Upload, stride * count, "hit records")
+        .gpu_malloc::<u8>(MemoryKind::Upload, prefix + stride * count, "hit records")
         .unwrap();
-    let bytes = records.as_mut_slice().unwrap();
+    let (head, bytes) = records
+        .as_mut_slice()
+        .unwrap()
+        .split_at_mut(prefix as usize);
+    p.write_hit_prefix(head, stride);
     bytes.fill(0);
     for i in 0..count {
         if let Some((group, data)) = fill(i) {
@@ -159,7 +164,7 @@ fn hit_table(p: &RayPipeline, count: u64, fill: impl Fn(u64) -> Option<(u32, Vec
     }
     Table {
         table: HitTable {
-            address: records.gpu().address(),
+            address: records.gpu().offset(prefix).address(),
             stride,
             count,
         },
@@ -369,9 +374,18 @@ fn trace_and_check(
 }
 
 fn base_scene(b: &mut Builder, hit_groups: [u32; 2]) -> (Tlas, Vec<Cluster>) {
+    base_scene_flagged(b, hit_groups, RtasFlags::FAST_TRACE)
+}
+
+/// [`base_scene`] with its cluster BLAS built with `flags`.
+fn base_scene_flagged(
+    b: &mut Builder,
+    hit_groups: [u32; 2],
+    flags: RtasFlags,
+) -> (Tlas, Vec<Cluster>) {
     let clusters = base_clusters();
     let clas = b.build_clas(&clusters, data_flags(), 0, None, None);
-    let blas = b.build_blas(clas.addrs.gpu(), &[vec![0, 1, 2, 3], vec![4]], None);
+    let blas = b.build_blas_flagged(clas.addrs.gpu(), &[vec![0, 1, 2, 3], vec![4]], None, flags);
     let tlas = b.build_tlas(
         blas.addrs.gpu(),
         &[
@@ -427,6 +441,38 @@ fn stages_read_their_records() {
         hit_groups: &hit_groups,
     };
     trace_and_check(&mut b, &p, &t.table, tlas, &placed, "base clusters");
+    assert_clean();
+}
+
+/// As [`stages_read_their_records`], over cluster BLAS built for a cheap rebuild, which a
+/// backend may trace through more instancing levels: the records each shader reads still
+/// follow the instance's contribution.
+#[test]
+fn transient_cluster_blas_read_their_records() {
+    if skipped() {
+        return;
+    }
+    let p = create(0, CompileThreads::default(), RayPipelineFlags::empty());
+    let mut b = Builder::new();
+    let hit_groups = [3, 41];
+    let (tlas, clusters) = base_scene_flagged(
+        &mut b,
+        hit_groups,
+        RtasFlags::FAST_TRACE | RtasFlags::TRANSIENT,
+    );
+    let insts = front_back(&clusters);
+    let t = triangle_table(
+        &p,
+        &[
+            (FRONT_CUSTOM, hit_groups[0], geometries(&insts[0])),
+            (BACK_CUSTOM, hit_groups[1], geometries(&insts[1])),
+        ],
+    );
+    let placed = Placed {
+        insts: &insts,
+        hit_groups: &hit_groups,
+    };
+    trace_and_check(&mut b, &p, &t.table, tlas, &placed, "transient clusters");
     assert_clean();
 }
 
