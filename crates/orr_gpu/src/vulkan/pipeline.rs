@@ -307,7 +307,11 @@ impl<'a> StageParts<'a> {
                 s.entry.name, s.entry.stage
             )));
         }
-        if matches!(want, Stage::Task | Stage::Mesh | Stage::Pixel) && s.inline_root_bytes > 0 {
+        if matches!(
+            want,
+            Stage::Task | Stage::Mesh | Stage::Vertex | Stage::Pixel
+        ) && s.inline_root_bytes > 0
+        {
             return Err(Error::Shader(format!(
                 "{name}: a {want:?} entry cannot use ORR_ROOT_INLINE"
             )));

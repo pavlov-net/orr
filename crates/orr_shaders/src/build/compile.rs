@@ -291,7 +291,7 @@ impl Build {
         self
     }
 
-    /// Also compiles each module's compute and mesh-pipeline entries to MSL and checks them
+    /// Also compiles each module's compute and graphics entries to MSL and checks them
     /// ([`Lint::Metal`]). Defaults to on when `ORR_METAL_CHECK=1`, and for Apple targets unless
     /// `ORR_METAL_CHECK=0`. The `.metal` files are written beside the SPIR-V; for Apple targets
     /// Xcode's Metal compiler also builds them into the `.metallib` files the modules embed,

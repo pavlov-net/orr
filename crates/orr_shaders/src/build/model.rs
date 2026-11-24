@@ -452,6 +452,7 @@ impl Extract<'_> {
                     S::SLANG_STAGE_COMPUTE => Stage::Compute,
                     S::SLANG_STAGE_AMPLIFICATION => Stage::Task,
                     S::SLANG_STAGE_MESH => Stage::Mesh,
+                    S::SLANG_STAGE_VERTEX => Stage::Vertex,
                     S::SLANG_STAGE_FRAGMENT => Stage::Pixel,
                     S::SLANG_STAGE_RAY_GENERATION => Stage::RayGen,
                     S::SLANG_STAGE_CLOSEST_HIT => Stage::ClosestHit,

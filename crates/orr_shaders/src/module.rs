@@ -70,6 +70,7 @@ pub enum Stage {
     Compute,
     Task,
     Mesh,
+    Vertex,
     Pixel,
     RayGen,
     ClosestHit,

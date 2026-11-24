@@ -25,6 +25,7 @@ bitflags::bitflags! {
         /// ([`crate::CommandList::preprocess_generated`]); ignored without
         /// `Caps::generated_commands`.
         const PREPROCESS = 1 << 12;
+        const VERTEX = 1 << 13;
     }
 }
 

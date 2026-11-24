@@ -1,4 +1,4 @@
-use crate::{CompareOp, Format, ShaderStage, Texture};
+use crate::{CompareOp, Error, Format, ShaderStage, Texture};
 
 /// Which triangles the rasterizer drops.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -36,7 +36,7 @@ pub struct DepthBias {
     pub clamp: f32,
 }
 
-/// Rasterizer state of a mesh pipeline.
+/// Rasterizer state of a graphics pipeline.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct RasterState {
     pub cull: Cull,
@@ -132,7 +132,7 @@ bitflags::bitflags! {
     }
 }
 
-/// A color target of a mesh pipeline.
+/// A color target of a graphics pipeline.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ColorTarget {
     pub format: Format,
@@ -152,7 +152,7 @@ impl ColorTarget {
     }
 }
 
-/// The depth target of a mesh pipeline: a fragment passes when `compare(fragment, stored)`
+/// The depth target of a graphics pipeline: a fragment passes when `compare(fragment, stored)`
 /// holds, and writes its depth when `write` is set.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct DepthTarget {
@@ -244,6 +244,97 @@ impl<'a> MeshPipelineDesc<'a> {
             depth: None,
             raster: RasterState::default(),
             samples: 1,
+        }
+    }
+}
+
+/// How consecutive vertices form primitives.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum PrimitiveTopology {
+    #[default]
+    TriangleList,
+    TriangleStrip,
+}
+
+/// A vertex/pixel pipeline. The shaders read their inputs through the draw's root pointer.
+#[derive(Clone, Copy, Debug)]
+pub struct VertexPipelineDesc<'a> {
+    pub vertex: ShaderStage<'a>,
+    /// `None` writes only depth.
+    pub pixel: Option<ShaderStage<'a>>,
+    pub topology: PrimitiveTopology,
+    pub colors: &'a [ColorTarget],
+    pub depth: Option<DepthTarget>,
+    pub raster: RasterState,
+    pub samples: u32,
+}
+
+impl<'a> VertexPipelineDesc<'a> {
+    /// A vertex stage alone with triangle-list topology, default raster state and one sample.
+    pub fn new(vertex: ShaderStage<'a>) -> Self {
+        Self {
+            vertex,
+            pixel: None,
+            topology: PrimitiveTopology::default(),
+            colors: &[],
+            depth: None,
+            raster: RasterState::default(),
+            samples: 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RasterTargets<'a> {
+    pub(crate) colors: &'a [ColorTarget],
+    pub(crate) depth: Option<DepthTarget>,
+    pub(crate) raster: RasterState,
+    pub(crate) samples: u32,
+}
+
+impl RasterTargets<'_> {
+    pub(crate) fn validate(self, max_colors: u32, name: &str) -> Result<(), Error> {
+        let bad = |m: String| Err(Error::Invalid(format!("graphics pipeline {name}: {m}")));
+        if self.colors.len() > max_colors as usize {
+            return bad(format!(
+                "{} color targets, the device has {max_colors}",
+                self.colors.len()
+            ));
+        }
+        if let Some(t) = self.colors.iter().find(|t| t.format.is_depth()) {
+            return bad(format!("{:?} is not a color format", t.format));
+        }
+        if let Some(t) = self.depth.filter(|t| !t.format.is_depth()) {
+            return bad(format!("{:?} is not a depth format", t.format));
+        }
+        if !self.samples.is_power_of_two() || self.samples > 16 {
+            return bad(format!("{} samples", self.samples));
+        }
+        if self.samples > 1 && (!self.colors.is_empty() || self.depth.is_some()) {
+            return bad("more than one sample needs a pipeline with no targets".into());
+        }
+        Ok(())
+    }
+}
+
+impl<'a> MeshPipelineDesc<'a> {
+    pub(crate) fn raster_targets(&self) -> RasterTargets<'a> {
+        RasterTargets {
+            colors: self.colors,
+            depth: self.depth,
+            raster: self.raster,
+            samples: self.samples,
+        }
+    }
+}
+
+impl<'a> VertexPipelineDesc<'a> {
+    pub(crate) fn raster_targets(&self) -> RasterTargets<'a> {
+        RasterTargets {
+            colors: self.colors,
+            depth: self.depth,
+            raster: self.raster,
+            samples: self.samples,
         }
     }
 }
