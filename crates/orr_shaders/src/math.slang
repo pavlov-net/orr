@@ -17,7 +17,7 @@ public static const float F32_MIN_NORMAL = 1.17549435e-38;
 // The offset per meter of render-space magnitude that clears f32 rounding: 4 to 8 ulps.
 public static const float F32_PRECISION = 1.0 / 1048576.0;
 
-// Standard normal CDF, Abramowitz and Stegun 26.2.17 (public domain).
+// Standard normal CDF approximation from Abramowitz and Stegun 26.2.17.
 public float standard_normal_cdf(float x)
 {
     float t = 1.0 / (1.0 + 0.2316419 * abs(x));

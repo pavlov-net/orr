@@ -3,6 +3,7 @@ import orr_color.primaries;
 import orr_color.luminance;
 import orr_color.transfer;
 import orr_color.ictcp;
+import orr_color.oklab;
 import orr_color.gamut;
 import orr_color.chromaticity;
 
@@ -34,6 +35,8 @@ export __extern_cpp void orr_color_pq_encode(float* c, float* out) { store3(out,
 export __extern_cpp void orr_color_pq_decode(float* c, float* out) { store3(out, pq_decode(load3(c))); }
 export __extern_cpp void orr_color_ictcp_from_rec2020(float* c, float* out) { store3(out, ictcp_from_rec2020(load3(c))); }
 export __extern_cpp void orr_color_rec2020_from_ictcp(float* c, float* out) { store3(out, rec2020_from_ictcp(load3(c))); }
+export __extern_cpp void orr_color_oklab_from_rec709(float* c, float* out) { store3(out, oklab_from_rec709(load3(c))); }
+export __extern_cpp void orr_color_rec709_from_oklab(float* c, float* out) { store3(out, rec709_from_oklab(load3(c))); }
 export __extern_cpp void orr_color_gamut_compress(float* c, float* out) { store3(out, gamut_compress(load3(c))); }
 export __extern_cpp float orr_color_cct_from_xy(float* xy) { return cct_from_xy(load2(xy)); }
 export __extern_cpp float orr_color_duv_from_xy(float* xy, float cct) { return duv_from_xy(load2(xy), cct); }

@@ -2,8 +2,9 @@
 //! the CIE 1931 color matching functions, luminance, and the sRGB, PQ and HLG transfer
 //! functions.
 //!
-//! orr renders in linear Rec.2020. Matrices are [`DMat3`](orr_math::DMat3)s derived in f64
-//! from the chromaticities and act on linear RGB as `m * rgb`:
+//! orr renders in linear Rec.2020. RGB primary conversion matrices are
+//! [`DMat3`](orr_math::DMat3)s derived in f64 from the chromaticities and act on linear RGB
+//! as `m * rgb`:
 //!
 //! ```
 //! use orr_color::RgbPrimaries;

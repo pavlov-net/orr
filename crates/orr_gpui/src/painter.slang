@@ -117,9 +117,9 @@ float4 fill_color(Fill fill, float4 bounds, float2 p)
         float4 color = lerp(fill.color0, fill.color1, t);
         if (fill.color_space == 1)
         {
-            float3 a = linear_rec709_to_oklab(srgb_decode(fill.color0.rgb));
-            float3 b = linear_rec709_to_oklab(srgb_decode(fill.color1.rgb));
-            color.rgb = srgb_encode(oklab_to_linear_rec709(lerp(a, b, t)));
+            float3 a = oklab_from_rec709(srgb_decode(fill.color0.rgb));
+            float3 b = oklab_from_rec709(srgb_decode(fill.color1.rgb));
+            color.rgb = srgb_encode(rec709_from_oklab(lerp(a, b, t)));
         }
         return color;
     }

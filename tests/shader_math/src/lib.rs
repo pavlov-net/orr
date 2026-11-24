@@ -94,6 +94,8 @@ mod ffi {
         pub(crate) fn orr_color_pq_decode(c: *const f32, out: *mut f32);
         pub(crate) fn orr_color_ictcp_from_rec2020(c: *const f32, out: *mut f32);
         pub(crate) fn orr_color_rec2020_from_ictcp(c: *const f32, out: *mut f32);
+        pub(crate) fn orr_color_oklab_from_rec709(c: *const f32, out: *mut f32);
+        pub(crate) fn orr_color_rec709_from_oklab(c: *const f32, out: *mut f32);
         pub(crate) fn orr_color_gamut_compress(c: *const f32, out: *mut f32);
         pub(crate) fn orr_color_cct_from_xy(xy: *const f32) -> f32;
         pub(crate) fn orr_color_duv_from_xy(xy: *const f32, cct: f32) -> f32;
@@ -404,6 +406,18 @@ pub mod color {
     pub fn rec2020_from_ictcp(ictcp: V3) -> V3 {
         out!(V3, |o| ffi::orr_color_rec2020_from_ictcp(
             ictcp.as_ptr(),
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn oklab_from_rec709(c: V3) -> V3 {
+        out!(V3, |o| ffi::orr_color_oklab_from_rec709(
+            c.as_ptr(),
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn rec709_from_oklab(c: V3) -> V3 {
+        out!(V3, |o| ffi::orr_color_rec709_from_oklab(
+            c.as_ptr(),
             o.as_mut_ptr()
         ))
     }
