@@ -111,6 +111,16 @@ impl AtlasBackend for Pages {
             }
         };
         let origin = allocation.rectangle.min;
+        let mut bytes = Box::<[u8]>::from(bytes);
+        if kind == AtlasTextureKind::Polychrome {
+            // Linear filtering blends the colors already weighted by alpha.
+            for texel in bytes.as_chunks_mut::<4>().0 {
+                let alpha = u16::from(texel[3]);
+                for channel in &mut texel[..3] {
+                    *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
+                }
+            }
+        }
         page.tiles.insert(
             tile_id,
             (
@@ -122,7 +132,7 @@ impl AtlasBackend for Pages {
                         width as u32,
                         height as u32,
                     ],
-                    bytes: Mutex::new(Some(bytes.into())),
+                    bytes: Mutex::new(Some(bytes)),
                 }),
             ),
         );

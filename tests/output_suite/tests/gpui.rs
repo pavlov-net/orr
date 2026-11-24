@@ -1,6 +1,7 @@
 use gpui::{
-    AtlasKey, Bounds, ContentMask, DevicePixels, ImageId, PaintedPath, PathBuilder,
-    PolychromeSprite, Quad, RenderImageParams, ScaledPixels, Scene, point, px, rgba, size,
+    AtlasKey, Bounds, ColorSpace, ContentMask, Corners, DevicePixels, ImageId, PaintedPath,
+    PathBuilder, PolychromeSprite, Quad, RenderImageParams, ScaledPixels, Scene, Shadow,
+    linear_color_stop, linear_gradient, point, px, rgba, size,
 };
 use orr_gpui::Painter;
 use orr_output::UiLayer;
@@ -19,8 +20,10 @@ fn gpui_layer_preserves_order_clip_and_atlas_pixels() {
     let tile = atlas
         .get_or_insert_with(image.clone(), &mut || {
             Ok(Some((
-                size(DevicePixels(2), DevicePixels(1)),
-                [255, 0, 0, 128, 0, 255, 0, 255].as_slice().into(),
+                size(DevicePixels(4), DevicePixels(1)),
+                [255, 0, 0, 128, 0, 0, 255, 255, 0, 255, 0, 255, 0, 0, 255, 0]
+                    .as_slice()
+                    .into(),
             )))
         })
         .unwrap()
@@ -42,8 +45,9 @@ fn gpui_layer_preserves_order_clip_and_atlas_pixels() {
     });
     let mut left = tile;
     left.bounds.size.width = DevicePixels(1);
-    let mut right = left;
-    right.bounds.origin.x.0 += 1;
+    let mut right = tile;
+    right.bounds.origin.x.0 += 2;
+    right.bounds.size.width = DevicePixels(2);
     let sprite = PolychromeSprite {
         order: 0,
         pad: 0,
@@ -57,7 +61,7 @@ fn gpui_layer_preserves_order_clip_and_atlas_pixels() {
     scene.insert_primitive(sprite);
     scene.insert_primitive(PolychromeSprite {
         tile: right,
-        bounds: bounds(13.0, 5.0, 4.0, 4.0),
+        bounds: bounds(13.0, 5.0, 5.0, 4.0),
         ..sprite
     });
     let mut path = PathBuilder::fill();
@@ -76,6 +80,36 @@ fn gpui_layer_preserves_order_clip_and_atlas_pixels() {
         },
         rgba(0x00ff00ff).into(),
     ));
+
+    let full = ContentMask {
+        bounds: bounds(0.0, 0.0, 32.0, 32.0),
+    };
+    scene.insert_primitive(Quad {
+        bounds: bounds(21.0, 3.0, 9.0, 3.0),
+        content_mask: full,
+        background: linear_gradient(
+            90.0,
+            linear_color_stop(rgba(0xff000080), 0.0),
+            linear_color_stop(rgba(0xffff0080), 1.0),
+        )
+        .color_space(ColorSpace::Oklab),
+        ..Quad::default()
+    });
+    // A 100 px circle with a spread of -45 px keeps its original radius.
+    let shape = bounds(20.0, 19.0, 10.0, 10.0);
+    let blur_radius = ScaledPixels(2.0);
+    scene.insert_primitive(Shadow {
+        order: 0,
+        blur_radius,
+        bounds: shape.dilate(blur_radius * 3.0),
+        corner_radii: Corners::default(),
+        content_mask: full,
+        color: rgba(0xffffffff).into(),
+        shape_bounds: shape,
+        shape_corner_radii: Corners::all(ScaledPixels(50.0)),
+        inset: false.into(),
+        pad: 0,
+    });
     scene.finish();
     let prepared = painter.prepare(&scene).unwrap();
 
@@ -115,7 +149,18 @@ fn gpui_layer_preserves_order_clip_and_atlas_pixels() {
     assert_eq!(pixel(5, 5), [128, 0, 0, 128]);
     assert_eq!(pixel(20, 5), [0, 0, 0, 0]);
     assert_eq!(pixel(9, 6), [64, 0, 128, 192]);
-    assert_eq!(pixel(15, 6), [0, 255, 0, 255]);
+    // The cropped sprite mixes opaque green and transparent red, over the red quad.
+    let filtered = pixel(15, 6);
+    assert!(
+        filtered
+            .iter()
+            .zip([64, 128, 0, 192])
+            .all(|(&got, want)| got.abs_diff(want) <= 1),
+        "{filtered:?}"
+    );
     assert_eq!(pixel(4, 24), [0, 255, 0, 255]);
+    let gradient = pixel(25, 4);
+    assert_eq!([gradient[0], gradient[3]], [128, 128]);
+    assert!(pixel(24, 23)[3] > 220, "{:?}", pixel(24, 23));
     assert_clean();
 }

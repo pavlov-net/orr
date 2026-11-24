@@ -89,7 +89,8 @@ impl Painter {
     }
 
     /// Supply this to the GPUI platform window's sprite-atlas hook. Use grayscale text
-    /// antialiasing for a layer whose background is composed later.
+    /// antialiasing for a layer whose background is composed later. Polychrome bitmaps
+    /// supplied to the atlas are straight BGRA.
     pub fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         Arc::clone(&self.atlas) as _
     }

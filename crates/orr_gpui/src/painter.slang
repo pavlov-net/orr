@@ -119,7 +119,7 @@ float4 fill_color(Fill fill, float4 bounds, float2 p)
         {
             float3 a = oklab_from_rec709(srgb_decode(fill.color0.rgb));
             float3 b = oklab_from_rec709(srgb_decode(fill.color1.rgb));
-            color.rgb = srgb_encode(rec709_from_oklab(lerp(a, b, t)));
+            color.rgb = srgb_encode(saturate(rec709_from_oklab(lerp(a, b, t))));
         }
         return color;
     }
@@ -395,9 +395,9 @@ float4 pixel_main(Vertex v) : SV_Target
         default:
             float4 texel = sprite(data, v.local);
             if (data.flags == 0 && !any(data.radii > 0.0))
-                return premultiply_alpha(texel, data.parameter);
+                return texel * data.parameter;
             if (data.flags != 0)
                 texel.rgb = float3(luma_rec709(texel.rgb));
-            return premultiply_alpha(texel, data.parameter * saturate(0.5 - rounded_box(p, data.bounds, data.radii)));
+            return texel * (data.parameter * saturate(0.5 - rounded_box(p, data.bounds, data.radii)));
     }
 }

@@ -79,16 +79,22 @@ impl SceneData {
                 PrimitiveBatch::Shadows(range) => {
                     frame
                         .instances
-                        .extend(scene.shadows[range].iter().map(|shadow| Instance {
-                            bounds: rect(shadow.bounds),
-                            clip: rect(shadow.content_mask.bounds),
-                            shape: rect(shadow.shape_bounds),
-                            radii: radii(shadow.shape_corner_radii),
-                            edges: radii(shadow.corner_radii),
-                            color: rgba(shadow.color),
-                            parameter: shadow.blur_radius.0,
-                            flags: u32::from(shadow.inset.as_bool()),
-                            ..Instance::zeroed()
+                        .extend(scene.shadows[range].iter().map(|shadow| {
+                            Instance {
+                                bounds: rect(shadow.bounds),
+                                clip: rect(shadow.content_mask.bounds),
+                                shape: rect(shadow.shape_bounds),
+                                radii: radii(
+                                    shadow
+                                        .shape_corner_radii
+                                        .clamp_radii_for_quad_size(shadow.shape_bounds.size),
+                                ),
+                                edges: radii(shadow.corner_radii),
+                                color: rgba(shadow.color),
+                                parameter: shadow.blur_radius.0,
+                                flags: u32::from(shadow.inset.as_bool()),
+                                ..Instance::zeroed()
+                            }
                         }));
                     SHADOW
                 }
