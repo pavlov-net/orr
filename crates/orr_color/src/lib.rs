@@ -14,10 +14,10 @@
 //! ```
 //!
 //! Slang has what kernels use of these in f32 as the modules `orr_color.primaries` (the
-//! matrices to and from Rec.2020), `orr_color.luminance` (of Rec.2020), `orr_color.transfer`
-//! (sRGB and PQ) and `orr_color.chromaticity` (without CIE 1976 u'v'), and ICtCp
-//! (`orr_color.ictcp`) and SDR gamut compression (`orr_color.gamut`) besides, under
-//! [`SHADER_DIR`], an import root of every shader build.
+//! matrices to and from Rec.2020), `orr_color.luminance`, `orr_color.transfer`
+//! (sRGB and PQ) and `orr_color.chromaticity` (without CIE 1976 u'v'). [`SHADER_DIR`]
+//! is an import root of every shader build. It also provides `orr_color.ictcp`,
+//! `orr_color.gamut` (SDR gamut compression), `orr_color.oklab` and `orr_color.alpha`.
 
 #![forbid(unsafe_code)]
 

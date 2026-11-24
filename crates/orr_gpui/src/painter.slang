@@ -1,5 +1,9 @@
 #include "orr_root.h"
 import orr_shaders.abi;
+import orr_shaders.math;
+import orr_color.alpha;
+import orr_color.luminance;
+import orr_color.oklab;
 import orr_color.transfer;
 
 struct Fill
@@ -99,44 +103,6 @@ Vertex vertex_main(uint corner : SV_VertexID, uint instance : SV_InstanceID)
     return v;
 }
 
-float4 premultiply(float4 color, float coverage)
-{
-    float a = color.a * coverage;
-    return float4(color.rgb * a, a);
-}
-
-float4 over(float4 top, float4 bottom)
-{
-    return top + (1.0 - top.a) * bottom;
-}
-
-// Oklab conversion coefficients: CSS Color 4, W3C Software and Document License.
-// https://www.w3.org/TR/css-color-4/#color-conversion-code
-float3 to_oklab(float3 rgb)
-{
-    float3 linear = srgb_decode(rgb);
-    float3 lms = mul(float3x3(
-        0.4122214708, 0.5363325363, 0.0514459929,
-        0.2119034982, 0.6806995451, 0.1073969566,
-        0.0883024619, 0.2817188376, 0.6299787005), linear);
-    return mul(float3x3(
-        0.2104542553, 0.7936177850, -0.0040720468,
-        1.9779984951, -2.4285922050, 0.4505937099,
-        0.0259040371, 0.7827717662, -0.8086757660), sign(lms) * pow(abs(lms), 1.0 / 3.0));
-}
-
-float3 from_oklab(float3 lab)
-{
-    float3 lms = mul(float3x3(
-        1.0, 0.3963377774, 0.2158037573,
-        1.0, -0.1055613458, -0.0638541728,
-        1.0, -0.0894841775, -1.2914855480), lab);
-    return srgb_encode(mul(float3x3(
-        4.0767416621, -3.3077115913, 0.2309699292,
-        -1.2684380046, 2.6097574011, -0.3413193965,
-        -0.0041960863, -0.7034186147, 1.7076147010), lms * lms * lms));
-}
-
 float4 fill_color(Fill fill, float4 bounds, float2 p)
 {
     if (fill.kind == 1)
@@ -150,7 +116,11 @@ float4 fill_color(Fill fill, float4 bounds, float2 p)
         float t = span == 0.0 ? step(fill.stops.x, along) : saturate((along - fill.stops.x) / span);
         float4 color = lerp(fill.color0, fill.color1, t);
         if (fill.color_space == 1)
-            color.rgb = from_oklab(lerp(to_oklab(fill.color0.rgb), to_oklab(fill.color1.rgb), t));
+        {
+            float3 a = linear_rec709_to_oklab(srgb_decode(fill.color0.rgb));
+            float3 b = linear_rec709_to_oklab(srgb_decode(fill.color1.rgb));
+            color.rgb = srgb_encode(oklab_to_linear_rec709(lerp(a, b, t)));
+        }
         return color;
     }
     if (fill.kind == 2)
@@ -241,11 +211,10 @@ float dashed_edge(float2 p, Instance data)
     bool rounded = any(radii > 0.0);
     if (rounded)
     {
-        const float quarter_turn = 1.57079632679;
         float4 corner_widths = max(widths, widths.yzwx);
         float4 arc_speed = select(corner_widths > 0.0, 1.0 / (3.0 * corner_widths), float4(0.0));
         float4 straight = (size.xyxy - radii.wxyz - radii) * side_speed;
-        float4 arc = quarter_turn * radii * arc_speed;
+        float4 arc = (0.5 * PI) * radii * arc_speed;
         float4 segment = straight + arc;
         float4 start = float4(0.0, segment.x, segment.x + segment.y, segment.x + segment.y + segment.z);
         length = start.w + segment.w;
@@ -275,25 +244,16 @@ float4 quad_color(float2 p, Instance data)
     float4 fill = fill_color(data.fill, data.shape, p);
     bool bordered = any(data.edges > 0.0);
     if (!bordered && !any(data.radii > 0.0) && data.fill.kind == 0)
-        return premultiply(fill, 1.0);
+        return premultiply_alpha(fill);
     float outer = saturate(0.5 - rounded_box(p, data.bounds, data.radii));
     if (!bordered)
-        return premultiply(fill, outer);
+        return premultiply_alpha(fill, outer);
     float border = saturate(0.5 + inner_box(p, data));
     if (data.flags != 0 && border > 0.0)
         border *= dashed_edge(p, data);
 
     // Take both colors at full coverage before masking the outer edge.
-    return over(premultiply(data.color, border), premultiply(fill, 1.0)) * outer;
-}
-
-float normal_cdf(float x)
-{
-    // Abramowitz and Stegun 26.2.17, public domain.
-    float t = 1.0 / (1.0 + 0.2316419 * abs(x));
-    float tail = 0.39894228 * exp(-0.5 * x * x) * t *
-        (0.31938153 + t * (-0.35656378 + t * (1.781478 + t * (-1.821256 + t * 1.3302744))));
-    return x < 0.0 ? tail : 1.0 - tail;
+    return over_premultiplied(premultiply_alpha(data.color, border), premultiply_alpha(fill)) * outer;
 }
 
 float corner_inset(float depth, float radius)
@@ -324,11 +284,11 @@ float shadow_coverage(float2 p, Instance data)
             float bottom = box.w - y;
             float lo = box.x + max(corner_inset(top, data.radii.x), corner_inset(bottom, data.radii.w));
             float hi = box.z - max(corner_inset(top, data.radii.y), corner_inset(bottom, data.radii.z));
-            float horizontal = normal_cdf((hi - p.x) / sigma) - normal_cdf((lo - p.x) / sigma);
+            float horizontal = standard_normal_cdf((hi - p.x) / sigma) - standard_normal_cdf((lo - p.x) / sigma);
             float v = (y - p.y) / sigma;
             alpha += horizontal * exp(-0.5 * v * v);
         }
-        alpha = saturate(alpha * (0.39894228 * dy / sigma));
+        alpha = saturate(alpha * (INV_SQRT_TWO_PI * dy / sigma));
     }
     if (data.flags != 0)
         return (1.0 - alpha) * saturate(0.5 - rounded_box(p, data.bounds, data.edges));
@@ -393,7 +353,7 @@ float underline_coverage(float2 p, Instance data)
     if (data.flags == 0)
         return 1.0;
     float height = data.bounds.w - data.bounds.y;
-    float rate = 6.2831853 * data.parameter / (height * height);
+    float rate = TWO_PI * data.parameter / (height * height);
     float phase = (p.x - data.bounds.x) * rate;
     float amplitude = 0.8 * data.parameter;
     float slope = amplitude * rate * cos(phase);
@@ -423,21 +383,21 @@ float4 pixel_main(Vertex v) : SV_Target
         case QUAD:
             return quad_color(p, data);
         case SHADOW:
-            return premultiply(data.color, shadow_coverage(p, data));
+            return premultiply_alpha(data.color, shadow_coverage(p, data));
         case UNDERLINE:
-            return premultiply(data.color, underline_coverage(p, data));
+            return premultiply_alpha(data.color, underline_coverage(p, data));
         case PATH:
-            return premultiply(fill_color(data.fill, data.shape, p), path_coverage(p, data));
+            return premultiply_alpha(fill_color(data.fill, data.shape, p), path_coverage(p, data));
         case MASK_SPRITE:
             if (any(p < data.clip.xy) || any(p >= data.clip.zw))
                 return float4(0.0);
-            return premultiply(data.color, sprite(data, v.local).r);
+            return premultiply_alpha(data.color, sprite(data, v.local).r);
         default:
             float4 texel = sprite(data, v.local);
             if (data.flags == 0 && !any(data.radii > 0.0))
-                return premultiply(texel, data.parameter);
+                return premultiply_alpha(texel, data.parameter);
             if (data.flags != 0)
-                texel.rgb = float3(dot(texel.rgb, float3(0.2126, 0.7152, 0.0722)));
-            return premultiply(texel, data.parameter * saturate(0.5 - rounded_box(p, data.bounds, data.radii)));
+                texel.rgb = float3(luma_rec709(texel.rgb));
+            return premultiply_alpha(texel, data.parameter * saturate(0.5 - rounded_box(p, data.bounds, data.radii)));
     }
 }
