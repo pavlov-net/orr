@@ -1,6 +1,6 @@
 [package]
 name = "orr_egui"
-description = "egui painter for orr: draws egui meshes into a UI layer with mesh shaders."
+description = "Draws egui meshes into the orr UI layer."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
