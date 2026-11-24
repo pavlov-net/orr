@@ -81,8 +81,6 @@ public struct SurfaceInput
     public uint surface;            // linked surface id; 0 = StandardSurface
     public UvFootprint uv[2];       // per uv set; producer and patch geometry give both its one uv, but for a subdivision copy holding uv set 1
     public float3 geometric_normal; // the triangle's, turned toward the ray on a back face but for a dielectric's
-    public bool back_face;          // the ray met the triangle's back
-    public bool swapped;            // `material` is the section material's back
     public float3 normal;           // interpolated vertex normal, unit
     public float3 frame_normal;     // `normal` before normalizing, not always unit
     public float4 tangent;          // xyz as interpolated, not always unit; w bitangent sign
@@ -102,6 +100,10 @@ public struct SurfaceInput
     public SceneRoot* scene;
     public ViewConstants* view;
     public uint64_t data;           // the material's consumer data, else the scene's
+    // Last: Apple's Metal compiler (macOS 27.2) fails to lower the three-byte copy it makes of
+    // the padding after these between the float3s, which kills the compiler service.
+    public bool back_face;          // the ray met the triangle's back
+    public bool swapped;            // `material` is the section material's back
 }
 
 // What a coverage reads of its candidate's input beside the scene, the view, the ray's direction
