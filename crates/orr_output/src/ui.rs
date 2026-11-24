@@ -11,7 +11,8 @@ use crate::Result;
 /// to draw into as a color attachment.
 pub struct UiPass<'a, 'q> {
     pub cmd: &'a mut CommandList<'q>,
-    /// RGBA8 UNORM at the display's extent, premultiplied, sRGB-encoded.
+    /// RGBA8 UNORM at the display's extent. RGB uses Rec.709 primaries and the sRGB transfer
+    /// function, with alpha multiplied into the encoded RGB.
     pub layer: &'a Texture,
     /// The presented image within the frame the UI is for: 0 unless the UI is drawn per
     /// presented image.

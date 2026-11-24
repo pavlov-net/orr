@@ -105,6 +105,7 @@ pub struct RayShader {
 pub enum PipelineKind {
     Compute,
     Mesh,
+    Vertex,
     Ray,
 }
 
@@ -113,6 +114,7 @@ impl PipelineKind {
         match self {
             Self::Compute => "compute",
             Self::Mesh => "mesh",
+            Self::Vertex => "vertex",
             Self::Ray => "ray",
         }
     }
@@ -129,13 +131,13 @@ impl PipelineKind {
 ///     [shaders=<shader>:<stack_bytes>:<instructions>,...] name=<name>
 /// ```
 ///
-/// A line holds no breaks. Times are whole microseconds. `kind` is `compute`, `mesh` or `ray`;
+/// A line holds no breaks. Times are whole microseconds. `kind` is `compute`, `mesh`, `vertex` or `ray`;
 /// `key` is the hash that names the pipeline's file in a pipeline store. `device` and `driver`
 /// are the device's name and its driver's name and version, as `Caps::device_name` and
 /// `Caps::driver` give them, with `_` for each space. `hit=1` marks a pipeline that came from the
 /// pipeline cache or the store, which cost the driver no compile: its times are 0, and the rest
 /// is what the driver reports of it as of a compiled one. A device records such a pipeline once,
-/// however often it creates it. `entries` lists a compute or mesh pipeline's stages by
+/// however often it creates it. `entries` lists a compute or graphics pipeline's stages by
 /// [`StageEntry::name`], and `specs` their specialization data in the same order, as hex bytes or
 /// `-` for none. The code statistics are [`CodeStatistics`]', where the driver reports them.
 /// `shaders` lists a ray tracing pipeline's shaders. `name` comes last and runs to the end of the
@@ -209,6 +211,7 @@ impl CompileRecord {
             kind: match *fields.get("kind")? {
                 "compute" => PipelineKind::Compute,
                 "mesh" => PipelineKind::Mesh,
+                "vertex" => PipelineKind::Vertex,
                 "ray" => PipelineKind::Ray,
                 _ => return None,
             },

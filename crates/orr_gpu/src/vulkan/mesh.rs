@@ -1,4 +1,4 @@
-//! Mesh pipelines (optional task, mesh, optional pixel) and the attachments rendering writes.
+//! Graphics pipelines and the attachments rendering writes.
 
 use std::sync::Arc;
 
@@ -10,9 +10,10 @@ use super::driver_cpu::DriverCpu;
 use super::garbage::Item;
 use super::pipeline::StageParts;
 use super::texture::{vk_compare, vk_format};
+use crate::raster::RasterTargets;
 use crate::{
     Blend, BlendFactor, BlendOp, ColorTarget, Cull, Error, Fill, FrontFace, MeshPipelineDesc,
-    PipelineKind, Stage,
+    PipelineKind, PrimitiveTopology, Stage, VertexPipelineDesc,
 };
 
 /// A task/mesh/pixel pipeline drawn by [`crate::CommandList::draw_mesh_tasks`] inside
@@ -24,6 +25,18 @@ pub struct MeshPipeline {
 }
 
 impl Drop for MeshPipeline {
+    fn drop(&mut self) {
+        self.shared.defer_after_submitted(Item::Pipeline(self.raw));
+    }
+}
+
+/// A vertex/pixel pipeline drawn by [`crate::CommandList::draw`] inside rendering.
+pub struct VertexPipeline {
+    pub(super) raw: vk::Pipeline,
+    shared: Arc<Shared>,
+}
+
+impl Drop for VertexPipeline {
     fn drop(&mut self) {
         self.shared.defer_after_submitted(Item::Pipeline(self.raw));
     }
@@ -71,27 +84,8 @@ fn blend_state(t: &ColorTarget) -> vk::PipelineColorBlendAttachmentState {
         .alpha_blend_op(vk_blend_op(alpha.op))
 }
 
-fn check(shared: &Shared, d: &MeshPipelineDesc<'_>, name: &str) -> Result<(), Error> {
-    let bad = |m: String| Err(Error::Invalid(format!("mesh pipeline {name}: {m}")));
-    let max = shared.caps.limits.max_color_targets;
-    if d.colors.len() > max as usize {
-        return bad(format!(
-            "{} color targets, the device has {max}",
-            d.colors.len()
-        ));
-    }
-    if let Some(t) = d.colors.iter().find(|t| t.format.is_depth()) {
-        return bad(format!("{:?} is not a color format", t.format));
-    }
-    if let Some(t) = d.depth.filter(|t| !t.format.is_depth()) {
-        return bad(format!("{:?} is not a depth format", t.format));
-    }
-    if !d.samples.is_power_of_two() || d.samples > 16 {
-        return bad(format!("{} samples", d.samples));
-    }
-    if d.samples > 1 && (!d.colors.is_empty() || d.depth.is_some()) {
-        return bad("more than one sample needs a pipeline with no targets".into());
-    }
+fn check(shared: &Shared, d: RasterTargets<'_>, name: &str) -> Result<(), Error> {
+    d.validate(shared.caps.limits.max_color_targets, name)?;
     if d.raster.conservative && !shared.caps.conservative_raster {
         return Err(Error::Unsupported {
             device: shared.caps.device_name.clone(),
@@ -109,7 +103,8 @@ impl Shared {
         extra: vk::PipelineCreateFlags2,
         name: &str,
     ) -> Result<vk::Pipeline, Error> {
-        check(self, d, name)?;
+        let targets = d.raster_targets();
+        check(self, targets, name)?;
         let mut parts = Vec::with_capacity(3);
         if let Some(s) = &d.task {
             parts.push((
@@ -127,6 +122,38 @@ impl Shared {
                 StageParts::new(self, s, Stage::Pixel, name)?,
             ));
         }
+        self.create_graphics(targets, &parts, None, extra, name)
+    }
+
+    fn create_vertex(
+        &self,
+        d: &VertexPipelineDesc<'_>,
+        extra: vk::PipelineCreateFlags2,
+        name: &str,
+    ) -> Result<vk::Pipeline, Error> {
+        let targets = d.raster_targets();
+        check(self, targets, name)?;
+        let mut parts = vec![(
+            vk::ShaderStageFlags::VERTEX,
+            StageParts::new(self, &d.vertex, Stage::Vertex, name)?,
+        )];
+        if let Some(pixel) = &d.pixel {
+            parts.push((
+                vk::ShaderStageFlags::FRAGMENT,
+                StageParts::new(self, pixel, Stage::Pixel, name)?,
+            ));
+        }
+        self.create_graphics(targets, &parts, Some(d.topology), extra, name)
+    }
+
+    fn create_graphics(
+        &self,
+        d: RasterTargets<'_>,
+        parts: &[(vk::ShaderStageFlags, StageParts<'_>)],
+        topology: Option<PrimitiveTopology>,
+        extra: vk::PipelineCreateFlags2,
+        name: &str,
+    ) -> Result<vk::Pipeline, Error> {
         let r = &d.raster;
         let colors: Vec<_> = d.colors.iter().map(|t| vk_format(t.format)).collect();
         let blends: Vec<_> = d.colors.iter().map(blend_state).collect();
@@ -139,19 +166,27 @@ impl Shared {
         };
         let bias = r.depth_bias.unwrap_or_default();
         let dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let state = format!("{:?}", (d.colors, d.depth, d.raster, d.samples));
+        let mut state = format!("{:?}", (d.colors, d.depth, d.raster, d.samples));
+        let kind = match topology {
+            Some(topology) => {
+                use std::fmt::Write as _;
+                write!(state, " {topology:?}").unwrap();
+                PipelineKind::Vertex
+            }
+            None => PipelineKind::Mesh,
+        };
         self.create_pipeline(
             &parts.iter().map(|(_, p)| p).collect::<Vec<_>>(),
             state.as_bytes(),
             extra,
-            PipelineKind::Mesh,
+            kind,
             name,
             "vkCreateGraphicsPipelines",
             |cache, next| {
                 let mut stage_chains: Vec<_> = parts.iter().map(|(_, p)| p.chain()).collect();
                 let stages: Vec<_> = stage_chains
                     .iter_mut()
-                    .zip(&parts)
+                    .zip(parts)
                     .map(|(c, (stage, _))| c.info(*stage))
                     .collect();
                 let viewport = vk::PipelineViewportStateCreateInfo::default()
@@ -210,6 +245,21 @@ impl Shared {
                     .depth_stencil_state(&depth)
                     .color_blend_state(&blend)
                     .dynamic_state(&dynamic);
+                let input = vk::PipelineVertexInputStateCreateInfo::default();
+                let assembly;
+                if let Some(topology) = topology {
+                    assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(
+                        match topology {
+                            PrimitiveTopology::TriangleList => vk::PrimitiveTopology::TRIANGLE_LIST,
+                            PrimitiveTopology::TriangleStrip => {
+                                vk::PrimitiveTopology::TRIANGLE_STRIP
+                            }
+                        },
+                    );
+                    info = info
+                        .vertex_input_state(&input)
+                        .input_assembly_state(&assembly);
+                }
                 info.p_next = std::ptr::from_ref(&rendering).cast();
                 let (created, cpu) = DriverCpu::serial(|| {
                     // SAFETY: valid create info; the SPIR-V was validated by the shader build.
@@ -237,6 +287,19 @@ impl Device {
         let _zone = crate::zone!("create pipeline", name);
         Ok(MeshPipeline {
             raw: self.shared.create_mesh(d, self.creation_flags, name)?,
+            shared: Arc::clone(&self.shared),
+        })
+    }
+
+    /// Creates a vertex pipeline with the same dynamic viewport and scissor as a mesh pipeline.
+    pub fn create_vertex_pipeline(
+        &self,
+        d: &VertexPipelineDesc<'_>,
+        name: &str,
+    ) -> Result<VertexPipeline, Error> {
+        let _zone = crate::zone!("create pipeline", name);
+        Ok(VertexPipeline {
+            raw: self.shared.create_vertex(d, self.creation_flags, name)?,
             shared: Arc::clone(&self.shared),
         })
     }

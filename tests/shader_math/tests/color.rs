@@ -171,6 +171,28 @@ fn ictcp_matches_bt2100() {
     }
 }
 
+#[test]
+fn oklab_matches_reference_colors() {
+    let to_rec709 = RgbPrimaries::REC709.xyz_to_rgb();
+    // Ottosson's example XYZ and Oklab pairs, rounded to three decimals.
+    // https://bottosson.github.io/posts/oklab/#converting-from-xyz-to-oklab
+    for (xyz, lab) in [
+        ([0.950, 1.000, 1.089], [1.000, 0.000, 0.000]),
+        ([1.000, 0.000, 0.000], [0.450, 1.236, -0.019]),
+        ([0.000, 1.000, 0.000], [0.922, -0.671, 0.263]),
+        ([0.000, 0.000, 1.000], [0.153, -1.415, -0.449]),
+    ] {
+        let rgb = to_rec709 * DVec3::from(xyz);
+        let got = oklab_from_rec709(rgb.to_array().map(|v| v as f32));
+        assert!(
+            d3(got).abs_diff_eq(DVec3::from(lab), 1e-3),
+            "{xyz:?}: {got:?}"
+        );
+        let back = d3(rec709_from_oklab(got));
+        assert!(back.abs_diff_eq(rgb, 3e-6), "{rgb} -> {back}");
+    }
+}
+
 const THRESHOLD: [f64; 3] = [0.815, 0.803, 0.880];
 const LIMIT: [f64; 3] = [1.593_869_6, 1.087_499_8, 1.116_575_8];
 

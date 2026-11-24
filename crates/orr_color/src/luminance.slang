@@ -1,4 +1,4 @@
-// Luminance (CIE Y) of linear color.
+// Luminance of linear color and luma of encoded color.
 module luminance;
 
 import orr_color.primaries;
@@ -6,6 +6,12 @@ import orr_color.primaries;
 public float luminance_rec2020(float3 c)
 {
     return dot(REC2020_TO_XYZ[1], c);
+}
+
+// BT.709 luma weights applied to encoded RGB.
+public float luma_rec709(float3 encoded)
+{
+    return dot(encoded, float3(0.2126, 0.7152, 0.0722));
 }
 
 // The luminance ray reconstruction's depth-of-field guide takes.

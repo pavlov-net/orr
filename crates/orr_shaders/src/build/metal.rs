@@ -420,7 +420,13 @@ pub(super) fn compile_library(metal: &Path, out: &Path, sdk: &str) -> Result<(),
     ))
 }
 
-const ENTRY_STAGES: &[&str] = &["[[kernel]]", "[[mesh]]", "[[object]]", "[[fragment]]"];
+const ENTRY_STAGES: &[&str] = &[
+    "[[kernel]]",
+    "[[mesh]]",
+    "[[object]]",
+    "[[vertex]]",
+    "[[fragment]]",
+];
 
 fn brace_delta(line: &str) -> i32 {
     line.chars()

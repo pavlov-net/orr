@@ -44,7 +44,7 @@ pub use command::CommandList;
 pub use device::{Device, DeviceHooks};
 pub use interop::{RawDevice, defer_after_submitted, raw_device, texture_handle};
 pub use memory::{Allocation, DeviceArenas, HostArenas};
-pub use mesh::MeshPipeline;
+pub use mesh::{MeshPipeline, VertexPipeline};
 pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{HostTimeline, Queue};
 pub use sparse::{SparseAllocation, SparseBinds};

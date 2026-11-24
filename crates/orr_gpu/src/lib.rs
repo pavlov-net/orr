@@ -1,9 +1,9 @@
 //! orr's GPU interface: one device with GPU memory reached by address, a texture heap,
-//! compute, mesh and ray tracing pipelines whose only parameter is a root, stage barriers and
+//! compute, vertex, mesh and ray tracing pipelines whose only parameter is a root, stage barriers and
 //! timeline submits.
 //!
 //! Shaders read everything through the root: [`CommandList::dispatch`] and
-//! [`CommandList::draw_mesh_tasks`] push the [`GpuPtr`] of a root struct in GPU memory, and
+//! [`CommandList::draw`] and [`CommandList::draw_mesh_tasks`] push the [`GpuPtr`] of a root struct in GPU memory, and
 //! [`CommandList::trace_rays`] and [`CommandList::dispatch_inline`] push the struct itself, for
 //! kernels that declare `ORR_ROOT_INLINE`;
 //! buffers are pointers inside it, textures and samplers are heap slots ([`TextureIndex`],
@@ -113,7 +113,7 @@ pub use queue::{PassResult, PipelineStats, QueueKind, QueueRequest};
 pub use raster::{
     Blend, BlendEquation, BlendFactor, BlendOp, ClearColor, ColorAttachment, ColorLoad, ColorMask,
     ColorTarget, Cull, DepthAttachment, DepthBias, DepthLoad, DepthTarget, Fill, FrontFace,
-    MeshPipelineDesc, RasterState, Rendering,
+    MeshPipelineDesc, PrimitiveTopology, RasterState, Rendering, VertexPipelineDesc,
 };
 pub use ray::{
     CompileThreads, HitGroup, HitTable, RayPipelineDesc, RayPipelineFlags, ShaderRecord,
@@ -136,7 +136,7 @@ pub use backend::{
     Allocation, ClassicAs, CommandList, ComputePipeline, Device, DeviceArenas, DeviceHooks,
     Diagnostics, ExecutionSet, HostArenas, HostTimeline, ImportedMemory, LowLatency, MeshPipeline,
     Micromap, Queue, RayPipeline, ShaderStage, SparseAllocation, SparseBinds, Swapchain,
-    SwapchainFrame, Texture, WindowExtent,
+    SwapchainFrame, Texture, VertexPipeline, WindowExtent,
 };
 
 #[cfg(not(target_vendor = "apple"))]

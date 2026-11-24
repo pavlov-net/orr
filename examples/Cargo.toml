@@ -9,6 +9,7 @@ publish = false
 
 [features]
 default = ["dlss", "metalfx"]
+gpui = ["dep:gpui", "dep:orr_gpui"]
 # orr's `dlss`. Without it or `metalfx` the reconstruction example only says so, and the others
 # run without reconstruction.
 dlss = ["orr/dlss"]
@@ -23,6 +24,8 @@ tracy = ["orr/tracy", "orr_cook/tracy", "dep:tracy-client"]
 
 [dependencies]
 orr.workspace = true
+gpui = { workspace = true, optional = true }
+orr_gpui = { workspace = true, optional = true }
 orr_cook.workspace = true
 orr_math.workspace = true
 orr_color.workspace = true
@@ -124,6 +127,11 @@ path = "sponza.rs"
 [[example]]
 name = "zorah"
 path = "zorah.rs"
+
+[[example]]
+name = "gpui-overlay"
+path = "gpui-overlay.rs"
+required-features = ["gpui"]
 
 [lints]
 workspace = true

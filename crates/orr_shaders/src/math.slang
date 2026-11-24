@@ -10,11 +10,21 @@ public static const float TWO_PI = 6.28318530717958647692;
 public static const float INV_PI = 0.31830988618379067154;
 public static const float INV_TWO_PI = 0.15915494309189533577;
 public static const float INV_FOUR_PI = 0.07957747154594766788;
+public static const float INV_SQRT_TWO_PI = 0.39894228040143267794;
 public static const float GOLDEN_ANGLE = 2.39996322972865332;
 // The smallest normal f32. A device may flush a smaller magnitude to 0.
 public static const float F32_MIN_NORMAL = 1.17549435e-38;
 // The offset per meter of render-space magnitude that clears f32 rounding: 4 to 8 ulps.
 public static const float F32_PRECISION = 1.0 / 1048576.0;
+
+// Standard normal CDF approximation from Abramowitz and Stegun 26.2.17.
+public float standard_normal_cdf(float x)
+{
+    float t = 1.0 / (1.0 + 0.2316419 * abs(x));
+    float tail = INV_SQRT_TWO_PI * exp(-0.5 * x * x) * t *
+        (0.31938153 + t * (-0.35656378 + t * (1.781478 + t * (-1.821256 + t * 1.3302744))));
+    return x < 0.0 ? tail : 1.0 - tail;
+}
 
 // `v` at unit length, or `fallback` when its length is zero, denormal or not finite.
 public float3 safe_normalize(float3 v, float3 fallback = float3(0, 0, 1))

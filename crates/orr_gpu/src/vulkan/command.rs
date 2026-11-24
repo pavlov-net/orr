@@ -7,7 +7,7 @@ use bytemuck::Pod;
 
 use super::diagnostics::next_pass_id;
 use super::garbage::Item;
-use super::mesh::MeshPipeline;
+use super::mesh::{MeshPipeline, VertexPipeline};
 use super::pipeline::ComputePipeline;
 use super::queue::{ListResources, Queue};
 use super::ray::RayPipeline;
@@ -616,6 +616,18 @@ impl<'q> CommandList<'q> {
         unsafe { self.device().cmd_end_rendering(self.cmd()) };
     }
 
+    /// Draws `vertices` vertices for each of `instances`, with both IDs starting at zero.
+    /// The shaders fetch their inputs through `root`. Inside rendering only.
+    pub fn draw<R>(&mut self, p: &VertexPipeline, root: GpuPtr<R>, vertices: u32, instances: u32) {
+        assert!(self.rendering.is_some(), "draw outside rendering");
+        self.bind(vk::PipelineBindPoint::GRAPHICS, p.raw, root.address().0);
+        // SAFETY: recording inside rendering with a vertex pipeline bound.
+        unsafe {
+            self.device()
+                .cmd_draw(self.cmd(), vertices, instances, 0, 0);
+        }
+    }
+
     /// Draws `p` over `groups` task workgroups (mesh workgroups without a task stage) with
     /// `root` as its root pointer. Inside rendering only.
     pub fn draw_mesh_tasks<R>(&mut self, p: &MeshPipeline, root: GpuPtr<R>, groups: [u32; 3]) {
@@ -1191,6 +1203,7 @@ fn vk_stages(s: Stages, caps: &Caps) -> vk::PipelineStageFlags2 {
         (Stages::COMPUTE, P::COMPUTE_SHADER),
         (Stages::TASK, P::TASK_SHADER_EXT),
         (Stages::MESH, P::MESH_SHADER_EXT),
+        (Stages::VERTEX, P::VERTEX_SHADER),
         (Stages::PIXEL, P::FRAGMENT_SHADER),
         (
             Stages::RAY,

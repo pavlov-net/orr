@@ -1,6 +1,5 @@
-// egui meshes into the UI layer. Each mesh workgroup draws 32 triangles of one mesh, pulling
-// their vertices through the root's pointers; the pixel stage filters, multiplies and blends
-// in gamma space like egui's reference painters.
+// egui meshes into the UI layer, pulling indexed vertices through the root.
+// The pixel stage filters, multiplies and blends in gamma space.
 #include "orr_root.h"
 import orr_shaders.packing;
 import orr_shaders.abi;
@@ -21,18 +20,16 @@ struct Root
     // Points to clip space: x * scale - 1.
     float scale_x;
     float scale_y;
-    uint first_triangle;
-    uint triangles;
     TextureIndex texture;
     SamplerIndex sampler;
     // 1: the texture holds linear color, encoded to sRGB after filtering; 0: it holds
     // egui's sRGB-encoded bytes, filtered as they are.
     uint linear;
     uint _pad0;
+    uint _pad1;
+    uint _pad2;
 }
 ORR_ROOT(Root);
-
-static const uint GROUP = 32;
 
 struct Vertex
 {
@@ -41,30 +38,15 @@ struct Vertex
     float4 color : COLOR0;
 }
 
-[shader("mesh")]
-[numthreads(32, 1, 1)]
-[outputtopology("triangle")]
-void mesh_main(
-    uint group: SV_GroupID,
-    uint thread: SV_GroupThreadID,
-    out indices uint3 triangles[32],
-    out vertices Vertex vertices[96])
+[shader("vertex")]
+Vertex vertex_main(uint id : SV_VertexID)
 {
-    uint first = root.first_triangle + group * GROUP;
-    uint count = min(GROUP, root.triangles - group * GROUP);
-    SetMeshOutputCounts(3 * count, count);
-    if (thread >= count)
-        return;
-    for (uint k = 0; k < 3; k++)
-    {
-        EguiVertex e = root.vertices[root.indices[3 * (first + thread) + k]];
-        Vertex v;
-        v.position = float4(e.pos.x * root.scale_x - 1.0, e.pos.y * root.scale_y - 1.0, 0.0, 1.0);
-        v.uv = e.uv;
-        v.color = unpack_unorm4x8(e.color);
-        vertices[3 * thread + k] = v;
-    }
-    triangles[thread] = uint3(3 * thread, 3 * thread + 1, 3 * thread + 2);
+    EguiVertex e = root.vertices[root.indices[id]];
+    Vertex v;
+    v.position = float4(e.pos.x * root.scale_x - 1.0, e.pos.y * root.scale_y - 1.0, 0.0, 1.0);
+    v.uv = e.uv;
+    v.color = unpack_unorm4x8(e.color);
+    return v;
 }
 
 [shader("pixel")]

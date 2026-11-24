@@ -1,4 +1,4 @@
-//! An egui painter for orr: draws egui's tessellated meshes into a UI layer with a mesh
+//! An egui painter for orr: draws egui's tessellated meshes into a UI layer with a vertex
 //! shader, blending in gamma space like egui's reference painters.
 //!
 //! The UI layer is an RGBA8 UNORM texture with `COLOR` usage holding premultiplied,
@@ -17,9 +17,9 @@ use egui::{
 };
 use orr_gpu::{
     AddressMode, Allocation, Blend, ColorAttachment, ColorLoad, ColorTarget, CommandList, Device,
-    Error, Filter, Format, GpuPtr, Hazards, MemoryKind, MeshPipeline, MeshPipelineDesc, ROOT_ALIGN,
-    Rendering, SamplerDesc, SamplerIndex, ShaderStage, SpecData, Stages, Texture, TextureDesc,
-    TextureIndex, TextureMemory, TextureRegion, TextureUsage, ViewDesc,
+    Error, Filter, Format, GpuPtr, Hazards, MemoryKind, ROOT_ALIGN, Rendering, SamplerDesc,
+    SamplerIndex, ShaderStage, SpecData, Stages, Texture, TextureDesc, TextureIndex, TextureMemory,
+    TextureRegion, TextureUsage, VertexPipeline, VertexPipelineDesc, ViewDesc,
 };
 
 mod shaders {
@@ -35,17 +35,13 @@ const _: () = {
     assert!(offset_of!(Vertex, color) == offset_of!(EguiVertex, color));
 };
 
-/// Triangles one mesh workgroup draws (`painter.slang`).
-const GROUP: u32 = 32;
-/// Workgroups per draw: Vulkan's minimum `maxMeshWorkGroupCount`.
-const MAX_GROUPS: u32 = 65_535;
 /// Bytes of a new upload block, unless one allocation needs more.
 const BLOCK_BYTES: u64 = 1 << 20;
 
 /// Paints egui output into a UI layer. Holds one list of upload blocks per frame in flight.
 pub struct Painter {
     device: Device,
-    pipeline: MeshPipeline,
+    pipeline: VertexPipeline,
     slots: Vec<FrameSlot>,
     /// The frame of the latest call.
     frame: Option<u64>,
@@ -83,11 +79,11 @@ impl Painter {
             blend: Some(Blend::PREMULTIPLIED),
             ..ColorTarget::new(Format::Rgba8Unorm)
         }];
-        let pipeline = gpu.create_mesh_pipeline(
-            &MeshPipelineDesc {
+        let pipeline = gpu.create_vertex_pipeline(
+            &VertexPipelineDesc {
                 pixel: Some(stage("pixel_main")?),
                 colors: &colors,
-                ..MeshPipelineDesc::new(stage("mesh_main")?)
+                ..VertexPipelineDesc::new(stage("vertex_main")?)
             },
             "egui",
         )?;
@@ -190,8 +186,8 @@ impl Painter {
             let clip = p.clip_rect;
             let (x0, y0) = (pixel(clip.min.x, width), pixel(clip.min.y, height));
             let (x1, y1) = (pixel(clip.max.x, width), pixel(clip.max.y, height));
-            let triangles = (mesh.indices.len() / 3) as u32;
-            if x1 <= x0 || y1 <= y0 || triangles == 0 {
+            let (triangles, _) = mesh.indices.as_chunks::<3>();
+            if x1 <= x0 || y1 <= y0 || triangles.is_empty() {
                 continue;
             }
             let (texture, sampler, linear) = match mesh.texture_id {
@@ -202,24 +198,27 @@ impl Painter {
                 TextureId::User(n) => (TextureIndex(n as u32), self.user_sampler, 1),
             };
             let vertices = self.put(frame_id, bytemuck::cast_slice(&mesh.vertices), 16)?;
-            let indices = self.put(frame_id, bytemuck::cast_slice(&mesh.indices), 16)?;
-            let per_draw = GROUP * MAX_GROUPS;
-            for first in (0..triangles).step_by(per_draw as usize) {
-                let n = (triangles - first).min(per_draw);
+            for triangles in triangles.chunks(u32::MAX as usize / 3) {
+                let indices = self.put(frame_id, bytemuck::cast_slice(triangles), 16)?;
                 let root = Root {
                     vertices: vertices.cast(),
                     indices: indices.cast(),
                     scale_x: 2.0 * pixels_per_point / width as f32,
                     scale_y: 2.0 * pixels_per_point / height as f32,
-                    first_triangle: first,
-                    triangles: n,
                     texture,
                     sampler,
                     linear,
                     _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
                 };
                 let root = self.put(frame_id, bytemuck::bytes_of(&root), ROOT_ALIGN)?;
-                draws.push(([x0, y0], [x1 - x0, y1 - y0], root, n.div_ceil(GROUP)));
+                draws.push((
+                    [x0, y0],
+                    [x1 - x0, y1 - y0],
+                    root,
+                    (3 * triangles.len()) as u32,
+                ));
             }
         }
         cmd.begin_rendering(&Rendering {
@@ -231,9 +230,9 @@ impl Painter {
             }],
             depth: None,
         });
-        for (offset, extent, root, groups) in draws {
+        for (offset, extent, root, vertices) in draws {
             cmd.set_scissor(offset, extent);
-            cmd.draw_mesh_tasks(&self.pipeline, root.cast::<Root>(), [groups, 1, 1]);
+            cmd.draw(&self.pipeline, root.cast::<Root>(), vertices, 1);
         }
         cmd.end_rendering();
         Ok(())

@@ -50,7 +50,7 @@ pub use interop::{
     defer_after_submitted, image_handles, raw_device,
 };
 pub use memory::{Allocation, DeviceArenas, HostArenas};
-pub use mesh::MeshPipeline;
+pub use mesh::{MeshPipeline, VertexPipeline};
 #[cfg(feature = "nsight-perf")]
 pub use perf::CounterSession;
 pub use pipeline::{ComputePipeline, ShaderStage};

@@ -1,0 +1,22 @@
+[package]
+name = "orr_gpui"
+description = "GPUI scene painter for orr."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0.105"
+bytemuck.workspace = true
+etagere = { version = "0.3.0", default-features = false }
+gpui.workspace = true
+orr_gpu.workspace = true
+orr_shaders.workspace = true
+
+[build-dependencies]
+orr_shaders = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true

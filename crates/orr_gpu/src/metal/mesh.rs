@@ -7,11 +7,12 @@ use objc2_foundation::NSString;
 use objc2_metal::{
     MTL4Archive, MTL4ArgumentTable, MTL4BlendState, MTL4CommandBuffer, MTL4CommandEncoder,
     MTL4Compiler, MTL4LibraryFunctionDescriptor, MTL4MeshRenderPipelineDescriptor,
-    MTL4PipelineDescriptor, MTL4RenderCommandEncoder, MTL4RenderPassDescriptor, MTLBlendFactor,
+    MTL4PipelineDescriptor, MTL4RenderCommandEncoder, MTL4RenderPassDescriptor,
+    MTL4RenderPipelineColorAttachmentDescriptorArray, MTL4RenderPipelineDescriptor, MTLBlendFactor,
     MTLBlendOperation, MTLClearColor, MTLColorWriteMask, MTLComputePipelineState, MTLCullMode,
     MTLDepthStencilDescriptor, MTLDepthStencilState, MTLDevice, MTLLoadAction,
-    MTLRenderPipelineState, MTLRenderStages, MTLScissorRect, MTLStoreAction, MTLTriangleFillMode,
-    MTLViewport, MTLWinding,
+    MTLPrimitiveTopologyClass, MTLPrimitiveType, MTLRenderPipelineState, MTLRenderStages,
+    MTLScissorRect, MTLStoreAction, MTLTriangleFillMode, MTLViewport, MTLWinding,
 };
 
 use super::Obj;
@@ -19,9 +20,11 @@ use super::command::{CommandList, RenderEncoder, size};
 use super::device::{Device, metal_error};
 use super::heap::compare;
 use super::texture::pixel_format;
+use crate::raster::RasterTargets;
 use crate::{
-    BlendFactor, BlendOp, ClearColor, ColorLoad, ColorMask, Cull, DepthLoad, Error, Fill,
-    FrontFace, GpuPtr, Hazards, MeshArgs, MeshPipelineDesc, RasterState, Rendering, Stages,
+    BlendFactor, BlendOp, ClearColor, ColorLoad, ColorMask, ColorTarget, Cull, DepthLoad, Error,
+    Fill, FrontFace, GpuPtr, Hazards, MeshArgs, MeshPipelineDesc, PrimitiveTopology, RasterState,
+    Rendering, Stage, Stages, VertexPipelineDesc,
 };
 
 /// Object payload bytes a task stage may write: Metal's limit, since the build does not
@@ -32,12 +35,15 @@ const PAYLOAD_BYTES: usize = 16 << 10;
 /// [`CommandList::begin_rendering`]. Command lists keep the pipelines they draw with until
 /// their submit completes.
 pub struct MeshPipeline {
-    raw: Obj<ProtocolObject<dyn MTLRenderPipelineState>>,
-    /// Metal sets depth testing and raster state on the encoder, at each draw.
-    depth: Option<Obj<ProtocolObject<dyn MTLDepthStencilState>>>,
-    raster: RasterState,
+    state: DrawState,
     task_workgroup: [u32; 3],
     mesh_workgroup: [u32; 3],
+}
+
+/// A vertex/pixel pipeline drawn by [`CommandList::draw`] inside rendering.
+pub struct VertexPipeline {
+    state: DrawState,
+    topology: MTLPrimitiveType,
 }
 
 impl Device {
@@ -48,6 +54,8 @@ impl Device {
         name: &str,
     ) -> Result<MeshPipeline, Error> {
         let _zone = crate::zone!("create pipeline", name);
+        let targets = d.raster_targets();
+        targets.validate(self.caps().limits.max_color_targets, name)?;
         if d.raster.conservative {
             return Err(Error::NotImplemented("conservative rasterization"));
         }
@@ -67,26 +75,9 @@ impl Device {
             let f = pixel.function(shared)?;
             desc.setFragmentFunctionDescriptor(Some(&f));
         }
-        let attachments = desc.colorAttachments();
-        for (i, c) in d.colors.iter().enumerate() {
-            // SAFETY: the index is below Metal's eight color attachments, which pixel_format
-            // and the pipeline compile validate.
-            let a = unsafe { attachments.objectAtIndexedSubscript(i) };
-            a.setPixelFormat(pixel_format(c.format)?);
-            a.setWriteMask(write_mask(c.write));
-            if let Some(b) = c.blend {
-                a.setBlendingState(MTL4BlendState::Enabled);
-                a.setSourceRGBBlendFactor(blend_factor(b.color.src));
-                a.setDestinationRGBBlendFactor(blend_factor(b.color.dst));
-                a.setRgbBlendOperation(blend_op(b.color.op));
-                a.setSourceAlphaBlendFactor(blend_factor(b.alpha.src));
-                a.setDestinationAlphaBlendFactor(blend_factor(b.alpha.dst));
-                a.setAlphaBlendOperation(blend_op(b.alpha.op));
-            }
-        }
+        color_targets(&desc.colorAttachments(), d.colors)?;
         // SAFETY: a sample count the device validates.
-        unsafe { desc.setRasterSampleCount(d.samples.max(1) as usize) };
-        let base: &MTL4PipelineDescriptor = &desc;
+        unsafe { desc.setRasterSampleCount(d.samples as usize) };
         // The stages, then the state the descriptor takes from `d`.
         let mut key = blake3::Hasher::new();
         key.update(b"mesh");
@@ -96,6 +87,71 @@ impl Device {
                 s.key(&mut key);
             }
         }
+        let state =
+            self.finish_graphics_pipeline(Retained::into_super(desc), key, targets, name)?;
+        Ok(MeshPipeline {
+            state,
+            task_workgroup: d.task.map_or([1, 1, 1], |t| t.entry.workgroup),
+            mesh_workgroup: d.mesh.entry.workgroup,
+        })
+    }
+
+    /// Creates a vertex pipeline with the same dynamic viewport and scissor as a mesh pipeline.
+    pub fn create_vertex_pipeline(
+        &self,
+        d: &VertexPipelineDesc<'_>,
+        name: &str,
+    ) -> Result<VertexPipeline, Error> {
+        let _zone = crate::zone!("create pipeline", name);
+        let targets = d.raster_targets();
+        targets.validate(self.caps().limits.max_color_targets, name)?;
+        if d.raster.conservative {
+            return Err(Error::NotImplemented("conservative rasterization"));
+        }
+        if d.vertex.entry.stage != Stage::Vertex
+            || d.pixel.is_some_and(|s| s.entry.stage != Stage::Pixel)
+        {
+            return Err(Error::Shader(format!(
+                "{name}: expected vertex and optional pixel stages"
+            )));
+        }
+        let shared = &self.shared;
+        let desc = MTL4RenderPipelineDescriptor::new();
+        desc.setLabel(Some(&NSString::from_str(name)));
+        let vertex = d.vertex.function(shared)?;
+        desc.setVertexFunctionDescriptor(Some(&vertex));
+        if let Some(pixel) = &d.pixel {
+            let f = pixel.function(shared)?;
+            desc.setFragmentFunctionDescriptor(Some(&f));
+        }
+        desc.setInputPrimitiveTopology(MTLPrimitiveTopologyClass::Triangle);
+        color_targets(&desc.colorAttachments(), d.colors)?;
+        // SAFETY: a sample count the device validates.
+        unsafe { desc.setRasterSampleCount(d.samples as usize) };
+        let mut key = blake3::Hasher::new();
+        key.update(b"vertex");
+        d.vertex.key(&mut key);
+        if let Some(pixel) = &d.pixel {
+            pixel.key(&mut key);
+        }
+        let state =
+            self.finish_graphics_pipeline(Retained::into_super(desc), key, targets, name)?;
+        let topology = match d.topology {
+            PrimitiveTopology::TriangleList => MTLPrimitiveType::Triangle,
+            PrimitiveTopology::TriangleStrip => MTLPrimitiveType::TriangleStrip,
+        };
+        Ok(VertexPipeline { state, topology })
+    }
+
+    fn finish_graphics_pipeline(
+        &self,
+        desc: Retained<MTL4PipelineDescriptor>,
+        mut key: blake3::Hasher,
+        d: RasterTargets<'_>,
+        name: &str,
+    ) -> Result<DrawState, Error> {
+        let shared = &self.shared;
+        let base = &desc;
         key.update(format!("{:?}", (d.colors, d.depth, d.raster, d.samples)).as_bytes());
         let raw = shared.cached_render(
             key.finalize(),
@@ -111,7 +167,7 @@ impl Device {
                     .newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(base, options)
                     .map_err(|e| metal_error("newRenderPipelineState", &e))
             },
-            Retained::into_super(desc.clone()),
+            desc.clone(),
         )?;
         let depth = match d.depth {
             Some(t) => {
@@ -129,14 +185,34 @@ impl Device {
             }
             None => None,
         };
-        Ok(MeshPipeline {
+        Ok(DrawState {
             raw,
             depth,
             raster: d.raster,
-            task_workgroup: d.task.map_or([1, 1, 1], |t| t.entry.workgroup),
-            mesh_workgroup: d.mesh.entry.workgroup,
         })
     }
+}
+
+fn color_targets(
+    attachments: &MTL4RenderPipelineColorAttachmentDescriptorArray,
+    colors: &[ColorTarget],
+) -> Result<(), Error> {
+    for (i, c) in colors.iter().enumerate() {
+        // SAFETY: pipeline creation checks the color attachment count.
+        let a = unsafe { attachments.objectAtIndexedSubscript(i) };
+        a.setPixelFormat(pixel_format(c.format)?);
+        a.setWriteMask(write_mask(c.write));
+        if let Some(b) = c.blend {
+            a.setBlendingState(MTL4BlendState::Enabled);
+            a.setSourceRGBBlendFactor(blend_factor(b.color.src));
+            a.setDestinationRGBBlendFactor(blend_factor(b.color.dst));
+            a.setRgbBlendOperation(blend_op(b.color.op));
+            a.setSourceAlphaBlendFactor(blend_factor(b.alpha.src));
+            a.setDestinationAlphaBlendFactor(blend_factor(b.alpha.dst));
+            a.setAlphaBlendOperation(blend_op(b.alpha.op));
+        }
+    }
+    Ok(())
 }
 
 /// A render pass being recorded. Metal opens its encoder at `end_rendering`, after a kernel
@@ -154,6 +230,19 @@ enum RenderCommand {
     Draw {
         pipeline: DrawState,
         root: u64,
+        draw: Draw,
+    },
+}
+
+enum Draw {
+    Vertices {
+        topology: MTLPrimitiveType,
+        vertices: u32,
+        instances: u32,
+    },
+    Mesh {
+        task: [u32; 3],
+        mesh: [u32; 3],
         groups: Groups,
     },
 }
@@ -164,14 +253,12 @@ enum Groups {
     Indirect(u64),
 }
 
-/// What a draw sets from its [`MeshPipeline`].
+/// What Metal sets on the render encoder at each draw.
 #[derive(Clone)]
 struct DrawState {
     raw: Obj<ProtocolObject<dyn MTLRenderPipelineState>>,
     depth: Option<Obj<ProtocolObject<dyn MTLDepthStencilState>>>,
     raster: RasterState,
-    task_workgroup: [u32; 3],
-    mesh_workgroup: [u32; 3],
 }
 
 /// Copies `max` draws' threadgroup counts, zeroing those at or past the count.
@@ -315,8 +402,8 @@ impl CommandList<'_> {
                 RenderCommand::Draw {
                     pipeline,
                     root,
-                    groups,
-                } => self.encode_draw(&e, &pipeline, root, groups),
+                    draw,
+                } => self.encode_draw(&e, &pipeline, root, draw),
             }
         }
         e.endEncoding();
@@ -326,23 +413,28 @@ impl CommandList<'_> {
         self.pass.as_mut().expect("drawing outside begin_rendering")
     }
 
-    fn draw(&mut self, p: &MeshPipeline, root: u64, groups: Groups) {
-        let pipeline = DrawState {
-            raw: p.raw.clone(),
-            depth: p.depth.clone(),
-            raster: p.raster,
-            task_workgroup: p.task_workgroup,
-            mesh_workgroup: p.mesh_workgroup,
-        };
-        self.keep.push(Box::new(pipeline.clone()));
+    fn record_draw(&mut self, p: &DrawState, root: u64, draw: Draw) {
+        self.keep.push(Box::new(p.clone()));
         self.pass().commands.push(RenderCommand::Draw {
-            pipeline,
+            pipeline: p.clone(),
             root,
-            groups,
+            draw,
         });
     }
 
-    fn encode_draw(&self, e: &RenderEncoder, p: &DrawState, root: u64, groups: Groups) {
+    fn draw_mesh(&mut self, p: &MeshPipeline, root: u64, groups: Groups) {
+        self.record_draw(
+            &p.state,
+            root,
+            Draw::Mesh {
+                task: p.task_workgroup,
+                mesh: p.mesh_workgroup,
+                groups,
+            },
+        );
+    }
+
+    fn encode_draw(&self, e: &RenderEncoder, p: &DrawState, root: u64, draw: Draw) {
         e.setRenderPipelineState(&p.raw);
         let raster = p.raster;
         e.setCullMode(match raster.cull {
@@ -358,36 +450,64 @@ impl CommandList<'_> {
             Fill::Solid => MTLTriangleFillMode::Fill,
             Fill::Lines => MTLTriangleFillMode::Lines,
         });
-        if let Some(b) = raster.depth_bias {
-            e.setDepthBias_slopeScale_clamp(b.constant, b.slope, b.clamp);
-        }
+        let bias = raster.depth_bias.unwrap_or_default();
+        e.setDepthBias_slopeScale_clamp(bias.constant, bias.slope, bias.clamp);
         e.setDepthStencilState(p.depth.as_deref());
         // SAFETY: the root's address is the caller's to keep valid until the submit
         // completes, as on every backend.
         unsafe { self.table.setAddress_atIndex(root, 0) };
-        e.setArgumentTable_atStages(
-            &self.table,
-            MTLRenderStages::Object | MTLRenderStages::Mesh | MTLRenderStages::Fragment,
-        );
-        let (task, mesh) = (size(p.task_workgroup), size(p.mesh_workgroup));
-        match groups {
-            Groups::Direct(g) => e
-                .drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
-                    size(g),
-                    task,
-                    mesh,
-                ),
-            Groups::Indirect(args) => e
-                .drawMeshThreadgroupsWithIndirectBuffer_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
-                    args, task, mesh,
-                ),
+        match draw {
+            Draw::Vertices {
+                topology,
+                vertices,
+                instances,
+            } => {
+                e.setArgumentTable_atStages(
+                    &self.table,
+                    MTLRenderStages::Vertex | MTLRenderStages::Fragment,
+                );
+                // SAFETY: the draw is inside rendering and the shaders fetch vertices through
+                // the root, whose data the caller sizes for the draw.
+                unsafe {
+                    e.drawPrimitives_vertexStart_vertexCount_instanceCount(
+                        topology,
+                        0,
+                        vertices as usize,
+                        instances as usize,
+                    );
+                }
+            }
+            Draw::Mesh { task, mesh, groups } => {
+                e.setArgumentTable_atStages(
+                    &self.table,
+                    MTLRenderStages::Object | MTLRenderStages::Mesh | MTLRenderStages::Fragment,
+                );
+                match groups {
+                    Groups::Direct(g) => e.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(size(g), size(task), size(mesh)),
+                    Groups::Indirect(args) => e.drawMeshThreadgroupsWithIndirectBuffer_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(args, size(task), size(mesh)),
+                }
+            }
         }
+    }
+
+    /// Draws `vertices` vertices for each of `instances`, with both IDs starting at zero.
+    /// The shaders fetch their inputs through `root`. Inside rendering only.
+    pub fn draw<R>(&mut self, p: &VertexPipeline, root: GpuPtr<R>, vertices: u32, instances: u32) {
+        self.record_draw(
+            &p.state,
+            root.address().0,
+            Draw::Vertices {
+                topology: p.topology,
+                vertices,
+                instances,
+            },
+        );
     }
 
     /// Draws `groups` task workgroups of `p`, or mesh workgroups without a task stage, with
     /// the root at `root`.
     pub fn draw_mesh_tasks<R>(&mut self, p: &MeshPipeline, root: GpuPtr<R>, groups: [u32; 3]) {
-        self.draw(p, root.address().0, Groups::Direct(groups));
+        self.draw_mesh(p, root.address().0, Groups::Direct(groups));
     }
 
     /// Draws up to `max` times with the workgroup counts at `args`, as many times as the
@@ -406,7 +526,7 @@ impl CommandList<'_> {
             .gates
             .push((args.address().0, count.address().0, gated, max));
         for i in 0..u64::from(max) {
-            self.draw(p, root.address().0, Groups::Indirect(gated + i * stride));
+            self.draw_mesh(p, root.address().0, Groups::Indirect(gated + i * stride));
         }
     }
 }

@@ -563,6 +563,9 @@ fn mtl_stages(s: Stages) -> MTLStages {
     if s.intersects(Stages::MESH) {
         m |= MTLStages::Mesh;
     }
+    if s.intersects(Stages::VERTEX) {
+        m |= MTLStages::Vertex;
+    }
     if s.intersects(Stages::PIXEL | Stages::COLOR_OUT | Stages::DEPTH) {
         m |= MTLStages::Fragment;
     }
