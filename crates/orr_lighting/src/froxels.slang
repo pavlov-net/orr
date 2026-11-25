@@ -624,7 +624,7 @@ public void froxel_inject<M : IMedium>(FroxelRoot r, uint3 f)
     FroxelMaterial m = FroxelMaterial();
     if (!eye_holds(r.eye[f.y * r.columns + f.x], f.z, r.slices, r.scene.near_range))
         m = froxel_material(M.sample(r.scene.medium, x));
-    r.sigma.get<RWTexture3D<float4>>()[f] = m.sigma;
+    r.sigma.get<RWTexture3D<float4>>()[f] = quantize_half(m.sigma, float4(0.5));
     r.words.get<RWTexture3D<uint4>>()[f] = m.words;
     if (r.smoke != nullptr)
     {
@@ -860,7 +860,19 @@ bool froxel_held(FroxelRoot r, uint3 f, uint lights, out float4 incident, out fl
     return true;
 }
 
-// Writes froxel `f`'s light, as `froxel_held` reads it, for `lights` shadowed lights.
+// Separates the numbers froxels round their history by from their samples.
+static const uint FROXEL_ROUND_STREAM = 0x68E31DA4;
+
+// Four numbers froxel `f` rounds its `k`th texel of history by.
+float4 froxel_round(FroxelRoot r, uint3 f, uint k)
+{
+    uint4 h = pcg4d(uint4(f.xy, f.z + r.slices * k, r.frame ^ r.seed ^ FROXEL_ROUND_STREAM));
+    return float4(unit_float(h.x), unit_float(h.y), unit_float(h.z), unit_float(h.w));
+}
+
+// Writes froxel `f`'s light, as `froxel_held` reads it, for `lights` shadowed lights. Each value
+// rounds at random to one of the two its texel can hold around it: a frame moves a history by
+// `FROXEL_BLEND` of what its light has left to go, which rounded any other way would stop short of it.
 void froxel_store(FroxelRoot r, uint3 f, uint lights, float4 incident, float4 more, float4 arrival[MAX_FROXEL_SHADOWED_LIGHTS], float4 chain[MAX_FROXEL_SHADOWED_LIGHTS], float yield)
 {
     if (r.chain.index != IMAGE_NONE)
@@ -869,21 +881,25 @@ void froxel_store(FroxelRoot r, uint3 f, uint lights, float4 incident, float4 mo
         for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
         {
             if (j < lights)
-                r.chain.get<RWTexture3D<float4>>()[arrival_texel(f, j, r.slices)] = chain[j];
+                r.chain.get<RWTexture3D<float4>>()[arrival_texel(f, j, r.slices)] = quantize_half(chain[j], froxel_round(r, f, 3 + j));
         }
     }
-    r.incident.get<RWTexture3D<float4>>()[f] = incident;
+    r.incident.get<RWTexture3D<float4>>()[f] = quantize_half(incident, froxel_round(r, f, 0));
     if (r.seed_yield.index != IMAGE_NONE)
-        r.seed_yield.get<RWTexture3D<float4>>()[f] = float4(yield);
+        r.seed_yield.get<RWTexture3D<float4>>()[f] = float4(quantize_half(yield, froxel_round(r, f, 2).x));
     if (lights > 1)
-        r.visibility.get<RWTexture3D<float4>>()[f] = more;
+    {
+        // 8 bits where no chain takes a visibility past 1.
+        float4 u = froxel_round(r, f, 1);
+        r.visibility.get<RWTexture3D<float4>>()[f] = r.chain.index != IMAGE_NONE ? quantize_half(more, u) : floor(more * 255.0 + u) / 255.0;
+    }
     if (r.arrival.index != IMAGE_NONE)
     {
         [unroll]
         for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
         {
             if (j < lights)
-                r.arrival.get<RWTexture3D<float4>>()[arrival_texel(f, j, r.slices)] = arrival[j];
+                r.arrival.get<RWTexture3D<float4>>()[arrival_texel(f, j, r.slices)] = quantize_half(arrival[j], froxel_round(r, f, 3 + MAX_FROXEL_SHADOWED_LIGHTS + j));
         }
     }
 }
@@ -1620,9 +1636,9 @@ public void froxel_integrate<M : IMedium>(FroxelRoot r, uint2 column)
             source = froxel_source<M>(set, lights, m, smoke_scatter, r.smoke_anisotropy, incident, more, x, dir, eye, inside, im, arrival);
         }
         march_step(m.sigma_t, source, dt, inscatter, transmittance);
-        r.integrated.get<RWTexture3D<float4>>()[f] = float4(apply_hdr_ceiling(inscatter * pre_exposure), luminance_rec2020(transmittance));
+        r.integrated.get<RWTexture3D<float4>>()[f] = quantize_half(float4(apply_hdr_ceiling(inscatter * pre_exposure), luminance_rec2020(transmittance)), float4(0.5));
         if (keep_rgb)
-            r.integrated_rgb.get<RWTexture3D<float4>>()[f] = float4(transmittance, 1.0);
+            r.integrated_rgb.get<RWTexture3D<float4>>()[f] = float4(r.arrival.index != IMAGE_NONE ? quantize_half(transmittance, 0.5) : transmittance, 1.0);
     }
 }
 
@@ -1802,9 +1818,9 @@ public void aerial_build<M : IMedium>(FroxelRoot r, uint2 column)
         }
         float3 transmittance = medium_transmittance<M>(data, start, dir, d1);
         uint3 texel = uint3(column, k);
-        r.aerial.get<RWTexture3D<float4>>()[texel] = float4(apply_hdr_ceiling(inscatter * pre_exposure), luminance_rec2020(transmittance));
+        r.aerial.get<RWTexture3D<float4>>()[texel] = quantize_half(float4(apply_hdr_ceiling(inscatter * pre_exposure), luminance_rec2020(transmittance)), float4(0.5));
         if (r.chromatic != 0)
-            r.aerial_rgb.get<RWTexture3D<float4>>()[texel] = float4(transmittance, 1.0);
+            r.aerial_rgb.get<RWTexture3D<float4>>()[texel] = float4(quantize_half(transmittance, 0.5), 1.0);
         d0 = d1;
     }
 }

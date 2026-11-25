@@ -1945,7 +1945,7 @@ public void view_paths(PathRoot r)
                 texel = float4(own / max(own.x + own.y, 1e-6), float(layers) / float(max(r.dielectric_depth, 1u)), 1.0);
             }
         }
-        r.radiance.get<RWTexture2D<float4>>()[pixel] = texel;
+        r.radiance.get<RWTexture2D<float4>>()[pixel] = float4(quantize_half(texel.rgb, 0.5), texel.a);
         r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(lights.feedback, asuint(first_distance));
         if ((r.light_flags & LIGHT_FEEDBACK_COUNT) != 0 && lights.feedback != NO_LIGHT)
             count_feedback(r.set, lights.feedback);
@@ -1986,7 +1986,7 @@ public void background_paths<E : IEnvironment, M : IMedium>(PathRoot r)
         texel = float4(apply_hdr_ceiling(pre_exposure * sky_radiance<E, M>(r.set, v.eye_render.xyz, s.dir)), 0.0);
     else
         texel = float4(apply_hdr_ceiling(pre_exposure * radiance), near / depth);
-    r.dof_background.get<RWTexture2D<float4>>()[pixel] = texel;
+    r.dof_background.get<RWTexture2D<float4>>()[pixel] = float4(quantize_half(texel.rgb, 0.5), texel.a);
 }
 
 // Traces the ray of `slot`'s photon toward its light from its hot words `at`, where its start left

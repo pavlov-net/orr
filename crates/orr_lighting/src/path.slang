@@ -1170,7 +1170,7 @@ public void first_vertex_view<S : ISurfaces>(PathRoot r, uint2 pixel, inout Samp
     float4 out = float4(r.mode == PATH_CACHE_LOD ? radiance : apply_hdr_ceiling(radiance), surface ? 1.0 : 0.0);
     if (r.mode == PATH_ORIGIN_BIAS)
         out = float4(surface ? length(vertex_origin(x1, x1.surface.normal) - x1.surface.position) : 0.0, 0.0, 0.0, out.a);
-    r.radiance.get<RWTexture2D<float4>>()[pixel] = out;
+    r.radiance.get<RWTexture2D<float4>>()[pixel] = float4(quantize_half(out.rgb, 0.5), out.a);
     r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(NO_LIGHT, asuint(surface ? x1.camera_distance : 0.0));
 }
 

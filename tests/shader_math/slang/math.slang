@@ -46,6 +46,7 @@ export __extern_cpp void orr_unpack_snorm2x16(uint p, float* out) { float2 v = u
 export __extern_cpp uint orr_pack_unorm4x8(float* v) { return pack_unorm4x8(load4(v)); }
 export __extern_cpp void orr_unpack_unorm4x8(uint p, float* out) { store4(out, unpack_unorm4x8(p)); }
 export __extern_cpp void orr_unpack_snorm4x8(uint p, float* out) { store4(out, unpack_snorm4x8(p)); }
+export __extern_cpp float orr_quantize_half(float v, float u) { return quantize_half(v, u); }
 export __extern_cpp uint orr_pack_half2x16(float x, float y) { return pack_half2x16(float2(x, y)); }
 export __extern_cpp void orr_unpack_half2x16(uint p, float* out) { float2 v = unpack_half2x16(p); out[0] = v.x; out[1] = v.y; }
 export __extern_cpp uint orr_pack_rgb9e5(float* c) { return pack_rgb9e5(load3(c)); }

@@ -2204,13 +2204,19 @@ fn smoke_takes_its_opacity_from_the_camera_ray() {
         );
     }
 
-    // In a square 8 m away, 2 m across, a grid of specks 2 cm across.
+    // Specks 2 cm across in a grid 8 m away. Its middle is on a corner of the froxels' columns
+    // and 12 specks fill a column's cell on each axis, so every cell the middle pixel reads
+    // takes the same share.
     let n = 40;
     let half = 0.01;
+    let [w, h] = EXTENT.map(|e| e as f32);
+    let pixel = 2.0 * 8.0 * 0.4f32.tan() / h;
+    let [columns, rows] = EXTENT.map(|e| e.div_ceil(8) as f32);
+    let pitch = Vec2::new(w / (columns - 1.0), h / (rows - 1.0)) * pixel / 12.0;
     let specks: Vec<Particle> = Vec::from_fn(n * n, |i| Particle {
         center: Vec3::new(
-            ((i % n) as f32 + 0.5) / n as f32 * 2.0 - 1.0,
-            1.5 + ((i / n) as f32 + 0.5) / n as f32 * 2.0 - 1.0,
+            ((i % n) as f32 + 0.5 - n as f32 / 2.0) * pitch.x,
+            1.5 + ((i / n) as f32 + 0.5 - n as f32 / 2.0) * pitch.y,
             -3.0,
         ),
         size: half,
@@ -2219,7 +2225,7 @@ fn smoke_takes_its_opacity_from_the_camera_ray() {
     let (mut bed, _fog) = foggy(&CLEAR, Vec::new(), Vec::new(), None, eye, target);
     bed.set_particles(&specks, smoke_look(opacity, 0.0), Opacity::Smoke);
     let got = middle_transmittance(&camera_transmittance(&mut bed, 1));
-    let share = f64::from((2.0 * half) * (2.0 * half) * (n * n) as f32 / 4.0);
+    let share = f64::from((2.0 * half) * (2.0 * half) / (pitch.x * pitch.y));
     let wanted = 1.0 - share * f64::from(opacity);
     assert!(
         (got - wanted).abs() < 0.01,

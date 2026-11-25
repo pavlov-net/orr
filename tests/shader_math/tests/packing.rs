@@ -442,3 +442,41 @@ fn exact_axis_rotations_are_the_24_proper_rotations() {
         [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
     );
 }
+
+/// A value rounded at random to a half keeps its mean, over normal, subnormal and negative halves,
+/// and every result is a half.
+#[test]
+fn quantized_halves_keep_the_mean() {
+    let mut rng = Rng::new(9);
+    for i in 0..2000u32 {
+        let magnitude = 2f32.powi((i % 38) as i32 - 24) * (1.0 + rng.f32());
+        let v = if i.is_multiple_of(2) {
+            magnitude
+        } else {
+            -magnitude
+        };
+        let step = f64::from(half::f16::from_f32(magnitude).to_bits() & 0x7C00);
+        let step = 2f64.powi(((step as i32 >> 10).max(1)) - 25);
+        let n = 64;
+        let mut sum = 0.0;
+        for k in 0..n {
+            let q = quantize_half(v, (k as f32 + 0.5) / n as f32);
+            assert_eq!(half::f16::from_f32(q).to_f32(), q, "{v:e} gives {q:e}");
+            assert!(
+                (f64::from(q) - f64::from(v)).abs() < 2.0 * step,
+                "{v:e} gives {q:e}"
+            );
+            sum += f64::from(q);
+        }
+        let mean = sum / f64::from(n);
+        assert!(
+            (mean - f64::from(v)).abs() <= step * 1.01 / f64::from(n),
+            "{v:e} has mean {mean:e}, a step {step:e}"
+        );
+        let nearest = quantize_half(v, 0.5);
+        assert!(
+            (f64::from(nearest) - f64::from(v)).abs() <= 0.5 * step * 1.01,
+            "{v:e}"
+        );
+    }
+}

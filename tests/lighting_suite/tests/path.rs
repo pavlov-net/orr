@@ -8,10 +8,10 @@ use lighting_suite::bed::{
     EMITTER_FIELD, EXTENT, FLOOR, FURNACE_RADIANCE, FloorDecal, FrostGuide, GLASS_SPHERE,
     GLOSSY_FLOOR, GLOSSY_MIRROR, Item, LAYERED_SPHERE, MIRROR, NEAR, Particle, ParticleLook, Paths,
     QUADRANT_EMITTER, SKINNED_EMITTER, SKY, SMOOTH_FLOOR, SUN, Spec, StrandRow, TILED_FLOOR,
-    TINTED_FLOOR, TRANSLUCENT_SHEET, TROUGH, WATER_BOX, WHITE_FLOOR, assert_close,
-    assert_converges, assert_renders_alike, assert_within_noise, glass_scene, image_mean,
-    light_bed, luminance, mean_where, occluded_light_spec, particle_bed, pixel_of, plume_bed,
-    producer_slab_bed, reference, render_paths, slab_spec, surface_mean,
+    TINTED_FLOOR, TRANSLUCENT_SHEET, TROUGH, WATER_BOX, WHITE_FLOOR, WHITE_FLOOR_ALBEDO,
+    assert_close, assert_converges, assert_renders_alike, assert_within_noise, glass_scene,
+    image_mean, light_bed, luminance, mean_where, occluded_light_spec, particle_bed, pixel_of,
+    plume_bed, producer_slab_bed, reference, render_paths, slab_spec, surface_mean,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::welch::{assert_mean, assert_same_mean};
@@ -662,6 +662,40 @@ fn rays_per_pixel_do_not_grow_with_directional_lights() {
     assert!(
         (with - without).abs() <= 0.01 * without,
         "{with} rays per pixel with seven directional lights, {without} with none"
+    );
+    assert_clean();
+}
+
+/// A pixel's radiance target holds the half nearest its light: a diffuse floor under a sun with no
+/// disc to speak of, whose light is known, at pre-exposures that put it all over a half's step.
+#[test]
+fn the_radiance_target_rounds_to_nearest() {
+    let toward = Vec3::new(0.3, 0.8, -0.5).normalize();
+    let lit =
+        f64::from(WHITE_FLOOR_ALBEDO) / std::f64::consts::PI * 100_000.0 * f64::from(toward.y);
+    let settings = ViewLighting {
+        traced_primary: true,
+        ..reference(4)
+    };
+    let mut worst = 0.0f64;
+    for i in 0..12 {
+        let pre_exposure = 1.0 / (64.0 + 5.3 * i as f32);
+        let mut bed = Bed::with(Spec {
+            copies: vec![at(WHITE_FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
+            lights: vec![directional(toward, 100_000.0, 1e-4)],
+            environment: None,
+            ..Analytic::SunAndGround.spec()
+        });
+        bed.set_pre_exposure(pre_exposure);
+        let image = render_paths(&mut bed, &paths(settings), 1, 1);
+        let pixel = (EXTENT[1] * 3 / 4 * EXTENT[0] + EXTENT[0] / 2) as usize;
+        let want = lit * f64::from(pre_exposure);
+        let step = 2f64.powi(want.log2().floor() as i32 - 10);
+        worst = worst.max(((f64::from(image.mean[pixel][0]) - want) / step).abs());
+    }
+    assert!(
+        worst < 0.6,
+        "a stored radiance lies {worst} half steps from its value"
     );
     assert_clean();
 }

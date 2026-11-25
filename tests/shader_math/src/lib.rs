@@ -39,6 +39,7 @@ mod ffi {
         pub(crate) fn orr_unpack_unorm4x8(p: u32, out: *mut f32);
         pub(crate) fn orr_unpack_snorm4x8(p: u32, out: *mut f32);
         pub(crate) fn orr_pack_half2x16(x: f32, y: f32) -> u32;
+        pub(crate) fn orr_quantize_half(v: f32, u: f32) -> f32;
         pub(crate) fn orr_unpack_half2x16(p: u32, out: *mut f32);
         pub(crate) fn orr_pack_rgb9e5(c: *const f32) -> u32;
         pub(crate) fn orr_unpack_rgb9e5(p: u32, out: *mut f32);
@@ -218,6 +219,9 @@ pub fn unpack_snorm4x8(p: u32) -> V4 {
 }
 pub fn pack_half2x16(v: [f32; 2]) -> u32 {
     call!(ffi::orr_pack_half2x16(v[0], v[1]))
+}
+pub fn quantize_half(v: f32, u: f32) -> f32 {
+    call!(ffi::orr_quantize_half(v, u))
 }
 pub fn unpack_half2x16(p: u32) -> [f32; 2] {
     out!([f32; 2], |o| ffi::orr_unpack_half2x16(p, o.as_mut_ptr()))

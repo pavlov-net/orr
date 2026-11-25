@@ -7,6 +7,7 @@ import orr_shaders.abi;
 import orr_shaders.math;
 import orr_color.luminance;
 import orr_color.primaries;
+import orr_shaders.packing;
 import orr_shaders.sampling;
 import orr_scene.tables;
 
@@ -265,7 +266,7 @@ static groupshared float3 bake_sums[64];
 public void bake_environment<E : IEnvironment>(BakeRoot r, uint2 texel, uint lane, uint group)
 {
     float3 c = bake_texel<E>(r.scene.environment, r.focus.xyz, texel, r.size);
-    r.map.get<RWTexture2D<float4>>()[texel] = float4(c, 1.0);
+    r.map.get<RWTexture2D<float4>>()[texel] = float4(quantize_half(c, 0.5), 1.0);
     r.luminance[texel.y * r.size + texel.x] = luminance_rec2020(c);
     bake_sums[lane] = c;
     GroupMemoryBarrierWithGroupSync();

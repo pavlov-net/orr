@@ -10,6 +10,7 @@ module camera_media;
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_color.luminance;
+import orr_shaders.packing;
 import orr_shaders.random;
 import orr_shaders.trace;
 import orr_scene.lights;
@@ -680,7 +681,7 @@ public void media_apply<S : ISurfaces, M : IMedium>(MediaApplyRoot r, uint2 pixe
         Fog fog = smoky_fog<S, M>(r, f, pixel, dir, layer == 0 ? t : tb, spans);
         if (layer == 1)
         {
-            r.dof_background.get<RWTexture2D<float4>>()[pixel] = float4(apply_hdr_ceiling(fog.inscatter + fog.transmittance * b.rgb), b.a);
+            r.dof_background.get<RWTexture2D<float4>>()[pixel] = float4(quantize_half(apply_hdr_ceiling(fog.inscatter + fog.transmittance * b.rgb), 0.5), b.a);
             continue;
         }
         float4 out = float4(apply_hdr_ceiling(fog.inscatter + fog.transmittance * l.rgb), l.a);
@@ -691,6 +692,6 @@ public void media_apply<S : ISurfaces, M : IMedium>(MediaApplyRoot r, uint2 pixe
             uint2 column = uint2(round((float2(pixel) + 0.5) / column_spacing(*f)));
             out.rgb = float3(luminance_rec2020(fog.transmittance), froxel_slice(t, f.slices, f.scene.near_range) / float(f.slices), float((column.x + column.y) & 1));
         }
-        radiance[pixel] = out;
+        radiance[pixel] = float4(quantize_half(out.rgb, 0.5), out.a);
     }
 }

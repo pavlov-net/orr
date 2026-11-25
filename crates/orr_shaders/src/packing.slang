@@ -212,6 +212,33 @@ public float unpack_half(uint p)
     return asfloat(sign | ((top + 103) << 23) | ((m << (23 - top)) & 0x7FFFFF));
 }
 
+// `v` as a half holds it: of the two halves around it the farther from 0 where `u` in [0, 1) and
+// how far `v` lies toward it sum to 1 or more, else the nearer. A uniform `u` keeps `v` on average,
+// and a `u` of 0.5 gives the nearest. A 16-bit float texel stores the result exactly, where a device
+// may round any other value either way. Magnitudes from 65504 up are left as they are.
+public float quantize_half(float v, float u)
+{
+    uint x = asuint(v);
+    uint sign = x & 0x80000000;
+    uint a = x & 0x7FFFFFFF;
+    if (a >= 0x477FE000)
+        return v;
+    // Under 2^-14 halves lie 2^-24 apart.
+    if (a < 0x38800000)
+        return asfloat(sign | asuint(floor(asfloat(a) * 16777216.0 + u) * (1.0 / 16777216.0)));
+    return asfloat(sign | ((a + uint(u * 8192.0)) & ~0x1FFFu));
+}
+
+public float3 quantize_half(float3 v, float u)
+{
+    return float3(quantize_half(v.x, u), quantize_half(v.y, u), quantize_half(v.z, u));
+}
+
+public float4 quantize_half(float4 v, float4 u)
+{
+    return float4(quantize_half(v.x, u.x), quantize_half(v.y, u.y), quantize_half(v.z, u.z), quantize_half(v.w, u.w));
+}
+
 // Two halves (`pack_half`), x in the low 16 bits.
 public uint pack_half2x16(float2 v)
 {
