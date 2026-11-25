@@ -50,6 +50,7 @@ export __extern_cpp float orr_quantize_half(float v, float u) { return quantize_
 export __extern_cpp uint orr_pack_half2x16(float x, float y) { return pack_half2x16(float2(x, y)); }
 export __extern_cpp void orr_unpack_half2x16(uint p, float* out) { float2 v = unpack_half2x16(p); out[0] = v.x; out[1] = v.y; }
 export __extern_cpp uint orr_pack_rgb9e5(float* c) { return pack_rgb9e5(load3(c)); }
+export __extern_cpp uint orr_pack_rgb9e5_by(float* c, float u) { return pack_rgb9e5(load3(c), u); }
 export __extern_cpp void orr_unpack_rgb9e5(uint p, float* out) { store3(out, unpack_rgb9e5(p)); }
 export __extern_cpp uint orr_pack_signed9e5(float* v) { return pack_signed9e5(load3(v)); }
 export __extern_cpp void orr_unpack_signed9e5(uint p, float* out) { store3(out, unpack_signed9e5(p)); }

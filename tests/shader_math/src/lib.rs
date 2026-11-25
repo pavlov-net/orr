@@ -42,6 +42,7 @@ mod ffi {
         pub(crate) fn orr_quantize_half(v: f32, u: f32) -> f32;
         pub(crate) fn orr_unpack_half2x16(p: u32, out: *mut f32);
         pub(crate) fn orr_pack_rgb9e5(c: *const f32) -> u32;
+        pub(crate) fn orr_pack_rgb9e5_by(c: *const f32, u: f32) -> u32;
         pub(crate) fn orr_unpack_rgb9e5(p: u32, out: *mut f32);
         pub(crate) fn orr_pack_signed9e5(v: *const f32) -> u32;
         pub(crate) fn orr_unpack_signed9e5(p: u32, out: *mut f32);
@@ -228,6 +229,9 @@ pub fn unpack_half2x16(p: u32) -> [f32; 2] {
 }
 pub fn pack_rgb9e5(c: V3) -> u32 {
     call!(ffi::orr_pack_rgb9e5(c.as_ptr()))
+}
+pub fn pack_rgb9e5_by(c: V3, u: f32) -> u32 {
+    call!(ffi::orr_pack_rgb9e5_by(c.as_ptr(), u))
 }
 pub fn unpack_rgb9e5(p: u32) -> V3 {
     out!(V3, |o| ffi::orr_unpack_rgb9e5(p, o.as_mut_ptr()))

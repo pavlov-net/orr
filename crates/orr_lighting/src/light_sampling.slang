@@ -636,8 +636,8 @@ public float directional_probability(LightSetGpu* set, float3 normal, uint id)
     return share > 0.0 ? share * directional_weight(set, id, normal) / total : 0.0;
 }
 
-// Shared-exponent radiance and its exponent byte (`LightSample.bits` 8-15).
-uint2 encode_radiance(float3 c)
+// Shared-exponent radiance, rounded at random by `u`, and its exponent byte (`LightSample.bits` 8-15).
+uint2 encode_radiance(float3 c, float u)
 {
     float m = max(c.r, max(c.g, c.b));
     if (!(m > 0.0) || !isfinite(m))
@@ -645,7 +645,7 @@ uint2 encode_radiance(float3 c)
     int e = int((asuint(m) >> 23) & 0xff) - 127;
     // 2^-k and 2^k stay normal f32s, which the encode and decode scale by.
     int k = clamp(e - 14, -126, 127);
-    return uint2(pack_rgb9e5(c * exp2(float(-k))), uint(k + 128));
+    return uint2(pack_rgb9e5(c * exp2(float(-k)), u), uint(k + 128));
 }
 
 public float3 decode_radiance(LightSample s)
@@ -654,9 +654,11 @@ public float3 decode_radiance(LightSample s)
     return unpack_rgb9e5(s.radiance) * exp2(float(k));
 }
 
-LightSample light_sample(uint kind, uint light, float3 point, float3 normal, float3 radiance, float pdf)
+// A sample of `light` drawn with `u`, which also rounds its radiance: its channels keep their values
+// over samples, where each alone holds them to the steps of the brightest one's exponent.
+LightSample light_sample(uint kind, uint light, float3 point, float3 normal, float3 radiance, float pdf, float2 u)
 {
-    uint2 r = encode_radiance(radiance);
+    uint2 r = encode_radiance(radiance, pcg_float(asuint(u.x) ^ pcg(asuint(u.y))));
     LightSample s;
     s.point = point;
     s.normal = oct_encode_snorm16(normal);
@@ -884,7 +886,7 @@ LightSample emissive_sample<S : ISurfaces>(LightSetGpu* set, uint entry, uint fi
         emitted *= presence ? saturate(present) : present;
     }
     float pdf = probability * list_step(e, p) / float(triangles) / area * side;
-    LightSample r = light_sample(LIGHT_SAMPLE_EMISSIVE, s.light_capacity + entry, i.position, facing, emitted, pdf);
+    LightSample r = light_sample(LIGHT_SAMPLE_EMISSIVE, s.light_capacity + entry, i.position, facing, emitted, pdf, u);
     r.position = p;
     r.triangle = triangle;
     if ((section.flags & (MATERIAL_DOUBLE_SIDED | MATERIAL_HAS_BACK)) == MATERIAL_DOUBLE_SIDED)
@@ -1041,7 +1043,7 @@ LightSample local_sample(LightSetGpu* set, uint id, float2 u, float probability)
         float3 n = cross(l.edge_x, l.edge_y);
         float area = length(n);
         float3 x = l.position + (u.x - 0.5) * l.edge_x + (u.y - 0.5) * l.edge_y;
-        LightSample rect = light_sample(LIGHT_SAMPLE_RECT, id, x, n / area, l.color, probability / area);
+        LightSample rect = light_sample(LIGHT_SAMPLE_RECT, id, x, n / area, l.color, probability / area, u);
         rect.bits |= (l.flags & LIGHT_UNSHADOWED) != 0 ? LIGHT_SAMPLE_UNSHADOWED : 0;
         return rect;
     }
@@ -1049,7 +1051,7 @@ LightSample local_sample(LightSetGpu* set, uint id, float2 u, float probability)
     float3 radiance = l.color;
     if (l.kind == LIGHT_SPHERE)
         sphere_light(l, r2, radiance);
-    LightSample sphere = light_sample(LIGHT_SAMPLE_SPHERE, id, l.position, float3(0.0, 0.0, 1.0), radiance, probability);
+    LightSample sphere = light_sample(LIGHT_SAMPLE_SPHERE, id, l.position, float3(0.0, 0.0, 1.0), radiance, probability, u);
     sphere.bits |= (l.flags & LIGHT_UNSHADOWED) != 0 ? LIGHT_SAMPLE_UNSHADOWED : 0;
     return sphere;
 }
@@ -1118,7 +1120,7 @@ LightSample tile_light_sample<S : ISurfaces>(LightSetGpu* set, uint id, uint fir
         float pdf;
         float3 d = environment_sample(set.environment, float3(u.z, u.xy), pdf);
         return light_sample(LIGHT_SAMPLE_ENVIRONMENT, id, d, float3(0.0, 0.0, 1.0),
-                            environment_map(set.environment, d), -probability * pdf);
+                            environment_map(set.environment, d), -probability * pdf, u.xy);
     }
     uint lights = set.scene.light_capacity;
     if (id < lights)

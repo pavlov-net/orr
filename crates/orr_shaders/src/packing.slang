@@ -259,9 +259,10 @@ float exp2i(int k)
     return asfloat(uint(k + 127) << 23);
 }
 
-// R in bits 0-8, G in 9-17, B in 18-26, the shared exponent (bias 15) in 27-31. The
-// encoding of the Vulkan specification's shared-exponent conversion.
-public uint pack_rgb9e5(float3 c)
+// R in bits 0-8, G in 9-17, B in 18-26, the shared exponent (bias 15) in 27-31. Each channel goes
+// up to its next step where `u` in [0, 1) and how far it lies toward it sum to 1 or more, in steps of
+// the exponent that holds the brightest channel: the next one past `most` of its steps.
+uint pack_rgb9e5(float3 c, float u, float most)
 {
     const float MAX = 65408.0; // (2^9 - 1) / 2^9 x 2^16
     float3 rc = float3(
@@ -271,10 +272,26 @@ public uint pack_rgb9e5(float3 c)
     float m = max(rc.r, max(rc.g, rc.b));
     int floor_log2 = int(asuint(m) >> 23) - 127;
     int exp = max(-16, floor_log2) + 16;
-    if (floor(m * exp2i(24 - exp) + 0.5) == 512.0)
+    if (m * exp2i(24 - exp) > most)
         exp += 1;
-    uint3 q = uint3(floor(rc * exp2i(24 - exp) + 0.5));
+    // A channel at exactly 511 steps plus a `u` just under 1 rounds to 512, so the step is compared
+    // by its fraction.
+    float3 x = rc * exp2i(24 - exp);
+    uint3 q = uint3(floor(x)) + uint3(frac(x) + u >= 1.0);
     return q.r | (q.g << 9) | (q.b << 18) | (uint(exp) << 27);
+}
+
+// The encoding of the Vulkan specification's shared-exponent conversion.
+public uint pack_rgb9e5(float3 c)
+{
+    return pack_rgb9e5(c, 0.5, asfloat(0x43FFBFFF)); // the largest f32 below 511.5
+}
+
+// `c` rounded at random by `u`, which a uniform `u` keeps on average: no `u` takes the brightest
+// channel to 512 steps, which 9 bits do not hold.
+public uint pack_rgb9e5(float3 c, float u)
+{
+    return pack_rgb9e5(c, u, 511.0);
 }
 
 public float3 unpack_rgb9e5(uint p)

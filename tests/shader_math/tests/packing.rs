@@ -443,6 +443,43 @@ fn exact_axis_rotations_are_the_24_proper_rotations() {
     );
 }
 
+/// Colors rounded at random to a shared exponent keep their mean in every channel, those whose
+/// brightest channel lies past its last step too.
+#[test]
+fn shared_exponents_rounded_at_random_keep_the_mean() {
+    // 511 steps of the largest exponent, and the largest draw below 1.
+    let most = [65408.0, 0.0, 65408.0];
+    let last = 1.0 - f32::EPSILON / 2.0;
+    assert_eq!(unpack_rgb9e5(pack_rgb9e5_by(most, last)), most);
+    let mut rng = Rng::new(11);
+    for i in 0..2000u32 {
+        let top = if i.is_multiple_of(4) {
+            511.0 / 256.0 + rng.f32() / 256.0
+        } else {
+            1.0 + rng.f32()
+        };
+        let m = 2f32.powi((i % 24) as i32 - 10) * top;
+        let c = [m, m * rng.f32(), m * rng.f32()];
+        let n = 512;
+        let mut sum = [0.0f64; 3];
+        for k in 0..n {
+            let d = unpack_rgb9e5(pack_rgb9e5_by(c, (k as f32 + 0.5) / n as f32));
+            for (s, d) in sum.iter_mut().zip(d) {
+                *s += f64::from(d);
+            }
+        }
+        // The coarsest step `c` can take.
+        let step = f64::from(m) / 255.0;
+        for (s, v) in sum.iter().zip(c) {
+            let mean = s / f64::from(n);
+            assert!(
+                (mean - f64::from(v)).abs() <= 1.01 * step / f64::from(n),
+                "{c:?} has mean {mean:e} for {v:e}"
+            );
+        }
+    }
+}
+
 /// A value rounded at random to a half keeps its mean, over normal, subnormal and negative halves,
 /// and every result is a half.
 #[test]
